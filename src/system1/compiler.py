@@ -495,6 +495,7 @@ class CompiledSystemOneModel:
                 telemetry=telemetry,
                 schema_digest=schema_dig,
                 model_version=cur_version, strict=True,
+                recency_weighted=use_recency,
             )
             if hit is not None:
                 entry, sim = hit
@@ -542,6 +543,7 @@ class CompiledSystemOneModel:
                 model_version=cur_version, strict=True,
                 source="evaluation",
                 explicit_embedding=(embedding is not None),
+                recency_weighted=use_recency,
             )
 
         return result
@@ -594,11 +596,12 @@ class CompiledSystemOneModel:
             if not math.isfinite(eff_ff) or not (0.0 < eff_ff <= 1.0):
                 raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_ff}")
             t0 = time.perf_counter()
+            use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
 
             if embedding is not None:
                 emb = np.asarray(embedding, dtype=np.float32).flatten()
             else:
-                emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
+                emb = self.encode(prompt, telemetry=telemetry, recency_weighted=use_recency)
             if len(emb) != self.dimension:
                 raise ValueError(f"Expected embedding of length {self.dimension}, got {len(emb)}")
             if not np.all(np.isfinite(emb)):
@@ -937,6 +940,7 @@ class CompiledSystemOneModel:
                     model_version=self.model_version, strict=True,
                     source="tier2",
                     explicit_embedding=(embedding is not None),
+                    recency_weighted=use_recency,
                 )
 
             return {
@@ -1535,6 +1539,9 @@ class SystemOneCompiler:
         familiarity_alpha: float = 0.0,
         prototype_alpha: float = 0.0,
         hierarchical: Union[bool, str] = "auto",
+        auto_regularization: bool = True,
+        noise_robust: bool = True,
+        label_noise_robust: Optional[bool] = None,
     ) -> None:
         if isinstance(schema, type) and issubclass(schema, DecisionSchema):
             self.schema = schema()
@@ -1563,6 +1570,13 @@ class SystemOneCompiler:
         if not isinstance(hierarchical, bool) and hierarchical != "auto":
             raise ValueError("hierarchical must be a boolean or 'auto'")
         self.hierarchical: Union[bool, str] = hierarchical
+        if not isinstance(auto_regularization, bool):
+            raise ValueError("auto_regularization must be a boolean")
+        self.auto_regularization = auto_regularization
+        resolved_noise_robust = noise_robust if label_noise_robust is None else label_noise_robust
+        if not isinstance(resolved_noise_robust, bool):
+            raise ValueError("noise_robust must be a boolean")
+        self.noise_robust = resolved_noise_robust
         self.backend = backend
         self.forgetting_factor = float(forgetting_factor)
         self.relative_odds_ratio = float(relative_odds_ratio)
@@ -1580,7 +1594,12 @@ class SystemOneCompiler:
         self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
 
     @staticmethod
-    def _solve_logistic(X: np.ndarray, Y: np.ndarray, regularization: float):
+    def _solve_logistic(
+        X: np.ndarray,
+        Y: np.ndarray,
+        regularization: float,
+        sample_weights: Optional[np.ndarray] = None,
+    ):
         """Fit sum cross-entropy + lambda/2 * ||W||², with an unpenalized bias.
 
         The runtime divides choice logits by .25, so scale the stored coefficients
@@ -1601,6 +1620,11 @@ class SystemOneCompiler:
         if np.any(Y.sum(axis=0) == 0):
             raise ValueError("Logistic teaching needs fitting examples for every choice")
 
+        sw_col: Optional[np.ndarray] = None
+        if sample_weights is not None:
+            sw_raw = np.maximum(1e-6, np.asarray(sample_weights, dtype=np.float64).flatten())
+            sw_col = (sw_raw * (n / float(np.sum(sw_raw))))[:, None]
+
         if 0 < n < dimension and regularization > 0.0:
             q_mat, r_mat = np.linalg.qr(X.T, mode="reduced")
             z_mat = r_mat.T
@@ -1613,9 +1637,14 @@ class SystemOneCompiler:
                 shifted = logits - logits.max(axis=1, keepdims=True)
                 exp = np.exp(shifted)
                 total = exp.sum(axis=1, keepdims=True)
-                loss = (np.log(total).sum() - np.sum(Y * shifted)
-                        + .5 * regularization * np.sum(w_sub * w_sub)) / n
-                residual = exp / total - Y
+                if sw_col is None:
+                    loss = (np.log(total).sum() - np.sum(Y * shifted)
+                            + .5 * regularization * np.sum(w_sub * w_sub)) / n
+                    residual = exp / total - Y
+                else:
+                    loss = (np.sum(sw_col * np.log(total)) - np.sum(sw_col * Y * shifted)
+                            + .5 * regularization * np.sum(w_sub * w_sub)) / n
+                    residual = sw_col * (exp / total - Y)
                 gradient = np.empty_like(parameters)
                 gradient[:, :-1] = (residual.T @ z_mat + regularization * w_sub) / n
                 gradient[:, -1] = residual.mean(axis=0)
@@ -1641,9 +1670,14 @@ class SystemOneCompiler:
             shifted = logits - logits.max(axis=1, keepdims=True)
             exp = np.exp(shifted)
             total = exp.sum(axis=1, keepdims=True)
-            loss = (np.log(total).sum() - np.sum(Y * shifted)
-                    + .5 * regularization * np.sum(weights * weights)) / n
-            residual = exp / total - Y
+            if sw_col is None:
+                loss = (np.log(total).sum() - np.sum(Y * shifted)
+                        + .5 * regularization * np.sum(weights * weights)) / n
+                residual = exp / total - Y
+            else:
+                loss = (np.sum(sw_col * np.log(total)) - np.sum(sw_col * Y * shifted)
+                        + .5 * regularization * np.sum(weights * weights)) / n
+                residual = sw_col * (exp / total - Y)
             gradient = np.empty_like(parameters)
             gradient[:, :-1] = (residual.T @ X + regularization * weights) / n
             gradient[:, -1] = residual.mean(axis=0)
@@ -2031,16 +2065,26 @@ class SystemOneCompiler:
         Y_train: np.ndarray,
         *,
         is_boolean: bool = False,
+        sample_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Compute unit-normalized class feature centroids (shape (K, D))."""
         X_mat = np.asarray(X_train, dtype=np.float32)
         N, D = X_mat.shape
+        sw = (
+            np.maximum(1e-6, np.asarray(sample_weights, dtype=np.float64).flatten())
+            if sample_weights is not None
+            else None
+        )
         if is_boolean:
             y_flat = np.asarray(Y_train, dtype=np.float32).flatten()
             protos = np.zeros((2, D), dtype=np.float32)
             for idx, mask in enumerate((y_flat < 0.0, y_flat > 0.0)):
                 if np.any(mask):
-                    vec = np.mean(X_mat[mask], axis=0)
+                    vec = (
+                        np.average(X_mat[mask], axis=0, weights=sw[mask])
+                        if sw is not None
+                        else np.mean(X_mat[mask], axis=0)
+                    )
                     norm = float(np.linalg.norm(vec))
                     if norm > 1e-12:
                         protos[idx] = (vec / norm).astype(np.float32)
@@ -2053,11 +2097,109 @@ class SystemOneCompiler:
         for k in range(K):
             mask = Y_mat[:, k] > 0.5
             if np.any(mask):
-                vec = np.mean(X_mat[mask], axis=0)
+                vec = (
+                    np.average(X_mat[mask], axis=0, weights=sw[mask])
+                    if sw is not None
+                    else np.mean(X_mat[mask], axis=0)
+                )
                 norm = float(np.linalg.norm(vec))
                 if norm > 1e-12:
                     protos[k] = (vec / norm).astype(np.float32)
         return protos
+
+    def _compute_loo_ridge_and_sample_weights(
+        self,
+        X_train: np.ndarray,
+        Y_onehot: np.ndarray,
+        *,
+        auto_regularization: bool = True,
+        noise_robust: bool = True,
+    ) -> Tuple[float, Optional[np.ndarray]]:
+        """Closed-form Leave-One-Out CV ridge selection and out-of-fold noise downweighting."""
+        base_reg = float(self.regularization)
+        N, D = X_train.shape
+        K = Y_onehot.shape[1]
+        if N < 40 or K < 2 or (N / K) < 4.0 or (not auto_regularization and not noise_robust):
+            return base_reg, None
+
+        X64 = np.asarray(X_train, dtype=np.float64)
+        Y64 = np.asarray(Y_onehot, dtype=np.float64)
+        if not np.all(np.isfinite(X64)) or not np.all(np.isfinite(Y64)):
+            return base_reg, None
+
+        mu_X = np.mean(X64, axis=0)
+        mu_Y = np.mean(Y64, axis=0)
+        Xc = X64 - mu_X
+        Yc = Y64 - mu_Y
+        try:
+            if N <= D:
+                s2, U = np.linalg.eigh(Xc @ Xc.T)
+            else:
+                U, s_vals, _ = np.linalg.svd(Xc, full_matrices=False)
+                s2 = s_vals * s_vals
+        except np.linalg.LinAlgError:
+            return base_reg, None
+
+        s2 = np.maximum(0.0, s2)
+        UT_Yc = U.T @ Yc
+        U_sq = U * U
+
+        best_reg = base_reg
+        if auto_regularization and base_reg < 1.0:
+            candidates = sorted(
+                {round(val, 6) for val in (base_reg, 0.15, 0.35, 0.75, 1.0) if val >= base_reg and val > 0.0}
+            )
+            best_brier = float("inf")
+            for reg in candidates:
+                f = s2 / (s2 + reg)
+                h_diag = (1.0 / N) + U_sq @ f
+                denom = np.maximum(1e-4, 1.0 - h_diag)[:, None]
+                Y_hat = mu_Y + U @ (f[:, None] * UT_Yc)
+                loo_res = (Y_hat - Y64) / denom
+                brier = float(np.mean(np.sum(loo_res * loo_res, axis=1)))
+                if reg == base_reg or brier < best_brier * 0.995:
+                    best_brier = brier
+                    best_reg = float(reg)
+
+        if not noise_robust:
+            return best_reg, None
+
+        loo_reg = max(best_reg, 0.5)
+        f_loo = s2 / (s2 + loo_reg)
+        h_diag_loo = (1.0 / N) + U_sq @ f_loo
+        denom_loo = np.maximum(1e-4, 1.0 - h_diag_loo)[:, None]
+        Y_hat_loo = mu_Y + U @ (f_loo[:, None] * UT_Yc)
+        Y_loo = (Y_hat_loo - h_diag_loo[:, None] * Y64) / denom_loo
+
+        true_cls = np.argmax(Y64, axis=1)
+        s_true = Y_loo[np.arange(N), true_cls]
+        s_other = np.max(np.where(Y64 > 0.5, -1e9, Y_loo), axis=1)
+        deficit = s_other - s_true
+
+        if not np.any(deficit > 0.18):
+            return best_reg, None
+
+        sw = np.where(
+            deficit > 0.18,
+            np.clip(1.0 - 2.2 * (deficit - 0.18), 0.20, 1.0),
+            1.0,
+        ).astype(np.float32)
+        s_true_excess = s_true - mu_Y[true_cls]
+        sw = np.where(s_true_excess > 0.105, np.maximum(sw, 0.75), sw).astype(np.float32)
+
+        for k in range(K):
+            cls_idx = np.where(true_cls == k)[0]
+            if len(cls_idx) > 0:
+                best_in_cls = int(cls_idx[int(np.argmin(deficit[cls_idx]))])
+                if sw[best_in_cls] < 0.75:
+                    sw[best_in_cls] = 0.75
+                cls_sum = float(np.sum(sw[cls_idx]))
+                if cls_sum < 1.0:
+                    sw[cls_idx] = np.clip(sw[cls_idx] * (1.0 / max(1e-6, cls_sum)), 0.20, 1.0)
+
+        if bool(np.all(sw > 0.999)):
+            return best_reg, None
+        return best_reg, sw
 
     @staticmethod
     def _spherical_kmeans_clusters(
@@ -2129,10 +2271,13 @@ class SystemOneCompiler:
         prototypes: np.ndarray,
         *,
         regularize_bias: bool = True,
+        regularization: Optional[float] = None,
+        sample_weights: Optional[np.ndarray] = None,
     ) -> Tuple[Tuple[int, ...], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Fit two-stage coarse cluster router + intra-cluster fine specialist heads."""
         N, D = X_train.shape
         K = Y_train.shape[1]
+        eff_reg = float(self.regularization if regularization is None else regularization)
         num_clusters = min(K, max(2, min(int(round(math.sqrt(K))), max(2, K // 2))))
         cluster_assignments = self._spherical_kmeans_clusters(prototypes, num_clusters)
         M = max(cluster_assignments) + 1 if cluster_assignments else 1
@@ -2145,7 +2290,8 @@ class SystemOneCompiler:
         coarse_weights, coarse_biases = self._solve_ridge(
             X_train,
             Y_coarse,
-            self.regularization,
+            eff_reg,
+            sample_weights=sample_weights,
             regularize_bias=regularize_bias,
         )
         # Zero-center coarse router across clusters so coarse boost is zero-sum
@@ -2164,14 +2310,17 @@ class SystemOneCompiler:
             if int(np.sum(cluster_mask)) < len(member_classes):
                 X_sub = X_train
                 Y_sub = Y_train[:, member_classes]
+                sw_sub = sample_weights
             else:
                 X_sub = X_train[cluster_mask]
                 Y_sub = Y_train[cluster_mask][:, member_classes]
+                sw_sub = sample_weights[cluster_mask] if sample_weights is not None else None
 
             w_sub, b_sub = self._solve_ridge(
                 X_sub,
                 Y_sub,
-                max(0.25, self.regularization * 0.5),
+                max(0.25, eff_reg * 0.5),
+                sample_weights=sw_sub,
                 regularize_bias=regularize_bias,
             )
             # Zero-center specialist fine head within the cluster for sibling contrast
@@ -2271,6 +2420,9 @@ class SystemOneCompiler:
         familiarity_alpha: Optional[float] = None,
         prototype_alpha: Optional[float] = None,
         hierarchical: Optional[Union[bool, str]] = None,
+        auto_regularization: Optional[bool] = None,
+        noise_robust: Optional[bool] = None,
+        label_noise_robust: Optional[bool] = None,
     ) -> CompiledSystemOneModel:
         """Compile a local model, optionally using supplied examples only.
 
@@ -2295,6 +2447,13 @@ class SystemOneCompiler:
         eff_hierarchical = self.hierarchical if hierarchical is None else hierarchical
         if not isinstance(eff_hierarchical, bool) and eff_hierarchical != "auto":
             raise ValueError("hierarchical must be a boolean or 'auto'")
+        if auto_regularization is not None and not isinstance(auto_regularization, bool):
+            raise ValueError("auto_regularization must be a boolean")
+        eff_auto_reg = self.auto_regularization if auto_regularization is None else auto_regularization
+        req_noise = noise_robust if label_noise_robust is None else label_noise_robust
+        if req_noise is not None and not isinstance(req_noise, bool):
+            raise ValueError("noise_robust must be a boolean")
+        eff_noise_robust = self.noise_robust if req_noise is None else req_noise
         if not math.isfinite(calibration_split) or not 0.0 <= calibration_split < 1.0:
             raise ValueError("calibration_split must be finite and in [0, 1)")
         if not augment and exemplars is None:
@@ -2531,17 +2690,36 @@ class SystemOneCompiler:
                 Y_train = Y_all[:num_train]
                 Y_calib = Y_all[num_train:]
 
-                prototypes = self._compute_class_prototypes(X_train, Y_train, is_boolean=False)
+                if generated_count == 0 and (eff_auto_reg or eff_noise_robust):
+                    eff_reg, sw_choice = self._compute_loo_ridge_and_sample_weights(
+                        X_train,
+                        Y_train,
+                        auto_regularization=eff_auto_reg,
+                        noise_robust=eff_noise_robust,
+                    )
+                else:
+                    eff_reg, sw_choice = self.regularization, None
+
+                prototypes = self._compute_class_prototypes(
+                    X_train, Y_train, is_boolean=False, sample_weights=sw_choice
+                )
                 proto_thresh, proto_scores = self._calibrate_prototype_scores(
                     X_conf, prototypes, eff_prototype_alpha
                 )
 
                 if self.choice_solver == "logistic":
-                    weights, biases = self._solve_logistic(X_train, Y_train, self.regularization)
+                    weights, biases = self._solve_logistic(
+                        X_train, Y_train, eff_reg, sample_weights=sw_choice
+                    )
                     P_mat = B_mat = None
                 else:
                     weights, biases, P_mat, B_mat = self._solve_ridge(
-                        X_train, Y_train, self.regularization, regularize_bias=augment, return_covariance=True
+                        X_train,
+                        Y_train,
+                        eff_reg,
+                        sample_weights=sw_choice,
+                        regularize_bias=augment,
+                        return_covariance=True,
                     )
 
                 use_hierarchical = False
@@ -2569,6 +2747,8 @@ class SystemOneCompiler:
                         Y_train,
                         prototypes,
                         regularize_bias=augment,
+                        regularization=eff_reg,
+                        sample_weights=sw_choice,
                     )
                     raw_logits_calib = self._compute_hierarchical_logits(
                         X_calib,
@@ -2674,22 +2854,36 @@ class SystemOneCompiler:
                 # Logit-space targets: +1.0 for True, -1.0 for False
                 Y_all = np.array([1.0 if lab else -1.0 for lab in raw_labels], dtype=np.float32).reshape(-1, 1)
                 Y_train = Y_all[:num_train]
-                prototypes = self._compute_class_prototypes(X_train, Y_train, is_boolean=True)
-                proto_thresh, proto_scores = self._calibrate_prototype_scores(
-                    X_conf, prototypes, eff_prototype_alpha
-                )
                 pos_mask = (Y_train.flatten() == 1.0)
                 neg_mask = (Y_train.flatten() == -1.0)
                 n_pos = int(np.sum(pos_mask))
                 n_neg = int(np.sum(neg_mask))
+                if generated_count == 0 and (eff_auto_reg or eff_noise_robust):
+                    Y_bool_oh = np.column_stack([neg_mask.astype(np.float32), pos_mask.astype(np.float32)])
+                    eff_reg_bool, sw_noise = self._compute_loo_ridge_and_sample_weights(
+                        X_train,
+                        Y_bool_oh,
+                        auto_regularization=eff_auto_reg,
+                        noise_robust=eff_noise_robust,
+                    )
+                else:
+                    eff_reg_bool, sw_noise = self.regularization, None
+                prototypes = self._compute_class_prototypes(
+                    X_train, Y_train, is_boolean=True, sample_weights=sw_noise
+                )
+                proto_thresh, proto_scores = self._calibrate_prototype_scores(
+                    X_conf, prototypes, eff_prototype_alpha
+                )
                 if n_pos > 0 and n_neg > 0:
                     sw = np.zeros(num_train, dtype=np.float32)
                     sw[pos_mask] = (0.5 * num_train) / n_pos
                     sw[neg_mask] = (0.5 * num_train) / n_neg
+                    if sw_noise is not None:
+                        sw = sw * sw_noise
                 else:
-                    sw = None
+                    sw = sw_noise
                 weights, biases, P_mat, B_mat = self._solve_ridge(
-                    X_train, Y_train, self.regularization, sample_weights=sw, regularize_bias=True, return_covariance=True
+                    X_train, Y_train, eff_reg_bool, sample_weights=sw, regularize_bias=True, return_covariance=True
                 )
 
                 # Calibrate conformal bounds on X_calib
@@ -2927,6 +3121,9 @@ class SystemOneCompiler:
         familiarity_alpha: Optional[float] = None,
         prototype_alpha: Optional[float] = None,
         hierarchical: Optional[Union[bool, str]] = None,
+        auto_regularization: Optional[bool] = None,
+        noise_robust: Optional[bool] = None,
+        label_noise_robust: Optional[bool] = None,
     ) -> CompiledSystemOneModel:
         """Compiles model and writes directly to target .s1m binary file."""
         model = self.compile(
@@ -2940,6 +3137,9 @@ class SystemOneCompiler:
             familiarity_alpha=familiarity_alpha,
             prototype_alpha=prototype_alpha,
             hierarchical=hierarchical,
+            auto_regularization=auto_regularization,
+            noise_robust=noise_robust,
+            label_noise_robust=label_noise_robust,
         )
         model.save(output_path)
         return model

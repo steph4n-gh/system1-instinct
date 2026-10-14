@@ -685,3 +685,162 @@ def test_cleared_lesson_is_not_resurrected_from_saved_metadata():
         assert actual.is_ambiguous == expected.is_ambiguous
         assert actual.conformal_sets == expected.conformal_sets
 
+
+def test_model_evaluate_cache_isolates_recency_weighted():
+    schema = DecisionSchema(fields={"route": ChoiceField(options=["refund", "password"])})
+    projector = DeterministicSemanticProjector(dimension=32, recency_weighted=True)
+    prompt = "refund payment invoice password login reset"
+    recent = projector.project(prompt, recency_weighted=True)
+    uniform = projector.project(prompt, recency_weighted=False)
+    recent /= np.linalg.norm(recent)
+    uniform /= np.linalg.norm(uniform)
+    weight = 20 * (recent - uniform) / np.dot(recent - uniform, recent - uniform)
+    bias = -float(weight @ ((recent + uniform) / 2))
+    head = CompiledHeadWeights(
+        "route",
+        "choice",
+        np.stack([weight, -weight]),
+        np.array([bias, -bias], dtype=np.float32),
+        options=("refund", "password"),
+        score_method="lac",
+        calibration_scores=(0.1,) * 20,
+    )
+    model = CompiledSystemOneModel(
+        schema,
+        {"route": head},
+        dimension=32,
+        projector=projector,
+        recency_weighted=True,
+        use_cache=True,
+    )
+    res_recent = model.evaluate(prompt)
+    assert res_recent.fields["route"].selected_value == "refund"
+
+    res_uniform = model.evaluate(prompt, recency_weighted=False)
+    assert res_uniform.fields["route"].selected_value == "password"
+
+    model.use_cache = False
+    uncached_uniform = model.evaluate(prompt, recency_weighted=False)
+    assert res_uniform.fields["route"].selected_value == uncached_uniform.fields["route"].selected_value
+
+
+def test_compiler_auto_regularization_and_noise_robust_under_teacher_label_noise():
+    from system1.compiler import SystemOneCompiler
+
+    classes = ["billing", "technical", "account", "shipping", "security", "cancellation"]
+    core_vocab = {
+        "billing": ["invoice", "charge", "payment", "receipt", "overcharged", "statement", "credit", "fee"],
+        "technical": ["crash", "stacktrace", "timeout", "database", "exception", "latency", "bug", "server"],
+        "account": ["password", "mfa", "login", "locked", "username", "profile", "twofactor", "verification"],
+        "shipping": ["delivery", "tracking", "package", "courier", "customs", "shipment", "warehouse", "transit"],
+        "security": ["phishing", "breach", "unauthorized", "compromised", "token", "audit", "vulnerability", "firewall"],
+        "cancellation": ["cancel", "unsubscribe", "terminate", "downgrade", "close", "discontinue", "optout", "renewal"],
+    }
+    rng = np.random.default_rng(20261014)
+    train_texts, train_labels = [], []
+    cal_rows, test_rows = [], []
+
+    for c_idx, cls in enumerate(classes):
+        words = core_vocab[cls]
+        for i in range(20):
+            chosen = rng.choice(words, size=4, replace=False)
+            noise_tok = f"uniq_{c_idx}_{i}_{rng.integers(10000, 99999)}"
+            shared_tok = f" distract_{rng.integers(0, 120)}"
+            text = f"customer ticket {chosen[0]} {chosen[1]} {chosen[2]} {chosen[3]} {noise_tok} {shared_tok}"
+            # Inject 15% teacher label corruption (3 of 20 per class)
+            if i < 3:
+                wrong_cls = classes[(c_idx + 1 + (i % (len(classes) - 1))) % len(classes)]
+                label = wrong_cls
+            else:
+                label = cls
+            train_texts.append(text)
+            train_labels.append(label)
+
+        for i in range(6):
+            chosen = rng.choice(words, size=3, replace=False)
+            cal_rows.append((f"customer ticket {chosen[0]} {chosen[1]} {chosen[2]}", cls))
+
+        for i in range(25):
+            chosen = rng.choice(words, size=2, replace=False)
+            other_cls = classes[(c_idx + i) % len(classes)]
+            cross_word = core_vocab[other_cls][i % len(core_vocab[other_cls])]
+            test_rows.append((f"inquiry {chosen[0]} {chosen[1]} regarding {cross_word}", cls))
+
+    projector = TfidfProjector.from_texts(
+        train_texts,
+        max_features=256,
+        selection="chi2",
+        labels=train_labels,
+    )
+    schema = DecisionSchema(fields={"intent": ChoiceField(options=classes)})
+    fit_exemplars = {"intent": list(zip(train_texts, train_labels))}
+    cal_exemplars = {"intent": cal_rows}
+
+    robust_model = SystemOneCompiler(
+        schema,
+        projector=projector,
+        regularization=0.02,
+        auto_regularization=True,
+        noise_robust=True,
+    ).compile(fit_exemplars, calibration_exemplars=cal_exemplars, augment=False)
+
+    fragile_model = SystemOneCompiler(
+        schema,
+        projector=projector,
+        regularization=0.02,
+        auto_regularization=False,
+        noise_robust=False,
+    ).compile(fit_exemplars, calibration_exemplars=cal_exemplars, augment=False)
+
+    robust_acc = np.mean([
+        robust_model.forward_single(t).fields["intent"].selected_value == y
+        for t, y in test_rows
+    ])
+    fragile_acc = np.mean([
+        fragile_model.forward_single(t).fields["intent"].selected_value == y
+        for t, y in test_rows
+    ])
+    assert robust_acc >= fragile_acc + 0.05
+    assert robust_acc >= 0.85
+
+
+def test_teaching_session_noise_robust_and_compile_under_teacher_corruption(tmp_path):
+    from system1.teaching import TeachingSession
+
+    classes = ["billing", "technical", "account", "shipping"]
+    core_vocab = {
+        "billing": ["invoice", "charge", "payment", "receipt", "overcharged", "statement"],
+        "technical": ["crash", "stacktrace", "timeout", "database", "exception", "latency"],
+        "account": ["password", "mfa", "login", "locked", "username", "profile"],
+        "shipping": ["delivery", "tracking", "package", "courier", "customs", "shipment"],
+    }
+    rng = np.random.default_rng(99)
+    schema = DecisionSchema(fields={"intent": ChoiceField(options=classes)})
+    session = TeachingSession(
+        tmp_path / "noisy_session",
+        schema,
+        regularization=0.02,
+        max_features=128,
+        selection="chi2",
+    )
+
+    for c_idx, cls in enumerate(classes):
+        words = core_vocab[cls]
+        for i in range(15):
+            chosen = rng.choice(words, size=3, replace=False)
+            text = f"request {chosen[0]} {chosen[1]} {chosen[2]} ref_{c_idx}_{i}"
+            label = classes[(c_idx + 1) % len(classes)] if i < 2 else cls
+            session.record(text, label, split="teach", source="teacher")
+        for i in range(4):
+            chosen = rng.choice(words, size=2, replace=False)
+            session.record(f"cal {chosen[0]} {chosen[1]} item_{c_idx}_{i}", cls, split="calibrate")
+        for i in range(6):
+            chosen = rng.choice(words, size=2, replace=False)
+            session.record(f"eval {chosen[0]} {chosen[1]} check_{c_idx}_{i}", cls, split="evaluate")
+
+    compiled = session.compile()
+    assert isinstance(compiled, CompiledSystemOneModel)
+    report = session.assess(min_accuracy=0.80, min_coverage=0.50, max_accepted_errors=2)
+    assert report["candidate"]["raw_accuracy"] >= 0.85
+
+

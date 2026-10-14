@@ -98,6 +98,9 @@ class TeachingSession:
         familiarity_alpha=None,
         prototype_alpha=None,
         hierarchical=None,
+        auto_regularization=None,
+        noise_robust=None,
+        label_noise_robust=None,
     ):
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -115,6 +118,7 @@ class TeachingSession:
         self._lock_fd = None
         supplied = schema() if isinstance(schema, type) and issubclass(schema, DecisionSchema) else schema
         norm_ngrams = list(char_ngrams) if isinstance(char_ngrams, (list, tuple)) else char_ngrams
+        eff_noise_robust = noise_robust if label_noise_robust is None else label_noise_robust
         if self.session_path.exists():
             state = self._read_state()
             if supplied is not None and (not isinstance(supplied, DecisionSchema) or
@@ -131,6 +135,8 @@ class TeachingSession:
                 "familiarity_alpha": 0.0,
                 "prototype_alpha": 0.0,
                 "hierarchical": "auto",
+                "auto_regularization": True,
+                "noise_robust": True,
             }
             supplied_opts = {
                 "regularization": regularization,
@@ -143,6 +149,8 @@ class TeachingSession:
                 "familiarity_alpha": familiarity_alpha,
                 "prototype_alpha": prototype_alpha,
                 "hierarchical": hierarchical,
+                "auto_regularization": auto_regularization,
+                "noise_robust": eff_noise_robust,
             }
             for name, value in supplied_opts.items():
                 if value is not None and value != state.get(name, defaults[name]):
@@ -172,6 +180,10 @@ class TeachingSession:
                 state["prototype_alpha"] = prototype_alpha
             if hierarchical is not None:
                 state["hierarchical"] = hierarchical
+            if auto_regularization is not None:
+                state["auto_regularization"] = auto_regularization
+            if eff_noise_robust is not None:
+                state["noise_robust"] = eff_noise_robust
             self._validate_state(state)
             with self._workspace_lock():
                 _write_json(self.session_path, state)
@@ -315,6 +327,10 @@ class TeachingSession:
             hier = state["hierarchical"]
             if type(hier) is not bool and hier != "auto":
                 raise ValueError("hierarchical must be a boolean or 'auto'")
+        if "auto_regularization" in state and type(state["auto_regularization"]) is not bool:
+            raise ValueError("auto_regularization must be a boolean")
+        if "noise_robust" in state and type(state["noise_robust"]) is not bool:
+            raise ValueError("noise_robust must be a boolean")
         if not isinstance(state["records"], list):
             raise ValueError("Session records must be a list")
         seen, groups = set(), {}
@@ -924,6 +940,106 @@ class TeachingSession:
                 "calibration_counts": calib_counts,
                 "evidence_scope": "recurring_development_checks", "identity": self._identity(state)}
 
+    def _compile_model_from_state(
+        self,
+        state: dict,
+        *,
+        require_calibration: bool = True,
+        auto_regularization: bool | None = None,
+        noise_robust: bool | None = None,
+    ) -> CompiledSystemOneModel:
+        fitting = [row for row in state["records"] if row["split"] == "teach"]
+        calibration = [row for row in state["records"] if row["split"] == "calibrate"]
+        if require_calibration and len(calibration) < 2:
+            raise ValueError("Supply at least two separate calibrate examples")
+        for fname, f_def in self.schema.fields.items():
+            f_labels = [self._field_label(row["label"], fname) for row in fitting]
+            if isinstance(f_def, ChoiceField):
+                if set(f_labels) != set(f_def.options):
+                    raise ValueError("Supply teaching examples for every choice before assessing")
+            elif isinstance(f_def, BooleanField):
+                if set(f_labels) != {False, True}:
+                    raise ValueError("Supply teaching examples for every choice before assessing")
+            elif isinstance(f_def, MultiChoiceField):
+                if len(fitting) < 2 or not {opt for labs in f_labels for opt in labs}:
+                    raise ValueError("Supply teaching examples for every choice before assessing")
+            elif isinstance(f_def, ScoreField):
+                if len(fitting) < 2 or len({float(v) for v in f_labels}) < 2:
+                    raise ValueError("Supply teaching examples for every choice before assessing")
+
+        selection = state.get("selection", "frequency")
+        char_ngrams_raw = state.get("char_ngrams")
+        char_ngrams = tuple(char_ngrams_raw) if char_ngrams_raw else None
+        if selection == "frequency" and char_ngrams is None:
+            projector = TfidfProjector.fit([row["input"] for row in fitting], max_features=state["max_features"])
+        else:
+            if selection in ("chi2", "mi"):
+                fit_labels = [
+                    row["label"] if isinstance(row["label"], str)
+                    else json.dumps(row["label"], sort_keys=True)
+                    for row in fitting
+                ]
+            else:
+                fit_labels = None
+            projector = TfidfProjector.fit(
+                [row["input"] for row in fitting],
+                max_features=state["max_features"],
+                selection=selection,
+                labels=fit_labels,
+                char_ngrams=char_ngrams,
+            )
+        eff_auto_reg = bool(state.get("auto_regularization", True)) if auto_regularization is None else bool(auto_regularization)
+        eff_noise_rob = bool(state.get("noise_robust", True)) if noise_robust is None else bool(noise_robust)
+        compiler = SystemOneCompiler(
+            self.schema,
+            projector=projector,
+            regularization=state["regularization"],
+            choice_solver=state.get("choice_solver", "ridge"),
+            mondrian=bool(state.get("mondrian", False)),
+            familiarity_alpha=float(state.get("familiarity_alpha", 0.0)),
+            prototype_alpha=float(state.get("prototype_alpha", 0.0)),
+            hierarchical=state.get("hierarchical", "auto"),
+            auto_regularization=eff_auto_reg,
+            noise_robust=eff_noise_rob,
+        )
+        fit_exemplars = {
+            fname: [(row["input"], self._field_label(row["label"], fname)) for row in fitting]
+            for fname in self.schema.fields
+        }
+        if calibration:
+            cal_exemplars = {
+                fname: [(row["input"], self._field_label(row["label"], fname)) for row in calibration]
+                for fname in self.schema.fields
+            }
+            return compiler.compile(
+                fit_exemplars,
+                augment=False,
+                calibration_exemplars=cal_exemplars,
+            )
+        return compiler.compile(
+            fit_exemplars,
+            augment=False,
+            calibration_split=0.0,
+        )
+
+    def compile(
+        self,
+        *,
+        auto_regularization: bool | None = None,
+        noise_robust: bool | None = None,
+        label_noise_robust: bool | None = None,
+    ) -> CompiledSystemOneModel:
+        """Compile a candidate model directly from the recorded teaching and calibration splits."""
+        eff_noise = noise_robust if label_noise_robust is None else label_noise_robust
+        with self._workspace_lock():
+            state = self._read_state()
+            return self._compile_model_from_state(
+                state,
+                require_calibration=False,
+                auto_regularization=auto_regularization,
+                noise_robust=eff_noise,
+            )
+
     def assess(self, *, min_accuracy=.8, min_coverage=.5, max_accepted_errors=0, max_regressions=0,
                require_qualification=False):
         """Compile/save/reload a candidate; compare it without replacing the skill.
@@ -935,71 +1051,9 @@ class TeachingSession:
         thresholds = self._thresholds(min_accuracy, min_coverage, max_accepted_errors, max_regressions, require_qualification)
         with self._workspace_lock():
             state = self._read_state()
-            fitting = [row for row in state["records"] if row["split"] == "teach"]
-            calibration = [row for row in state["records"] if row["split"] == "calibrate"]
             if not self._counts(state)["evaluate"]:
                 raise ValueError("Supply separate evaluate examples before assessing a candidate")
-            if len(calibration) < 2:
-                raise ValueError("Supply at least two separate calibrate examples")
-            for fname, f_def in self.schema.fields.items():
-                f_labels = [self._field_label(row["label"], fname) for row in fitting]
-                if isinstance(f_def, ChoiceField):
-                    if set(f_labels) != set(f_def.options):
-                        raise ValueError("Supply teaching examples for every choice before assessing")
-                elif isinstance(f_def, BooleanField):
-                    if set(f_labels) != {False, True}:
-                        raise ValueError("Supply teaching examples for every choice before assessing")
-                elif isinstance(f_def, MultiChoiceField):
-                    if len(fitting) < 2 or not {opt for labs in f_labels for opt in labs}:
-                        raise ValueError("Supply teaching examples for every choice before assessing")
-                elif isinstance(f_def, ScoreField):
-                    if len(fitting) < 2 or len({float(v) for v in f_labels}) < 2:
-                        raise ValueError("Supply teaching examples for every choice before assessing")
-
-            selection = state.get("selection", "frequency")
-            char_ngrams_raw = state.get("char_ngrams")
-            char_ngrams = tuple(char_ngrams_raw) if char_ngrams_raw else None
-            if selection == "frequency" and char_ngrams is None:
-                projector = TfidfProjector.fit([row["input"] for row in fitting], max_features=state["max_features"])
-            else:
-                if selection in ("chi2", "mi"):
-                    fit_labels = [
-                        row["label"] if isinstance(row["label"], str)
-                        else json.dumps(row["label"], sort_keys=True)
-                        for row in fitting
-                    ]
-                else:
-                    fit_labels = None
-                projector = TfidfProjector.fit(
-                    [row["input"] for row in fitting],
-                    max_features=state["max_features"],
-                    selection=selection,
-                    labels=fit_labels,
-                    char_ngrams=char_ngrams,
-                )
-            compiler = SystemOneCompiler(
-                self.schema,
-                projector=projector,
-                regularization=state["regularization"],
-                choice_solver=state.get("choice_solver", "ridge"),
-                mondrian=bool(state.get("mondrian", False)),
-                familiarity_alpha=float(state.get("familiarity_alpha", 0.0)),
-                prototype_alpha=float(state.get("prototype_alpha", 0.0)),
-                hierarchical=state.get("hierarchical", "auto"),
-            )
-            fit_exemplars = {
-                fname: [(row["input"], self._field_label(row["label"], fname)) for row in fitting]
-                for fname in self.schema.fields
-            }
-            cal_exemplars = {
-                fname: [(row["input"], self._field_label(row["label"], fname)) for row in calibration]
-                for fname in self.schema.fields
-            }
-            model = compiler.compile(
-                fit_exemplars,
-                augment=False,
-                calibration_exemplars=cal_exemplars,
-            )
+            model = self._compile_model_from_state(state, require_calibration=True)
             model.metadata["teaching_session"] = {
                 "session": _digest(state), "current": _file_digest(self.current_path), "thresholds": thresholds}
             temporary = self.directory / ".candidate.s1m"

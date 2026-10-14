@@ -222,6 +222,7 @@ def _select_supervised_terms(
         )
 
     n_total = float(total_docs)
+    use_support_weight = total_docs >= 40 and (n_total / len(classes)) >= 3.0
     per_class_positive: dict[str, list[tuple[float, int, int, str]]] = {c: [] for c in classes}
     global_scores: dict[str, float] = {}
 
@@ -234,6 +235,7 @@ def _select_supervised_terms(
         c_dfs = term_class_df[term]
         best_score = 0.0
         len_tie = len(term) if term.startswith("#") else 0
+        support_weight = math.log1p(df) if use_support_weight else 1.0
         for c in classes:
             n_c = float(class_counts[c])
             not_n_c = n_total - n_c
@@ -248,7 +250,7 @@ def _select_supervised_terms(
             if selection == "chi2":
                 num = n_total * (a * d - b * c_neg) ** 2
                 den = df * not_df * n_c * not_n_c
-                score = num / den if den > 0.0 else 0.0
+                score = (num / den if den > 0.0 else 0.0) * support_weight
             else:  # "mi"
                 score = 0.0
                 for obs, row_sum, col_sum in (
@@ -259,6 +261,13 @@ def _select_supervised_terms(
                 ):
                     if obs > 0.0 and row_sum > 0.0 and col_sum > 0.0:
                         score += (obs / n_total) * math.log((n_total * obs) / (row_sum * col_sum))
+                score *= support_weight
+
+            if use_support_weight:
+                if df_int == 1:
+                    score *= 0.05
+                elif a <= 1.0:
+                    score *= 0.25
 
             if score > best_score:
                 best_score = score
@@ -545,6 +554,7 @@ class TfidfProjector:
             raise ValueError(f"TF-IDF vocabulary must contain 1–{limit} terms")
         return cls(terms, config["idf"], char_ngrams=config.get("char_ngrams"))
 
+    from_texts = fit
     to_dict = to_config
     from_dict = from_config
 
