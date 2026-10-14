@@ -97,3 +97,5 @@ runs/
 
 # Quality benchmark results
 benchmarks/quality/results/quality_results_*.json
+benchmarks/heldout_traffic/results/predictions.json.gz
+benchmarks/heldout_traffic/data/

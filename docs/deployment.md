@@ -30,6 +30,13 @@ Split-conformal coverage requires calibration examples and future examples to be
 
 Use separate teaching, calibration, and evaluation data. Recalibrate after model updates and measure behavior on your deployment distribution. Neither the significance level `alpha` nor a confidence threshold implies a fixed escalation or local-retention rate. Optional fallback routing is application behavior; `System1Engine.decide()` itself returns structured values and uncertainty rather than executing a frontier model or tool.
 
+`learn()` defaults to `preserve_calibration=True`, which retains acceptance
+thresholds and may synthesize twenty identical scores when no calibration exists.
+These are heuristic online acceptance gates, not independent calibration data;
+they do not preserve split-conformal coverage after the model changes. Use
+`preserve_calibration=False` and independent recalibration when that guarantee is
+required. Exact learned-prompt overrides are also corrections, not held-out evidence.
+
 ## Audit evidence and privacy
 
 Signed receipts allow a verifier with an independently trusted public key to detect changes to the signed payload. The SQLite ledger is a linear SHA-256 hash chain, not a Merkle tree or hardware attestation. It cannot prove that an external tool executed correctly or that a compromised host recorded every event. Preserve trusted ledger-head checkpoints outside the writable ledger if detecting truncation or rollback is required.
@@ -88,16 +95,24 @@ Experimental [Docker and Kubernetes templates](../deploy/README.md) are included
 ## Saved-skill resource limits
 
 The `.s1m` loader accepts at most 64 MiB of file data, a 1 MiB JSON header,
-64 fields, 1,024 options per field, dimension 4,096, and 1,000,000 calibration
-scores per field. It checks a maximum of five NPZ members per field, 128 MiB of
+64 fields, 1,024 options per field, dimension 8,192, and 1,000,000 calibration
+scores per field. It checks a maximum of seventeen NPZ members per field, 128 MiB of
 expanded arrays, a 1,024:1 per-member compression ratio, and a 256 MiB estimated
 model-construction allocation budget. NPY headers must describe correctly shaped
 float32 or float64 arrays before any array is materialized; pickle is disabled.
 Projector dimensions must match the model, and the allocation estimate includes
-covariance matrices and hybrid-projector tables. These are loader admission
+covariance matrices, calibration score objects, exemplar state and hybrid-projector reconstruction buffers. Loaded heads use their saved weights without rebuilding description embeddings. File reads are bounded on startup and reload. These are loader admission
 budgets, not a process-wide memory ceiling; stricter application limits can be
 applied outside the loader. Ordinary v1/v2 skills continue to load; over-budget
 files raise `ValueError` and malformed files are rejected.
+
+Newly saved cold-start skills retain exemplar banks and online prototype state, and
+`HybridProjector` skills store their spectral and learned subspace matrices as
+binary `.npz` members (`_projector_spectral_vectors`, `_projector_subspace_components`)
+rather than inline JSON lists in the header.
+Readers predating these optional arrays reject those files. Existing v1/v2
+skills (including legacy JSON-inline projector fields) remain readable; inference
+state omitted by an older writer cannot be recovered from that artifact.
 
 ## Performance and optional backends
 

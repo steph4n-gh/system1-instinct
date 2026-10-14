@@ -446,6 +446,32 @@ class DecisionSchema(metaclass=SchemaMeta):
                 validated[name] = None
         return validated
 
+    def validate_lesson(self, target: Any, *, allow_unknown: bool = False) -> Dict[str, Any]:
+        """Validate every supplied label before an online update changes any head."""
+        if isinstance(target, Mapping):
+            values = dict(target)
+        else:
+            if target is None:
+                raise ValueError("Lesson target cannot be None")
+            values = {next(iter(self._fields)): target}
+        if not values:
+            raise ValueError("Lesson target cannot be empty")
+        unknown = [name for name in values if name not in self._fields]
+        if unknown and not allow_unknown:
+            raise ValueError(
+                f"Unknown field(s) {unknown!r} in lesson target for schema {self.schema_name!r}"
+            )
+        validated = {
+            name: self._fields[name].validate_value(value)
+            for name, value in values.items()
+            if name in self._fields
+        }
+        if not validated:
+            raise ValueError(
+                f"Lesson target contained no valid fields for schema {self.schema_name!r}"
+            )
+        return validated
+
     def to_dict(self) -> Dict[str, Any]:
         """Serializes the complete schema definition into a canonical dictionary."""
         return {

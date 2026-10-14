@@ -288,6 +288,7 @@ class DecisionFieldHead:
         projector: Optional[Any] = None,
         contrastive_whitening: bool = True,
         forgetting_factor: float = 0.995,
+        initialize_weights: bool = True,
     ) -> None:
         self.field_def = field_def
         self.dimension = dimension
@@ -314,7 +315,12 @@ class DecisionFieldHead:
         self._initial_weights: Optional[np.ndarray] = None
         self._online_shots_p: Optional[List[List[np.ndarray]]] = None
         self._online_shots_c: Optional[List[List[np.ndarray]]] = None
-        self._init_head()
+        if initialize_weights:
+            self._init_head()
+        else:
+            width = len(field_def.options) if isinstance(field_def, (ChoiceField, MultiChoiceField)) else 1
+            self.weights = np.zeros((width, dimension), dtype=np.float32)
+            self.biases = np.zeros(width, dtype=np.float32)
 
     def _build_concept_aware_exemplar_bank(self) -> None:
         """Constructs the concept-aware prototype and sub-prototype bank for a ChoiceField."""
@@ -650,6 +656,75 @@ class DecisionFieldHead:
             return y
         return np.asarray(target_value, dtype=np.float32)
 
+    def export_exemplar_state(self) -> Optional[Dict[str, Any]]:
+        """Snapshot the nonlinear routing state that cannot be recovered from weights."""
+        if self._exemplar_bank is None:
+            return None
+        centroids, banks = self._exemplar_bank
+        arrays = {"exemplar_centroids": centroids.copy()}
+        counts: Dict[str, List[int]] = {}
+        for key, groups in (("exemplar_vectors", banks), ("shots_p", self._online_shots_p), ("shots_c", self._online_shots_c)):
+            if groups is not None:
+                counts[key] = [len(group) for group in groups]
+                arrays[key] = np.concatenate([
+                    np.asarray(group, dtype=np.float32).reshape(-1, self.dimension) for group in groups
+                ], axis=0)
+        if self._exemplar_mean is not None:
+            arrays["exemplar_mean"] = self._exemplar_mean.copy()
+        if self._initial_weights is not None:
+            arrays["initial_w"] = self._initial_weights.copy()
+        return {"arrays": arrays, "counts": counts,
+                "online_shots_are_pseudo": bool(getattr(self, "_online_shots_are_pseudo", False))}
+
+    def restore_exemplar_state(self, state: Dict[str, Any]) -> None:
+        if not isinstance(state, Mapping):
+            raise ValueError("Saved exemplar state must be a mapping")
+        arrays = state.get("arrays")
+        counts = state.get("counts")
+        if not isinstance(arrays, Mapping) or not isinstance(counts, Mapping):
+            raise ValueError("Saved exemplar state requires 'arrays' and 'counts' mappings")
+        allowed_arrays = {
+            "exemplar_centroids",
+            "exemplar_vectors",
+            "shots_p",
+            "shots_c",
+            "exemplar_mean",
+            "initial_w",
+        }
+        if set(arrays.keys()) - allowed_arrays or set(counts.keys()) - {"exemplar_vectors", "shots_p", "shots_c"}:
+            raise ValueError("Saved exemplar state contains unsupported keys")
+        if ("shots_p" in arrays) != ("shots_c" in arrays) or ("shots_p" in counts) != ("shots_c" in counts):
+            raise ValueError("Saved exemplar state requires both shots_p and shots_c when online shots are present")
+        online_shots_are_pseudo = state.get("online_shots_are_pseudo", False)
+        if not isinstance(online_shots_are_pseudo, bool):
+            raise ValueError("Saved exemplar state 'online_shots_are_pseudo' must be a boolean")
+        width = len(self.field_def.options) if isinstance(self.field_def, ChoiceField) else 0
+        if not width or self.hierarchical or "exemplar_centroids" not in arrays or "exemplar_vectors" not in arrays:
+            raise ValueError("Saved exemplar state requires a non-hierarchical choice head")
+        for key, arr in arrays.items():
+            if not isinstance(arr, np.ndarray):
+                raise ValueError(f"Saved exemplar array {key!r} must be a numpy ndarray")
+            expected = (self.dimension,) if key == "exemplar_mean" else (width, self.dimension)
+            if key in ("exemplar_vectors", "shots_p", "shots_c"):
+                sizes = counts.get(key)
+                if (not isinstance(sizes, (list, tuple)) or len(sizes) != width
+                        or any(type(n) is not int or n < 0 for n in sizes)):
+                    raise ValueError("Saved exemplar group counts are invalid")
+                expected = (sum(sizes), self.dimension)
+            if arr.shape != expected or not np.all(np.isfinite(arr)):
+                raise ValueError(f"Saved exemplar array {key!r} is invalid")
+        groups: Dict[str, List[np.ndarray]] = {}
+        for key in ("exemplar_vectors", "shots_p", "shots_c"):
+            if key in arrays:
+                groups[key] = list(np.split(arrays[key], np.cumsum(counts[key])[:-1]))
+        self._exemplar_bank = (arrays["exemplar_centroids"], groups["exemplar_vectors"])
+        self._exemplar_mean = arrays.get("exemplar_mean")
+        self._initial_weights = arrays.get("initial_w")
+        self._online_shots_p = [list(group) for group in groups["shots_p"]] if "shots_p" in groups else None
+        self._online_shots_c = [list(group) for group in groups["shots_c"]] if "shots_c" in groups else None
+        self._online_shots_are_pseudo = online_shots_are_pseudo
+        self._exemplar_projector = DeterministicSemanticProjector(dimension=self.dimension)
+
     def _update_exemplar_bank_entry(
         self,
         emb_feat: np.ndarray,
@@ -911,17 +986,12 @@ class DecisionFieldHead:
         W_{t+1} = (P_{t+1} B_{t+1})^T
         """
         t0 = time.perf_counter()
-        if self.covariance_inv is None or self.cross_covariance is None:
-            self.init_covariance(regularization=self.regularization)
-
         lam_f = float(
             forgetting_factor if forgetting_factor is not None else self.forgetting_factor
         )
-        if not (0.0 < lam_f <= 1.0):
+        if not math.isfinite(lam_f) or not (0.0 < lam_f <= 1.0):
             raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {lam_f}")
 
-        P = self.covariance_inv
-        B = self.cross_covariance
         D = self.dimension
         K = self.weights.shape[0]
 
@@ -940,6 +1010,12 @@ class DecisionFieldHead:
             raise ValueError("y_target contains NaN or Inf non-finite values")
         if len(y) != K:
             raise ValueError(f"Expected target vector y of length {K}, got {len(y)}")
+
+        if self.covariance_inv is None or self.cross_covariance is None:
+            self.init_covariance(regularization=self.regularization)
+
+        P = self.covariance_inv
+        B = self.cross_covariance
 
         x_step = x
         y_step = y
@@ -1436,23 +1512,26 @@ class SystemOneModel:
     ) -> Dict[str, Any]:
         """Closed-form rank-1 Sherman-Morrison online update on the metal (<0.1ms)."""
         with self._lock:
+            target_dict = self.schema.validate_lesson(target, allow_unknown=True)
+            eff_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+            if not math.isfinite(eff_ff) or not (0.0 < eff_ff <= 1.0):
+                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_ff}")
             t0 = time.perf_counter()
             if embedding is not None:
                 emb = np.asarray(embedding, dtype=np.float32).flatten()
             else:
                 emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
+            if len(emb) != self.dimension:
+                raise ValueError(f"Expected embedding of length {self.dimension}, got {len(emb)}")
+            if not np.all(np.isfinite(emb)):
+                raise ValueError("embedding contains NaN or Inf non-finite values")
             x_aug = np.append(emb, 1.0).astype(np.float32)
-
-            target_dict: Dict[str, Any]
-            if isinstance(target, Mapping):
-                target_dict = dict(target)
-            else:
-                first_field = next(iter(self.schema.fields.keys()))
-                target_dict = {first_field: target}
 
             updated_fields: List[str] = []
             update_durations_ms: List[float] = []
-            prompt_for_head = prompt if (isinstance(prompt, str) and prompt.strip()) else None
+            prompt_for_head = (
+                prompt if (embedding is None and isinstance(prompt, str) and prompt.strip()) else None
+            )
 
             for f_name, target_val in target_dict.items():
                 if f_name in self.heads:
@@ -1461,7 +1540,7 @@ class SystemOneModel:
                     dt = head.online_update(
                         x_aug,
                         y_target,
-                        forgetting_factor=forgetting_factor,
+                        forgetting_factor=eff_ff,
                         prompt=prompt_for_head,
                         preserve_calibration=preserve_calibration,
                     )
@@ -1538,6 +1617,10 @@ class SystemOneModel:
         reward: Optional[float] = None,
     ) -> Dict[str, Any]:
         """First-class online teaching method that preserves calibration by default."""
+        if forgetting_factor is not None:
+            ff_check = float(forgetting_factor)
+            if not math.isfinite(ff_check) or not (0.0 < ff_check <= 1.0):
+                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_check}")
         eff_ff = forgetting_factor
         if reward is not None:
             r_val = float(reward)
@@ -1570,6 +1653,7 @@ class SystemOneModel:
                 resolved_target = outcome
         if resolved_target is None:
             raise ValueError("learn() requires a target label/mapping or outcome")
+        resolved_target = self.schema.validate_lesson(resolved_target)
 
         res = self.learn_from_tier2(
             prompt,

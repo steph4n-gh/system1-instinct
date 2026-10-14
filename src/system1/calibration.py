@@ -519,7 +519,15 @@ class ConformalPredictor:
             return float(c_scores[k_c - 1])
         if q_global >= 1.0:
             return 1.0
-        q_emp = float(np.quantile(c_scores, 1.0 - alpha))
+        if n_c == 1:
+            q_emp = float(c_scores[0])
+        else:
+            pos = (n_c - 1) * (1.0 - alpha)
+            lo = int(math.floor(pos))
+            hi = min(n_c - 1, lo + 1)
+            frac = pos - lo
+            c_lo = float(c_scores[lo])
+            q_emp = c_lo + frac * (float(c_scores[hi]) - c_lo)
         shrink = max(1.0, self.mondrian_shrinkage)
         w = float(n_c) / (float(n_c) + shrink)
         return float(w * q_emp + (1.0 - w) * q_global)

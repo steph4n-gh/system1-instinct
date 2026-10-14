@@ -147,6 +147,8 @@ Here is the real progression from **`0` examples** to a compiled **`.s1m` skill*
 | **`25–50` examples / option** | Standalone `.s1m` saturates; out-of-scope inputs still cleanly rejected (`0.0%` OOS FA) | **`80%–100%`** | `0%–20%` | **`~99%–100%`** |
 | **`10,000+` examples** | **Wrong tool for new gains** — linear + spectral hyperplanes plateau around `50–100` examples/option | *Plateau* | — | Use a fine-tuned model / local LLM |
 
+> **Scope & Fallible-Teacher Boundary:** The progression above summarizes `CLINC150` and `BANKING77` adaptation curves with an oracle teacher fallback ($\alpha = 0.10$ marginal conformal gating). When learning from a **noisy/fallible teacher** (`10%` label noise on `64`-class `HWU64`) on strictly fresh traffic, under an ultra-strict **`1%` (`0.01`) family-wise conditional local error budget** (`1,394` qualification items), neither Instinct nor a classical logistic classifier can statistically certify `<= 1%` upper-bound risk; at a standard **`5%` (`0.05`) local error budget**, all generalizing methods qualify on `5/5` seeds (`instinct_lexical` offloads `24.41%` vs `simple_classifier`'s `20.46%` at `1.75%` error, and `instinct_hybrid` achieves the lowest local error rate at `1.36%` with `5/5` `.s1m` reloadability)—see **[Fresh HWU64 Traffic with a Fallible Teacher (`benchmarks/heldout_traffic/REPORT.md`)](benchmarks/heldout_traffic/REPORT.md)**.
+
 ---
 
 ## When to Use Instinct vs. a Local LLM or Fine-Tuned Model
@@ -249,6 +251,8 @@ Reproduce 100% offline (`block_network()`) with `python benchmarks/quality/evalu
 | **4. Authored Drift Probes (106)** | `banking_support` / `sms_triage` / `model_routing` | 86.2% / 77.5% / 77.8% cov | **100.0%** / **82.5%** / **88.9% cov** | **100.0%** / **87.5%** / **94.4% cov** |
 | **5. Multi-Field Structured Triage** | 4-Field Joint Accuracy (`Choice`+`Bool`+`Multi`+`Score`) | 97.1% | **100.0%** (`0.40 ms`) | **100.0%** (`0%` Wave 3 esc) |
 | **6. Zero-Shot Cold-Start Routing** | `intent_routing` / `security_triage` (0-Shot) | 51.0% / 50.0% | **81.0%** / **85.0%** | **100.0%** |
+
+> **Interpretation (`+ Flywheel` vs. Fresh Noisy-Teacher Traffic):** In the gauntlet above, `+ Flywheel` columns measure closed-loop oracle correction and replay on the evaluated prompt set, and end-to-end curves in Section 2 use an oracle fallback at $\alpha = 0.10$. For an external evaluation on **fresh held-out `HWU64` traffic (`64` intents) taught by a `10%`-noisy teacher under both strict `1%` (`0.01`) and standard `5%` (`0.05`) family-wise local accepted-error gates**, see **[`benchmarks/heldout_traffic/REPORT.md`](benchmarks/heldout_traffic/REPORT.md)** ([protocol & verifier](benchmarks/heldout_traffic/README.md)).
 
 ---
 

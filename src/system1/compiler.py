@@ -54,9 +54,18 @@ MAX_SKILL_FIELDS = 64
 MAX_SKILL_OPTIONS = 1024
 MAX_SKILL_CALIBRATION_SCORES = 1_000_000
 MAX_SKILL_COMPRESSION_RATIO = 1024
+EXEMPLAR_ARRAYS = ("exemplar_centroids", "exemplar_vectors", "exemplar_mean", "initial_w", "shots_p", "shots_c")
 
 
-def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> Dict[str, np.ndarray]:
+def _read_skill_bytes(path: Union[str, Path]) -> bytes:
+    with Path(path).open("rb") as stream:
+        data = stream.read(MAX_SKILL_BYTES + 1)
+    if len(data) > MAX_SKILL_BYTES:
+        raise ValueError("Saved skill file exceeds size limit")
+    return data
+
+
+def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runtime_bytes: int = 0) -> Dict[str, np.ndarray]:
     """Preflight ZIP and NPY headers before NumPy can allocate any array."""
     # Bound central-directory parsing too: ZipFile creates one object per entry.
     end = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
@@ -65,7 +74,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> D
     _, disk, directory_disk, disk_count, count, directory_size, directory_offset, comment_size = struct.unpack(
         "<4s4H2LH", data[end:end + 22]
     )
-    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * 5
+    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS))
             or directory_size > MAX_SKILL_HEADER_BYTES or directory_offset + directory_size != end
             or end + 22 + comment_size != len(data)):
         raise ValueError("Saved skill NPZ directory exceeds limits or is malformed")
@@ -84,7 +93,10 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> D
             "coarse_b",
             "fine_w",
             "fine_b",
-        )
+        ) + EXEMPLAR_ARRAYS
+    } | {
+        "_projector_spectral_vectors.npy",
+        "_projector_subspace_components.npy",
     }
     shapes: Dict[str, Tuple[int, ...]] = {}
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -113,6 +125,20 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> D
                 if byte_count > MAX_SKILL_ARRAY_BYTES or stream.tell() + byte_count != info.file_size:
                     raise ValueError("Saved skill array shape exceeds its declared size or budget")
                 shapes[info.filename[:-4]] = shape
+        spec_vec_shape = shapes.get("_projector_spectral_vectors")
+        if spec_vec_shape is not None and (
+            len(spec_vec_shape) != 2
+            or not (1 <= spec_vec_shape[0] <= 1024)
+            or not (1 <= spec_vec_shape[1] <= dimension)
+        ):
+            raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
+        sub_comp_shape = shapes.get("_projector_subspace_components")
+        if sub_comp_shape is not None and (
+            len(sub_comp_shape) != 2
+            or not (1 <= sub_comp_shape[0] <= dimension)
+            or sub_comp_shape[1] != dimension
+        ):
+            raise ValueError("Saved hybrid projector subspace_components have invalid shape")
         for name, definition in schema.fields.items():
             widths = (1, 2) if isinstance(definition, BooleanField) else (len(definition.options),) if hasattr(definition, "options") else (1,)
             weight_shape = shapes.get(f"{name}_w", ())
@@ -156,12 +182,31 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> D
             if fine_w_shape is not None:
                 if fine_w_shape != (width, dimension) or fine_b_shape != (width,):
                     raise ValueError(f"Saved head {name!r} has incompatible fine hierarchical dimensions")
+            if f"{name}_B" in shapes and f"{name}_P" not in shapes:
+                runtime_bytes += 8 * (dimension + 1) ** 2
+            for suffix in ("calib_scores", "proto_scores"):
+                runtime_bytes += 32 * shapes.get(f"{name}_{suffix}", (0,))[0]
+            for suffix in EXEMPLAR_ARRAYS:
+                shape = shapes.get(f"{name}_{suffix}")
+                if shape is None:
+                    continue
+                valid = (shape == (dimension,)) if suffix == "exemplar_mean" else (
+                    len(shape) == 2 and shape[1] == dimension
+                    and (suffix not in ("exemplar_centroids", "initial_w") or shape[0] == width)
+                )
+                if not isinstance(definition, ChoiceField) or not valid:
+                    raise ValueError(f"Saved head {name!r} has incompatible exemplar dimensions")
+                if suffix in ("shots_p", "shots_c"):
+                    runtime_bytes += 160 * shape[0]  # Retained per-row ndarray views and list slots.
+        runtime_bytes += 2 * sum(info.file_size for info in members)
+        if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
+            raise ValueError("Saved skill runtime allocation exceeds memory budget")
         # Every member has been checked, including optional covariance arrays.
         with np.load(io.BytesIO(data), allow_pickle=False) as arrays:
             return {name: arrays[name] for name in shapes}
 
 
-def _projector_config(projector: Any) -> Dict[str, Any]:
+def _projector_config(projector: Any, *, include_arrays: bool = True) -> Dict[str, Any]:
     """Persist the settings that define the feature space, not just its width."""
     from system1.core.embeddings import HybridProjector
 
@@ -171,7 +216,7 @@ def _projector_config(projector: Any) -> Dict[str, Any]:
     if type(projector) is TfidfProjector:
         return projector.to_config()
     if type(projector) is HybridProjector:
-        return projector.to_config()
+        return projector.to_config(include_arrays=include_arrays)
     config = {"type": "external", "class": f"{type(projector).__module__}.{type(projector).__qualname__}",
               "dimension": getattr(projector, "dimension", None)}
     if callable(getattr(projector, "projector_digest", None)):
@@ -211,6 +256,7 @@ class CompiledHeadWeights:
     coarse_biases: Optional[np.ndarray] = None
     fine_weights: Optional[np.ndarray] = None
     fine_biases: Optional[np.ndarray] = None
+    exemplar_state: Optional[Dict[str, Any]] = None
 
 
 class CompiledSystemOneModel:
@@ -285,10 +331,13 @@ class CompiledSystemOneModel:
                 backend=self.backend,
                 projector=self.projector,
                 forgetting_factor=self.forgetting_factor,
+                initialize_weights=False,
             )
             if name in self.heads:
                 ch = self.heads[name]
                 head.set_weights(ch.weights, ch.biases)
+                if ch.exemplar_state is not None:
+                    head.restore_exemplar_state(ch.exemplar_state)
                 if (
                     getattr(ch, "hierarchical", False)
                     and ch.coarse_weights is not None
@@ -396,16 +445,41 @@ class CompiledSystemOneModel:
             emb = self.telemetry_projector.fuse(emb, telemetry)
         return emb
 
+    def encode_batch(
+        self,
+        prompts: Sequence[str],
+        telemetry: Optional[Sequence[Any]] = None,
+        recency_weighted: Optional[bool] = None,
+    ) -> np.ndarray:
+        """Batch-projects a sequence of prompts into normalized dense vectors."""
+        if len(prompts) == 0:
+            return np.zeros((0, self.dimension), dtype=np.float32)
+        if telemetry is not None and len(telemetry) == len(prompts):
+            return np.stack(
+                [
+                    self.encode(p, telemetry=telemetry[i], recency_weighted=recency_weighted)
+                    for i, p in enumerate(prompts)
+                ],
+                axis=0,
+            ).astype(np.float32)
+        return np.stack(
+            [self.encode(p, recency_weighted=recency_weighted) for p in prompts],
+            axis=0,
+        ).astype(np.float32)
+
     def forward_single(
         self,
         prompt: str,
         telemetry: Optional[Any] = None,
         embedding: Optional[np.ndarray] = None,
         recency_weighted: Optional[bool] = None,
+        *,
+        use_cache: Optional[bool] = None,
     ) -> ModelInferenceResult:
         """Executes a forward evaluation over the schema."""
         t0 = time.perf_counter()
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
+        eff_use_cache = self.use_cache if use_cache is None else bool(use_cache)
         if embedding is not None:
             emb = np.asarray(embedding, dtype=np.float32).flatten()
         else:
@@ -413,7 +487,7 @@ class CompiledSystemOneModel:
 
         # Check Tier 0 Semantic System 1 Cache
         cur_version = getattr(self, "model_version", 1)
-        if self.use_cache:
+        if eff_use_cache:
             schema_dig = self.schema.schema_digest()
             hit = self.cache.get(
                 prompt,
@@ -438,12 +512,18 @@ class CompiledSystemOneModel:
             norm_key = " ".join(prompt.strip().casefold().split())
             override_map = self._learned_prompt_overrides.get(norm_key)
 
+        is_zero_emb_eval = not bool(np.any(emb))
+        is_cold_skill = bool(self.metadata.get("cold_start", False))
         evals: Dict[str, RawFieldEvaluation] = {}
         for name, head in self._field_heads.items():
-            if override_map is not None and name in override_map:
+            if (
+                override_map is not None
+                and name in override_map
+                and (is_zero_emb_eval or (head._exemplar_bank is None and not is_cold_skill))
+            ):
                 evals[name] = self._build_override_eval(head, override_map[name])
             else:
-                evals[name] = head.forward(emb)
+                evals[name] = head.forward(emb, prompt=prompt if embedding is None else None)
         latency = (time.perf_counter() - t0) * 1000.0
         result = ModelInferenceResult(
             prompt=prompt,
@@ -452,7 +532,7 @@ class CompiledSystemOneModel:
             inference_latency_ms=latency,
         )
 
-        if self.use_cache:
+        if eff_use_cache:
             self.cache.put(
                 prompt,
                 result,
@@ -461,6 +541,7 @@ class CompiledSystemOneModel:
                 schema_digest=schema_dig,
                 model_version=cur_version, strict=True,
                 source="evaluation",
+                explicit_embedding=(embedding is not None),
             )
 
         return result
@@ -508,35 +589,41 @@ class CompiledSystemOneModel:
         Separate recalibration is needed before strict local acceptance. Retaining
         examples and recompiling is the simplest reproducible update workflow."""
         with self._lock:
+            target_dict = self.schema.validate_lesson(target, allow_unknown=True)
+            eff_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+            if not math.isfinite(eff_ff) or not (0.0 < eff_ff <= 1.0):
+                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_ff}")
             t0 = time.perf_counter()
-
-            # Bump model_version and evict prompt before reevaluation
-            self.model_version = getattr(self, "model_version", 1) + 1
-            if self.use_cache and self.cache is not None:
-                if hasattr(self.cache, "evict_prompt"):
-                    self.cache.evict_prompt(prompt)
-                if hasattr(self.cache, "invalidate_prior_versions"):
-                    self.cache.invalidate_prior_versions(self.model_version)
 
             if embedding is not None:
                 emb = np.asarray(embedding, dtype=np.float32).flatten()
             else:
                 emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
+            if len(emb) != self.dimension:
+                raise ValueError(f"Expected embedding of length {self.dimension}, got {len(emb)}")
+            if not np.all(np.isfinite(emb)):
+                raise ValueError("embedding contains NaN or Inf non-finite values")
             x_aug = np.append(emb, 1.0).astype(np.float32)
 
-            target_dict: Dict[str, Any]
-            if isinstance(target, Mapping):
-                target_dict = dict(target)
-            else:
-                first_field = next(iter(self.schema.fields.keys()))
-                target_dict = {first_field: target}
+            # Bump model_version and evict prompt only after all inputs are validated
+            self.model_version = getattr(self, "model_version", 1) + 1
+            if self.use_cache and self.cache is not None:
+                if embedding is None and hasattr(self.cache, "evict_prompt"):
+                    self.cache.evict_prompt(prompt)
+                if hasattr(self.cache, "invalidate_prior_versions"):
+                    self.cache.invalidate_prior_versions(self.model_version)
 
             updated_fields: List[str] = []
             update_durations_ms: List[float] = []
             is_zero_emb = not bool(np.any(emb))
+            is_cold_skill = bool(self.metadata.get("cold_start", False))
+            prompt_for_head = (
+                prompt if (embedding is None and isinstance(prompt, str) and prompt.strip()) else None
+            )
+            prompt_for_eval = prompt_for_head
             norm_key = (
                 " ".join(prompt.strip().casefold().split())
-                if telemetry is None and isinstance(prompt, str) and prompt.strip()
+                if (embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip())
                 else None
             )
 
@@ -544,6 +631,8 @@ class CompiledSystemOneModel:
                 if f_name in self._field_heads:
                     head = self._field_heads[f_name]
                     y_target = head.format_target_vector(target_val)
+                    is_cold_head = head._exemplar_bank is not None or is_cold_skill
+                    skip_field = False
                     if is_zero_emb:
                         dt = 0.0
                         if norm_key is not None:
@@ -553,12 +642,32 @@ class CompiledSystemOneModel:
                             self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
                                 self.schema.fields[f_name].validate_value(target_val)
                             )
+                    elif is_cold_head:
+                        if preserve_calibration:
+                            if norm_key is not None:
+                                if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
+                                    oldest_key = next(iter(self._learned_prompt_overrides))
+                                    self._learned_prompt_overrides.pop(oldest_key, None)
+                                self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
+                                    self.schema.fields[f_name].validate_value(target_val)
+                                )
+                        else:
+                            if norm_key is not None and norm_key in self._learned_prompt_overrides:
+                                self._learned_prompt_overrides[norm_key].pop(f_name, None)
+                                if not self._learned_prompt_overrides[norm_key]:
+                                    self._learned_prompt_overrides.pop(norm_key, None)
+                        dt = head.online_update(
+                            x_aug,
+                            y_target,
+                            forgetting_factor=eff_ff,
+                            prompt=prompt_for_head,
+                            preserve_calibration=preserve_calibration,
+                        )
                     else:
                         if preserve_calibration:
                             if head.covariance_inv is None or head.cross_covariance is None:
                                 head.init_covariance(regularization=max(4.0, float(getattr(head, "regularization", 1.0))))
                             x_step = np.append(emb, 0.0).astype(np.float32)
-                            eff_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
                             step_ff = 1.0 if eff_ff >= 0.95 else eff_ff
                             ch_ref = self.heads.get(f_name)
                             f_type = getattr(ch_ref, "field_type", None) or getattr(getattr(head, "definition", None), "field_type", "choice")
@@ -603,7 +712,7 @@ class CompiledSystemOneModel:
                                 b_val = float(b0[0]) if len(b0) > 0 else 0.0
                                 y_desired = np.array([(req_raw_mag if want_true else -req_raw_mag) - b_val], dtype=np.float32)
                             elif f_type in ("multi_choice", "multichoice"):
-                                ev_mc0 = head.forward(emb)
+                                ev_mc0 = head.forward(emb, prompt=prompt_for_eval)
                                 probs_mc0 = np.asarray(ev_mc0.raw_probabilities, dtype=np.float64)
                                 y_desired = wx0.copy()
                                 z_mag = float(np.clip(0.25 * math.log((1.0 - q_goal) / max(1e-6, q_goal)), 1.8, 5.5))
@@ -621,9 +730,8 @@ class CompiledSystemOneModel:
                                 y_desired = y_target
 
                             dt = 0.0
-                            skip_field = False
                             if len(self._field_heads) > 1:
-                                ev_pre = head.forward(emb)
+                                ev_pre = head.forward(emb, prompt=prompt_for_eval)
                                 logits_pre = np.asarray(ev_pre.logits, dtype=np.float64) / ch_temp
                                 eff_q_skip = ch_q if 0.0 < ch_q < 0.90 else 0.04
                                 if f_type == "choice" and len(logits_pre) >= 2:
@@ -655,9 +763,14 @@ class CompiledSystemOneModel:
                                     y_step = np.clip(y_step, -40.0, 40.0).astype(np.float32)
                                 else:
                                     y_step = y_desired
-                                dt = head.online_update(x_step, y_step, forgetting_factor=step_ff)
+                                dt = head.online_update(
+                                    x_step,
+                                    y_step,
+                                    forgetting_factor=step_ff,
+                                    prompt=prompt_for_head,
+                                )
                                 for step_i in range(4):
-                                    ev = head.forward(emb)
+                                    ev = head.forward(emb, prompt=prompt_for_eval)
                                     logits_ev = np.asarray(ev.logits, dtype=np.float64) / ch_temp
                                     if f_type == "choice" and len(logits_ev) >= 2:
                                         shifted_ev = logits_ev - np.max(logits_ev)
@@ -699,6 +812,7 @@ class CompiledSystemOneModel:
                                         x_step,
                                         y_refine,
                                         forgetting_factor=step_ff,
+                                        prompt=prompt_for_head,
                                     )
                             if norm_key is not None:
                                 if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
@@ -712,7 +826,12 @@ class CompiledSystemOneModel:
                                 self._learned_prompt_overrides[norm_key].pop(f_name, None)
                                 if not self._learned_prompt_overrides[norm_key]:
                                     self._learned_prompt_overrides.pop(norm_key, None)
-                            dt = head.online_update(x_aug, y_target, forgetting_factor=forgetting_factor)
+                            dt = head.online_update(
+                                x_aug,
+                                y_target,
+                                forgetting_factor=eff_ff,
+                                prompt=prompt_for_head,
+                            )
                     update_durations_ms.append(dt)
 
                     # Sync back to compiled head weights
@@ -722,6 +841,7 @@ class CompiledSystemOneModel:
                         ch.biases = head.biases
                         ch.P = head.covariance_inv
                         ch.B = head.cross_covariance
+                        ch.exemplar_state = head.export_exemplar_state()
                         if head.hierarchical:
                             ch.coarse_weights = head.coarse_weights
                             ch.coarse_biases = head.coarse_biases
@@ -736,14 +856,15 @@ class CompiledSystemOneModel:
                                     proto_idx = int(np.argmax(y_target))
                                 elif ch.field_type == "boolean" and ch.prototypes.shape[0] == 2:
                                     proto_idx = 1 if float(y_target[0]) > 0.0 else 0
-                                if proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
-                                    blend = 0.25 if preserve_calibration else 0.15
+                                if not skip_field and proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
                                     cur_p = ch.prototypes[proto_idx]
-                                    updated_p = emb_u if not np.any(cur_p) else ((1.0 - blend) * cur_p + blend * emb_u)
-                                    up_norm = float(np.linalg.norm(updated_p))
-                                    if up_norm > 1e-12:
-                                        ch.prototypes = ch.prototypes.copy()
-                                        ch.prototypes[proto_idx] = (updated_p / up_norm).astype(np.float32)
+                                    if not preserve_calibration or ch.prototype_threshold <= 0.0 or not np.any(cur_p):
+                                        blend = 0.25 if preserve_calibration else 0.15
+                                        updated_p = emb_u if not np.any(cur_p) else ((1.0 - blend) * cur_p + blend * emb_u)
+                                        up_norm = float(np.linalg.norm(updated_p))
+                                        if up_norm > 1e-12:
+                                            ch.prototypes = ch.prototypes.copy()
+                                            ch.prototypes[proto_idx] = (updated_p / up_norm).astype(np.float32)
                                 if preserve_calibration and ch.prototype_threshold > 0.0:
                                     sim_after = float(np.max(ch.prototypes @ emb_u))
                                     if sim_after < ch.prototype_threshold:
@@ -799,7 +920,7 @@ class CompiledSystemOneModel:
                 if override_map is not None and name in override_map:
                     evals[name] = self._build_override_eval(head, override_map[name])
                 else:
-                    evals[name] = head.forward(emb)
+                    evals[name] = head.forward(emb, prompt=prompt_for_eval)
             inference_res = ModelInferenceResult(
                 prompt=prompt,
                 embedding=emb,
@@ -815,6 +936,7 @@ class CompiledSystemOneModel:
                     schema_digest=self.schema.schema_digest(),
                     model_version=self.model_version, strict=True,
                     source="tier2",
+                    explicit_embedding=(embedding is not None),
                 )
 
             return {
@@ -822,6 +944,60 @@ class CompiledSystemOneModel:
                 "update_latency_ms": round(rank1_ms, 4),
                 "total_latency_ms": round(total_ms, 4),
                 "updated_fields": updated_fields,
+            }
+
+    def adapt_zero_shot(
+        self,
+        prompts: Union[str, Sequence[str]],
+        *,
+        telemetry: Optional[Sequence[Any]] = None,
+        margin_threshold: float = 0.18,
+        learning_rate: float = 0.25,
+        recency_weighted: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Unsupervised test-time zero-shot prototype and exemplar adaptation across schema heads."""
+        with self._lock:
+            t0 = time.perf_counter()
+            if isinstance(prompts, str):
+                prompt_seq: Sequence[str] = [prompts]
+            else:
+                prompt_seq = list(prompts)
+            if len(prompt_seq) == 0:
+                return {"status": "no_op", "adapted_fields": {}, "adapted_samples": 0, "latency_ms": 0.0}
+
+            embs = self.encode_batch(prompt_seq, telemetry=telemetry, recency_weighted=recency_weighted)
+            adapted_fields: Dict[str, Any] = {}
+            total_adapted = 0
+            for f_name, head in self._field_heads.items():
+                if hasattr(head, "adapt_zero_shot"):
+                    info = head.adapt_zero_shot(
+                        embs,
+                        prompts=prompt_seq,
+                        margin_threshold=margin_threshold,
+                        learning_rate=learning_rate,
+                    )
+                    if info.get("adapted_samples", 0) > 0:
+                        adapted_fields[f_name] = info
+                        total_adapted = max(total_adapted, int(info["adapted_samples"]))
+                        if f_name in self.heads:
+                            ch = self.heads[f_name]
+                            ch.weights = head.weights
+                            ch.biases = head.biases
+                            ch.P = head.covariance_inv
+                            ch.B = head.cross_covariance
+                            ch.exemplar_state = head.export_exemplar_state()
+
+            if total_adapted > 0:
+                self.model_version = getattr(self, "model_version", 1) + 1
+                if self.use_cache and self.cache is not None and hasattr(self.cache, "invalidate_prior_versions"):
+                    self.cache.invalidate_prior_versions(self.model_version)
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return {
+                "status": "adapted" if adapted_fields else "no_op",
+                "adapted_fields": adapted_fields,
+                "adapted_samples": total_adapted,
+                "latency_ms": round(elapsed_ms, 4),
             }
 
     # Cognitive dual-process and execution pipeline aliases
@@ -841,7 +1017,11 @@ class CompiledSystemOneModel:
         outcome: Optional[Any] = None,
         reward: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """First-class online teaching method that preserves calibration by default."""
+        """Online teaching with retained heuristic gates, not preserved coverage."""
+        if forgetting_factor is not None:
+            ff_val = float(forgetting_factor)
+            if not math.isfinite(ff_val) or not (0.0 < ff_val <= 1.0):
+                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_val}")
         eff_ff = forgetting_factor
         if reward is not None:
             r_val = float(reward)
@@ -872,8 +1052,7 @@ class CompiledSystemOneModel:
                 resolved_target = outcome["target"]
             else:
                 resolved_target = outcome
-        if resolved_target is None:
-            raise ValueError("learn() requires a target label/mapping or outcome")
+        resolved_target = self.schema.validate_lesson(resolved_target)
 
         res = self.learn_from_tier2(
             prompt,
@@ -924,6 +1103,7 @@ class CompiledSystemOneModel:
         """
         with self._lock:
             heads_meta: Dict[str, Any] = {}
+            exemplar_states = {name: head.export_exemplar_state() for name, head in self._field_heads.items()}
             for name, ch in sorted(self.heads.items()):
                 h_entry: Dict[str, Any] = {
                     "field_type": ch.field_type,
@@ -955,6 +1135,9 @@ class CompiledSystemOneModel:
                 if getattr(ch, "hierarchical", False) and getattr(ch, "cluster_assignments", ()):
                     h_entry["hierarchical"] = True
                     h_entry["cluster_assignments"] = [int(c) for c in ch.cluster_assignments]
+                state = exemplar_states.get(name)
+                if state is not None:
+                    h_entry["exemplar_state"] = {key: value for key, value in state.items() if key != "arrays"}
                 heads_meta[name] = h_entry
 
             serialized_meta: Dict[str, Any] = {
@@ -973,7 +1156,7 @@ class CompiledSystemOneModel:
 
             header_meta = {
                 "version": 2,
-                "projector": _projector_config(self.projector),
+                "projector": _projector_config(self.projector, include_arrays=False),
                 "schema_name": self.schema.schema_name,
                 "schema_dict": self.schema.to_dict(),
                 "schema_digest": self.schema.schema_digest(),
@@ -984,13 +1167,30 @@ class CompiledSystemOneModel:
             }
             header_bytes = json.dumps(header_meta, sort_keys=True).encode("utf-8")
             header_len = len(header_bytes)
+            if header_len > MAX_SKILL_HEADER_BYTES:
+                raise ValueError("Saved skill header exceeds size limit")
 
             # Pack numpy weights into compressed zip buffer
             npz_buf = io.BytesIO()
             arrays_to_save: Dict[str, np.ndarray] = {}
+            from system1.core.embeddings import HybridProjector
+
+            if type(self.projector) is HybridProjector and getattr(self.projector, "_fitted", False):
+                if getattr(self.projector, "_spectral_vectors", None) is not None:
+                    arrays_to_save["_projector_spectral_vectors"] = np.asarray(
+                        self.projector._spectral_vectors, dtype=np.float32
+                    )
+                if getattr(self.projector, "_subspace_components", None) is not None:
+                    arrays_to_save["_projector_subspace_components"] = np.asarray(
+                        self.projector._subspace_components, dtype=np.float32
+                    )
             for name, ch in sorted(self.heads.items()):
                 arrays_to_save[f"{name}_w"] = ch.weights.astype(np.float32)
                 arrays_to_save[f"{name}_b"] = ch.biases.astype(np.float32)
+                state = exemplar_states.get(name)
+                if state is not None:
+                    for suffix, arr in state["arrays"].items():
+                        arrays_to_save[f"{name}_{suffix}"] = np.asarray(arr)
                 if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
                     arrays_to_save[f"{name}_calib_scores"] = np.asarray(ch.calibration_scores, dtype=np.float64)
                 if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
@@ -1090,20 +1290,41 @@ class CompiledSystemOneModel:
                 raise ValueError("Saved projector dimension does not match the skill")
             if kind == "hybrid":
                 from system1.core.embeddings import HybridProjector
+                if set(projector_config) - HybridProjector.CONFIG_KEYS:
+                    raise ValueError("Saved hybrid projector contains unsupported settings")
                 sparse, dense = projector_config.get("sparse_dim"), projector_config.get("dense_dim")
                 if (type(sparse) is not int or type(dense) is not int or sparse <= 0 or dense <= 0
                         or sparse + dense != dimension):
                     raise ValueError("Saved hybrid projector dimensions do not match the skill")
                 runtime_bytes += 16 * 25000 * dense
+                runtime_bytes += 16 * len(projector_config.get("spectral_terms", ())) * dense
+                runtime_bytes += 8 * sum(len(row) for key in ("spectral_vectors", "subspace_components")
+                                         for row in (projector_config.get(key) or ()))
                 if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
                     raise ValueError("Saved skill runtime allocation exceeds memory budget")
-                saved_hybrid = HybridProjector.from_config(projector_config, backend=backend)
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
-        npz_file = _read_skill_arrays(data[header_end:], schema, dimension)
+        npz_file = _read_skill_arrays(data[header_end:], schema, dimension, runtime_bytes)
+        if (projector_config is None or projector_config.get("type") != "hybrid") and (
+            "_projector_spectral_vectors" in npz_file or "_projector_subspace_components" in npz_file
+        ):
+            raise ValueError("Saved skill contains unexpected hybrid projector arrays")
+        if projector_config is not None and projector_config["type"] == "hybrid":
+            saved_hybrid = HybridProjector.from_config(
+                projector_config,
+                backend=backend,
+                spectral_vectors=npz_file.get("_projector_spectral_vectors"),
+                subspace_components=npz_file.get("_projector_subspace_components"),
+            )
         if projector_config is not None:
             if projector is not None:
-                if _projector_config(projector) != projector_config:
+                if projector_config["type"] == "hybrid" and saved_hybrid is not None:
+                    if (
+                        type(projector) is not HybridProjector
+                        or projector.projector_digest() != saved_hybrid.projector_digest()
+                    ):
+                        raise ValueError("Supplied projector does not match the saved skill's feature space")
+                elif _projector_config(projector) != projector_config:
                     raise ValueError("Supplied projector does not match the saved skill's feature space")
             elif projector_config["type"] == "deterministic":
                 projector = DeterministicSemanticProjector(
@@ -1116,6 +1337,11 @@ class CompiledSystemOneModel:
                 projector = saved_tfidf
             else:
                 raise ValueError("This skill requires its original external projector; pass projector= when loading")
+
+        saved_meta = meta.get("metadata", {})
+        if not isinstance(saved_meta, dict):
+            raise ValueError("Saved skill metadata must be a mapping")
+        is_cold_skill = bool(saved_meta.get("cold_start", False))
 
         # Reconstruct head weights
         heads: Dict[str, CompiledHeadWeights] = {}
@@ -1160,7 +1386,13 @@ class CompiledSystemOneModel:
             proto_mat = npz_file[f"{name}_prototypes"] if f"{name}_prototypes" in npz_file else None
             if proto_mat is not None and not np.all(np.isfinite(proto_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite prototypes")
-            if proto_mat is None and isinstance(definition, (ChoiceField, BooleanField)) and np.any(w):
+            if (
+                proto_mat is None
+                and not is_cold_skill
+                and "exemplar_state" not in h_info
+                and isinstance(definition, (ChoiceField, BooleanField))
+                and np.any(w)
+            ):
                 if w.shape[0] >= 2:
                     w_norms = np.linalg.norm(w, axis=1, keepdims=True)
                     w_norms = np.where(w_norms < 1e-12, 1.0, w_norms)
@@ -1193,6 +1425,26 @@ class CompiledSystemOneModel:
                 if any(c < 0 or c >= coarse_w.shape[0] for c in cluster_assign):
                     raise ValueError(f"Saved head {name!r} has out-of-range cluster_assignments")
 
+            exemplar_arrays = {
+                suffix: npz_file[f"{name}_{suffix}"]
+                for suffix in EXEMPLAR_ARRAYS
+                if f"{name}_{suffix}" in npz_file
+            }
+            if "exemplar_state" in h_info:
+                exemplar_meta = h_info["exemplar_state"]
+                if not isinstance(exemplar_meta, Mapping) or (
+                    set(exemplar_meta.keys()) - {"counts", "online_shots_are_pseudo"}
+                ):
+                    raise ValueError(f"Saved head {name!r} has an invalid exemplar_state header")
+                exemplar_state: Optional[Dict[str, Any]] = {
+                    **exemplar_meta,
+                    "arrays": exemplar_arrays,
+                }
+            else:
+                if exemplar_arrays:
+                    raise ValueError(f"Saved head {name!r} has unexpected exemplar arrays without exemplar_state")
+                exemplar_state = None
+
             heads[name] = CompiledHeadWeights(
                 field_name=name,
                 field_type=h_info["field_type"],
@@ -1222,9 +1474,9 @@ class CompiledSystemOneModel:
                 coarse_biases=coarse_b,
                 fine_weights=fine_w,
                 fine_biases=fine_b,
+                exemplar_state=exemplar_state,
             )
 
-        saved_meta = meta.get("metadata", {})
         return cls(
             schema=schema,
             heads=heads,
@@ -1247,8 +1499,7 @@ class CompiledSystemOneModel:
         target = Path(path)
         if not target.is_file():
             raise FileNotFoundError(f"Model file not found: {target}")
-        with target.open("rb") as stream:
-            data = stream.read(MAX_SKILL_BYTES + 1)
+        data = _read_skill_bytes(target)
         return cls.from_bytes(data, projector=projector, backend=backend)
 
 
@@ -1347,6 +1598,39 @@ class SystemOneCompiler:
             raise ValueError("Logistic teaching requires finite features and targets")
         if np.any(Y.sum(axis=0) == 0):
             raise ValueError("Logistic teaching needs fitting examples for every choice")
+
+        if 0 < n < dimension and regularization > 0.0:
+            q_mat, r_mat = np.linalg.qr(X.T, mode="reduced")
+            z_mat = r_mat.T
+            r_dim = z_mat.shape[1]
+
+            def objective_subspace(flat):
+                parameters = flat.reshape(choices, r_dim + 1)
+                w_sub, biases = parameters[:, :-1], parameters[:, -1]
+                logits = z_mat @ w_sub.T + biases
+                shifted = logits - logits.max(axis=1, keepdims=True)
+                exp = np.exp(shifted)
+                total = exp.sum(axis=1, keepdims=True)
+                loss = (np.log(total).sum() - np.sum(Y * shifted)
+                        + .5 * regularization * np.sum(w_sub * w_sub)) / n
+                residual = exp / total - Y
+                gradient = np.empty_like(parameters)
+                gradient[:, :-1] = (residual.T @ z_mat + regularization * w_sub) / n
+                gradient[:, -1] = residual.mean(axis=0)
+                return float(loss), gradient.ravel()
+
+            result = minimize(
+                objective_subspace,
+                np.zeros(choices * (r_dim + 1)),
+                jac=True,
+                method="L-BFGS-B",
+                options={"maxiter": 1000, "gtol": 1e-6, "ftol": 1e-10},
+            )
+            if not result.success or not np.all(np.isfinite(result.x)):
+                raise RuntimeError("Logistic teaching did not converge; no skill was compiled")
+            parameters = result.x.reshape(choices, r_dim + 1)
+            weights_full = parameters[:, :-1] @ q_mat.T
+            return (.25 * weights_full).astype(np.float32), (.25 * parameters[:, -1]).astype(np.float32)
 
         def objective(flat):
             parameters = flat.reshape(choices, dimension + 1)
@@ -1575,20 +1859,88 @@ class SystemOneCompiler:
         Y_mat = Y.reshape(N, K).astype(np.float32)
 
         X_aug = np.column_stack([X, np.ones((N, 1), dtype=np.float32)])
-        reg_matrix = float(regularization) * np.eye(D + 1, dtype=np.float32)
-        if not regularize_bias:
-            reg_matrix[D, D] = 0.0
-        else:
-            reg_matrix[D, D] = max(1.0, float(regularization))
-
         if sample_weights is not None:
             sw = np.asarray(sample_weights, dtype=np.float32).flatten()
             sw_sqrt = np.sqrt(np.maximum(1e-8, sw))[:, None]
             X_aug = X_aug * sw_sqrt
             Y_mat = Y_mat * sw_sqrt
 
+        if 0 < N < D and float(regularization) > 0.0:
+            if regularize_bias:
+                X64 = X_aug.astype(np.float64)
+                Y64 = Y_mat.astype(np.float64)
+                d_inv = np.full(D + 1, 1.0 / float(regularization), dtype=np.float64)
+                d_inv[D] = 1.0 / max(1.0, float(regularization))
+                XD = X64 * d_inv
+                gram = np.eye(N, dtype=np.float64) + XD @ X64.T
+                try:
+                    alpha_dual = np.linalg.solve(gram, Y64)
+                    sol = (XD.T @ alpha_dual).astype(np.float32)
+                    weights = sol[:D, :].T.astype(np.float32)
+                    biases = sol[D, :].astype(np.float32)
+                    if not return_covariance:
+                        return weights, biases
+                    K_inv_XD = np.linalg.solve(gram, XD).astype(np.float32)
+                    P = -(XD.astype(np.float32).T @ K_inv_XD)
+                    P[np.diag_indices(D + 1)] += d_inv.astype(np.float32)
+                    B = (X_aug.T @ Y_mat).astype(np.float32)
+                    return weights, biases, P, B
+                except np.linalg.LinAlgError:
+                    pass
+            else:
+                try:
+                    if sample_weights is not None:
+                        w_vec = np.maximum(1e-8, np.asarray(sample_weights, dtype=np.float64).flatten())
+                        w_sum = float(np.sum(w_vec))
+                        mu_X = ((w_vec @ X.astype(np.float64)) / w_sum).astype(np.float32)
+                        mu_Y = ((w_vec @ np.asarray(Y, dtype=np.float64).reshape(N, K)) / w_sum).astype(np.float32)
+                        sw_f32 = np.sqrt(w_vec).astype(np.float32)[:, None]
+                        Xc = (X - mu_X) * sw_f32
+                        Yc = (np.asarray(Y, dtype=np.float32).reshape(N, K) - mu_Y) * sw_f32
+                    else:
+                        w_sum = float(N)
+                        mu_X = np.mean(X, axis=0, dtype=np.float64).astype(np.float32)
+                        mu_Y = np.mean(Y_mat, axis=0, dtype=np.float64).astype(np.float32)
+                        Xc = X - mu_X
+                        Yc = Y_mat - mu_Y
+                    inv_reg = 1.0 / float(regularization)
+                    inv_reg_f32 = np.float32(inv_reg)
+                    gram = np.eye(N, dtype=np.float64) + inv_reg * (Xc @ Xc.T).astype(np.float64)
+                    alpha_dual = np.linalg.solve(gram, Yc.astype(np.float64)).astype(np.float32)
+                    theta = inv_reg_f32 * (Xc.T @ alpha_dual)
+                    weights = theta.T.astype(np.float32)
+                    biases = (mu_Y - mu_X @ theta).astype(np.float32)
+                    if not return_covariance:
+                        return weights, biases
+                    K_inv_Xc = np.linalg.solve(gram, (inv_reg_f32 * Xc).astype(np.float64)).astype(np.float32)
+                    S_inv = -(inv_reg_f32 * (Xc.T @ K_inv_Xc))
+                    S_inv[np.diag_indices(D)] += inv_reg_f32
+                    v = S_inv @ mu_X
+                    P = np.empty((D + 1, D + 1), dtype=np.float32)
+                    P[:D, :D] = S_inv
+                    P[:D, D] = -v
+                    P[D, :D] = -v
+                    P[D, D] = np.float32(1.0 / w_sum + float(mu_X @ v))
+                    B = (X_aug.T @ Y_mat).astype(np.float32)
+                    return weights, biases, P, B
+                except np.linalg.LinAlgError:
+                    pass
+
+        reg_matrix = float(regularization) * np.eye(D + 1, dtype=np.float32)
+        if not regularize_bias:
+            reg_matrix[D, D] = 0.0
+        else:
+            reg_matrix[D, D] = max(1.0, float(regularization))
+
         A = X_aug.T @ X_aug + reg_matrix
         B = X_aug.T @ Y_mat
+
+        if not return_covariance:
+            try:
+                sol = np.linalg.solve(A, B)
+            except np.linalg.LinAlgError:
+                sol, _, _, _ = np.linalg.lstsq(A, B, rcond=None)
+            return sol[:D, :].T.astype(np.float32), sol[D, :].astype(np.float32)
 
         try:
             P = np.linalg.inv(A)
@@ -1599,14 +1951,12 @@ class SystemOneCompiler:
 
         weights = sol[:D, :].T  # shape: (K, D)
         biases = sol[D, :]      # shape: (K,)
-        if return_covariance:
-            return (
-                weights.astype(np.float32),
-                biases.astype(np.float32),
-                P.astype(np.float32),
-                B.astype(np.float32),
-            )
-        return weights.astype(np.float32), biases.astype(np.float32)
+        return (
+            weights.astype(np.float32),
+            biases.astype(np.float32),
+            P.astype(np.float32),
+            B.astype(np.float32),
+        )
 
     @staticmethod
     def _prompt_key(prompt: str) -> str:
@@ -2113,31 +2463,53 @@ class SystemOneCompiler:
             prompts = [s[0] for s in samples]
             raw_labels = [s[1] for s in samples]
 
+            conf_start_idx = (num_train + num_temperature) if isinstance(f_def, ChoiceField) else num_train
+            if conf_start_idx >= len(prompts):
+                conf_start_idx = num_train
+            need_fam = eff_familiarity_alpha > 0.0 and hasattr(self.projector, "raw_norm") and conf_start_idx < len(prompts)
+
+            # Encode all prompts (and optional continuous telemetry) to embedding matrix X
+            X_list = []
+            fam_vals: List[float] = []
+            proj_cache: Dict[str, Tuple[np.ndarray, Optional[float]]] = {}
+            for idx_s, s in enumerate(samples):
+                p = s[0]
+                t = s[2] if len(s) > 2 else None
+                want_raw = need_fam and idx_s >= conf_start_idx
+                cached = proj_cache.get(p) if isinstance(p, str) else None
+                if cached is not None:
+                    emb_base, rn_val = cached
+                    if want_raw and rn_val is None:
+                        rn_val = float(self.projector.raw_norm(p))
+                        proj_cache[p] = (emb_base, rn_val)
+                    emb = emb_base
+                else:
+                    raw_emb = self.projector.project(p)
+                    rn_val = float(self.projector.raw_norm(p)) if want_raw else None
+                    norm = float(np.linalg.norm(raw_emb))
+                    emb_base = (
+                        (raw_emb / norm).astype(np.float32)
+                        if norm > 1e-12
+                        else np.asarray(raw_emb, dtype=np.float32)
+                    )
+                    if isinstance(p, str):
+                        proj_cache[p] = (emb_base, rn_val)
+                    emb = emb_base
+                if want_raw and rn_val is not None:
+                    fam_vals.append(rn_val)
+                if t is not None:
+                    emb = self.telemetry_projector.fuse(emb, t)
+                X_list.append(emb)
+            X_all = np.stack(X_list, axis=0).astype(np.float32)
+
             fam_thresh = 0.0
-            conf_prompts = prompts[num_train + num_temperature:] if isinstance(f_def, ChoiceField) else prompts[num_train:]
-            if not conf_prompts:
-                conf_prompts = prompts[num_train:]
-            if eff_familiarity_alpha > 0.0 and hasattr(self.projector, "raw_norm") and conf_prompts:
-                fam_vals = [float(self.projector.raw_norm(p)) for p in conf_prompts]
+            if fam_vals:
                 pos_fam = [v for v in fam_vals if math.isfinite(v) and v > 0.0]
                 if pos_fam:
                     sorted_fam = np.sort(np.asarray(pos_fam, dtype=np.float64))
                     idx_f = max(0, int(math.floor((len(sorted_fam) + 1) * eff_familiarity_alpha)) - 1)
                     idx_f = min(idx_f, len(sorted_fam) - 1)
                     fam_thresh = float(sorted_fam[idx_f])
-
-            # Encode all prompts (and optional continuous telemetry) to embedding matrix X
-            X_list = []
-            for s in samples:
-                p = s[0]
-                t = s[2] if len(s) > 2 else None
-                emb = self.projector.project(p)
-                norm = float(np.linalg.norm(emb))
-                emb = (emb / norm).astype(np.float32) if norm > 1e-12 else emb
-                if t is not None:
-                    emb = self.telemetry_projector.fuse(emb, t)
-                X_list.append(emb)
-            X_all = np.stack(X_list, axis=0).astype(np.float32)
 
             N = len(prompts)
             X_train = X_all[:num_train]

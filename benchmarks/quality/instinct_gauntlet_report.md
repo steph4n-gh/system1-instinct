@@ -4,6 +4,8 @@
 **Execution Mode**: 100% Offline, Deterministic, Socket-Blocked (`block_network()`)  
 **Hardware Target**: Local CPU / NumPy Single-Pass Non-Autoregressive Runtime
 
+**Interpretation:** Flywheel columns teach evaluated prompts with oracle answers and replay those prompts. They measure correction/reuse, not fresh generalization after learning. Static and adaptive results are not matched at a 1% accepted-error budget; finite zero OOS errors are not a zero-error guarantee. See the [fresh noisy-teacher comparison](../heldout_traffic/REPORT.md) for frozen held-out gates and a stronger simple classifier baseline.
+
 ---
 
 ## Executive Summary Across All 6 Benchmark Categories

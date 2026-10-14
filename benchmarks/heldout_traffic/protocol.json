@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "runtime_base": "0b1072453749855f78669b73c54b938959627e3a",
+  "dataset_revision": "fa9553312b1dba54b1be0aae2d30b13171f898e5",
+  "prepared_inputs_sha256": "b74dde80134de327bfb5e65e4a5acea381a94b908fc61917a91da77d4bf65f0c",
+  "source_repository": "jianguoz/Few-Shot-Intent-Detection",
+  "source_sha256": {
+    "train.text": "6f37991e7920711e3c5024f5f5ac535882b9da1df84e837d889c5a53ef91cd4f",
+    "train.label": "90e21d2f25cba02dd332b6cdb7d09d4fe178680b91a4469adf1790f753f7df2c",
+    "valid.text": "fa939bc5394f708691c3d4d5c03bb59fc8301af4cc72a73e9e32fcedafd4e3c2",
+    "valid.label": "aec9b5c05528709ec48202dddd7ee1789536a5562866d91feef102d5d9476815",
+    "test.text": "c0129df86114872dd58ac48448fd5559ed6679895b1938f469cf360f7c85ba79",
+    "test.label": "aec9b5c05528709ec48202dddd7ee1789536a5562866d91feef102d5d9476815"
+  },
+  "noise_seeds": [17, 29, 43, 71, 101],
+  "teaching_per_class": 20,
+  "trusted_calibration_per_class": 10,
+  "teacher_error_rate": 0.1,
+  "local_error_budget": 0.01,
+  "standard_error_budget": 0.05,
+  "family_failure_probability": 0.05,
+  "methods": ["exact_cache", "simple_classifier", "instinct_lexical", "instinct_hybrid"],
+  "native_conformal_alpha": 0.1,
+  "minimum_dev_accepts": 50,
+  "simple_classifier": {"word_features": 4096, "char_features": 8192, "C": 4.0, "max_iter": 1000},
+  "instinct_lexical": {"max_features": 8192, "selection": "frequency", "regularization": 1.0, "hierarchical": false},
+  "instinct_hybrid": {"sparse_dim": 3072, "dense_dim": 192, "alpha": 0.82, "seed": 42, "max_vocab": 512, "spectral_dim": 32, "subspace_dim": 32, "regularization": 1.0, "hierarchical": true},
+  "teacher_latency_scenarios_ms": [50, 500],
+  "minimum_fresh_coverage_gain": 0.05,
+  "minimum_winning_seeds": 4,
+  "bootstrap_seed": 20261014,
+  "bootstrap_replicates": 10000
+}

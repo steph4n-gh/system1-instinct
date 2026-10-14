@@ -234,9 +234,9 @@ class SystemOneEngine:
         self._model_stat: Optional[Tuple[int, int, str]] = None
 
         if model is None and self.model_path is not None and self.model_path.exists():
-            from system1.compiler import CompiledSystemOneModel
+            from system1.compiler import CompiledSystemOneModel, _read_skill_bytes
 
-            raw = self.model_path.read_bytes()
+            raw = _read_skill_bytes(self.model_path)
             st = self.model_path.stat()
             loaded = CompiledSystemOneModel.from_bytes(
                 raw,
@@ -382,9 +382,10 @@ class SystemOneEngine:
             return False
         if self._model_stat is not None and (st.st_mtime_ns, st.st_size) == self._model_stat[:2]:
             return False
+        from system1.compiler import CompiledSystemOneModel, _read_skill_bytes
         try:
-            raw = self.model_path.read_bytes()
-        except OSError:
+            raw = _read_skill_bytes(self.model_path)
+        except (OSError, ValueError):
             return False
         if not raw:
             return False
@@ -392,8 +393,6 @@ class SystemOneEngine:
         if self._model_stat is not None and digest == self._model_stat[2]:
             self._model_stat = (st.st_mtime_ns, st.st_size, digest)
             return False
-        from system1.compiler import CompiledSystemOneModel
-
         try:
             new_model = CompiledSystemOneModel.from_bytes(
                 raw,
@@ -832,13 +831,22 @@ class SystemOneEngine:
                         telemetry=telemetry,
                         embedding=user_emb,
                         recency_weighted=recency_weighted,
+                        use_cache=False,
                     )
                 except TypeError:
-                    raw_result = self.model.forward_single(
-                        prompt,
-                        telemetry=telemetry,
-                        embedding=user_emb,
-                    )
+                    try:
+                        raw_result = self.model.forward_single(
+                            prompt,
+                            telemetry=telemetry,
+                            embedding=user_emb,
+                            recency_weighted=recency_weighted,
+                        )
+                    except TypeError:
+                        raw_result = self.model.forward_single(
+                            prompt,
+                            telemetry=telemetry,
+                            embedding=user_emb,
+                        )
 
             values: Dict[str, Any] = {}
             confidences: Dict[str, float] = {}
@@ -856,14 +864,25 @@ class SystemOneEngine:
 
             from system1.core.text import TfidfProjector
             prompt_raw_norm: Optional[float] = None
-            if embedding is None and hasattr(self.projector, "raw_norm"):
+            has_cached_raw_norm = (
+                hasattr(self.projector, "_last_raw_norm")
+                or hasattr(getattr(self.projector, "tfidf", None), "_last_raw_norm")
+            )
+            needs_raw_norm = has_cached_raw_norm or any(
+                float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
+                for cp in self.conformal_predictors.values()
+            ) or any(
+                float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                for ch in getattr(self.model, "heads", {}).values()
+            )
+            if embedding is None and needs_raw_norm and hasattr(self.projector, "raw_norm"):
                 try:
                     prompt_raw_norm = float(self.projector.raw_norm(prompt))
                 except Exception:
                     prompt_raw_norm = None
 
             learned_overrides: Dict[str, Any] = {}
-            if telemetry is None and isinstance(prompt, str) and prompt.strip():
+            if embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
                 norm_key = " ".join(prompt.strip().casefold().split())
                 model_ov = getattr(self.model, "_learned_prompt_overrides", {})
                 if isinstance(model_ov, Mapping) and norm_key in model_ov:
@@ -1041,8 +1060,8 @@ class SystemOneEngine:
                             # Each label has a set of possible binary assignments. Only
                             # a unique complete assignment can be accepted, including {}.
                             q = float(scores[k - 1])
-                            can_include = (1.0 - probs) <= q + 1e-12
-                            can_exclude = probs <= q + 1e-12
+                            can_include = (1.0 - probs) <= q + 1e-6
+                            can_exclude = probs <= q + 1e-6
                             conformal_sets[name] = [opt for opt, possible in zip(f_def.options, can_include) if possible]
                             unique = np.logical_xor(can_include, can_exclude)
                             consistent = can_include == np.array([opt in selected for opt in f_def.options])
@@ -1159,18 +1178,32 @@ class SystemOneEngine:
             validated_values = self.schema.validate_decision(values)
             total_latency_ms = (time.perf_counter() - t_start) * 1000.0
 
-            safe_values = copy.deepcopy(validated_values)
-            safe_confidences = copy.deepcopy(confidences)
-            safe_conformal_sets = copy.deepcopy(conformal_sets)
-            safe_probabilities = copy.deepcopy(probabilities)
-            safe_margins = copy.deepcopy(margins)
-            safe_margin_thresholds = copy.deepcopy(margin_thresholds)
-            safe_margin_gate_active = copy.deepcopy(margin_gate_active)
-            safe_odds_ratios = copy.deepcopy(odds_ratios)
-            safe_relative_odds_ratio_thresholds = copy.deepcopy(relative_odds_ratio_thresholds)
-            safe_confidence_floors = copy.deepcopy(confidence_floors)
-            safe_ambiguous_fields = copy.deepcopy(ambiguous_fields)
-            safe_escalated_fields = copy.deepcopy(escalated_fields)
+            if record_receipt or (self.use_cache and not is_ambiguous):
+                safe_values = copy.deepcopy(validated_values)
+                safe_confidences = dict(confidences)
+                safe_conformal_sets = {k: list(v) for k, v in conformal_sets.items()}
+                safe_probabilities = {k: dict(v) for k, v in probabilities.items()}
+                safe_margins = dict(margins)
+                safe_margin_thresholds = dict(margin_thresholds)
+                safe_margin_gate_active = dict(margin_gate_active)
+                safe_odds_ratios = dict(odds_ratios)
+                safe_relative_odds_ratio_thresholds = dict(relative_odds_ratio_thresholds)
+                safe_confidence_floors = dict(confidence_floors)
+                safe_ambiguous_fields = list(ambiguous_fields)
+                safe_escalated_fields = list(escalated_fields)
+            else:
+                safe_values = validated_values
+                safe_confidences = confidences
+                safe_conformal_sets = conformal_sets
+                safe_probabilities = probabilities
+                safe_margins = margins
+                safe_margin_thresholds = margin_thresholds
+                safe_margin_gate_active = margin_gate_active
+                safe_odds_ratios = odds_ratios
+                safe_relative_odds_ratio_thresholds = relative_odds_ratio_thresholds
+                safe_confidence_floors = confidence_floors
+                safe_ambiguous_fields = ambiguous_fields
+                safe_escalated_fields = escalated_fields
 
             # ActionLedger integration
             active_ledger = ledger or self.ledger
@@ -1322,22 +1355,34 @@ class SystemOneEngine:
         ``preserve_calibration=True`` is specified.
         """
         with self._lock, getattr(self.model, "_lock", nullcontext()):
-            eff_forgetting = forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+            target = self.schema.validate_lesson(target, allow_unknown=True)
+            eff_forgetting = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+            if not math.isfinite(eff_forgetting) or not (0.0 < eff_forgetting <= 1.0):
+                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_forgetting}")
             t0 = time.perf_counter()
 
             if embedding is not None:
                 emb = np.asarray(embedding, dtype=np.float32).flatten()
             else:
                 emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
+            if len(emb) != self.dimension:
+                raise ValueError(f"Expected embedding of length {self.dimension}, got {len(emb)}")
+            if not np.all(np.isfinite(emb)):
+                raise ValueError("embedding contains NaN or Inf non-finite values")
             x_aug = np.append(emb, 1.0).astype(np.float32)
 
             if hasattr(self.model, "learn_from_tier2"):
+                model_emb = (
+                    None
+                    if (embedding is None and getattr(self.model, "projector", None) is self.projector)
+                    else emb
+                )
                 try:
                     res_dict = self.model.learn_from_tier2(
                         prompt,
                         target,
                         telemetry=telemetry,
-                        embedding=emb,
+                        embedding=model_emb,
                         forgetting_factor=eff_forgetting,
                         recency_weighted=recency_weighted,
                         preserve_calibration=preserve_calibration,
@@ -1348,35 +1393,30 @@ class SystemOneEngine:
                             prompt,
                             target,
                             telemetry=telemetry,
-                            embedding=emb,
+                            embedding=model_emb,
                             forgetting_factor=eff_forgetting,
                             recency_weighted=recency_weighted,
                         )
                     except TypeError:
                         try:
                             res_dict = self.model.learn_from_tier2(
-                                prompt, target, telemetry=telemetry, embedding=emb, forgetting_factor=eff_forgetting
+                                prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
                             )
                         except TypeError:
                             res_dict = self.model.learn_from_tier2(
-                                prompt, target, telemetry=telemetry, embedding=emb
+                                prompt, target, telemetry=telemetry, embedding=model_emb
                             )
                 updated_fields = res_dict.get("updated_fields", [])
                 rank1_ms = res_dict.get("update_latency_ms", 0.0)
             else:
-                target_dict: Dict[str, Any]
-                if isinstance(target, Mapping):
-                    target_dict = dict(target)
-                else:
-                    first_field = next(iter(self.schema.fields.keys()))
-                    target_dict = {first_field: target}
+                target_dict = dict(target)
 
                 updated_fields = []
                 update_durations_ms: List[float] = []
                 is_zero_emb = not bool(np.any(emb))
                 norm_key = (
                     " ".join(prompt.strip().casefold().split())
-                    if is_zero_emb and telemetry is None and isinstance(prompt, str) and prompt.strip()
+                    if (embedding is None and is_zero_emb and telemetry is None and isinstance(prompt, str) and prompt.strip())
                     else None
                 )
                 heads_dict = getattr(self.model, "_field_heads", getattr(self.model, "heads", {}))
@@ -1442,7 +1482,17 @@ class SystemOneEngine:
                 self.model.model_version = self.model_version
 
             if not preserve_calibration:
+                norm_key_clear = (
+                    " ".join(prompt.strip().casefold().split())
+                    if (embedding is None and bool(np.any(emb)) and telemetry is None and isinstance(prompt, str) and prompt.strip())
+                    else None
+                )
                 for f_name in updated_fields:
+                    if norm_key_clear is not None and getattr(self, "_learned_prompt_overrides", None):
+                        if norm_key_clear in self._learned_prompt_overrides:
+                            self._learned_prompt_overrides[norm_key_clear].pop(f_name, None)
+                            if not self._learned_prompt_overrides[norm_key_clear]:
+                                self._learned_prompt_overrides.pop(norm_key_clear, None)
                     if f_name in self.calibrators:
                         self.calibrators[f_name] = DecisionCalibrator()
                     if f_name in self.conformal_predictors:
@@ -1456,14 +1506,10 @@ class SystemOneEngine:
                     if f_name in self.regression_conformal_predictors:
                         self.regression_conformal_predictors[f_name].is_calibrated = False
             else:
-                target_dict_for_override: Dict[str, Any] = (
-                    dict(target)
-                    if isinstance(target, Mapping)
-                    else {next(iter(self.schema.fields.keys())): target}
-                )
+                target_dict_for_override: Dict[str, Any] = dict(target)
                 norm_key_override = (
                     " ".join(prompt.strip().casefold().split())
-                    if telemetry is None and isinstance(prompt, str) and prompt.strip()
+                    if (embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip())
                     else None
                 )
                 for f_name in updated_fields:
@@ -1524,11 +1570,12 @@ class SystemOneEngine:
                                 rcp.is_calibrated = True
 
             if self.use_cache and self.cache is not None:
-                self.cache.evict_prompt(prompt)
+                if embedding is None:
+                    self.cache.evict_prompt(prompt)
                 self.cache.invalidate_prior_versions(self.model_version)
 
             if hasattr(self.model, "cache") and self.model.cache is not None:
-                if hasattr(self.model.cache, "evict_prompt"):
+                if embedding is None and hasattr(self.model.cache, "evict_prompt"):
                     self.model.cache.evict_prompt(prompt)
                 if hasattr(self.model.cache, "invalidate_prior_versions"):
                     self.model.cache.invalidate_prior_versions(self.model_version)
@@ -1632,11 +1679,16 @@ class SystemOneEngine:
         outcome: Optional[Any] = None,
         reward: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """First-class online teaching method that preserves calibration by default.
+        """Online teaching that retains heuristic acceptance gates by default.
 
         Supports teaching directly from LLM fallback outputs, user corrections,
-        or application outcomes without invalidating conformal calibration.
+        or application outcomes. Retained or synthesized thresholds do not
+        preserve split-conformal coverage; use independent recalibration for it.
         """
+        if forgetting_factor is not None:
+            ff_val = float(forgetting_factor)
+            if not math.isfinite(ff_val) or not (0.0 < ff_val <= 1.0):
+                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_val}")
         eff_ff = forgetting_factor
         if reward is not None:
             r_val = float(reward)
@@ -1667,8 +1719,7 @@ class SystemOneEngine:
                 resolved_target = outcome["target"]
             else:
                 resolved_target = outcome
-        if resolved_target is None:
-            raise ValueError("learn() requires a target label/mapping or outcome")
+        resolved_target = self.schema.validate_lesson(resolved_target)
 
         res = self.learn_from_tier2(
             prompt,
@@ -1718,6 +1769,13 @@ class SystemOneEngine:
         with self._lock, getattr(self.model, "_lock", nullcontext()):
             if isinstance(self.model, CompiledSystemOneModel):
                 for name, ch in self.model.heads.items():
+                    if name in self.model._field_heads:
+                        live_head = self.model._field_heads[name]
+                        ch.weights = live_head.weights
+                        ch.biases = live_head.biases
+                        ch.P = live_head.covariance_inv
+                        ch.B = live_head.cross_covariance
+                        ch.exemplar_state = live_head.export_exemplar_state()
                     if name in self.calibrators:
                         ch.temperature = float(self.calibrators[name].temperature)
                     if name in self.conformal_predictors:
@@ -1845,6 +1903,7 @@ class SystemOneEngine:
                     coarse_biases=getattr(head, "coarse_biases", None),
                     fine_weights=getattr(head, "fine_weights", None),
                     fine_biases=getattr(head, "fine_biases", None),
+                    exemplar_state=head.export_exemplar_state(),
                 )
 
             compiled = CompiledSystemOneModel(
@@ -1853,7 +1912,7 @@ class SystemOneEngine:
                 dimension=self.dimension,
                 projector=self.projector,
                 backend="numpy" if self.backend == "auto" else self.backend,
-                metadata={"strict_mode": bool(self.strict_mode)},
+                metadata={"strict_mode": bool(self.strict_mode), "cold_start": True},
                 forgetting_factor=self.forgetting_factor,
                 recency_weighted=self.recency_weighted,
             )

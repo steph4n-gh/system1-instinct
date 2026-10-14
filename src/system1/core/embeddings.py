@@ -7,6 +7,7 @@ no workload-independent latency bound is asserted."""
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -85,6 +86,7 @@ _ANCHOR_STOPWORDS: frozenset[str] = frozenset({
 })
 
 
+@lru_cache(maxsize=65536)
 def _stem_word(word: str) -> str:
     """Deterministic Porter-style English morphological stemmer for cold-start alignment."""
     w = word.lower().strip()
@@ -733,7 +735,19 @@ def _build_concept_stem_index() -> Tuple[Dict[str, List[Tuple[str, float]]], Dic
     return dict(stem_weights), pair_map
 
 
+def _build_multiword_concept_index() -> Dict[str, Tuple[Tuple[str, str], ...]]:
+    by_space3: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    for cluster_name, terms in _ALL_CONCEPT_CLUSTERS.items():
+        for term in terms:
+            if " " in term:
+                s = term.find(" ")
+                if 0 < s < len(term) - 1:
+                    by_space3[term[s - 1 : s + 2]].append((cluster_name, term))
+    return {k: tuple(v) for k, v in by_space3.items()}
+
+
 _CONCEPT_STEM_INDEX, _CONCEPT_PAIR_INDEX = _build_concept_stem_index()
+_MULTIWORD_CONCEPTS_BY_SPACE3 = _build_multiword_concept_index()
 
 
 def match_semantic_concepts(text: str) -> Dict[str, float]:
@@ -747,11 +761,21 @@ def match_semantic_concepts(text: str) -> Dict[str, float]:
 
     scores: Dict[str, float] = defaultdict(float)
 
-    # 1. Multi-word phrase matches
-    for cluster_name, terms in _ALL_CONCEPT_CLUSTERS.items():
-        for term in terms:
-            if " " in term and term in clean_text:
-                scores[cluster_name] += 2.6
+    # 1. Multi-word phrase matches via space-adjacent 3-gram index
+    if " " in clean_text:
+        seen_k3: set[str] = set()
+        pos_sp = clean_text.find(" ")
+        while pos_sp != -1:
+            if 0 < pos_sp < len(clean_text) - 1:
+                k3 = clean_text[pos_sp - 1 : pos_sp + 2]
+                if k3 not in seen_k3:
+                    seen_k3.add(k3)
+                    cands = _MULTIWORD_CONCEPTS_BY_SPACE3.get(k3)
+                    if cands is not None:
+                        for cluster_name, term in cands:
+                            if term in clean_text:
+                                scores[cluster_name] += 2.6
+            pos_sp = clean_text.find(" ", pos_sp + 1)
 
     # 2. Content stems & adjacent stem pairs (excluding negated positions)
     active_stems: List[str] = []
@@ -817,6 +841,12 @@ def match_semantic_concepts(text: str) -> Dict[str, float]:
     return dict(scores)
 
 
+@lru_cache(maxsize=65536)
+def _cached_token_hash(token_norm: str, vocab_size: int) -> int:
+    h = hashlib.sha256(token_norm.encode("utf-8")).digest()
+    return int.from_bytes(h[:4], "big") % vocab_size
+
+
 class SubwordSemanticEmbeddings:
     """Seeded NumPy subword table with curated semantic anchors and negation-scope binding.
 
@@ -837,7 +867,20 @@ class SubwordSemanticEmbeddings:
         self.dimension = dimension
         self.vocab_size = vocab_size
         self.seed = seed
+        self._multiword_by_space3: Dict[str, Tuple[Tuple[str, bool, int], ...]] = self._build_multiword_anchor_index()
         self._table: np.ndarray = self._init_embedding_table()
+
+    def _build_multiword_anchor_index(self) -> Dict[str, Tuple[Tuple[str, bool, int], ...]]:
+        by_space3: Dict[str, List[Tuple[str, bool, int]]] = defaultdict(list)
+        for terms in _SEMANTIC_ANCHORS.values():
+            for term in terms:
+                if " " in term:
+                    s = term.find(" ")
+                    if 0 < s < len(term) - 1:
+                        tw = term.split()
+                        first_is_neg = bool(tw and tw[0] in _NEGATION_TOKENS)
+                        by_space3[term[s - 1 : s + 2]].append((term, first_is_neg, self._hash_token(term)))
+        return {k: tuple(v) for k, v in by_space3.items()}
 
     @property
     def concept_clusters(self) -> Mapping[str, List[str]]:
@@ -845,8 +888,7 @@ class SubwordSemanticEmbeddings:
 
     def _hash_token(self, token: str) -> int:
         """Deterministically map a token or n-gram string to a table row index."""
-        h = hashlib.sha256(token.strip().lower().encode("utf-8")).digest()
-        return int.from_bytes(h[:4], "big") % self.vocab_size
+        return _cached_token_hash(token.strip().lower(), self.vocab_size)
 
     def _build_default_table(self) -> np.ndarray:
         """Constructs the dense subword embedding table with calibrated semantic anchors."""
@@ -944,7 +986,12 @@ class SubwordSemanticEmbeddings:
         """Constructs the dense subword embedding table with calibrated semantic anchors."""
         return self._build_default_table()
 
-    def encode(self, text: str) -> np.ndarray:
+    def encode(
+        self,
+        text: str,
+        *,
+        _pretokenized: Optional[Tuple[str, List[str], Dict[int, str]]] = None,
+    ) -> np.ndarray:
         """Encodes text into a normalized dense subword vector with negation-scope binding."""
         if not isinstance(text, str):
             raise TypeError(f"Expected text to be a string, got {type(text).__name__}")
@@ -953,34 +1000,45 @@ class SubwordSemanticEmbeddings:
             v[0] = 1.0
             return v
 
-        clean_text = _normalize_text(text)
+        if _pretokenized is not None:
+            clean_text, words, negated_positions = _pretokenized
+        else:
+            clean_text = _normalize_text(text)
+            words, negated_positions = _tokenize_with_negation_scope(clean_text)
 
         indices: List[int] = []
         weights: List[float] = []
 
-        # 1. Check for multi-word phrase & idiom anchors
-        for terms in _SEMANTIC_ANCHORS.values():
-            for term in terms:
-                if " " in term and term in clean_text:
-                    # Check if this non-negated phrase match is preceded in the same clause by a negation cue
-                    term_words = term.split()
-                    if term_words and term_words[0] not in _NEGATION_TOKENS:
-                        pos_match = clean_text.find(term)
-                        clause_prefix = _CLAUSE_SPLIT_RE.split(clean_text[:pos_match])[-1]
-                        prefix_words = [
-                            w
-                            for w in re.findall(r"\b\w+\b", clause_prefix)
-                            if w not in _NEGATION_SKIP_MODIFIERS
-                        ]
-                        if prefix_words and prefix_words[-1] in _NEGATION_TOKENS:
-                            indices.append(self._hash_token(term))
-                            weights.append(-2.5)
-                            continue
-                    indices.append(self._hash_token(term))
-                    weights.append(3.5)
+        # 1. Check for multi-word phrase & idiom anchors via space-adjacent 3-gram index
+        if " " in clean_text:
+            seen_k3: set[str] = set()
+            pos_sp = clean_text.find(" ")
+            while pos_sp != -1:
+                if 0 < pos_sp < len(clean_text) - 1:
+                    k3 = clean_text[pos_sp - 1 : pos_sp + 2]
+                    if k3 not in seen_k3:
+                        seen_k3.add(k3)
+                        cands = self._multiword_by_space3.get(k3)
+                        if cands is not None:
+                            for term, first_is_neg, term_hash in cands:
+                                if term in clean_text:
+                                    if not first_is_neg:
+                                        pos_match = clean_text.find(term)
+                                        clause_prefix = _CLAUSE_SPLIT_RE.split(clean_text[:pos_match])[-1]
+                                        prefix_words = [
+                                            w
+                                            for w in re.findall(r"\b\w+\b", clause_prefix)
+                                            if w not in _NEGATION_SKIP_MODIFIERS
+                                        ]
+                                        if prefix_words and prefix_words[-1] in _NEGATION_TOKENS:
+                                            indices.append(term_hash)
+                                            weights.append(-2.5)
+                                            continue
+                                    indices.append(term_hash)
+                                    weights.append(3.5)
+                pos_sp = clean_text.find(" ", pos_sp + 1)
 
         # 2. Extract words, negation-scope bindings, and subwords
-        words, negated_positions = _tokenize_with_negation_scope(clean_text)
         for pos, word in enumerate(words):
             word_weight = math.log1p(len(word)) / math.sqrt(1.0 + pos * 0.05)
             if pos in negated_positions:
@@ -1022,11 +1080,10 @@ class SubwordSemanticEmbeddings:
             return v
 
         idx_arr = np.array(indices, dtype=np.int32)
-        w_arr = np.array(weights, dtype=np.float32).reshape(-1, 1)
+        w_arr = np.array(weights, dtype=np.float32)
 
-        # Fast vectorized matrix take & sum
-        vecs = np.take(self._table, idx_arr, axis=0)
-        accum = np.sum(vecs * w_arr, axis=0)
+        # Fast BLAS 1D-by-2D dot product
+        accum = w_arr @ self._table[idx_arr]
 
         norm = float(np.linalg.norm(accum))
         if norm < 1e-12 or not np.isfinite(norm):
@@ -1105,6 +1162,9 @@ class HybridProjector:
     For unit components, square-root weights preserve unit norm; the
     implementation also normalizes its final vector. The default dimensions
     are 1024 lexical plus 256 dense, with alpha=0.5. No latency guarantee."""
+
+    CONFIG_KEYS = frozenset({"type", "sparse_dim", "dense_dim", "alpha", "seed", "fitted", "spectral_terms",
+                             "spectral_weights", "spectral_vectors", "subspace_components", "subspace_weight"})
 
     def __init__(
         self,
@@ -1369,7 +1429,12 @@ class HybridProjector:
         self._fitted = True
 
         # Step 2: Fit supervised class-prototype discriminative subspace or unsupervised principal subspace
+        self._fit_base_cache: Dict[str, np.ndarray] = {}
         base_embs = np.stack([self._project_base(t) for t in text_list], axis=0).astype(np.float64)
+        if len(text_list) <= 4096:
+            self._fit_base_cache = {
+                t: base_embs[i].astype(np.float32) for i, t in enumerate(text_list)
+            }
         if label_list is not None and len(classes) >= 2:
             centroids: List[np.ndarray] = []
             for c in classes:
@@ -1438,15 +1503,44 @@ class HybridProjector:
 
     fit = _HybridFitDescriptor()
 
-    def _hash_to_sparse_vec(self, text: str) -> np.ndarray:
+    @staticmethod
+    @lru_cache(maxsize=65536)
+    def _sparse_word_hashes(token: str, sparse_dim: int, count: int = 4) -> Tuple[Tuple[int, float], ...]:
+        h = hashlib.sha256(f"word:{token}".encode("utf-8")).digest()
+        res: List[Tuple[int, float]] = []
+        for i in range(count):
+            chunk = h[i * 4 : (i + 1) * 4]
+            val = int.from_bytes(chunk, byteorder="big", signed=False)
+            idx = val % sparse_dim
+            sign = 1.0 if ((val >> 16) & 1) == 0 else -1.0
+            res.append((idx, sign))
+        return tuple(res)
+
+    @staticmethod
+    @lru_cache(maxsize=65536)
+    def _sparse_single_hash(prefix_token: str, sparse_dim: int) -> Tuple[int, float]:
+        h = hashlib.sha256(prefix_token.encode("utf-8")).digest()
+        idx = int.from_bytes(h[:4], "big") % sparse_dim
+        sign = 1.0 if (h[4] & 1) == 0 else -1.0
+        return idx, sign
+
+    def _hash_to_sparse_vec(
+        self,
+        text: str,
+        *,
+        _pretokenized: Optional[Tuple[str, List[str], Dict[int, str]]] = None,
+    ) -> np.ndarray:
         """Projects text into normalized sparse lexical n-gram vector with negation-scope binding."""
         vec = np.zeros(self.sparse_dim, dtype=np.float32)
         if not text or not text.strip():
             vec[0] = 1.0
             return vec
 
-        clean_text = _normalize_text(text)
-        words, negated_positions = _tokenize_with_negation_scope(clean_text)
+        if _pretokenized is not None:
+            clean_text, words, negated_positions = _pretokenized
+        else:
+            clean_text = _normalize_text(text)
+            words, negated_positions = _tokenize_with_negation_scope(clean_text)
 
         for pos, word in enumerate(words):
             word_weight = math.log1p(len(word)) / math.sqrt(1.0 + pos * 0.05)
@@ -1456,13 +1550,9 @@ class HybridProjector:
                     boost = 1.0
                     if self._fitted and neg_token in self._spectral_vocab:
                         boost = 1.0 + min(1.8, self._spectral_weights[self._spectral_vocab[neg_token]] * 0.22)
-                    h_neg = hashlib.sha256(f"word:{neg_token}".encode("utf-8")).digest()
-                    for i in range(4):
-                        chunk = h_neg[i * 4 : (i + 1) * 4]
-                        val = int.from_bytes(chunk, byteorder="big", signed=False)
-                        idx = val % self.sparse_dim
-                        sign = 1.0 if ((val >> 16) & 1) == 0 else -1.0
-                        vec[idx] += sign * word_weight * mult * boost
+                    scaled_neg = word_weight * mult * boost
+                    for idx, sign in self._sparse_word_hashes(neg_token, self.sparse_dim, 4):
+                        vec[idx] += sign * scaled_neg
                 continue
 
             is_stop = word in _ANCHOR_STOPWORDS
@@ -1473,13 +1563,9 @@ class HybridProjector:
                 elif is_stop:
                     corpus_boost = 0.25
 
-            h = hashlib.sha256(f"word:{word}".encode("utf-8")).digest()
-            for i in range(4):
-                chunk = h[i * 4 : (i + 1) * 4]
-                val = int.from_bytes(chunk, byteorder="big", signed=False)
-                idx = val % self.sparse_dim
-                sign = 1.0 if ((val >> 16) & 1) == 0 else -1.0
-                vec[idx] += sign * word_weight * 2.0 * corpus_boost
+            scaled_word = word_weight * 2.0 * corpus_boost
+            for idx, sign in self._sparse_word_hashes(word, self.sparse_dim, 4):
+                vec[idx] += sign * scaled_word
 
             if self._fitted and not is_stop and len(word) >= 3:
                 stem = _stem_word(word)
@@ -1490,13 +1576,9 @@ class HybridProjector:
                         stem_boost = 1.0 + min(1.8, self._spectral_weights[self._spectral_vocab[stem_key]] * 0.22)
                     elif stem in self._spectral_vocab:
                         stem_boost = 1.0 + min(1.8, self._spectral_weights[self._spectral_vocab[stem]] * 0.22)
-                    h_st = hashlib.sha256(f"word:{stem_key}".encode("utf-8")).digest()
-                    for i in range(2):
-                        chunk = h_st[i * 4 : (i + 1) * 4]
-                        val = int.from_bytes(chunk, byteorder="big", signed=False)
-                        idx = val % self.sparse_dim
-                        sign = 1.0 if ((val >> 16) & 1) == 0 else -1.0
-                        vec[idx] += sign * word_weight * 1.15 * stem_boost
+                    scaled_stem = word_weight * 1.15 * stem_boost
+                    for idx, sign in self._sparse_word_hashes(stem_key, self.sparse_dim, 2):
+                        vec[idx] += sign * scaled_stem
 
             if len(word) >= 3 and not (self._fitted and is_stop and word not in self._spectral_vocab):
                 ng_source = f"<{word}>" if self._fitted else word
@@ -1504,9 +1586,7 @@ class HybridProjector:
                 for n in (3, 4):
                     for j in range(len(ng_source) - n + 1):
                         ngram = ng_source[j : j + n]
-                        h_ng = hashlib.sha256(f"ng:{ngram}".encode("utf-8")).digest()
-                        idx_ng = int.from_bytes(h_ng[:4], "big") % self.sparse_dim
-                        sign_ng = 1.0 if (h_ng[4] & 1) == 0 else -1.0
+                        idx_ng, sign_ng = self._sparse_single_hash(f"ng:{ngram}", self.sparse_dim)
                         vec[idx_ng] += sign_ng * ng_weight
 
         for i in range(len(words) - 1):
@@ -1517,9 +1597,7 @@ class HybridProjector:
                     bi_weight = 1.5 * (1.0 + min(1.8, self._spectral_weights[self._spectral_vocab[bigram]] * 0.25))
                 elif words[i] in _ANCHOR_STOPWORDS and words[i + 1] in _ANCHOR_STOPWORDS:
                     bi_weight = 0.30
-            h_bi = hashlib.sha256(f"bi:{bigram}".encode("utf-8")).digest()
-            idx_bi = int.from_bytes(h_bi[:4], "big") % self.sparse_dim
-            sign_bi = 1.0 if (h_bi[4] & 1) == 0 else -1.0
+            idx_bi, sign_bi = self._sparse_single_hash(f"bi:{bigram}", self.sparse_dim)
             vec[idx_bi] += sign_bi * bi_weight
 
         norm = float(np.linalg.norm(vec))
@@ -1563,8 +1641,19 @@ class HybridProjector:
         return (blended / b_norm).astype(np.float32) if b_norm > 1e-12 else base_dense
 
     def _project_base(self, text: str) -> np.ndarray:
-        v_sparse = self._hash_to_sparse_vec(text)
-        v_dense = self._dense_engine.encode(text)
+        fit_cache = getattr(self, "_fit_base_cache", None)
+        if fit_cache and text in fit_cache:
+            return fit_cache[text]
+        if text and text.strip():
+            clean_text = _normalize_text(text)
+            pretok: Optional[Tuple[str, List[str], Dict[int, str]]] = (
+                clean_text,
+                *_tokenize_with_negation_scope(clean_text),
+            )
+        else:
+            pretok = None
+        v_sparse = self._hash_to_sparse_vec(text, _pretokenized=pretok)
+        v_dense = self._dense_engine.encode(text, _pretokenized=pretok)
         if self._fitted:
             v_dense = self._encode_spectral_dense(text, v_dense)
 
@@ -1624,7 +1713,7 @@ class HybridProjector:
         v_b = self.project(text_b)
         return float(np.dot(v_a, v_b))
 
-    def to_config(self) -> Dict[str, Any]:
+    def to_config(self, *, include_arrays: bool = True) -> Dict[str, Any]:
         cfg: Dict[str, Any] = {
             "type": "hybrid",
             "sparse_dim": self.sparse_dim,
@@ -1636,35 +1725,30 @@ class HybridProjector:
             cfg["fitted"] = True
             cfg["spectral_terms"] = list(self._spectral_terms)
             cfg["spectral_weights"] = [round(float(w), 6) for w in self._spectral_weights]
-            if self._spectral_vectors is not None:
-                cfg["spectral_vectors"] = [
-                    [round(float(x), 6) for x in row] for row in self._spectral_vectors
-                ]
-            if self._subspace_components is not None:
-                cfg["subspace_components"] = [
-                    [round(float(x), 6) for x in row] for row in self._subspace_components
-                ]
+            if include_arrays:
+                if self._spectral_vectors is not None:
+                    cfg["spectral_vectors"] = [
+                        [round(float(x), 6) for x in row] for row in self._spectral_vectors
+                    ]
+                if self._subspace_components is not None:
+                    cfg["subspace_components"] = [
+                        [round(float(x), 6) for x in row] for row in self._subspace_components
+                    ]
             cfg["subspace_weight"] = round(float(self._subspace_weight), 6)
         return cfg
 
     @classmethod
-    def from_config(cls, config: Mapping[str, Any], *, backend: str = "auto") -> HybridProjector:
+    def from_config(
+        cls,
+        config: Mapping[str, Any],
+        *,
+        backend: str = "auto",
+        spectral_vectors: Optional[np.ndarray] = None,
+        subspace_components: Optional[np.ndarray] = None,
+    ) -> HybridProjector:
         if not isinstance(config, Mapping) or config.get("type") != "hybrid":
             raise ValueError("Unsupported hybrid projector settings")
-        allowed_keys = {
-            "type",
-            "sparse_dim",
-            "dense_dim",
-            "alpha",
-            "seed",
-            "fitted",
-            "spectral_terms",
-            "spectral_weights",
-            "spectral_vectors",
-            "subspace_components",
-            "subspace_weight",
-        }
-        if set(config.keys()) - allowed_keys:
+        if set(config.keys()) - cls.CONFIG_KEYS:
             raise ValueError("Saved hybrid projector contains unsupported settings")
         sparse = config.get("sparse_dim")
         dense = config.get("dense_dim")
@@ -1672,6 +1756,9 @@ class HybridProjector:
             raise ValueError("Saved hybrid projector dimensions do not match the skill")
         alpha = float(config.get("alpha", 0.5))
         seed = int(config.get("seed", 42))
+        terms = tuple(config.get("spectral_terms", ()))
+        if any(not isinstance(term, str) or not term.strip() for term in terms) or len(set(terms)) != len(terms):
+            raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
         proj = cls(
             sparse_dim=sparse,
             dense_dim=dense,
@@ -1680,17 +1767,24 @@ class HybridProjector:
             backend=backend,
         )
         if config.get("fitted"):
-            terms = tuple(str(t) for t in config.get("spectral_terms", ()))
-            weights = tuple(float(w) for w in config.get("spectral_weights", ()))
-            if len(terms) != len(weights):
+            raw_weights = config.get("spectral_weights", ())
+            if not isinstance(raw_weights, (list, tuple)):
+                raise ValueError("Saved hybrid projector spectral weights must be a sequence")
+            weights = tuple(float(w) for w in raw_weights)
+            if len(terms) != len(weights) or any(not math.isfinite(w) for w in weights):
                 raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
             proj._spectral_terms = terms
             proj._spectral_vocab = {tm: i for i, tm in enumerate(terms)}
             proj._spectral_weights = weights
-            raw_spec = config.get("spectral_vectors")
+            raw_spec = spectral_vectors if spectral_vectors is not None else config.get("spectral_vectors")
             if raw_spec is not None and len(raw_spec) > 0:
                 spec_arr = np.asarray(raw_spec, dtype=np.float32)
-                if spec_arr.ndim != 2 or spec_arr.shape[0] != len(terms) or spec_arr.shape[1] > dense:
+                if (
+                    spec_arr.ndim != 2
+                    or spec_arr.shape[0] != len(terms)
+                    or not (1 <= spec_arr.shape[1] <= dense)
+                    or not np.all(np.isfinite(spec_arr))
+                ):
                     raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
                 proj._spectral_vectors = spec_arr
                 vocab_dense = np.stack([proj._dense_engine.encode(tm) for tm in terms], axis=0).astype(np.float32)
@@ -1700,13 +1794,21 @@ class HybridProjector:
                     proj._spectral_basis = (aligned_basis / b_norms).astype(np.float32)
                 else:
                     proj._spectral_basis = proj._build_spectral_basis(spec_arr.shape[1])
-            raw_sub = config.get("subspace_components")
+            raw_sub = subspace_components if subspace_components is not None else config.get("subspace_components")
             if raw_sub is not None and len(raw_sub) > 0:
                 sub_arr = np.asarray(raw_sub, dtype=np.float32)
-                if sub_arr.ndim != 2 or sub_arr.shape[1] != proj.dimension:
+                if (
+                    sub_arr.ndim != 2
+                    or not (1 <= sub_arr.shape[0] <= proj.dimension)
+                    or sub_arr.shape[1] != proj.dimension
+                    or not np.all(np.isfinite(sub_arr))
+                ):
                     raise ValueError("Saved hybrid projector subspace_components have invalid shape")
                 proj._subspace_components = sub_arr
-            proj._subspace_weight = float(config.get("subspace_weight", 0.20))
+            sub_w = float(config.get("subspace_weight", 0.20))
+            if not math.isfinite(sub_w):
+                raise ValueError("Saved hybrid projector subspace_weight must be finite")
+            proj._subspace_weight = sub_w
             proj._fitted = True
         proj._digest = None
         return proj

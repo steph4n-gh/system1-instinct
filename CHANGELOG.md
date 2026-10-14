@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Add a frozen fresh HWU64/noisy-teacher comparison (`benchmarks/heldout_traffic/`) against an exact cache and a simple classifier at a matched 1% local error budget, with provenance receipts and independent verification (`verify.py` enforcing explicit `ValueError` checks even under `python -O`).
+- Serialize `HybridProjector` spectral and learned subspace matrices as binary `.npz` arrays inside `.s1m` artifacts instead of nested JSON lists in the header (reducing 64-class HWU64 hybrid headers from `1.27 MB` to `20.9 KB` and restoring `5/5` reloadability), while retaining backward-compatible loading for legacy JSON-inline projector fields.
+- Accelerate `SystemOneCompiler._solve_ridge` via an $O(N^3)$ dual/Woodbury solve when $N < D$, eliminate redundant `TfidfProjector` tokenization during compilation, and cache `HybridProjector` stem/hash tokens (cutting 64-class hybrid compile + calibration time from `4.68 s` to `1.74 s`).
+- Bound cache vectors and aliases during eviction, invalidation and clearing, and promote semantic cache hits in LRU order.
+- Validate complete online lessons across all schema fields before mutating any field head, exemplar bank, or model version.
+- Preserve cold-start exemplar banks and online prototype state across skill saves and reloads with strict shape/finiteness validation. Newly saved exemplar arrays require the updated reader; existing skills remain readable.
+- Recheck permission and context synchronously on submission and before deferred async reviewers start, and classify deterministic input/validation errors inside async reviewers without penalizing the circuit breaker.
+- Bound every skill file read and account for covariance, calibration objects, exemplar state and spectral reconstruction during model admission. Loaded heads no longer rebuild discarded seed embeddings.
+- Include FastAPI/httpx test dependencies, refresh the lockfile and constrain BLAS test threads in CI.
+
 ## 1.0.0 — 2026-10-14
 
 **System 1: Instinct (`1.0.0`)** — Sub-millisecond non-autoregressive decision runtime, zero-shot unsupervised adaptation (`adapt_zero_shot`), and calibration-preserving online RLS skills.

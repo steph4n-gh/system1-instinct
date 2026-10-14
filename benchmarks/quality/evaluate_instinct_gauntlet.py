@@ -146,7 +146,11 @@ def _evaluate_choice_flywheel(
     eval_pairs: Sequence[Tuple[str, str]],
     alpha: float = 0.10,
 ) -> Dict[str, Any]:
-    """Evaluate closed-loop BoundedReviewFallback with online rank-1 RLS updates."""
+    """Oracle replay diagnostic: teach evaluated prompts, then rescore them.
+
+    This measures correction/reuse, not fresh generalization after learning.
+    See benchmarks/heldout_traffic for the fallible-teacher risk comparison.
+    """
     oracle_map = {text: truth for text, truth in eval_pairs}
     teacher_calls = 0
 
@@ -1605,6 +1609,8 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
         "**Version**: System 1: Instinct `1.0.0`  ",
         "**Execution Mode**: 100% Offline, Deterministic, Socket-Blocked (`block_network()`)  ",
         "**Hardware Target**: Local CPU / NumPy Single-Pass Non-Autoregressive Runtime",
+        "",
+        "**Interpretation:** Flywheel columns teach evaluated prompts with oracle answers and replay those prompts. They measure correction/reuse, not fresh generalization after learning. Static and adaptive results are not matched at a 1% accepted-error budget; finite zero OOS errors are not a zero-error guarantee. See the [fresh noisy-teacher comparison](../heldout_traffic/REPORT.md) for frozen held-out gates and a stronger simple classifier baseline.",
         "",
         "---",
         "",

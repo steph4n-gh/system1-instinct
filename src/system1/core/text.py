@@ -375,6 +375,7 @@ class TfidfProjector:
         object.__setattr__(self, "_char_ngrams", validated_ngrams)
         object.__setattr__(self, "_vocabulary", MappingProxyType({term: i for i, term in enumerate(terms)}))
         object.__setattr__(self, "_digest", hashlib.sha256(json.dumps(self.to_config(), sort_keys=True).encode()).hexdigest())
+        object.__setattr__(self, "_last_raw_norm", None)
 
     @property
     def dimension(self) -> int:
@@ -471,32 +472,43 @@ class TfidfProjector:
         """Compute unnormalized TF-IDF vector for familiarity/support inspection."""
         vector = np.zeros(self.dimension, dtype=np.float32)
         term_counts = Counter(_terms(text, self._char_ngrams))
+        vocab = self._vocabulary
+        idf = self._idf
         negated_targets = {
-            t[4:] for t in term_counts if t.startswith("neg:") and t in self._vocabulary
+            t[4:] for t in term_counts if t.startswith("neg:") and t in vocab
         }
         for term, count in term_counts.items():
-            index = self._vocabulary.get(term)
+            index = vocab.get(term)
             if index is not None:
                 if term.startswith("#"):
                     scale = 0.32
                 elif term.startswith("neg:") or term.startswith("not_"):
                     scale = 1.6
-                elif term in negated_targets or any(w in negated_targets for w in term.split()):
+                elif negated_targets and (term in negated_targets or any(w in negated_targets for w in term.split())):
                     scale = 0.15
                 else:
                     scale = 1.0
-                vector[index] = scale * (1 + math.log(count)) * self._idf[index]
+                tf = 1.0 if count == 1 else (1.0 + math.log(count))
+                vector[index] = scale * tf * idf[index]
         return vector
 
     def raw_norm(self, text: str) -> float:
         """Return pre-normalization L2 norm of matched TF-IDF features."""
-        return float(np.linalg.norm(self.raw_vector(text)))
+        if not isinstance(text, str):
+            raise TypeError("TF-IDF input must be text")
+        last = getattr(self, "_last_raw_norm", None)
+        if last is not None and (last[0] is text or last[0] == text):
+            return last[1]
+        norm = float(np.linalg.norm(self.raw_vector(text)))
+        object.__setattr__(self, "_last_raw_norm", (text, norm))
+        return norm
 
     def project(self, text: str, recency_weighted: bool | None = None) -> np.ndarray:
         if recency_weighted:
             raise ValueError("TF-IDF uses document frequencies, not recency weighting")
         vector = self.raw_vector(text)
         norm = float(np.linalg.norm(vector))
+        object.__setattr__(self, "_last_raw_norm", (text, norm))
         return vector / norm if norm > 0 else vector
 
     def project_batch(self, texts: Sequence[str], recency_weighted: bool | None = None) -> np.ndarray:
