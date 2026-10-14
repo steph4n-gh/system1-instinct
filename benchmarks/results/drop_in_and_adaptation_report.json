@@ -1,28 +1,28 @@
 {
-  "version": "1.4.0",
+  "version": "1.0.0",
   "drop_in_suite": {
     "semantic_router": {
       "in_domain_accuracy": 1.0,
       "ood_rejection_rate": 1.0,
       "pre_adapt_jargon_accuracy": 0.0,
       "post_adapt_jargon_accuracy": 1.0,
-      "p50_latency_ms": 1.363
+      "p50_latency_ms": 1.217
     },
     "routellm": {
       "tier_routing_accuracy": 1.0,
-      "p50_latency_ms": 1.468
+      "p50_latency_ms": 1.434
     },
     "instructor": {
       "department_accuracy": 1.0,
       "page_oncall_accuracy": 1.0,
       "joint_field_accuracy": 1.0,
-      "p50_latency_ms": 2.729
+      "p50_latency_ms": 1.825
     },
     "prompt_guard": {
       "notinject_benign_fpr": 0.0,
       "attack_detection_recall": 1.0,
       "verdict_exact_accuracy": 1.0,
-      "p50_latency_ms": 0.811
+      "p50_latency_ms": 0.81
     }
   },
   "adaptation_curves": {
@@ -37,7 +37,7 @@
       "online_5_shot_accuracy": 0.7031,
       "compiled_s1m_accuracy": 0.901,
       "zero_shot_p50_latency_ms": 0.681,
-      "compiled_p50_latency_ms": 0.339
+      "compiled_p50_latency_ms": 0.35
     },
     "clinc150_24_intents": {
       "dataset": "CLINC150",
@@ -49,8 +49,55 @@
       "online_3_shot_accuracy": 0.725,
       "online_5_shot_accuracy": 0.825,
       "compiled_s1m_accuracy": 0.875,
-      "zero_shot_p50_latency_ms": 0.543,
-      "compiled_p50_latency_ms": 0.312
+      "zero_shot_p50_latency_ms": 0.583,
+      "compiled_p50_latency_ms": 0.329
+    }
+  },
+  "neural_embedding_comparison": {
+    "classical_unigram_tfidf": {
+      "weights_size": "85 KiB (0 neural weights)",
+      "banking77_32_clean": 0.7734,
+      "banking77_32_typo": 0.6602,
+      "clinc150_oos_false_accept": 0.0333,
+      "polarity_negation_acc": 0.7,
+      "p50_latency_ms": 0.18,
+      "online_1shot_update": "No (requires full refit)"
+    },
+    "all_minilm_l6_v2_cosine_router": {
+      "weights_size": "91.1 MB ONNX (22M params)",
+      "banking77_32_clean": 0.9102,
+      "banking77_32_typo": 0.707,
+      "clinc150_oos_false_accept": 0.08,
+      "polarity_negation_acc": 0.6,
+      "p50_latency_ms": 1.32,
+      "online_1shot_update": "No (static embeddings)"
+    },
+    "bge_small_en_v1_5_cosine_router": {
+      "weights_size": "67.2 MB ONNX (33M params)",
+      "banking77_32_clean": 0.9453,
+      "banking77_32_typo": 0.7695,
+      "clinc150_oos_false_accept": 0.05,
+      "polarity_negation_acc": 0.9,
+      "p50_latency_ms": 2.96,
+      "online_1shot_update": "No (static embeddings)"
+    },
+    "system1_instinct_static": {
+      "weights_size": "120 KiB .s1m (0 neural weights)",
+      "banking77_32_clean": 0.8789,
+      "banking77_32_typo": 0.7422,
+      "clinc150_oos_false_accept": 0.0,
+      "polarity_negation_acc": 0.9,
+      "p50_latency_ms": 0.22,
+      "online_1shot_update": "Yes (<0.5 ms Sherman-Morrison RLS)"
+    },
+    "system1_instinct_flywheel": {
+      "weights_size": "120 KiB .s1m (0 neural weights)",
+      "banking77_32_clean": 0.9141,
+      "banking77_32_typo": 0.7422,
+      "clinc150_oos_false_accept": 0.0,
+      "polarity_negation_acc": 1.0,
+      "p50_latency_ms": 0.22,
+      "online_1shot_update": "Yes (<0.5 ms Sherman-Morrison RLS)"
     }
   }
 }

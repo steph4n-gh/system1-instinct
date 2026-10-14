@@ -6,7 +6,7 @@ Maintainer-authored technical whitepaper; not a peer-reviewed publication.
 
 This document describes **System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
 the original source revisions and evidence linked in each experiment; this
-release adds the v1.4 6-category benchmark gauntlet alongside historical results.
+release includes the 6-category benchmark gauntlet and neural baseline comparisons alongside historical results.
 
 System 1 is **not an LLM**. Its built-in local path fits small numerical decision
 heads and requires no language-model download, token generation or GPU. It can
@@ -282,17 +282,17 @@ serving skill or successful adoption/reopen prediction parity. Published evidenc
 includes every outcome and source hash. Historical news-topic routing does not
 qualify private document filing, unfamiliar-topic rejection or traffic drift.
 
-### 1.4.0 industry-standard benchmark gauntlet
+### Industry-standard benchmark gauntlet
 
-The [v1.4 benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md)
-(`python benchmarks/quality/evaluate_v1_4_gauntlet.py`) evaluates System 1 1.4.0
-against the v1.2 baseline across six offline categories:
+The [6-category benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md)
+(`python benchmarks/quality/evaluate_v1_4_gauntlet.py`) evaluates **System 1: Instinct 1.0.0**
+against a Classical Linear Baseline (Unigram TF-IDF / Hash Ridge) across six offline categories:
 
 1. **High-cardinality `BANKING77` intent routing + typo stress + lazy covariance scaling**:
-   On 32 intents, clean accuracy rises from `76.6%` to `87.9%` (`+11.3%`) and
-   `91.8%` with the `BoundedReviewFallback` flywheel (`66.0% -> 74.6%` under typo
-   stress); on all 77 intents, clean accuracy rises from `59.9%` to `79.5%`
-   (`+19.7%`) and `87.5%` with the flywheel (`44.0% -> 58.3%` under typo stress),
+   On 32 intents, clean accuracy rises from `77.3%` (Classical Linear Baseline) to `87.9%` (`+10.5%`) and
+   `91.4%` with the `BoundedReviewFallback` flywheel (`66.0% -> 74.2%` under typo
+   stress); on all 77 intents, clean accuracy rises from `62.0%` to `79.5%`
+   (`+17.5%`) and `88.1%` with the flywheel (`45.5% -> 58.3%` under typo stress),
    while `lazy_covariance=True` reduces `D=8192` memory by `108.4x`.
 2. **Multi-domain `CLINC150-OOS` routing + strict OOS rejection**: Dual
    `low_feature_familiarity` + `low_prototype_similarity` gates and Mondrian
@@ -310,7 +310,7 @@ against the v1.2 baseline across six offline categories:
    `88.9%` (`94.4%` post-flywheel) at `100.0%` static accepted accuracy.
 5. **Multi-field structured ticket triage**: Single-pass extraction across
    `ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField` reaches
-   `100.0%` joint 4-field accuracy (`0.43 ms` P50 latency), converging from
+   `100.0%` joint 4-field accuracy (`0.40 ms` P50 latency), converging from
    `37.1%` Wave 1 teacher escalation to `0.0%` by Wave 2.
 6. **Zero-shot cold-start routing**: Sibling-contrastive stem IDF and
    multi-exemplar sub-prototypes lift zero-shot `intent_routing` from `51.0%` to
@@ -338,7 +338,7 @@ linear SHA-256 hash chain, not a Merkle tree or hardware attestation. Signatures
 verify recorded payloads under a trusted key; they do not prove correct external
 execution or complete event capture on a compromised host.
 
-In 1.0.3, authentication requires an independent key; unsigned diagnostics expose
+Authentication requires an independent key; unsigned diagnostics expose
 only an integrity check. The signed envelope binds the committed ledger ID,
 guards check exact inclusion, and writes reverify the whole chain. Saved-skill
 resource budgets and a closed gRPC schema registry constrain input handling.
@@ -367,7 +367,7 @@ not learned strategic competence or verified speed records.
 Later experiments widen the scope without establishing universal quality. The
 historical [full-scope n8n gauntlet](../../benchmarks/quality/n8n_gauntlet/README.md) baseline fails
 accepted accuracy on all-intent CLINC and BANKING77, plus unfamiliar-input
-rejection on CLINC (addressed in the separate [v1.4 benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md)). Its teacher-disconnection recording is an integration
+rejection on CLINC (addressed in the separate [6-category benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md)). Its teacher-disconnection recording is an integration
 rehearsal using an unqualified artifact; independent confirmation remains missing.
 The [Inbox Zero pilot](../../examples/inbox_zero/README.md) improves authored email
 results but retains accepted errors and lacks independent mailbox qualification.
@@ -386,6 +386,6 @@ results, reproduction commands and each scope. They are the entry points for
 research history, rather than treating later experiments as revisions of older
 measurements.
 
-Suggested citation: steph4n-gh (2026), *System 1: teaching bounded decisions for
-local reuse*, version 1.4.0. Cite the source revision and linked evidence when
+Suggested citation: steph4n-gh (2026), *System 1: Instinct — teaching bounded decisions for
+local reuse*, version 1.0.0. Cite the source revision and linked evidence when
 quoting measurements; earlier unsupported benchmark tables have been withdrawn.

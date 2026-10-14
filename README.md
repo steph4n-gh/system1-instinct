@@ -31,15 +31,15 @@
 
 ## Step-by-Step Drop-In Replacement Guides
 
-Replace slow LLM routers, guardrails, and structured extractors in **one command**. Every guide in **[docs/drop_in/README.md](docs/drop_in/README.md)** includes before/after code, a runnable script, and real measured output:
+Every guide in **[docs/drop_in/README.md](docs/drop_in/README.md)** is a **working procedural example** with before/after code, a runnable script, and a functional smoke check (Guides 1–5 use compact inspectable prompt sets to verify API compatibility, latency, and live adaptation; see [Benchmarks](#benchmarks) below for external public dataset evaluations):
 
-| # | Drop-In Guide | Replaces | Run Command | Measured Result | P50 Latency |
+| # | Drop-In Guide | Replaces | Run Command | Procedural Verification | P50 Latency |
 | :-: | :--- | :--- | :--- | :--- | :---: |
-| **1** | **[Semantic Router](docs/drop_in/01_semantic_router.md)** | `semantic_router.RouteLayer` | `python examples/drop_in/semantic_router_dropin.py` | **100% In-Domain · 100% OOD Reject · 100% Adapted** | **`1.36 ms`** |
-| **2** | **[RouteLLM Cascade](docs/drop_in/02_routellm_cascade.md)** | `routellm.controller.Controller` | `python examples/drop_in/routellm_dropin.py` | **100% 3-Tier Cascade Routing** | **`1.47 ms`** |
-| **3** | **[Instructor / BAML](docs/drop_in/03_instructor_structured_outputs.md)** | `instructor.from_openai(...).create()` | `python examples/drop_in/instructor_structured_dropin.py` | **100% 4-Field Joint Extraction** | **`2.73 ms`** |
-| **4** | **[Prompt-Guard Security](docs/drop_in/04_prompt_guard_security.md)** | `Llama-Prompt-Guard` / `Guardrails` | `python examples/drop_in/prompt_guard_dropin.py` | **0.0% `NotInject` Benign FPR · 100% Attack Recall** | **`0.81 ms`** |
-| **5** | **[LLM Auto-Cutover](docs/drop_in/05_llm_observe_and_cutover.md)** | Recurring OpenAI / Anthropic calls | `python examples/drop_in/llm_cutover_dropin.py` | **Wave 1: 6 LLM calls $\to$ Wave 2: 0 LLM calls (100% Local)** | **`0.37 ms`** |
+| **1** | **[Semantic Router](docs/drop_in/01_semantic_router.md)** | `semantic_router.RouteLayer` | `python examples/drop_in/semantic_router_dropin.py` | **In-Domain · OOD Reject · `adapt_zero_shot` (`0% -> 100%`)** | **`1.36 ms`** |
+| **2** | **[RouteLLM Cascade](docs/drop_in/02_routellm_cascade.md)** | `routellm.controller.Controller` | `python examples/drop_in/routellm_dropin.py` | **3-Tier Complexity Routing (`0` API Calls)** | **`1.47 ms`** |
+| **3** | **[Instructor / BAML](docs/drop_in/03_instructor_structured_outputs.md)** | `instructor.from_openai(...).create()` | `python examples/drop_in/instructor_structured_dropin.py` | **4-Field Joint Extraction (`Choice`+`Bool`+`Multi`+`Score`)** | **`2.73 ms`** |
+| **4** | **[Prompt-Guard Security](docs/drop_in/04_prompt_guard_security.md)** | `Llama-Prompt-Guard` / `Guardrails` | `python examples/drop_in/prompt_guard_dropin.py` | **`0.0%` `NotInject` Benign FPR · Attack Recall** | **`0.81 ms`** |
+| **5** | **[LLM Auto-Cutover](docs/drop_in/05_llm_observe_and_cutover.md)** | Recurring OpenAI / Anthropic calls | `python examples/drop_in/llm_cutover_dropin.py` | **Wave 1: 6 LLM calls $\to$ Wave 2: 0 LLM calls (`100%` Local)** | **`0.37 ms`** |
 | **6** | **[`poke-env` Showdown Agent](docs/drop_in/06_poke_env_showdown_agent.md)** | Slow LLM / static game bots | `python benchmarks/quality/evaluate_poke_env_showdown.py` | **100% vs `Random` · 98% vs `MaxPower` · 62% vs `Heuristics`** | **`0.093 ms`** |
 
 ---
@@ -118,15 +118,26 @@ res = fallback.decide("Please refund my duplicate invoice charge")
 
 ## Benchmarks
 
-### 1. Zero-Shot $\to$ Few-Shot $\to$ Compiled `.s1m` Adaptation Curves
-Reproduce with `python benchmarks/quality/evaluate_drop_in_replacements.py` ([full report](benchmarks/quality/drop_in_and_adaptation_report.md)):
+### 1. Head-to-Head vs. Pretrained Neural Embedding Routers & Classical Linear Baseline
+Compares **System 1: Instinct (`0` neural weights)** against both a **Classical Linear Baseline (`Unigram TF-IDF`)** and standard **Pretrained Neural Embedding Routers (`all-MiniLM-L6-v2` and `BAAI/bge-small-en-v1.5` via ONNX)** on the exact same held-out splits ([full report](benchmarks/quality/drop_in_and_adaptation_report.md)):
 
-| Multi-Class Benchmark (24 Intents) | `0`-Shot (Schema Only) | `0`-Shot + `adapt_zero_shot` | `1`-Shot Online RLS | `3`-Shot Online RLS | `5`-Shot Online RLS | Compiled `.s1m` |
+| Router Architecture | Model / Artifact Size | `BANKING77` (32c Clean) | `BANKING77` (32c Typo Stress) | `CLINC150-OOS` False Accept | Negation / Polarity Acc | P50 CPU Latency | `<1 ms` Online RLS |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Classical Linear Baseline** (`Unigram TF-IDF`) | `85 KiB` (`0` weights) | 77.3% | 66.0% | 3.3% | 70.0% | `0.18 ms` | No |
+| **`all-MiniLM-L6-v2`** (`22M` Dense Bi-Encoder) | `91.1 MB` ONNX | 91.0% | 70.7% (`-20.3%` drop) | 8.0% | 60.0% | `1.32 ms` (`~10 ms` PyTorch) | No |
+| **`BAAI/bge-small-en-v1.5`** (`33M` Dense Bi-Encoder) | `67.2 MB` ONNX | **94.5%** | **77.0%** (`-17.5%` drop) | 5.0% (cal) / 100% (`@0.5`) | 90.0% | `2.96 ms` (`~14 ms` PyTorch) | No |
+| **System 1: Instinct (Static `.s1m`)** | **`120 KiB`** (`0` weights) | **87.9%** | **74.2%** (`+3.5%` vs MiniLM) | **0.0%** (`0/120`) | **90.0%** | **`0.22 ms`** | **Yes** |
+| **System 1: Instinct (`+ Online Flywheel`)** | **`120 KiB`** (`0` weights) | **91.4%** (`+0.4%` vs MiniLM) | **74.2%** | **0.0%** (`0/120`) | **100.0%** | **`0.22 ms`** | **Yes** |
+
+### 2. Public Dataset Adaptation Curves (`BANKING77` & `CLINC150`)
+Starts from **`0` training examples** (raw intent label names only) and adapts online via `adapt_zero_shot()`, `1/3/5`-shot `learn_from_tier2()`, and `.s1m` compilation (`python benchmarks/quality/evaluate_drop_in_replacements.py`):
+
+| Public Dataset (24 Intents) | `0`-Shot (Label Names Only) | `0`-Shot + `adapt_zero_shot` | `1`-Shot Online RLS | `3`-Shot Online RLS | `5`-Shot Online RLS | Compiled `.s1m` |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **`BANKING77`** (`192` test queries) | `53.6%` | **`55.2%`** | **`57.3%`** | **`65.6%`** | **`70.3%`** | **`90.1%`** (`0.22 ms`) |
 | **`CLINC150`** (`120` test queries) | `61.7%` | **`62.5%`** | **`65.8%`** | **`72.5%`** | **`82.5%`** | **`87.5%`** (`0.20 ms`) |
 
-### 2. 6-Category Industry-Standard Decision Benchmark Gauntlet
+### 3. 6-Category Industry-Standard Decision Benchmark Gauntlet
 Reproduce 100% offline with `python benchmarks/quality/evaluate_v1_4_gauntlet.py` ([full report](benchmarks/quality/v1_4_gauntlet_report.md)):
 
 | Category | Workload | Classical Linear Baseline | System 1: Instinct (Static) | System 1: Instinct (+ Flywheel) |
@@ -139,7 +150,7 @@ Reproduce 100% offline with `python benchmarks/quality/evaluate_v1_4_gauntlet.py
 | **5. Multi-Field Structured Triage** | 4-Field Joint Accuracy (`Choice`+`Bool`+`Multi`+`Score`) | 97.1% | **100.0%** (`0.40 ms`) | **100.0%** (`0%` Wave 3 esc) |
 | **6. Zero-Shot Cold-Start Routing** | `intent_routing` / `security_triage` (0-Shot) | 51.0% / 50.0% | **81.0%** / **85.0%** | **100.0%** |
 
-### 3. Official `poke-env` + Pokémon Showdown Benchmark (`gen9randombattle`)
+### 4. Official `poke-env` + Pokémon Showdown Benchmark (`gen9randombattle`)
 Reproduce with `python benchmarks/quality/evaluate_poke_env_showdown.py --battles 50` ([full report & analysis](docs/drop_in/06_poke_env_showdown_agent.md)):
 
 | System 1: Instinct Agent | vs `RandomPlayer` | vs `MaxBasePowerPlayer` | vs `SimpleHeuristicsPlayer` | P50 Decision Latency |

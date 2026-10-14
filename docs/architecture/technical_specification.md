@@ -78,12 +78,12 @@ understanding system.
 The compiler defaults to 384 features, ridge regularization 1.0 and NumPy.
 Published explicit-teaching workloads use 2,048 features and regularization 0.1;
 the original automatic-observation experiments use regularization 1.0. Later
-quality-round and v1.4 gauntlet recipes state their own settings. `TeachingSession` defaults
+quality-round and 6-category gauntlet recipes state their own settings. `TeachingSession` defaults
 to fitted TF-IDF with at most 1,024 features, ridge regularization 0.1, strict
 `alpha=0.05` and disabled inference caches. These are distinct paths; their
-settings and measured costs must not be conflated. Since 1.2.0, its ridge or
+settings and measured costs must not be conflated. Its ridge or
 optional logistic choice solver is saved when the session is created; reopening
-with a different explicit solver is rejected. Existing 1.1.0 sessions retain ridge.
+with a different explicit solver is rejected.
 
 ## Teaching and calibration
 

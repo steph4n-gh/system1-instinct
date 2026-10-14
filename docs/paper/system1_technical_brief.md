@@ -3,8 +3,8 @@
 **System 1: Instinct 1.0.0 · 14 October 2026 · Maintainer-authored implementation brief**
 
 This brief describes **System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Each linked experiment
-retains its original source revision and evidence; the v1.4 gauntlet adds six
-offline evaluation categories alongside historical quality results.
+retains its original source revision and evidence; the benchmark gauntlet adds six
+offline evaluation categories and neural baseline comparisons alongside historical quality results.
 
 System 1 turns a repeatable decision into a small reusable local skill. Define the
 choices, show examples, check a candidate, adopt it, then correct and compare when
@@ -15,7 +15,7 @@ inherit a teacher's general knowledge.
 
 ## One teaching and correction workflow
 
-`TeachingSession`, introduced in 1.1.0 and expanded in 1.4.0, keeps single-field
+`TeachingSession` keeps single-field
 or multi-field schemas (`ChoiceField`, `BooleanField`, `MultiChoiceField`,
 `ScoreField`), explicit lessons, separate calibration examples and evaluation checks
 together (including `split="auto"` stratified routing). At least one field
@@ -28,7 +28,7 @@ bounds, changed answers and regressions. Reused checks remain development eviden
 skill have not changed. Editing or failing an assessment leaves the approved
 skill available.
 
-In 1.2.0, `assess(require_qualification=True)` also requires `qualify()` to pass
+`assess(require_qualification=True)` also requires `qualify()` to pass
 on one separately supplied fresh cohort. Provenance, targets and labels are
 frozen before scoring. Consumed inputs and supplied groups cannot become lessons
 or another qualification cohort, and one candidate gets one request even when
@@ -92,7 +92,7 @@ deferred or missed the independent quality target. These bounded measurements
 do not establish general provider parity or superiority over conventional
 classifiers. See the [original workload report](../../benchmarks/quality/workloads/README.md).
 
-The new [BBC workflow test](../../benchmarks/quality/document_workflow/README.md)
+The [BBC workflow test](../../benchmarks/quality/document_workflow/README.md)
 measured one correction round on five news topics. On 400 previously unscored
 articles, targeted feedback reduced accepted errors 16→8 while acceptance fell
 373→337. Raw correctness rose 369→373, but the paired interval includes no gain.
@@ -101,16 +101,16 @@ a serving skill. This is evidence of a review/quality tradeoff and candidate
 rejection; it does not establish successful real-data adoption or superiority
 over its ordinary-addition control.
 
-Historical baselines preserve important limitations: under the v1.2 baseline, fresh authored SMS probes reached
+Classical linear baselines preserve important limitations: under the unigram TF-IDF baseline, fresh authored SMS probes reached
 only 27/33 correct accepted answers; public email has a source-shift failure and
 a retrospective improvement; Inbox Zero remains review-only; the full-scope n8n
 skills fail accepted-accuracy targets and CLINC unfamiliar-input rejection.
-In the [v1.4 benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md),
+In the [6-category benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md),
 supervised `chi2` + character n-gram TF-IDF, `HybridProjector.fit` spectral
 `PPMI+SVD`, two-stage `hierarchical` routing, Mondrian class-conditional
 calibration, and dual OOD gates (`familiarity_alpha` + `prototype_alpha`) raise
-`BANKING77` 32-intent accuracy from `76.6% -> 87.9%` (`91.8%` post-flywheel) and
-77-intent accuracy from `59.9% -> 79.5%` (`87.5%` post-flywheel), reduce
+`BANKING77` 32-intent accuracy from `77.3% -> 87.9%` (`91.4%` post-flywheel) and
+77-intent accuracy from `62.0% -> 79.5%` (`88.1%` post-flywheel), reduce
 `CLINC150-OOS` false acceptance to `0.0%` (`0/120` accepted OOS), eliminate
 `NotInject` benign-trigger false positives (`10.0% -> 0.0%` FPR, `70.0% -> 100.0%`
 polarity contrast accuracy), and lift `quality_round` fresh `banking_support`
