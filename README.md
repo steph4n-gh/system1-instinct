@@ -73,18 +73,44 @@ engine.learn_from_tier2(
 )
 ```
 
-Run the complete, self-contained cutover script in [`examples/drop_in/llm_cutover_dropin.py`](examples/drop_in/llm_cutover_dropin.py):
+Run the **"Break-Me & Teach-Me" Live Showcase** ([`examples/showcase_break_and_teach.py`](examples/showcase_break_and_teach.py))—or pass `--interactive` to type your own curveballs and teach it in 1 line against `BAAI/bge-small-en-v1.5` (`67.2 MB` ONNX):
 
 ```bash
-python examples/drop_in/llm_cutover_dropin.py
+python examples/showcase_break_and_teach.py
+# Or launch the interactive REPL:
+python examples/showcase_break_and_teach.py --interactive
 ```
 
 ```text
-Wave 1 (Cold Start)         | Local:   0.0% (0/6) | LLM Calls: 6 | Accuracy: 100.0% | P50: 0.903 ms
-Wave 2 (Online RLS Active)  | Local: 100.0% (6/6) | LLM Calls: 0 | Accuracy: 100.0% | P50: 0.434 ms
-Wave 3 (Compiled .s1m)      | Local: 100.0% (6/6) | LLM Calls: 0 | Accuracy: 100.0% | P50: 0.370 ms
-Saved portable .s1m skill -> 45.1 KiB (0 LLM calls required in production)
+[Setup from 6 examples/option (30 total teacher logs)]
+  • Neural Vector Router (`BAAI/bge-small-en-v1.5`) : 67,200 KiB ONNX | Init:  208.8 ms
+  • System 1: Instinct (`.s1m` compiled skill)      :   23.7 KiB .s1m | Init:   40.3 ms
+
+ACT 1: ROUTINE TRAFFIC — Replacing 450 ms LLM Calls in ~0.2 ms ($0 API Cost)
+  Query: 'Please cancel my monthly subscription and stop billing me' -> LOCAL .s1m (0.377 ms): cancel_subscription ✅
+  Query: 'My Visa card was billed twice for the same invoice today'  -> LOCAL .s1m (0.213 ms): refund_duplicate_charge ✅
+
+ACT 2: 'BREAK ME' — 3 Real-World Curveballs Where Static Vector Routers Fail
+  [Trap 1: Negation Flip] 'Please do NOT cancel my subscription, I want to upgrade to Pro instead'
+    • bge-small-en-v1.5 (4.23 ms, cos=0.80) -> cancel_subscription      ❌ MISROUTED!
+    • System 1: Instinct (0.40 ms, fam=12.10) -> upgrade_plan             ✅
+  [Trap 2: Out-of-Scope Garbage] 'What is the best temperature to bake sourdough bread in a Dutch oven?'
+    • bge-small-en-v1.5 (3.81 ms, cos=0.46) -> upgrade_plan             ❌ MISROUTED!
+    • System 1: Instinct (0.32 ms, fam=4.80) -> ABSTAIN_TO_LLM           ✅
+  [Trap 3: Heavy Mobile Typos] 'chagred twcie on my vsia crad endign 4412, pls refnud'
+    • bge-small-en-v1.5 (3.94 ms, cos=0.67) -> reset_account_access     ❌ MISROUTED!
+    • System 1: Instinct (0.39 ms, fam=5.85) -> refund_duplicate_charge  ✅
+
+ACT 3: 'TEACH ME' — Teaching a Brand-New Jargon Term in 1 Line (< 4 ms)
+  1. Unseen codeword ('Customer is asking for a Project-Sunburst adjustment on their account'):
+     Before : ABSTAIN_TO_LLM (Safe! 0.313 ms)
+  2. Teach 1 example: engine.learn_from_tier2(prompt, {'action': 'refund_duplicate_charge', 'urgent': True})
+  3. Next ticket ('Please apply the Project-Sunburst adjustment for this workspace'):
+     • bge-small-en-v1.5 (Static)   : upgrade_plan (cos=0.73) ❌ MISROUTED!
+     • System 1: Instinct (Taught)  : refund_duplicate_charge (urgent=True) in 0.512 ms ✅
 ```
+
+You can also run the 3-wave teacher auto-cutover demo in [`examples/drop_in/llm_cutover_dropin.py`](examples/drop_in/llm_cutover_dropin.py).
 
 ### How Many Examples Does It Actually Take?
 

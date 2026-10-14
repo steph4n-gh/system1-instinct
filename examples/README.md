@@ -15,7 +15,8 @@ The [teaching guide](../docs/guides/training_experts.md) and
 
 | Example | What it demonstrates |
 |---|---|
-| [drop_in/](drop_in/README.md) | 1-line local replacements for **Semantic Router**, **RouteLLM**, **Instructor / BAML**, and **Llama-Prompt-Guard / Guardrails** (`100%` accuracy at `0.81–2.73 ms` P50) |
+| [showcase_break_and_teach.py](showcase_break_and_teach.py) | **"Break-Me & Teach-Me" Live Showcase & REPL**: Compiles a `23.7 KiB` `.s1m` skill from 6 examples/option, runs side-by-side against `BAAI/bge-small-en-v1.5` (`67.2 MB` ONNX) on negation flips, OOS garbage, and mobile typos, and teaches a brand-new codeword in 1 line |
+| [drop_in/](drop_in/README.md) | Real drop-in replacements for **Semantic Router**, **LangChain / RouteLLM**, **FastAPI + Instructor**, **Prompt-Guard**, and **`poke-env` Showdown** |
 | [teach_skill.py](teach_skill.py) | Eight editable lessons; custom lesson file, message and saved path; [beginner walkthrough](../docs/guides/first_skill.md) |
 | [teaching_by_doing/](teaching_by_doing/README.md) | Browser workspace: explicit filing lessons, before/after candidate checks, explicit adoption and portable skills; historical sample failures remain available |
 | [support_triage.py](support_triage.py) | Taught department routing, calibration, saved/reloaded evaluation |
