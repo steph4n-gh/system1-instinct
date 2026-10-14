@@ -186,16 +186,16 @@ def _format_context(
 ) -> str:
     """Formats execution context string for collision-resistant cache key isolation."""
     a_val = float(alpha) if alpha is not None else 0.05
-    m_val = float(margin_threshold) if margin_threshold is not None else 0.0
+    m_val = float.hex(float(margin_threshold)) if margin_threshold is not None else "auto"
     eff_odds = odds_ratio if odds_ratio is not None else relative_odds_ratio
     o_val = float(eff_odds) if eff_odds is not None else 0.0
-    tau0_val = float(confidence_floor_tau0) if confidence_floor_tau0 is not None else 0.0
+    tau0_val = float.hex(float(confidence_floor_tau0)) if confidence_floor_tau0 is not None else "auto"
     rec_val = 1 if recency_weighted else 0
     st_val = 1 if strict else 0
     return (
         f"s:{schema_digest}|v:{model_version}|md:{model_digest}|pd:{projector_digest}|"
         f"cd:{calibration_digest}|sc:{policy_scope}|pe:{policy_epoch}|a:{float.hex(a_val)}|"
-        f"m:{float.hex(m_val)}|or:{float.hex(o_val)}|cf:{float.hex(tau0_val)}|rw:{rec_val}|st:{st_val}"
+        f"m:{m_val}|or:{float.hex(o_val)}|cf:{tau0_val}|rw:{rec_val}|st:{st_val}"
     )
 
 
@@ -372,8 +372,8 @@ class SemanticSystemOneCache:
                     q_norm = q_emb / norm
                     sims = self._embeddings @ q_norm
 
-                    # Isolate telemetry presence and execution context
-                    has_query_telem = (telemetry is not None)
+                    # Nearby feature vectors do not make different observations interchangeable.
+                    query_telem_digest = _digest_telemetry(telemetry)
                     ctx = _format_context(
                         schema_digest=schema_digest,
                         model_version=model_version,
@@ -391,7 +391,7 @@ class SemanticSystemOneCache:
                         policy_epoch=policy_epoch,
                     )
                     mask = np.array([
-                        ((e.telemetry is not None) == has_query_telem)
+                        (e.telemetry_digest == query_telem_digest)
                         and (getattr(e, "context_digest", "") == ctx or not getattr(e, "context_digest", ""))
                         for e in self._embedding_entries
                     ], dtype=bool)

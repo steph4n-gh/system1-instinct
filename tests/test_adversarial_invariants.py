@@ -3115,7 +3115,7 @@ class TestAttack3CacheHitAmbiguityMasking:
             model_version=engine.model_version,
             policy_scope=engine.policy_scope,
             alpha=0.05,
-            margin_threshold=0.0,
+            margin_threshold=engine.margin_threshold,
             strict=False,
             relative_odds_ratio=engine.relative_odds_ratio,
             confidence_floor_tau0=engine.confidence_floor_tau0,

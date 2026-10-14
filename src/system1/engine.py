@@ -310,12 +310,12 @@ class SystemOneEngine:
         self.projector = getattr(model, "projector", self.projector)
         self.recency_weighted = getattr(model, "recency_weighted", self.recency_weighted)
         self._init_calibrators_and_predictors()
+        # Lessons belong to the active skill; a replacement retires the old ones.
+        self._learned_prompt_overrides = {}
         if hasattr(model, "_learned_prompt_overrides") and isinstance(model._learned_prompt_overrides, Mapping):
-            if not hasattr(self, "_learned_prompt_overrides"):
-                self._learned_prompt_overrides = {}
             for p_key, f_map in model._learned_prompt_overrides.items():
                 if isinstance(p_key, str) and isinstance(f_map, Mapping):
-                    self._learned_prompt_overrides.setdefault(p_key, {}).update(f_map)
+                    self._learned_prompt_overrides[p_key] = copy.deepcopy(dict(f_map))
 
         if hasattr(model, "heads"):
             for name, ch in model.heads.items():
@@ -406,6 +406,7 @@ class SystemOneEngine:
         with self._lock:
             self._sync_from_model(new_model)
             self.model_version += 1
+            new_model.model_version = self.model_version
             self._model_stat = (st.st_mtime_ns, st.st_size, digest)
             if self.use_cache and self.cache is not None:
                 self.cache.clear()
@@ -652,6 +653,7 @@ class SystemOneEngine:
             self.reload_if_changed()
         # A decision, its uncertainty, and its receipt use one model snapshot.
         with self._lock, getattr(self.model, "_lock", nullcontext()):
+            recency_weighted = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
             version = getattr(self.model, "model_version", self.model_version)
             if version != self.model_version:
                 self.model_version = version
@@ -1355,6 +1357,7 @@ class SystemOneEngine:
         ``preserve_calibration=True`` is specified.
         """
         with self._lock, getattr(self.model, "_lock", nullcontext()):
+            recency_weighted = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
             target = self.schema.validate_lesson(target, allow_unknown=True)
             eff_forgetting = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
             if not math.isfinite(eff_forgetting) or not (0.0 < eff_forgetting <= 1.0):
