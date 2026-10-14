@@ -74,12 +74,12 @@ def main():
     labels = {
         "README.md": r"\*\*Version ([\d.]+):",
         "docs/README.md": r"stable runtime: \*\*([\d.]+)\*\*",
-        "docs/deployment.md": r"System 1 ([\d.]+)",
-        "docs/architecture/technical_specification.md": r"System 1 ([\d.]+)",
-        "docs/paper/system1_whitepaper.md": r"System 1 ([\d.]+)",
-        "docs/paper/system1_technical_brief.md": r"System 1 ([\d.]+)",
-        "docs/paper/conformal_gating.md": r"System 1 ([\d.]+)",
-        "docs/SPEEDRUN_SHOWDOWN_WORLD_RECORDS.md": r"System 1 ([\d.]+)",
+        "docs/deployment.md": r"System 1(?:: Instinct)? ([\d.]+)",
+        "docs/architecture/technical_specification.md": r"System 1(?:: Instinct)? ([\d.]+)",
+        "docs/paper/system1_whitepaper.md": r"System 1(?:: Instinct)? ([\d.]+)",
+        "docs/paper/system1_technical_brief.md": r"System 1(?:: Instinct)? ([\d.]+)",
+        "docs/paper/conformal_gating.md": r"System 1(?:: Instinct)? ([\d.]+)",
+        "docs/SPEEDRUN_SHOWDOWN_WORLD_RECORDS.md": r"System 1(?:: Instinct)? ([\d.]+)",
         "src/system1/__init__.py": r'__version__ = "([\d.]+)"',
     }
     for name, pattern in labels.items():

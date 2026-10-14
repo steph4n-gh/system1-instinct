@@ -15,6 +15,7 @@ from examples.drop_in.routellm_dropin import (
     RouteLLMCascadeSchema,
     SystemOneRouteController,
 )
+from examples.drop_in.llm_cutover_dropin import SupportTicketSchema
 from examples.drop_in.semantic_router_dropin import (
     InstinctRouteLayer,
     RouteMatchResult,
@@ -32,6 +33,7 @@ __all__ = [
     "RouteMatchResult",
     "SemanticRoute",
     "StructuredExtractionResult",
+    "SupportTicketSchema",
     "SystemOneInstructorClient",
     "SystemOnePromptGuard",
     "SystemOneRouteController",

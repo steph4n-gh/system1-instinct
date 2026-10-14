@@ -1145,9 +1145,9 @@ def generate_showdown_markdown_report(report: Dict[str, Any]) -> str:
     """Renders the Markdown report for the poke-env + Pokémon Showdown benchmark."""
     offline = report["offline_tactical_suite"]
     lines = [
-        "# System 1 v1.4 — Official `poke-env` + Pokémon Showdown Benchmark Report",
+        "# System 1: Instinct — Official `poke-env` + Pokémon Showdown Benchmark Report",
         "",
-        "**Engine**: System 1 `1.4.0` Non-Autoregressive Mathematical Decision Runtime  ",
+        "**Engine**: System 1: Instinct `1.0.0` Non-Autoregressive Mathematical Decision Runtime  ",
         "**Simulator**: Local `smogon/pokemon-showdown` Server + `poke-env` (`gen9randombattle`)  ",
         "**LLM API Calls**: `0` (`$0.00` cost, sub-millisecond local CPU execution)",
         "",
@@ -1161,7 +1161,7 @@ def generate_showdown_markdown_report(report: Dict[str, Any]) -> str:
     if live and live.get("matchups"):
         lines.extend(
             [
-                "| System 1 Configuration | Opponent (`poke-env` Official) | Battles | Wins / Losses | Win Rate | Turn Decisions | P50 Decision Latency | Online Adaptations |",
+                "| System 1: Instinct Agent | Opponent (`poke-env` Official) | Battles | Wins / Losses | Win Rate | Turn Decisions | P50 Decision Latency | Online Adaptations |",
                 "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
             ]
         )
@@ -1182,7 +1182,7 @@ def generate_showdown_markdown_report(report: Dict[str, Any]) -> str:
             "",
             "## 2. Zero-Shot Cold-Start & Online Adaptation Tactical Suite",
             "",
-            "Evaluates how System 1 handles unseen battle-state signals starting from `0` training examples,",
+            "Evaluates how System 1: Instinct handles unseen battle-state signals starting from `0` training examples,",
             "after unsupervised test-time prototype adaptation (`adapt_zero_shot`), after 1-shot online",
             "updates (`learn_from_tier2`), and when compiled into a `.s1m` skill:",
             "",
@@ -1202,13 +1202,13 @@ def generate_showdown_markdown_report(report: Dict[str, Any]) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run System 1 poke-env + Pokémon Showdown benchmark.")
+    parser = argparse.ArgumentParser(description="Run System 1: Instinct poke-env + Pokémon Showdown benchmark.")
     parser.add_argument("--battles", type=int, default=40, help="Number of battles per matchup.")
     parser.add_argument("--format", type=str, default="gen9randombattle", help="Showdown battle format.")
     parser.add_argument("--offline-only", action="store_true", help="Run only the offline tactical suite.")
     args = parser.parse_args()
 
-    print("=== System 1 v1.4 — poke-env + Pokémon Showdown Benchmark ===")
+    print("=== System 1: Instinct — poke-env + Pokémon Showdown Benchmark ===")
     offline_res = evaluate_offline_tactical_suite()
     print(
         f"[Offline Tactical Suite] "
@@ -1243,7 +1243,7 @@ def main() -> int:
                     server_proc.kill()
 
     report = {
-        "version": "1.4.0",
+        "version": "1.0.0",
         "offline_tactical_suite": offline_res,
         "live_showdown_gauntlet": live_res,
     }

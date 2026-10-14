@@ -1,9 +1,11 @@
 # Gaming demonstrations and their limits
 
-Current scope for **System 1 1.4.0**. The legacy filename is retained for links;
-this project has no independently verified speedrun world record or #1 ladder
-result. These examples explore game rules, local decisions, observation loops
-and optional emulator/browser integrations.
+Current scope for **System 1: Instinct 1.0.0**. For the standardized competitive
+`poke-env` + Pokémon Showdown (`gen9randombattle`) benchmark (`100%` vs `RandomPlayer`,
+`98%` vs `MaxBasePowerPlayer`, and `62%` Adaptive / `60%` Compiled `.s1m` at `0.093 ms`
+vs `SimpleHeuristicsPlayer`), see **[Drop-In Guide 6: `poke-env` Showdown Reflex Agent](drop_in/06_poke_env_showdown_agent.md)**.
+The legacy filename is retained for links; this project has no independently verified
+campaign speedrun world record or #1 public ladder result.
 
 ## First-use behavior
 
@@ -11,8 +13,8 @@ The [frozen first-use evaluation](../benchmarks/quality/zero_shot/README.md)
 checks 24 Pokémon and 12 Paperclips immediate decisions with teaching and network
 access disabled. Explicit game rules improve the former from 6/24 to 24/24 and
 the latter from 8/12 to 12/12. The raw Pokémon model suggestion remains 6/24;
-with v1.4 sibling-contrastive multi-exemplar cold-start projection, the raw routing
-control reaches 12/12 (up from 8/12 in 1.2.0). These are small authored regression cases,
+with sibling-contrastive multi-exemplar cold-start projection, the raw routing
+control reaches 12/12. These are small authored regression cases,
 not evidence of learned long-term strategy or game completion.
 
 Pokémon ranks currently legal moves by immediate damage and heals at low HP when

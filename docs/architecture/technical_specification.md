@@ -1,8 +1,9 @@
-# System 1 architecture and implementation
+# System 1: Instinct architecture and implementation
 
-Implementation reference for **System 1 1.4.0**, reviewed 13 October 2026.
-See the [v1.4 benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md)
-and [changelog](../../CHANGELOG.md) for version boundaries.
+Implementation reference for **System 1: Instinct 1.0.0**, reviewed 14 October 2026.
+See the [6-category benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md),
+[drop-in guides](../drop_in/README.md) and
+[changelog](../../CHANGELOG.md) for version boundaries.
 The [whitepaper](../paper/system1_whitepaper.md) explains the product and evidence;
 this document maps its behavior to the source. The package version is defined in
 [pyproject.toml](../../pyproject.toml).

@@ -1,6 +1,6 @@
-# System 1 v1.4 — Official `poke-env` + Pokémon Showdown Benchmark Report
+# System 1: Instinct — Official `poke-env` + Pokémon Showdown Benchmark Report
 
-**Engine**: System 1 `1.4.0` Non-Autoregressive Mathematical Decision Runtime  
+**Engine**: System 1: Instinct `1.0.0` Non-Autoregressive Mathematical Decision Runtime  
 **Simulator**: Local `smogon/pokemon-showdown` Server + `poke-env` (`gen9randombattle`)  
 **LLM API Calls**: `0` (`$0.00` cost, sub-millisecond local CPU execution)
 
@@ -8,7 +8,7 @@
 
 ## 1. Live `gen9randombattle` Showdown Matchups vs. Official `poke-env` Baselines
 
-| System 1 Configuration | Opponent (`poke-env` Official) | Battles | Wins / Losses | Win Rate | Turn Decisions | P50 Decision Latency | Online Adaptations |
+| System 1: Instinct Agent | Opponent (`poke-env` Official) | Battles | Wins / Losses | Win Rate | Turn Decisions | P50 Decision Latency | Online Adaptations |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **System 1 Zero-Shot (0 Examples)** | `RandomPlayer` | 50 | `50W - 0L` | **100.0%** | 1036 | **3.177 ms** | 0 |
 | **System 1 Zero-Shot (0 Examples)** | `MaxBasePowerPlayer` | 50 | `49W - 1L` | **98.0%** | 829 | **3.217 ms** | 0 |
@@ -24,7 +24,7 @@
 
 ## 2. Zero-Shot Cold-Start & Online Adaptation Tactical Suite
 
-Evaluates how System 1 handles unseen battle-state signals starting from `0` training examples,
+Evaluates how System 1: Instinct handles unseen battle-state signals starting from `0` training examples,
 after unsupervised test-time prototype adaptation (`adapt_zero_shot`), after 1-shot online
 updates (`learn_from_tier2`), and when compiled into a `.s1m` skill:
 

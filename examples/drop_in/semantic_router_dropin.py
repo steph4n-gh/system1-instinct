@@ -166,5 +166,33 @@ def run_demo() -> Dict[str, Any]:
     return {"total": len(probes), "correct": correct, "accuracy": correct / len(probes)}
 
 
+def main() -> int:
+    print("=== System 1: Instinct — Semantic Router Drop-In Replacement Demo ===")
+    router = build_default_router(confidence_threshold=0.38)
+    for query in [
+        "Please refund the duplicate charge on my billing invoice",
+        "Production API returning 502 bad gateway and database timeout",
+        "What is the best sourdough pizza recipe in Naples?",
+    ]:
+        res = router(query)
+        print(f"  [0-Shot] route={str(res.name):<20} | conf={res.confidence:.2f} | latency={res.latency_ms:.3f} ms | query={query!r}")
+
+    # Step 2: Unsupervised test-time adaptation on unlabeled logs with internal codewords
+    router.adapt_unlabeled(
+        [
+            "Suspicious login attempt and leaked API key credential compromise SEC_ALPHA_9",
+            "Refund my duplicate charge on billing invoice BILL_OMEGA_4",
+            "Production API returning 502 bad gateway and database timeout OPS_SIGMA_7",
+        ]
+    )
+    for query in [
+        "Alert triggered for security code SEC_ALPHA_9 on production tenant",
+        "Cluster alert on node OPS_SIGMA_7 experiencing service degradation",
+    ]:
+        res = router(query)
+        print(f"  [Adapted] route={str(res.name):<19} | conf={res.confidence:.2f} | latency={res.latency_ms:.3f} ms | query={query!r}")
+    return 0
+
+
 if __name__ == "__main__":
-    print("Semantic Router Drop-In Demo:", run_demo())
+    raise SystemExit(main())

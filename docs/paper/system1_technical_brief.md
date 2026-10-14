@@ -1,8 +1,8 @@
-# System 1: technical brief
+# System 1: Instinct — technical brief
 
-**System 1 1.4.0 · 13 October 2026 · Maintainer-authored implementation brief**
+**System 1: Instinct 1.0.0 · 14 October 2026 · Maintainer-authored implementation brief**
 
-This brief describes **System 1 1.4.0** (see the [v1.4 benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Each linked experiment
+This brief describes **System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Each linked experiment
 retains its original source revision and evidence; the v1.4 gauntlet adds six
 offline evaluation categories alongside historical quality results.
 

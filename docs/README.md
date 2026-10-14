@@ -1,54 +1,52 @@
-# System 1: Instinct documentation
+# System 1: Instinct Documentation
 
-Current stable runtime: **1.4.0**. Source documentation reviewed 14 October 2026.
-System 1 is not an LLM. Start with one journey: **choose a decision → show
-examples (or start zero-shot) → check a candidate → adopt → correct and compare**.
-A person or a running teacher can supply the examples, `adapt_zero_shot(...)` can
-adapt prototypes from unlabeled live traffic, and `BoundedReviewFallback` can close
-the loop by escalating uncertain boundary cases to a reviewer and updating the
-local skill. See the [CHANGELOG](../CHANGELOG.md) for current 1.4.0 capabilities.
+Current stable runtime: **1.0.0**.
 
-## Use the product
+**System 1: Instinct** is a sub-millisecond non-autoregressive decision runtime. Define a structured decision (`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`), start **zero-shot** from option descriptions or teach from examples, adapt online via `adapt_zero_shot` and `BoundedReviewFallback`, and deploy portable `.s1m` skills locally with zero LLM calls.
 
-| Start here | Purpose |
-|---|---|
-| [README quickstart](../README.md#quickstart) | Install System 1 and run a complete taught skill |
-| [Drop-In Replacements](../examples/drop_in/README.md) | 1-line local replacements for Semantic Router, RouteLLM, Instructor / BAML, and Llama-Prompt-Guard / Guardrails |
-| [Your first skill](guides/first_skill.md) | What an example means, an editable lesson file, corrections and readiness |
-| [Correct, compare, and adopt](guides/correcting_skills.md) | Retain lessons across single- and multi-field schemas, inspect before/after answers, and explicitly adopt a passing candidate |
-| [Teach by doing](../examples/teaching_by_doing/README.md) | Use the same candidate/adoption flow by filing fictional documents |
-| [Teaching guide](guides/training_experts.md) | Label formats, separate evidence, compilation and corrections |
-| [Teacher observation](typesafe.md) | Callback contract, actual Jev/Gemini evidence, promotion and reuse |
-| [Example catalog](../examples/README.md) | Every example's role and supported or experimental scope |
-| [Application integrations](integrations.md) | Connect a checked skill to LangChain, MCP, ASGI, gRPC or monitoring |
-| [Tool permissions](guides/policy_guard.md) | Add an explicit permission rule when an answer would trigger an action |
-| [Deployment boundaries](deployment.md) | Permissions, identity, audit, network paths and service limits |
-| [Observability](observability/README.md) | Optional metrics/tracing and dashboard |
-| [Container templates](../deploy/README.md) | Experimental local Docker/Kubernetes starting points |
+---
 
-## Understand the implementation and evidence
+## 1. Real Drop-In Replacement Guides
+
+Start with a real, runnable procedure in **[docs/drop_in/README.md](drop_in/README.md)**:
+
+| Guide | What You Replace | Runnable Example |
+| :--- | :--- | :--- |
+| **[1. Semantic Router Drop-In](drop_in/01_semantic_router.md)** | `semantic_router.RouteLayer` | [`examples/drop_in/semantic_router_dropin.py`](../examples/drop_in/semantic_router_dropin.py) |
+| **[2. RouteLLM Cascade Drop-In](drop_in/02_routellm_cascade.md)** | `routellm.controller.Controller` | [`examples/drop_in/routellm_dropin.py`](../examples/drop_in/routellm_dropin.py) |
+| **[3. Instructor / BAML Structured Drop-In](drop_in/03_instructor_structured_outputs.md)** | `instructor.from_openai(...).create()` | [`examples/drop_in/instructor_structured_dropin.py`](../examples/drop_in/instructor_structured_dropin.py) |
+| **[4. Prompt-Guard Security Drop-In](drop_in/04_prompt_guard_security.md)** | `Llama-Prompt-Guard` / `Guardrails` | [`examples/drop_in/prompt_guard_dropin.py`](../examples/drop_in/prompt_guard_dropin.py) |
+| **[5. Live LLM Observe $\to$ `.s1m` Cutover](drop_in/05_llm_observe_and_cutover.md)** | Recurring OpenAI / Anthropic / Gemini calls | [`examples/drop_in/llm_cutover_dropin.py`](../examples/drop_in/llm_cutover_dropin.py) |
+| **[6. `poke-env` Showdown Reflex Agent](drop_in/06_poke_env_showdown_agent.md)** | Slow LLM / static game bots | [`benchmarks/quality/evaluate_poke_env_showdown.py`](../benchmarks/quality/evaluate_poke_env_showdown.py) |
+
+---
+
+## 2. Core Guides & Integrations
+
+| Guide | Purpose |
+| :--- | :--- |
+| [Quickstart](../README.md#quickstart) | Install System 1: Instinct and run your first zero-shot or taught skill |
+| [Your first skill](guides/first_skill.md) | Editable lesson file, candidate checks, and local reuse |
+| [Correct, compare, and adopt](guides/correcting_skills.md) | Multi-field `TeachingSession` lifecycle, qualification, and rollback |
+| [Teaching guide](guides/training_experts.md) | Label formats, compilation flags (`--hierarchical`, `--mondrian`), and online updates |
+| [Teacher observation (`TypeSafeClient`)](typesafe.md) | Observe a live teacher and automatically cut over to local `.s1m` execution |
+| [Application integrations](integrations.md) | Connect a skill to LangChain, MCP, FastAPI/ASGI, or gRPC (with live hot-reload) |
+| [Deterministic policy guard](guides/policy_guard.md) | Enforce explicit tool permissions, Ed25519 receipts, and SHA-256 hash-chained ledgers |
+| [Deployment boundaries](deployment.md) | Security boundaries, resource limits, and production checklists |
+| [Observability](observability/README.md) | Prometheus metrics and OpenTelemetry tracing |
+| [Example catalog](../examples/README.md) | Complete index of runnable examples and interactive labs |
+
+---
+
+## 3. Architecture, Mathematics & Benchmarks
 
 | Document | Scope |
-|---|---|
-| [Architecture reference](architecture/technical_specification.md) | Actual components, defaults, code links and lifecycle |
-| [Technical brief](paper/system1_technical_brief.md) | Short product and evidence overview |
-| [Whitepaper](paper/system1_whitepaper.md) | Current design, measurements and limitations |
-| [Mathematical notes](paper/conformal_gating.md) | Established results and their assumptions |
-| [v1.4 benchmark gauntlet report](../benchmarks/quality/v1_4_gauntlet_report.md) | Six-category offline evaluation of v1.2 baseline vs. v1.4 static vs. v1.4 closed-loop flywheel |
-| [Drop-in & adaptation curve report](../benchmarks/quality/drop_in_and_adaptation_report.md) | Drop-in replacement benchmarks + `0`-shot $\to$ `adapt_zero_shot` $\to$ `1`-shot $\to$ `3`-shot $\to$ `5`-shot $\to$ `Compiled .s1m` on `BANKING77` & `CLINC150` |
-| [`poke-env` Showdown benchmark report](../benchmarks/quality/poke_env_showdown_report.md) | Live `gen9randombattle` Showdown benchmark against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer` |
-| [Workload and evidence index](../benchmarks/quality/README.md) | One overview of task scope, held-out or reused evidence, baselines, successes and failed targets |
-| [Real-document workflow test](../benchmarks/quality/document_workflow/README.md) | BBC topic routing: fewer accepted mistakes with more review; every candidate rejected by default adoption gates |
-| [Teaching examples](../examples/teaching/README.md) | Authored lessons, current counts and historical development |
-| [Benchmark index](../benchmarks/README.md) | Separate quality, throughput and historical runners |
-| [Research and integration examples](../examples/README.md) | Inbox Zero, n8n, games and composition labs, with each experiment's limits |
-
-The quality index links the v1.4 gauntlet, drop-in & adaptation curves, Pokémon
-Showdown benchmark, public-data, teacher, email, BBC workflow, n8n and game reports.
-Research remains available without being a prerequisite for teaching one useful skill.
-
-The papers are maintainer-authored documentation, not peer-reviewed publications.
-Quality claims must identify the task, evidence split and acceptance rule. Local
-computation, acceptance without review and correctness are separate measurements.
-Do not compare unlike timing cohorts as a measured speedup. See
-[contributing](../CONTRIBUTING.md) for the documentation check and release procedure.
+| :--- | :--- |
+| [6-Category Benchmark Gauntlet](../benchmarks/quality/v1_4_gauntlet_report.md) | `BANKING77` (32/77), `CLINC150-OOS`, `NotInject`, authored drift probes, 4-field extraction, and 0-shot routing |
+| [Drop-In & Adaptation Curve Report](../benchmarks/quality/drop_in_and_adaptation_report.md) | `0`-shot $\to$ `adapt_zero_shot` $\to$ `1`-shot $\to$ `3`-shot $\to$ `5`-shot $\to$ `.s1m` curves on `BANKING77` & `CLINC150` |
+| [`poke-env` Showdown Benchmark Report](../benchmarks/quality/poke_env_showdown_report.md) | Live `gen9randombattle` Showdown results against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer` |
+| [Architecture Reference](architecture/technical_specification.md) | Runtime components, `.s1m` v2 binary format, and module map |
+| [Technical Brief](paper/system1_technical_brief.md) | Concise overview of the runtime and empirical results |
+| [Whitepaper](paper/system1_whitepaper.md) | Full design, mathematical formulation, and workload evaluations |
+| [Mathematical Notes](paper/conformal_gating.md) | Split-conformal prediction, Mondrian calibration, dual OOD gating, and rank-1 RLS updates |
+| [Benchmark Suite Index](../benchmarks/quality/README.md) | All reproducible benchmark runners and datasets |

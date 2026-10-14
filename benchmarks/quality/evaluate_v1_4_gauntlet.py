@@ -1591,9 +1591,9 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
     zs_ctl = c6["zero_shot_projectors"]["raw_routing_control_12"]
 
     lines = [
-        "# System 1 v1.4 — Industry-Standard Decision Benchmark Gauntlet Report",
+        "# System 1: Instinct — 6-Category Industry-Standard Decision Benchmark Gauntlet",
         "",
-        "**Version**: System 1 `1.4.0`  ",
+        "**Version**: System 1: Instinct `1.0.0`  ",
         "**Execution Mode**: 100% Offline, Deterministic, Socket-Blocked (`block_network()`)  ",
         "**Hardware Target**: Local CPU / NumPy Single-Pass Non-Autoregressive Runtime",
         "",
@@ -1601,7 +1601,9 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
         "",
         "## Executive Summary Across All 6 Benchmark Categories",
         "",
-        "| Category | Workload | Baseline v1.2 | System 1 v1.4 (Static) | System 1 v1.4 (+ Flywheel) | Key v1.4 Improvement |",
+        "Compares a **Classical Linear Baseline** (standard frequency TF-IDF + flat Ridge / hash projection) against **System 1: Instinct (Static `.s1m`)** and **System 1: Instinct (+ Online Adaptive Flywheel)**:",
+        "",
+        "| Category | Workload | Classical Linear Baseline | System 1: Instinct (Static) | System 1: Instinct (+ Flywheel) | Key Advantage |",
         "| :--- | :--- | :---: | :---: | :---: | :--- |",
         (
             f"| **1. High-Cardinality Intent Routing** | `BANKING77` (32 Intents, Clean / Typo) | "
@@ -1671,37 +1673,37 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
         "",
         "## Category 1: High-Cardinality Fine-Grained Intent Routing (`BANKING77` + Typo Stress + Memory Scaling)",
         "",
-        "Evaluates System 1 v1.4's class-discriminative `chi2` feature selection, boundary character n-grams `(3, 5)`,",
+        "Evaluates System 1: Instinct's class-discriminative `chi2` feature selection, boundary character n-grams `(3, 5)`,",
         "`HybridProjector.fit` spectral `PPMI + SVD` projection with concept anchors, and coarse-to-fine `hierarchical`",
-        "choice heads against Baseline v1.2 flat word-frequency Ridge regression.",
+        "choice heads against a standard flat word-frequency Ridge baseline.",
         "",
         "### 1.1 Accuracy & Latency Breakdown",
         "",
         "| Configuration | 32-Intent Clean Acc | 32-Intent Typo Acc | 77-Intent Clean Acc | 77-Intent Typo Acc | P50 Latency | `.s1m` Artifact Size |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: |",
         (
-            f"| **Baseline v1.2** (`frequency` TF-IDF, flat, eager cov) | "
+            f"| **Classical Linear Baseline** (`frequency` TF-IDF, flat) | "
             f"{b32['v1_2_baseline']['clean']['raw_accuracy']:.1%} | {b32['v1_2_baseline']['typo_stress']['raw_accuracy']:.1%} | "
             f"{b77['v1_2_baseline']['clean']['raw_accuracy']:.1%} | {b77['v1_2_baseline']['typo_stress']['raw_accuracy']:.1%} | "
             f"{b77['v1_2_baseline']['clean']['p50_latency_ms']:.3f} ms | "
             f"{b77['v1_2_baseline']['s1m_bytes_with_cov']/1024:.1f} KB |"
         ),
         (
-            f"| **System 1 v1.4** (`chi2` + `char_ngrams=(3,5)` + `hierarchical`) | "
+            f"| **System 1: Instinct** (`chi2` + `char_ngrams=(3,5)` + `hierarchical`) | "
             f"{b32['v1_4_tfidf_chi2_char_hierarchical']['clean']['raw_accuracy']:.1%} | **{b32['v1_4_tfidf_chi2_char_hierarchical']['typo_stress']['raw_accuracy']:.1%}** | "
             f"{b77['v1_4_tfidf_chi2_char_hierarchical']['clean']['raw_accuracy']:.1%} | **{b77['v1_4_tfidf_chi2_char_hierarchical']['typo_stress']['raw_accuracy']:.1%}** | "
             f"{b77['v1_4_tfidf_chi2_char_hierarchical']['clean']['p50_latency_ms']:.3f} ms | "
             f"**{b77['v1_4_tfidf_chi2_char_hierarchical']['s1m_bytes_lazy_cov']/1024:.1f} KB** |"
         ),
         (
-            f"| **System 1 v1.4** (`HybridProjector.fit` + `hierarchical`) | "
+            f"| **System 1: Instinct** (`HybridProjector.fit` + `hierarchical`) | "
             f"**{b32['v1_4_hybrid_spectral_hierarchical']['clean']['raw_accuracy']:.1%}** | {b32['v1_4_hybrid_spectral_hierarchical']['typo_stress']['raw_accuracy']:.1%} | "
             f"**{b77['v1_4_hybrid_spectral_hierarchical']['clean']['raw_accuracy']:.1%}** | {b77['v1_4_hybrid_spectral_hierarchical']['typo_stress']['raw_accuracy']:.1%} | "
             f"{b77['v1_4_hybrid_spectral_hierarchical']['clean']['p50_latency_ms']:.3f} ms | "
             f"{b77['v1_4_hybrid_spectral_hierarchical']['s1m_bytes_lazy_cov']/1024:.1f} KB |"
         ),
         (
-            f"| **System 1 v1.4 + Flywheel** (`BoundedReviewFallback`) | "
+            f"| **System 1: Instinct + Flywheel** (`BoundedReviewFallback`) | "
             f"**{b32['v1_4_closed_loop_flywheel']['post_flywheel_raw_accuracy']:.1%}** | — | "
             f"**{b77['v1_4_closed_loop_flywheel']['post_flywheel_raw_accuracy']:.1%}** | — | "
             f"{b77['v1_4_hybrid_spectral_hierarchical']['clean']['p50_latency_ms']:.3f} ms | "
@@ -1710,7 +1712,7 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
         "",
         "### 1.2 Lazy Covariance Memory Scaling (`D = 1024 .. 8192`, `K = 77` Intents)",
         "",
-        "| Feature Dimension (`D`) | v1.2 Eager Covariance RAM | v1.4 Lazy Covariance RAM | Memory Reduction Factor |",
+        "| Feature Dimension (`D`) | Eager `(D+1)²` Covariance RAM | Lazy Covariance RAM (`.s1m`) | Memory Reduction Factor |",
         "| :---: | :---: | :---: | :---: |",
     ]
     for row in c1["lazy_covariance_memory_scaling"]:
@@ -1725,11 +1727,11 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
         "## Category 2: Multi-Domain Assistant Routing + Strict Out-of-Scope Rejection (`CLINC150-OOS`)",
         "",
         "Evaluates 15 in-scope assistant domains alongside official held-out `CLINC150` out-of-scope (OOS) queries",
-        "and cross-domain adversarial prompts. System 1 v1.4 combines **TF-IDF feature familiarity gating**",
+        "and cross-domain adversarial prompts. System 1: Instinct combines **TF-IDF feature familiarity gating**",
         "(`familiarity_alpha=0.15`, `low_feature_familiarity`) and **class-prototype cosine distance gating**",
         "(`prototype_alpha=0.15`, `low_prototype_similarity`) with **Mondrian class-conditional calibration**.",
         "",
-        "| Metric | Baseline v1.2 | System 1 v1.4 (Static) | System 1 v1.4 (+ Flywheel) |",
+        "| Metric | Classical Linear Baseline | System 1: Instinct (Static) | System 1: Instinct (+ Flywheel) |",
         "| :--- | :---: | :---: | :---: |",
         f"| **In-Scope Raw Accuracy** ({c2['in_scope_eval_count']} queries) | {c2['v1_2_baseline']['in_scope']['raw_accuracy']:.1%} | **{c2['v1_4_static']['in_scope']['raw_accuracy']:.1%}** | **{c2['v1_4_closed_loop_flywheel']['post_flywheel_raw_accuracy']:.1%}** |",
         f"| **In-Scope Accepted Accuracy** | {c2['v1_2_baseline']['in_scope']['accepted_accuracy']:.1%} | **{c2['v1_4_static']['in_scope']['accepted_accuracy']:.1%}** | **{c2['v1_4_closed_loop_flywheel']['post_flywheel_accepted_accuracy']:.1%}** |",
@@ -1745,7 +1747,7 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
         "`\"override\"`, `\"bypass\"`, `\"admin\"`) and minimal negation/polarity pairs (`\"no, working great\"`,",
         "`\"do not cancel, upgrade\"`).",
         "",
-        "| Suite & Metric | Baseline v1.2 | System 1 v1.4 (Static) | System 1 v1.4 (+ Flywheel) |",
+        "| Suite & Metric | Classical Linear Baseline | System 1: Instinct (Static) | System 1: Instinct (+ Flywheel) |",
         "| :--- | :---: | :---: | :---: |",
         f"| **`NotInject` Overall Accuracy** | {c3['notinject_hard_negatives']['v1_2_baseline']['raw_accuracy']:.1%} | **{c3['notinject_hard_negatives']['v1_4_static']['raw_accuracy']:.1%}** | **100.0%** |",
         f"| **`NotInject` Benign-Trigger False Positive Rate (FPR)** | {c3['notinject_hard_negatives']['v1_2_baseline']['benign_trigger_fpr']:.1%} | **{c3['notinject_hard_negatives']['v1_4_static']['benign_trigger_fpr']:.1%}** | **0.0%** |",
@@ -1761,7 +1763,7 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
         "Evaluates all 106 human-authored non-template probes from `benchmarks/quality/quality_round/cases.json`",
         "designed to test vocabulary drift, class imbalance (`sms_triage`), and multi-tier complexity routing (`model_routing`).",
         "",
-        "| Workload (Fresh Cohort) | Metric | Baseline v1.2 | System 1 v1.4 (Static) | System 1 v1.4 (+ Flywheel) |",
+        "| Workload (Fresh Cohort) | Metric | Classical Linear Baseline | System 1: Instinct (Static) | System 1: Instinct (+ Flywheel) |",
         "| :--- | :--- | :---: | :---: | :---: |",
         f"| **`banking_support`** (30 probes) | Raw Accuracy | {c4['banking_support_30']['v1_2_baseline']['raw_accuracy']:.1%} | **{c4['banking_support_30']['v1_4_static']['raw_accuracy']:.1%}** | **{c4['banking_support_30']['v1_4_closed_loop_flywheel']['post_flywheel_raw_accuracy']:.1%}** |",
         f"| **`banking_support`** (30 probes) | Accepted Accuracy (Target ≥95%) | {c4['banking_support_30']['v1_2_baseline']['accepted_accuracy']:.1%} ({c4['banking_support_30']['v1_2_baseline']['accepted_errors']} err) | **{c4['banking_support_30']['v1_4_static']['accepted_accuracy']:.1%}** ({c4['banking_support_30']['v1_4_static']['accepted_errors']} err) | **{c4['banking_support_30']['v1_4_closed_loop_flywheel']['post_flywheel_accepted_accuracy']:.1%}** ({c4['banking_support_30']['v1_4_closed_loop_flywheel']['post_flywheel_accepted_errors']} err) |",
@@ -1780,7 +1782,7 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
         "",
         "### 5.1 Multi-Field Structured Extraction Accuracy",
         "",
-        "| Field / Metric | Baseline v1.2 | System 1 v1.4 (Static) |",
+        "| Field / Metric | Classical Linear Baseline | System 1: Instinct (Static) |",
         "| :--- | :---: | :---: |",
         f"| `department` (`ChoiceField` 5 options) | {c5['v1_2_baseline']['department_accuracy']:.1%} | **{c5['v1_4_static']['department_accuracy']:.1%}** |",
         f"| `urgent_escalation` (`BooleanField`) | {c5['v1_2_baseline']['urgent_escalation_accuracy']:.1%} | **{c5['v1_4_static']['urgent_escalation_accuracy']:.1%}** |",
@@ -1805,11 +1807,11 @@ def generate_markdown_report(report: Mapping[str, Any]) -> str:
         "",
         "## Category 6: Out-of-the-Box Zero-Shot Routing & Drop-In Open-Source Router Patterns",
         "",
-        "Evaluates System 1 v1.4 out-of-the-box (`0` teaching calls, `0` calibration calls) using morphological",
+        "Evaluates System 1: Instinct out-of-the-box (`0` teaching calls, `0` calibration calls) using morphological",
         "stemming (`_stem_word`), sibling-contrastive stem IDF filtering, and disjunctive multi-exemplar sub-prototype",
         "scoring (`_exemplar_bank`), followed by online `BoundedReviewFallback` flywheel convergence.",
         "",
-        "| Workload | Baseline v1.2 (0-Shot) | System 1 v1.4 Default (0-Shot) | System 1 v1.4 Hybrid (0-Shot) | System 1 v1.4 + Flywheel |",
+        "| Workload | Naive Hash Baseline (0-Shot) | System 1: Instinct Default (0-Shot) | System 1: Instinct Hybrid (0-Shot) | System 1: Instinct + Flywheel |",
         "| :--- | :---: | :---: | :---: | :---: |",
         f"| **`intent_routing`** (100 tickets, 4 depts) | {zs_int['v1_2_default']['raw_accuracy']:.1%} | **{zs_int['v1_4_default']['raw_accuracy']:.1%}** (+{zs_int['default_gain']*100:.1f}%) | **{zs_int['v1_4_hybrid']['raw_accuracy']:.1%}** (+{zs_int['hybrid_gain']*100:.1f}%) | — |",
         f"| **`security_triage`** (100 ops, 3 tiers) | {zs_sec['v1_2_default']['raw_accuracy']:.1%} | **{zs_sec['v1_4_default']['raw_accuracy']:.1%}** (+{zs_sec['default_gain']*100:.1f}%) | **{zs_sec['v1_4_hybrid']['raw_accuracy']:.1%}** (+{zs_sec['hybrid_gain']*100:.1f}%) | **{c6['fastmcp_tool_guardrail_flywheel_100']['flywheel_waves'][-1]['end_to_end_accuracy']:.1%}** |",
@@ -1836,7 +1838,7 @@ def run_gauntlet(
     elapsed_s = round(time.perf_counter() - t0, 3)
     report: Dict[str, Any] = {
         "benchmark_suite": "system1_v1_4_industry_gauntlet",
-        "version": "1.4.0",
+        "version": "1.0.0",
         "offline_verified": True,
         "elapsed_seconds": elapsed_s,
         "categories": {

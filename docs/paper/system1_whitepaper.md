@@ -1,10 +1,10 @@
-# System 1: teaching bounded decisions for local reuse
+# System 1: Instinct — teaching bounded decisions for local reuse
 
-**steph4n-gh · System 1 1.4.0 · 13 October 2026**
+**steph4n-gh · System 1: Instinct 1.0.0 · 14 October 2026**
 Maintainer-authored technical whitepaper; not a peer-reviewed publication.
 [Source repository](https://github.com/steph4n-gh/system1-instinct)
 
-This document describes **System 1 1.4.0** (see the [v1.4 benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
+This document describes **System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
 the original source revisions and evidence linked in each experiment; this
 release adds the v1.4 6-category benchmark gauntlet alongside historical results.
 
