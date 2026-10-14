@@ -17,7 +17,7 @@ Evaluated on held-out public intent datasets (`BANKING77` and `CLINC150`). Start
 
 Compares **System 1: Instinct (`0` neural weights)** against both a **Classical Linear Baseline (Unigram TF-IDF)**
 and standard **Pretrained Neural Embedding Routers (`all-MiniLM-L6-v2` and `BAAI/bge-small-en-v1.5` via ONNX)**
-on the exact same held-out splits from the [6-category benchmark gauntlet](v1_4_gauntlet_report.md):
+on the exact same held-out splits from the [6-category benchmark gauntlet](instinct_gauntlet_report.md):
 
 | Router Architecture | Model / Artifact Size | `BANKING77` (32c Clean) | `BANKING77` (32c Typo Stress) | `CLINC150-OOS` False Accept | Negation / Polarity Acc | P50 CPU Latency | `<1 ms` Online RLS Update |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |

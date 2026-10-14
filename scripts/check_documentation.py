@@ -79,7 +79,6 @@ def main():
         "docs/paper/system1_whitepaper.md": r"System 1(?:: Instinct)? ([\d.]+)",
         "docs/paper/system1_technical_brief.md": r"System 1(?:: Instinct)? ([\d.]+)",
         "docs/paper/conformal_gating.md": r"System 1(?:: Instinct)? ([\d.]+)",
-        "docs/SPEEDRUN_SHOWDOWN_WORLD_RECORDS.md": r"System 1(?:: Instinct)? ([\d.]+)",
         "src/system1/__init__.py": r'__version__ = "([\d.]+)"',
     }
     for name, pattern in labels.items():

@@ -1,7 +1,7 @@
 # System 1: Instinct architecture and implementation
 
 Implementation reference for **System 1: Instinct 1.0.0**, reviewed 14 October 2026.
-See the [6-category benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md),
+See the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md),
 [drop-in guides](../drop_in/README.md) and
 [changelog](../../CHANGELOG.md) for version boundaries.
 The [whitepaper](../paper/system1_whitepaper.md) explains the product and evidence;

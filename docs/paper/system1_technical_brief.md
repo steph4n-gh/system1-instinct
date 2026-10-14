@@ -2,7 +2,7 @@
 
 **System 1: Instinct 1.0.0 · 14 October 2026 · Maintainer-authored implementation brief**
 
-This brief describes **System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Each linked experiment
+This brief describes **System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Each linked experiment
 retains its original source revision and evidence; the benchmark gauntlet adds six
 offline evaluation categories and neural baseline comparisons alongside historical quality results.
 
@@ -105,7 +105,7 @@ Classical linear baselines preserve important limitations: under the unigram TF-
 only 27/33 correct accepted answers; public email has a source-shift failure and
 a retrospective improvement; Inbox Zero remains review-only; the full-scope n8n
 skills fail accepted-accuracy targets and CLINC unfamiliar-input rejection.
-In the [6-category benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md),
+In the [6-category benchmark gauntlet](../../benchmarks/quality/instinct_gauntlet_report.md),
 supervised `chi2` + character n-gram TF-IDF, `HybridProjector.fit` spectral
 `PPMI+SVD`, two-stage `hierarchical` routing, Mondrian class-conditional
 calibration, and dual OOD gates (`familiarity_alpha` + `prototype_alpha`) raise

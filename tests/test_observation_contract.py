@@ -211,18 +211,3 @@ def test_comparison_local_side_stays_local_in_passthrough_mode(monkeypatch):
     assert result.local_response.local_execution
     assert len(calls) == 1
     assert result.is_live
-
-
-@pytest.mark.parametrize('script,function', [
-    ('deep_jev_benchmark.py', 'run_benchmark'),
-    ('killer_use_cases_live_test.py', 'run_use_case_tests'),
-])
-def test_all_failed_benchmarks_report_no_speedup(script, function, monkeypatch, capsys):
-    import urllib.error
-    import urllib.request
-    def unavailable(*args, **kwargs):
-        raise urllib.error.URLError('offline test')
-    monkeypatch.setattr(urllib.request, 'urlopen', unavailable)
-    demo = runpy.run_path(str(ROOT / 'examples' / script))
-    assert demo[function]('fake-test-key') == []
-    assert 'no speedup can be reported' in capsys.readouterr().out

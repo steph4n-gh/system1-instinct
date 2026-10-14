@@ -4,7 +4,7 @@
 Maintainer-authored technical whitepaper; not a peer-reviewed publication.
 [Source repository](https://github.com/steph4n-gh/system1-instinct)
 
-This document describes **System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
+This document describes **System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
 the original source revisions and evidence linked in each experiment; this
 release includes the 6-category benchmark gauntlet and neural baseline comparisons alongside historical results.
 
@@ -284,8 +284,8 @@ qualify private document filing, unfamiliar-topic rejection or traffic drift.
 
 ### Industry-standard benchmark gauntlet
 
-The [6-category benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md)
-(`python benchmarks/quality/evaluate_v1_4_gauntlet.py`) evaluates **System 1: Instinct 1.0.0**
+The [6-category benchmark gauntlet](../../benchmarks/quality/instinct_gauntlet_report.md)
+(`python benchmarks/quality/evaluate_instinct_gauntlet.py`) evaluates **System 1: Instinct 1.0.0**
 against a Classical Linear Baseline (Unigram TF-IDF / Hash Ridge) across six offline categories:
 
 1. **High-cardinality `BANKING77` intent routing + typo stress + lazy covariance scaling**:
@@ -360,15 +360,13 @@ claim is made here.
 Public datasets may have appeared in provider pretraining. Related paraphrases
 and SMS campaigns can remain correlated despite duplicate checks. Task subsets
 above do not evaluate all BANKING77/CLINC150 intents or out-of-scope detection, and
-historical SMS data does not measure modern phishing. Scripted gaming gains are
-separate [first-use policy evidence](../../benchmarks/quality/zero_shot/README.md),
-not learned strategic competence or verified speed records.
+historical SMS data does not measure modern phishing.
 
 Later experiments widen the scope without establishing universal quality. The
-historical [full-scope n8n gauntlet](../../benchmarks/quality/n8n_gauntlet/README.md) baseline fails
-accepted accuracy on all-intent CLINC and BANKING77, plus unfamiliar-input
-rejection on CLINC (addressed in the separate [6-category benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md)). Its teacher-disconnection recording is an integration
-rehearsal using an unqualified artifact; independent confirmation remains missing.
+[6-category benchmark gauntlet](../../benchmarks/quality/instinct_gauntlet_report.md)
+and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)
+evaluate 32-intent and 77-intent `BANKING77`, `CLINC150-OOS` unfamiliar-input rejection,
+`NotInject` benign hard negatives, and multi-field structured triage.
 The [Inbox Zero pilot](../../examples/inbox_zero/README.md) improves authored email
 results but retains accepted errors and lacks independent mailbox qualification.
 A separate binary [public-email experiment](../../benchmarks/quality/public_email/README.md)
@@ -378,13 +376,9 @@ Neither result qualifies seven-category mailbox automation or modern drift.
 
 The [document workspace](../../examples/teaching_by_doing/README.md) demonstrates
 explicit lessons, corrections, candidate comparison and adoption on recurring
-authored checks. Courier and Pokémon labs retain bounded composition tests,
-baselines and regressions. Snake receives planner hints. None establishes general
-agency. The [evidence index](../../benchmarks/quality/README.md) and
+authored checks. The [evidence index](../../benchmarks/quality/README.md) and
 [example catalog](../../examples/README.md) preserve complete protocols, raw
-results, reproduction commands and each scope. They are the entry points for
-research history, rather than treating later experiments as revisions of older
-measurements.
+results, reproduction commands and each scope.
 
 Suggested citation: steph4n-gh (2026), *System 1: Instinct — teaching bounded decisions for
 local reuse*, version 1.0.0. Cite the source revision and linked evidence when

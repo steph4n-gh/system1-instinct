@@ -45,14 +45,26 @@ class SupportTriage(DecisionSchema):
 engine = SystemOneEngine(SupportTriage, strict_mode=True, use_cache=False)
 ```
 
-### Step 2: Teach It `3 to 10` Examples per Option (Two Ways)
+### Step 2: Teach It `3 to 10` Examples per Option (From Application Context or an LLM)
 
-You do **not** need `5,000,000` examples or a GPU training pipeline. You either let your LLM teach Instinct automatically on live traffic, or feed `3–10` examples per option yourself:
+An LLM teacher (`Jev`, `GPT-4o`, `Claude`) is only **guessing from text** before anything happens. **Your application context is an even better teacher** because it knows what *actually worked* after it happened—which tool returned `200 OK`, which button the operator clicked in the UI, or which handler resolved the request—for **`$0` and `0` LLM tokens**:
 
 ```python
-# WAY A: Automatic (0 manual labeling) — Wrap your LLM call.
-# Whenever Instinct is unsure, it calls `my_llm_triage`, returns the LLM's answer,
-# and updates its own weights in < 0.5 ms so it can handle the next similar request locally.
+# WAY A: Learn from Application Context (< 0.5 ms, $0 LLM cost)
+# Feed ground-truth outcomes from your own app (a UI click, a tool execution that
+# succeeded, or a webhook handler) directly into Instinct:
+engine.learn(
+    "charged twice on my Visa ending 4412, do not upgrade, just refund the duplicate",
+    {"queue": "refunds", "urgent": False},
+)
+engine.learn(
+    "production webhook endpoint returning 502 bad gateway since the 9am deploy",
+    {"queue": "technical_bug", "urgent": True},
+)
+
+# WAY B: Learn from an LLM / Jev on Cold Start (0 manual labeling)
+# When no downstream outcome exists yet and Instinct is unsure (`is_ambiguous=True`),
+# fall back to your LLM once and record the lesson automatically:
 triage = BoundedReviewFallback(
     engine,
     review_fn=my_llm_triage,
@@ -61,16 +73,6 @@ triage = BoundedReviewFallback(
     auto_online_update=True,
 )
 result = triage.decide("Our SSO login keeps throwing SAML signature error for all users")
-
-# WAY B: Explicit (< 0.5 ms per example) — Teach a few examples or fix a production miss on the spot:
-engine.learn_from_tier2(
-    "charged twice on my Visa ending 4412, do not upgrade, just refund the duplicate",
-    {"queue": "refunds", "urgent": False},
-)
-engine.learn_from_tier2(
-    "production webhook endpoint returning 502 bad gateway since the 9am deploy",
-    {"queue": "technical_bug", "urgent": True},
-)
 ```
 
 Run the **"Break-Me & Teach-Me" Live Showcase** ([`examples/showcase_break_and_teach.py`](examples/showcase_break_and_teach.py))—or pass `--interactive` to type your own curveballs and teach it in 1 line against `BAAI/bge-small-en-v1.5` (`67.2 MB` ONNX):
@@ -104,7 +106,7 @@ ACT 2: 'BREAK ME' — 3 Real-World Curveballs Where Static Vector Routers Fail
 ACT 3: 'TEACH ME' — Teaching a Brand-New Jargon Term in 1 Line (< 4 ms)
   1. Unseen codeword ('Customer is asking for a Project-Sunburst adjustment on their account'):
      Before : ABSTAIN_TO_LLM (Safe! 0.313 ms)
-  2. Teach 1 example: engine.learn_from_tier2(prompt, {'action': 'refund_duplicate_charge', 'urgent': True})
+  2. Teach 1 example: engine.learn(prompt, {'action': 'refund_duplicate_charge', 'urgent': True})
   3. Next ticket ('Please apply the Project-Sunburst adjustment for this workspace'):
      • bge-small-en-v1.5 (Static)   : upgrade_plan (cos=0.73) ❌ MISROUTED!
      • System 1: Instinct (Taught)  : refund_duplicate_charge (urgent=True) in 0.512 ms ✅
@@ -216,7 +218,7 @@ Measured on `24` intents from `CLINC150` (`120` test queries) and `BANKING77` (`
 | **`24–40` / class** | **`576–960`** | **`90.8%`** | **`87.5%` local** *(compiled)* | **`99.2%`** | **`90.1%`** (`.s1m`) | **`70.3%` local** *(compiled)* | **`100.0%`** |
 
 ### 3. Full 6-Category Offline Benchmark Gauntlet
-Reproduce 100% offline (`block_network()`) with `python benchmarks/quality/evaluate_v1_4_gauntlet.py` ([full report](benchmarks/quality/v1_4_gauntlet_report.md)):
+Reproduce 100% offline (`block_network()`) with `python benchmarks/quality/evaluate_instinct_gauntlet.py` ([full report](benchmarks/quality/instinct_gauntlet_report.md)):
 
 | Category | Workload | Classical Linear Baseline | System 1: Instinct (Static) | System 1: Instinct (+ Flywheel) |
 | :--- | :--- | :---: | :---: | :---: |

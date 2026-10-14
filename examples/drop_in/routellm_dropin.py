@@ -164,10 +164,10 @@ def run_real_langchain_banking77_benchmark() -> Dict[str, Any]:
         _inject_deterministic_typo,
     )
 
-    ot_data = json.loads((REPO_ROOT / "benchmarks/quality/n8n_gauntlet/results/official-test.json").read_text())
-    cl_lessons = json.loads((REPO_ROOT / "benchmarks/quality/n8n_gauntlet/results/contrast-lessons.json").read_text())["lessons"]
-    bt_lessons = json.loads((REPO_ROOT / "benchmarks/quality/n8n_gauntlet/results/boundary-teaching/lessons.json").read_text())["lessons"]
-    bt_reqs = json.loads((REPO_ROOT / "benchmarks/quality/n8n_gauntlet/boundary-teaching-requests.json").read_text())["requests"]
+    ot_data = json.loads((REPO_ROOT / "benchmarks/quality/datasets/public_splits/official-test.json").read_text())
+    cl_lessons = json.loads((REPO_ROOT / "benchmarks/quality/datasets/public_splits/contrast-lessons.json").read_text())["lessons"]
+    bt_lessons = json.loads((REPO_ROOT / "benchmarks/quality/datasets/public_splits/boundary-teaching-lessons.json").read_text())["lessons"]
+    bt_reqs = json.loads((REPO_ROOT / "benchmarks/quality/datasets/public_splits/boundary-teaching-requests.json").read_text())["requests"]
 
     b77_test: Dict[str, List[str]] = {}
     for item in ot_data["results"]:

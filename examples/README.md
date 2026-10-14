@@ -1,89 +1,49 @@
-# Example catalog
+# Example Catalog
 
-Run examples from a repository checkout with System 1 installed. The primary
-workflow is **teach → check a candidate → adopt → run locally → correct**.
-For a text classifier with one `ChoiceField`, the
-[correction workflow](../docs/guides/correcting_skills.md) uses the same
-`TeachingSession` helper, available since 1.1.0, in Python, the CLI and the
-experimental document demo.
-It retains the current skill while changes are checked. Existing multi-field,
-numeric and teacher-observation examples keep their current APIs.
-The [teaching guide](../docs/guides/training_experts.md) and
-[teacher adapter](../docs/typesafe.md) describe the supported core.
+Run examples from a repository checkout with **System 1: Instinct** installed.
 
-## Start with a bounded skill
+## 1. Interactive Showcase & Real Open-Source Drop-Ins
 
-| Example | What it demonstrates |
-|---|---|
-| [showcase_break_and_teach.py](showcase_break_and_teach.py) | **"Break-Me & Teach-Me" Live Showcase & REPL**: Compiles a `23.7 KiB` `.s1m` skill from 6 examples/option, runs side-by-side against `BAAI/bge-small-en-v1.5` (`67.2 MB` ONNX) on negation flips, OOS garbage, and mobile typos, and teaches a brand-new codeword in 1 line |
-| [drop_in/](drop_in/README.md) | Real drop-in replacements for **Semantic Router**, **LangChain / RouteLLM**, **FastAPI + Instructor**, **Prompt-Guard**, and **`poke-env` Showdown** |
-| [teach_skill.py](teach_skill.py) | Eight editable lessons; custom lesson file, message and saved path; [beginner walkthrough](../docs/guides/first_skill.md) |
-| [teaching_by_doing/](teaching_by_doing/README.md) | Browser workspace: explicit filing lessons, before/after candidate checks, explicit adoption and portable skills; historical sample failures remain available |
-| [support_triage.py](support_triage.py) | Taught department routing, calibration, saved/reloaded evaluation |
-| [model_routing.py](model_routing.py) | A stated routing policy; does not call downstream models |
-| [agent_guard.py](agent_guard.py) | Operation classification plus a separate explicit permission/audit example |
-| [banking_support.py](banking_support.py) | Three BANKING77 intents using original public labels |
-| [observe_routing.py](observe_routing.py) | Default-gate takeover from an offline rule or optional actual Jev, then saved reuse |
-| [_teaching_demo.py](_teaching_demo.py) | Shared measurement helper, not a standalone task |
+| Example | What It Demonstrates |
+| :--- | :--- |
+| **[showcase_break_and_teach.py](showcase_break_and_teach.py)** | **"Break-Me & Teach-Me" Live Showcase & REPL**: Compiles a `23.7 KiB` `.s1m` skill from 6 examples/option, runs side-by-side against `BAAI/bge-small-en-v1.5` (`67.2 MB` ONNX) on negation flips, OOS garbage, and mobile typos, and teaches a brand-new codeword in 1 line via `engine.learn(...)`. Pass `--interactive` to test your own prompts live. |
+| **[drop_in/instructor_structured_dropin.py](drop_in/instructor_structured_dropin.py)** | Real `FastAPI` + `Instructor` / Pydantic 4-field structured triage endpoint (`ChoiceField` + `BooleanField` + `MultiChoiceField` + `ScoreField`) converging to `0%` LLM escalation in `0.45 ms` ([guide](../docs/drop_in/03_instructor_structured_outputs.md)). |
+| **[drop_in/semantic_router_dropin.py](drop_in/semantic_router_dropin.py)** | Drop-in `InstinctRouteLayer` accepting real `semantic_router.Route` objects (`0.14 ms` CPU latency, `0.0%` OOS false acceptance) ([guide](../docs/drop_in/01_semantic_router.md)). |
+| **[drop_in/routellm_dropin.py](drop_in/routellm_dropin.py)** | Drop-in `langchain-core` `RunnableLambda` cascade router with character-typo resilience and online learning ([guide](../docs/drop_in/02_routellm_cascade.md)). |
+| **[drop_in/prompt_guard_dropin.py](drop_in/prompt_guard_dropin.py)** | Sub-millisecond prompt-injection & negation-polarity gate (`0.0%` `NotInject` benign false-positive rate) ([guide](../docs/drop_in/04_prompt_guard_security.md)). |
+| **[drop_in/llm_cutover_dropin.py](drop_in/llm_cutover_dropin.py)** | End-to-end 3-wave progression from `0` examples $\to$ online learning $\to$ compiled `.s1m` cutover with `0` teacher calls ([guide](../docs/drop_in/05_llm_observe_and_cutover.md)). |
 
 ```bash
+python examples/showcase_break_and_teach.py
+python examples/drop_in/instructor_structured_dropin.py
+python examples/drop_in/semantic_router_dropin.py
+python examples/drop_in/routellm_dropin.py
+python examples/drop_in/prompt_guard_dropin.py
+python examples/drop_in/llm_cutover_dropin.py
+```
+
+---
+
+## 2. Core Skill Teaching & Verification Workflows
+
+The core lifecycle is **teach → check a candidate → adopt → run locally → correct** ([correction guide](../docs/guides/correcting_skills.md), [teaching guide](../docs/guides/training_experts.md)).
+
+| Example | What It Demonstrates |
+| :--- | :--- |
+| **[teach_skill.py](teach_skill.py)** | Minimal 8-lesson skill compilation, reload, and CLI inspection ([beginner walkthrough](../docs/guides/first_skill.md)). |
+| **[support_triage.py](support_triage.py)** | Taught department routing, split-conformal calibration, and saved/reloaded `.s1m` evaluation. |
+| **[banking_support.py](banking_support.py)** | Three `BANKING77` intents evaluated using original public labels. |
+| **[model_routing.py](model_routing.py)** | Stated model-complexity routing policy (`local_small` / `standard_chat` / `frontier_reasoning`). |
+| **[agent_guard.py](agent_guard.py)** | Operation classification paired with explicit `PolicyEngine` permissions and Ed25519 audit receipts. |
+| **[observe_routing.py](observe_routing.py)** | Automatic teacher observation, statistical promotion gate, and offline `.s1m` reuse. |
+| **[train_expert.py](train_expert.py)** | Programmatic compilation, online `learn()` updates, and multi-head composition. |
+| **[teaching_by_doing/](teaching_by_doing/README.md)** | Browser workspace for interactive lesson editing, candidate assessment, and explicit adoption. |
+| **[inbox_zero/](inbox_zero/README.md)** | Local HTTP classification pilot for Inbox Zero's 7 email categories. |
+| **[teaching/](teaching/README.md)** | Datasets and recorded evaluation outputs for the core teaching scripts. |
+
+```bash
+python examples/teach_skill.py
 python examples/support_triage.py
 python examples/observe_routing.py
 python examples/banking_support.py
 ```
-
-[Teaching data/results](teaching/README.md) report accepted accuracy and review
-rates separately. The [public-workload runner](../benchmarks/quality/workloads/README.md)
-adds six assistant intents, SMS and actual Jev/Gemini takeover with offline replay.
-No live credentials are needed for the commands above.
-
-The separate [real-document workflow test](../benchmarks/quality/document_workflow/README.md)
-uses published BBC topic labels as simulated feedback, not the fictional folders
-from the browser demo. Targeted lessons reduced accepted mistakes with more
-review; no candidate passed the default adoption gates. The report retains the
-ordinary-addition control and full failure evidence. It does not qualify the
-demo's filing policy on real office documents.
-
-## API and experimental demonstrations
-
-| Example | Scope and evidence boundary |
-|---|---|
-| [n8n development workflow](../benchmarks/quality/n8n_gauntlet/N8N.md) | Importable workflow with local decisions, item pairing and review; its full-scope quality gauntlet remains unqualified |
-| [core_standalone_evaluator.py](core_standalone_evaluator.py) | NumPy-only core and typed outputs; sample predictions are not a quality benchmark |
-| [train_expert.py](train_expert.py) | Legacy name for synthetic/supplied examples, correction and composition; these are optional teaching mechanisms |
-| [four_levers_benchmark.py](four_levers_benchmark.py) | Cache, online correction, margins and numerical telemetry; repeated scripted feedback is not generalization evidence |
-| [typesafe_sdk_dropin_showcase.py](typesafe_sdk_dropin_showcase.py) | Local SDK calls, patching, async access and optional comparison; only the documented SDK surface is supported |
-| [auto_cutover_showcase.py](auto_cutover_showcase.py) | Legacy augmented/relaxed-promotion simulation; clinical/financial schemas are unvalidated illustrations |
-| [autonomous_agent_firewall_showcase.py](autonomous_agent_firewall_showcase.py) | Multi-field observation, concurrency and audit; default lookup teacher and WAN timings are simulated, with relaxed promotion settings |
-| [enterprise_stress_showcase.py](enterprise_stress_showcase.py) | Alternate entry point for the same firewall demonstration |
-| [jev_comparison_demos.py](jev_comparison_demos.py) | Local multi-field schemas; does not establish general Jev parity |
-| [deep_jev_benchmark.py](deep_jev_benchmark.py) | Optional HTTP comparison harness; successful calls and failed requests are distinguished, no observed-skill qualification |
-| [killer_use_cases_live_test.py](killer_use_cases_live_test.py) | A few typed-schema scenarios with optional live comparisons, not validated domain specialists |
-| [paperclips_typesafe_dropin.py](paperclips_typesafe_dropin.py) | Structured game-state adapter, actual returned distributions and optional observation; no verified real-game completion |
-
-Cloud modes require explicit configuration and may make billable calls. Prefer
-`observe_routing.py` and the workload runner for normal promotion evidence. A
-statistical action label in any example does not itself grant a tool permission.
-
-## Gaming and emulation
-
-| Example | Actual control path |
-|---|---|
-| [gaming/pokemon_battle_system1.py](gaming/pokemon_battle_system1.py) | Default immediate-damage/healing rules; supplied engines or saved skills can control strategy, with legal-action checks |
-| [gaming/pokemon_full_campaign_speedrun.py](gaming/pokemon_full_campaign_speedrun.py) | Scripted route/level progression, battle integration and real adapter promotion state |
-| [gaming/pokemon_gameboy_gui.py](gaming/pokemon_gameboy_gui.py) | Optional RAM advisor, navigation scripts and partial action-to-button mapping |
-| [gaming/pokemon_all_games_benchmark.py](gaming/pokemon_all_games_benchmark.py) | Optional cartridge/emulator throughput and decision measurements, not game completion |
-| [gaming/pokemon_kaizo_speedrun.py](gaming/pokemon_kaizo_speedrun.py) | Scripted milestones and damage-risk heuristic; no fitted conformal calibration or taught decision model |
-| [gaming/pokemon_showdown_system1.py](gaming/pokemon_showdown_system1.py) | Damage heuristic and minimax fallback, mock/WebSocket transport; opponent-update helper is not called by the supplied loops |
-| [gaming/paperclips_speedrun.py](gaming/paperclips_speedrun.py) | Handwritten three-phase policy with accelerated mock and optional Playwright controller |
-| [gaming/teach_paperclips_wire.py](gaming/teach_paperclips_wire.py) | Teach, save and check one numeric restocking skill; [live demonstration and limitations](gaming/PAPERCLIPS_TEACHING.md) |
-| [gaming/snake_arena/](gaming/snake_arena/README.md) | Three-player GUI: taught System1 skill vs real Laya-MLX and Jev; timed/equal-move runs, explicit planner hints and optional shield; [recordings and results](gaming/snake_arena/RESULTS.md) |
-| [gaming/pokemon_teaching/](gaming/pokemon_teaching/README.md) | Two taught battle skills, isolated healing correction, real Red/Blue potion control and paired save-state evidence |
-| [gaming/skill_playground/](gaming/skill_playground/README.md) | Three taught skills, live terrain correction, held-out mission composition and measured single-model/rules baselines |
-| [gaming/__init__.py](gaming/__init__.py) | Package marker |
-
-See [game commands and limits](../docs/SPEEDRUN_SHOWDOWN_WORLD_RECORDS.md).
-The [frozen first-use cases](../benchmarks/quality/zero_shot/README.md) distinguish
-rule-based improvements from raw model quality. ROMs are not included; live
-browser play, public ladder results and complete model-controlled campaigns have
-not been established by these evaluations.

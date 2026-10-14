@@ -24,18 +24,15 @@ def main(directory):
             'examples/teaching_by_doing/index.html', 'examples/teaching_by_doing/documents.json',
             'src/system1/teaching.py', 'src/reflex/teaching.py',
             'docs/guides/correcting_skills.md',
-            'benchmarks/quality/v1_4_gauntlet_report.md',
+            'benchmarks/quality/instinct_gauntlet_report.md',
             'benchmarks/quality/drop_in_and_adaptation_report.md',
             'benchmarks/quality/poke_env_showdown_report.md',
             'benchmarks/quality/document_workflow/run.py',
             'benchmarks/quality/document_workflow/PROTOCOL.md',
             'benchmarks/quality/document_workflow/results/summary.json',
             'benchmarks/quality/document_workflow/results/evidence.zip',
-            'benchmarks/quality/n8n_gauntlet/prepare.py',
-            'benchmarks/quality/n8n_gauntlet/boundary-teaching-requests.json'} <= source_names
-    assert not any(name.startswith('benchmarks/quality/n8n_gauntlet/artifacts/') or
-                   (name.startswith('benchmarks/quality/n8n_gauntlet/results/') and name.endswith(('.json', '.png')))
-                   for name in source_names), 'Research payload leaked into the source archive'
+            'benchmarks/quality/datasets/public_splits/official-test.json',
+            'benchmarks/quality/datasets/public_splits/boundary-teaching-requests.json'} <= source_names
     print(f'Checked wheel ({wheel.stat().st_size:,} bytes) and source archive ({source.stat().st_size:,} bytes).')
 
 

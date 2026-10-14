@@ -43,9 +43,9 @@ from system1 import (
 
 def _load_committed_dataset_splits(dataset_key: str, max_classes: int = 24) -> Tuple[List[str], Dict[str, List[str]], List[Tuple[str, str]]]:
     """Loads disjoint train pool and held-out test split from committed benchmark files."""
-    ot_path = REPO_ROOT / "benchmarks" / "quality" / "n8n_gauntlet" / "results" / "official-test.json"
-    bt_path = REPO_ROOT / "benchmarks" / "quality" / "n8n_gauntlet" / "results" / "boundary-teaching" / "lessons.json"
-    req_path = REPO_ROOT / "benchmarks" / "quality" / "n8n_gauntlet" / "boundary-teaching-requests.json"
+    ot_path = REPO_ROOT / "benchmarks" / "quality" / "datasets" / "public_splits" / "official-test.json"
+    bt_path = REPO_ROOT / "benchmarks" / "quality" / "datasets" / "public_splits" / "boundary-teaching-lessons.json"
+    req_path = REPO_ROOT / "benchmarks" / "quality" / "datasets" / "public_splits" / "boundary-teaching-requests.json"
 
     ot_data = json.loads(ot_path.read_text(encoding="utf-8"))
     bt_lessons = json.loads(bt_path.read_text(encoding="utf-8"))["lessons"]
@@ -482,7 +482,7 @@ def generate_markdown_report(report: Dict[str, Any]) -> str:
         "",
         "Compares **System 1: Instinct (`0` neural weights)** against both a **Classical Linear Baseline (Unigram TF-IDF)**",
         "and standard **Pretrained Neural Embedding Routers (`all-MiniLM-L6-v2` and `BAAI/bge-small-en-v1.5` via ONNX)**",
-        "on the exact same held-out splits from the [6-category benchmark gauntlet](v1_4_gauntlet_report.md):",
+        "on the exact same held-out splits from the [6-category benchmark gauntlet](instinct_gauntlet_report.md):",
         "",
         "| Router Architecture | Model / Artifact Size | `BANKING77` (32c Clean) | `BANKING77` (32c Typo Stress) | `CLINC150-OOS` False Accept | Negation / Polarity Acc | P50 CPU Latency | `<1 ms` Online RLS Update |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",

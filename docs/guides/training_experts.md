@@ -217,12 +217,6 @@ examples outside both files. Explicit teaching and calibration inputs must be
 disjoint. A Python `calibration_split=0` produces an uncalibrated skill;
 strict mode then asks for review.
 
-For a concrete numeric example, run
-`python examples/gaming/teach_paperclips_wire.py` from the repository root.
-Its [lesson file](../../examples/teaching/paperclips_wire.json) teaches the same
-question with different wire supplies; its [walkthrough](../../examples/gaming/PAPERCLIPS_TEACHING.md)
-shows the saved skill, a supervised live purchase, and the remaining boundary errors.
-
 Measure raw accuracy, accepted errors and acceptance coverage separately.
 Low raw accuracy points to the learned decision or input representation; more
 calibration alone cannot correct the chosen labels. High raw accuracy with low

@@ -238,9 +238,9 @@ def run_real_clinc150_head_to_head() -> Dict[str, Any]:
     """Runs unmodified `semantic_router.routers.SemanticRouter` vs `InstinctRouteLayer`
     on the real 24-intent `CLINC150-OOS` dataset (144 in-scope + 120 OOS queries).
     """
-    ot_data = json.loads((REPO_ROOT / "benchmarks/quality/n8n_gauntlet/results/official-test.json").read_text())
-    bt_lessons = json.loads((REPO_ROOT / "benchmarks/quality/n8n_gauntlet/results/boundary-teaching/lessons.json").read_text())["lessons"]
-    bt_reqs = json.loads((REPO_ROOT / "benchmarks/quality/n8n_gauntlet/boundary-teaching-requests.json").read_text())["requests"]
+    ot_data = json.loads((REPO_ROOT / "benchmarks/quality/datasets/public_splits/official-test.json").read_text())
+    bt_lessons = json.loads((REPO_ROOT / "benchmarks/quality/datasets/public_splits/boundary-teaching-lessons.json").read_text())["lessons"]
+    bt_reqs = json.loads((REPO_ROOT / "benchmarks/quality/datasets/public_splits/boundary-teaching-requests.json").read_text())["requests"]
 
     clinc_test: Dict[str, List[str]] = {}
     oos_queries: List[str] = []

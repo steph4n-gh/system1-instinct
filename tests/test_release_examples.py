@@ -13,13 +13,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_readme_and_policy_quickstarts_run_outside_checkout(tmp_path):
-    # Follow the README's first lesson before reopening its saved skill.
+    # Follow the first lesson before reopening its saved skill.
     taught = subprocess.run(
         [sys.executable, str(ROOT / 'examples/teach_skill.py')], cwd=tmp_path,
         capture_output=True, text=True, timeout=30,
     )
     assert taught.returncode == 0, taught.stderr
-    for page, expected in [('README.md', 'Needs review: True'),
+    for page, expected in [('docs/guides/training_experts.md', 'Needs review: True'),
                            ('docs/guides/policy_guard.md', 'system1-demo')]:
         blocks = re.findall(r"```python\n(.*?)```", (ROOT / page).read_text(), re.S)
         for _ in range(2):  # Saved uncertainty and persistent signing identity survive reuse.

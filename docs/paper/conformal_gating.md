@@ -3,7 +3,7 @@
 **System 1: Instinct 1.0.0 · 14 October 2026 · Implementation notes, not new theorems**
 
 This note describes the runtime mathematics in
-**System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)) and the assumptions needed to interpret it,
+**System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)) and the assumptions needed to interpret it,
 including Mondrian class-conditional calibration, dual OOD familiarity and prototype similarity gating, the teaching workflow, and calibration-preserving online RLS updates. The [whitepaper](system1_whitepaper.md) contains the
 product evaluation; the [architecture reference](../architecture/technical_specification.md)
 maps behavior to code. Earlier claims of guaranteed safe execution, universal
@@ -254,15 +254,12 @@ Restoration does not recompute an online update or make old qualification data f
 
 ## 5. Reading the evidence
 
-The [three-workload report](../../benchmarks/quality/workloads/README.md) records
+The [three-workload report](../../benchmarks/quality/workloads/README.md) and
+[6-category benchmark gauntlet](../../benchmarks/quality/instinct_gauntlet_report.md) record
 measured quality, errors, timings, baseline behavior and failed takeovers.
-It does not experimentally prove exchangeability or the conditions of the
+They do not experimentally prove exchangeability or the conditions of the
 prototype identity. Deterministic tool permissions and signed audit records are
 separate software mechanisms; see [deployment boundaries](../deployment.md).
-The [n8n gauntlet](../../benchmarks/quality/n8n_gauntlet/README.md) is a separate
-selective-classification experiment with learned review policies and failed
-quality gates. Its development scores are not conformal guarantees or independent
-confirmation of accepted correctness or unfamiliar-input rejection.
 
 The new session's adoption checks are an explicit empirical policy over recurring
 development cases: raw accuracy, acceptance coverage, accepted-error count and

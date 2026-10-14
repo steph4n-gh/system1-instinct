@@ -1,4 +1,3 @@
-# Keep the research evidence, while making the implementation diff reviewable.
-benchmarks/quality/n8n_gauntlet/artifacts/** linguist-generated=true
-benchmarks/quality/n8n_gauntlet/results/** linguist-generated=true
-benchmarks/quality/n8n_gauntlet/results/*.md linguist-generated=false
+# Keep generated dataset splits collapsed in GitHub diffs.
+benchmarks/quality/datasets/public_splits/** linguist-generated=true
+benchmarks/results/** linguist-generated=true

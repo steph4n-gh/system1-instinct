@@ -1600,7 +1600,9 @@ class SystemOneEngine:
                     self.cache.invalidate_prior_versions(self.model_version)
             return res_info
 
-    # Cognitive dual-process and execution pipeline aliases
+    # Primary learning entrypoints (application context, execution outcomes, or teacher fallback)
+    learn = learn_from_tier2
+    learn_from_outcome = learn_from_tier2
     learn_from_system2 = learn_from_tier2
     learn_from_tier3 = learn_from_tier2
 
