@@ -1145,6 +1145,8 @@ class CompiledSystemOneModel:
                 "forgetting_factor": self.forgetting_factor,
                 "recency_weighted": self.recency_weighted,
             }
+            # Loaded metadata may describe lessons that have since been cleared.
+            serialized_meta.pop("learned_prompt_overrides", None)
             if self._learned_prompt_overrides:
                 serialized_meta["learned_prompt_overrides"] = {
                     p_k: {

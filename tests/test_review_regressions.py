@@ -11,7 +11,7 @@ import pytest
 from system1 import BooleanField, BoundedReviewFallback, ChoiceField, DecisionSchema, ScoreField, SystemOneEngine
 from system1.cache import SemanticSystemOneCache
 from system1.compiler import CompiledHeadWeights, CompiledSystemOneModel
-from system1.core.model import DecisionFieldHead
+from system1.core.model import DecisionFieldHead, DeterministicSemanticProjector
 from system1.core.text import TfidfProjector
 
 
@@ -562,4 +562,126 @@ def test_solve_ridge_and_logistic_n_lt_d_augment_false_exact_match():
     assert np.allclose(weights, Wb_ref[:-1, :].T, atol=1e-5)
     assert np.allclose(biases, Wb_ref[-1, :], atol=1e-5)
     assert np.allclose(P, cov_ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("warm_with_lesson", [False, True])
+def test_cache_resolves_default_recency_before_lookup_and_learning(warm_with_lesson):
+    schema = DecisionSchema(fields={"route": ChoiceField(options=["refund", "password"])})
+    projector = DeterministicSemanticProjector(dimension=32, recency_weighted=True)
+    prompt = "refund payment invoice password login reset"
+    recent = projector.project(prompt, recency_weighted=True)
+    uniform = projector.project(prompt, recency_weighted=False)
+    recent /= np.linalg.norm(recent)
+    uniform /= np.linalg.norm(uniform)
+    # Separate the two real feature vectors so a context collision flips the label.
+    weight = 20 * (recent - uniform) / np.dot(recent - uniform, recent - uniform)
+    bias = -float(weight @ ((recent + uniform) / 2))
+    head = CompiledHeadWeights(
+        "route", "choice", np.stack([weight, -weight]), np.array([bias, -bias], dtype=np.float32),
+        options=("refund", "password"), score_method="lac", calibration_scores=(0.1,) * 20,
+    )
+    model = CompiledSystemOneModel(schema, {"route": head}, dimension=32,
+                                  projector=projector, recency_weighted=True)
+    engine = SystemOneEngine(schema, model=model, strict_mode=True, backend="numpy")
+    if warm_with_lesson:
+        engine.learn(prompt, {"route": "refund"})
+    default = engine.decide(prompt, record_receipt=False)
+    assert default.values == {"route": "refund"} and not default.is_ambiguous
+    other = engine.decide(prompt, recency_weighted=False, record_receipt=False)
+    explicit_default = engine.decide(prompt, recency_weighted=True, record_receipt=False)
+    assert explicit_default.is_cache_hit
+    engine.use_cache = False
+    uncached = engine.decide(prompt, recency_weighted=False, record_receipt=False)
+    assert not other.is_cache_hit
+    assert other.values == uncached.values
+    if not warm_with_lesson:
+        assert other.values == {"route": "password"}
+    assert other.probabilities == uncached.probabilities
+    assert other.is_ambiguous == uncached.is_ambiguous
+
+
+@pytest.mark.parametrize("telemetry", [{"risk": 1.0}, [1.0], np.array([1.0])])
+def test_semantic_cache_requires_matching_telemetry_values(telemetry):
+    cache = SemanticSystemOneCache()
+    vector = np.array([1.0, 0.0], dtype=np.float32)
+    cache.put("old prompt", {"state": "old"}, embedding=vector, telemetry=telemetry)
+    changed = {"risk": 2.0} if isinstance(telemetry, dict) else [2.0]
+    assert cache.get("new prompt", embedding=vector, telemetry=changed) is None
+    # Semantic reuse within the same observed state is still supported.
+    hit = cache.get("new prompt", embedding=vector, telemetry=telemetry)
+    assert hit is not None and hit[0].result == {"state": "old"}
+
+
+@pytest.mark.parametrize("setting", ["margin_threshold", "confidence_floor_tau0"])
+def test_cache_distinguishes_automatic_acceptance_gate_from_zero(setting):
+    schema = DecisionSchema(fields={"route": ChoiceField(options=["refund", "password"])})
+    head = CompiledHeadWeights(
+        "route", "choice", np.zeros((2, 2), dtype=np.float32),
+        0.25 * np.log(np.array([0.8, 0.2], dtype=np.float32)), options=("refund", "password"),
+        margin_threshold=0.2, confidence_floor_tau0=0.4,
+    )
+    model = CompiledSystemOneModel(schema, {"route": head}, dimension=2,
+                                  projector=TfidfProjector(("refund", "password"), (1.0, 1.0)))
+    engine = SystemOneEngine(schema, model=model, backend="numpy",
+                            confidence_floor_tau0=None if setting == "confidence_floor_tau0" else 0.15)
+    accepted_kwargs = {setting: 0.0} if setting == "confidence_floor_tau0" else {}
+    review_kwargs = {setting: 0.0} if setting == "margin_threshold" else {}
+    accepted = engine.decide("refund", record_receipt=False, **accepted_kwargs)
+    assert not accepted.is_ambiguous and accepted.margin_gate_active["route"]
+    result = engine.decide("refund", record_receipt=False, **review_kwargs)
+    engine.use_cache = False
+    uncached = engine.decide("refund", record_receipt=False, **review_kwargs)
+    assert uncached.is_ambiguous and not uncached.margin_gate_active["route"]
+    assert result.is_ambiguous == uncached.is_ambiguous
+    assert result.margin_gate_active == uncached.margin_gate_active
+    assert not result.is_cache_hit
+
+
+def test_hot_reload_discards_retired_lessons_and_keeps_model_version(tmp_path):
+    schema = DecisionSchema(fields={"route": ChoiceField(options=["refund", "password"])})
+    projector = TfidfProjector(("refund", "password"), (1.0, 1.0))
+    head = CompiledHeadWeights("route", "choice", np.eye(2, dtype=np.float32),
+                              np.zeros(2, dtype=np.float32), options=("refund", "password"))
+    replacement = CompiledSystemOneModel(schema, {"route": head}, dimension=2, projector=projector)
+    path = tmp_path / "skill.s1m"
+    replacement.save(path)
+    engine = SystemOneEngine(schema, model_path=path, auto_reload=True, backend="numpy",
+                            strict_mode=True)
+    engine.learn("zxqv", {"route": "password"})
+    assert not engine.decide("zxqv", record_receipt=False).is_ambiguous
+    previous_version = engine.model_version
+    replacement.learn("different oov prompt", {"route": "refund"})
+    replacement.save(path)
+    assert engine.reload_if_changed()
+    version = engine.model_version
+    assert version > previous_version
+    fresh = SystemOneEngine(schema, model_path=path, strict_mode=True, backend="numpy", use_cache=False)
+    for prompt in ("zxqv", "different oov prompt"):
+        result = engine.decide(prompt, record_receipt=False)
+        expected = fresh.decide(prompt, record_receipt=False)
+        assert result.values == expected.values
+        assert result.is_ambiguous == expected.is_ambiguous
+        assert result.conformal_sets == expected.conformal_sets
+        assert engine.model_version == engine.model.model_version == version
+    restored = SystemOneEngine.from_bytes(engine.to_bytes(), backend="numpy")
+    assert "zxqv" not in restored.model._learned_prompt_overrides
+    assert restored.model._learned_prompt_overrides == replacement._learned_prompt_overrides
+
+
+def test_cleared_lesson_is_not_resurrected_from_saved_metadata():
+    schema = DecisionSchema(fields={"route": ChoiceField(options=["refund", "password"])})
+    engine = SystemOneEngine(schema, dimension=32, backend="numpy", strict_mode=True, use_cache=False)
+    prompt = "refund payment invoice"
+    engine.learn(prompt, {"route": "refund"})
+    engine = SystemOneEngine.from_bytes(engine.to_bytes(), backend="numpy", use_cache=False)
+    engine.learn_from_tier2(prompt, {"route": "password"}, preserve_calibration=False)
+    assert not engine.model._learned_prompt_overrides
+    expected = engine.decide(prompt, record_receipt=False)
+    for _ in range(2):
+        engine = SystemOneEngine.from_bytes(engine.to_bytes(), backend="numpy", use_cache=False)
+        assert not engine.model._learned_prompt_overrides
+        actual = engine.decide(prompt, record_receipt=False)
+        assert actual.values == expected.values
+        assert actual.is_ambiguous == expected.is_ambiguous
+        assert actual.conformal_sets == expected.conformal_sets
 
