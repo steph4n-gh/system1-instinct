@@ -1,0 +1,10 @@
+{
+  "runner_revision": "87379662ed4fff9e5c8d4948781ac9787b9b07e8",
+  "noise_seed": 17,
+  "method": "instinct_hybrid",
+  "stage": "save/load parity after development and qualification inference",
+  "exception": "ValueError: Saved skill header exceeds size limit",
+  "final_inference_started": false,
+  "final_answers_scored": false,
+  "resolution": "Harness-only pre-score amendment retained deployment failures and evaluated the full hybrid model in memory; protocol settings were unchanged."
+}

@@ -544,6 +544,8 @@ def generate_markdown_report(report: Dict[str, Any]) -> str:
     lines = [
         "# System 1: Instinct (`1.0.0`) — Adaptation Curves, Neural Baseline Comparison & Drop-In Verification",
         "",
+        "**Interpretation:** End-to-end curves use an oracle fallback. Flywheel comparisons teach and replay evaluated prompts; they do not measure fresh generalization with a fallible teacher or match methods at a 1% local error budget. See the [fresh noisy-teacher comparison](../heldout_traffic/REPORT.md).",
+        "",
         "## 1. Public Benchmark Adaptation Curves (`BANKING77` & `CLINC150`)",
         "",
         "Evaluated on held-out public intent datasets (`BANKING77` and `CLINC150`). Starts from **`0` training examples**",

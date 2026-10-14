@@ -1,0 +1,112 @@
+{
+  "data": {
+    "classes": [
+      "alarm_query",
+      "alarm_remove",
+      "alarm_set",
+      "audio_volume_down",
+      "audio_volume_mute",
+      "audio_volume_up",
+      "calendar_query",
+      "calendar_remove",
+      "calendar_set",
+      "cooking_recipe",
+      "datetime_convert",
+      "datetime_query",
+      "email_addcontact",
+      "email_query",
+      "email_querycontact",
+      "email_sendemail",
+      "general_affirm",
+      "general_commandstop",
+      "general_confirm",
+      "general_dontcare",
+      "general_explain",
+      "general_joke",
+      "general_negate",
+      "general_praise",
+      "general_quirky",
+      "general_repeat",
+      "iot_cleaning",
+      "iot_coffee",
+      "iot_hue_lightchange",
+      "iot_hue_lightdim",
+      "iot_hue_lightoff",
+      "iot_hue_lighton",
+      "iot_hue_lightup",
+      "iot_wemo_off",
+      "iot_wemo_on",
+      "lists_createoradd",
+      "lists_query",
+      "lists_remove",
+      "music_likeness",
+      "music_query",
+      "music_settings",
+      "news_query",
+      "play_audiobook",
+      "play_game",
+      "play_music",
+      "play_podcasts",
+      "play_radio",
+      "qa_currency",
+      "qa_definition",
+      "qa_factoid",
+      "qa_maths",
+      "qa_stock",
+      "recommendation_events",
+      "recommendation_locations",
+      "recommendation_movies",
+      "social_post",
+      "social_query",
+      "takeaway_order",
+      "takeaway_query",
+      "transport_query",
+      "transport_taxi",
+      "transport_ticket",
+      "transport_traffic",
+      "weather_query"
+    ],
+    "cohorts": {
+      "calibrate": {
+        "count": 640,
+        "ids_sha256": "4d74b9cc19c1dd61f043e6e494ff35926163865d3ac3cb95ca83ef8e8d033caa"
+      },
+      "dev": {
+        "count": 1006,
+        "ids_sha256": "6ba1a59b0c5b43968070a9d6005ec763f897a89ef97b417b2b95279c643e922b"
+      },
+      "qualify": {
+        "count": 7031,
+        "ids_sha256": "ba12590cdbca980fa0ee1ce719aac9b17333e63206fa0be337875f8adc6ad784"
+      },
+      "teach": {
+        "count": 1280,
+        "ids_sha256": "7a3376448e8580398b0f4b15f435b801ee3d827084b4250f3d990a2a51a4b9d8"
+      },
+      "test": {
+        "count": 1076,
+        "ids_sha256": "30331ef7488d909ba9c76c281af553a8ee9af6bfa5e13bdbbbb264ea06777e5a"
+      }
+    },
+    "collapsed_duplicate_rows": 73,
+    "dropped_conflicting_rows": 0,
+    "dropped_shared_rows": 0,
+    "source_counts": {
+      "test": 1076,
+      "train": 8954,
+      "valid": 1076
+    }
+  },
+  "environment": {
+    "machine": "arm64",
+    "numpy": "2.5.4",
+    "platform": "macOS-27.0-arm64-arm-64bit",
+    "python": "3.12.9 (main, Feb 12 2025, 15:09:19) [Clang 19.1.6 ]",
+    "scipy": "1.18.1",
+    "sklearn": "1.7.2"
+  },
+  "inputs_sha256": "b74dde80134de327bfb5e65e4a5acea381a94b908fc61917a91da77d4bf65f0c",
+  "protocol_sha256": "14399aefe0d4fd306706289f03eddef6f8aaceb729dab84a916b73e4ae3a624a",
+  "revision": "a660f1e1c59a25eace725c5dd6b2a7bc97f2308f",
+  "runtime_base": "0b1072453749855f78669b73c54b938959627e3a"
+}

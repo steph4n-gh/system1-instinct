@@ -1,0 +1,162 @@
+{
+  "exact_cache:101": {
+    "delta": 0.0025,
+    "qualification_count": 0,
+    "qualification_errors": 0,
+    "qualification_upper_bound": 1.0,
+    "qualified": false,
+    "threshold": null
+  },
+  "exact_cache:17": {
+    "delta": 0.0025,
+    "qualification_count": 0,
+    "qualification_errors": 0,
+    "qualification_upper_bound": 1.0,
+    "qualified": false,
+    "threshold": null
+  },
+  "exact_cache:29": {
+    "delta": 0.0025,
+    "qualification_count": 0,
+    "qualification_errors": 0,
+    "qualification_upper_bound": 1.0,
+    "qualified": false,
+    "threshold": null
+  },
+  "exact_cache:43": {
+    "delta": 0.0025,
+    "qualification_count": 0,
+    "qualification_errors": 0,
+    "qualification_upper_bound": 1.0,
+    "qualified": false,
+    "threshold": null
+  },
+  "exact_cache:71": {
+    "delta": 0.0025,
+    "qualification_count": 0,
+    "qualification_errors": 0,
+    "qualification_upper_bound": 1.0,
+    "qualified": false,
+    "threshold": null
+  },
+  "instinct_hybrid:101": {
+    "delta": 0.0025,
+    "qualification_count": 1012,
+    "qualification_errors": 35,
+    "qualification_upper_bound": 0.05394274515968336,
+    "qualified": false,
+    "threshold": 0.9962423079424857
+  },
+  "instinct_hybrid:17": {
+    "delta": 0.0025,
+    "qualification_count": 1112,
+    "qualification_errors": 37,
+    "qualification_upper_bound": 0.051318948733702234,
+    "qualified": false,
+    "threshold": 0.994917873170911
+  },
+  "instinct_hybrid:29": {
+    "delta": 0.0025,
+    "qualification_count": 909,
+    "qualification_errors": 24,
+    "qualification_upper_bound": 0.04503627123361727,
+    "qualified": false,
+    "threshold": 0.9970470614354646
+  },
+  "instinct_hybrid:43": {
+    "delta": 0.0025,
+    "qualification_count": 1292,
+    "qualification_errors": 46,
+    "qualification_upper_bound": 0.052586736538513236,
+    "qualified": false,
+    "threshold": 0.9889233620646378
+  },
+  "instinct_hybrid:71": {
+    "delta": 0.0025,
+    "qualification_count": 1350,
+    "qualification_errors": 38,
+    "qualification_upper_bound": 0.043239208659980335,
+    "qualified": false,
+    "threshold": 0.9901686924322878
+  },
+  "instinct_lexical:101": {
+    "delta": 0.0025,
+    "qualification_count": 0,
+    "qualification_errors": 0,
+    "qualification_upper_bound": 1.0,
+    "qualified": false,
+    "threshold": null
+  },
+  "instinct_lexical:17": {
+    "delta": 0.0025,
+    "qualification_count": 0,
+    "qualification_errors": 0,
+    "qualification_upper_bound": 1.0,
+    "qualified": false,
+    "threshold": null
+  },
+  "instinct_lexical:29": {
+    "delta": 0.0025,
+    "qualification_count": 0,
+    "qualification_errors": 0,
+    "qualification_upper_bound": 1.0,
+    "qualified": false,
+    "threshold": null
+  },
+  "instinct_lexical:43": {
+    "delta": 0.0025,
+    "qualification_count": 0,
+    "qualification_errors": 0,
+    "qualification_upper_bound": 1.0,
+    "qualified": false,
+    "threshold": null
+  },
+  "instinct_lexical:71": {
+    "delta": 0.0025,
+    "qualification_count": 563,
+    "qualification_errors": 21,
+    "qualification_upper_bound": 0.06556892621388064,
+    "qualified": false,
+    "threshold": 0.9835215425564686
+  },
+  "simple_classifier:101": {
+    "delta": 0.0025,
+    "qualification_count": 814,
+    "qualification_errors": 10,
+    "qualification_upper_bound": 0.0275522193777101,
+    "qualified": false,
+    "threshold": 0.8059982272255931
+  },
+  "simple_classifier:17": {
+    "delta": 0.0025,
+    "qualification_count": 674,
+    "qualification_errors": 6,
+    "qualification_upper_bound": 0.02460030677788409,
+    "qualified": false,
+    "threshold": 0.8235098121413983
+  },
+  "simple_classifier:29": {
+    "delta": 0.0025,
+    "qualification_count": 1164,
+    "qualification_errors": 15,
+    "qualification_upper_bound": 0.025205493963167725,
+    "qualified": false,
+    "threshold": 0.7349840817063427
+  },
+  "simple_classifier:43": {
+    "delta": 0.0025,
+    "qualification_count": 1477,
+    "qualification_errors": 35,
+    "qualification_upper_bound": 0.03707740114320202,
+    "qualified": false,
+    "threshold": 0.6867054516746253
+  },
+  "simple_classifier:71": {
+    "delta": 0.0025,
+    "qualification_count": 1201,
+    "qualification_errors": 13,
+    "qualification_upper_bound": 0.022184364412738678,
+    "qualified": false,
+    "threshold": 0.7381933895946067
+  }
+}

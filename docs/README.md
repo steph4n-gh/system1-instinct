@@ -42,6 +42,7 @@ Start with a real, runnable procedure in **[docs/drop_in/README.md](drop_in/READ
 
 | Document | Scope |
 | :--- | :--- |
+| [Fresh Traffic with a Fallible Teacher](../benchmarks/heldout_traffic/REPORT.md) | HWU64, 10% noisy lessons, matched 1% local error budget, exact cache/classifier/Instinct comparison, frozen gates and independent verification; negative result |
 | [6-Category Benchmark Gauntlet](../benchmarks/quality/instinct_gauntlet_report.md) | `BANKING77` (32/77), `CLINC150-OOS`, `NotInject`, authored drift probes, 4-field extraction, and 0-shot routing |
 | [Drop-In & Adaptation Curve Report](../benchmarks/quality/drop_in_and_adaptation_report.md) | `0`-shot $\to$ `adapt_zero_shot` $\to$ `1`-shot $\to$ `3`-shot $\to$ `5`-shot $\to$ `.s1m` curves on `BANKING77` & `CLINC150` |
 | [`poke-env` Showdown Benchmark Report](../benchmarks/quality/poke_env_showdown_report.md) | Live `gen9randombattle` Showdown results against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer` |

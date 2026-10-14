@@ -1,0 +1,1725 @@
+{
+  "assumptions": [
+    "public in-scope simulation, not production/timestamped traffic",
+    "exchangeability, not drift guarantee",
+    "1% locally accepted error; fallback can still be wrong",
+    "repeat diagnostics do not qualify fresh gates"
+  ],
+  "comparisons": {
+    "instinct_hybrid": {
+      "bootstrap_95": [
+        0.0,
+        0.0
+      ],
+      "earns_complexity": false,
+      "mean_coverage_gain": 0.0,
+      "observed_budget_miss_seeds": [],
+      "per_seed_gain": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "seeds_with_5pp_gain": 0
+    },
+    "instinct_lexical": {
+      "bootstrap_95": [
+        0.0,
+        0.0
+      ],
+      "earns_complexity": false,
+      "mean_coverage_gain": 0.0,
+      "observed_budget_miss_seeds": [],
+      "per_seed_gain": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "seeds_with_5pp_gain": 0
+    }
+  },
+  "dataset": {
+    "classes": [
+      "alarm_query",
+      "alarm_remove",
+      "alarm_set",
+      "audio_volume_down",
+      "audio_volume_mute",
+      "audio_volume_up",
+      "calendar_query",
+      "calendar_remove",
+      "calendar_set",
+      "cooking_recipe",
+      "datetime_convert",
+      "datetime_query",
+      "email_addcontact",
+      "email_query",
+      "email_querycontact",
+      "email_sendemail",
+      "general_affirm",
+      "general_commandstop",
+      "general_confirm",
+      "general_dontcare",
+      "general_explain",
+      "general_joke",
+      "general_negate",
+      "general_praise",
+      "general_quirky",
+      "general_repeat",
+      "iot_cleaning",
+      "iot_coffee",
+      "iot_hue_lightchange",
+      "iot_hue_lightdim",
+      "iot_hue_lightoff",
+      "iot_hue_lighton",
+      "iot_hue_lightup",
+      "iot_wemo_off",
+      "iot_wemo_on",
+      "lists_createoradd",
+      "lists_query",
+      "lists_remove",
+      "music_likeness",
+      "music_query",
+      "music_settings",
+      "news_query",
+      "play_audiobook",
+      "play_game",
+      "play_music",
+      "play_podcasts",
+      "play_radio",
+      "qa_currency",
+      "qa_definition",
+      "qa_factoid",
+      "qa_maths",
+      "qa_stock",
+      "recommendation_events",
+      "recommendation_locations",
+      "recommendation_movies",
+      "social_post",
+      "social_query",
+      "takeaway_order",
+      "takeaway_query",
+      "transport_query",
+      "transport_taxi",
+      "transport_ticket",
+      "transport_traffic",
+      "weather_query"
+    ],
+    "cohorts": {
+      "calibrate": {
+        "count": 640,
+        "ids_sha256": "4d74b9cc19c1dd61f043e6e494ff35926163865d3ac3cb95ca83ef8e8d033caa"
+      },
+      "dev": {
+        "count": 1006,
+        "ids_sha256": "6ba1a59b0c5b43968070a9d6005ec763f897a89ef97b417b2b95279c643e922b"
+      },
+      "qualify": {
+        "count": 7031,
+        "ids_sha256": "ba12590cdbca980fa0ee1ce719aac9b17333e63206fa0be337875f8adc6ad784"
+      },
+      "teach": {
+        "count": 1280,
+        "ids_sha256": "7a3376448e8580398b0f4b15f435b801ee3d827084b4250f3d990a2a51a4b9d8"
+      },
+      "test": {
+        "count": 1076,
+        "ids_sha256": "30331ef7488d909ba9c76c281af553a8ee9af6bfa5e13bdbbbb264ea06777e5a"
+      }
+    },
+    "collapsed_duplicate_rows": 73,
+    "dropped_conflicting_rows": 0,
+    "dropped_shared_rows": 0,
+    "source_counts": {
+      "test": 1076,
+      "train": 8954,
+      "valid": 1076
+    }
+  },
+  "environment": {
+    "machine": "arm64",
+    "numpy": "2.5.4",
+    "platform": "macOS-27.0-arm64-arm-64bit",
+    "python": "3.12.9 (main, Feb 12 2025, 15:09:19) [Clang 19.1.6 ]",
+    "scipy": "1.18.1",
+    "sklearn": "1.7.2"
+  },
+  "evidence_verified": true,
+  "protocol_revision": "a660f1e1c59a25eace725c5dd6b2a7bc97f2308f",
+  "results": {
+    "exact_cache:101": {
+      "costs": {
+        "fit_seconds": 0.00010283337906002998,
+        "reloadable": true,
+        "serialized_bytes": 69433
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.000167,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 0,
+        "qualification_errors": 0,
+        "qualification_upper_bound": 1.0,
+        "qualified": false,
+        "threshold": null
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 50.00012319516728,
+        "500": 500.0001231951673
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.1,
+        "local_error_upper_95": 0.11487345346632132,
+        "local_errors": 128,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000166,
+        "p95_latency_ms": 0.00025,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000166,
+        "p95_latency_ms": 0.00025,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "unqualified_candidate": {
+        "accepted": 0,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.000167,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0
+      }
+    },
+    "exact_cache:17": {
+      "costs": {
+        "fit_seconds": 0.00015874998643994331,
+        "reloadable": true,
+        "serialized_bytes": 69440
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.000167,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 0,
+        "qualification_errors": 0,
+        "qualification_upper_bound": 1.0,
+        "qualified": false,
+        "threshold": null
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 50.00023203531598,
+        "500": 500.000232035316
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.1,
+        "local_error_upper_95": 0.11487345346632132,
+        "local_errors": 128,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000167,
+        "p95_latency_ms": 0.000292,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000167,
+        "p95_latency_ms": 0.000292,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "unqualified_candidate": {
+        "accepted": 0,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.000167,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0
+      }
+    },
+    "exact_cache:29": {
+      "costs": {
+        "fit_seconds": 0.00011283392086625099,
+        "reloadable": true,
+        "serialized_bytes": 69454
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.00013525,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 0,
+        "qualification_errors": 0,
+        "qualification_upper_bound": 1.0,
+        "qualified": false,
+        "threshold": null
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 50.00011776394052,
+        "500": 500.0001177639405
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.1,
+        "local_error_upper_95": 0.11487345346632132,
+        "local_errors": 128,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000166,
+        "p95_latency_ms": 0.000209,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000166,
+        "p95_latency_ms": 0.000209,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "unqualified_candidate": {
+        "accepted": 0,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.00013525,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0
+      }
+    },
+    "exact_cache:43": {
+      "costs": {
+        "fit_seconds": 0.00010783318430185318,
+        "reloadable": true,
+        "serialized_bytes": 69418
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.000167,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 0,
+        "qualification_errors": 0,
+        "qualification_upper_bound": 1.0,
+        "qualified": false,
+        "threshold": null
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 50.00012145167286,
+        "500": 500.00012145167284
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.1,
+        "local_error_upper_95": 0.11487345346632132,
+        "local_errors": 128,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.00020804999999999993,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.00020804999999999993,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "unqualified_candidate": {
+        "accepted": 0,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.000167,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0
+      }
+    },
+    "exact_cache:71": {
+      "costs": {
+        "fit_seconds": 0.00010941596701741219,
+        "reloadable": true,
+        "serialized_bytes": 69413
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.000167,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 0,
+        "qualification_errors": 0,
+        "qualification_upper_bound": 1.0,
+        "qualified": false,
+        "threshold": null
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 50.00012584944238,
+        "500": 500.0001258494424
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.1,
+        "local_error_upper_95": 0.11487345346632132,
+        "local_errors": 128,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000167,
+        "p95_latency_ms": 0.000334,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 0.000167,
+        "p95_latency_ms": 0.000334,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "unqualified_candidate": {
+        "accepted": 0,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 0,
+        "p50_latency_ms": 0.000125,
+        "p95_latency_ms": 0.000167,
+        "predictions": 0,
+        "raw_accuracy": 0.0,
+        "raw_correct": 0
+      }
+    },
+    "instinct_hybrid:101": {
+      "costs": {
+        "fit_seconds": 4.7520871250890195,
+        "reload_error": "Saved skill header exceeds size limit",
+        "reloadable": false,
+        "serialized_bytes": 3741154,
+        "serialized_header_bytes": 1268995
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 572,
+        "p50_latency_ms": 2.4220414999999997,
+        "p95_latency_ms": 2.86507275,
+        "predictions": 1076,
+        "raw_accuracy": 0.7044609665427509,
+        "raw_correct": 758,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 1012,
+        "qualification_errors": 35,
+        "qualification_upper_bound": 0.05394274515968336,
+        "qualified": false,
+        "threshold": 0.9962423079424857
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 52.51672659944238,
+        "500": 502.5167265994424
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1122,
+        "count": 1280,
+        "coverage": 0.8765625,
+        "local_error_rate": 0.040106951871657755,
+        "local_error_upper_95": 0.051128864427545245,
+        "local_errors": 45,
+        "native_eligible": 1122,
+        "p50_latency_ms": 2.3654995000000003,
+        "p95_latency_ms": 2.7388059499999997,
+        "predictions": 1280,
+        "raw_accuracy": 0.928125,
+        "raw_correct": 1188
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1122,
+        "p50_latency_ms": 2.3654995000000003,
+        "p95_latency_ms": 2.7388059499999997,
+        "predictions": 1280,
+        "raw_accuracy": 0.928125,
+        "raw_correct": 1188
+      },
+      "unqualified_candidate": {
+        "accepted": 168,
+        "count": 1076,
+        "coverage": 0.15613382899628253,
+        "local_error_rate": 0.041666666666666664,
+        "local_error_upper_95": 0.07683457145972235,
+        "local_errors": 7,
+        "native_eligible": 572,
+        "p50_latency_ms": 2.4220414999999997,
+        "p95_latency_ms": 2.86507275,
+        "predictions": 1076,
+        "raw_accuracy": 0.7044609665427509,
+        "raw_correct": 758
+      }
+    },
+    "instinct_hybrid:17": {
+      "costs": {
+        "fit_seconds": 4.929776332806796,
+        "reload_error": "Saved skill header exceeds size limit",
+        "reloadable": false,
+        "serialized_bytes": 3742238,
+        "serialized_header_bytes": 1269769
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 590,
+        "p50_latency_ms": 2.4219585,
+        "p95_latency_ms": 2.8620105000000002,
+        "predictions": 1076,
+        "raw_accuracy": 0.7035315985130112,
+        "raw_correct": 757,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 1112,
+        "qualification_errors": 37,
+        "qualification_upper_bound": 0.051318948733702234,
+        "qualified": false,
+        "threshold": 0.994917873170911
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 52.5098386394052,
+        "500": 502.5098386394052
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1141,
+        "count": 1280,
+        "coverage": 0.89140625,
+        "local_error_rate": 0.04557405784399649,
+        "local_error_upper_95": 0.057077085538154874,
+        "local_errors": 52,
+        "native_eligible": 1141,
+        "p50_latency_ms": 2.388521,
+        "p95_latency_ms": 2.7172163499999997,
+        "predictions": 1280,
+        "raw_accuracy": 0.928125,
+        "raw_correct": 1188
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1141,
+        "p50_latency_ms": 2.388521,
+        "p95_latency_ms": 2.7172163499999997,
+        "predictions": 1280,
+        "raw_accuracy": 0.928125,
+        "raw_correct": 1188
+      },
+      "unqualified_candidate": {
+        "accepted": 179,
+        "count": 1076,
+        "coverage": 0.16635687732342008,
+        "local_error_rate": 0.0223463687150838,
+        "local_error_upper_95": 0.05040430222355676,
+        "local_errors": 4,
+        "native_eligible": 590,
+        "p50_latency_ms": 2.4219585,
+        "p95_latency_ms": 2.8620105000000002,
+        "predictions": 1076,
+        "raw_accuracy": 0.7035315985130112,
+        "raw_correct": 757
+      }
+    },
+    "instinct_hybrid:29": {
+      "costs": {
+        "fit_seconds": 4.475014832802117,
+        "reload_error": "Saved skill header exceeds size limit",
+        "reloadable": false,
+        "serialized_bytes": 3741664,
+        "serialized_header_bytes": 1268694
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 605,
+        "p50_latency_ms": 2.4062504999999996,
+        "p95_latency_ms": 3.05548975,
+        "predictions": 1076,
+        "raw_accuracy": 0.6933085501858736,
+        "raw_correct": 746,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 909,
+        "qualification_errors": 24,
+        "qualification_upper_bound": 0.04503627123361727,
+        "qualified": false,
+        "threshold": 0.9970470614354646
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 52.55247666078067,
+        "500": 502.55247666078066
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1147,
+        "count": 1280,
+        "coverage": 0.89609375,
+        "local_error_rate": 0.04097646033129904,
+        "local_error_upper_95": 0.05195766569979618,
+        "local_errors": 47,
+        "native_eligible": 1147,
+        "p50_latency_ms": 2.489396,
+        "p95_latency_ms": 3.0107003,
+        "predictions": 1280,
+        "raw_accuracy": 0.928125,
+        "raw_correct": 1188
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1147,
+        "p50_latency_ms": 2.489396,
+        "p95_latency_ms": 3.0107003,
+        "predictions": 1280,
+        "raw_accuracy": 0.928125,
+        "raw_correct": 1188
+      },
+      "unqualified_candidate": {
+        "accepted": 146,
+        "count": 1076,
+        "coverage": 0.13568773234200743,
+        "local_error_rate": 0.0136986301369863,
+        "local_error_upper_95": 0.04249184241652744,
+        "local_errors": 2,
+        "native_eligible": 605,
+        "p50_latency_ms": 2.4062504999999996,
+        "p95_latency_ms": 3.05548975,
+        "predictions": 1076,
+        "raw_accuracy": 0.6933085501858736,
+        "raw_correct": 746
+      }
+    },
+    "instinct_hybrid:43": {
+      "costs": {
+        "fit_seconds": 4.614979083649814,
+        "reload_error": "Saved skill header exceeds size limit",
+        "reloadable": false,
+        "serialized_bytes": 3742466,
+        "serialized_header_bytes": 1269451
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 552,
+        "p50_latency_ms": 2.406813,
+        "p95_latency_ms": 2.77662525,
+        "predictions": 1076,
+        "raw_accuracy": 0.7007434944237918,
+        "raw_correct": 754,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 1292,
+        "qualification_errors": 46,
+        "qualification_upper_bound": 0.052586736538513236,
+        "qualified": false,
+        "threshold": 0.9889233620646378
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 52.48200535687732,
+        "500": 502.4820053568773
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1107,
+        "count": 1280,
+        "coverage": 0.86484375,
+        "local_error_rate": 0.04245709123757904,
+        "local_error_upper_95": 0.05382391782304572,
+        "local_errors": 47,
+        "native_eligible": 1107,
+        "p50_latency_ms": 2.3900005,
+        "p95_latency_ms": 2.7902375,
+        "predictions": 1280,
+        "raw_accuracy": 0.92578125,
+        "raw_correct": 1185
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1107,
+        "p50_latency_ms": 2.3900005,
+        "p95_latency_ms": 2.7902375,
+        "predictions": 1280,
+        "raw_accuracy": 0.92578125,
+        "raw_correct": 1185
+      },
+      "unqualified_candidate": {
+        "accepted": 198,
+        "count": 1076,
+        "coverage": 0.18401486988847585,
+        "local_error_rate": 0.020202020202020204,
+        "local_error_upper_95": 0.04563081717964959,
+        "local_errors": 4,
+        "native_eligible": 552,
+        "p50_latency_ms": 2.406813,
+        "p95_latency_ms": 2.77662525,
+        "predictions": 1076,
+        "raw_accuracy": 0.7007434944237918,
+        "raw_correct": 754
+      }
+    },
+    "instinct_hybrid:71": {
+      "costs": {
+        "fit_seconds": 4.618182208854705,
+        "reload_error": "Saved skill header exceeds size limit",
+        "reloadable": false,
+        "serialized_bytes": 3742544,
+        "serialized_header_bytes": 1269547
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 621,
+        "p50_latency_ms": 2.4022295,
+        "p95_latency_ms": 2.77107275,
+        "predictions": 1076,
+        "raw_accuracy": 0.716542750929368,
+        "raw_correct": 771,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 1350,
+        "qualification_errors": 38,
+        "qualification_upper_bound": 0.043239208659980335,
+        "qualified": false,
+        "threshold": 0.9901686924322878
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 52.47821231598513,
+        "500": 502.4782123159851
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1157,
+        "count": 1280,
+        "coverage": 0.90390625,
+        "local_error_rate": 0.05012964563526361,
+        "local_error_upper_95": 0.061997464990945945,
+        "local_errors": 58,
+        "native_eligible": 1157,
+        "p50_latency_ms": 2.3751664999999997,
+        "p95_latency_ms": 2.6674201999999996,
+        "predictions": 1280,
+        "raw_accuracy": 0.92734375,
+        "raw_correct": 1187
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1157,
+        "p50_latency_ms": 2.3751664999999997,
+        "p95_latency_ms": 2.6674201999999996,
+        "predictions": 1280,
+        "raw_accuracy": 0.92734375,
+        "raw_correct": 1187
+      },
+      "unqualified_candidate": {
+        "accepted": 206,
+        "count": 1076,
+        "coverage": 0.19144981412639406,
+        "local_error_rate": 0.02912621359223301,
+        "local_error_upper_95": 0.056674563405967264,
+        "local_errors": 6,
+        "native_eligible": 621,
+        "p50_latency_ms": 2.4022295,
+        "p95_latency_ms": 2.77107275,
+        "predictions": 1076,
+        "raw_accuracy": 0.716542750929368,
+        "raw_correct": 771
+      }
+    },
+    "instinct_lexical:101": {
+      "costs": {
+        "fit_seconds": 0.7162427078001201,
+        "reloadable": true,
+        "serialized_bytes": 697574
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 439,
+        "p50_latency_ms": 1.78275,
+        "p95_latency_ms": 2.5708747499999998,
+        "predictions": 1076,
+        "raw_accuracy": 0.6022304832713755,
+        "raw_correct": 648,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 0,
+        "qualification_errors": 0,
+        "qualification_upper_bound": 1.0,
+        "qualified": false,
+        "threshold": null
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.81601425185874,
+        "500": 501.81601425185875
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1129,
+        "count": 1280,
+        "coverage": 0.88203125,
+        "local_error_rate": 0.06023029229406555,
+        "local_error_upper_95": 0.0731988531529855,
+        "local_errors": 68,
+        "native_eligible": 1129,
+        "p50_latency_ms": 3.313875,
+        "p95_latency_ms": 4.83927145,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1129,
+        "p50_latency_ms": 3.313875,
+        "p95_latency_ms": 4.83927145,
+        "predictions": 1280,
+        "raw_accuracy": 0.9,
+        "raw_correct": 1152
+      },
+      "unqualified_candidate": {
+        "accepted": 0,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 439,
+        "p50_latency_ms": 1.78275,
+        "p95_latency_ms": 2.5708747499999998,
+        "predictions": 1076,
+        "raw_accuracy": 0.6022304832713755,
+        "raw_correct": 648
+      }
+    },
+    "instinct_lexical:17": {
+      "costs": {
+        "fit_seconds": 0.7463186248205602,
+        "reloadable": true,
+        "serialized_bytes": 690766
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 442,
+        "p50_latency_ms": 1.661521,
+        "p95_latency_ms": 3.09829125,
+        "predictions": 1076,
+        "raw_accuracy": 0.6143122676579925,
+        "raw_correct": 661,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 0,
+        "qualification_errors": 0,
+        "qualification_upper_bound": 1.0,
+        "qualified": false,
+        "threshold": null
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.85024983085502,
+        "500": 501.85024983085503
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1112,
+        "count": 1280,
+        "coverage": 0.86875,
+        "local_error_rate": 0.05665467625899281,
+        "local_error_upper_95": 0.06940994255836255,
+        "local_errors": 63,
+        "native_eligible": 1112,
+        "p50_latency_ms": 3.4503335,
+        "p95_latency_ms": 5.6761375,
+        "predictions": 1280,
+        "raw_accuracy": 0.89296875,
+        "raw_correct": 1143
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1112,
+        "p50_latency_ms": 3.4503335,
+        "p95_latency_ms": 5.6761375,
+        "predictions": 1280,
+        "raw_accuracy": 0.89296875,
+        "raw_correct": 1143
+      },
+      "unqualified_candidate": {
+        "accepted": 0,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 442,
+        "p50_latency_ms": 1.661521,
+        "p95_latency_ms": 3.09829125,
+        "predictions": 1076,
+        "raw_accuracy": 0.6143122676579925,
+        "raw_correct": 661
+      }
+    },
+    "instinct_lexical:29": {
+      "costs": {
+        "fit_seconds": 0.7296007922850549,
+        "reloadable": true,
+        "serialized_bytes": 691175
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 397,
+        "p50_latency_ms": 1.83,
+        "p95_latency_ms": 2.60109375,
+        "predictions": 1076,
+        "raw_accuracy": 0.6161710037174721,
+        "raw_correct": 663,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 0,
+        "qualification_errors": 0,
+        "qualification_upper_bound": 1.0,
+        "qualified": false,
+        "threshold": null
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.85852651208178,
+        "500": 501.85852651208177
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1113,
+        "count": 1280,
+        "coverage": 0.86953125,
+        "local_error_rate": 0.06019766397124888,
+        "local_error_upper_95": 0.07326607618783668,
+        "local_errors": 67,
+        "native_eligible": 1113,
+        "p50_latency_ms": 2.906021,
+        "p95_latency_ms": 5.06849615,
+        "predictions": 1280,
+        "raw_accuracy": 0.90390625,
+        "raw_correct": 1157
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1113,
+        "p50_latency_ms": 2.906021,
+        "p95_latency_ms": 5.06849615,
+        "predictions": 1280,
+        "raw_accuracy": 0.90390625,
+        "raw_correct": 1157
+      },
+      "unqualified_candidate": {
+        "accepted": 0,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 397,
+        "p50_latency_ms": 1.83,
+        "p95_latency_ms": 2.60109375,
+        "predictions": 1076,
+        "raw_accuracy": 0.6161710037174721,
+        "raw_correct": 663
+      }
+    },
+    "instinct_lexical:43": {
+      "costs": {
+        "fit_seconds": 0.7268021670170128,
+        "reloadable": true,
+        "serialized_bytes": 693580
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 408,
+        "p50_latency_ms": 1.7681045,
+        "p95_latency_ms": 2.6119895,
+        "predictions": 1076,
+        "raw_accuracy": 0.6189591078066915,
+        "raw_correct": 666,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 0,
+        "qualification_errors": 0,
+        "qualification_upper_bound": 1.0,
+        "qualified": false,
+        "threshold": null
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.84021135594796,
+        "500": 501.84021135594793
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1124,
+        "count": 1280,
+        "coverage": 0.878125,
+        "local_error_rate": 0.06316725978647687,
+        "local_error_upper_95": 0.0764226190539284,
+        "local_errors": 71,
+        "native_eligible": 1124,
+        "p50_latency_ms": 3.5801245,
+        "p95_latency_ms": 5.46765145,
+        "predictions": 1280,
+        "raw_accuracy": 0.90703125,
+        "raw_correct": 1161
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1124,
+        "p50_latency_ms": 3.5801245,
+        "p95_latency_ms": 5.46765145,
+        "predictions": 1280,
+        "raw_accuracy": 0.90703125,
+        "raw_correct": 1161
+      },
+      "unqualified_candidate": {
+        "accepted": 0,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 408,
+        "p50_latency_ms": 1.7681045,
+        "p95_latency_ms": 2.6119895,
+        "predictions": 1076,
+        "raw_accuracy": 0.6189591078066915,
+        "raw_correct": 666
+      }
+    },
+    "instinct_lexical:71": {
+      "costs": {
+        "fit_seconds": 0.7496385001577437,
+        "reloadable": true,
+        "serialized_bytes": 695846
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 427,
+        "p50_latency_ms": 1.8184585,
+        "p95_latency_ms": 2.70483275,
+        "predictions": 1076,
+        "raw_accuracy": 0.6171003717472119,
+        "raw_correct": 664,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 563,
+        "qualification_errors": 21,
+        "qualification_upper_bound": 0.06556892621388064,
+        "qualified": false,
+        "threshold": 0.9835215425564686
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.896821935873604,
+        "500": 501.8968219358736
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1130,
+        "count": 1280,
+        "coverage": 0.8828125,
+        "local_error_rate": 0.061061946902654866,
+        "local_error_upper_95": 0.07409693108142666,
+        "local_errors": 69,
+        "native_eligible": 1130,
+        "p50_latency_ms": 2.898146,
+        "p95_latency_ms": 5.18306605,
+        "predictions": 1280,
+        "raw_accuracy": 0.9015625,
+        "raw_correct": 1154
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1130,
+        "p50_latency_ms": 2.898146,
+        "p95_latency_ms": 5.18306605,
+        "predictions": 1280,
+        "raw_accuracy": 0.9015625,
+        "raw_correct": 1154
+      },
+      "unqualified_candidate": {
+        "accepted": 78,
+        "count": 1076,
+        "coverage": 0.0724907063197026,
+        "local_error_rate": 0.038461538461538464,
+        "local_error_upper_95": 0.09641275320690786,
+        "local_errors": 3,
+        "native_eligible": 427,
+        "p50_latency_ms": 1.8184585,
+        "p95_latency_ms": 2.70483275,
+        "predictions": 1076,
+        "raw_accuracy": 0.6171003717472119,
+        "raw_correct": 664
+      }
+    },
+    "simple_classifier:101": {
+      "costs": {
+        "fit_seconds": 0.5632614167407155,
+        "reloadable": true,
+        "serialized_bytes": 6738136
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.0191455,
+        "p95_latency_ms": 1.4752915,
+        "predictions": 1076,
+        "raw_accuracy": 0.7369888475836431,
+        "raw_correct": 793,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 814,
+        "qualification_errors": 10,
+        "qualification_upper_bound": 0.0275522193777101,
+        "qualified": false,
+        "threshold": 0.8059982272255931
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.11277061988848,
+        "500": 501.11277061988847
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.0921875,
+        "local_error_upper_95": 0.10658409644146905,
+        "local_errors": 118,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.0067085,
+        "p95_latency_ms": 1.1296690999999999,
+        "predictions": 1280,
+        "raw_accuracy": 0.9078125,
+        "raw_correct": 1162
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.0067085,
+        "p95_latency_ms": 1.1296690999999999,
+        "predictions": 1280,
+        "raw_accuracy": 0.9078125,
+        "raw_correct": 1162
+      },
+      "unqualified_candidate": {
+        "accepted": 135,
+        "count": 1076,
+        "coverage": 0.12546468401486988,
+        "local_error_rate": 0.014814814814814815,
+        "local_error_upper_95": 0.04589903483036225,
+        "local_errors": 2,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.0191455,
+        "p95_latency_ms": 1.4752915,
+        "predictions": 1076,
+        "raw_accuracy": 0.7369888475836431,
+        "raw_correct": 793
+      }
+    },
+    "simple_classifier:17": {
+      "costs": {
+        "fit_seconds": 0.7414964172057807,
+        "reloadable": true,
+        "serialized_bytes": 6738136
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.053083,
+        "p95_latency_ms": 1.4482815,
+        "predictions": 1076,
+        "raw_accuracy": 0.7481412639405205,
+        "raw_correct": 805,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 674,
+        "qualification_errors": 6,
+        "qualification_upper_bound": 0.02460030677788409,
+        "qualified": false,
+        "threshold": 0.8235098121413983
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.12319295260223,
+        "500": 501.1231929526022
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.09375,
+        "local_error_upper_95": 0.10824416499833567,
+        "local_errors": 120,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.0595415,
+        "p95_latency_ms": 1.49920625,
+        "predictions": 1280,
+        "raw_accuracy": 0.90625,
+        "raw_correct": 1160
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.0595415,
+        "p95_latency_ms": 1.49920625,
+        "predictions": 1280,
+        "raw_accuracy": 0.90625,
+        "raw_correct": 1160
+      },
+      "unqualified_candidate": {
+        "accepted": 104,
+        "count": 1076,
+        "coverage": 0.09665427509293681,
+        "local_error_rate": 0.009615384615384616,
+        "local_error_upper_95": 0.044801226523795576,
+        "local_errors": 1,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.053083,
+        "p95_latency_ms": 1.4482815,
+        "predictions": 1076,
+        "raw_accuracy": 0.7481412639405205,
+        "raw_correct": 805
+      }
+    },
+    "simple_classifier:29": {
+      "costs": {
+        "fit_seconds": 0.6033266671001911,
+        "reloadable": true,
+        "serialized_bytes": 6738136
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.0094585,
+        "p95_latency_ms": 1.16729225,
+        "predictions": 1076,
+        "raw_accuracy": 0.7276951672862454,
+        "raw_correct": 783,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 1164,
+        "qualification_errors": 15,
+        "qualification_upper_bound": 0.025205493963167725,
+        "qualified": false,
+        "threshold": 0.7349840817063427
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.03841864591078,
+        "500": 501.0384186459108
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.09140625,
+        "local_error_upper_95": 0.10575363326311497,
+        "local_errors": 117,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.019146,
+        "p95_latency_ms": 1.26314135,
+        "predictions": 1280,
+        "raw_accuracy": 0.90859375,
+        "raw_correct": 1163
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.019146,
+        "p95_latency_ms": 1.26314135,
+        "predictions": 1280,
+        "raw_accuracy": 0.90859375,
+        "raw_correct": 1163
+      },
+      "unqualified_candidate": {
+        "accepted": 176,
+        "count": 1076,
+        "coverage": 0.16356877323420074,
+        "local_error_rate": 0.017045454545454544,
+        "local_error_upper_95": 0.04346307660435234,
+        "local_errors": 3,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.0094585,
+        "p95_latency_ms": 1.16729225,
+        "predictions": 1076,
+        "raw_accuracy": 0.7276951672862454,
+        "raw_correct": 783
+      }
+    },
+    "simple_classifier:43": {
+      "costs": {
+        "fit_seconds": 0.5857775830663741,
+        "reloadable": true,
+        "serialized_bytes": 6738136
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.0255,
+        "p95_latency_ms": 1.23235425,
+        "predictions": 1076,
+        "raw_accuracy": 0.7351301115241635,
+        "raw_correct": 791,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 1477,
+        "qualification_errors": 35,
+        "qualification_upper_bound": 0.03707740114320202,
+        "qualified": false,
+        "threshold": 0.6867054516746253
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.06247907063197,
+        "500": 501.062479070632
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.0921875,
+        "local_error_upper_95": 0.10658409644146905,
+        "local_errors": 118,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.019125,
+        "p95_latency_ms": 1.2413151999999998,
+        "predictions": 1280,
+        "raw_accuracy": 0.9078125,
+        "raw_correct": 1162
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.019125,
+        "p95_latency_ms": 1.2413151999999998,
+        "predictions": 1280,
+        "raw_accuracy": 0.9078125,
+        "raw_correct": 1162
+      },
+      "unqualified_candidate": {
+        "accepted": 234,
+        "count": 1076,
+        "coverage": 0.2174721189591078,
+        "local_error_rate": 0.008547008547008548,
+        "local_error_upper_95": 0.026659199359173717,
+        "local_errors": 2,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.0255,
+        "p95_latency_ms": 1.23235425,
+        "predictions": 1076,
+        "raw_accuracy": 0.7351301115241635,
+        "raw_correct": 791
+      }
+    },
+    "simple_classifier:71": {
+      "costs": {
+        "fit_seconds": 0.5859106252901256,
+        "reloadable": true,
+        "serialized_bytes": 6738136
+      },
+      "fresh": {
+        "accepted": 0,
+        "cascade_error_rate": 0.10037174721189591,
+        "cascade_errors": 108,
+        "count": 1076,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.019083,
+        "p95_latency_ms": 1.19982275,
+        "predictions": 1076,
+        "raw_accuracy": 0.7434944237918215,
+        "raw_correct": 800,
+        "teacher_calls": 1076
+      },
+      "gate": {
+        "delta": 0.0025,
+        "qualification_count": 1201,
+        "qualification_errors": 13,
+        "qualification_upper_bound": 0.022184364412738678,
+        "qualified": false,
+        "threshold": 0.7381933895946067
+      },
+      "modeled_mean_cascade_ms": {
+        "50": 51.04241185873606,
+        "500": 501.04241185873605
+      },
+      "native_repeat_diagnostic": {
+        "accepted": 1280,
+        "count": 1280,
+        "coverage": 1.0,
+        "local_error_rate": 0.09140625,
+        "local_error_upper_95": 0.10575363326311497,
+        "local_errors": 117,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.024,
+        "p95_latency_ms": 1.2337979499999998,
+        "predictions": 1280,
+        "raw_accuracy": 0.90859375,
+        "raw_correct": 1163
+      },
+      "repeat_diagnostic": {
+        "accepted": 0,
+        "count": 1280,
+        "coverage": 0.0,
+        "local_error_rate": null,
+        "local_error_upper_95": null,
+        "local_errors": 0,
+        "native_eligible": 1280,
+        "p50_latency_ms": 1.024,
+        "p95_latency_ms": 1.2337979499999998,
+        "predictions": 1280,
+        "raw_accuracy": 0.90859375,
+        "raw_correct": 1163
+      },
+      "unqualified_candidate": {
+        "accepted": 186,
+        "count": 1076,
+        "coverage": 0.17286245353159851,
+        "local_error_rate": 0.010752688172043012,
+        "local_error_upper_95": 0.033459589496859926,
+        "local_errors": 2,
+        "native_eligible": 1076,
+        "p50_latency_ms": 1.019083,
+        "p95_latency_ms": 1.19982275,
+        "predictions": 1076,
+        "raw_accuracy": 0.7434944237918215,
+        "raw_correct": 800
+      }
+    }
+  },
+  "runtime_base": "0b1072453749855f78669b73c54b938959627e3a"
+}

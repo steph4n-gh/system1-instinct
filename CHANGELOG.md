@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a frozen fresh HWU64/noisy-teacher comparison against an exact cache and a simple classifier at a matched 1% local error budget, with raw evidence and independent verification. Retain the negative result and hybrid reload failure; remove general offload/example-count forecasts and distinguish oracle replay from fresh generalization.
+
 - Bound cache vectors and aliases during eviction, invalidation and clearing.
 - Validate complete online lessons before updating any field or model version.
 - Preserve cold-start exemplar banks and online prototype state across skill saves and reloads. Newly saved exemplar arrays require the updated reader; existing skills remain readable.

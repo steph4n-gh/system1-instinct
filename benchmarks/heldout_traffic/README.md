@@ -96,16 +96,30 @@ The original run used Python 3.12.9, NumPy 2.5.4, SciPy 1.18.1 and scikit-learn
 1.7.2. Set BLAS to one thread for consistent local timing.
 
 ```bash
-uv venv --python 3.12.9 .venv-heldout
-uv pip install --python .venv-heldout/bin/python numpy==2.5.4 scipy==1.18.1 scikit-learn==1.7.2 cryptography
-.venv-heldout/bin/python benchmarks/heldout_traffic/prepare.py --data-dir scratch/hwu64 --download
+uv venv --python 3.12.9 scratch/heldout-venv
+uv pip install --python scratch/heldout-venv/bin/python numpy==2.5.4 scipy==1.18.1 scikit-learn==1.7.2 cryptography
+scratch/heldout-venv/bin/python benchmarks/heldout_traffic/prepare.py --data-dir scratch/hwu64 --download
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
-  PYTHONPATH=src .venv-heldout/bin/python benchmarks/heldout_traffic/run.py \
-  --data-dir scratch/hwu64 --output-dir benchmarks/heldout_traffic/results
-.venv-heldout/bin/python benchmarks/heldout_traffic/verify.py \
-  --data-dir scratch/hwu64 --output-dir benchmarks/heldout_traffic/results
+  PYTHONPATH=src scratch/heldout-venv/bin/python benchmarks/heldout_traffic/run.py \
+  --data-dir scratch/hwu64 --output-dir scratch/heldout-replay
+scratch/heldout-venv/bin/python benchmarks/heldout_traffic/verify.py \
+  --data-dir scratch/hwu64 --output-dir scratch/heldout-replay
 ```
 
 The runner refuses an existing results directory. Replays use another output
 directory; timings need not reproduce bit for bit. Source and gate receipts
 identify the evaluated revision. The final report is added only after scoring.
+
+Recorded result: [fresh-traffic report](REPORT.md). To check the archived evidence
+without refitting, download the data and invoke `verify.py` against
+`benchmarks/heldout_traffic/results`. The exact evaluated code is commit
+`a660f1e1c59a25eace725c5dd6b2a7bc97f2308f`; later commits add reporting and
+corruption checks without changing the predictor settings or frozen protocol.
+
+Run focused checks, including the five archived-evidence corruption controls:
+
+```bash
+uv pip install --python scratch/heldout-venv/bin/python pytest
+PYTHONPATH=src:benchmarks/heldout_traffic SYSTEM1_HELDOUT_DATA_DIR=scratch/hwu64 \
+  scratch/heldout-venv/bin/python -m pytest -q benchmarks/heldout_traffic/test_protocol.py
+```

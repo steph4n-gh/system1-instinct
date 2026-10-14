@@ -1,0 +1,112 @@
+{
+  "exact_cache:101": {
+    "fit_seconds": 0.00010283337906002998,
+    "reloadable": true,
+    "serialized_bytes": 69433
+  },
+  "exact_cache:17": {
+    "fit_seconds": 0.00015874998643994331,
+    "reloadable": true,
+    "serialized_bytes": 69440
+  },
+  "exact_cache:29": {
+    "fit_seconds": 0.00011283392086625099,
+    "reloadable": true,
+    "serialized_bytes": 69454
+  },
+  "exact_cache:43": {
+    "fit_seconds": 0.00010783318430185318,
+    "reloadable": true,
+    "serialized_bytes": 69418
+  },
+  "exact_cache:71": {
+    "fit_seconds": 0.00010941596701741219,
+    "reloadable": true,
+    "serialized_bytes": 69413
+  },
+  "instinct_hybrid:101": {
+    "fit_seconds": 4.7520871250890195,
+    "reload_error": "Saved skill header exceeds size limit",
+    "reloadable": false,
+    "serialized_bytes": 3741154,
+    "serialized_header_bytes": 1268995
+  },
+  "instinct_hybrid:17": {
+    "fit_seconds": 4.929776332806796,
+    "reload_error": "Saved skill header exceeds size limit",
+    "reloadable": false,
+    "serialized_bytes": 3742238,
+    "serialized_header_bytes": 1269769
+  },
+  "instinct_hybrid:29": {
+    "fit_seconds": 4.475014832802117,
+    "reload_error": "Saved skill header exceeds size limit",
+    "reloadable": false,
+    "serialized_bytes": 3741664,
+    "serialized_header_bytes": 1268694
+  },
+  "instinct_hybrid:43": {
+    "fit_seconds": 4.614979083649814,
+    "reload_error": "Saved skill header exceeds size limit",
+    "reloadable": false,
+    "serialized_bytes": 3742466,
+    "serialized_header_bytes": 1269451
+  },
+  "instinct_hybrid:71": {
+    "fit_seconds": 4.618182208854705,
+    "reload_error": "Saved skill header exceeds size limit",
+    "reloadable": false,
+    "serialized_bytes": 3742544,
+    "serialized_header_bytes": 1269547
+  },
+  "instinct_lexical:101": {
+    "fit_seconds": 0.7162427078001201,
+    "reloadable": true,
+    "serialized_bytes": 697574
+  },
+  "instinct_lexical:17": {
+    "fit_seconds": 0.7463186248205602,
+    "reloadable": true,
+    "serialized_bytes": 690766
+  },
+  "instinct_lexical:29": {
+    "fit_seconds": 0.7296007922850549,
+    "reloadable": true,
+    "serialized_bytes": 691175
+  },
+  "instinct_lexical:43": {
+    "fit_seconds": 0.7268021670170128,
+    "reloadable": true,
+    "serialized_bytes": 693580
+  },
+  "instinct_lexical:71": {
+    "fit_seconds": 0.7496385001577437,
+    "reloadable": true,
+    "serialized_bytes": 695846
+  },
+  "simple_classifier:101": {
+    "fit_seconds": 0.5632614167407155,
+    "reloadable": true,
+    "serialized_bytes": 6738136
+  },
+  "simple_classifier:17": {
+    "fit_seconds": 0.7414964172057807,
+    "reloadable": true,
+    "serialized_bytes": 6738136
+  },
+  "simple_classifier:29": {
+    "fit_seconds": 0.6033266671001911,
+    "reloadable": true,
+    "serialized_bytes": 6738136
+  },
+  "simple_classifier:43": {
+    "fit_seconds": 0.5857775830663741,
+    "reloadable": true,
+    "serialized_bytes": 6738136
+  },
+  "simple_classifier:71": {
+    "fit_seconds": 0.5859106252901256,
+    "reloadable": true,
+    "serialized_bytes": 6738136
+  }
+}

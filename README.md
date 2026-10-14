@@ -6,10 +6,16 @@
 
 **Stop paying an LLM `500 ms` and an API call to make the same repeatable decision 10,000 times a day.**
 
-**System 1: Instinct** is a sub-millisecond (`0.1–0.4 ms`), zero-weight (`~100 KiB`) decision runtime for Python. You put it in front of your existing LLM, local model, or tool router:
+**System 1: Instinct** is a local structured decision runtime for Python, with no pretrained neural weights. You put it in front of your existing LLM, local model, or tool router:
 - **Start at `0` examples** with a typed schema (`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`).
 - **Teach it `3 to 10` real examples per option**—either automatically by watching your LLM answer live traffic, or by passing a handful of examples directly.
-- **Carry `70%–95%+` of repeatable traffic locally in `0.2 ms` on CPU**, while automatically escalating ambiguous or unfamiliar inputs (`is_ambiguous=True`) back to your LLM.
+- **Qualify local acceptance on fresh requests at your error budget**, and escalate ambiguous or unfamiliar inputs (`is_ambiguous=True`) back to your teacher. Coverage, latency and skill size depend on the workload and configuration.
+
+The [fresh HWU64 comparison](benchmarks/heldout_traffic/REPORT.md) used a 10% noisy
+teacher and a 1% locally accepted error budget. A simple TF-IDF/logistic classifier
+averaged 73.83% raw accuracy versus 70.37% for hybrid Instinct; **neither qualified
+for any offload**. Exact repeats retained the teacher's errors. Historical oracle
+and replay results below do not predict fresh-traffic savings with a fallible teacher.
 
 [![CI](https://github.com/steph4n-gh/system1-instinct/actions/workflows/ci.yml/badge.svg)](https://github.com/steph4n-gh/system1-instinct/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://github.com/steph4n-gh/system1-instinct/blob/main/pyproject.toml)
@@ -136,29 +142,26 @@ You can also run the 3-wave teacher auto-cutover demo in [`examples/drop_in/llm_
 
 ### How Many Examples Does It Actually Take?
 
-Here is the real progression from **`0` examples** to a compiled **`.s1m` skill**:
-
-| Examples per Option | What Happens Inside Instinct | Traffic Handled Locally (`0.2 ms`) | Traffic Sent to Teacher LLM | End-to-End Accuracy |
-| :---: | :--- | :---: | :---: | :---: |
-| **`0` examples** | Cold start from option descriptions; abstains on anything non-obvious | **`0%–20%`** | `80%–100%` | **`100%`** *(Teacher answers)* |
-| **`1–2` examples / option** | Instant Sherman-Morrison rank-1 RLS update (`<0.5 ms` per example) | **`40%–60%`** | `40%–60%` | **`~90%–95%`** |
-| **`3–5` examples / option** | Captures domain jargon, character typos (`char 3–5` n-grams), and `#` negation scope | **`55%–85%`** | `15%–45%` | **`~93%–98%`** |
-| **`8–15` examples / option** | Auto-compiles a calibrated **`.s1m` skill (`~50–120 KiB`)** with spectral `PPMI+SVD` features | **`70%–95%+`** | `5%–30%` | **`~96%–100%`** |
-| **`25–50` examples / option** | Standalone `.s1m` saturates; out-of-scope inputs still cleanly rejected (`0.0%` OOS FA) | **`80%–100%`** | `0%–20%` | **`~99%–100%`** |
-| **`10,000+` examples** | **Wrong tool for new gains** — linear + spectral hyperplanes plateau around `50–100` examples/option | *Plateau* | — | Use a fine-tuned model / local LLM |
+There is no universal example-count cutover. The public sample-efficiency tables
+below describe particular BANKING77/CLINC150 experiments with an oracle fallback;
+they do not establish an accepted-error budget for a new workload. The
+[fresh HWU64 test](benchmarks/heldout_traffic/REPORT.md) used 20 noisy examples per
+class plus independent trusted calibration and qualification labels, and no
+method qualified at 1% local error. A fallible fallback also limits end-to-end
+accuracy even when the local gate abstains correctly.
 
 ---
 
 ## When to Use Instinct vs. a Local LLM or Fine-Tuned Model
 
-We don't oversell what a `100 KiB` non-autoregressive runtime can do, and we don't undersell where it beats heavy neural models. Here is the exact architectural boundary:
+Choose a router using fresh requests, matched error budgets and measured costs.
 
 | Question / Scenario | Best Tool | Why |
 | :--- | :--- | :--- |
-| **"I have `3 to 30` examples per option (or a live teacher LLM) and want to stop paying `500 ms` for repeatable routing, triage, tool selection, or guardrails."** | **System 1: Instinct**<br>(`~100 KiB` `.s1m`, `0.2 ms` CPU) | Offloads `70%–100%` of repetitive structured decisions in `0.2 ms` on CPU with `0` neural weights, `0.0%` out-of-scope false acceptance, character-typo resilience, and `<0.5 ms` 1-shot online fixes (`learn_from_tier2`). |
+| **"I have examples per option and want to reduce teacher calls for routing, triage or tool selection."** | **Compare an exact cache, a simple classifier and Instinct** | Adopt Instinct's additional machinery when it provides independently qualified coverage or a required runtime capability that the simpler baseline lacks. Label noise, error budget and request novelty determine savings. |
 | **"I have `3` static examples per class, NO teacher model in the loop, and users use open-vocabulary synonyms (`'automobile'` when my examples only said `'car'`)."** | **Pretrained Bi-Encoder**<br>(`bge-small` / `all-MiniLM`, `70–90 MB`, `1.5–4 ms`) | Internet pretraining already knows `'automobile' == 'car'` on Day 0 (`+3% to +5%` higher static clean recall)—at the cost of `70–90 MB` weights, no `<1 ms` online updates, and misrouting `100%` of out-of-scope queries unless wrapped by Instinct's conformal gate. |
 | **"The decision requires multi-hop logic, reading comprehension across paragraphs, arithmetic, or I have `50,000` complex labeled examples."** | **Local Small LLM / Fine-Tuned Decision Model**<br>(`0.5B–8B`, `20–200 ms` GPU/NPU) | No n-gram + spectral hyperplane (`10` examples or `5,000,000` examples) can reason through a 4-page contract or multi-step deduction. |
-| **"How do Instinct and a Local LLM work together?"** | **`Tier 1 Instinct` (`0.2 ms`) $\to$ `Tier 2 Local LLM` (`50 ms`)** | Put Instinct in front of your local LLM via `BoundedReviewFallback`. Instinct absorbs the `70%–85%` of fast reflex decisions and rejects out-of-scope garbage in `0.2 ms`, waking up your local LLM **only** on the `15%–30%` of hard/ambiguous inputs (`is_ambiguous=True`). |
+| **"How do Instinct and a Local LLM work together?"** | **Tier 1 Instinct → Tier 2 teacher** | `BoundedReviewFallback` sends ambiguous decisions to the teacher. Measure local accepted error and fallback error separately; a confidence threshold or conformal alpha alone does not certify end-to-end accuracy. |
 
 ---
 
@@ -212,6 +215,13 @@ python examples/drop_in/prompt_guard_dropin.py
 ## Receipts & Public Benchmarks
 
 To verify that System 1: Instinct works on **external, publicly authored datasets** (rather than only self-authored demo prompts), every benchmark below runs offline on standard academic/industry splits (`BANKING77`, `CLINC150-OOS`, `NotInject`) and live `smogon/pokemon-showdown` battles.
+
+The [fresh noisy-teacher gate](benchmarks/heldout_traffic/REPORT.md) compares all
+methods at the same 1% local error budget. The historical tables below use other
+operating points. Their flywheel columns teach evaluated prompts with oracle
+answers and replay those prompts; they measure correction/reuse, not independent
+generalization after learning. Zero observed out-of-scope errors in finite
+samples do not guarantee zero future errors.
 
 ### 1. Head-to-Head vs. Pretrained Neural Encoders (`all-MiniLM-L6-v2` & `BAAI/bge-small-en-v1.5`)
 Reproduce with `python benchmarks/quality/evaluate_drop_in_replacements.py` ([full report](benchmarks/quality/drop_in_and_adaptation_report.md)):
