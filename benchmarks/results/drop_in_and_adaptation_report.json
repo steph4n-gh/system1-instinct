@@ -6,23 +6,23 @@
       "ood_rejection_rate": 1.0,
       "pre_adapt_jargon_accuracy": 0.0,
       "post_adapt_jargon_accuracy": 1.0,
-      "p50_latency_ms": 1.217
+      "p50_latency_ms": 1.817
     },
     "routellm": {
       "tier_routing_accuracy": 1.0,
-      "p50_latency_ms": 1.434
+      "p50_latency_ms": 1.31
     },
     "instructor": {
       "department_accuracy": 1.0,
       "page_oncall_accuracy": 1.0,
       "joint_field_accuracy": 1.0,
-      "p50_latency_ms": 1.825
+      "p50_latency_ms": 1.738
     },
     "prompt_guard": {
       "notinject_benign_fpr": 0.0,
       "attack_detection_recall": 1.0,
       "verdict_exact_accuracy": 1.0,
-      "p50_latency_ms": 0.81
+      "p50_latency_ms": 0.789
     }
   },
   "adaptation_curves": {
@@ -35,9 +35,71 @@
       "online_1_shot_accuracy": 0.5729,
       "online_3_shot_accuracy": 0.6562,
       "online_5_shot_accuracy": 0.7031,
+      "online_8_shot_accuracy": 0.724,
+      "online_10_shot_accuracy": 0.7708,
       "compiled_s1m_accuracy": 0.901,
-      "zero_shot_p50_latency_ms": 0.681,
-      "compiled_p50_latency_ms": 0.35
+      "strict_local_offload_rate": 0.6875,
+      "end_to_end_accuracy": 0.9948,
+      "zero_shot_p50_latency_ms": 0.654,
+      "compiled_p50_latency_ms": 0.334,
+      "sample_efficiency_rows": [
+        {
+          "examples_per_class": 0,
+          "mode": "zero_shot_cold_start",
+          "raw_accuracy": 0.5365,
+          "strict_local_offload_rate": 0.0,
+          "end_to_end_accuracy": 1.0,
+          "p50_latency_ms": 0.654
+        },
+        {
+          "examples_per_class": 1,
+          "mode": "online_rls_1_shot",
+          "raw_accuracy": 0.5729,
+          "strict_local_offload_rate": 0.276,
+          "end_to_end_accuracy": 0.9635,
+          "p50_latency_ms": 0.918
+        },
+        {
+          "examples_per_class": 3,
+          "mode": "online_rls_3_shot",
+          "raw_accuracy": 0.6562,
+          "strict_local_offload_rate": 0.276,
+          "end_to_end_accuracy": 0.9792,
+          "p50_latency_ms": 0.947
+        },
+        {
+          "examples_per_class": 5,
+          "mode": "online_rls_5_shot",
+          "raw_accuracy": 0.7031,
+          "strict_local_offload_rate": 0.3385,
+          "end_to_end_accuracy": 0.974,
+          "p50_latency_ms": 1.017
+        },
+        {
+          "examples_per_class": 8,
+          "mode": "online_rls_8_shot",
+          "raw_accuracy": 0.724,
+          "strict_local_offload_rate": 0.401,
+          "end_to_end_accuracy": 0.9688,
+          "p50_latency_ms": 1.051
+        },
+        {
+          "examples_per_class": 10,
+          "mode": "compiled_s1m_10_shot",
+          "raw_accuracy": 0.7708,
+          "strict_local_offload_rate": 0.7812,
+          "end_to_end_accuracy": 0.901,
+          "p50_latency_ms": 0.338
+        },
+        {
+          "examples_per_class": "all",
+          "mode": "compiled_s1m",
+          "raw_accuracy": 0.901,
+          "strict_local_offload_rate": 0.6875,
+          "end_to_end_accuracy": 0.9948,
+          "p50_latency_ms": 0.334
+        }
+      ]
     },
     "clinc150_24_intents": {
       "dataset": "CLINC150",
@@ -48,9 +110,71 @@
       "online_1_shot_accuracy": 0.6583,
       "online_3_shot_accuracy": 0.725,
       "online_5_shot_accuracy": 0.825,
+      "online_8_shot_accuracy": 0.8583,
+      "online_10_shot_accuracy": 0.8583,
       "compiled_s1m_accuracy": 0.875,
-      "zero_shot_p50_latency_ms": 0.583,
-      "compiled_p50_latency_ms": 0.329
+      "strict_local_offload_rate": 0.7917,
+      "end_to_end_accuracy": 0.9583,
+      "zero_shot_p50_latency_ms": 0.57,
+      "compiled_p50_latency_ms": 0.337,
+      "sample_efficiency_rows": [
+        {
+          "examples_per_class": 0,
+          "mode": "zero_shot_cold_start",
+          "raw_accuracy": 0.6167,
+          "strict_local_offload_rate": 0.0,
+          "end_to_end_accuracy": 1.0,
+          "p50_latency_ms": 0.57
+        },
+        {
+          "examples_per_class": 1,
+          "mode": "online_rls_1_shot",
+          "raw_accuracy": 0.6583,
+          "strict_local_offload_rate": 0.425,
+          "end_to_end_accuracy": 0.925,
+          "p50_latency_ms": 0.856
+        },
+        {
+          "examples_per_class": 3,
+          "mode": "online_rls_3_shot",
+          "raw_accuracy": 0.725,
+          "strict_local_offload_rate": 0.3667,
+          "end_to_end_accuracy": 0.975,
+          "p50_latency_ms": 0.894
+        },
+        {
+          "examples_per_class": 5,
+          "mode": "online_rls_5_shot",
+          "raw_accuracy": 0.825,
+          "strict_local_offload_rate": 0.375,
+          "end_to_end_accuracy": 0.975,
+          "p50_latency_ms": 0.921
+        },
+        {
+          "examples_per_class": 8,
+          "mode": "online_rls_8_shot",
+          "raw_accuracy": 0.8583,
+          "strict_local_offload_rate": 0.4,
+          "end_to_end_accuracy": 0.9917,
+          "p50_latency_ms": 0.972
+        },
+        {
+          "examples_per_class": 10,
+          "mode": "compiled_s1m_10_shot",
+          "raw_accuracy": 0.8583,
+          "strict_local_offload_rate": 0.8,
+          "end_to_end_accuracy": 0.975,
+          "p50_latency_ms": 0.331
+        },
+        {
+          "examples_per_class": "all",
+          "mode": "compiled_s1m",
+          "raw_accuracy": 0.875,
+          "strict_local_offload_rate": 0.7917,
+          "end_to_end_accuracy": 0.9583,
+          "p50_latency_ms": 0.337
+        }
+      ]
     }
   },
   "neural_embedding_comparison": {

@@ -269,6 +269,20 @@ _MODULE_MAP = {
     "SystemOneToolInterceptor": "reflex.integrations",
     "SystemOneGuardBlockedException": "reflex.integrations",
     "wrap_langchain_tool": "reflex.integrations",
+    "SemanticRoute": "reflex.integrations",
+    "RouteMatchResult": "reflex.integrations",
+    "SystemOneRouteLayer": "reflex.integrations",
+    "InstinctRouteLayer": "reflex.integrations",
+    "build_default_router": "reflex.integrations",
+    "RouteLLMCascadeSchema": "reflex.integrations",
+    "RouteDecision": "reflex.integrations",
+    "SystemOneRouteController": "reflex.integrations",
+    "IncidentTriageModel": "reflex.integrations",
+    "StructuredExtractionResult": "reflex.integrations",
+    "SystemOneInstructorClient": "reflex.integrations",
+    "PromptGuardSchema": "reflex.integrations",
+    "PromptGuardResult": "reflex.integrations",
+    "SystemOnePromptGuard": "reflex.integrations",
 }
 
 

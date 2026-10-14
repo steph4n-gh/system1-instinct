@@ -106,6 +106,20 @@ def test_system1_namespace_exports():
         "batch_systemone",
         "patch_typesafe",
         "DotDict",
+        "SemanticRoute",
+        "RouteMatchResult",
+        "InstinctRouteLayer",
+        "SystemOneRouteLayer",
+        "build_default_router",
+        "RouteLLMCascadeSchema",
+        "RouteDecision",
+        "SystemOneRouteController",
+        "IncidentTriageModel",
+        "StructuredExtractionResult",
+        "SystemOneInstructorClient",
+        "PromptGuardSchema",
+        "PromptGuardResult",
+        "SystemOnePromptGuard",
     }
     assert expected_exports.issubset(set(system1.__all__))
     for name in system1.__all__:
@@ -513,11 +527,55 @@ def test_spec_harmonization_aliases():
     client_r = reflex.compat.typesafe.TypeSafeClient(agreement_threshold=0.92)
     assert client_r.min_agreement_threshold == 0.92
 
-    # 3. Engine and Model System 2 / Tier 3 learning aliases
+    # 3. Engine and Model System 2 / Tier 3 learning aliases & friendly learn / learn_from_outcome
+    import inspect
+
     assert system1.SystemOneEngine.learn_from_system2 is system1.SystemOneEngine.learn_from_tier2
     assert system1.SystemOneEngine.learn_from_tier3 is system1.SystemOneEngine.learn_from_tier2
     assert reflex.SystemOneEngine.learn_from_system2 is reflex.SystemOneEngine.learn_from_tier2
 
     assert system1.compiler.CompiledSystemOneModel.learn_from_system2 is system1.compiler.CompiledSystemOneModel.learn_from_tier2
     assert system1.core.SystemOneModel.learn_from_system2 is system1.core.SystemOneModel.learn_from_tier2
+
+    for cls in (
+        system1.SystemOneEngine,
+        system1.compiler.CompiledSystemOneModel,
+        system1.core.SystemOneModel,
+    ):
+        assert hasattr(cls, "learn")
+        assert hasattr(cls, "learn_from_outcome")
+        sig_learn = inspect.signature(cls.learn)
+        sig_outcome = inspect.signature(cls.learn_from_outcome)
+        sig_tier2 = inspect.signature(cls.learn_from_tier2)
+        assert sig_learn.parameters["preserve_calibration"].default is True
+        assert sig_outcome.parameters["preserve_calibration"].default is True
+        assert sig_tier2.parameters["preserve_calibration"].default is False
+        assert "outcome" in sig_learn.parameters
+        assert "reward" in sig_learn.parameters
+        assert "outcome" in sig_outcome.parameters
+        assert "reward" in sig_outcome.parameters
+
+    # 4. Drop-in ecosystem replacement exports in system1, reflex, system1.integrations, reflex.integrations
+    drop_in_symbols = (
+        "SemanticRoute",
+        "RouteMatchResult",
+        "InstinctRouteLayer",
+        "SystemOneRouteLayer",
+        "build_default_router",
+        "RouteLLMCascadeSchema",
+        "RouteDecision",
+        "SystemOneRouteController",
+        "IncidentTriageModel",
+        "StructuredExtractionResult",
+        "SystemOneInstructorClient",
+        "PromptGuardSchema",
+        "PromptGuardResult",
+        "SystemOnePromptGuard",
+    )
+    for sym in drop_in_symbols:
+        assert getattr(system1, sym) is getattr(system1.integrations, sym)
+        assert getattr(reflex, sym) is getattr(system1, sym)
+        assert getattr(reflex.integrations, sym) is getattr(system1.integrations, sym)
+    assert system1.SystemOneRouteLayer is system1.InstinctRouteLayer
+
 

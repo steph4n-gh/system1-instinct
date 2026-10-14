@@ -55,10 +55,6 @@ metal = [
 neural = [
     "mlx>=0.10.0",
 ]
-gameboy = [
-    "pyboy>=2.0.0",
-    "Pillow>=10.0.0",
-]
 observability = [
     "prometheus_client>=0.17.0",
 ]

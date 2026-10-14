@@ -262,6 +262,19 @@ class CompiledSystemOneModel:
         self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
         self._lock = threading.RLock()
         self._learned_prompt_overrides: Dict[str, Dict[str, Any]] = {}
+        raw_overrides = self.metadata.get("learned_prompt_overrides")
+        if isinstance(raw_overrides, Mapping):
+            for p_key, f_map in raw_overrides.items():
+                if isinstance(p_key, str) and isinstance(f_map, Mapping):
+                    valid_f: Dict[str, Any] = {}
+                    for f_k, f_v in f_map.items():
+                        if f_k in self.schema.fields:
+                            try:
+                                valid_f[f_k] = self.schema.fields[f_k].validate_value(f_v)
+                            except (TypeError, ValueError):
+                                pass
+                    if valid_f:
+                        self._learned_prompt_overrides[p_key] = valid_f
 
         # Build live heads for evaluation
         self._field_heads: Dict[str, DecisionFieldHead] = {}
@@ -554,8 +567,8 @@ class CompiledSystemOneModel:
                             raw_cal_scores = getattr(ch_ref, "calibration_scores", ()) if ch_ref is not None else ()
                             ch_q = float(getattr(ch_ref, "conformal_quantile", 0.05)) if ch_ref is not None else 0.05
                             if score_method == "lac":
-                                pos_scores = [float(s) for s in raw_cal_scores if float(s) > 1e-6]
-                                eff_lac_q = max(ch_q, min(pos_scores) if pos_scores else 0.01)
+                                pos_scores = [float(s) for s in raw_cal_scores if 1e-6 < float(s) < 0.99]
+                                eff_lac_q = max(ch_q if ch_q < 0.99 else 0.01, min(pos_scores) if pos_scores else 0.01)
                                 q_goal = max(1e-4, min(0.035, eff_lac_q * 0.65))
                             else:
                                 q_goal = 0.02
@@ -612,24 +625,26 @@ class CompiledSystemOneModel:
                             if len(self._field_heads) > 1:
                                 ev_pre = head.forward(emb)
                                 logits_pre = np.asarray(ev_pre.logits, dtype=np.float64) / ch_temp
+                                eff_q_skip = ch_q if 0.0 < ch_q < 0.90 else 0.04
                                 if f_type == "choice" and len(logits_pre) >= 2:
                                     shifted_pre = logits_pre - np.max(logits_pre)
                                     exp_pre = np.exp(shifted_pre)
                                     probs_c_pre = exp_pre / np.sum(exp_pre)
-                                    p_top_pre = float(np.max(probs_c_pre))
-                                    if ev_pre.selected_value == target_val and (1.0 - p_top_pre) <= max(1e-3, ch_q) and p_top_pre >= 0.85:
+                                    pred_idx_pre = int(np.argmax(probs_c_pre))
+                                    p_top_pre = float(probs_c_pre[pred_idx_pre])
+                                    if pred_idx_pre == target_idx and (1.0 - p_top_pre) <= max(1e-3, eff_q_skip) and p_top_pre >= 0.95:
                                         skip_field = True
                                 elif f_type in ("multi_choice", "multichoice"):
                                     probs_pre = np.asarray(ev_pre.raw_probabilities, dtype=np.float64)
                                     s_pre = float(np.max(np.minimum(probs_pre, 1.0 - probs_pre))) if len(probs_pre) > 0 else 0.0
-                                    if set(ev_pre.selected_value) == set(target_val) and s_pre <= max(0.05, ch_q):
+                                    if set(ev_pre.selected_value) == set(target_val) and s_pre <= max(0.04, eff_q_skip):
                                         skip_field = True
                                 elif f_type == "boolean":
                                     p_sel_pre = float(ev_pre.confidence)
-                                    if bool(ev_pre.selected_value) == bool(target_val) and (1.0 - p_sel_pre) <= max(0.04, ch_q) and p_sel_pre >= 0.85:
+                                    if bool(ev_pre.selected_value) == bool(target_val) and (1.0 - p_sel_pre) <= max(0.04, eff_q_skip) and p_sel_pre >= 0.95:
                                         skip_field = True
                                 elif f_type == "score":
-                                    if abs(float(ev_pre.selected_value) - float(target_val)) <= min(0.04, max(0.01, ch_q * 0.8)):
+                                    if abs(float(ev_pre.selected_value) - float(target_val)) <= min(0.04, max(0.01, eff_q_skip * 0.8)):
                                         skip_field = True
                             if not skip_field:
                                 # Exact Sherman-Morrison directional gain scaling so W_next @ emb == y_desired in 1 step
@@ -721,14 +736,49 @@ class CompiledSystemOneModel:
                                     proto_idx = int(np.argmax(y_target))
                                 elif ch.field_type == "boolean" and ch.prototypes.shape[0] == 2:
                                     proto_idx = 1 if float(y_target[0]) > 0.0 else 0
-                                if not preserve_calibration and proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
-                                    blend = 0.15
-                                    updated_p = (1.0 - blend) * ch.prototypes[proto_idx] + blend * emb_u
+                                if proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
+                                    blend = 0.25 if preserve_calibration else 0.15
+                                    cur_p = ch.prototypes[proto_idx]
+                                    updated_p = emb_u if not np.any(cur_p) else ((1.0 - blend) * cur_p + blend * emb_u)
                                     up_norm = float(np.linalg.norm(updated_p))
                                     if up_norm > 1e-12:
                                         ch.prototypes = ch.prototypes.copy()
                                         ch.prototypes[proto_idx] = (updated_p / up_norm).astype(np.float32)
-                        if not preserve_calibration:
+                                if preserve_calibration and ch.prototype_threshold > 0.0:
+                                    sim_after = float(np.max(ch.prototypes @ emb_u))
+                                    if sim_after < ch.prototype_threshold:
+                                        ch.prototype_threshold = max(0.0, sim_after - 1e-4)
+                        if (
+                            preserve_calibration
+                            and ch.familiarity_threshold > 0.0
+                            and hasattr(self.projector, "raw_norm")
+                            and isinstance(prompt, str)
+                            and prompt.strip()
+                        ):
+                            try:
+                                p_raw_norm = float(self.projector.raw_norm(prompt))
+                                if p_raw_norm > 0.0 and p_raw_norm < ch.familiarity_threshold:
+                                    ch.familiarity_threshold = max(0.0, p_raw_norm - 1e-4)
+                            except Exception:
+                                pass
+                        if preserve_calibration and not ch.calibration_scores:
+                            if ch.field_type in ("choice", "boolean", "multi_choice", "multichoice"):
+                                k_opts = max(2, len(ch.options))
+                                q_init = float((k_opts - 1.0) / (3.5 + k_opts))
+                                ch.score_method = "lac"
+                                ch.calibration_scores = tuple(q_init for _ in range(20))
+                                ch.conformal_quantile = q_init
+                            elif ch.field_type == "score":
+                                f_def_sc = self.schema.fields.get(f_name)
+                                span = (
+                                    max(1e-6, float(f_def_sc.max_value - f_def_sc.min_value))
+                                    if isinstance(f_def_sc, ScoreField)
+                                    else 1.0
+                                )
+                                q_init_sc = 0.05 * span
+                                ch.calibration_scores = tuple(q_init_sc for _ in range(20))
+                                ch.conformal_quantile = q_init_sc
+                        elif not preserve_calibration:
                             # Old evidence describes the previous weights, including on disk.
                             ch.calibration_scores = ()
                             ch.class_calibration_scores = {}
@@ -778,6 +828,94 @@ class CompiledSystemOneModel:
     learn_from_system2 = learn_from_tier2
     learn_from_tier3 = learn_from_tier2
 
+    def learn(
+        self,
+        prompt: str,
+        target: Union[Mapping[str, Any], Any] = None,
+        telemetry: Optional[Any] = None,
+        embedding: Optional[np.ndarray] = None,
+        forgetting_factor: Optional[float] = None,
+        recency_weighted: Optional[bool] = None,
+        *,
+        preserve_calibration: bool = True,
+        outcome: Optional[Any] = None,
+        reward: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """First-class online teaching method that preserves calibration by default."""
+        eff_ff = forgetting_factor
+        if reward is not None:
+            r_val = float(reward)
+            if not math.isfinite(r_val):
+                raise ValueError("reward must be a finite number")
+            if r_val <= 0.0:
+                skipped: Dict[str, Any] = {
+                    "status": "skipped_non_positive_reward",
+                    "update_latency_ms": 0.0,
+                    "total_latency_ms": 0.0,
+                    "updated_fields": [],
+                    "reward": r_val,
+                }
+                if outcome is not None:
+                    skipped["outcome_recorded"] = True
+                return skipped
+            if r_val != 1.0:
+                base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+                eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
+
+        resolved_target = target
+        if resolved_target is None and outcome is not None:
+            if (
+                isinstance(outcome, Mapping)
+                and "target" in outcome
+                and not (set(outcome.keys()) & set(self.schema.fields.keys()))
+            ):
+                resolved_target = outcome["target"]
+            else:
+                resolved_target = outcome
+        if resolved_target is None:
+            raise ValueError("learn() requires a target label/mapping or outcome")
+
+        res = self.learn_from_tier2(
+            prompt,
+            resolved_target,
+            telemetry=telemetry,
+            embedding=embedding,
+            forgetting_factor=eff_ff,
+            recency_weighted=recency_weighted,
+            preserve_calibration=preserve_calibration,
+        )
+        if outcome is not None:
+            res["outcome_recorded"] = True
+        if reward is not None:
+            res["reward"] = float(reward)
+        return res
+
+    def learn_from_outcome(
+        self,
+        prompt: str,
+        target: Union[Mapping[str, Any], Any] = None,
+        telemetry: Optional[Any] = None,
+        embedding: Optional[np.ndarray] = None,
+        forgetting_factor: Optional[float] = None,
+        recency_weighted: Optional[bool] = None,
+        *,
+        preserve_calibration: bool = True,
+        outcome: Optional[Any] = None,
+        reward: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Online teaching from application context, user actions, or business outcomes."""
+        return self.learn(
+            prompt,
+            target,
+            telemetry=telemetry,
+            embedding=embedding,
+            forgetting_factor=forgetting_factor,
+            recency_weighted=recency_weighted,
+            preserve_calibration=preserve_calibration,
+            outcome=outcome,
+            reward=reward,
+        )
+
     def to_bytes(self, include_covariance: bool = False) -> bytes:
         """Serializes the compiled model into compact .s1m binary bytes.
 
@@ -819,6 +957,20 @@ class CompiledSystemOneModel:
                     h_entry["cluster_assignments"] = [int(c) for c in ch.cluster_assignments]
                 heads_meta[name] = h_entry
 
+            serialized_meta: Dict[str, Any] = {
+                **self.metadata,
+                "forgetting_factor": self.forgetting_factor,
+                "recency_weighted": self.recency_weighted,
+            }
+            if self._learned_prompt_overrides:
+                serialized_meta["learned_prompt_overrides"] = {
+                    p_k: {
+                        f_k: (list(f_v) if isinstance(f_v, tuple) else f_v)
+                        for f_k, f_v in f_map.items()
+                    }
+                    for p_k, f_map in self._learned_prompt_overrides.items()
+                }
+
             header_meta = {
                 "version": 2,
                 "projector": _projector_config(self.projector),
@@ -827,11 +979,7 @@ class CompiledSystemOneModel:
                 "schema_digest": self.schema.schema_digest(),
                 "dimension": self.dimension,
                 "created_at": getattr(self, "created_at", 0.0),
-                "metadata": {
-                    **self.metadata,
-                    "forgetting_factor": self.forgetting_factor,
-                    "recency_weighted": self.recency_weighted,
-                },
+                "metadata": serialized_meta,
                 "heads": heads_meta,
             }
             header_bytes = json.dumps(header_meta, sort_keys=True).encode("utf-8")
@@ -1949,7 +2097,10 @@ class SystemOneCompiler:
                     num_temperature = len(temperature_samples)
                     calibration_samples = temperature_samples + conformal_samples
             elif isinstance(f_def, ChoiceField) and len(calibration_samples) >= 2:
-                num_temperature = len(calibration_samples) // 2
+                if len(calibration_samples) >= 40 or len(calibration_samples) <= 20:
+                    num_temperature = len(calibration_samples) // 2
+                else:
+                    num_temperature = len(calibration_samples) - 20
             num_train, num_calib = len(samples), len(calibration_samples)
             sample_counts[field_name] = {
                 "fit": num_train, "calibration": num_calib,

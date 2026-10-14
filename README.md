@@ -25,11 +25,12 @@ A raw `0`-shot classifier is **not** magic on its own—if you force a `0`-shot 
 
 What makes **System 1: Instinct** work in production from Request #1 is **Conformal Abstention + Sub-Millisecond Online Learning**:
 
-### Step 1: Start at Zero (`0` Examples)
-Define your structured decision. At `0` examples, Instinct only answers obvious matches and **abstains (`is_ambiguous=True`) on everything else**, handing uncertain requests to your LLM so your production accuracy starts at **`100%`**:
+### Copy-Paste Quickstart: `Before -> Teach -> After` in 5 Seconds
+
+Define your structured decision schema (`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`). At **`0` examples**, Instinct abstains (`is_ambiguous=True`) on uncertain requests so it never guesses blindly on Day 0. Teach it **`3 to 10` examples per option** (from application outcomes or an LLM teacher), and it generalizes to unseen phrasings in `< 1 ms` while still rejecting out-of-scope inputs:
 
 ```python
-from system1 import BooleanField, BoundedReviewFallback, ChoiceField, DecisionSchema, SystemOneEngine, TeachingSession
+from system1 import BooleanField, BoundedReviewFallback, ChoiceField, DecisionSchema, SystemOneEngine
 
 class SupportTriage(DecisionSchema):
     queue = ChoiceField(
@@ -42,38 +43,57 @@ class SupportTriage(DecisionSchema):
     )
     urgent = BooleanField(description="True if production is down, security is compromised, or money is blocked")
 
+# 1. BEFORE (0 examples): Cold-start strict mode safely abstains instead of guessing blindly
 engine = SystemOneEngine(SupportTriage, strict_mode=True, use_cache=False)
-```
+unseen_ticket = "Production webhook endpoint returning 502 bad gateway and API timeout"
+before = engine.decide(unseen_ticket, strict=True, record_receipt=False)
+print(before.is_ambiguous)  # -> True (escalates to your fallback / LLM on Day 0)
 
-### Step 2: Teach It `3 to 10` Examples per Option (From Application Context or an LLM)
-
-An LLM teacher (`Jev`, `GPT-4o`, `Claude`) is only **guessing from text** before anything happens. **Your application context is an even better teacher** because it knows what *actually worked* after it happened—which tool returned `200 OK`, which button the operator clicked in the UI, or which handler resolved the request—for **`$0` and `0` LLM tokens**:
-
-```python
-# WAY A: Learn from Application Context (< 0.5 ms, $0 LLM cost)
-# Feed ground-truth outcomes from your own app (a UI click, a tool execution that
-# succeeded, or a webhook handler) directly into Instinct:
-engine.learn(
-    "charged twice on my Visa ending 4412, do not upgrade, just refund the duplicate",
-    {"queue": "refunds", "urgent": False},
+# 2. TEACH (< 0.5 ms per lesson, $0 LLM cost): Teach from app outcomes or LLM fallback
+engine.learn_from_outcome(
+    "Charged twice on my Visa invoice, please refund the duplicate billing charge",
+    outcome={"queue": "refunds", "urgent": False},
+)
+engine.learn_from_outcome(
+    "Locked out of SSO login because my 2FA reset code is not arriving",
+    outcome={"queue": "account_access", "urgent": True},
 )
 engine.learn(
-    "production webhook endpoint returning 502 bad gateway since the 9am deploy",
+    "API timeout and 502 bad gateway crashing production startup after deploy",
     {"queue": "technical_bug", "urgent": True},
 )
 
-# WAY B: Learn from an LLM / Jev on Cold Start (0 manual labeling)
-# When no downstream outcome exists yet and Instinct is unsure (`is_ambiguous=True`),
-# fall back to your LLM once and record the lesson automatically:
-triage = BoundedReviewFallback(
+# Or wrap any LLM callable so uncertain queries teach Instinct automatically:
+fallback = BoundedReviewFallback(
     engine,
-    review_fn=my_llm_triage,
-    teaching_session=TeachingSession(".system1/triage", SupportTriage),
-    auto_record_lessons=True,
+    review_fn=lambda prompt: {"queue": "technical_bug", "urgent": True},
     auto_online_update=True,
 )
-result = triage.decide("Our SSO login keeps throwing SAML signature error for all users")
+fallback.decide("Webhook delivery failing with 502 bad gateway timeout in production")
+
+# 3. AFTER: Unseen phrasing resolves locally in < 1 ms; out-of-scope safely abstains
+after = engine.decide(unseen_ticket, strict=True, record_receipt=False)
+print(after.is_ambiguous, after.values)
+# -> False {'queue': 'technical_bug', 'urgent': True} (0 LLM calls, < 1 ms on CPU)
+
+oos = engine.decide("What is the best recipe for sourdough bread?", strict=True, record_receipt=False)
+print(oos.is_ambiguous, oos.conformal_sets)
+# -> True {'queue': [], 'urgent': []} (safe out-of-scope abstention!)
+
+# 4. Save & reload a portable ~12 KiB .s1m skill in 2 lines (preserves strict calibration)
+engine.save("triage.s1m")
+reloaded = SystemOneEngine.load("triage.s1m")
 ```
+
+### 3 Ways to Teach Instinct in Production
+
+An LLM teacher (`GPT-4o`, `Claude`, `Gemini`) only guesses from text before anything happens. Your **application context** is often an even better teacher because it observes what *actually worked* after execution—for **`$0` and `0` LLM tokens**:
+
+| Teaching Path | API Entrypoint | Cost & Speed | Best For |
+| :--- | :--- | :---: | :--- |
+| **1. From Application Context & Outcomes** | `engine.learn_from_outcome(prompt, outcome=...)`<br>`engine.learn(prompt, labels)` | **`$0` LLM cost**<br>`< 0.5 ms` RLS update | Ground-truth reality: UI clicks, user edits, tool exit codes (`200 OK`), support ticket resolutions, or game rewards. |
+| **2. By Shadowing an LLM Teacher** | `BoundedReviewFallback(engine, review_fn=..., auto_online_update=True)`<br>`TypeSafeClient(...)` | **`0` manual labeling**<br>Auto-cuts over to `.s1m` | Wrapping an existing OpenAI / Anthropic / local LLM call so cache/confidence misses teach Instinct automatically. |
+| **3. From Historical Logs or Unlabeled Traffic** | `SystemOneCompiler(Schema).compile(exemplars)`<br>`engine.adapt_zero_shot(unlabeled_prompts)` | **Offline CPU fit**<br>`< 120 KiB` `.s1m` file | Compiling `10–50` historical logs per option into a versioned `.s1m` artifact, or bridging co-occurring domain jargon without labels. |
 
 Run the **"Break-Me & Teach-Me" Live Showcase** ([`examples/showcase_break_and_teach.py`](examples/showcase_break_and_teach.py))—or pass `--interactive` to type your own curveballs and teach it in 1 line against `BAAI/bge-small-en-v1.5` (`67.2 MB` ONNX):
 
@@ -210,12 +230,12 @@ Measured on `24` intents from `CLINC150` (`120` test queries) and `BANKING77` (`
 | Examples / Class | Total Examples (`24` classes) | `CLINC150` Raw Online Acc | `CLINC150` Local Offload % | `CLINC150` End-to-End Acc | `BANKING77` Raw Online Acc | `BANKING77` Local Offload % | `BANKING77` End-to-End Acc |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **`0` (Cold)** | **`0`** | `61.7%` | `0.0%` *(100% teacher)* | **`100.0%`** | `53.6%` | `0.0%` *(100% teacher)* | **`100.0%`** |
-| **`1` / class** | **`24`** | `65.8%` | **`59.2%` local** | **`88.3%`** | `57.3%` | **`42.2%` local** | **`92.2%`** |
-| **`3` / class** | **`72`** | `72.5%` | **`60.8%` local** | **`90.8%`** | `65.6%` | **`48.4%` local** | **`93.2%`** |
-| **`5` / class** | **`120`** | `82.5%` | **`85.0%` local** | **`90.8%`** | `70.3%` | **`50.0%` local** | **`95.3%`** |
-| **`8` / class** | **`192`** | `85.8%` | **`65.0%` local** *(compiled)* | **`98.3%`** | `72.4%` | **`56.2%` local** *(compiled)* | **`96.9%`** |
-| **`10` / class** | **`240`** | `85.8%` (`.s1m`) | **`70.0%` local** *(compiled)* | **`99.2%`** | `77.1%` (`.s1m`) | **`64.6%` local** *(compiled)* | **`94.8%`** |
-| **`24–40` / class** | **`576–960`** | **`90.8%`** | **`87.5%` local** *(compiled)* | **`99.2%`** | **`90.1%`** (`.s1m`) | **`70.3%` local** *(compiled)* | **`100.0%`** |
+| **`1` / class** | **`24`** | `65.8%` | **`42.5%` local** | **`92.5%`** | `57.3%` | **`27.6%` local** | **`96.4%`** |
+| **`3` / class** | **`72`** | `72.5%` | **`36.7%` local** | **`97.5%`** | `65.6%` | **`27.6%` local** | **`97.9%`** |
+| **`5` / class** | **`120`** | `82.5%` | **`37.5%` local** | **`97.5%`** | `70.3%` | **`33.9%` local** | **`97.4%`** |
+| **`8` / class** | **`192`** | `85.8%` | **`40.0%` local** | **`99.2%`** | `72.4%` | **`40.1%` local** | **`96.9%`** |
+| **`10` / class** | **`240`** | `85.8%` (`.s1m`) | **`80.0%` local** *(compiled)* | **`97.5%`** | `77.1%` (`.s1m`) | **`78.1%` local** *(compiled)* | **`90.1%`** |
+| **`all` (`10–25` / class)** | **`240–600`** | **`87.5%`** (`.s1m`) | **`79.2%` local** *(compiled)* | **`95.8%`** | **`90.1%`** (`.s1m`) | **`68.8%` local** *(compiled)* | **`99.5%`** |
 
 ### 3. Full 6-Category Offline Benchmark Gauntlet
 Reproduce 100% offline (`block_network()`) with `python benchmarks/quality/evaluate_instinct_gauntlet.py` ([full report](benchmarks/quality/instinct_gauntlet_report.md)):

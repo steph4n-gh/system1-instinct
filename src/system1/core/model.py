@@ -963,10 +963,10 @@ class DecisionFieldHead:
                         if i != t_idx and z0[i] > 0.15:
                             z_desired[i] = 0.05
                     comp_after = float(np.max([z_desired[i] for i in range(K) if i != t_idx]))
-                    z_desired[t_idx] = max(float(z0[t_idx]), comp_after + 1.25, 1.25)
+                    z_desired[t_idx] = max(float(z0[t_idx]), comp_after + 1.45, 1.45)
                 elif isinstance(self.field_def, BooleanField):
                     sign = 1.0 if float(y[0]) >= 0.0 else -1.0
-                    z_desired[0] = sign * max(abs(float(z0[0])), 1.25)
+                    z_desired[0] = sign * max(abs(float(z0[0])), 1.45)
                 elif isinstance(self.field_def, MultiChoiceField):
                     for i in range(K):
                         sign = 1.0 if float(y[i]) >= 0.0 else -1.0
@@ -1523,6 +1523,94 @@ class SystemOneModel:
     # Cognitive dual-process and execution pipeline aliases
     learn_from_system2 = learn_from_tier2
     learn_from_tier3 = learn_from_tier2
+
+    def learn(
+        self,
+        prompt: str,
+        target: Union[Mapping[str, Any], Any] = None,
+        telemetry: Optional[Any] = None,
+        embedding: Optional[np.ndarray] = None,
+        forgetting_factor: Optional[float] = None,
+        recency_weighted: Optional[bool] = None,
+        *,
+        preserve_calibration: bool = True,
+        outcome: Optional[Any] = None,
+        reward: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """First-class online teaching method that preserves calibration by default."""
+        eff_ff = forgetting_factor
+        if reward is not None:
+            r_val = float(reward)
+            if not math.isfinite(r_val):
+                raise ValueError("reward must be a finite number")
+            if r_val <= 0.0:
+                skipped: Dict[str, Any] = {
+                    "status": "skipped_non_positive_reward",
+                    "update_latency_ms": 0.0,
+                    "total_latency_ms": 0.0,
+                    "updated_fields": [],
+                    "reward": r_val,
+                }
+                if outcome is not None:
+                    skipped["outcome_recorded"] = True
+                return skipped
+            if r_val != 1.0:
+                base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+                eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
+
+        resolved_target = target
+        if resolved_target is None and outcome is not None:
+            if (
+                isinstance(outcome, Mapping)
+                and "target" in outcome
+                and not (set(outcome.keys()) & set(self.schema.fields.keys()))
+            ):
+                resolved_target = outcome["target"]
+            else:
+                resolved_target = outcome
+        if resolved_target is None:
+            raise ValueError("learn() requires a target label/mapping or outcome")
+
+        res = self.learn_from_tier2(
+            prompt,
+            resolved_target,
+            telemetry=telemetry,
+            embedding=embedding,
+            forgetting_factor=eff_ff,
+            recency_weighted=recency_weighted,
+            preserve_calibration=preserve_calibration,
+        )
+        if outcome is not None:
+            res["outcome_recorded"] = True
+        if reward is not None:
+            res["reward"] = float(reward)
+        return res
+
+    def learn_from_outcome(
+        self,
+        prompt: str,
+        target: Union[Mapping[str, Any], Any] = None,
+        telemetry: Optional[Any] = None,
+        embedding: Optional[np.ndarray] = None,
+        forgetting_factor: Optional[float] = None,
+        recency_weighted: Optional[bool] = None,
+        *,
+        preserve_calibration: bool = True,
+        outcome: Optional[Any] = None,
+        reward: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Online teaching from application context, user actions, or business outcomes."""
+        return self.learn(
+            prompt,
+            target,
+            telemetry=telemetry,
+            embedding=embedding,
+            forgetting_factor=forgetting_factor,
+            recency_weighted=recency_weighted,
+            preserve_calibration=preserve_calibration,
+            outcome=outcome,
+            reward=reward,
+        )
 
     def forward_batch(
         self,

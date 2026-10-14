@@ -79,7 +79,10 @@ def upstream_llm_teacher(prompt: str) -> Dict[str, object]:
 
 
 def main() -> int:
-    # Build a calibrated starter skill from 3 seed examples per class
+    # Step 1: Start from a cold-start 0-shot engine (or optional starter examples)
+    engine = SystemOneEngine(SupportTicketSchema, strict_mode=True, use_cache=False)
+
+    # Teach 3 starter examples per class online (or via BoundedReviewFallback)
     seed_examples: List[Tuple[str, Dict[str, object]]] = [
         ("Please refund the duplicate charge on my monthly invoice", {"queue": "billing", "urgent": False}),
         ("Download our annual subscription receipt and VAT tax form", {"queue": "billing", "urgent": False}),
@@ -94,14 +97,8 @@ def main() -> int:
         ("How do I invite a team member and update workspace role permissions?", {"queue": "account_access", "urgent": False}),
         ("SSO SAML login redirect fails when assigning a new seat", {"queue": "account_access", "urgent": False}),
     ]
-
-    compiler = SystemOneCompiler(SupportTicketSchema, dimension=1024, regularization=0.2)
-    exemplars = {
-        "queue": [(t, str(y["queue"])) for t, y in seed_examples * 3],
-        "urgent": [(t, bool(y["urgent"])) for t, y in seed_examples * 3],
-    }
-    model = compiler.compile(exemplars, calibration_split=0.25)
-    engine = SystemOneEngine(SupportTicketSchema, model=model, strict_mode=True, use_cache=False)
+    for prompt, label in seed_examples:
+        engine.learn(prompt, label)
 
     llm_call_count = 0
 
@@ -117,8 +114,8 @@ def main() -> int:
         auto_online_update=True,
     )
 
-    # Incoming production waves (including novel domain jargon like 'Kafka consumer lag', 'SIEM alert', 'SAML assertion')
-    wave_requests: List[Tuple[str, Dict[str, object]]] = [
+    # Wave 1: Novel domain jargon (e.g. 'Kafka consumer lag', 'SIEM alert', 'ledger wire')
+    wave_1_requests: List[Tuple[str, Dict[str, object]]] = [
         ("Refund my duplicate credit card charge on the billing invoice", {"queue": "billing", "urgent": False}),
         ("Kafka consumer lag and Redis cluster crash causing 502 timeouts", {"queue": "infrastructure", "urgent": True}),
         ("SIEM alert: CVE exploit and unauthorized token compromise", {"queue": "security", "urgent": True}),
@@ -127,12 +124,31 @@ def main() -> int:
         ("Invite a new team member seat with workspace role permissions", {"queue": "account_access", "urgent": False}),
     ]
 
+    # Wave 2: Repeat traffic on taught patterns
+    wave_2_requests = list(wave_1_requests)
+
+    # Wave 3: Unseen generalized phrasings (never seen in seed_examples or Wave 1/2)
+    wave_3_unseen_requests: List[Tuple[str, Dict[str, object]]] = [
+        ("Duplicate credit card charge on our monthly billing invoice needs a refund", {"queue": "billing", "urgent": False}),
+        ("Redis cluster crash and Kafka consumer lag triggering 502 gateway timeouts", {"queue": "infrastructure", "urgent": True}),
+        ("Unauthorized API token compromise and CVE exploit flagged in SIEM alert", {"queue": "security", "urgent": True}),
+        ("MFA authenticator reset locked out my account from SSO SAML login", {"queue": "account_access", "urgent": True}),
+        ("Monthly VAT billing statement has a wire transfer payout overcharge", {"queue": "billing", "urgent": False}),
+        ("Update workspace role permissions to invite a new team member seat", {"queue": "account_access", "urgent": False}),
+    ]
+
+    waves = [
+        ("Wave 1 (Initial Stream + Novel Jargon)", wave_1_requests),
+        ("Wave 2 (Repeat Stream)", wave_2_requests),
+        ("Wave 3 (Unseen Generalized Phrasings)", wave_3_unseen_requests),
+    ]
+
     print("=== System 1: Instinct — LLM Observe -> Online RLS -> Local Cutover Demo ===")
-    for wave_idx in range(1, 4):
+    for wave_label, requests in waves:
         calls_before = llm_call_count
         correct = 0
         latencies: List[float] = []
-        for prompt, expected in wave_requests:
+        for prompt, expected in requests:
             t0 = time.perf_counter()
             res = fallback.decide(prompt)
             latencies.append((time.perf_counter() - t0) * 1000.0)
@@ -140,23 +156,25 @@ def main() -> int:
             if vals["queue"] == expected["queue"] and bool(vals["urgent"]) == bool(expected["urgent"]):
                 correct += 1
         wave_llm_calls = llm_call_count - calls_before
-        local_rate = 1.0 - (wave_llm_calls / len(wave_requests))
+        local_rate = 1.0 - (wave_llm_calls / len(requests))
         avg_ms = sum(latencies) / len(latencies)
         print(
-            f"  Wave {wave_idx}: Joint Accuracy={correct}/{len(wave_requests)} ({correct/len(wave_requests):.0%}) | "
+            f"  {wave_label}: Joint Accuracy={correct}/{len(requests)} ({correct/len(requests):.0%}) | "
             f"Served Locally={local_rate:.0%} (LLM Calls={wave_llm_calls}) | Avg Latency={avg_ms:.3f} ms"
         )
 
     with tempfile.TemporaryDirectory() as tmp:
         s1m_path = Path(tmp) / "support_ticket_instinct.s1m"
-        model.save(s1m_path)
-        reloaded = CompiledSystemOneModel.load(s1m_path)
-        reloaded_engine = SystemOneEngine(SupportTicketSchema, model=reloaded, strict_mode=False)
-        probe = "Kafka consumer lag and Redis cluster crash causing 502 timeouts"
+        engine.save(s1m_path)
+        reloaded_engine = SystemOneEngine.load(s1m_path)
+        probe = "Redis cluster crash and Kafka consumer lag triggering 502 gateway timeouts"
         dec = reloaded_engine.decide(probe, record_receipt=False)
+        assert reloaded_engine.strict_mode is True
+        assert not dec.is_ambiguous
+        assert dec.values == {"queue": "infrastructure", "urgent": True}
         print(
-            f"\nSaved & Reloaded .s1m ({s1m_path.stat().st_size / 1024:.1f} KiB): "
-            f"queue={dec.values['queue']!r}, urgent={dec.values['urgent']} "
+            f"\nSaved & Reloaded .s1m ({s1m_path.stat().st_size / 1024:.1f} KiB, strict_mode={reloaded_engine.strict_mode}): "
+            f"queue={dec.values['queue']!r}, urgent={dec.values['urgent']}, is_ambiguous={dec.is_ambiguous} "
             f"(latency={dec.latency_ms:.3f} ms, 0 LLM calls)"
         )
     return 0

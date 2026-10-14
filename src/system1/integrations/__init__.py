@@ -25,6 +25,22 @@ from system1.integrations.langchain import (
     SystemOneToolInterceptor,
     wrap_langchain_tool,
 )
+from system1.integrations.drop_in import (
+    IncidentTriageModel,
+    InstinctRouteLayer,
+    PromptGuardResult,
+    PromptGuardSchema,
+    RouteDecision,
+    RouteLLMCascadeSchema,
+    RouteMatchResult,
+    SemanticRoute,
+    StructuredExtractionResult,
+    SystemOneInstructorClient,
+    SystemOnePromptGuard,
+    SystemOneRouteController,
+    SystemOneRouteLayer,
+    build_default_router,
+)
 
 # Compatibility alias
 System1MCPProxy = SystemOneMCPProxy
@@ -43,6 +59,21 @@ __all__ = [
     "SystemOneGuardCallbackHandler",
     "SystemOneToolInterceptor",
     "wrap_langchain_tool",
+    # Drop-In Ecosystem Replacements
+    "SemanticRoute",
+    "RouteMatchResult",
+    "SystemOneRouteLayer",
+    "InstinctRouteLayer",
+    "build_default_router",
+    "RouteLLMCascadeSchema",
+    "RouteDecision",
+    "SystemOneRouteController",
+    "IncidentTriageModel",
+    "StructuredExtractionResult",
+    "SystemOneInstructorClient",
+    "PromptGuardSchema",
+    "PromptGuardResult",
+    "SystemOnePromptGuard",
 ]
 
 # Optional: Prometheus observability (requires `prometheus_client`)

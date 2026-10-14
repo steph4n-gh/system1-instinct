@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report vulnerabilities privately through [GitHub's private vulnerability reporting form](https://github.com/steph4n-gh/system1/security/advisories/new). If private reporting is unavailable, open an issue requesting a private contact without posting exploit details, credentials, or sensitive data.
+Report vulnerabilities privately through [GitHub's private vulnerability reporting form](https://github.com/steph4n-gh/system1-instinct/security/advisories/new). If private reporting is unavailable, open an issue requesting a private contact without posting exploit details, credentials, or sensitive data.
 
 Include the affected version, configuration, expected boundary, reproduction steps using harmless sentinel tools, and observed result. Please avoid testing against services or data you do not own.
 

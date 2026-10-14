@@ -1,14 +1,14 @@
 # Correct, compare, and adopt a skill
 
-A teaching session keeps the lessons, a working skill, and a proposed revision
-together. **Correct a lesson → build a candidate → compare answers → explicitly
-adopt.** Editing a lesson or assessing a candidate does not replace the skill
-already serving your application.
+System 1 gives you two complementary ways to correct a skill when you see a mistake or a new edge case:
 
-This additive workflow is available in **System 1 1.1.0 and newer** (current release **1.4.0**):
+1. **Instant Online Correction (`<1 ms` in-place Rank-1 RLS)**: Call `engine.learn(prompt, {"team": "support"})` or `engine.learn_from_outcome(prompt, {"team": "support"}, outcome="resolved", reward=1.0)` (or wrap your upstream LLM/reviewer with `BoundedReviewFallback(..., auto_online_update=True)`). By default (`preserve_calibration=True`), System 1 applies an exact Sherman-Morrison Rank-1 covariance update and scales calibration quantiles in place, then lets you persist immediately with `engine.save("support-route.s1m")`.
+2. **Governed Candidate Promotion (`TeachingSession`)**: Keep the lessons, a working incumbent skill, and a proposed candidate revision together: **Correct a lesson → build a candidate → compare answers → explicitly adopt.** Editing a lesson or assessing a candidate does not replace the skill already serving your application until `session.adopt()` passes your regression and error gates.
+
+This governed workflow is available in **System 1 1.0.0**:
 
 ```bash
-python -m pip install 'system1>=1.4.0'
+python -m pip install 'system1>=1.0.0'
 ```
 
 `TeachingSession` supports both single-field text classification (`ChoiceField`,
@@ -17,10 +17,9 @@ extraction schemas (where at least one field has ambiguity escalation enabled,
 the schema default). A schema that disables escalation on all fields is rejected
 because the session requires review of uncertain answers. Existing compiler and
 engine APIs, numerical algorithms, and `.s1m` format remain unchanged; no
-additional dependency is required. Existing hashed skills remain readable. The
-helper's TF-IDF skills need a 1.1.0-or-newer reader. This helper uses the
+additional dependency is required. Existing hashed skills remain readable. This helper uses the
 existing TF-IDF projector with at most 1,024 features, ridge regularization
-0.1, and strict decisions at `alpha=0.05` (with optional `selection="chi2"`, `char_ngrams`, `mondrian=True`, `familiarity_alpha`, `prototype_alpha`, `hierarchical` routing, and `split="auto"` stratified routing in 1.4.0). These choices are confined to the helper;
+0.1, and strict decisions at `alpha=0.05` (with optional `selection="chi2"`, `char_ngrams`, `mondrian=True`, `familiarity_alpha`, `prototype_alpha`, `hierarchical` routing, and `split="auto"` stratified routing). These choices are confined to the helper;
 the compiler's existing defaults remain unchanged.
 
 For the experimental visual version, use a repository checkout and run
@@ -243,7 +242,7 @@ separate decisions.
 
 ## Independent qualification
 
-Version 1.2.0 adds a separate one-shot qualification step. Choose the workload
+`TeachingSession` also supports a separate one-shot qualification step. Choose the workload
 policy before inspecting the cohort, keep this data outside fitting, calibration,
 and recurring evaluation, and collect independently reviewed representative rows.
 
@@ -304,7 +303,7 @@ was part of the approval. Recovery validates the artifact, schema, approval poli
 and required qualification. A missing or altered archive is refused. Rollback
 invalidates the pending assessment even if the restored skill was its original
 incumbent. Reassess before another adoption; restore is not automatic promotion.
-An existing 1.1 approved skill is retained during the first 1.2 adoption with its
+An existing approved skill is retained during adoption with its
 legacy status when its earlier assessment is unavailable.
 
 ```bash
@@ -325,5 +324,4 @@ Install `system1[teaching]` for its SciPy fitting dependency. The chosen setting
 retained, and reopening with a different supplied setting is refused. Default
 teaching, qualification, rollback, and inference on saved logistic heads need no
 SciPy. Old version-one session state reopens without rewriting; missing solver
-settings mean ridge. Reassess old active candidate reports before adoption. Use
-1.2.0 for directories that now contain the new session contracts.
+settings mean ridge. Reassess old active candidate reports before adoption.

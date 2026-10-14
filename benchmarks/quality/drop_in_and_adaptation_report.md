@@ -4,12 +4,24 @@
 
 Evaluated on held-out public intent datasets (`BANKING77` and `CLINC150`). Starts from **`0` training examples**
 (using only the raw intent label names as descriptions), then adapts online via unsupervised `adapt_zero_shot()`,
-`1`-shot, `3`-shot, `5`-shot `learn_from_tier2()`, and full `.s1m` compilation:
+`1`-shot, `3`-shot, `5`-shot, `8`-shot, `10`-shot `learn()`, and full `.s1m` compilation:
 
-| Public Dataset (`24` Intents) | `0`-Shot (Label Names Only) | `0`-Shot + Unsupervised `adapt_zero_shot` | `1`-Shot Online | `3`-Shot Online | `5`-Shot Online | Compiled `.s1m` | Compiled P50 Latency |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`BANKING77`** (`192` test queries) | 53.6% | 55.2% | **57.3%** | **65.6%** | **70.3%** | **90.1%** | **0.350 ms** |
-| **`CLINC150`** (`120` test queries) | 61.7% | 62.5% | **65.8%** | **72.5%** | **82.5%** | **87.5%** | **0.329 ms** |
+| Public Dataset (`24` Intents) | `0`-Shot (Label Names Only) | `0`-Shot + Unsupervised `adapt_zero_shot` | `1`-Shot Online | `3`-Shot Online | `5`-Shot Online | `8`-Shot Online | `10`-Shot Online | Compiled `.s1m` (`all`) | Compiled P50 Latency |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`BANKING77`** (`192` test queries) | 53.6% | 55.2% | **57.3%** | **65.6%** | **70.3%** | **72.4%** | **77.1%** | **90.1%** | **0.334 ms** |
+| **`CLINC150`** (`120` test queries) | 61.7% | 62.5% | **65.8%** | **72.5%** | **82.5%** | **85.8%** | **85.8%** | **87.5%** | **0.337 ms** |
+
+### 7-Point Sample-Efficiency Progression (`0, 1, 3, 5, 8, 10, all` Examples / Class)
+
+| Examples / Class | `BANKING77` Raw Acc | `BANKING77` Strict Local Offload | `BANKING77` End-to-End Acc (w/ Fallback) | `CLINC150` Raw Acc | `CLINC150` Strict Local Offload | `CLINC150` End-to-End Acc (w/ Fallback) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`0`** | 53.6% | 0.0% | **100.0%** | 61.7% | 0.0% | **100.0%** |
+| **`1`** | 57.3% | 27.6% | **96.4%** | 65.8% | 42.5% | **92.5%** |
+| **`3`** | 65.6% | 27.6% | **97.9%** | 72.5% | 36.7% | **97.5%** |
+| **`5`** | 70.3% | 33.9% | **97.4%** | 82.5% | 37.5% | **97.5%** |
+| **`8`** | 72.4% | 40.1% | **96.9%** | 85.8% | 40.0% | **99.2%** |
+| **`10`** | 77.1% | 78.1% | **90.1%** | 85.8% | 80.0% | **97.5%** |
+| **`all`** | 90.1% | 68.8% | **99.5%** | 87.5% | 79.2% | **95.8%** |
 
 ---
 
@@ -43,7 +55,7 @@ on the exact same held-out splits from the [6-category benchmark gauntlet](insti
 
 | Procedural Drop-In Example | Verified Capability | Smoke Check | Secondary Verification | P50 CPU Latency |
 | :--- | :--- | :---: | :---: | :---: |
-| **`semantic-router`** ([guide](../../docs/drop_in/01_semantic_router.md)) | In-Domain + OOD + `adapt_zero_shot` | **100.0%** | OOD Reject: **100.0%** · Unseen Jargon: `0% -> 100%` | **1.217 ms** |
-| **`RouteLLM`** ([guide](../../docs/drop_in/02_routellm_cascade.md)) | 3-Tier Complexity Cascade | **100.0%** | Zero External API Calls | **1.434 ms** |
-| **`Instructor` / `BAML`** ([guide](../../docs/drop_in/03_instructor_structured_outputs.md)) | 4-Field Joint Extraction | **100.0%** | Dept: **100.0%** / Alert: **100.0%** | **1.825 ms** |
-| **`Llama-Prompt-Guard`** ([guide](../../docs/drop_in/04_prompt_guard_security.md)) | Attack Recall + `NotInject` Guard | **100.0%** | `NotInject` Benign FPR: **0.0%** | **0.810 ms** |
+| **`semantic-router`** ([guide](../../docs/drop_in/01_semantic_router.md)) | In-Domain + OOD + `adapt_zero_shot` | **100.0%** | OOD Reject: **100.0%** · Unseen Jargon: `0% -> 100%` | **1.817 ms** |
+| **`RouteLLM`** ([guide](../../docs/drop_in/02_routellm_cascade.md)) | 3-Tier Complexity Cascade | **100.0%** | Zero External API Calls | **1.310 ms** |
+| **`Instructor` / `BAML`** ([guide](../../docs/drop_in/03_instructor_structured_outputs.md)) | 4-Field Joint Extraction | **100.0%** | Dept: **100.0%** / Alert: **100.0%** | **1.738 ms** |
+| **`Llama-Prompt-Guard`** ([guide](../../docs/drop_in/04_prompt_guard_security.md)) | Attack Recall + `NotInject` Guard | **100.0%** | `NotInject` Benign FPR: **0.0%** | **0.789 ms** |

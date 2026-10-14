@@ -28,6 +28,51 @@ You are showing complete messages and their correct destination. You do not need
 to highlight keywords, write a prompt for an LLM or describe an algorithm.
 The answer names must match the two choices exactly: `billing` or `support`.
 
+## Fast path in Python: 0 examples $\to$ 6 online examples $\to$ `.s1m`
+
+Before creating any files, you can teach an engine interactively in Python. With
+**0 examples**, `strict_mode=True` safely abstains (`is_ambiguous=True`). After
+**6 online examples** via `engine.learn_from_outcome(...)` (or `engine.learn(...)`),
+System 1 routes unseen phrasings locally in `<1 ms`, still abstains on unrelated
+topics, and saves to a portable `.s1m` file:
+
+```python
+from system1 import ChoiceField, DecisionSchema, SystemOneEngine
+
+
+class SupportRoute(DecisionSchema):
+    team = ChoiceField(options=["billing", "support"])
+
+
+# 1. Start at 0 examples — strict mode safely abstains instead of guessing
+engine = SystemOneEngine(SupportRoute, strict_mode=True)
+before = engine.decide("Duplicate charge on my credit card invoice", record_receipt=False)
+assert before.is_ambiguous is True
+
+# 2. Teach 6 examples online (<1 ms per Rank-1 Sherman-Morrison update)
+for message, team in [
+    ("Refund my duplicate credit card charge and fix the invoice", "billing"),
+    ("Why was my subscription billed twice on this receipt?", "billing"),
+    ("Please update our billing address and send the tax invoice", "billing"),
+    ("Application crashes with a stack trace when calling the API", "support"),
+    ("Debug this software exception and fix the failing endpoint", "support"),
+    ("Production server error logs show a timeout crash on startup", "support"),
+]:
+    engine.learn_from_outcome(message, {"team": team}, outcome="resolved", reward=1.0)
+
+# 3. Unseen phrasings now resolve locally with high confidence
+after = engine.decide("My credit card was billed twice for the subscription invoice", record_receipt=False)
+assert after.values["team"] == "billing" and after.is_ambiguous is False
+
+# Out-of-scope inputs still abstain safely
+oos = engine.decide("What is the best recipe for sourdough bread?", record_receipt=False)
+assert oos.is_ambiguous is True
+
+# 4. Save & reload the portable .s1m skill
+engine.save(".system1/support-route.s1m")
+reloaded = SystemOneEngine.load(".system1/support-route.s1m")
+```
+
 ## Run the first lesson
 
 From a repository checkout with System 1 installed, run:
@@ -69,8 +114,9 @@ Needs review: True
 ```
 
 `billing` is its best guess. **Needs review means a person should still decide.**
-Eight examples show the process, but do not provide enough separate evidence for
-reliable automatic routing. Saving a skill does not certify that it is ready.
+Eight examples split between fitting and held-out calibration show the batch
+compile process, but leave a tiny calibration fold so review is requested.
+Saving a skill does not certify that it is ready.
 
 The saved `.s1m` file contains the reusable skill. System 1 applies learned
 patterns to new messages; it does not need the JSON file at decision time.
@@ -137,23 +183,29 @@ so check it again.
 
 ## Reuse the saved skill
 
-After the first run, the saved file can answer new messages without reading the
+After saving a `.s1m` file (via `engine.save(...)` or `skill.save(...)`), you can
+load it directly into a ready-to-use `SystemOneEngine` without reading the
 lesson file or calling a teacher:
 
 ```python
-from system1 import CompiledSystemOneModel, System1Engine
+from system1 import CompiledSystemOneModel, SystemOneEngine
 
+# Direct one-line load (preserves strict_mode from when the engine was saved)
+engine = SystemOneEngine.load(".system1/support-route.s1m")
+
+# Or load the CompiledSystemOneModel artifact explicitly:
 skill = CompiledSystemOneModel.load(".system1/support-route.s1m")
-engine = System1Engine(skill.schema, model=skill, strict_mode=True)
+engine = SystemOneEngine(skill.schema, model=skill, strict_mode=True)
+
 answer = engine.decide("Please refund this payment", record_receipt=False)
 print(answer.values["team"])
 print("Needs review:", answer.is_ambiguous)
 ```
 
-The starter still needs review. Saving and reopening a skill preserves that
-behavior; it does not approve the answer. Your application chooses what to do
-when review is requested. Keep the earlier file while checking a revised
-candidate, then choose which saved skill your application loads.
+Saving and reopening a skill preserves its calibration state; it does not
+blindly approve every answer. Your application chooses what to do when review is
+requested (`answer.is_ambiguous is True`). Keep the earlier file while checking
+a revised candidate, then choose which saved skill your application loads.
 
 ## What does correcting a mistake mean?
 
@@ -161,7 +213,14 @@ Suppose a new message says **“The payment page crashes when I open it.”** an
 System 1 suggests `billing`. Under our rule the right answer is `support`: the
 problem is broken software, even though it mentions payment.
 
-Add this pair to your lessons, remembering the comma between JSON entries:
+You can correct it immediately in Python with an online Rank-1 Sherman-Morrison
+update (`<1 ms`, preserving calibration by default):
+
+```python
+engine.learn("The payment page crashes when I open it.", {"team": "support"})
+```
+
+Or add the pair to your JSON lessons file, remembering the comma between JSON entries:
 
 ```json
 ["The payment page crashes when I open it.", "support"]
@@ -178,20 +237,19 @@ now works is useful, but it does not show that the skill handles new cases.
 A correction can also affect other decisions, so check both teams again.
 
 For an ongoing skill, use the
-[correct, compare, and adopt workflow](correcting_skills.md), available in System 1 1.1.0. It retains separate
+[correct, compare, and adopt workflow](correcting_skills.md), available in System 1 1.0.0+. It retains separate
 teaching, calibration and evaluation examples, builds a candidate, and compares
 old and new answers before you explicitly activate it. It reports lost useful
 answers as regressions even when the revised skill merely sends them to review.
-An unsuccessful candidate leaves the approved skill available. The first helper
-supports one text-choice decision; the existing compiler still supports broader
-schemas and numerical inputs.
+An unsuccessful candidate leaves the approved skill available.
 
 ## Can someone else supply the lessons?
 
 Yes. A colleague, reviewed historical decisions, a rule in your existing software,
-a conventional classifier, Jev, Gemini or another API can provide the same
+a conventional classifier, an OpenAI, Anthropic, or Gemini model, or another API can provide the same
 message-and-answer pairs. JSON is simply a way to store them. The
-[observation workflow](../typesafe.md) collects answers from a running teacher
-and keeps that teacher responsible until a candidate qualifies for local takeover.
+[observation workflow](../typesafe.md) and [`BoundedReviewFallback`](../drop_in/05_llm_observe_and_cutover.md)
+collect answers from a running teacher and keep that teacher responsible until
+System 1 qualifies for local takeover.
 
 System 1 remains a small local decision skill regardless of who taught it.

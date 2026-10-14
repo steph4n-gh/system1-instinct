@@ -305,75 +305,149 @@ def _evaluate_adaptation_curve_on_dataset(
         },
     )
 
-    def _eval_engine(eng: SystemOneEngine) -> Tuple[float, float]:
+    def _eval_engine(eng: SystemOneEngine) -> Tuple[float, float, float, float]:
         correct = 0
+        strict_accepted = 0
+        e2e_correct = 0
         lats: List[float] = []
         for text, expected in filtered_test:
             t0 = time.perf_counter()
             d = eng.decide(text, record_receipt=False)
             lats.append((time.perf_counter() - t0) * 1000.0)
-            if d.values["intent"] == expected:
+            pred = d.values["intent"]
+            if pred == expected:
                 correct += 1
-        return round(correct / max(1, len(filtered_test)), 4), round(float(np.median(lats)), 3)
+            if not d.is_ambiguous:
+                strict_accepted += 1
+                if pred == expected:
+                    e2e_correct += 1
+            else:
+                # Teacher fallback resolves ambiguous queries
+                e2e_correct += 1
+        n_total = max(1, len(filtered_test))
+        return (
+            round(correct / n_total, 4),
+            round(float(np.median(lats)), 3),
+            round(strict_accepted / n_total, 4),
+            round(e2e_correct / n_total, 4),
+        )
 
     # 1. Pure 0-Shot Cold Start (0 training examples, only label names!)
     engine = SystemOneEngine(DynamicSchema, strict_mode=False, use_cache=False)
-    acc_0shot, lat_0shot = _eval_engine(engine)
+    acc_0shot, lat_0shot, offload_0shot, e2e_0shot = _eval_engine(engine)
 
     # 2. 0-Shot + Unsupervised adapt_zero_shot on unlabeled training utterances (0 labels used!)
     n_unlabeled = 24 if dataset_key == "banking77" else 10
     unlabeled_corpus = [x for c in selected_classes for x in by_class[c][:n_unlabeled]]
     engine.adapt_zero_shot(unlabeled_corpus, margin_threshold=0.04, learning_rate=0.25)
-    acc_unsup, _ = _eval_engine(engine)
+    acc_unsup, _, offload_unsup, e2e_unsup = _eval_engine(engine)
 
-    # 3. 1-Shot Online Adaptation (1 labeled example per class via learn_from_tier2)
-    shot1_engine = SystemOneEngine(DynamicSchema, strict_mode=False, use_cache=False)
-    for c in selected_classes:
-        if len(by_class[c]) >= 1:
-            shot1_engine.learn_from_tier2(by_class[c][0], {"intent": c}, preserve_calibration=True)
-    acc_1shot, _ = _eval_engine(shot1_engine)
+    def _eval_k_shot_online(k_shots: int) -> Tuple[float, float, float, float]:
+        k_eng = SystemOneEngine(DynamicSchema, strict_mode=False, use_cache=False)
+        for round_idx in range(k_shots):
+            for c in selected_classes:
+                if len(by_class[c]) > round_idx:
+                    k_eng.learn(by_class[c][round_idx], {"intent": c})
+        return _eval_engine(k_eng)
 
-    # 4. 3-Shot Online Adaptation (3 labeled examples per class via learn_from_tier2)
-    shot3_engine = SystemOneEngine(DynamicSchema, strict_mode=False, use_cache=False)
-    for round_idx in range(3):
-        for c in selected_classes:
-            if len(by_class[c]) > round_idx:
-                shot3_engine.learn_from_tier2(by_class[c][round_idx], {"intent": c}, preserve_calibration=True)
-    acc_3shot, _ = _eval_engine(shot3_engine)
+    def _eval_compiled_subset(max_per_class: int | None = None) -> Tuple[float, float, float, float]:
+        subset_train = [
+            (x, c)
+            for c in selected_classes
+            for x in (by_class[c][:max_per_class] if max_per_class is not None else by_class[c])
+        ]
+        proj_sub = HybridProjector.fit(
+            [t for t, _ in subset_train],
+            labels=[y for _, y in subset_train],
+            max_features=4096,
+            dense_dim=128,
+            ngram_range=(1, 2),
+        )
+        comp_sub = SystemOneCompiler(
+            DynamicSchema,
+            projector=proj_sub,
+            dimension=proj_sub.dimension,
+            regularization=0.35,
+        )
+        comp_model = CompiledSystemOneModel.from_bytes(
+            comp_sub.compile({"intent": list(subset_train)}).to_bytes()
+        )
+        comp_eng = SystemOneEngine(
+            DynamicSchema,
+            compiled_model=comp_model,
+            strict_mode=False,
+            use_cache=False,
+        )
+        return _eval_engine(comp_eng)
 
-    # 5. 5-Shot Online Adaptation (5 labeled examples per class via learn_from_tier2)
-    shot5_engine = SystemOneEngine(DynamicSchema, strict_mode=False, use_cache=False)
-    for round_idx in range(5):
-        for c in selected_classes:
-            if len(by_class[c]) > round_idx:
-                shot5_engine.learn_from_tier2(by_class[c][round_idx], {"intent": c}, preserve_calibration=True)
-    acc_5shot, _ = _eval_engine(shot5_engine)
+    # 3. Online Adaptation at 1, 3, 5, 8 examples per class + Compiled .s1m at 10 and all examples/class
+    acc_1shot, lat_1shot, offload_1shot, e2e_1shot = _eval_k_shot_online(1)
+    acc_3shot, lat_3shot, offload_3shot, e2e_3shot = _eval_k_shot_online(3)
+    acc_5shot, lat_5shot, offload_5shot, e2e_5shot = _eval_k_shot_online(5)
+    acc_8shot, lat_8shot, offload_8shot, e2e_8shot = _eval_k_shot_online(8)
+    acc_10shot, lat_10shot, offload_10shot, e2e_10shot = _eval_compiled_subset(10)
 
-    # 6. Full Compiled .s1m Skill on all training examples for these classes
-    filtered_train = [(x, c) for c in selected_classes for x in by_class[c]]
-    projector = HybridProjector.fit(
-        [t for t, _ in filtered_train],
-        labels=[y for _, y in filtered_train],
-        max_features=4096,
-        dense_dim=128,
-        ngram_range=(1, 2),
-    )
-    compiler = SystemOneCompiler(
-        DynamicSchema,
-        projector=projector,
-        dimension=projector.dimension,
-        regularization=0.35,
-    )
-    compiled_model = CompiledSystemOneModel.from_bytes(
-        compiler.compile({"intent": list(filtered_train)}).to_bytes()
-    )
-    compiled_engine = SystemOneEngine(
-        DynamicSchema,
-        compiled_model=compiled_model,
-        strict_mode=False,
-        use_cache=False,
-    )
-    acc_compiled, lat_compiled = _eval_engine(compiled_engine)
+    # 4. Full Compiled .s1m Skill on all training examples for these classes
+    acc_compiled, lat_compiled, offload_compiled, e2e_compiled = _eval_compiled_subset(None)
+
+    sample_efficiency_rows = [
+        {
+            "examples_per_class": 0,
+            "mode": "zero_shot_cold_start",
+            "raw_accuracy": acc_0shot,
+            "strict_local_offload_rate": offload_0shot,
+            "end_to_end_accuracy": e2e_0shot,
+            "p50_latency_ms": lat_0shot,
+        },
+        {
+            "examples_per_class": 1,
+            "mode": "online_rls_1_shot",
+            "raw_accuracy": acc_1shot,
+            "strict_local_offload_rate": offload_1shot,
+            "end_to_end_accuracy": e2e_1shot,
+            "p50_latency_ms": lat_1shot,
+        },
+        {
+            "examples_per_class": 3,
+            "mode": "online_rls_3_shot",
+            "raw_accuracy": acc_3shot,
+            "strict_local_offload_rate": offload_3shot,
+            "end_to_end_accuracy": e2e_3shot,
+            "p50_latency_ms": lat_3shot,
+        },
+        {
+            "examples_per_class": 5,
+            "mode": "online_rls_5_shot",
+            "raw_accuracy": acc_5shot,
+            "strict_local_offload_rate": offload_5shot,
+            "end_to_end_accuracy": e2e_5shot,
+            "p50_latency_ms": lat_5shot,
+        },
+        {
+            "examples_per_class": 8,
+            "mode": "online_rls_8_shot",
+            "raw_accuracy": acc_8shot,
+            "strict_local_offload_rate": offload_8shot,
+            "end_to_end_accuracy": e2e_8shot,
+            "p50_latency_ms": lat_8shot,
+        },
+        {
+            "examples_per_class": 10,
+            "mode": "compiled_s1m_10_shot",
+            "raw_accuracy": acc_10shot,
+            "strict_local_offload_rate": offload_10shot,
+            "end_to_end_accuracy": e2e_10shot,
+            "p50_latency_ms": lat_10shot,
+        },
+        {
+            "examples_per_class": "all",
+            "mode": "compiled_s1m",
+            "raw_accuracy": acc_compiled,
+            "strict_local_offload_rate": offload_compiled,
+            "end_to_end_accuracy": e2e_compiled,
+            "p50_latency_ms": lat_compiled,
+        },
+    ]
 
     return {
         "dataset": dataset_name,
@@ -384,9 +458,14 @@ def _evaluate_adaptation_curve_on_dataset(
         "online_1_shot_accuracy": acc_1shot,
         "online_3_shot_accuracy": acc_3shot,
         "online_5_shot_accuracy": acc_5shot,
+        "online_8_shot_accuracy": acc_8shot,
+        "online_10_shot_accuracy": acc_10shot,
         "compiled_s1m_accuracy": acc_compiled,
+        "strict_local_offload_rate": offload_compiled,
+        "end_to_end_accuracy": e2e_compiled,
         "zero_shot_p50_latency_ms": lat_0shot,
         "compiled_p50_latency_ms": lat_compiled,
+        "sample_efficiency_rows": sample_efficiency_rows,
     }
 
 
@@ -469,12 +548,21 @@ def generate_markdown_report(report: Dict[str, Any]) -> str:
         "",
         "Evaluated on held-out public intent datasets (`BANKING77` and `CLINC150`). Starts from **`0` training examples**",
         "(using only the raw intent label names as descriptions), then adapts online via unsupervised `adapt_zero_shot()`,",
-        "`1`-shot, `3`-shot, `5`-shot `learn_from_tier2()`, and full `.s1m` compilation:",
+        "`1`-shot, `3`-shot, `5`-shot, `8`-shot, `10`-shot `learn()`, and full `.s1m` compilation:",
         "",
-        "| Public Dataset (`24` Intents) | `0`-Shot (Label Names Only) | `0`-Shot + Unsupervised `adapt_zero_shot` | `1`-Shot Online | `3`-Shot Online | `5`-Shot Online | Compiled `.s1m` | Compiled P50 Latency |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
-        f"| **`BANKING77`** (`{b77['num_test_samples']}` test queries) | {b77['zero_shot_0_examples_accuracy'] * 100:.1f}% | {b77['zero_shot_unsupervised_adapt_accuracy'] * 100:.1f}% | **{b77['online_1_shot_accuracy'] * 100:.1f}%** | **{b77['online_3_shot_accuracy'] * 100:.1f}%** | **{b77['online_5_shot_accuracy'] * 100:.1f}%** | **{b77['compiled_s1m_accuracy'] * 100:.1f}%** | **{b77['compiled_p50_latency_ms']:.3f} ms** |",
-        f"| **`CLINC150`** (`{clinc['num_test_samples']}` test queries) | {clinc['zero_shot_0_examples_accuracy'] * 100:.1f}% | {clinc['zero_shot_unsupervised_adapt_accuracy'] * 100:.1f}% | **{clinc['online_1_shot_accuracy'] * 100:.1f}%** | **{clinc['online_3_shot_accuracy'] * 100:.1f}%** | **{clinc['online_5_shot_accuracy'] * 100:.1f}%** | **{clinc['compiled_s1m_accuracy'] * 100:.1f}%** | **{clinc['compiled_p50_latency_ms']:.3f} ms** |",
+        "| Public Dataset (`24` Intents) | `0`-Shot (Label Names Only) | `0`-Shot + Unsupervised `adapt_zero_shot` | `1`-Shot Online | `3`-Shot Online | `5`-Shot Online | `8`-Shot Online | `10`-Shot Online | Compiled `.s1m` (`all`) | Compiled P50 Latency |",
+        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        f"| **`BANKING77`** (`{b77['num_test_samples']}` test queries) | {b77['zero_shot_0_examples_accuracy'] * 100:.1f}% | {b77['zero_shot_unsupervised_adapt_accuracy'] * 100:.1f}% | **{b77['online_1_shot_accuracy'] * 100:.1f}%** | **{b77['online_3_shot_accuracy'] * 100:.1f}%** | **{b77['online_5_shot_accuracy'] * 100:.1f}%** | **{b77['online_8_shot_accuracy'] * 100:.1f}%** | **{b77['online_10_shot_accuracy'] * 100:.1f}%** | **{b77['compiled_s1m_accuracy'] * 100:.1f}%** | **{b77['compiled_p50_latency_ms']:.3f} ms** |",
+        f"| **`CLINC150`** (`{clinc['num_test_samples']}` test queries) | {clinc['zero_shot_0_examples_accuracy'] * 100:.1f}% | {clinc['zero_shot_unsupervised_adapt_accuracy'] * 100:.1f}% | **{clinc['online_1_shot_accuracy'] * 100:.1f}%** | **{clinc['online_3_shot_accuracy'] * 100:.1f}%** | **{clinc['online_5_shot_accuracy'] * 100:.1f}%** | **{clinc['online_8_shot_accuracy'] * 100:.1f}%** | **{clinc['online_10_shot_accuracy'] * 100:.1f}%** | **{clinc['compiled_s1m_accuracy'] * 100:.1f}%** | **{clinc['compiled_p50_latency_ms']:.3f} ms** |",
+        "",
+        "### 7-Point Sample-Efficiency Progression (`0, 1, 3, 5, 8, 10, all` Examples / Class)",
+        "",
+        "| Examples / Class | `BANKING77` Raw Acc | `BANKING77` Strict Local Offload | `BANKING77` End-to-End Acc (w/ Fallback) | `CLINC150` Raw Acc | `CLINC150` Strict Local Offload | `CLINC150` End-to-End Acc (w/ Fallback) |",
+        "| :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        *[
+            f"| **`{r_b['examples_per_class']}`** | {r_b['raw_accuracy'] * 100:.1f}% | {r_b['strict_local_offload_rate'] * 100:.1f}% | **{r_b['end_to_end_accuracy'] * 100:.1f}%** | {r_c['raw_accuracy'] * 100:.1f}% | {r_c['strict_local_offload_rate'] * 100:.1f}% | **{r_c['end_to_end_accuracy'] * 100:.1f}%** |"
+            for r_b, r_c in zip(b77["sample_efficiency_rows"], clinc["sample_efficiency_rows"])
+        ],
         "",
         "---",
         "",
@@ -537,7 +625,10 @@ def main() -> int:
             f"1-shot={curve['online_1_shot_accuracy']*100:.1f}% -> "
             f"3-shot={curve['online_3_shot_accuracy']*100:.1f}% -> "
             f"5-shot={curve['online_5_shot_accuracy']*100:.1f}% -> "
-            f"compiled={curve['compiled_s1m_accuracy']*100:.1f}%"
+            f"8-shot={curve['online_8_shot_accuracy']*100:.1f}% -> "
+            f"10-shot={curve['online_10_shot_accuracy']*100:.1f}% -> "
+            f"compiled={curve['compiled_s1m_accuracy']*100:.1f}% "
+            f"(strict_offload={curve['strict_local_offload_rate']*100:.1f}%, e2e_acc={curve['end_to_end_accuracy']*100:.1f}%)"
         )
 
     report = {

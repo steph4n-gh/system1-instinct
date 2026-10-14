@@ -310,6 +310,12 @@ class SystemOneEngine:
         self.projector = getattr(model, "projector", self.projector)
         self.recency_weighted = getattr(model, "recency_weighted", self.recency_weighted)
         self._init_calibrators_and_predictors()
+        if hasattr(model, "_learned_prompt_overrides") and isinstance(model._learned_prompt_overrides, Mapping):
+            if not hasattr(self, "_learned_prompt_overrides"):
+                self._learned_prompt_overrides = {}
+            for p_key, f_map in model._learned_prompt_overrides.items():
+                if isinstance(p_key, str) and isinstance(f_map, Mapping):
+                    self._learned_prompt_overrides.setdefault(p_key, {}).update(f_map)
 
         if hasattr(model, "heads"):
             for name, ch in model.heads.items():
@@ -1474,6 +1480,7 @@ class SystemOneEngine:
                     cp = self.conformal_predictors.get(f_name)
                     if cp is not None:
                         if ch is not None and hasattr(ch, "calibration_scores"):
+                            cp.score_method = getattr(ch, "score_method", cp.score_method)
                             protos = getattr(ch, "prototypes", None)
                             if protos is not None:
                                 cp.prototypes = np.asarray(protos, dtype=np.float32)
@@ -1482,6 +1489,7 @@ class SystemOneEngine:
                             cal_scores = getattr(ch, "calibration_scores", ())
                             if cal_scores:
                                 cp.calibration_scores = np.sort(np.asarray(cal_scores, dtype=np.float64))
+                                cp.is_calibrated = True
                             cls_scores = getattr(ch, "class_calibration_scores", None)
                             if cls_scores:
                                 cp.class_calibration_scores = {
@@ -1490,9 +1498,6 @@ class SystemOneEngine:
                                     if len(v) > 0
                                 }
                         else:
-                            if not cp.is_calibrated:
-                                cp.calibration_scores = np.full(20, 0.12, dtype=np.float64)
-                                cp.is_calibrated = True
                             if getattr(cp, "prototypes", None) is not None and len(emb) == cp.prototypes.shape[1]:
                                 e_norm = float(np.linalg.norm(emb))
                                 if e_norm > 1e-12:
@@ -1500,13 +1505,23 @@ class SystemOneEngine:
                                     sim_after = float(np.max(cp.prototypes @ emb_u))
                                     if cp.prototype_threshold > 0.0 and sim_after < cp.prototype_threshold:
                                         cp.prototype_threshold = max(0.0, sim_after - 1e-4)
+                        if not cp.is_calibrated:
+                            k_opts = max(2, len(cp.options))
+                            q_init = float((k_opts - 1.0) / (3.5 + k_opts))
+                            cp.score_method = "lac"
+                            cp.calibration_scores = np.full(20, q_init, dtype=np.float64)
+                            cp.is_calibrated = True
                     rcp = self.regression_conformal_predictors.get(f_name)
-                    if rcp is not None and not rcp.is_calibrated and f_name in self.schema.fields:
-                        f_def_s = self.schema.fields[f_name]
-                        if isinstance(f_def_s, ScoreField):
-                            span = max(1e-6, float(f_def_s.max_value - f_def_s.min_value))
-                            rcp.residuals = np.full(20, 0.05 * span, dtype=np.float64)
+                    if rcp is not None and f_name in self.schema.fields:
+                        if ch is not None and getattr(ch, "calibration_scores", ()):
+                            rcp.residuals = np.sort(np.asarray(ch.calibration_scores, dtype=np.float64))
                             rcp.is_calibrated = True
+                        elif not rcp.is_calibrated:
+                            f_def_s = self.schema.fields[f_name]
+                            if isinstance(f_def_s, ScoreField):
+                                span = max(1e-6, float(f_def_s.max_value - f_def_s.min_value))
+                                rcp.residuals = np.full(20, 0.05 * span, dtype=np.float64)
+                                rcp.is_calibrated = True
 
             if self.use_cache and self.cache is not None:
                 self.cache.evict_prompt(prompt)
@@ -1600,11 +1615,324 @@ class SystemOneEngine:
                     self.cache.invalidate_prior_versions(self.model_version)
             return res_info
 
-    # Primary learning entrypoints (application context, execution outcomes, or teacher fallback)
-    learn = learn_from_tier2
-    learn_from_outcome = learn_from_tier2
+    # Cognitive dual-process and execution pipeline aliases
     learn_from_system2 = learn_from_tier2
     learn_from_tier3 = learn_from_tier2
+
+    def learn(
+        self,
+        prompt: str,
+        target: Union[Mapping[str, Any], Any] = None,
+        telemetry: Optional[Any] = None,
+        embedding: Optional[np.ndarray] = None,
+        forgetting_factor: Optional[float] = None,
+        recency_weighted: Optional[bool] = None,
+        *,
+        preserve_calibration: bool = True,
+        outcome: Optional[Any] = None,
+        reward: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """First-class online teaching method that preserves calibration by default.
+
+        Supports teaching directly from LLM fallback outputs, user corrections,
+        or application outcomes without invalidating conformal calibration.
+        """
+        eff_ff = forgetting_factor
+        if reward is not None:
+            r_val = float(reward)
+            if not math.isfinite(r_val):
+                raise ValueError("reward must be a finite number")
+            if r_val <= 0.0:
+                skipped: Dict[str, Any] = {
+                    "status": "skipped_non_positive_reward",
+                    "update_latency_ms": 0.0,
+                    "total_latency_ms": 0.0,
+                    "updated_fields": [],
+                    "reward": r_val,
+                }
+                if outcome is not None:
+                    skipped["outcome_recorded"] = True
+                return skipped
+            if r_val != 1.0:
+                base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+                eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
+
+        resolved_target = target
+        if resolved_target is None and outcome is not None:
+            if (
+                isinstance(outcome, Mapping)
+                and "target" in outcome
+                and not (set(outcome.keys()) & set(self.schema.fields.keys()))
+            ):
+                resolved_target = outcome["target"]
+            else:
+                resolved_target = outcome
+        if resolved_target is None:
+            raise ValueError("learn() requires a target label/mapping or outcome")
+
+        res = self.learn_from_tier2(
+            prompt,
+            resolved_target,
+            telemetry=telemetry,
+            embedding=embedding,
+            forgetting_factor=eff_ff,
+            recency_weighted=recency_weighted,
+            preserve_calibration=preserve_calibration,
+        )
+        if outcome is not None:
+            res["outcome_recorded"] = True
+        if reward is not None:
+            res["reward"] = float(reward)
+        return res
+
+    def learn_from_outcome(
+        self,
+        prompt: str,
+        target: Union[Mapping[str, Any], Any] = None,
+        telemetry: Optional[Any] = None,
+        embedding: Optional[np.ndarray] = None,
+        forgetting_factor: Optional[float] = None,
+        recency_weighted: Optional[bool] = None,
+        *,
+        preserve_calibration: bool = True,
+        outcome: Optional[Any] = None,
+        reward: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Online teaching from application context, user actions, or business outcomes."""
+        return self.learn(
+            prompt,
+            target,
+            telemetry=telemetry,
+            embedding=embedding,
+            forgetting_factor=forgetting_factor,
+            recency_weighted=recency_weighted,
+            preserve_calibration=preserve_calibration,
+            outcome=outcome,
+            reward=reward,
+        )
+
+    def to_compiled_model(self) -> Any:
+        """Exports the active engine state (weights, calibration, prototypes, overrides) as a CompiledSystemOneModel."""
+        from system1.compiler import CompiledHeadWeights, CompiledSystemOneModel
+
+        with self._lock, getattr(self.model, "_lock", nullcontext()):
+            if isinstance(self.model, CompiledSystemOneModel):
+                for name, ch in self.model.heads.items():
+                    if name in self.calibrators:
+                        ch.temperature = float(self.calibrators[name].temperature)
+                    if name in self.conformal_predictors:
+                        cp = self.conformal_predictors[name]
+                        ch.score_method = cp.score_method
+                        ch.mondrian = bool(cp.mondrian)
+                        ch.familiarity_threshold = float(cp.familiarity_threshold)
+                        ch.prototype_threshold = float(cp.prototype_threshold)
+                        if getattr(cp, "prototypes", None) is not None:
+                            ch.prototypes = np.asarray(cp.prototypes, dtype=np.float32)
+                        if getattr(cp, "prototype_scores", None) is not None and len(cp.prototype_scores) > 0:
+                            ch.prototype_scores = tuple(float(s) for s in cp.prototype_scores)
+                        if cp.is_calibrated and len(cp.calibration_scores) > 0:
+                            ch.calibration_scores = tuple(float(s) for s in cp.calibration_scores)
+                            n_sc = len(cp.calibration_scores)
+                            k_sc = int(math.ceil((n_sc + 1) * 0.95))
+                            ch.conformal_quantile = 1.0 if k_sc > n_sc else float(cp.calibration_scores[k_sc - 1])
+                            if getattr(cp, "class_calibration_scores", None):
+                                ch.class_calibration_scores = {
+                                    str(k): tuple(float(v) for v in vals)
+                                    for k, vals in cp.class_calibration_scores.items()
+                                    if len(vals) > 0
+                                }
+                        elif not cp.is_calibrated:
+                            ch.calibration_scores = ()
+                            ch.conformal_quantile = 0.0
+                    if name in self.regression_conformal_predictors:
+                        rcp = self.regression_conformal_predictors[name]
+                        if rcp.is_calibrated and len(rcp.residuals) > 0:
+                            ch.calibration_scores = tuple(float(s) for s in rcp.residuals)
+                            n_res = len(rcp.residuals)
+                            k_res = int(math.ceil((n_res + 1) * 0.95))
+                            val_range = float(rcp.max_value - rcp.min_value)
+                            ch.conformal_quantile = val_range if k_res > n_res else float(rcp.residuals[k_res - 1])
+                        elif not rcp.is_calibrated:
+                            ch.calibration_scores = ()
+                            ch.conformal_quantile = 0.0
+                if getattr(self, "_learned_prompt_overrides", None):
+                    for p_k, f_map in self._learned_prompt_overrides.items():
+                        self.model._learned_prompt_overrides.setdefault(p_k, {}).update(f_map)
+                self.model.metadata["strict_mode"] = bool(self.strict_mode)
+                return self.model
+
+            heads_dict = getattr(self.model, "heads", getattr(self.model, "_field_heads", {}))
+            compiled_heads: Dict[str, CompiledHeadWeights] = {}
+            for name, f_def in self.schema.fields.items():
+                head = heads_dict[name]
+                calibrator = self.calibrators.get(name)
+                cp = self.conformal_predictors.get(name)
+                rcp = self.regression_conformal_predictors.get(name)
+
+                temp = float(calibrator.temperature) if calibrator is not None else 1.0
+                calib_scores: Tuple[float, ...] = ()
+                conf_q = 0.0
+                score_method = "aps"
+                mondrian = False
+                class_scores: Dict[str, Tuple[float, ...]] = {}
+                fam_thresh = 0.0
+                proto_mat: Optional[np.ndarray] = None
+                proto_thresh = 0.0
+                proto_scores: Tuple[float, ...] = ()
+
+                if cp is not None:
+                    score_method = cp.score_method
+                    mondrian = bool(cp.mondrian)
+                    fam_thresh = float(cp.familiarity_threshold)
+                    proto_thresh = float(cp.prototype_threshold)
+                    if getattr(cp, "prototypes", None) is not None:
+                        proto_mat = np.asarray(cp.prototypes, dtype=np.float32)
+                    if getattr(cp, "prototype_scores", None) is not None and len(cp.prototype_scores) > 0:
+                        proto_scores = tuple(float(s) for s in cp.prototype_scores)
+                    if cp.is_calibrated and len(cp.calibration_scores) > 0:
+                        calib_scores = tuple(float(s) for s in cp.calibration_scores)
+                        n_sc = len(cp.calibration_scores)
+                        k_sc = int(math.ceil((n_sc + 1) * 0.95))
+                        conf_q = 1.0 if k_sc > n_sc else float(cp.calibration_scores[k_sc - 1])
+                    if getattr(cp, "class_calibration_scores", None):
+                        class_scores = {
+                            str(k): tuple(float(v) for v in vals)
+                            for k, vals in cp.class_calibration_scores.items()
+                            if len(vals) > 0
+                        }
+                elif rcp is not None:
+                    if rcp.is_calibrated and len(rcp.residuals) > 0:
+                        calib_scores = tuple(float(s) for s in rcp.residuals)
+                        n_res = len(rcp.residuals)
+                        k_res = int(math.ceil((n_res + 1) * 0.95))
+                        val_range = float(rcp.max_value - rcp.min_value)
+                        conf_q = val_range if k_res > n_res else float(rcp.residuals[k_res - 1])
+
+                opts: Tuple[str, ...]
+                if isinstance(f_def, BooleanField):
+                    opts = ("False", "True")
+                elif hasattr(f_def, "options"):
+                    opts = tuple(f_def.options)
+                else:
+                    opts = ()
+
+                compiled_heads[name] = CompiledHeadWeights(
+                    field_name=name,
+                    field_type=f_def.field_type,
+                    weights=np.asarray(head.weights, dtype=np.float32).copy(),
+                    biases=np.asarray(head.biases, dtype=np.float32).copy(),
+                    temperature=temp,
+                    conformal_quantile=conf_q,
+                    options=opts,
+                    P=getattr(head, "covariance_inv", None),
+                    B=getattr(head, "cross_covariance", None),
+                    margin_threshold=float(self.margin_threshold if self.margin_threshold is not None else 0.20),
+                    forgetting_factor=float(self.forgetting_factor),
+                    relative_odds_ratio=float(self.relative_odds_ratio if self.relative_odds_ratio is not None else 1.5),
+                    confidence_floor_tau0=float(self.confidence_floor_tau0 if self.confidence_floor_tau0 is not None else 0.15),
+                    escalate_on_ambiguity=bool(getattr(f_def, "escalate_on_ambiguity", True)),
+                    calibration_scores=calib_scores,
+                    score_method=score_method,
+                    mondrian=mondrian,
+                    class_calibration_scores=class_scores,
+                    familiarity_threshold=fam_thresh,
+                    prototypes=proto_mat,
+                    prototype_threshold=proto_thresh,
+                    prototype_scores=proto_scores,
+                    hierarchical=bool(getattr(head, "hierarchical", False)),
+                    cluster_assignments=tuple(getattr(head, "cluster_assignments", ())),
+                    coarse_weights=getattr(head, "coarse_weights", None),
+                    coarse_biases=getattr(head, "coarse_biases", None),
+                    fine_weights=getattr(head, "fine_weights", None),
+                    fine_biases=getattr(head, "fine_biases", None),
+                )
+
+            compiled = CompiledSystemOneModel(
+                schema=self.schema,
+                heads=compiled_heads,
+                dimension=self.dimension,
+                projector=self.projector,
+                backend="numpy" if self.backend == "auto" else self.backend,
+                metadata={"strict_mode": bool(self.strict_mode)},
+                forgetting_factor=self.forgetting_factor,
+                recency_weighted=self.recency_weighted,
+            )
+            if getattr(self, "_learned_prompt_overrides", None):
+                for p_k, f_map in self._learned_prompt_overrides.items():
+                    compiled._learned_prompt_overrides[p_k] = dict(f_map)
+            return compiled
+
+    def to_bytes(self, include_covariance: bool = False) -> bytes:
+        """Serializes the engine's model and calibration state into compact .s1m binary bytes."""
+        return self.to_compiled_model().to_bytes(include_covariance=include_covariance)
+
+    def save(self, path: Union[str, Path], include_covariance: bool = False) -> None:
+        """Saves the engine's model, calibration, and online state to a portable .s1m file."""
+        self.to_compiled_model().save(path, include_covariance=include_covariance)
+
+    @classmethod
+    def from_bytes(
+        cls,
+        data: bytes,
+        *,
+        schema: Optional[Union[DecisionSchema, Type[DecisionSchema]]] = None,
+        projector: Optional[Any] = None,
+        backend: str = "auto",
+        **kwargs: Any,
+    ) -> SystemOneEngine:
+        """Reconstructs a SystemOneEngine directly from .s1m binary bytes."""
+        from system1.compiler import CompiledSystemOneModel
+
+        compiled = CompiledSystemOneModel.from_bytes(
+            data,
+            projector=projector,
+            backend="numpy" if backend == "auto" else backend,
+        )
+        if "strict_mode" not in kwargs and isinstance(compiled.metadata, Mapping) and "strict_mode" in compiled.metadata:
+            kwargs["strict_mode"] = bool(compiled.metadata["strict_mode"])
+        resolved_schema = schema if schema is not None else compiled.schema
+        return cls(
+            schema=resolved_schema,
+            model=compiled,
+            dimension=compiled.dimension,
+            backend=backend,
+            projector=compiled.projector,
+            forgetting_factor=compiled.forgetting_factor,
+            recency_weighted=compiled.recency_weighted,
+            **kwargs,
+        )
+
+    @classmethod
+    def load(
+        cls,
+        path: Union[str, Path],
+        *,
+        schema: Optional[Union[DecisionSchema, Type[DecisionSchema]]] = None,
+        projector: Optional[Any] = None,
+        backend: str = "auto",
+        **kwargs: Any,
+    ) -> SystemOneEngine:
+        """Loads a SystemOneEngine directly from a saved .s1m file."""
+        from system1.compiler import CompiledSystemOneModel
+
+        compiled = CompiledSystemOneModel.load(
+            path,
+            projector=projector,
+            backend="numpy" if backend == "auto" else backend,
+        )
+        if "strict_mode" not in kwargs and isinstance(compiled.metadata, Mapping) and "strict_mode" in compiled.metadata:
+            kwargs["strict_mode"] = bool(compiled.metadata["strict_mode"])
+        resolved_schema = schema if schema is not None else compiled.schema
+        return cls(
+            schema=resolved_schema,
+            model=compiled,
+            dimension=compiled.dimension,
+            backend=backend,
+            projector=compiled.projector,
+            forgetting_factor=compiled.forgetting_factor,
+            recency_weighted=compiled.recency_weighted,
+            **kwargs,
+        )
 
     def decide_batch(
         self,

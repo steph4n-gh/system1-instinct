@@ -23,11 +23,11 @@ The callback uses scope `langchain:tools:exec` and the serialized tool input in 
 
 ### MCP
 
-`System1MCPProxy` intercepts JSON-RPC tool calls. Supply your configured guard and authenticated identity, then use `handle_call(request, executor)` or `async_handle_call(request, executor)` to connect it to your application's executor. See [integration tests](https://github.com/steph4n-gh/system1/blob/main/tests/test_integrations.py) for the dispatch contract. Diagnostic mode does not produce trusted signed enforcement evidence by default.
+`System1MCPProxy` intercepts JSON-RPC tool calls. Supply your configured guard and authenticated identity, then use `handle_call(request, executor)` or `async_handle_call(request, executor)` to connect it to your application's executor. See [integration tests](https://github.com/steph4n-gh/system1-instinct/blob/main/tests/test_integrations.py) for the dispatch contract. Diagnostic mode does not produce trusted signed enforcement evidence by default.
 
 ### FastAPI / ASGI
 
-`add_system1_gateway(app, schema=YourSchema)` can respond to confident classification requests locally and pass uncertain requests to the downstream application. Install your ASGI framework separately. Configure authentication and request-size limits **outside** this middleware: local responses bypass downstream endpoint dependencies. This is a classification gateway, not a tool authorization boundary. See [deployment guidance](https://github.com/steph4n-gh/system1/blob/main/docs/deployment.md#asgi-gateway).
+`add_system1_gateway(app, schema=YourSchema)` can respond to confident classification requests locally and pass uncertain requests to the downstream application. Install your ASGI framework separately. Configure authentication and request-size limits **outside** this middleware: local responses bypass downstream endpoint dependencies. This is a classification gateway, not a tool authorization boundary. See [deployment guidance](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/deployment.md#asgi-gateway).
 
 ### gRPC
 
@@ -36,11 +36,11 @@ python -m pip install 'system1[grpc]'
 system1 serve --grpc --host 127.0.0.1 --port 50051
 ```
 
-The bundled [protobuf contract](https://github.com/steph4n-gh/system1/blob/main/src/system1/proto/system1.proto) supports clients generated for other languages. The CLI server is a local diagnostic service with insecure gRPC transport. Configure signing, ledger, and policy through the Python `serve(...)` API for a custom deployment. The repository includes experimental [container and Kubernetes templates](https://github.com/steph4n-gh/system1/blob/main/deploy/README.md), but does not supply a published image or an authenticated service.
+The bundled [protobuf contract](https://github.com/steph4n-gh/system1-instinct/blob/main/src/system1/proto/system1.proto) supports clients generated for other languages. The CLI server is a local diagnostic service with insecure gRPC transport. Configure signing, ledger, and policy through the Python `serve(...)` API for a custom deployment. The repository includes experimental [container and Kubernetes templates](https://github.com/steph4n-gh/system1-instinct/blob/main/deploy/README.md), but does not supply a published image or an authenticated service.
 
 ### Observability
 
-Install `system1[observability]` for Prometheus or `system1[otel]` for OpenTelemetry. See the [observability guide](https://github.com/steph4n-gh/system1/blob/main/docs/observability/README.md) and [Grafana dashboard](https://github.com/steph4n-gh/system1/blob/main/docs/observability/grafana-dashboard.json). Starting a metrics server or configuring an exporter changes the application's network behavior.
+Install `system1[observability]` for Prometheus or `system1[otel]` for OpenTelemetry. See the [observability guide](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/observability/README.md) and [Grafana dashboard](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/observability/grafana-dashboard.json). Starting a metrics server or configuring an exporter changes the application's network behavior.
 
 ### Inbox Zero email categories
 

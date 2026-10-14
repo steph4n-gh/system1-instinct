@@ -1,14 +1,14 @@
 # Contributing
 
-Report reproducible bugs and feature requests through the [issue tracker](https://github.com/steph4n-gh/system1/issues). For vulnerabilities, follow [SECURITY.md](SECURITY.md).
+Report reproducible bugs and feature requests through the [issue tracker](https://github.com/steph4n-gh/system1-instinct/issues). For vulnerabilities, follow [SECURITY.md](SECURITY.md).
 
 ## Set up
 
 Use Python 3.11 or newer:
 
 ```bash
-git clone https://github.com/steph4n-gh/system1.git
-cd system1
+git clone https://github.com/steph4n-gh/system1-instinct.git
+cd system1-instinct
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev,langchain]'

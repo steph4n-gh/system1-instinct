@@ -57,4 +57,4 @@ with ActionLedger(".system1/demo-audit.sqlite", require_durable=True) as ledger:
     print(result)
 ```
 
-The application must derive identity from its authenticated session, constrain tool arguments and targets, and keep agent code from bypassing the guard. Policy correctness is the operator's responsibility. The default guard without `enforcement_profile=True` can use statistical classification to allow actions. See [deployment boundaries](https://github.com/steph4n-gh/system1/blob/main/docs/deployment.md) before granting consequential permissions.
+The application must derive identity from its authenticated session, constrain tool arguments and targets, and keep agent code from bypassing the guard. Policy correctness is the operator's responsibility. The default guard without `enforcement_profile=True` can use statistical classification to allow actions. See [deployment boundaries](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/deployment.md) before granting consequential permissions.

@@ -39,118 +39,11 @@ from system1 import (
 )
 
 
-class RouteLLMCascadeSchema(DecisionSchema):
-    """Multi-field routing schema for LLM cost/quality cascade control."""
-
-    target_tier = ChoiceField(
-        options=[
-            "system1_local",
-            "fast_small_model",
-            "frontier_reasoning_model",
-        ],
-        descriptions={
-            "system1_local": [
-                "simple status check account balance greeting faq password reset lookup",
-                "short deterministic intent routing classification triage ticket tagging",
-                "instant factual status query order tracking simple yes no question",
-            ],
-            "fast_small_model": [
-                "summarize article rewrite email translate paragraph extract bullet points",
-                "draft polite customer reply format json markdown table standard copywriting",
-                "routine single step explanation grammar correction basic code snippet",
-            ],
-            "frontier_reasoning_model": [
-                "complex multi-step distributed systems architecture race condition root cause",
-                "formal mathematical proof dynamic programming algorithm optimization security audit",
-                "deep debugging subtle concurrency deadlock compiler type theory theorem",
-            ],
-        },
-    )
-    requires_deep_reasoning = BooleanField(
-        true_description="complex multi-step reasoning formal proof distributed architecture debugging",
-        false_description="simple lookup faq status check or standard single-pass summarization",
-        threshold=0.55,
-    )
-    complexity_score = ScoreField(
-        min_value=0.0,
-        max_value=1.0,
-        low_description="simple status check greeting faq lookup basic formatting",
-        high_description="complex multi-step architecture formal mathematical proof concurrency debugging",
-    )
-
-
-@dataclass(frozen=True)
-class RouteDecision:
-    """Result returned by SystemOneRouteController.route()."""
-
-    prompt: str
-    selected_tier: str
-    selected_model: str
-    requires_deep_reasoning: bool
-    complexity_score: float
-    confidence: float
-    latency_ms: float
-
-
-class SystemOneRouteController:
-    """Drop-in replacement for ``routellm.controller.Controller``."""
-
-    def __init__(
-        self,
-        strong_model: str = "gpt-5-reasoning",
-        weak_model: str = "gpt-4o-mini",
-        local_model: str = "system1-instinct-local",
-        confidence_threshold: float = 0.20,
-    ) -> None:
-        self.strong_model = strong_model
-        self.weak_model = weak_model
-        self.local_model = local_model
-        self.confidence_threshold = float(confidence_threshold)
-        self.engine = SystemOneEngine(RouteLLMCascadeSchema, strict_mode=False, use_cache=True)
-        self._tier_to_model = {
-            "system1_local": self.local_model,
-            "fast_small_model": self.weak_model,
-            "frontier_reasoning_model": self.strong_model,
-        }
-
-    def route(self, prompt: str) -> RouteDecision:
-        """Routes a prompt to the optimal model tier in sub-millisecond latency."""
-        t0 = time.perf_counter()
-        decision = self.engine.decide(prompt, record_receipt=False)
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-
-        tier = str(decision.values["target_tier"])
-        deep = bool(decision.values["requires_deep_reasoning"])
-        complexity = float(decision.values["complexity_score"])
-        conf = float(min(decision.confidences.values())) if decision.confidences else 1.0
-
-        if conf < self.confidence_threshold and tier == "system1_local":
-            tier = "fast_small_model"
-
-        return RouteDecision(
-            prompt=prompt,
-            selected_tier=tier,
-            selected_model=self._tier_to_model.get(tier, self.strong_model),
-            requires_deep_reasoning=deep,
-            complexity_score=round(complexity, 4),
-            confidence=round(conf, 4),
-            latency_ms=round(latency_ms, 3),
-        )
-
-    def adapt_unlabeled(self, prompts: Sequence[str]) -> Dict[str, Any]:
-        """Adapts prototypes online from unlabeled production traffic."""
-        return self.engine.adapt_zero_shot(prompts, margin_threshold=0.08, learning_rate=0.30)
-
-    def record_feedback(self, prompt: str, true_tier: str) -> None:
-        """Online 1-shot update when a downstream evaluator overrides the routed tier."""
-        self.engine.learn_from_tier2(
-            prompt,
-            {
-                "target_tier": true_tier,
-                "requires_deep_reasoning": (true_tier == "frontier_reasoning_model"),
-            },
-            preserve_calibration=True,
-        )
+from system1.integrations.drop_in import (
+    RouteDecision,
+    RouteLLMCascadeSchema,
+    SystemOneRouteController,
+)
 
 
 def run_real_langchain_banking77_benchmark() -> Dict[str, Any]:
@@ -158,7 +51,7 @@ def run_real_langchain_banking77_benchmark() -> Dict[str, Any]:
     tickets (32 intents, clean & character-typo stress) vs `all-MiniLM-L6-v2`.
     """
     from langchain_core.runnables import RunnableLambda
-    from benchmarks.quality.evaluate_v1_4_gauntlet import (
+    from benchmarks.quality.evaluate_instinct_gauntlet import (
         _evaluate_choice_flywheel,
         _evaluate_choice_model,
         _inject_deterministic_typo,
