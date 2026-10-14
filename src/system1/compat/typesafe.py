@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -804,7 +805,14 @@ class Choice:
             elif isinstance(criteria, Mapping):
                 self.criteria = dict(criteria)
                 self.options = tuple(str(k) for k in criteria.keys())
-                self.descriptions = {str(k): _content_text(v) if v is not None else str(k) for k, v in criteria.items()}
+                self.descriptions = {
+                    str(k): (
+                        tuple(str(x) for x in v if str(x).strip())
+                        if isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v)
+                        else (_content_text(v) if v is not None else str(k))
+                    )
+                    for k, v in criteria.items()
+                }
             elif isinstance(criteria, (Sequence, set)):
                 self.criteria = list(criteria)
                 self.options = tuple(str(x) for x in criteria)
@@ -1497,6 +1505,7 @@ class TypeSafeClient:
         fallback_baseline: bool = False,
         promotion_policy: Optional[PromotionPolicy] = None,
         drift_detector: Optional[DriftDetector] = None,
+        background_compile: bool = False,
         **kwargs: Any,
     ) -> None:
         if api_key is None:
@@ -1515,6 +1524,7 @@ class TypeSafeClient:
         self.zero_egress = bool(kwargs.get("zero_egress", zero_egress))
         self.allow_cloud_fallback = bool(kwargs.get("allow_cloud_fallback", allow_cloud_fallback))
         self.fallback_baseline = bool(kwargs.get("fallback_baseline", fallback_baseline))
+        self.background_compile = bool(kwargs.get("background_compile", background_compile))
         self.promotion_policy = promotion_policy or kwargs.get("promotion_policy", None)
         self._drift_detector = drift_detector or kwargs.get("drift_detector", None) or DriftDetector()
         self._drift_detectors: Dict[str, DriftDetector] = {}
@@ -1541,6 +1551,8 @@ class TypeSafeClient:
 
         self._engine_cache: Dict[str, SystemOneEngine] = {}
         self._engine_lock = threading.Lock()
+        self._compile_cond = threading.Condition(self._engine_lock)
+        self._compiling_schemas: Set[str] = set()
         self._call_count: Dict[str, int] = collections.defaultdict(int)
         self._teacher_sample_count: Dict[str, int] = collections.defaultdict(int)
         self._history: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
@@ -1594,7 +1606,19 @@ class TypeSafeClient:
     @property
     def is_cutover(self) -> bool:
         """Whether the client has automatically cut over to 100% local execution."""
-        return self._has_cutover or bool(self._has_cutover_schemas)
+        with self._engine_lock:
+            return self._has_cutover or bool(self._has_cutover_schemas)
+
+    @property
+    def is_compiling(self) -> bool:
+        """Whether a background cutover candidate compilation is currently running."""
+        with self._engine_lock:
+            return bool(self._compiling_schemas)
+
+    def wait_for_compilation(self, timeout: Optional[float] = None) -> bool:
+        """Wait for any in-flight background compilation tasks to complete."""
+        with self._compile_cond:
+            return self._compile_cond.wait_for(lambda: not self._compiling_schemas, timeout=timeout)
 
     @property
     def call_count(self) -> int:
@@ -1614,7 +1638,8 @@ class TypeSafeClient:
     @property
     def cutover_audit_log(self) -> List[Dict[str, Any]]:
         """Log of cutover audit events."""
-        return list(self._cutover_audit_log)
+        with self._engine_lock:
+            return list(self._cutover_audit_log)
 
     @property
     def compiled_model(self) -> Optional[Any]:
@@ -1645,7 +1670,8 @@ class TypeSafeClient:
     @property
     def last_promotion_report(self) -> Optional[PromotionReport]:
         """Audit report from the most recent cutover promotion evaluation."""
-        return self._last_promotion_report
+        with self._engine_lock:
+            return self._last_promotion_report
 
     def export_model(self, path: Union[str, Path]) -> bool:
         """Compiles and exports the validated System 1 model to disk."""
@@ -1655,6 +1681,146 @@ class TypeSafeClient:
             
         cm.save(path)
         return True
+
+    def export_teaching_session(
+        self,
+        directory: Union[str, Path],
+        schema: Optional[Union[DecisionSchema, Type[DecisionSchema]]] = None,
+        *,
+        questions: Optional[Mapping[str, Any]] = None,
+        **session_kwargs: Any,
+    ) -> Any:
+        """Exports accumulated teacher observations into a governed TeachingSession workspace.
+
+        Partitions observed history into disjoint teach (60%), calibrate (20%),
+        and evaluate (20%) splits while preserving lineage/group isolation, and
+        exports any promoted .s1m skill into the workspace.
+        """
+        from system1.compiler import CompiledSystemOneModel
+        from system1.teaching import TeachingSession
+
+        self.wait_for_compilation(timeout=5.0)
+        with self._engine_lock:
+            target_schema: Optional[DecisionSchema] = None
+            target_history: List[Dict[str, Any]] = []
+            promoted_model: Optional[Any] = None
+
+            if schema is not None:
+                target_schema = (
+                    schema()
+                    if isinstance(schema, type) and issubclass(schema, DecisionSchema)
+                    else schema
+                )
+                if not isinstance(target_schema, DecisionSchema):
+                    raise ValueError("schema must be a DecisionSchema instance or subclass")
+                digest = target_schema.schema_digest()
+                if digest in self._history and self._history[digest]:
+                    target_history = list(self._history[digest])
+                    promoted_model = self._compiled_models.get(digest)
+                elif len(self._history) == 1:
+                    only_digest = next(iter(self._history.keys()))
+                    target_history = list(self._history[only_digest])
+                    promoted_model = self._compiled_models.get(only_digest) or self._compiled_model
+            elif questions is not None:
+                target_schema = _build_dynamic_schema(questions)
+                digest = target_schema.schema_digest()
+                target_history = list(self._history.get(digest, []))
+                promoted_model = self._compiled_models.get(digest)
+            else:
+                non_empty_digests = [d for d, h in self._history.items() if h]
+                if not non_empty_digests:
+                    raise ValueError("No observed teacher history available to export")
+                digest = non_empty_digests[-1]
+                target_history = list(self._history[digest])
+                target_schema = _build_dynamic_schema(target_history[0]["questions"])
+                promoted_model = self._compiled_models.get(digest) or self._compiled_model
+
+            if not target_history or target_schema is None:
+                raise ValueError("No observed teacher history available to export")
+
+        partition = partition_cutover_history(target_history)
+        records: List[Dict[str, Any]] = []
+        seen_keys: Set[str] = set()
+        group_splits: Dict[str, str] = {}
+        single_field = len(target_schema.fields) == 1
+        only_name, only_field = (
+            next(iter(target_schema.fields.items())) if single_field else ("", None)
+        )
+
+        splits = (
+            ("teach", partition.train_history),
+            ("calibrate", partition.calib_history),
+            ("evaluate", partition.val_history),
+        )
+        for split_name, items in splits:
+            for item in items:
+                text = _content_text(item.get("state", ""))
+                if not text or not text.strip():
+                    continue
+                norm_key = " ".join(text.split()).casefold()
+                if norm_key in seen_keys:
+                    continue
+                seen_keys.add(norm_key)
+
+                ans_map = item.get("answers", {})
+                if single_field and only_field is not None:
+                    if only_name not in ans_map or ans_map[only_name] is None:
+                        continue
+                    label: Any = _teaching_target(only_field, ans_map[only_name])
+                else:
+                    if any(fname not in ans_map or ans_map[fname] is None for fname in target_schema.fields):
+                        continue
+                    label = {
+                        fname: _teaching_target(fdef, ans_map[fname])
+                        for fname, fdef in target_schema.fields.items()
+                    }
+
+                row: Dict[str, Any] = {
+                    "input": text,
+                    "label": label,
+                    "split": split_name,
+                    "source": "observed_teacher",
+                }
+                group_val = item.get("group_id") or item.get("lineage_id") or item.get("request_id")
+                if group_val is not None and str(group_val).strip():
+                    raw_group = str(group_val).strip()
+                    prev_split = group_splits.get(raw_group)
+                    if prev_split is None or prev_split == split_name:
+                        group_splits[raw_group] = split_name
+                        row["group"] = raw_group
+                    else:
+                        row["group"] = f"{split_name}:{raw_group}"
+                records.append(row)
+
+        session = TeachingSession(directory, target_schema, **session_kwargs)
+        if records:
+            session.record_many(records)
+        if promoted_model is not None and set(promoted_model.heads.keys()) == set(target_schema.fields.keys()):
+            if promoted_model.schema.schema_digest() != target_schema.schema_digest():
+                export_model = CompiledSystemOneModel(
+                    schema=target_schema,
+                    heads=promoted_model.heads,
+                    dimension=promoted_model.dimension,
+                    use_cache=promoted_model.use_cache,
+                    projector=promoted_model.projector,
+                    metadata=dict(promoted_model.metadata),
+                )
+            else:
+                export_model = promoted_model
+            artifact = export_model.to_bytes()
+            rev_digest = hashlib.sha256(artifact).hexdigest()
+            legacy_report = {
+                "passed": True,
+                "identity": {"candidate": rev_digest},
+                "evidence_scope": "legacy_approved_skill",
+                "assessment_available": False,
+            }
+            with session._workspace_lock():
+                session._retain_revision(artifact, legacy_report)
+                session.current_path.write_bytes(artifact)
+                session._engine = None
+                session._engine_digest = None
+        return session
 
     def _new_engine(self, schema: DecisionSchema, compiled_model: Any = None) -> SystemOneEngine:
         if compiled_model is not None:
@@ -1778,17 +1944,19 @@ class TypeSafeClient:
             "is_ambiguous": result.is_ambiguous,
         })
 
-    def _distill_and_cutover_locked(self, questions: Mapping[str, Any]) -> None:
-        """Fits closed-form local weights from collected query history and flips to local."""
+    def _run_distill_pipeline(
+        self,
+        schema: DecisionSchema,
+        digest: str,
+        schema_history: List[Dict[str, Any]],
+        seen_keys: Set[str],
+        attempt: int,
+        call_count_snapshot: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Compiles and evaluates a candidate model from a snapshot of history."""
         from system1.compiler import SystemOneCompiler
 
-        schema = _build_dynamic_schema(questions)
-        digest = schema.schema_digest()
-
-        # Decouple history into train (60%), calib (20%), and val (20%) partitions
-        # Invariant 10: Training, calibration, and promotion validation must be strictly disjoint!
-        schema_history = self._history[digest]
-        def examples_from(history):
+        def examples_from(history: Sequence[Dict[str, Any]]) -> Dict[str, List[Tuple[str, Any]]]:
             return {
                 name: [(item["state"], _teaching_target(field, item["answers"][name]))
                        for item in history if item["answers"].get(name) is not None]
@@ -1803,29 +1971,36 @@ class TypeSafeClient:
             partition = partition_cutover_history(schema_history)
             partition.assert_disjoint()
             validation_keys = set().union(*(_evidence_keys(row) for row in partition.val_history))
-            if validation_keys & self._validation_seen_keys[digest]:
+            if validation_keys & seen_keys:
                 # Wait for an entirely fresh validation block. Replaying the same
                 # holdout after every answer cannot establish promotion evidence.
-                return
+                return None
             compiled_model = compiler.compile(
                 exemplars=examples_from(partition.train_history), augment=self.augment,
                 calibration_exemplars=examples_from([group[0] for group in _evidence_groups(partition.calib_history)]), calibration_split=0,
             )
         except (ValueError, AssertionError) as exc:
-            # Missing classes or disjoint evidence defer promotion, not the teacher's answer.
-            self._last_promotion_report = PromotionReport(
+            report = PromotionReport(
                 False, 0, 0, 0.0, 0.0, 0, 0, 0.0, [str(exc)], schema_digest=digest,
             )
-            self._cutover_audit_log.append({
+            event = {
                 "event": "trojan_horse_cutover_deferred", "schema_digest": digest,
                 "rejection_reasons": [str(exc)], "status": "deferred_insufficient_evidence",
-                "report": self._last_promotion_report,
-            })
-            return
+                "report": report,
+            }
+            return {
+                "report": report,
+                "event": event,
+                "validation_keys": set(),
+                "attempt_incremented": False,
+                "compiled_model": None,
+                "engine": None,
+                "ledger_promotion": None,
+            }
+
         compiled_model.metadata["typesafe_strict_mode"] = self.strict_mode
         engine = self._new_engine(schema, compiled_model)
 
-        # Evaluate promotion eligibility strictly on held-out validation fold
         policy = self.promotion_policy or PromotionPolicy(
             min_agreement_threshold=self.min_agreement_threshold,
             false_allow_ceiling=0.0,
@@ -1838,15 +2013,11 @@ class TypeSafeClient:
             val_history=partition.val_history,
             schema=schema,
             policy=policy,
-            validation_attempt=self._validation_attempts[digest] + 1,
+            validation_attempt=attempt,
         )
-        self._validation_attempts[digest] += 1
-        self._validation_seen_keys[digest].update(validation_keys)
-        self._last_promotion_report = report
 
+        ledger_promotion = None
         if report.is_eligible:
-            # Release Invariant 3: Freeze, hash, validate, and promote the EXACT evaluated candidate artifact.
-            # Never recompile or recalibrate on all history post-validation.
             candidate_bytes = compiled_model.to_bytes() if hasattr(compiled_model, "to_bytes") else b""
             artifact_digest = (
                 hashlib.sha256(candidate_bytes).hexdigest()
@@ -1863,7 +2034,6 @@ class TypeSafeClient:
                     })
                 return hashlib.sha256(json.dumps(clean, sort_keys=True).encode()).hexdigest()
 
-            # The exact calibration state, schema digest, and evaluated artifacts are verified
             report.artifact_digest = artifact_digest
             report.schema_digest = digest
             report.manifest = {
@@ -1891,34 +2061,24 @@ class TypeSafeClient:
                     "timestamp": time.time(),
                 },
             }
-
-            if self.ledger is not None:
-                self.ledger.record_action(
-                    action="auto_cutover_promotion",
-                    proposal={
-                        "schema_digest": digest,
-                        "artifact_digest": artifact_digest,
-                        "metrics": {
-                            "total_validation_checks": report.total_validation_checks,
-                            "agreement_rate": report.agreement_rate,
-                            "wilson_lower_bound": report.wilson_lower_bound,
-                            "critical_class_count": report.critical_class_count,
-                            "false_allow_rate": report.false_allow_rate,
-                            "accepted_agreement_rate": report.accepted_agreement_rate,
-                            "accepted_agreement_lower_bound": report.accepted_agreement_lower_bound,
-                        },
-                        "manifest": report.manifest,
-                    },
-                )
-
-            # Promote exact evaluated candidate artifact
-            self._engine_cache[digest] = engine
-            self._compiled_models[digest] = compiled_model
-            self._has_cutover_schemas.add(digest)
+            ledger_promotion = {
+                "schema_digest": digest,
+                "artifact_digest": artifact_digest,
+                "metrics": {
+                    "total_validation_checks": report.total_validation_checks,
+                    "agreement_rate": report.agreement_rate,
+                    "wilson_lower_bound": report.wilson_lower_bound,
+                    "critical_class_count": report.critical_class_count,
+                    "false_allow_rate": report.false_allow_rate,
+                    "accepted_agreement_rate": report.accepted_agreement_rate,
+                    "accepted_agreement_lower_bound": report.accepted_agreement_lower_bound,
+                },
+                "manifest": report.manifest,
+            }
             event = {
                 "event": "trojan_horse_cutover",
                 "timestamp": time.time(),
-                "call_count": self._call_count[digest],
+                "call_count": call_count_snapshot,
                 "samples_collected": len(schema_history),
                 "agreement_rate": report.agreement_rate,
                 "min_agreement_threshold": policy.min_agreement_threshold,
@@ -1935,20 +2095,11 @@ class TypeSafeClient:
                 ),
                 "report": report,
             }
-            if self.ledger is not None:
-                try:
-                    self.ledger.record_action(
-                        action="trojan_horse_cutover",
-                        proposal=event,
-                    )
-                except Exception:
-                    pass
         else:
-            self._has_cutover = False
             event = {
                 "event": "trojan_horse_cutover_deferred",
                 "timestamp": time.time(),
-                "call_count": self._call_count[digest],
+                "call_count": call_count_snapshot,
                 "samples_collected": len(schema_history),
                 "agreement_rate": report.agreement_rate,
                 "min_agreement_threshold": policy.min_agreement_threshold,
@@ -1962,20 +2113,120 @@ class TypeSafeClient:
                 ),
                 "report": report,
             }
+
+        return {
+            "report": report,
+            "event": event,
+            "validation_keys": validation_keys,
+            "attempt_incremented": True,
+            "compiled_model": compiled_model,
+            "engine": engine,
+            "ledger_promotion": ledger_promotion,
+        }
+
+    def _commit_distill_outcome_locked(self, digest: str, outcome: Dict[str, Any]) -> None:
+        report: PromotionReport = outcome["report"]
+        event: Dict[str, Any] = outcome["event"]
+        if outcome["attempt_incremented"]:
+            self._validation_attempts[digest] += 1
+            self._validation_seen_keys[digest].update(outcome["validation_keys"])
+        self._last_promotion_report = report
+
+        if report.is_eligible:
+            if self.ledger is not None and outcome["ledger_promotion"] is not None:
+                self.ledger.record_action(
+                    action="auto_cutover_promotion",
+                    proposal=outcome["ledger_promotion"],
+                )
+            self._engine_cache[digest] = outcome["engine"]
+            self._compiled_models[digest] = outcome["compiled_model"]
+            self._has_cutover_schemas.add(digest)
+            if self.ledger is not None:
+                try:
+                    self.ledger.record_action(
+                        action="trojan_horse_cutover",
+                        proposal=event,
+                    )
+                except Exception:
+                    pass
+        elif outcome["attempt_incremented"]:
+            self._has_cutover = False
+
         self._cutover_audit_log.append(event)
+
+    def _distill_and_cutover_locked(self, questions: Mapping[str, Any]) -> None:
+        """Fits closed-form local weights from collected query history and flips to local."""
+        schema = _build_dynamic_schema(questions)
+        digest = schema.schema_digest()
+        outcome = self._run_distill_pipeline(
+            schema=schema,
+            digest=digest,
+            schema_history=list(self._history[digest]),
+            seen_keys=set(self._validation_seen_keys[digest]),
+            attempt=self._validation_attempts[digest] + 1,
+            call_count_snapshot=self._call_count[digest],
+        )
+        if outcome is not None:
+            self._commit_distill_outcome_locked(digest, outcome)
+
+    def _schedule_background_distill_locked(self, questions: Mapping[str, Any]) -> None:
+        """Spawns a non-blocking background thread to compile and validate cutover candidate."""
+        schema = _build_dynamic_schema(questions)
+        digest = schema.schema_digest()
+        if digest in self._compiling_schemas or digest in self._has_cutover_schemas:
+            return
+        schema_history = list(self._history[digest])
+        seen_keys = set(self._validation_seen_keys[digest])
+        try:
+            partition = partition_cutover_history(schema_history)
+            partition.assert_disjoint()
+            validation_keys = set().union(*(_evidence_keys(row) for row in partition.val_history))
+            if validation_keys & seen_keys:
+                return
+        except (ValueError, AssertionError):
+            pass
+
+        self._compiling_schemas.add(digest)
+        attempt = self._validation_attempts[digest] + 1
+        call_count_snapshot = self._call_count[digest]
+
+        def _worker() -> None:
+            outcome = None
+            try:
+                outcome = self._run_distill_pipeline(
+                    schema=schema,
+                    digest=digest,
+                    schema_history=schema_history,
+                    seen_keys=seen_keys,
+                    attempt=attempt,
+                    call_count_snapshot=call_count_snapshot,
+                )
+            finally:
+                with self._compile_cond:
+                    try:
+                        if outcome is not None and not self._closed and digest not in self._has_cutover_schemas:
+                            self._commit_distill_outcome_locked(digest, outcome)
+                    finally:
+                        self._compiling_schemas.discard(digest)
+                        self._compile_cond.notify_all()
+
+        threading.Thread(target=_worker, name=f"system1-cutover-{digest[:8]}", daemon=True).start()
 
     def distill_and_cutover(self, questions: Optional[Mapping[str, Any]] = None) -> bool:
         """Manually triggers distillation and flips client to 100% local execution."""
-        with self._engine_lock:
+        with self._compile_cond:
+            self._compile_cond.wait_for(lambda: not self._compiling_schemas)
             if questions is None and self._history:
                 first_digest = next(iter(self._history))
                 if self._history[first_digest]:
                     questions = self._history[first_digest][0].get("questions", {})
             if not questions:
                 return False
-            self._distill_and_cutover_locked(questions)
             schema = _build_dynamic_schema(questions)
-            return self._has_cutover or (schema.schema_digest() in self._has_cutover_schemas)
+            digest = schema.schema_digest()
+            if not (self._has_cutover or (digest in self._has_cutover_schemas)):
+                self._distill_and_cutover_locked(questions)
+            return self._has_cutover or (digest in self._has_cutover_schemas)
 
     def systemone(
         self,
@@ -2083,12 +2334,17 @@ class TypeSafeClient:
                             pass
 
                     if current_count >= self.cutover_threshold and digest not in self._has_cutover_schemas:
-                        self._distill_and_cutover_locked(questions)
+                        if self.background_compile:
+                            self._schedule_background_distill_locked(questions)
+                        else:
+                            self._distill_and_cutover_locked(questions)
 
                     current_cutover = self._has_cutover or (digest in self._has_cutover_schemas)
+                    currently_compiling = digest in self._compiling_schemas
 
                 cloud_resp["auto_cutover_active"] = True
                 cloud_resp["is_cutover"] = current_cutover
+                cloud_resp["background_compiling"] = currently_compiling
                 cloud_resp["cutover_progress"] = f"{current_count}/{self.cutover_threshold}"
                 cloud_resp["egress_bytes"] = egress_bytes
                 return cloud_resp
@@ -2320,6 +2576,7 @@ class AsyncTypeSafeClient:
         allow_cloud_fallback: bool = False,
         promotion_policy: Optional[PromotionPolicy] = None,
         drift_detector: Optional[DriftDetector] = None,
+        background_compile: bool = False,
         **kwargs: Any,
     ) -> None:
         self._sync_client = TypeSafeClient(
@@ -2339,6 +2596,7 @@ class AsyncTypeSafeClient:
             allow_cloud_fallback=allow_cloud_fallback,
             promotion_policy=promotion_policy,
             drift_detector=drift_detector,
+            background_compile=background_compile,
             **kwargs,
         )
 
@@ -2373,6 +2631,17 @@ class AsyncTypeSafeClient:
     @property
     def allow_cloud_fallback(self) -> bool:
         return self._sync_client.allow_cloud_fallback
+
+    @property
+    def background_compile(self) -> bool:
+        return self._sync_client.background_compile
+
+    @property
+    def is_compiling(self) -> bool:
+        return self._sync_client.is_compiling
+
+    async def wait_for_compilation(self, timeout: Optional[float] = None) -> bool:
+        return await asyncio.to_thread(self._sync_client.wait_for_compilation, timeout)
 
     @property
     def promotion_policy(self) -> Optional[PromotionPolicy]:
@@ -2414,6 +2683,23 @@ class AsyncTypeSafeClient:
     async def export_model(self, path: Union[str, Path]) -> bool:
         """Asynchronously exports the distilled closed-form model as a static .s1m binary."""
         return await asyncio.to_thread(self._sync_client.export_model, path)
+
+    async def export_teaching_session(
+        self,
+        directory: Union[str, Path],
+        schema: Optional[Union[DecisionSchema, Type[DecisionSchema]]] = None,
+        *,
+        questions: Optional[Mapping[str, Any]] = None,
+        **session_kwargs: Any,
+    ) -> Any:
+        """Asynchronously exports observed teacher history into a governed TeachingSession."""
+        return await asyncio.to_thread(
+            self._sync_client.export_teaching_session,
+            directory,
+            schema=schema,
+            questions=questions,
+            **session_kwargs,
+        )
 
     async def distill_and_cutover(self, questions: Optional[Mapping[str, Any]] = None) -> bool:
         """Asynchronously triggers distillation and flips client to local execution."""

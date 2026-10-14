@@ -94,11 +94,16 @@ class SystemOneServiceServicer(_BaseServicer):
         signing_key: Optional[Any] = None,
         ledger: Optional[Any] = None,
         policy_engine: Optional[Any] = None,
+        *,
+        model_paths: Optional[Dict[str, Any]] = None,
+        auto_reload: bool = False,
     ) -> None:
         from system1.engine import SystemOneEngine
         from system1.guard import SystemOneGuardHook
 
         self._custom_schemas = dict(schemas or {})
+        self._model_paths = dict(model_paths or {})
+        self._auto_reload = bool(auto_reload)
         self._signing_key = signing_key
         self._ledger = ledger
         self._policy_engine = policy_engine
@@ -111,6 +116,8 @@ class SystemOneServiceServicer(_BaseServicer):
                 schema,
                 signing_key=self._signing_key,
                 ledger=self._ledger,
+                model_path=self._model_paths.get(name),
+                auto_reload=self._auto_reload,
             )
 
     # -- helpers ----------------------------------------------------------
@@ -125,6 +132,8 @@ class SystemOneServiceServicer(_BaseServicer):
                 schema,
                 signing_key=self._signing_key,
                 ledger=self._ledger,
+                model_path=self._model_paths.get(key),
+                auto_reload=self._auto_reload,
             )
         return self._engines[key]
 
@@ -688,6 +697,8 @@ def serve(
     signing_key: Optional[Any] = None,
     ledger: Optional[Any] = None,
     policy_engine: Optional[Any] = None,
+    model_paths: Optional[Dict[str, Union[str, Path]]] = None,
+    auto_reload: bool = False,
 ) -> Any:
     """Start the System 1 gRPC server.
 
@@ -709,6 +720,10 @@ def serve(
         Persistent audit ledger.
     policy_engine : PolicyEngine, optional
         Deterministic policy reference monitor.
+    model_paths : dict, optional
+        Mapping of schema name → ``.s1m`` model file path.
+    auto_reload : bool
+        If True, automatically reload ``.s1m`` models when modified on disk.
 
     Returns
     -------
@@ -726,6 +741,8 @@ def serve(
         signing_key=signing_key,
         ledger=ledger,
         policy_engine=policy_engine,
+        model_paths=model_paths,
+        auto_reload=auto_reload,
     )
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
 

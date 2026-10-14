@@ -45,12 +45,22 @@ def main():
             url = urlsplit(raw.strip("<>"))
             # Links to this repository's main branch describe this checkout.
             # Historical commits/tags and external sites remain separate evidence.
-            repo_prefixes = ("/steph4n-gh/system1/blob/main/", "/steph4n-gh/system1/tree/main/")
+            repo_prefixes = (
+                "/steph4n-gh/system1-instinct/blob/main/",
+                "/steph4n-gh/system1-instinct/tree/main/",
+                "/steph4n-gh/system1/blob/main/",
+                "/steph4n-gh/system1/tree/main/",
+            )
+            raw_prefixes = (
+                "/steph4n-gh/system1-instinct/main/",
+                "/steph4n-gh/system1/main/",
+            )
             repo_prefix = next((prefix for prefix in repo_prefixes if url.path.startswith(prefix)), None)
+            raw_prefix = next((prefix for prefix in raw_prefixes if url.path.startswith(prefix)), None)
             if url.netloc == "github.com" and repo_prefix:
                 target = (ROOT / unquote(url.path[len(repo_prefix):])).resolve()
-            elif url.netloc == "raw.githubusercontent.com" and url.path.startswith("/steph4n-gh/system1/main/"):
-                target = (ROOT / unquote(url.path.removeprefix("/steph4n-gh/system1/main/"))).resolve()
+            elif url.netloc == "raw.githubusercontent.com" and raw_prefix:
+                target = (ROOT / unquote(url.path[len(raw_prefix):])).resolve()
             elif url.scheme or url.netloc:
                 continue
             else:

@@ -193,6 +193,9 @@ def test_missing_evaluation_calibration_or_classes_cannot_be_assessed(tmp_path):
 
 
 def test_only_supported_schemas_and_valid_explicit_labels(tmp_path):
+    class EmptySkill(DecisionSchema):
+        pass
+
     class BooleanSkill(DecisionSchema):
         ready = BooleanField()
 
@@ -200,9 +203,15 @@ def test_only_supported_schemas_and_valid_explicit_labels(tmp_path):
         first = ChoiceField(["a", "b"])
         second = ChoiceField(["a", "b"])
 
-    for schema in (None, BooleanSkill, Multiple):
-        with pytest.raises(ValueError, match="ChoiceField"):
+    for schema in (None, EmptySkill):
+        with pytest.raises(ValueError, match="ChoiceField|no fields defined"):
             TeachingSession(tmp_path / str(schema), schema)
+    bool_session = TeachingSession(tmp_path / "bool", BooleanSkill)
+    with pytest.raises(ValueError):
+        bool_session.record("text", "yes")
+    multi_session = TeachingSession(tmp_path / "multi", Multiple)
+    with pytest.raises(ValueError):
+        multi_session.record("text", {"first": "a"})
     session = TeachingSession(tmp_path / "valid", Filing)
     for text, label in (("", "billing"), ("text", None), ("text", "unknown")):
         with pytest.raises(ValueError):

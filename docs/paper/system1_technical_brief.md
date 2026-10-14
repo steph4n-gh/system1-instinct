@@ -1,10 +1,10 @@
 # System 1: technical brief
 
-**System 1 1.2.0 · 1 October 2026 · Maintainer-authored implementation brief**
+**System 1 1.4.0 · 13 October 2026 · Maintainer-authored implementation brief**
 
-This brief describes [System 1 1.2.0](../releases/1.2.0.md). Each linked experiment
-retains its original source revision and evidence; a release does not rerun or
-upgrade historical quality results.
+This brief describes **System 1 1.4.0** (see the [v1.4 benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Each linked experiment
+retains its original source revision and evidence; the v1.4 gauntlet adds six
+offline evaluation categories alongside historical quality results.
 
 System 1 turns a repeatable decision into a small reusable local skill. Define the
 choices, show examples, check a candidate, adopt it, then correct and compare when
@@ -15,8 +15,10 @@ inherit a teacher's general knowledge.
 
 ## One teaching and correction workflow
 
-`TeachingSession`, introduced in 1.1.0, keeps one text `ChoiceField`, explicit
-lessons, separate calibration examples and evaluation checks together. The field
+`TeachingSession`, introduced in 1.1.0 and expanded in 1.4.0, keeps single-field
+or multi-field schemas (`ChoiceField`, `BooleanField`, `MultiChoiceField`,
+`ScoreField`), explicit lessons, separate calibration examples and evaluation checks
+together (including `split="auto"` stratified routing). At least one field
 must keep ambiguity escalation enabled, so uncertainty requests review. A
 correction replaces a same-input lesson. `assess()` builds, saves and reloads a
 candidate and compares it with the approved skill on the same checks. It reports
@@ -43,14 +45,14 @@ observable review conditions, without automatically calling a teacher or teachin
 from predictions.
 
 This is an additive wrapper around the existing compiler and strict engine. It
-uses the existing TF-IDF projector and a ridge or optional logistic head, with
+uses the existing TF-IDF or `HybridProjector` representation and a ridge or optional logistic head, with
 the solver fixed when the session is created, no new dependency or
 saved-format change. The [walkthrough](../guides/correcting_skills.md) is the
 reference for Python, CLI, defaults and evidence limits. The
 [document workspace](../../examples/teaching_by_doing/README.md) exposes the same
 workflow through filing actions. Its authored sample checks demonstrate the
 process; they do not qualify a customer's document workload.
-The release introduces no new encoder or lesson-selection algorithm and does not
+The release introduces no pretrained language model and does not
 weaken the existing full-scope quality targets.
 
 ## How a saved skill works
@@ -99,10 +101,21 @@ a serving skill. This is evidence of a review/quality tradeoff and candidate
 rejection; it does not establish successful real-data adoption or superiority
 over its ordinary-addition control.
 
-Later work preserves substantial limitations: fresh authored SMS probes reached
+Historical baselines preserve important limitations: under the v1.2 baseline, fresh authored SMS probes reached
 only 27/33 correct accepted answers; public email has a source-shift failure and
 a retrospective improvement; Inbox Zero remains review-only; the full-scope n8n
 skills fail accepted-accuracy targets and CLINC unfamiliar-input rejection.
+In the [v1.4 benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md),
+supervised `chi2` + character n-gram TF-IDF, `HybridProjector.fit` spectral
+`PPMI+SVD`, two-stage `hierarchical` routing, Mondrian class-conditional
+calibration, and dual OOD gates (`familiarity_alpha` + `prototype_alpha`) raise
+`BANKING77` 32-intent accuracy from `76.6% -> 87.9%` (`91.8%` post-flywheel) and
+77-intent accuracy from `59.9% -> 79.5%` (`87.5%` post-flywheel), reduce
+`CLINC150-OOS` false acceptance to `0.0%` (`0/120` accepted OOS), eliminate
+`NotInject` benign-trigger false positives (`10.0% -> 0.0%` FPR, `70.0% -> 100.0%`
+polarity contrast accuracy), and lift `quality_round` fresh `banking_support`
+accepted accuracy to `100.0%` (`0` errors) and `model_routing` coverage to `88.9%`
+(`100.0%` accepted accuracy).
 The [workload and evidence index](../../benchmarks/quality/README.md) links every
 protocol, baseline, result and reproduction path. Reused checks are regression
 evidence. New candidates still need representative independent confirmation.
@@ -120,8 +133,7 @@ solve them.
 Optional `PolicyEngine`/`SystemOneGuard` permissions, software Ed25519 receipts
 and a SHA-256-chained ledger support enforcement and auditing. Applications must
 authenticate callers, protect keys and enforce tool boundaries. See
-[deployment boundaries](../deployment.md) and the
-[1.0.3 security release](../releases/1.0.3.md).
+[deployment boundaries](../deployment.md).
 
 Start with [your first skill](../guides/first_skill.md), then
 [correct, compare, and adopt](../guides/correcting_skills.md). The

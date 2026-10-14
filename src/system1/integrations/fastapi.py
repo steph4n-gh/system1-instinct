@@ -34,10 +34,12 @@ class SystemOneGatewayMiddleware:
         is_fastpath_fn: Optional[Callable[[DecisionResult, Dict[str, Any]], bool]] = None,
         extract_prompt_fn: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
         fastpath_response_fn: Optional[Callable[[DecisionResult, Dict[str, Any]], Dict[str, Any]]] = None,
+        model_path: Optional[Any] = None,
+        auto_reload: bool = False,
     ):
         self.app = app
         self.schema = schema
-        self.engine = engine or SystemOneEngine(schema)
+        self.engine = engine or SystemOneEngine(schema, model_path=model_path, auto_reload=auto_reload)
         self.route_paths = tuple(route_paths)
         self.fastpath_threshold = fastpath_threshold
         self.alpha = alpha

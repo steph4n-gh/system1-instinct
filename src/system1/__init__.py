@@ -26,6 +26,7 @@ from system1.core import (
     MultiChoiceField,
     RawFieldEvaluation,
     ScoreField,
+    StaticEmbeddingTable,
     SubwordSemanticEmbeddings,
     SystemOneModel,
     SchemaMeta,
@@ -52,7 +53,7 @@ from system1 import (
     schema,
 )
 
-__version__ = "1.2.0"
+__version__ = "1.4.0"
 
 
 def decide(
@@ -112,6 +113,7 @@ _SUBMODULE_NAMES = {
     "core",
     "embeddings",
     "engine",
+    "fallback",
     "grpc_server",
     "guard",
     "integrations",
@@ -136,6 +138,7 @@ _MODULE_MAP = {
     "core": "system1.core",
     "embeddings": "system1.embeddings",
     "engine": "system1.engine",
+    "fallback": "system1.fallback",
     "grpc_server": "system1.grpc_server",
     "guard": "system1.guard",
     "integrations": "system1.integrations",
@@ -148,6 +151,8 @@ _MODULE_MAP = {
     "telemetry": "system1.telemetry",
     "teaching": "system1.teaching",
     "TeachingSession": "system1.teaching",
+    "BoundedReviewFallback": "system1.fallback",
+    "ReviewFallbackDecision": "system1.fallback",
     # cache (Lever 1)
     "SemanticSystemOneCache": "system1.cache",
     "CacheEntry": "system1.cache",
@@ -263,6 +268,8 @@ def __dir__() -> list[str]:
 
 __all__ = [
     "TeachingSession",
+    "BoundedReviewFallback",
+    "ReviewFallbackDecision",
     # Version
     "__version__",
     # Engine & Core Results
@@ -342,6 +349,7 @@ __all__ = [
     "LocalNeuralProjector",
     "HybridProjector",
     "HybridSemanticProjector",
+    "StaticEmbeddingTable",
     "SubwordSemanticEmbeddings",
     "ModelInferenceResult",
     "RawFieldEvaluation",

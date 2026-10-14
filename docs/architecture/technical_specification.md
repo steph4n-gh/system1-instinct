@@ -1,8 +1,8 @@
 # System 1 architecture and implementation
 
-Implementation reference for **System 1 1.2.0**, reviewed 1 October 2026.
-See the [release changes](../releases/1.2.0.md) and
-[changelog](../../CHANGELOG.md) for version boundaries.
+Implementation reference for **System 1 1.4.0**, reviewed 13 October 2026.
+See the [v1.4 benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md)
+and [changelog](../../CHANGELOG.md) for version boundaries.
 The [whitepaper](../paper/system1_whitepaper.md) explains the product and evidence;
 this document maps its behavior to the source. The package version is defined in
 [pyproject.toml](../../pyproject.toml).
@@ -48,32 +48,36 @@ it does not run the teacher, execute a tool, or perform the entire lifecycle.
 | Component | Responsibility | Source |
 |---|---|---|
 | `DecisionSchema` and field classes | Choice, Boolean, MultiChoice and continuous score outputs; field-level review configuration | [schema](../../src/system1/core/schema.py) |
-| `DeterministicSemanticProjector` | SHA-256-derived signed word, subword and character features, normalized into 384 dimensions by default | [core model](../../src/system1/core/model.py) |
-| `TfidfProjector` | Optional fitted word unigram/bigram vocabulary, smoothed IDF and sublinear term frequency; frozen during inference and saved in the skill | [text features](../../src/system1/core/text.py) |
-| `HybridProjector` | Optional hashed lexical features plus a seeded subword table with curated semantic anchors | [embeddings](../../src/system1/core/embeddings.py) |
-| `SystemOneCompiler` | Validate labels, partition examples, fit ridge or optional logistic choice heads, calibrate, serialize | [compiler](../../src/system1/compiler.py) |
-| `TeachingSession` (since 1.1.0) | Retain explicit lessons and groups for one ChoiceField; assess, independently qualify, explicitly adopt and restore exact approved revisions | [teaching lifecycle](../../src/system1/teaching.py) |
-| `System1Engine` / `SystemOneEngine` | Apply a schema or compiled skill, uncertainty checks, optional caching and audit evidence | [engine](../../src/system1/engine.py) |
-| TypeSafe `Client` / `AsyncClient` | Teacher observation, per-schema promotion, local typed responses and skill reuse | [adapter](../../src/system1/compat/typesafe.py) |
+| `DeterministicSemanticProjector` | SHA-256-derived signed word, subword, character and concept-aware features, normalized into 384 dimensions by default | [core model](../../src/system1/core/model.py) |
+| `TfidfProjector` | Optional fitted word unigram/bigram and character n-gram vocabulary with document-frequency or supervised $\chi^2$ feature selection, smoothed IDF and sublinear term frequency; frozen during inference and saved in the skill | [text features](../../src/system1/core/text.py) |
+| `HybridProjector` | Optional hashed or fitted $\chi^2$ TF-IDF lexical features plus a seeded or corpus-fitted spectral (PPMI + truncated SVD) dense subspace with curated semantic anchors | [embeddings](../../src/system1/core/embeddings.py) |
+| `SystemOneCompiler` | Validate labels, partition examples, fit ridge or optional logistic choice heads (with optional two-stage hierarchical routing for high-cardinality fields), calibrate (marginal or Mondrian per-class LAC plus dual OOD familiarity and prototype similarity gates), serialize | [compiler](../../src/system1/compiler.py) |
+| `TeachingSession` (since 1.1.0; multi-field in 1.4.0) | Retain explicit lessons and groups across `ChoiceField`, `BooleanField`, `MultiChoiceField` and `ScoreField` (`split="auto"` stratified routing); assess, independently qualify, explicitly adopt and restore exact approved revisions | [teaching lifecycle](../../src/system1/teaching.py) |
+| `BoundedReviewFallback` | Bounded teacher fallback runner with optional closed-loop lesson recording (`auto_record_lessons=True`) and sub-millisecond online RLS updates (`auto_online_update=True`) | [fallback runner](../../src/system1/fallback.py) |
+| `System1Engine` / `SystemOneEngine` | Apply a schema or compiled skill, uncertainty checks, calibration-preserving online RLS updates (`learn_from_tier2`), optional caching and audit evidence | [engine](../../src/system1/engine.py) |
+| TypeSafe `Client` / `AsyncClient` | Teacher observation, optional background compilation (`background_compile=True`), per-schema promotion, local typed responses, `TeachingSession` export and skill reuse | [adapter](../../src/system1/compat/typesafe.py) |
 | `PolicyEngine` / `SystemOneGuard` | Explicit permissions and guarded proposal evaluation | [guard](../../src/system1/guard.py) |
 | Receipts / `ActionLedger` | Software signatures and a local hash-chained event record | [receipts](../../src/system1/receipt.py), [ledger](../../src/system1/ledger.py) |
 
 The deterministic projector uses words, character 3/4-grams within words, adjacent
-word pairs and cross-word character 4-grams. Its hashes are SHA-256, not MurmurHash;
+word pairs, cross-word character 4-grams and concept-aware cluster channels. Its hashes are SHA-256, not MurmurHash;
 there is no corpus-fitted IDF or pretrained contextual language model. Positional
 weighting is built in; recency weighting is optional. Shared lexical features
-allow generalization to new combinations, but lexical overlap is not meaning.
+allow generalization to new combinations, and cold-start `ChoiceField` compilation
+additionally performs sibling-contrastive stem IDF weighting and multi-exemplar
+sub-prototype scoring across semicolon/clause-delimited option descriptions.
 
 `HybridProjector()` defaults to 1,024 lexical and 256 dense dimensions with mixing
-weight 0.5 and seed 42. Supplying `dimension` divides it approximately 75%/25%.
-The table is generated locally and adjusted by curated anchors. It is an optional
+weight 0.5 and seed 42, while `HybridProjector.fit(...)` learns a supervised $\chi^2$
+word + character n-gram sparse block and a spectral PPMI + truncated SVD dense
+subspace directly from teaching examples. It is an optional
 representation, not the compiler's default or an independently learned language
 understanding system.
 
 The compiler defaults to 384 features, ridge regularization 1.0 and NumPy.
 Published explicit-teaching workloads use 2,048 features and regularization 0.1;
 the original automatic-observation experiments use regularization 1.0. Later
-quality-round recipes state their own settings. `TeachingSession` defaults
+quality-round and v1.4 gauntlet recipes state their own settings. `TeachingSession` defaults
 to fitted TF-IDF with at most 1,024 features, ridge regularization 0.1, strict
 `alpha=0.05` and disabled inference caches. These are distinct paths; their
 settings and measured costs must not be conflated. Since 1.2.0, its ridge or
@@ -143,8 +147,12 @@ certify an action. The public workload timings disable caches and receipts.
 
 The [adapter contract](../typesafe.md) is the detailed reference. In
 `mode="auto_cutover"`, teacher answers continue until that schema's candidate
-qualifies. Compilation and transition are synchronized in the request path;
-there is no guaranteed background compilation or zero-latency transition.
+qualifies. By default (`background_compile=False`), compilation and transition are
+synchronized in the request path; when `background_compile=True` (since 1.4.0),
+candidate compilation and promotion checks run asynchronously on a background
+worker thread while active requests continue to return teacher responses without
+blocking (`wait_for_compilation()` synchronizes in tests or shutdown hooks, and
+`export_teaching_session()` exports observed history into a `TeachingSession`).
 
 Defaults are a 50-observation earliest attempt, 80% agreement, 80% local acceptance,
 95% statistical confidence and zero observed critical false-allows. Candidates
@@ -184,15 +192,22 @@ checks NPY shapes and floating-point types before NumPy loading, including
 covariance and calibration state. See the [exact budgets](../deployment.md#saved-skill-resource-limits).
 
 Saving a validated skill is tested to preserve values, probabilities, prediction
-sets and review flags. Online correction methods, including `learn_from_tier2`
-and its aliases, invalidate changed heads' calibration and caches. Recalibrate
-on separate examples before strict acceptance. Retaining examples and recompiling
-is the simplest reproducible update process.
+sets and review flags. By default (`preserve_calibration=False`), online correction
+methods including `learn_from_tier2` and its aliases invalidate changed heads'
+calibration and caches so separate recalibration is required before strict acceptance.
+Since 1.4.0, `learn_from_tier2(..., preserve_calibration=True)` (used by
+`BoundedReviewFallback(..., auto_online_update=True)`) applies exact Sherman-Morrison
+directional gain scaling to update the target class margin while preserving existing
+conformal quantiles for immediate online boundary adaptation. Retaining examples and
+recompiling remains the primary reproducible update process.
 
-The additive `TeachingSession` helper introduced in 1.1.0 implements that process for a
-text classifier with one `ChoiceField` whose `escalate_on_ambiguity` is enabled.
-The helper rejects a schema that suppresses its review flag. Separate `teach`,
-`calibrate`, and `evaluate` records feed a TF-IDF candidate with the session's
+The additive `TeachingSession` helper introduced in 1.1.0 (and expanded in 1.4.0)
+implements that process for single-field or multi-field schemas across `ChoiceField`,
+`BooleanField`, `MultiChoiceField` and `ScoreField` where at least one field has
+`escalate_on_ambiguity` enabled.
+The helper rejects a schema that suppresses all review flags. Separate `teach`,
+`calibrate`, and `evaluate` records (or `split="auto"` deterministic 60%/20%/20%
+stratified routing) feed a TF-IDF or `HybridProjector` candidate with the session's
 fixed ridge or optional logistic solver, strict
 uncertainty calibration, and recurring comparison
 checks. Assessing does not replace the current skill; adopting rechecks the exact
@@ -262,7 +277,7 @@ Receipt authentication requires an independently supplied public key. Diagnostic
 integrity checks do not authenticate a signer. After append, the existing signed
 envelope binds the committed ledger record ID while the core receipt digest stays
 stable. Guards check exact stored receipt inclusion; write transactions reverify
-the complete chain. See [audit migration details](../releases/1.0.3.md).
+the complete chain. See [deployment boundaries](../deployment.md).
 
 LangChain, MCP, ASGI, gRPC, Prometheus and OpenTelemetry are adapters around these
 contracts. gRPC's diagnostic CLI has insecure transport and defaults to loopback.

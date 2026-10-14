@@ -1,0 +1,56 @@
+{
+  "version": "1.4.0",
+  "drop_in_suite": {
+    "semantic_router": {
+      "in_domain_accuracy": 1.0,
+      "ood_rejection_rate": 1.0,
+      "pre_adapt_jargon_accuracy": 0.0,
+      "post_adapt_jargon_accuracy": 1.0,
+      "p50_latency_ms": 1.363
+    },
+    "routellm": {
+      "tier_routing_accuracy": 1.0,
+      "p50_latency_ms": 1.468
+    },
+    "instructor": {
+      "department_accuracy": 1.0,
+      "page_oncall_accuracy": 1.0,
+      "joint_field_accuracy": 1.0,
+      "p50_latency_ms": 2.729
+    },
+    "prompt_guard": {
+      "notinject_benign_fpr": 0.0,
+      "attack_detection_recall": 1.0,
+      "verdict_exact_accuracy": 1.0,
+      "p50_latency_ms": 0.811
+    }
+  },
+  "adaptation_curves": {
+    "banking77_24_intents": {
+      "dataset": "BANKING77",
+      "num_classes": 24,
+      "num_test_samples": 192,
+      "zero_shot_0_examples_accuracy": 0.5365,
+      "zero_shot_unsupervised_adapt_accuracy": 0.5521,
+      "online_1_shot_accuracy": 0.5729,
+      "online_3_shot_accuracy": 0.6562,
+      "online_5_shot_accuracy": 0.7031,
+      "compiled_s1m_accuracy": 0.901,
+      "zero_shot_p50_latency_ms": 0.681,
+      "compiled_p50_latency_ms": 0.339
+    },
+    "clinc150_24_intents": {
+      "dataset": "CLINC150",
+      "num_classes": 24,
+      "num_test_samples": 120,
+      "zero_shot_0_examples_accuracy": 0.6167,
+      "zero_shot_unsupervised_adapt_accuracy": 0.625,
+      "online_1_shot_accuracy": 0.6583,
+      "online_3_shot_accuracy": 0.725,
+      "online_5_shot_accuracy": 0.825,
+      "compiled_s1m_accuracy": 0.875,
+      "zero_shot_p50_latency_ms": 0.543,
+      "compiled_p50_latency_ms": 0.312
+    }
+  }
+}

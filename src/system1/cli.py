@@ -467,11 +467,16 @@ def handle_compile_command(args: argparse.Namespace) -> int:
         print(f"[SYSTEM1 ERROR] Cannot load examples: {exc}", file=sys.stderr)
         return 1
 
+    raw_hier = _parse_hierarchical(getattr(args, "hierarchical", "auto"))
     compiler = SystemOneCompiler(
         schema=schema,
         dimension=getattr(args, "dimension", 384),
         regularization=getattr(args, "regularization", 1.0),
         choice_solver=getattr(args, "choice_solver", "ridge"),
+        mondrian=bool(getattr(args, "mondrian", False)),
+        familiarity_alpha=float(getattr(args, "familiarity_alpha", 0.0) or 0.0),
+        prototype_alpha=float(getattr(args, "prototype_alpha", 0.0) or 0.0),
+        hierarchical="auto" if raw_hier is None else raw_hier,
     )
 
     output_path = getattr(args, "output", "model.s1m") or "model.s1m"
@@ -504,6 +509,10 @@ def handle_compile_command(args: argparse.Namespace) -> int:
         "fields_compiled": list(schema.fields.keys()),
         "regularization": getattr(args, "regularization", 1.0),
         "choice_solver": compiled_model.metadata["choice_solver"],
+        "mondrian": compiled_model.metadata.get("mondrian", False),
+        "familiarity_alpha": compiled_model.metadata.get("familiarity_alpha", 0.0),
+        "prototype_alpha": compiled_model.metadata.get("prototype_alpha", 0.0),
+        "hierarchical": compiled_model.metadata.get("hierarchical", "auto"),
         "teacher": compiled_model.metadata["teacher"],
         "teaching_mode": compiled_model.metadata["teaching_mode"],
         "sample_counts": compiled_model.metadata["sample_counts"],
@@ -550,18 +559,76 @@ def handle_serve_command(args: argparse.Namespace) -> int:
     # Build schemas dict from --schema flags.
     # Formats: "guard", "triage", "name:path/to/file.s1m"
     schemas: Dict[str, Any] = {}
+    model_paths: Dict[str, Any] = {}
     for spec in schema_args:
         if ":" in spec and not spec.startswith(":"):
             name, path_str = spec.split(":", 1)
-            schema = _load_schema(path_str)
-            schemas[name] = schema
+            if path_str.endswith(".s1m") and Path(path_str).is_file():
+                from system1.compiler import CompiledSystemOneModel
+
+                m = CompiledSystemOneModel.load(path_str)
+                schemas[name] = m.schema
+                model_paths[name] = path_str
+            else:
+                schema = _load_schema(path_str)
+                schemas[name] = schema
         else:
-            schema = _load_schema(spec)
-            schemas[spec] = schema
+            if spec.endswith(".s1m") and Path(spec).is_file():
+                from system1.compiler import CompiledSystemOneModel
+
+                m = CompiledSystemOneModel.load(spec)
+                schemas[m.schema.schema_name] = m.schema
+                model_paths[m.schema.schema_name] = spec
+            else:
+                schema = _load_schema(spec)
+                schemas[spec] = schema
 
     print(f"[SYSTEM1] Starting gRPC server on {host}:{port}...")
-    grpc_serve(host=host, port=port, schemas=schemas if schemas else None, block=True)
+    grpc_serve(
+        host=host,
+        port=port,
+        schemas=schemas if schemas else None,
+        model_paths=model_paths if model_paths else None,
+        auto_reload=bool(model_paths),
+        block=True,
+    )
     return 0
+
+
+def _parse_char_ngrams(raw: Optional[str]) -> Optional[List[int]]:
+    if raw is None:
+        return None
+    parts = [p.strip() for p in raw.replace("-", ",").split(",") if p.strip()]
+    if len(parts) != 2:
+        raise ValueError("--char-ngrams must be 'min_n,max_n' (e.g. '3,5')")
+    return [int(parts[0]), int(parts[1])]
+
+
+def _parse_hierarchical(raw: Any) -> Any:
+    if raw is None or isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if s in ("true", "1", "yes"):
+        return True
+    if s in ("false", "0", "no"):
+        return False
+    if s == "auto":
+        return "auto"
+    raise ValueError("--hierarchical must be 'auto', 'true', or 'false'")
+
+
+def _parse_cli_label(session: Any, raw_label: str) -> Any:
+    if len(session.schema.fields) == 1 and isinstance(next(iter(session.schema.fields.values())), ChoiceField):
+        if raw_label.strip().startswith("{"):
+            try:
+                return json.loads(raw_label)
+            except Exception:
+                pass
+        return raw_label
+    try:
+        return json.loads(raw_label)
+    except Exception:
+        return raw_label
 
 
 def handle_teach_command(args: argparse.Namespace) -> int:
@@ -586,7 +653,22 @@ def handle_teach_command(args: argparse.Namespace) -> int:
         if args.qualification and (not args.source or not args.source.strip()):
             raise ValueError("Fresh qualification needs --source to describe the independently collected cohort")
         schema = _load_schema(args.schema) if args.schema else None
-        session = TeachingSession(args.directory, schema, choice_solver=args.choice_solver)
+        char_ngrams = _parse_char_ngrams(getattr(args, "char_ngrams", None))
+        hierarchical = _parse_hierarchical(getattr(args, "hierarchical", None))
+        session = TeachingSession(
+            args.directory,
+            schema,
+            regularization=getattr(args, "regularization", None),
+            max_features=getattr(args, "max_features", None),
+            choice_solver=args.choice_solver,
+            alpha=getattr(args, "alpha", None),
+            selection=getattr(args, "selection", None),
+            char_ngrams=char_ngrams,
+            mondrian=getattr(args, "mondrian", None),
+            familiarity_alpha=getattr(args, "familiarity_alpha", None),
+            prototype_alpha=getattr(args, "prototype_alpha", None),
+            hierarchical=hierarchical,
+        )
         if args.dataset:
             with open(args.dataset, encoding="utf-8") as stream:
                 data = json.load(stream)
@@ -605,7 +687,8 @@ def handle_teach_command(args: argparse.Namespace) -> int:
                     rows.append({**example, "split": split, "source": "file"})
             session.record_many(rows)
         elif args.record is not None:
-            session.record(args.record, args.label, split=args.split or "teach", source="human", group=args.group)
+            parsed_label = _parse_cli_label(session, args.label)
+            session.record(args.record, parsed_label, split=args.split or "teach", source="human", group=args.group)
         elif args.remove is not None:
             session.remove(args.remove)
 
@@ -694,8 +777,12 @@ def handle_teach_command(args: argparse.Namespace) -> int:
     elif args.rollback:
         print(f"Restored approved revision {result['revision']}. Lessons stay available for a new assessment.")
     elif args.predict is not None:
-        print(f"{'Review required' if result['review'] else 'Accepted suggestion'}: {result['values'][session.field_name]}")
-        print(f"Possible choices: {', '.join(result['prediction_set']) or 'none'}")
+        if len(session.schema.fields) == 1:
+            print(f"{'Review required' if result['review'] else 'Accepted suggestion'}: {result['values'][session.field_name]}")
+            print(f"Possible choices: {', '.join(str(x) for x in result['prediction_set']) or 'none'}")
+        else:
+            print(f"{'Review required' if result['review'] else 'Accepted suggestion'}: {json.dumps(result['values'])}")
+            print(f"Possible choices: {json.dumps(result['prediction_set'])}")
         if result["review_reasons"]:
             print(f"Review reasons: {', '.join(result['review_reasons'])}")
         print(f"Approved revision: {result['revision']}")
@@ -780,13 +867,26 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--samples-per-choice", type=int, default=20, help="Number of synthetic samples to generate per choice")
     compile_parser.add_argument("--regularization", type=float, default=1.0, help="Ridge regression L2 regularization lambda")
     compile_parser.add_argument("--choice-solver", choices=("ridge", "logistic"), default="ridge", help="Choice head fitting method (default: ridge)")
+    compile_parser.add_argument("--mondrian", action="store_true", help="Enable class-conditional (Mondrian) conformal calibration")
+    compile_parser.add_argument("--familiarity-alpha", type=float, default=0.0, help="TF-IDF feature familiarity OOD abstention quantile (default: 0.0)")
+    compile_parser.add_argument("--prototype-alpha", type=float, default=0.0, help="Semantic prototype distance OOD abstention quantile (default: 0.0)")
+    compile_parser.add_argument("--hierarchical", nargs="?", const="true", default="auto", help="Coarse-to-fine hierarchical choice routing ('auto', 'true', 'false', or flag for True)")
     compile_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON compilation summary")
     compile_parser.set_defaults(func=handle_compile_command)
 
     teach_parser = subparsers.add_parser("teach", help="Record corrections, check a candidate, and explicitly adopt a local text skill")
     teach_parser.add_argument("directory", help="Local teaching session directory")
-    teach_parser.add_argument("--schema", help="Single-choice schema; required when creating a session")
+    teach_parser.add_argument("--schema", help="DecisionSchema; required when creating a session")
     teach_parser.add_argument("--choice-solver", choices=("ridge", "logistic"), help="Fitting method for a new session (default: ridge); existing settings must match")
+    teach_parser.add_argument("--regularization", type=float, help="L2 regularization for a new session (default: 0.1)")
+    teach_parser.add_argument("--max-features", type=int, help="Maximum TF-IDF features for a new session (default: 1024, max: 8192)")
+    teach_parser.add_argument("--alpha", type=float, help="Conformal significance level alpha for a new session (default: 0.05)")
+    teach_parser.add_argument("--selection", choices=("frequency", "chi2", "mi"), help="TF-IDF term selection strategy for a new session (default: frequency)")
+    teach_parser.add_argument("--char-ngrams", help="Boundary character n-gram range 'min_n,max_n' (e.g. '3,5') for a new session")
+    teach_parser.add_argument("--mondrian", action="store_true", default=None, help="Enable class-conditional (Mondrian) conformal calibration")
+    teach_parser.add_argument("--familiarity-alpha", type=float, help="TF-IDF feature familiarity OOD abstention quantile (default: 0.0)")
+    teach_parser.add_argument("--prototype-alpha", type=float, help="Semantic prototype distance OOD abstention quantile (default: 0.0)")
+    teach_parser.add_argument("--hierarchical", nargs="?", const="true", default=None, help="Coarse-to-fine hierarchical choice routing ('auto', 'true', 'false', or flag for True)")
     teach_action = teach_parser.add_mutually_exclusive_group()
     teach_action.add_argument("--record", metavar="TEXT", help="Record an explicit answer or replace an earlier lesson")
     teach_action.add_argument("--remove", metavar="TEXT", help="Remove a recorded input")
@@ -797,7 +897,7 @@ def build_parser() -> argparse.ArgumentParser:
     teach_action.add_argument("--history", action="store_true", help="List retained approved revisions")
     teach_action.add_argument("--rollback", metavar="REVISION", help="Restore an exact retained approved revision; keep current lessons")
     teach_action.add_argument("--predict", metavar="TEXT", help="Preview an approved-skill suggestion and factual review reasons")
-    teach_parser.add_argument("--label", help="Desired choice for --record")
+    teach_parser.add_argument("--label", help="Desired choice or JSON label for --record")
     teach_parser.add_argument("--split", choices=("teach", "calibrate", "evaluate"), help="Purpose of --record (default: teach)")
     teach_parser.add_argument("--group", help="Related-document group for --record; keep a group within one split")
     teach_parser.add_argument("--min-accuracy", type=float, help="Minimum raw correctness on checking examples (assessment default: 0.8)")

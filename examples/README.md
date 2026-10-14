@@ -15,6 +15,7 @@ The [teaching guide](../docs/guides/training_experts.md) and
 
 | Example | What it demonstrates |
 |---|---|
+| [drop_in/](drop_in/README.md) | 1-line local replacements for **Semantic Router**, **RouteLLM**, **Instructor / BAML**, and **Llama-Prompt-Guard / Guardrails** (`100%` accuracy at `0.81–2.73 ms` P50) |
 | [teach_skill.py](teach_skill.py) | Eight editable lessons; custom lesson file, message and saved path; [beginner walkthrough](../docs/guides/first_skill.md) |
 | [teaching_by_doing/](teaching_by_doing/README.md) | Browser workspace: explicit filing lessons, before/after candidate checks, explicit adoption and portable skills; historical sample failures remain available |
 | [support_triage.py](support_triage.py) | Taught department routing, calibration, saved/reloaded evaluation |

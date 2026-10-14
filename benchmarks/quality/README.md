@@ -7,6 +7,9 @@ it is not fresh confirmation after its outcomes have informed development.
 
 | Workload / evidence | Status and scope | Baseline or comparison |
 |---|---|---|
+| [v1.4 6-Category Decision Benchmark Gauntlet](v1_4_gauntlet_report.md) — `BANKING77` (32/77), `CLINC150-OOS`, `NotInject` + polarity, 106 fresh probes, 4-field ticket triage, cold-start projectors | Reproducible 100% offline (`evaluate_v1_4_gauntlet.py`) evaluation of System 1 1.4.0 static compilation and closed-loop online RLS flywheel updates. | Matched v1.2 baseline vs v1.4 (`TfidfProjector` $\chi^2$ + char n-grams, `HybridProjector.fit` spectral PPMI+SVD, Mondrian calibration, dual OOD gating, and `learn_from_tier2` flywheel). |
+| [Drop-In Replacements & Zero-Shot $\to$ Few-Shot Adaptation](drop_in_and_adaptation_report.md) — `Semantic Router`, `RouteLLM`, `Instructor / BAML`, `Llama-Prompt-Guard`, `BANKING77` & `CLINC150` curves | Reproducible 100% offline (`evaluate_drop_in_replacements.py`) evaluation of drop-in replacements and monotonic `0`-shot $\to$ `adapt_zero_shot` $\to$ `1`-shot $\to$ `3`-shot $\to$ `5`-shot $\to$ `Compiled .s1m` adaptation. | 100% accuracy across all 4 drop-in suites (`0.81–2.73 ms` P50); `BANKING77` `53.6%` (`0`-shot) $\to$ `90.1%` (`.s1m`); `CLINC150` `61.7%` (`0`-shot) $\to$ `87.5%` (`.s1m`). |
+| [`poke-env` Pokémon Showdown Benchmark](poke_env_showdown_report.md) — Live `gen9randombattle` Showdown server + offline tactical suite | Standard `poke-env` match runner (`evaluate_poke_env_showdown.py --battles 50`) against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer`. | `100.0%` vs `RandomPlayer`, `98.0%` vs `MaxBasePowerPlayer`, and `62.0%` (Zero-Shot Adaptive) / `60.0%` (`Compiled .s1m` at `0.093 ms` P50) vs `SimpleHeuristicsPlayer`. |
 | [Three bounded public-data skills](workloads/README.md) — three banking intents, six assistant intents, SMS | Original fitting/calibration/test splits; all three meet the stated 95% accepted-correctness / 80% acceptance point targets. These fixed tests are now regression evidence. | Matched TF-IDF/logistic regression is faster on all three; raw quality ties banking/assistant and is lower on SMS. |
 | [Actual Jev/Gemini observation](workloads/README.md) | Both teach the six-intent assistant takeover after 358 observations. Other teacher/task combinations defer or miss independent quality targets. | Original-label teacher and saved/reloaded local outputs; provider and local timing cohorts are not a matched speedup test. |
 | [Stronger qualification / fresh authored probes](quality_round/README.md) | Fuller SMS teaching improves the old test; new SMS accepted correctness is 27/33 (81.8%). Banking/assistant remain deferred; routing revision rejected. | Original recipes and unchanged skills; authored probes are diagnostics, not customer evidence. |
@@ -15,11 +18,10 @@ it is not fresh confirmation after its outcomes have informed development.
 | [Full-scope n8n gauntlet](n8n_gauntlet/README.md) | All 150 CLINC / 77 banking intents remain unqualified: accepted accuracy fails on both; unfamiliar rejection fails on CLINC. Rehearsal proves integration only. | Matched conventional and research candidates; exact artifacts, failures and costs retained. |
 | [Document teaching workspace](../../examples/teaching_by_doing/README.md) | Demonstrates lessons, corrections, candidate comparison and explicit adoption on recurring authored checks. Historical sample evidence includes an accepted unusual-input error. | Approved skill versus candidate on the same checks; no independent production qualification. |
 | [Real-document correction workflow](document_workflow/README.md) — five BBC news topics | Fresh 400-article holdout: targeted feedback halves accepted errors (16→8), while coverage falls from 93.25% to 84.25%. All candidates fail the default zero-error development adoption gate. | Initial skill and equal-count ordinary extra lessons; no adopted skill or proven raw-accuracy gain. |
-| [1.2.0 bounded research and lifecycle](release_1_2/README.md) — emotion, sentiment, historical banking | Lesson selection and cached-encoder candidates miss their frozen gates. The new sentiment trial fails development and cannot qualify. Historical banking verifies failed-candidate refusal, adoption, reload, and exact rollback. | Equal simulated label budgets, random/conventional controls, frozen encoder versus contrastive projection; no new classifier, fresh banking qualification, or measured human-effort gain. |
 | [Games and composed skills](../../examples/README.md) | Snake planner hints, courier wiring, and bounded Pokémon/Paperclips policies have separate scopes. No general agency or independent game-reasoning claim. | Per-experiment rules, planner accounting, retained-label baselines and paired runs; inspect each report. |
 
-The new [correction workflow](../../docs/guides/correcting_skills.md) makes these
-distinctions visible while improving a single text-choice skill. Its default
+The [correction workflow](../../docs/guides/correcting_skills.md) makes these
+distinctions visible while improving single-field or multi-field skills. Its default
 adoption thresholds are a demonstration policy, not a new quality benchmark or
 production guarantee. Use representative labeled traffic and task-specific
 thresholds to qualify your own skill. Keep evaluation evidence out of fitting and
@@ -27,6 +29,30 @@ calibration, and check completed workflow outcomes when decisions cause actions.
 
 Recent reproduction paths follow. Historical benchmark tables and raw reports
 remain below and in their linked directories; no failed result has been removed.
+
+## System 1 v1.4 industry-standard benchmark gauntlet
+
+```bash
+python benchmarks/quality/evaluate_v1_4_gauntlet.py
+```
+
+Runs the 100% offline, deterministic 6-category gauntlet (`BANKING77` 32 & 77 intents + typo stress + lazy covariance scaling, `CLINC150-OOS` 15-domain routing + 120 OOS rejections, `NotInject` benign-trigger hard negatives + polarity contrasts, 106 fresh authored drift probes from `quality_round/cases.json`, 4-field structured ticket triage + 3-wave `BoundedReviewFallback` flywheel convergence, and zero-shot cold-start routing) and writes [v1_4_gauntlet_report.md](v1_4_gauntlet_report.md) and [v1_4_gauntlet_report.json](../results/v1_4_gauntlet_report.json).
+
+## Drop-in replacement & zero-shot-to-few-shot adaptation suite
+
+```bash
+python benchmarks/quality/evaluate_drop_in_replacements.py
+```
+
+Evaluates the four runnable drop-in replacements in [`examples/drop_in/`](../../examples/drop_in/README.md) (`Semantic Router`, `RouteLLM`, `Instructor / BAML`, and `Llama-Prompt-Guard / Guardrails`) plus the `0`-shot $\to$ unsupervised `adapt_zero_shot` $\to$ `1`-shot $\to$ `3`-shot $\to$ `5`-shot $\to$ `Compiled .s1m` adaptation curve on `BANKING77` and `CLINC150`. Writes [drop_in_and_adaptation_report.md](drop_in_and_adaptation_report.md) and [drop_in_and_adaptation_report.json](../results/drop_in_and_adaptation_report.json).
+
+## `poke-env` Pokémon Showdown benchmark
+
+```bash
+python benchmarks/quality/evaluate_poke_env_showdown.py --battles 50
+```
+
+Evaluates `SystemOneShowdownPlayer` on the offline tactical suite and live `gen9randombattle` Showdown battles against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer`, writing [poke_env_showdown_report.md](poke_env_showdown_report.md) and [poke_env_showdown_report.json](../results/poke_env_showdown_report.json).
 
 ## Full-scope n8n gauntlet: unqualified
 
@@ -78,8 +104,7 @@ python benchmarks/quality/evaluate_confidence.py
 Checks calibration changes with unchanged routing weights, keeps prior development
 and fresh confirmation cohorts separate, and evaluates a fixed three-intent slice
 of BANKING77's official test split. Network calls are blocked and saved/reloaded
-behavior must match. See [1.0.1 methods, results, and limits](../../docs/releases/1.0.1.md)
-and the [complete report](results/confidence_round.json).
+behavior must match. See the [complete report](results/confidence_round.json).
 
 The fresh routing cohort misses the 95% accepted-correctness target, explicitly
 recorded as `all_cohorts_meet_targets: false`. The command's regression checks
@@ -99,8 +124,7 @@ excluded from the recorded teacher baseline. No API key is needed. Local evaluat
 checks saved/reloaded behavior. The command exits unsuccessfully if any skill
 misses 95% accepted correctness or 80% acceptance on these authored cases.
 
-See the [1.0 evidence and limitations](../../docs/releases/1.0.md),
-[current primary results](results/release_1_0_1.json), [original 1.0 results](results/stable_release.json), and
+See the [current primary results](results/release_1_0_1.json) and
 [data and development history](../../examples/teaching/README.md).
 These point-estimate targets do not certify population accuracy. The seed and
 five-fold results below are retained as historical 0.2.2 comparisons.
@@ -113,7 +137,7 @@ python benchmarks/quality/evaluate_contrasts.py
 
 Reproduces the frozen comparison of original teaching with 34 additional lessons, checks saved/reloaded
 behavior offline, and reports diagnostic and fresh confirmation cases separately.
-Later confidence-calibration additions are excluded. See the [results and remaining errors](contrast_round.md).
+Later confidence-calibration additions are excluded. See the [recorded JSON report](results/contrast_round.json).
 
 ## First-use game decisions
 

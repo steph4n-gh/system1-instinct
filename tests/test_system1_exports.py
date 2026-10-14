@@ -17,6 +17,7 @@ ALL_SUBMODULES = [
     "core",
     "embeddings",
     "engine",
+    "fallback",
     "grpc_server",
     "guard",
     "integrations",

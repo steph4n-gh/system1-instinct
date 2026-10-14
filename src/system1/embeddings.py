@@ -8,6 +8,7 @@ from __future__ import annotations
 from system1.core.embeddings import (
     HybridProjector,
     HybridSemanticProjector,
+    StaticEmbeddingTable,
     SubwordSemanticEmbeddings,
 )
 from system1.core.embeddings import *

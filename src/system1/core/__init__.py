@@ -48,6 +48,7 @@ from system1.core.model import (
 from system1.core.embeddings import (
     HybridProjector,
     HybridSemanticProjector,
+    StaticEmbeddingTable,
     SubwordSemanticEmbeddings,
 )
 
@@ -78,6 +79,7 @@ __all__ = [
     "HybridProjector",
     "HybridSemanticProjector",
     "SubwordSemanticEmbeddings",
+    "StaticEmbeddingTable",
     "SystemOneModel",
     "DecisionFieldHead",
     "RawFieldEvaluation",

@@ -1,10 +1,10 @@
 # Mathematical notes: uncertainty, prototype geometry and online correction
 
-**System 1 1.2.0 · 1 October 2026 · Implementation notes, not new theorems**
+**System 1 1.4.0 · 13 October 2026 · Implementation notes, not new theorems**
 
 This note describes the runtime mathematics in
-[System 1 1.2.0](../releases/1.2.0.md) and the assumptions needed to interpret it,
-including the teaching workflow and optional fitting method. The [whitepaper](system1_whitepaper.md) contains the
+**System 1 1.4.0** (see the [v1.4 benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)) and the assumptions needed to interpret it,
+including Mondrian class-conditional calibration, dual OOD familiarity and prototype similarity gating, the teaching workflow, and calibration-preserving online RLS updates. The [whitepaper](system1_whitepaper.md) contains the
 product evaluation; the [architecture reference](../architecture/technical_specification.md)
 maps behavior to code. Earlier claims of guaranteed safe execution, universal
 margin improvement and fixed microsecond update times are withdrawn.
@@ -205,13 +205,41 @@ limit exact equivalence. A positive diagonal alone does not prove positive
 definiteness; rescaling a matrix alone does not improve its condition number.
 No fixed latency, unlimited stability or immunity to forgetting is implied.
 
-The `TeachingSession` workflow introduced in 1.1.0 retains corrected examples and
-recompiles a separate TF-IDF candidate, then recalibrates it on its separate
-calibration records. It does not use the online update formulas above or mutate
-the approved skill during assessment. If online correction is used directly,
-changed weights invalidate their old calibration, in memory and saved artifacts. Strict inference requests review until separate recalibration. A
-teacher label is fallible supervision, so one correction should not be described
-as making every unseen related case correct.
+The `TeachingSession` workflow introduced in 1.1.0 (and expanded to multi-field
+schemas in 1.4.0) retains corrected examples and
+recompiles a separate TF-IDF or `HybridProjector` candidate, then recalibrates it on its separate
+calibration records. It does not mutate
+the approved skill during assessment. When `learn_from_tier2` is called with the
+default `preserve_calibration=False`,
+changed weights invalidate their old calibration in memory and saved artifacts, so strict inference requests review until separate recalibration.
+When `learn_from_tier2(..., preserve_calibration=True)` is used (such as inside
+`BoundedReviewFallback(..., auto_online_update=True)`), System 1 1.4.0 preserves
+existing conformal calibration scores and uses exact Sherman-Morrison directional
+gain scaling $y_{\text{step}} = ((\lambda_f + g) y_{\text{desired}} - \lambda_f W_t x) / g$
+(with $g = x^T P_t x$) so that only the target class and competing positive runner-up
+logits are adjusted while non-competing classes remain unperturbed. Even so, a
+teacher label is fallible supervision, and online updates do not re-establish
+formal split-conformal exchangeability; periodic batch recompilation on retained
+lessons remains recommended.
+
+### Mondrian class-conditional calibration and dual OOD gating in 1.4.0
+
+In System 1 1.4.0, `ConformalPredictor(mondrian=True)` partitions the calibration
+fold by true class $c\in\{1,\ldots,K\}$ and computes per-class quantiles
+$q_c = s_{c,(\lceil (n_c + 1)(1 - \alpha)\rceil)}$ (falling back to the marginal
+quantile when $n_c < 3$). Candidate label $y$ is included in $C(x)$ iff
+$s(x, y) \le q_y$, preventing majority classes from starving minority classes on
+imbalanced workloads (`sms_triage`). Additionally, two orthogonal OOD gates can
+escalate unfamiliar inputs before conformal singleton acceptance:
+
+1. **Feature familiarity gate** (`familiarity_alpha > 0`): Escalates with
+   `abstention_reason="low_feature_familiarity"` when known vocabulary mass
+   falls below the empirical $\alpha_{\text{fam}}$ calibration quantile.
+2. **Prototype cosine similarity gate** (`prototype_alpha > 0`): Computes
+   unit-normalized class centroids $\mu_c$ during compilation and escalates with
+   `abstention_reason="low_prototype_similarity"` when
+   $\max_c \langle \hat{x}, \mu_c \rangle$ falls below the empirical
+   $\alpha_{\text{proto}}$ calibration quantile.
 
 The compiler's optional logistic choice fit instead minimizes summed
 cross-entropy plus $\lambda\|W\|_F^2/2$, with an unpenalized bias, using SciPy

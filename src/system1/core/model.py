@@ -19,6 +19,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
 import numpy as np
 
+from system1.core.embeddings import (
+    _ANCHOR_STOPWORDS,
+    _stem_word,
+    match_semantic_concepts,
+)
 from system1.core.schema import (
     BooleanField,
     ChoiceField,
@@ -49,6 +54,12 @@ class DeterministicSemanticProjector:
             raise ValueError(f"dimension must be positive, got {dimension}")
         self.dimension = dimension
         self.recency_weighted = bool(recency_weighted)
+        self._digest = hashlib.sha256(
+            f'{{"dimension": {self.dimension}, "recency_weighted": {"true" if self.recency_weighted else "false"}, "type": "deterministic_hash"}}'.encode("utf-8")
+        ).hexdigest()
+
+    def projector_digest(self) -> str:
+        return self._digest
 
     def _hash_to_sparse_vec(self, token: str, weight: float = 1.0) -> np.ndarray:
         """Map a token or n-gram deterministically to a sparse pseudo-random vector."""
@@ -114,6 +125,74 @@ class DeterministicSemanticProjector:
             vec += self._hash_to_sparse_vec(f"char4:{c_ngram}", weight=0.3)
 
         # L2-normalization
+        max_abs = float(np.max(np.abs(vec))) if len(vec) > 0 else 0.0
+        if max_abs < 1e-12 or not np.isfinite(max_abs):
+            v = np.zeros(self.dimension, dtype=np.float32)
+            v[0] = 1.0
+            return v
+        scaled = vec / max_abs
+        norm = float(np.linalg.norm(scaled))
+        if norm < 1e-12:
+            vec_zero = np.zeros(self.dimension, dtype=np.float32)
+            vec_zero[0] = 1.0
+            return vec_zero
+        return (scaled / norm).astype(np.float32)
+
+    def _project_concept_aware(self, text: str) -> np.ndarray:
+        """Project input text with morphological stems, stopword downweighting, and concept anchors for zero-shot exemplar banks."""
+        if not text or not text.strip():
+            v = np.zeros(self.dimension, dtype=np.float32)
+            v[0] = 1.0
+            return v
+
+        clean_text = text.lower().strip()
+        if len(clean_text) > 8192:
+            clean_text = clean_text[:4096] + " " + clean_text[-4096:]
+        words = re.findall(r"\b\w+\b", clean_text)
+        n_words = len(words)
+        vec = np.zeros(self.dimension, dtype=np.float32)
+
+        stems: List[str] = []
+        for pos, word in enumerate(words):
+            word_weight = math.log1p(len(word)) / math.sqrt(1.0 + pos * 0.05)
+            if word in _ANCHOR_STOPWORDS:
+                stems.append(word)
+                vec += self._hash_to_sparse_vec(f"word:{word}", weight=word_weight * 0.35)
+                continue
+
+            vec += self._hash_to_sparse_vec(f"word:{word}", weight=word_weight * 2.0)
+            stem = _stem_word(word)
+            stems.append(stem)
+            if len(stem) >= 3:
+                vec += self._hash_to_sparse_vec(f"stem:{stem}", weight=word_weight * 1.8)
+                if stem != word:
+                    vec += self._hash_to_sparse_vec(f"word:{stem}", weight=word_weight * 1.2)
+
+            if len(word) >= 3:
+                for n in (3, 4):
+                    for j in range(len(word) - n + 1):
+                        ngram = word[j : j + n]
+                        vec += self._hash_to_sparse_vec(f"ng:{ngram}", weight=0.4)
+
+        for i in range(len(words) - 1):
+            bigram = f"{words[i]}_{words[i+1]}"
+            vec += self._hash_to_sparse_vec(f"bi:{bigram}", weight=1.5)
+            if stems[i] not in _ANCHOR_STOPWORDS or stems[i + 1] not in _ANCHOR_STOPWORDS:
+                s_bigram = f"{stems[i]}_{stems[i+1]}"
+                vec += self._hash_to_sparse_vec(f"sbi:{s_bigram}", weight=1.2)
+
+        len_scale = math.sqrt(max(1.0, n_words / 4.0))
+        for c_name, c_score in match_semantic_concepts(clean_text).items():
+            vec += self._hash_to_sparse_vec(
+                f"concept:{c_name}",
+                weight=min(7.5, c_score * 2.1) * len_scale,
+            )
+
+        boundary_text = f" {clean_text} "
+        for j in range(max(0, len(boundary_text) - 4)):
+            c_ngram = boundary_text[j : j + 4]
+            vec += self._hash_to_sparse_vec(f"char4:{c_ngram}", weight=0.18)
+
         max_abs = float(np.max(np.abs(vec))) if len(vec) > 0 else 0.0
         if max_abs < 1e-12 or not np.isfinite(max_abs):
             v = np.zeros(self.dimension, dtype=np.float32)
@@ -223,7 +302,105 @@ class DecisionFieldHead:
         self.covariance_inv: Optional[np.ndarray] = None
         self.cross_covariance: Optional[np.ndarray] = None
         self.regularization: float = 1.0
+        self.hierarchical: bool = False
+        self.cluster_assignments: Tuple[int, ...] = ()
+        self.coarse_weights: Optional[np.ndarray] = None
+        self.coarse_biases: Optional[np.ndarray] = None
+        self.fine_weights: Optional[np.ndarray] = None
+        self.fine_biases: Optional[np.ndarray] = None
+        self._exemplar_bank: Optional[Tuple[np.ndarray, List[np.ndarray]]] = None
+        self._exemplar_mean: Optional[np.ndarray] = None
+        self._exemplar_projector: Optional[DeterministicSemanticProjector] = None
+        self._initial_weights: Optional[np.ndarray] = None
+        self._online_shots_p: Optional[List[List[np.ndarray]]] = None
+        self._online_shots_c: Optional[List[List[np.ndarray]]] = None
         self._init_head()
+
+    def _build_concept_aware_exemplar_bank(self) -> None:
+        """Constructs the concept-aware prototype and sub-prototype bank for a ChoiceField."""
+        if not isinstance(self.field_def, ChoiceField):
+            return
+        num_options = len(self.field_def.options)
+        if num_options <= 1:
+            return
+        ex_proj = DeterministicSemanticProjector(dimension=self.dimension)
+        self._exemplar_projector = ex_proj
+        stem_opt_df: Dict[str, set[int]] = {}
+        for idx, opt in enumerate(self.field_def.options):
+            desc = self.field_def.descriptions.get(opt, "")
+            clean_opt = opt.replace("_", " ").replace("-", " ")
+            texts_k = (
+                list(desc)
+                if isinstance(desc, (list, tuple)) and len(desc) > 0
+                else [
+                    s.strip()
+                    for s in re.split(r"[;,]", str(desc) if desc else clean_opt)
+                    if s.strip()
+                ]
+            )
+            for t_str in texts_k:
+                for w in re.findall(r"\b\w+\b", str(t_str).lower()):
+                    if w not in _ANCHOR_STOPWORDS and len(w) >= 2:
+                        st = _stem_word(w)
+                        stem_opt_df.setdefault(st, set()).add(idx)
+        shared_thresh = max(2, (num_options + 1) // 2)
+        shared_stems = {s for s, opts in stem_opt_df.items() if len(opts) >= shared_thresh}
+
+        W_cons = np.zeros((num_options, self.dimension), dtype=np.float32)
+        raw_sub_banks: List[np.ndarray] = []
+        for idx, opt in enumerate(self.field_def.options):
+            desc = self.field_def.descriptions.get(opt, "")
+            clean_opt = opt.replace("_", " ").replace("-", " ")
+            texts_k = (
+                list(desc)
+                if isinstance(desc, (list, tuple)) and len(desc) > 0
+                else [
+                    s.strip()
+                    for s in re.split(r"[;,]", str(desc) if desc else clean_opt)
+                    if s.strip()
+                ]
+            )
+            filtered_clauses: List[str] = []
+            sub_vecs: List[np.ndarray] = []
+            for ex in texts_k:
+                ex_str = str(ex).strip()
+                if not ex_str:
+                    continue
+                ex_words = re.findall(r"\b\w+\b", ex_str.lower())
+                uniq_words = [
+                    w
+                    for w in ex_words
+                    if w not in _ANCHOR_STOPWORDS and _stem_word(w) not in shared_stems
+                ]
+                clause_text = " ".join(uniq_words) if len(uniq_words) >= 2 else ex_str
+                filtered_clauses.append(clause_text)
+                v_sub = ex_proj._project_concept_aware(clause_text)
+                n_sub = float(np.linalg.norm(v_sub))
+                sub_vecs.append(v_sub / (n_sub if n_sub > 1e-12 else 1.0))
+
+            cons_text = " ".join(filtered_clauses).strip() or clean_opt
+            v_cons = ex_proj._project_concept_aware(cons_text)
+            n_cons = float(np.linalg.norm(v_cons))
+            W_cons[idx] = v_cons / (n_cons if n_cons > 1e-12 else 1.0)
+            if sub_vecs:
+                raw_sub_banks.append(np.stack(sub_vecs, axis=0).astype(np.float32))
+            else:
+                raw_sub_banks.append(W_cons[idx : idx + 1].copy())
+
+        mu_cons = np.mean(W_cons, axis=0, keepdims=True)
+        W_cons_c = W_cons - mu_cons
+        norms_c = np.linalg.norm(W_cons_c, axis=1, keepdims=True)
+        norms_c = np.where(norms_c < 1e-12, 1.0, norms_c)
+        W_cons_norm = (W_cons_c / norms_c).astype(np.float32)
+
+        centered_sub_banks: List[np.ndarray] = []
+        for bank in raw_sub_banks:
+            b_c = bank - mu_cons
+            b_norms = np.linalg.norm(b_c, axis=1, keepdims=True)
+            b_norms = np.where(b_norms < 1e-12, 1.0, b_norms)
+            centered_sub_banks.append((b_c / b_norms).astype(np.float32))
+        self._exemplar_mean = mu_cons.flatten().astype(np.float32)
+        self._exemplar_bank = (W_cons_norm, centered_sub_banks)
 
     def _init_head(self) -> None:
         if self.projector is None:
@@ -233,10 +410,12 @@ class DecisionFieldHead:
         if isinstance(self.field_def, ChoiceField):
             num_options = len(self.field_def.options)
             W = np.zeros((num_options, self.dimension), dtype=np.float32)
+            has_multi_exemplars = False
             for idx, opt in enumerate(self.field_def.options):
                 desc = self.field_def.descriptions.get(opt, "")
                 clean_opt = opt.replace("_", " ").replace("-", " ")
                 if isinstance(desc, (list, tuple)) and len(desc) > 0:
+                    has_multi_exemplars = True
                     ex_vecs = []
                     for ex in desc:
                         ex_text = str(ex).strip()
@@ -259,6 +438,18 @@ class DecisionFieldHead:
                     norm_v = float(np.linalg.norm(v))
                     W[idx] = v / (norm_v if norm_v > 1e-12 else 1.0)
 
+            has_delimited_exemplar_lists = (
+                len(self.field_def.descriptions) == num_options
+                and all(
+                    isinstance(self.field_def.descriptions.get(opt, ""), str)
+                    and (
+                        ";" in str(self.field_def.descriptions.get(opt, ""))
+                        or str(self.field_def.descriptions.get(opt, "")).count(",") >= 3
+                    )
+                    for opt in self.field_def.options
+                )
+            )
+
             # Contrastive centering and whitening across choices
             if self.contrastive_whitening and num_options > 1:
                 mu = np.mean(W, axis=0, keepdims=True)
@@ -266,11 +457,15 @@ class DecisionFieldHead:
                 norms = np.linalg.norm(W_centered, axis=1, keepdims=True)
                 norms = np.where(norms < 1e-12, 1.0, norms)
                 self.weights = (W_centered / norms).astype(np.float32)
+
+                if has_multi_exemplars or has_delimited_exemplar_lists or num_options > 8:
+                    self._build_concept_aware_exemplar_bank()
             else:
                 norms = np.linalg.norm(W, axis=1, keepdims=True)
                 norms = np.where(norms < 1e-12, 1.0, norms)
                 self.weights = (W / norms).astype(np.float32)
 
+            self._initial_weights = self.weights.copy()
             self.biases = np.zeros(num_options, dtype=np.float32)
 
         elif isinstance(self.field_def, BooleanField):
@@ -345,8 +540,19 @@ class DecisionFieldHead:
             self.mx_weights = mx.array(self.weights)
             self.mx_biases = mx.array(self.biases)
 
-    def set_weights(self, weights: np.ndarray, biases: Optional[np.ndarray] = None) -> None:
+    def set_weights(
+        self,
+        weights: np.ndarray,
+        biases: Optional[np.ndarray] = None,
+        *,
+        clear_exemplar_bank: bool = True,
+    ) -> None:
         """Updates head weights and biases, synchronizing MLX buffers if active."""
+        if clear_exemplar_bank:
+            self._exemplar_bank = None
+            self._exemplar_mean = None
+            self._online_shots_p = None
+            self._online_shots_c = None
         self.weights = np.asarray(weights, dtype=np.float32)
         if biases is not None:
             self.biases = np.asarray(biases, dtype=np.float32)
@@ -355,6 +561,34 @@ class DecisionFieldHead:
         if self.backend == "mlx" and HAS_MLX and mx is not None:
             self.mx_weights = mx.array(self.weights)
             self.mx_biases = mx.array(self.biases)
+
+    def set_hierarchical_weights(
+        self,
+        *,
+        cluster_assignments: Sequence[int],
+        coarse_weights: np.ndarray,
+        coarse_biases: np.ndarray,
+        fine_weights: Optional[np.ndarray] = None,
+        fine_biases: Optional[np.ndarray] = None,
+    ) -> None:
+        """Configures two-stage coarse-to-fine hierarchical routing parameters."""
+        cw = np.asarray(coarse_weights, dtype=np.float32)
+        cb = np.asarray(coarse_biases, dtype=np.float32).flatten()
+        assign = tuple(int(c) for c in cluster_assignments)
+        if cw.ndim != 2 or cb.shape[0] != cw.shape[0]:
+            raise ValueError("coarse_weights and coarse_biases shape mismatch")
+        if any(c < 0 or c >= cw.shape[0] for c in assign):
+            raise ValueError("cluster_assignments contains out-of-bounds cluster index")
+        self.hierarchical = True
+        self.cluster_assignments = assign
+        self.coarse_weights = cw
+        self.coarse_biases = cb
+        self.fine_weights = (
+            np.asarray(fine_weights, dtype=np.float32) if fine_weights is not None else None
+        )
+        self.fine_biases = (
+            np.asarray(fine_biases, dtype=np.float32).flatten() if fine_biases is not None else None
+        )
 
     def init_covariance(
         self,
@@ -416,11 +650,259 @@ class DecisionFieldHead:
             return y
         return np.asarray(target_value, dtype=np.float32)
 
+    def _update_exemplar_bank_entry(
+        self,
+        emb_feat: np.ndarray,
+        target_k: int,
+        prompt: Optional[str] = None,
+        *,
+        blend_rate: float = 0.28,
+        attenuate_competitors: bool = True,
+    ) -> None:
+        """Updates the live multi-exemplar sub-prototype bank for ChoiceField class target_k."""
+        if not isinstance(self.field_def, ChoiceField) or self.hierarchical:
+            return
+        K = self.weights.shape[0]
+        D = self.dimension
+        if target_k < 0 or target_k >= K:
+            return
+        if self._exemplar_bank is None:
+            return
+        if prompt is not None and self._exemplar_projector is not None:
+            c_vec = self._exemplar_projector._project_concept_aware(prompt)
+            if self._exemplar_mean is not None and len(self._exemplar_mean) == D:
+                c_vec = (c_vec - self._exemplar_mean).astype(np.float32)
+            c_norm = float(np.linalg.norm(c_vec))
+            if c_norm <= 1e-12:
+                return
+            c_full = (c_vec / c_norm).astype(np.float32)
+            # Boost novel co-occurring vocabulary not already present in the initial description of target_k
+            opt_name = self.field_def.options[target_k]
+            desc_k = self.field_def.descriptions.get(opt_name, "")
+            txts_k = desc_k if isinstance(desc_k, (list, tuple)) else [str(desc_k), opt_name.replace("_", " ")]
+            known_stems_k = {
+                _stem_word(w)
+                for t in txts_k
+                for w in re.findall(r"\b\w+\b", str(t).lower())
+            }
+            words = re.findall(r"\b\w+\b", prompt.lower())
+            novel_words = [
+                w
+                for w in words
+                if w not in _ANCHOR_STOPWORDS and _stem_word(w) not in known_stems_k
+            ]
+            if novel_words and len(novel_words) < len(words):
+                c_nov_raw = self._exemplar_projector._project_concept_aware(" ".join(novel_words))
+                if self._exemplar_mean is not None and len(self._exemplar_mean) == D:
+                    c_nov_raw = (c_nov_raw - self._exemplar_mean).astype(np.float32)
+                cn_norm = float(np.linalg.norm(c_nov_raw))
+                if cn_norm > 1e-12:
+                    c_nov = (c_nov_raw / cn_norm).astype(np.float32)
+                    c_mix = 0.45 * c_full + 0.55 * c_nov
+                    cm_norm = float(np.linalg.norm(c_mix))
+                    c_unit = (c_mix / (cm_norm if cm_norm > 1e-12 else 1.0)).astype(np.float32)
+                else:
+                    c_unit = c_full
+            else:
+                c_unit = c_full
+        else:
+            c_vec = np.asarray(emb_feat, dtype=np.float32).flatten()[:D].copy()
+            if self._exemplar_mean is not None and len(self._exemplar_mean) == D:
+                c_vec = (c_vec - self._exemplar_mean).astype(np.float32)
+            c_norm = float(np.linalg.norm(c_vec))
+            if c_norm <= 1e-12:
+                return
+            c_unit = (c_vec / c_norm).astype(np.float32)
+
+        w_cons, sub_banks = self._exemplar_bank
+        w_cons_new = w_cons.copy()
+        w_blend = (1.0 - blend_rate) * w_cons_new[target_k] + blend_rate * c_unit
+        wb_norm = float(np.linalg.norm(w_blend))
+        if wb_norm > 1e-12:
+            w_cons_new[target_k] = (w_blend / wb_norm).astype(np.float32)
+
+        sim_w_thresh = 0.35 if K > 8 else 0.15
+        sim_b_thresh = 0.42 if K > 8 else 0.20
+
+        new_sub_banks = list(sub_banks)
+        for k_idx in range(K):
+            if k_idx == target_k:
+                bank_k = new_sub_banks[k_idx]
+                if bank_k.size > 0:
+                    updated_bank = np.vstack([bank_k[-63:], c_unit.reshape(1, -1)]).astype(np.float32)
+                else:
+                    updated_bank = c_unit.reshape(1, -1).astype(np.float32)
+                new_sub_banks[k_idx] = updated_bank
+            elif attenuate_competitors:
+                sim_w = float(w_cons_new[k_idx] @ c_unit)
+                if sim_w > sim_w_thresh:
+                    w_orth = w_cons_new[k_idx] - 0.35 * sim_w * c_unit
+                    wo_norm = float(np.linalg.norm(w_orth))
+                    if wo_norm > 1e-12:
+                        w_cons_new[k_idx] = (w_orth / wo_norm).astype(np.float32)
+                bank_k = new_sub_banks[k_idx]
+                if bank_k.size > 0:
+                    sims_b = bank_k @ c_unit
+                    mask_high = sims_b > sim_b_thresh
+                    if np.any(mask_high):
+                        b_mod = bank_k.copy()
+                        b_mod[mask_high] = b_mod[mask_high] - 0.45 * np.outer(sims_b[mask_high], c_unit)
+                        b_norms = np.linalg.norm(b_mod, axis=1, keepdims=True)
+                        b_norms = np.where(b_norms < 1e-12, 1.0, b_norms)
+                        new_sub_banks[k_idx] = (b_mod / b_norms).astype(np.float32)
+        self._exemplar_bank = (w_cons_new, new_sub_banks)
+
+    def adapt_zero_shot(
+        self,
+        embeddings: np.ndarray,
+        prompts: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        margin_threshold: float = 0.18,
+        learning_rate: float = 0.25,
+    ) -> Dict[str, Any]:
+        """Unsupervised test-time zero-shot prototype and exemplar adaptation.
+
+        Refines class prototypes and appends high-margin domain exemplars from
+        unlabeled inputs whose zero-shot probability margin exceeds ``margin_threshold``,
+        bridging co-occurring domain vocabulary without requiring teacher calls.
+        """
+        embs = np.asarray(embeddings, dtype=np.float32)
+        if embs.ndim == 1:
+            embs = embs.reshape(1, -1)
+        if embs.size == 0 or not isinstance(self.field_def, ChoiceField):
+            return {"adapted_samples": 0, "class_counts": {}}
+
+        prompt_list: Optional[List[str]] = None
+        if isinstance(prompts, str):
+            prompt_list = [prompts]
+        elif prompts is not None:
+            prompt_list = [str(p) for p in prompts]
+
+        # Ensure _exemplar_bank exists on non-hierarchical ChoiceField in proper concept-aware space
+        if self._exemplar_bank is None and not self.hierarchical:
+            if isinstance(self.projector, DeterministicSemanticProjector):
+                self._build_concept_aware_exemplar_bank()
+            else:
+                K_init = self.weights.shape[0]
+                w_init = self.weights.copy()
+                b_init = [self.weights[idx : idx + 1].copy() for idx in range(K_init)]
+                self._exemplar_bank = (w_init, b_init)
+
+        raw_logits = self.compute_logits(embs, prompts=prompts)
+        if raw_logits.ndim == 1:
+            raw_logits = raw_logits.reshape(1, -1)
+        probs = _stable_softmax(raw_logits / 0.25, temperature=1.0)
+        N, K = probs.shape
+        if K < 2:
+            return {"adapted_samples": 0, "class_counts": {}}
+
+        # High-cardinality multi-class orthogonal subspace adaptation (K > 8)
+        if K > 8 and prompt_list is not None and len(prompt_list) == N and self._exemplar_projector is not None:
+            logits_sorted = np.sort(raw_logits, axis=1)
+            logit_margins = logits_sorted[:, -1] - logits_sorted[:, -2]
+            preds = np.argmax(raw_logits, axis=1)
+            shots_p: List[List[np.ndarray]] = [[] for _ in range(K)]
+            shots_c: List[List[np.ndarray]] = [[] for _ in range(K)]
+            class_counts: Dict[str, int] = {}
+            adapted_samples = 0
+            m_th = 0.10
+            top_m = 3
+            for k_idx in range(K):
+                idxs = [
+                    i
+                    for i in range(N)
+                    if int(preds[i]) == k_idx and float(logit_margins[i]) >= m_th
+                ]
+                idxs.sort(key=lambda i: float(logit_margins[i]), reverse=True)
+                selected = idxs[:top_m]
+                if selected:
+                    opt_name = self.field_def.options[k_idx]
+                    class_counts[opt_name] = len(selected)
+                    adapted_samples += len(selected)
+                    for i in selected:
+                        vp = embs[i]
+                        np_n = float(np.linalg.norm(vp))
+                        if np_n > 1e-12:
+                            shots_p[k_idx].append((vp / np_n).astype(np.float32))
+                        vc = self._exemplar_projector._project_concept_aware(prompt_list[i])
+                        nc_n = float(np.linalg.norm(vc))
+                        if nc_n > 1e-12:
+                            shots_c[k_idx].append((vc / nc_n).astype(np.float32))
+            if adapted_samples > 0 and (
+                self._online_shots_p is None or getattr(self, "_online_shots_are_pseudo", False)
+            ):
+                self._online_shots_p = shots_p
+                self._online_shots_c = shots_c
+                self._online_shots_are_pseudo = True
+            return {"adapted_samples": adapted_samples, "class_counts": class_counts}
+
+        mu_bg = np.mean(self.weights, axis=0)
+        if N >= 4:
+            valid_embs = [embs[i] for i in range(N) if float(np.linalg.norm(embs[i])) > 1e-12]
+            if len(valid_embs) >= 4:
+                mu_bg = (0.70 * mu_bg + 0.30 * np.mean(valid_embs, axis=0)).astype(np.float32)
+
+        class_vecs: Dict[int, List[np.ndarray]] = {}
+        class_weights_map: Dict[int, List[float]] = {}
+        class_counts = {}
+        adapted_samples = 0
+
+        for i in range(N):
+            emb_i = embs[i]
+            if float(np.linalg.norm(emb_i)) <= 1e-12:
+                continue
+            p_i = probs[i]
+            sorted_p = np.sort(p_i)
+            margin = float(sorted_p[-1] - sorted_p[-2])
+            if margin < margin_threshold:
+                continue
+            k_best = int(np.argmax(p_i))
+            conf_w = float(
+                min(1.0, (margin - margin_threshold) / max(0.1, 1.0 - margin_threshold) + 0.35)
+            )
+            u_i = emb_i - mu_bg
+            u_norm = float(np.linalg.norm(u_i))
+            if u_norm > 1e-12:
+                u_unit = (u_i / u_norm).astype(np.float32)
+                class_vecs.setdefault(k_best, []).append(u_unit)
+                class_weights_map.setdefault(k_best, []).append(conf_w)
+                opt_name = self.field_def.options[k_best]
+                class_counts[opt_name] = class_counts.get(opt_name, 0) + 1
+                adapted_samples += 1
+                p_str = prompt_list[i] if (prompt_list is not None and i < len(prompt_list)) else None
+                self._update_exemplar_bank_entry(
+                    emb_i,
+                    k_best,
+                    prompt=p_str,
+                    blend_rate=float(min(0.35, learning_rate * conf_w)),
+                    attenuate_competitors=False,
+                )
+
+        if adapted_samples > 0:
+            new_W = self.weights.copy()
+            for k_idx, vecs in class_vecs.items():
+                ws = np.asarray(class_weights_map[k_idx], dtype=np.float32).reshape(-1, 1)
+                pseudo_proto = np.sum(np.stack(vecs, axis=0) * ws, axis=0) / max(1e-6, float(np.sum(ws)))
+                p_norm = float(np.linalg.norm(pseudo_proto))
+                if p_norm > 1e-12:
+                    pseudo_unit = (pseudo_proto / p_norm).astype(np.float32)
+                    eff_lr = float(min(0.45, learning_rate * min(1.5, 0.7 + 0.15 * len(vecs))))
+                    w_blended = (1.0 - eff_lr) * new_W[k_idx] + eff_lr * pseudo_unit
+                    wb_norm = float(np.linalg.norm(w_blended))
+                    if wb_norm > 1e-12:
+                        new_W[k_idx] = (w_blended / wb_norm).astype(np.float32)
+            self.set_weights(new_W, self.biases, clear_exemplar_bank=False)
+
+        return {"adapted_samples": adapted_samples, "class_counts": class_counts}
+
     def online_update(
         self,
         x_aug: np.ndarray,
         y_target: np.ndarray,
         forgetting_factor: Optional[float] = None,
+        *,
+        prompt: Optional[str] = None,
+        preserve_calibration: bool = False,
     ) -> float:
         r"""Closed-form rank-1 Sherman-Morrison update with exponential forgetting factor.
 
@@ -459,9 +941,45 @@ class DecisionFieldHead:
         if len(y) != K:
             raise ValueError(f"Expected target vector y of length {K}, got {len(y)}")
 
-        # v = P @ x_aug (shape: D+1,)
-        v = P @ x
-        denom = float(lam_f + x @ v)
+        x_step = x
+        y_step = y
+        if not preserve_calibration and isinstance(self.field_def, ChoiceField) and K > 8:
+            pos_max = float(np.max(y))
+            if pos_max > 0.0:
+                neg_balanced = -pos_max / float(max(1, K - 1))
+                y_step = np.where(y > 0.0, y, neg_balanced).astype(np.float32)
+        if preserve_calibration and float(np.linalg.norm(x[:D])) > 1e-12:
+            x_step = np.append(x[:D], 0.0).astype(np.float32)
+            v_dir = P @ x_step
+            g = float(x_step @ v_dir)
+            if g > 1e-12:
+                z0 = (self.weights @ x[:D] + self.biases).astype(np.float64)
+                b0 = self.biases.astype(np.float64)
+                z_desired = z0.copy()
+                if isinstance(self.field_def, ChoiceField) and K >= 2:
+                    t_idx = int(np.argmax(y))
+                    comp_max = float(np.max([z0[i] for i in range(K) if i != t_idx]))
+                    for i in range(K):
+                        if i != t_idx and z0[i] > 0.15:
+                            z_desired[i] = 0.05
+                    comp_after = float(np.max([z_desired[i] for i in range(K) if i != t_idx]))
+                    z_desired[t_idx] = max(float(z0[t_idx]), comp_after + 1.25, 1.25)
+                elif isinstance(self.field_def, BooleanField):
+                    sign = 1.0 if float(y[0]) >= 0.0 else -1.0
+                    z_desired[0] = sign * max(abs(float(z0[0])), 1.25)
+                elif isinstance(self.field_def, MultiChoiceField):
+                    for i in range(K):
+                        sign = 1.0 if float(y[i]) >= 0.0 else -1.0
+                        z_desired[i] = sign * max(abs(float(z0[i])), 0.90)
+                elif isinstance(self.field_def, ScoreField):
+                    z_desired[0] = float(y[0])
+                y_des = z_desired - b0
+                z_curr_dir = z0 - b0
+                y_step = (((lam_f + g) * y_des - lam_f * z_curr_dir) / g).astype(np.float32)
+
+        # v = P @ x_step (shape: D+1,)
+        v = P @ x_step
+        denom = float(lam_f + x_step @ v)
         if denom <= 1e-12 or not math.isfinite(denom):
             # Degenerate input or numerical singularity: preserve internal state
             return (time.perf_counter() - t0) * 1000.0
@@ -472,7 +990,7 @@ class DecisionFieldHead:
         P_next = 0.5 * (P_next + P_next.T)
 
         # Cross-covariance update: B_{t+1} = lam_f * B_t + x y^T
-        B_next = (lam_f * B) + np.outer(x, y)
+        B_next = (lam_f * B) + np.outer(x_step, y_step)
 
         # Covariance bounding: prevent covariance windup along unexcited subspace directions
         p_max = float(50.0 / max(1e-4, self.regularization))
@@ -490,10 +1008,74 @@ class DecisionFieldHead:
         new_W = W_aug[:, :D].astype(np.float32)
         new_b = W_aug[:, D].astype(np.float32)
 
-        # Atomic commit
+        # Update live cold-start exemplar bank if active
+        if not self.hierarchical and isinstance(self.field_def, ChoiceField):
+            if self._exemplar_bank is not None:
+                target_k = int(np.argmax(y))
+                if 0 <= target_k < K and float(y[target_k]) > 0.0:
+                    if K <= 8:
+                        self._update_exemplar_bank_entry(
+                            x[:D],
+                            target_k,
+                            prompt=prompt,
+                            blend_rate=0.35 if preserve_calibration else 0.28,
+                            attenuate_competitors=True,
+                        )
+                    elif isinstance(self.projector, DeterministicSemanticProjector):
+                        if self._online_shots_p is None or getattr(self, "_online_shots_are_pseudo", False):
+                            self._online_shots_p = [[] for _ in range(K)]
+                            self._online_shots_c = [[] for _ in range(K)]
+                            self._online_shots_are_pseudo = False
+                        xp = x[:D].copy()
+                        np_norm = float(np.linalg.norm(xp))
+                        if np_norm > 1e-12:
+                            self._online_shots_p[target_k].append((xp / np_norm).astype(np.float32))
+                        if prompt is not None and self._exemplar_projector is not None:
+                            xc = self._exemplar_projector._project_concept_aware(prompt)
+                            nc_norm = float(np.linalg.norm(xc))
+                            if nc_norm > 1e-12:
+                                self._online_shots_c[target_k].append((xc / nc_norm).astype(np.float32))
+
+        # Also update coarse cluster router and fine cluster specialist weights if hierarchical routing is active
+        if (
+            self.hierarchical
+            and self.coarse_weights is not None
+            and self.coarse_biases is not None
+            and len(self.cluster_assignments) == K
+        ):
+            target_k = int(np.argmax(y))
+            if 0 <= target_k < K and float(y[target_k]) > 0.0:
+                target_c = self.cluster_assignments[target_k]
+                if 0 <= target_c < self.coarse_weights.shape[0]:
+                    x_feat = x[:D]
+                    c_logits = self.coarse_weights @ x_feat + self.coarse_biases
+                    err_c = np.zeros_like(c_logits)
+                    if c_logits[target_c] < 1.2:
+                        err_c[target_c] = 1.2 - c_logits[target_c]
+                    for c_idx in range(len(c_logits)):
+                        if c_idx != target_c and c_logits[c_idx] > 0.1:
+                            err_c[c_idx] = -0.1 - c_logits[c_idx]
+                    step = float(min(0.35, 1.0 / max(1.0, float(x_feat @ x_feat))))
+                    self.coarse_weights = (self.coarse_weights + step * np.outer(err_c, x_feat)).astype(np.float32)
+                    if (
+                        self.fine_weights is not None
+                        and self.fine_biases is not None
+                        and self.fine_weights.shape == (K, D)
+                        and self.fine_biases.shape == (K,)
+                    ):
+                        f_logits = self.fine_weights @ x_feat + self.fine_biases
+                        err_f = np.zeros_like(f_logits)
+                        if f_logits[target_k] < 1.5:
+                            err_f[target_k] = 1.5 - f_logits[target_k]
+                        for k_idx in range(K):
+                            if k_idx != target_k and f_logits[k_idx] > 0.1:
+                                err_f[k_idx] = -0.1 - f_logits[k_idx]
+                        self.fine_weights = (self.fine_weights + step * np.outer(err_f, x_feat)).astype(np.float32)
+
+        # Atomic commit (preserve _exemplar_bank across online updates)
         self.covariance_inv = P_next.astype(np.float32)
         self.cross_covariance = B_next.astype(np.float32)
-        self.set_weights(new_W, new_b)
+        self.set_weights(new_W, new_b, clear_exemplar_bank=False)
         return (time.perf_counter() - t0) * 1000.0
 
     def evaluate_logits(self, logits: np.ndarray) -> RawFieldEvaluation:
@@ -566,20 +1148,110 @@ class DecisionFieldHead:
 
         raise TypeError(f"Unknown field type: {self.field_def}")
 
-    def forward(self, embedding: np.ndarray) -> RawFieldEvaluation:
-        """Projects dense embedding into logits and raw probabilities."""
+    def compute_logits(
+        self,
+        embedding: np.ndarray,
+        prompts: Optional[Union[str, Sequence[str]]] = None,
+    ) -> np.ndarray:
+        """Compute raw logits (including two-stage coarse-to-fine routing when active)."""
         emb = np.asarray(embedding, dtype=np.float32)
-        if emb.ndim == 1:
+        single = emb.ndim == 1
+        if single:
             emb = emb.reshape(1, -1)
 
-        if self.backend == "mlx" and HAS_MLX and mx is not None and self.mx_weights is not None:
+        if (
+            self.backend == "mlx"
+            and HAS_MLX
+            and mx is not None
+            and self.mx_weights is not None
+            and not self.hierarchical
+            and self._exemplar_bank is None
+        ):
             mx_emb = mx.array(emb)
             mx_logits = mx.matmul(mx_emb, mx.transpose(self.mx_weights)) + self.mx_biases
             mx.eval(mx_logits)
-            logits = np.array(mx_logits).flatten()
+            logits = np.array(mx_logits)
         else:
-            logits = (emb @ self.weights.T + self.biases).flatten()
+            logits = emb @ self.weights.T + self.biases
+            if self._exemplar_bank is not None and not self.hierarchical:
+                w_cons, sub_banks = self._exemplar_bank
+                if prompts is not None and self._exemplar_projector is not None:
+                    if isinstance(prompts, str):
+                        c_emb = self._exemplar_projector._project_concept_aware(prompts).reshape(1, -1)
+                    else:
+                        c_emb = np.stack(
+                            [self._exemplar_projector._project_concept_aware(str(p)) for p in prompts],
+                            axis=0,
+                        ).astype(np.float32)
+                else:
+                    c_emb = emb
+                cons_logits = c_emb @ w_cons.T
+                max_ex = np.zeros_like(logits)
+                for k, bank in enumerate(sub_banks):
+                    if bank.size > 0:
+                        max_ex[:, k] = np.max(c_emb @ bank.T, axis=1)
+                w0_logits = (
+                    emb @ self._initial_weights.T
+                    if self._online_shots_p is not None and self._initial_weights is not None
+                    else logits
+                )
+                base_logits = (0.20 * w0_logits + 0.40 * cons_logits + 0.60 * max_ex).astype(np.float32)
+                if self._online_shots_p is not None and self.weights.shape[0] > 8:
+                    K_cls = self.weights.shape[0]
+                    D_dim = self.dimension
+                    all_p = [v for k in range(K_cls) for v in self._online_shots_p[k]]
+                    all_c = (
+                        [v for k in range(K_cls) for v in self._online_shots_c[k]]
+                        if self._online_shots_c is not None
+                        else []
+                    )
+                    if all_p:
+                        mu_p = np.mean(all_p, axis=0)
+                        mu_c = np.mean(all_c, axis=0) if all_c else np.zeros(D_dim, dtype=np.float32)
+                        W_shot_p = np.zeros((K_cls, D_dim), dtype=np.float32)
+                        W_shot_c = np.zeros((K_cls, D_dim), dtype=np.float32)
+                        for k in range(K_cls):
+                            if self._online_shots_p[k]:
+                                cp = np.mean(self._online_shots_p[k], axis=0) - mu_p
+                                np_n = float(np.linalg.norm(cp))
+                                if np_n > 1e-12:
+                                    W_shot_p[k] = (cp / np_n).astype(np.float32)
+                            if self._online_shots_c is not None and self._online_shots_c[k]:
+                                cc = np.mean(self._online_shots_c[k], axis=0) - mu_c
+                                nc_n = float(np.linalg.norm(cc))
+                                if nc_n > 1e-12:
+                                    W_shot_c[k] = (cc / nc_n).astype(np.float32)
+                        shot_logits = 0.55 * (emb @ W_shot_p.T) + 0.45 * (c_emb @ W_shot_c.T)
+                        avg_shots = float(len(all_p)) / float(max(1, K_cls))
+                        alpha = min(0.65, 0.28 * avg_shots / (1.0 + 0.25 * avg_shots))
+                        base_logits = ((1.0 - alpha) * base_logits + alpha * shot_logits).astype(np.float32)
+                logits = base_logits
+            elif (
+                self.hierarchical
+                and self.coarse_weights is not None
+                and self.coarse_biases is not None
+                and len(self.cluster_assignments) == self.weights.shape[0]
+            ):
+                coarse_logits = emb @ self.coarse_weights.T + self.coarse_biases
+                coarse_probs = _stable_softmax(coarse_logits / 0.25, temperature=1.0)
+                assign = np.asarray(self.cluster_assignments, dtype=np.int64)
+                mapped_coarse = coarse_logits[:, assign]
+                mapped_probs = coarse_probs[:, assign]
+                if self.fine_weights is not None and self.fine_biases is not None:
+                    spec_logits = emb @ self.fine_weights.T + self.fine_biases
+                    logits = (
+                        0.65 * logits
+                        + (0.20 + 0.30 * mapped_probs) * spec_logits
+                        + 0.20 * mapped_coarse
+                    ).astype(np.float32)
+                else:
+                    logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
 
+        return logits.flatten() if single else logits
+
+    def forward(self, embedding: np.ndarray, prompt: Optional[str] = None) -> RawFieldEvaluation:
+        """Projects dense embedding into logits and raw probabilities."""
+        logits = self.compute_logits(embedding, prompts=prompt)
         return self.evaluate_logits(logits)
 
 
@@ -725,8 +1397,9 @@ class SystemOneModel:
             emb = self.encode(prompt, telemetry=telemetry, recency_weighted=use_recency)
 
         field_results: Dict[str, RawFieldEvaluation] = {}
+        prompt_for_head = prompt if embedding is None else None
         for name, head in self.heads.items():
-            field_results[name] = head.forward(emb)
+            field_results[name] = head.forward(emb, prompt=prompt_for_head)
 
         elapsed_ms = (time.perf_counter() - start_t) * 1000.0
         return ModelInferenceResult(
@@ -759,6 +1432,7 @@ class SystemOneModel:
         embedding: Optional[np.ndarray] = None,
         forgetting_factor: Optional[float] = None,
         recency_weighted: Optional[bool] = None,
+        preserve_calibration: bool = False,
     ) -> Dict[str, Any]:
         """Closed-form rank-1 Sherman-Morrison online update on the metal (<0.1ms)."""
         with self._lock:
@@ -778,12 +1452,19 @@ class SystemOneModel:
 
             updated_fields: List[str] = []
             update_durations_ms: List[float] = []
+            prompt_for_head = prompt if (isinstance(prompt, str) and prompt.strip()) else None
 
             for f_name, target_val in target_dict.items():
                 if f_name in self.heads:
                     head = self.heads[f_name]
                     y_target = head.format_target_vector(target_val)
-                    dt = head.online_update(x_aug, y_target, forgetting_factor=forgetting_factor)
+                    dt = head.online_update(
+                        x_aug,
+                        y_target,
+                        forgetting_factor=forgetting_factor,
+                        prompt=prompt_for_head,
+                        preserve_calibration=preserve_calibration,
+                    )
                     update_durations_ms.append(dt)
                     updated_fields.append(f_name)
 
@@ -795,6 +1476,48 @@ class SystemOneModel:
                 "update_latency_ms": round(rank1_ms, 4),
                 "total_latency_ms": round(total_ms, 4),
                 "updated_fields": updated_fields,
+            }
+
+    def adapt_zero_shot(
+        self,
+        prompts: Union[str, Sequence[str]],
+        *,
+        telemetry: Optional[Sequence[Any]] = None,
+        margin_threshold: float = 0.18,
+        learning_rate: float = 0.25,
+        recency_weighted: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """Unsupervised test-time zero-shot prototype and exemplar adaptation across schema heads."""
+        with self._lock:
+            t0 = time.perf_counter()
+            if isinstance(prompts, str):
+                prompt_seq: Sequence[str] = [prompts]
+            else:
+                prompt_seq = list(prompts)
+            if len(prompt_seq) == 0:
+                return {"status": "no_op", "adapted_fields": {}, "adapted_samples": 0, "latency_ms": 0.0}
+
+            embs = self.encode_batch(prompt_seq, telemetry=telemetry, recency_weighted=recency_weighted)
+            adapted_fields: Dict[str, Any] = {}
+            total_adapted = 0
+            for f_name, head in self.heads.items():
+                if hasattr(head, "adapt_zero_shot"):
+                    info = head.adapt_zero_shot(
+                        embs,
+                        prompts=prompt_seq,
+                        margin_threshold=margin_threshold,
+                        learning_rate=learning_rate,
+                    )
+                    if info.get("adapted_samples", 0) > 0:
+                        adapted_fields[f_name] = info
+                        total_adapted = max(total_adapted, int(info["adapted_samples"]))
+
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            return {
+                "status": "adapted" if adapted_fields else "no_op",
+                "adapted_fields": adapted_fields,
+                "adapted_samples": total_adapted,
+                "latency_ms": round(elapsed_ms, 4),
             }
 
     # Cognitive dual-process and execution pipeline aliases
@@ -820,18 +1543,8 @@ class SystemOneModel:
         embs = self.encode_batch(prompts, telemetry=telemetry, recency_weighted=use_recency)
 
         head_logits: Dict[str, np.ndarray] = {}
-        if self.backend == "mlx" and HAS_MLX and mx is not None:
-            mx_embs = mx.array(embs)
-            for name, head in self.heads.items():
-                if head.mx_weights is not None:
-                    mx_out = mx.matmul(mx_embs, mx.transpose(head.mx_weights)) + head.mx_biases
-                    mx.eval(mx_out)
-                    head_logits[name] = np.array(mx_out)
-                else:
-                    head_logits[name] = embs @ head.weights.T + head.biases
-        else:
-            for name, head in self.heads.items():
-                head_logits[name] = embs @ head.weights.T + head.biases
+        for name, head in self.heads.items():
+            head_logits[name] = head.compute_logits(embs, prompts=prompts)
 
         total_elapsed_ms = (time.perf_counter() - start_t) * 1000.0
         per_sample_latency = total_elapsed_ms / len(prompts)

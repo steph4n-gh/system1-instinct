@@ -1,6 +1,6 @@
 # Gaming demonstrations and their limits
 
-Current scope for **System 1 1.2.0**. The legacy filename is retained for links;
+Current scope for **System 1 1.4.0**. The legacy filename is retained for links;
 this project has no independently verified speedrun world record or #1 ladder
 result. These examples explore game rules, local decisions, observation loops
 and optional emulator/browser integrations.
@@ -11,7 +11,8 @@ The [frozen first-use evaluation](../benchmarks/quality/zero_shot/README.md)
 checks 24 Pokémon and 12 Paperclips immediate decisions with teaching and network
 access disabled. Explicit game rules improve the former from 6/24 to 24/24 and
 the latter from 8/12 to 12/12. The raw Pokémon model suggestion remains 6/24;
-the raw routing control remains 8/12. These are small authored regression cases,
+with v1.4 sibling-contrastive multi-exemplar cold-start projection, the raw routing
+control reaches 12/12 (up from 8/12 in 1.2.0). These are small authored regression cases,
 not evidence of learned long-term strategy or game completion.
 
 Pokémon ranks currently legal moves by immediate damage and heals at low HP when

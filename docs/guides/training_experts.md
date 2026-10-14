@@ -4,12 +4,13 @@ If you are new to labeling examples or correcting a skill, start with
 [Teach your first skill](first_skill.md). It explains those terms using a copyable
 message-and-answer file. This page covers the underlying API and data contracts.
 
-For a text classifier with one `ChoiceField`, System 1 1.1.0 adds the
-[correction workflow](correcting_skills.md): retain lessons, assess a separate
+For single-field and multi-field schemas (`ChoiceField`, `BooleanField`,
+`MultiChoiceField`, `ScoreField`), System 1 provides the
+[correction workflow](correcting_skills.md) (`TeachingSession`): retain lessons, assess a separate
 candidate, compare it with the approved skill, and adopt explicitly. It wraps the
 existing compiler and strict engine without changing their APIs or saved format.
-This page remains the reference for lower-level compilation, multiple fields,
-numerical telemetry and other output types.
+This page remains the reference for lower-level compilation, custom projectors,
+and continuous numerical telemetry.
 
 System 1 learns a particular decision from labeled examples, saves it as a small
 `.s1m` file, and applies it locally. A person, an existing system, or a reasoning
@@ -89,13 +90,27 @@ not a language model. Both teaching and inference use only NumPy.
 from system1 import TfidfProjector
 
 # Fit the vocabulary ONLY on the examples reserved for teaching.
-projector = TfidfProjector.fit([text for text, label in examples["team"]])
+# In 1.4.0, you can optionally pass selection="chi2", labels=[...], and char_ngrams=(3, 5)
+# for supervised feature selection and character n-gram typo resilience, or use
+# HybridProjector.fit(...) to combine chi2 TF-IDF with a spectral PPMI+SVD dense subspace.
+projector = TfidfProjector.fit(
+    [text for text, label in examples["team"]],
+    selection="chi2",
+    labels=[label for text, label in examples["team"]],
+    char_ngrams=(3, 5),
+)
 calibration = {"team": [
     ("Please correct my invoice total", "billing"),
     ("The application crashes during startup", "support"),
     # Supply enough separate, representative examples for useful calibration.
 ]}
-skill = SystemOneCompiler(SupportRoute, projector=projector).compile(
+skill = SystemOneCompiler(
+    SupportRoute,
+    projector=projector,
+    mondrian=True,
+    familiarity_alpha=0.05,
+    prototype_alpha=0.05,
+).compile(
     examples, augment=False, calibration_exemplars=calibration,
 )
 skill.save("support-route.s1m")
@@ -246,15 +261,21 @@ and compile again. Recheck with separate calibration and evaluation examples.
 Saving the revised skill uses the same runtime. Version 1.0 writes format v2
 and reads older v1 skills; older runtimes must be upgraded before reading v2.
 
-Online correction methods invalidate the changed heads' calibration in memory
-and in saved artifacts. Strict mode then requires review until recalibration.
+By default (`preserve_calibration=False`), online correction methods invalidate
+the changed heads' calibration in memory and in saved artifacts so strict mode
+requires review until recalibration. Passing `preserve_calibration=True` to
+`learn_from_tier2` (or enabling `auto_online_update=True` on `BoundedReviewFallback`)
+applies exact Sherman-Morrison directional gain scaling to preserve calibration
+quantiles during online boundary adaptation.
 
-For one text-choice field, `TeachingSession` retains those examples and compiles
+`TeachingSession` retains examples across single-field or multi-field schemas
+(`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`) and compiles
 a separate candidate. Its report compares raw accuracy, coverage, accepted
 errors and regressions on the same recurring checks. `adopt()` requires a passing
 report and unchanged candidate, data and current skill. The
 [walkthrough](correcting_skills.md) covers defaults and their evidence limits.
-For other schemas, retain your examples and recompile with this lower-level API.
+For continuous telemetry or custom compilation pipelines, retain your examples
+and recompile with this lower-level API.
 
 The broader [expert examples](../../examples/train_expert.py) explore synthetic
 bootstrapping, online updates, and composition. They are optional. Teaching one

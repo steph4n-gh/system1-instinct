@@ -5,21 +5,22 @@ together. **Correct a lesson → build a candidate → compare answers → expli
 adopt.** Editing a lesson or assessing a candidate does not replace the skill
 already serving your application.
 
-This additive workflow is available in **System 1 1.1.0 and newer**:
+This additive workflow is available in **System 1 1.1.0 and newer** (current release **1.4.0**):
 
 ```bash
-python -m pip install 'system1>=1.2.0'
+python -m pip install 'system1>=1.4.0'
 ```
 
-The first supported workflow is text classification with one
-`ChoiceField` with ambiguity escalation enabled (the schema default). A field
-that disables escalation is rejected because the session requires review of
-uncertain answers. Existing compiler and engine APIs, numerical algorithms, and
-`.s1m` format remain unchanged; no additional dependency is required. Existing
-hashed skills remain readable. The helper's TF-IDF skills need a 1.1.0-or-newer
-reader. This helper uses the existing TF-IDF projector with at most 1,024 features,
-ridge regularization
-0.1, and strict decisions at `alpha=0.05`. These choices are confined to the helper;
+`TeachingSession` supports both single-field text classification (`ChoiceField`,
+`BooleanField`, `MultiChoiceField`, `ScoreField`) and multi-field structured
+extraction schemas (where at least one field has ambiguity escalation enabled,
+the schema default). A schema that disables escalation on all fields is rejected
+because the session requires review of uncertain answers. Existing compiler and
+engine APIs, numerical algorithms, and `.s1m` format remain unchanged; no
+additional dependency is required. Existing hashed skills remain readable. The
+helper's TF-IDF skills need a 1.1.0-or-newer reader. This helper uses the
+existing TF-IDF projector with at most 1,024 features, ridge regularization
+0.1, and strict decisions at `alpha=0.05` (with optional `selection="chi2"`, `char_ngrams`, `mondrian=True`, `familiarity_alpha`, `prototype_alpha`, `hierarchical` routing, and `split="auto"` stratified routing in 1.4.0). These choices are confined to the helper;
 the compiler's existing defaults remain unchanged.
 
 For the experimental visual version, use a repository checkout and run
@@ -225,9 +226,12 @@ After reviewing a passing assessment:
 system1 teach .system1/support-session --adopt --json
 ```
 
-For existing lower-level compilation, numerical telemetry, multiple fields, or
-other output types, continue using the [teaching API guide](training_experts.md).
-The session helper deliberately starts with one text-choice task.
+For multi-field schemas (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and
+`ScoreField`), pass a mapping of field values to `session.record(text, {"field_a": ..., "field_b": ...}, split="auto")`
+or attach the session to `BoundedReviewFallback(teaching_session=session, review_fn=..., auto_record_lessons=True, auto_online_update=True)`
+to automatically record teacher-reviewed boundary decisions and apply sub-millisecond
+online updates. For lower-level compilation or continuous numerical telemetry, see the
+[teaching API guide](training_experts.md).
 
 For a measured real-document example, see the
 [BBC correction-workflow experiment](../../benchmarks/quality/document_workflow/README.md).

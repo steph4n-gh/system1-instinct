@@ -1,22 +1,21 @@
-# System 1 documentation
+# System 1: Instinct documentation
 
-Current stable runtime: **1.2.0**. Source documentation reviewed 1 October 2026.
+Current stable runtime: **1.4.0**. Source documentation reviewed 14 October 2026.
 System 1 is not an LLM. Start with one journey: **choose a decision → show
-examples → check a candidate → adopt → correct and compare**. A person or a running
-teacher can supply the examples.
-The [1.2.0 release notes](releases/1.2.0.md) identify the packaged lifecycle changes
-and compatibility requirements.
-Experimental labs and full research evidence remain in the repository; their
-availability does not establish production qualification. [CHANGELOG](../CHANGELOG.md)
-tracks later development separately.
+examples (or start zero-shot) → check a candidate → adopt → correct and compare**.
+A person or a running teacher can supply the examples, `adapt_zero_shot(...)` can
+adapt prototypes from unlabeled live traffic, and `BoundedReviewFallback` can close
+the loop by escalating uncertain boundary cases to a reviewer and updating the
+local skill. See the [CHANGELOG](../CHANGELOG.md) for current 1.4.0 capabilities.
 
 ## Use the product
 
 | Start here | Purpose |
 |---|---|
 | [README quickstart](../README.md#quickstart) | Install System 1 and run a complete taught skill |
+| [Drop-In Replacements](../examples/drop_in/README.md) | 1-line local replacements for Semantic Router, RouteLLM, Instructor / BAML, and Llama-Prompt-Guard / Guardrails |
 | [Your first skill](guides/first_skill.md) | What an example means, an editable lesson file, corrections and readiness |
-| [Correct, compare, and adopt](guides/correcting_skills.md) | Retain lessons, inspect before/after answers, and explicitly adopt a passing candidate; single-choice text workflow introduced in 1.1.0 |
+| [Correct, compare, and adopt](guides/correcting_skills.md) | Retain lessons across single- and multi-field schemas, inspect before/after answers, and explicitly adopt a passing candidate |
 | [Teach by doing](../examples/teaching_by_doing/README.md) | Use the same candidate/adoption flow by filing fictional documents |
 | [Teaching guide](guides/training_experts.md) | Label formats, separate evidence, compilation and corrections |
 | [Teacher observation](typesafe.md) | Callback contract, actual Jev/Gemini evidence, promotion and reuse |
@@ -35,28 +34,21 @@ tracks later development separately.
 | [Technical brief](paper/system1_technical_brief.md) | Short product and evidence overview |
 | [Whitepaper](paper/system1_whitepaper.md) | Current design, measurements and limitations |
 | [Mathematical notes](paper/conformal_gating.md) | Established results and their assumptions |
+| [v1.4 benchmark gauntlet report](../benchmarks/quality/v1_4_gauntlet_report.md) | Six-category offline evaluation of v1.2 baseline vs. v1.4 static vs. v1.4 closed-loop flywheel |
+| [Drop-in & adaptation curve report](../benchmarks/quality/drop_in_and_adaptation_report.md) | Drop-in replacement benchmarks + `0`-shot $\to$ `adapt_zero_shot` $\to$ `1`-shot $\to$ `3`-shot $\to$ `5`-shot $\to$ `Compiled .s1m` on `BANKING77` & `CLINC150` |
+| [`poke-env` Showdown benchmark report](../benchmarks/quality/poke_env_showdown_report.md) | Live `gen9randombattle` Showdown benchmark against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer` |
 | [Workload and evidence index](../benchmarks/quality/README.md) | One overview of task scope, held-out or reused evidence, baselines, successes and failed targets |
 | [Real-document workflow test](../benchmarks/quality/document_workflow/README.md) | BBC topic routing: fewer accepted mistakes with more review; every candidate rejected by default adoption gates |
 | [Teaching examples](../examples/teaching/README.md) | Authored lessons, current counts and historical development |
 | [Benchmark index](../benchmarks/README.md) | Separate quality, throughput and historical runners |
 | [Research and integration examples](../examples/README.md) | Inbox Zero, n8n, games and composition labs, with each experiment's limits |
 
-The quality index links the public-data, teacher, email, BBC workflow, n8n and
-game reports. Research remains available without being a prerequisite for teaching
-one useful skill.
+The quality index links the v1.4 gauntlet, drop-in & adaptation curves, Pokémon
+Showdown benchmark, public-data, teacher, email, BBC workflow, n8n and game reports.
+Research remains available without being a prerequisite for teaching one useful skill.
 
 The papers are maintainer-authored documentation, not peer-reviewed publications.
 Quality claims must identify the task, evidence split and acceptance rule. Local
 computation, acceptance without review and correctness are separate measurements.
-Do not compare unlike timing cohorts as a measured speedup.
-
-## Release and review history
-
-[1.2.0 qualification and recovery release](releases/1.2.0.md) · [1.1.0 teaching workflow release](releases/1.1.0.md) · [1.0.3 security release](releases/1.0.3.md) · [1.0.2 release report](releases/1.0.2.md) · [1.0.1 release report](releases/1.0.1.md) · [1.0 release and migration](releases/1.0.md) ·
-[completed stabilization checklist](stable-release-checklist.md) ·
-[historical launch review](launch-review.md) · [historical example review](examples-review.md).
-
-Historical reports and raw response/result files are retained as evidence of
-what ran then. They are not rewritten to match later improvements. Current guides
-link to the appropriate snapshot and disclose failed targets. See
+Do not compare unlike timing cohorts as a measured speedup. See
 [contributing](../CONTRIBUTING.md) for the documentation check and release procedure.

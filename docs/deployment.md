@@ -1,9 +1,11 @@
 # Deployment boundaries and release limitations
 
-System 1 1.2.0 supports NumPy teaching, calibration, local decisions, portable
-skills, observation/cutover and explicit policy/audit paths. It adds retained
-teaching sessions with candidate assessment and explicit adoption. See the
-[current release evidence](releases/1.2.0.md) and
+System 1 1.4.0 supports NumPy teaching, calibration, local decisions, portable
+skills, observation/cutover, closed-loop boundary fallback (`BoundedReviewFallback`),
+and explicit policy/audit paths. It includes retained multi-field teaching sessions
+with candidate assessment, dual-gate OOD abstention, and explicit adoption. See the
+[v1.4 benchmark gauntlet](../benchmarks/quality/v1_4_gauntlet_report.md),
+[changelog](../CHANGELOG.md) and
 [workload evidence index](../benchmarks/quality/README.md). Experimental labs and
 successful workflow checks do not establish production quality for their tasks.
 Current papers describe these same boundaries; earlier release reports retain

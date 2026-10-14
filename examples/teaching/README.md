@@ -37,7 +37,7 @@ system1 decide "Inspect the local source files" --model .system1/examples/agent_
 
 The current files include six additional routing lessons and 28 operation lessons
 for close distinctions. They are marked `quality_round` and are locally authored.
-The [contrast comparison](../../benchmarks/quality/contrast_round.md) keeps their
+The [contrast comparison](../../benchmarks/quality/results/contrast_round.json) keeps their
 fresh evaluation separate from teaching and records the remaining errors. Support
 teaching is unchanged. The later confidence round adds 60 routing calibration
 cases marked `2026-09-confidence`; the historical contrast comparison excludes
@@ -45,7 +45,7 @@ those rows to preserve its original results. No new APIs or settings are needed.
 
 The banking example uses externally labeled public queries, with all selected
 official test rows kept separate. See its [source and license](BANKING77.md).
-The [1.0.1 evidence](../../docs/releases/1.0.1.md) reports current calibration and
+The [confidence report](../../benchmarks/quality/results/confidence_round.json) reports current calibration and
 banking results, including the harder routing cohort that misses the 95% target.
 
 The agent example additionally demonstrates an explicit permission rule: a local
@@ -159,7 +159,7 @@ proves that second path: 357 teacher observations, default-gate promotion, then
 
 The comparison runs offline by default and is checked in CI. `--refresh-teacher`
 collects only missing responses using `TYPESAFE_API_KEY` and makes billable HTTP
-calls. See the [release evidence](../../docs/releases/1.0.md) for methods and limits.
+calls. See the [workload evidence](../../benchmarks/quality/workloads/README.md) for methods and limits.
 
 ## Data separation and development history
 

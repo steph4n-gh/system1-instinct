@@ -1,0 +1,226 @@
+{
+  "version": "1.4.0",
+  "offline_tactical_suite": {
+    "num_states": 10,
+    "zero_shot_canonical_accuracy": 1.0,
+    "zero_shot_unseen_jargon_accuracy": 0.2,
+    "adapted_zero_shot_canonical_accuracy": 1.0,
+    "adapted_zero_shot_unseen_jargon_accuracy": 1.0,
+    "one_shot_online_jargon_accuracy": 1.0,
+    "compiled_s1m_canonical_accuracy": 1.0,
+    "adapted_samples": 10,
+    "zero_shot_p50_latency_ms": 1.628,
+    "compiled_p50_latency_ms": 1.23,
+    "s1m_size_bytes": 159317
+  },
+  "live_showdown_gauntlet": {
+    "battle_format": "gen9randombattle",
+    "n_battles_per_matchup": 50,
+    "matchups": [
+      {
+        "mode": "zero_shot",
+        "mode_label": "System 1 Zero-Shot (0 Examples)",
+        "opponent": "RandomPlayer",
+        "battle_format": "gen9randombattle",
+        "n_battles": 50,
+        "wins": 50,
+        "losses": 0,
+        "ties": 0,
+        "win_rate": 1.0,
+        "total_turns_decided": 1036,
+        "p50_decision_latency_ms": 3.177,
+        "p95_decision_latency_ms": 3.658,
+        "online_adaptations": 0,
+        "wall_time_s": 4.72,
+        "tactic_distribution": {
+          "super_effective_strike": 325,
+          "setup_or_hazard_control": 6,
+          "priority_or_tempo_strike": 675,
+          "defensive_switch": 29,
+          "status_or_recovery": 1
+        }
+      },
+      {
+        "mode": "zero_shot",
+        "mode_label": "System 1 Zero-Shot (0 Examples)",
+        "opponent": "MaxBasePowerPlayer",
+        "battle_format": "gen9randombattle",
+        "n_battles": 50,
+        "wins": 49,
+        "losses": 1,
+        "ties": 0,
+        "win_rate": 0.98,
+        "total_turns_decided": 829,
+        "p50_decision_latency_ms": 3.217,
+        "p95_decision_latency_ms": 4.122,
+        "online_adaptations": 0,
+        "wall_time_s": 3.37,
+        "tactic_distribution": {
+          "setup_or_hazard_control": 13,
+          "priority_or_tempo_strike": 510,
+          "super_effective_strike": 265,
+          "defensive_switch": 16,
+          "status_or_recovery": 25
+        }
+      },
+      {
+        "mode": "zero_shot",
+        "mode_label": "System 1 Zero-Shot (0 Examples)",
+        "opponent": "SimpleHeuristicsPlayer",
+        "battle_format": "gen9randombattle",
+        "n_battles": 50,
+        "wins": 21,
+        "losses": 29,
+        "ties": 0,
+        "win_rate": 0.42,
+        "total_turns_decided": 863,
+        "p50_decision_latency_ms": 3.22,
+        "p95_decision_latency_ms": 3.777,
+        "online_adaptations": 0,
+        "wall_time_s": 3.37,
+        "tactic_distribution": {
+          "super_effective_strike": 252,
+          "priority_or_tempo_strike": 551,
+          "defensive_switch": 23,
+          "setup_or_hazard_control": 17,
+          "status_or_recovery": 20
+        }
+      },
+      {
+        "mode": "zero_shot_adaptive",
+        "mode_label": "System 1 Zero-Shot Adaptive (Online)",
+        "opponent": "RandomPlayer",
+        "battle_format": "gen9randombattle",
+        "n_battles": 50,
+        "wins": 50,
+        "losses": 0,
+        "ties": 0,
+        "win_rate": 1.0,
+        "total_turns_decided": 1051,
+        "p50_decision_latency_ms": 3.166,
+        "p95_decision_latency_ms": 3.65,
+        "online_adaptations": 5,
+        "wall_time_s": 3.92,
+        "tactic_distribution": {
+          "super_effective_strike": 325,
+          "priority_or_tempo_strike": 697,
+          "defensive_switch": 21,
+          "setup_or_hazard_control": 7,
+          "status_or_recovery": 1
+        }
+      },
+      {
+        "mode": "zero_shot_adaptive",
+        "mode_label": "System 1 Zero-Shot Adaptive (Online)",
+        "opponent": "MaxBasePowerPlayer",
+        "battle_format": "gen9randombattle",
+        "n_battles": 50,
+        "wins": 46,
+        "losses": 4,
+        "ties": 0,
+        "win_rate": 0.92,
+        "total_turns_decided": 831,
+        "p50_decision_latency_ms": 3.201,
+        "p95_decision_latency_ms": 3.683,
+        "online_adaptations": 4,
+        "wall_time_s": 3.18,
+        "tactic_distribution": {
+          "super_effective_strike": 313,
+          "priority_or_tempo_strike": 500,
+          "defensive_switch": 11,
+          "setup_or_hazard_control": 7
+        }
+      },
+      {
+        "mode": "zero_shot_adaptive",
+        "mode_label": "System 1 Zero-Shot Adaptive (Online)",
+        "opponent": "SimpleHeuristicsPlayer",
+        "battle_format": "gen9randombattle",
+        "n_battles": 50,
+        "wins": 31,
+        "losses": 19,
+        "ties": 0,
+        "win_rate": 0.62,
+        "total_turns_decided": 867,
+        "p50_decision_latency_ms": 3.238,
+        "p95_decision_latency_ms": 3.713,
+        "online_adaptations": 4,
+        "wall_time_s": 3.37,
+        "tactic_distribution": {
+          "priority_or_tempo_strike": 513,
+          "super_effective_strike": 311,
+          "defensive_switch": 20,
+          "setup_or_hazard_control": 23
+        }
+      },
+      {
+        "mode": "compiled_s1m",
+        "mode_label": "System 1 Compiled (.s1m)",
+        "opponent": "RandomPlayer",
+        "battle_format": "gen9randombattle",
+        "n_battles": 50,
+        "wins": 49,
+        "losses": 1,
+        "ties": 0,
+        "win_rate": 0.98,
+        "total_turns_decided": 1148,
+        "p50_decision_latency_ms": 0.097,
+        "p95_decision_latency_ms": 0.181,
+        "online_adaptations": 0,
+        "wall_time_s": 0.86,
+        "tactic_distribution": {
+          "priority_or_tempo_strike": 736,
+          "super_effective_strike": 368,
+          "setup_or_hazard_control": 11,
+          "defensive_switch": 22,
+          "status_or_recovery": 11
+        }
+      },
+      {
+        "mode": "compiled_s1m",
+        "mode_label": "System 1 Compiled (.s1m)",
+        "opponent": "MaxBasePowerPlayer",
+        "battle_format": "gen9randombattle",
+        "n_battles": 50,
+        "wins": 41,
+        "losses": 9,
+        "ties": 0,
+        "win_rate": 0.82,
+        "total_turns_decided": 874,
+        "p50_decision_latency_ms": 0.09,
+        "p95_decision_latency_ms": 0.147,
+        "online_adaptations": 0,
+        "wall_time_s": 0.59,
+        "tactic_distribution": {
+          "super_effective_strike": 294,
+          "priority_or_tempo_strike": 544,
+          "setup_or_hazard_control": 16,
+          "defensive_switch": 15,
+          "status_or_recovery": 5
+        }
+      },
+      {
+        "mode": "compiled_s1m",
+        "mode_label": "System 1 Compiled (.s1m)",
+        "opponent": "SimpleHeuristicsPlayer",
+        "battle_format": "gen9randombattle",
+        "n_battles": 50,
+        "wins": 30,
+        "losses": 20,
+        "ties": 0,
+        "win_rate": 0.6,
+        "total_turns_decided": 869,
+        "p50_decision_latency_ms": 0.093,
+        "p95_decision_latency_ms": 0.147,
+        "online_adaptations": 0,
+        "wall_time_s": 0.61,
+        "tactic_distribution": {
+          "super_effective_strike": 312,
+          "priority_or_tempo_strike": 517,
+          "defensive_switch": 13,
+          "setup_or_hazard_control": 27
+        }
+      }
+    ]
+  }
+}

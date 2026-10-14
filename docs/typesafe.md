@@ -85,9 +85,12 @@ blocks the adapter's own HTTP transport, not arbitrary callback code.
 
 `Client(mode="auto_cutover", model_path="queue.s1m")` reopens the validated skill
 without a teacher or API key. The questions must match its complete saved schema.
-The file restores built-in deterministic/hybrid projectors and their settings,
+The file restores built-in deterministic, TF-IDF and hybrid projectors and their settings,
 weights, temperature, conformal scores, and the adapter's evaluated strict-mode
-setting. A mismatched projector or schema raises an error. External projectors
+setting. In System 1 1.4.0, `Choice(criteria=...)` also accepts a list or tuple
+of example strings per option (or semicolon-separated phrases), which are
+compiled into sibling-contrastive multi-exemplar sub-prototypes for zero-shot
+cold-start routing before teacher cutover. A mismatched projector or schema raises an error. External projectors
 must be supplied explicitly; implement `projector_digest()` to validate their
 configuration. Older files without projector metadata retain legacy loading
 behavior and cannot verify the original feature space.
@@ -160,12 +163,12 @@ Pydantic model contract.
 
 | Surface | Behavior |
 |---|---|
-| `Client`, `AsyncClient` | Sync/async context managers, `close()` / `aclose()`, `systemone`, constructor model default and request override. |
+| `Client`, `AsyncClient` | Sync/async context managers, `close()` / `aclose()`, `systemone`, constructor model default and request override, optional `background_compile=True`, `wait_for_compilation()`, and `export_teaching_session()`. |
 | Structured `state` | Strings, JSON objects and arrays. Canonical JSON text supplies local features; HTTP preserves the original JSON value. |
 | Questions | `Choice`, `Noul`, `NoulCriteria`, ordinal `Score`; mappings and objects exposing `model_dump()` also work. JSON-valued descriptions/instructions are retained on the wire. |
 | Responses | `.answers`, `.choices`, `.nouls`, `.scores`, nested attribute access and token usage. Responses are mutable dicts, not the SDK's immutable Pydantic models. |
 | Ordinal `Score` | Two to ten ordered levels; actual per-level probabilities, integer-keyed legend, and probability-weighted mean score. Every level participates in the local head. Observed scalar scores teach the nearest level, so this is not full teacher-distribution distillation. |
-| Local extensions | Explicit-range continuous scores, `MultiChoice`, receipts, uncertainty sets, local batch helpers and portable skills. These are not promises about Jev's HTTP API. |
+| Local extensions | Explicit-range continuous scores, `MultiChoice`, receipts, uncertainty sets, local batch helpers, `background_compile=True` non-blocking candidate compilation, `export_teaching_session()`, and portable skills. These are not promises about Jev's HTTP API. |
 | Unsupported extensions | SDK retry policies, custom HTTP clients/transports, custom headers, extra request bodies, custom response models, and model-management endpoints. Supplied transport/response options raise `NotImplementedError`. |
 
 Local confidence is the local head's probability, not a promise to reproduce
@@ -180,21 +183,27 @@ also requires review. See the
 [conformal prediction procedure](https://arxiv.org/html/2107.07511v6#S2.SS1).
 
 
-## Saved skills and corrections in 1.0
+## Saved skills and corrections in 1.0–1.4
 
 New `.s1m` files use format v2 so older runtimes cannot silently interpret LAC
-scores as APS. System 1 1.0 reads v1 artifacts using their original APS semantics;
+scores as APS. System 1 1.0+ reads v1 artifacts using their original APS semantics;
 0.2.x cannot read v2. Upgrade readers before distributing newly saved skills.
 Invalid versions, schema identity, shapes, and nonfinite weights or temperatures
 are rejected. Keep a copy of the original artifact when migrating.
 
 `engine.calibrate(...)` saves the resulting evidence into the compiled model.
-`learn_from_tier2(...)` invalidates the changed heads' calibration, including in
-saved files. Strict decisions request review until those heads are recalibrated
-on separate examples. Calibration, correction, inference, and serialization of a
+By default (`preserve_calibration=False`), `learn_from_tier2(...)` invalidates the
+changed heads' calibration, including in saved files, so strict decisions request
+review until those heads are recalibrated on separate examples. In System 1 1.4.0,
+`learn_from_tier2(..., preserve_calibration=True)` (also used by
+`BoundedReviewFallback(..., auto_online_update=True)`) applies exact Sherman-Morrison
+directional gain scaling to update the target class margin while preserving existing
+conformal quantiles. You can also export an adapter's observed history into a
+persistent `TeachingSession` workspace via `client.export_teaching_session(path)`.
+Calibration, correction, inference, and serialization of a
 shared compiled model are synchronized. Retaining examples and recompiling is
 the simplest reproducible update workflow.
 
-The [release comparison](releases/1.0.md) separately measures three natural-language
+The [workload comparison](../benchmarks/quality/workloads/README.md) separately measures three natural-language
 skills taught from actual recorded Jev responses. It does not claim all three
 automatically promoted from a live stream or that local confidence equals Jev's.

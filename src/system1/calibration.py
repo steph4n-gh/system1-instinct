@@ -79,6 +79,9 @@ class ConformalPredictionSet:
     relative_odds_ratio_threshold: float = 0.0
     confidence_floor: float = 0.0
     needs_escalation: bool = False
+    abstention_reason: Optional[str] = None
+    prototype_similarity: Optional[float] = None
+    prototype_threshold: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -98,6 +101,9 @@ class ConformalPredictionSet:
             "odds_ratio": self.odds_ratio,
             "relative_odds_ratio_threshold": self.relative_odds_ratio_threshold,
             "confidence_floor": self.confidence_floor,
+            "abstention_reason": self.abstention_reason,
+            "prototype_similarity": self.prototype_similarity,
+            "prototype_threshold": self.prototype_threshold,
         }
 
 
@@ -358,21 +364,39 @@ class ConformalPredictor:
 
     def __init__(
         self,
-        field_name: str,
-        options: Sequence[str],
+        field_name: Union[str, Sequence[str]] = "default",
+        options: Sequence[str] = (),
         margin_threshold: Optional[float] = None,
         *,
         relative_odds_ratio: Optional[float] = 1.5,
         confidence_floor_tau0: Optional[float] = 0.15,
         score_method: str = "aps",
+        mondrian: bool = False,
+        mondrian_shrinkage: float = 10.0,
+        familiarity_threshold: float = 0.0,
+        prototype_threshold: float = 0.0,
+        prototypes: Optional[np.ndarray] = None,
     ) -> None:
         if score_method not in ("aps", "lac"):
             raise ValueError(f"Unknown conformal score method: {score_method!r}")
+        if not isinstance(field_name, str) and not options:
+            options = field_name
+            field_name = "default"
         self.score_method = score_method
-        self.field_name = field_name
+        self.field_name = str(field_name)
         self.options = tuple(options)
         self.option_to_idx = {opt: idx for idx, opt in enumerate(self.options)}
         self.calibration_scores: np.ndarray = np.array([], dtype=np.float64)
+        self.class_calibration_scores: Dict[str, np.ndarray] = {}
+        self.mondrian: bool = bool(mondrian)
+        self.mondrian_shrinkage: float = float(mondrian_shrinkage)
+        self.familiarity_threshold: float = float(familiarity_threshold)
+        self.familiarity_scores: np.ndarray = np.array([], dtype=np.float64)
+        self.prototype_threshold: float = float(prototype_threshold)
+        self.prototype_scores: np.ndarray = np.array([], dtype=np.float64)
+        self.prototypes: Optional[np.ndarray] = (
+            np.asarray(prototypes, dtype=np.float32) if prototypes is not None else None
+        )
         self.is_calibrated: bool = False
         self.quantile: Optional[float] = None
         self.margin_threshold: Optional[float] = (
@@ -386,6 +410,120 @@ class ConformalPredictor:
             float(confidence_floor_tau0) if confidence_floor_tau0 is not None else 0.15
         )
 
+    def compute_prototype_similarity(self, embedding: np.ndarray) -> Optional[float]:
+        """Compute maximum cosine similarity between an input embedding and class prototypes."""
+        if self.prototypes is None or self.prototypes.size == 0:
+            return None
+        emb = np.asarray(embedding, dtype=np.float32).flatten()
+        if emb.ndim != 1 or self.prototypes.ndim != 2 or self.prototypes.shape[1] != emb.shape[0]:
+            return None
+        e_norm = float(np.linalg.norm(emb))
+        if e_norm < 1e-12 or not math.isfinite(e_norm):
+            return 0.0
+        emb_unit = emb / e_norm
+        p_norms = np.linalg.norm(self.prototypes, axis=1, keepdims=True)
+        valid_rows = (p_norms.flatten() > 1e-12)
+        if not np.any(valid_rows):
+            return None
+        proto_unit = self.prototypes[valid_rows] / np.where(p_norms[valid_rows] < 1e-12, 1.0, p_norms[valid_rows])
+        sims = proto_unit @ emb_unit
+        return float(np.max(sims))
+
+    def calibrate_familiarity(
+        self,
+        familiarity_values: Sequence[float],
+        *,
+        alpha_ood: float = 0.01,
+    ) -> float:
+        """Fit a held-out lower conformal threshold on non-negative familiarity scores."""
+        if not (0.0 <= alpha_ood < 1.0) or not math.isfinite(alpha_ood):
+            raise ValueError(f"alpha_ood must be in [0, 1), got {alpha_ood}")
+        vals = np.asarray(familiarity_values, dtype=np.float64).flatten()
+        vals = vals[np.isfinite(vals) & (vals > 0.0)]
+        if len(vals) == 0 or alpha_ood == 0.0:
+            self.familiarity_scores = np.array([], dtype=np.float64)
+            self.familiarity_threshold = 0.0
+            return 0.0
+        self.familiarity_scores = np.sort(vals)
+        m = len(self.familiarity_scores)
+        rank = int(math.floor((m + 1) * alpha_ood))
+        self.familiarity_threshold = float(self.familiarity_scores[rank - 1]) if rank >= 1 else 0.0
+        return self.familiarity_threshold
+
+    def calibrate_prototypes(
+        self,
+        prototype_values: Union[Sequence[float], np.ndarray],
+        labels: Optional[Sequence[Any]] = None,
+        *,
+        alpha_prototype: float = 0.01,
+        alpha: Optional[float] = None,
+        prototypes: Optional[np.ndarray] = None,
+    ) -> float:
+        """Fit a held-out lower conformal threshold on max class-prototype cosine similarities."""
+        eff_alpha = float(alpha) if alpha is not None else float(alpha_prototype)
+        if not (0.0 <= eff_alpha < 1.0) or not math.isfinite(eff_alpha):
+            raise ValueError(f"alpha_prototype must be in [0, 1), got {eff_alpha}")
+        if prototypes is not None:
+            self.prototypes = np.asarray(prototypes, dtype=np.float32)
+        arr = np.asarray(prototype_values, dtype=np.float64)
+        if arr.ndim == 2:
+            if self.prototypes is None and labels is not None and len(labels) == arr.shape[0] and len(self.options) > 0:
+                protos = np.zeros((len(self.options), arr.shape[1]), dtype=np.float32)
+                for c_idx, opt in enumerate(self.options):
+                    mask = [i for i, lbl in enumerate(labels) if str(lbl) == str(opt)]
+                    if mask:
+                        c_mean = np.mean(arr[mask], axis=0)
+                        c_norm = float(np.linalg.norm(c_mean))
+                        if c_norm > 1e-12:
+                            protos[c_idx] = (c_mean / c_norm).astype(np.float32)
+                self.prototypes = protos
+            if self.prototypes is not None and self.prototypes.size > 0 and len(arr) > 0:
+                sims = [self.compute_prototype_similarity(row) for row in arr]
+                vals = np.asarray([s for s in sims if s is not None], dtype=np.float64)
+            else:
+                vals = np.array([], dtype=np.float64)
+        else:
+            vals = arr.flatten()
+        vals = vals[np.isfinite(vals)]
+        if len(vals) == 0 or eff_alpha == 0.0:
+            self.prototype_scores = np.array([], dtype=np.float64)
+            self.prototype_threshold = 0.0
+            return 0.0
+        self.prototype_scores = np.sort(vals)
+        m = len(self.prototype_scores)
+        rank = int(math.floor((m + 1) * eff_alpha))
+        if rank >= 1:
+            self.prototype_threshold = float(self.prototype_scores[rank - 1])
+        else:
+            # For small calibration cohorts where (m + 1) * alpha < 1, use a conservative
+            # margin below the minimum observed in-distribution prototype similarity.
+            min_sim = float(self.prototype_scores[0])
+            self.prototype_threshold = float(max(0.0, min_sim * 0.90)) if min_sim > 0.0 else 0.0
+        return self.prototype_threshold
+
+    def class_quantile(self, option: str, alpha: float = 0.05) -> float:
+        """Compute global or Mondrian (exact when n_y >= ceil(1/alpha)-1, empirical-Bayes blended when small) quantile."""
+        n = len(self.calibration_scores)
+        if not self.is_calibrated or n == 0:
+            return 1.0
+        k_global = int(math.ceil((n + 1) * (1.0 - alpha)))
+        q_global = 1.0 if k_global > n else float(self.calibration_scores[k_global - 1])
+        if not self.mondrian:
+            return q_global
+        c_scores = self.class_calibration_scores.get(option)
+        if c_scores is None or len(c_scores) == 0:
+            return q_global
+        n_c = len(c_scores)
+        k_c = int(math.ceil((n_c + 1) * (1.0 - alpha)))
+        if k_c <= n_c:
+            return float(c_scores[k_c - 1])
+        if q_global >= 1.0:
+            return 1.0
+        q_emp = float(np.quantile(c_scores, 1.0 - alpha))
+        shrink = max(1.0, self.mondrian_shrinkage)
+        w = float(n_c) / (float(n_c) + shrink)
+        return float(w * q_emp + (1.0 - w) * q_global)
+
     def calibrate(
         self,
         calibrated_probs: np.ndarray,
@@ -394,8 +532,17 @@ class ConformalPredictor:
         *,
         relative_odds_ratio: Optional[float] = None,
         confidence_floor_tau0: Optional[float] = None,
+        mondrian: Optional[bool] = None,
+        familiarity_values: Optional[Sequence[float]] = None,
+        alpha_ood: float = 0.0,
+        familiarity_alpha: float = 0.0,
+        prototype_values: Optional[Union[Sequence[float], np.ndarray]] = None,
+        embeddings: Optional[np.ndarray] = None,
+        alpha_prototype: float = 0.0,
+        prototype_alpha: float = 0.0,
+        prototypes: Optional[np.ndarray] = None,
     ) -> None:
-        """Fits the configured nonconformity score and optional margin threshold."""
+        """Fits the configured nonconformity score and optional margin/familiarity/prototype thresholds."""
         probs = np.asarray(calibrated_probs, dtype=np.float64)
         if len(probs) != len(ground_truth_labels):
             raise ValueError("Mismatched probabilities and labels length")
@@ -406,8 +553,13 @@ class ConformalPredictor:
             self.relative_odds_ratio = float(relative_odds_ratio)
         if confidence_floor_tau0 is not None:
             self.confidence_floor_tau0 = float(confidence_floor_tau0)
+        if mondrian is not None:
+            self.mondrian = bool(mondrian)
+        if prototypes is not None:
+            self.prototypes = np.asarray(prototypes, dtype=np.float32)
 
         scores: List[float] = []
+        per_class_scores: Dict[str, List[float]] = {opt: [] for opt in self.options}
         error_margins: List[float] = []
 
         for i, label in enumerate(ground_truth_labels):
@@ -432,10 +584,30 @@ class ConformalPredictor:
                 if idx == true_idx:
                     score_val = cum_sum
                     break
-            scores.append(1.0 - float(row[true_idx]) if self.score_method == "lac" else score_val)
+            s_i = 1.0 - float(row[true_idx]) if self.score_method == "lac" else score_val
+            scores.append(s_i)
+            per_class_scores[label].append(s_i)
 
         self.calibration_scores = np.sort(np.asarray(scores, dtype=np.float64))
+        self.class_calibration_scores = {
+            opt: np.sort(np.asarray(vals, dtype=np.float64))
+            for opt, vals in per_class_scores.items()
+            if vals
+        }
         self.is_calibrated = True
+
+        eff_alpha_ood = float(familiarity_alpha) if familiarity_alpha > 0.0 else float(alpha_ood)
+        eff_alpha_proto = float(prototype_alpha) if prototype_alpha > 0.0 else float(alpha_prototype)
+        eff_proto_vals = prototype_values if prototype_values is not None else embeddings
+        if familiarity_values is not None and eff_alpha_ood > 0.0:
+            self.calibrate_familiarity(familiarity_values, alpha_ood=eff_alpha_ood)
+        if eff_proto_vals is not None and eff_alpha_proto > 0.0:
+            self.calibrate_prototypes(
+                eff_proto_vals,
+                labels=ground_truth_labels,
+                alpha_prototype=eff_alpha_proto,
+                prototypes=prototypes,
+            )
 
         if margin_threshold is not None:
             self.margin_threshold = float(margin_threshold)
@@ -461,6 +633,9 @@ class ConformalPredictor:
         relative_odds_ratio: Optional[float] = None,
         confidence_floor_tau0: Optional[float] = None,
         strict: bool = False,
+        familiarity_score: Optional[float] = None,
+        prototype_similarity: Optional[float] = None,
+        embedding: Optional[np.ndarray] = None,
     ) -> ConformalPredictionSet:
         """Invert the configured score to construct a prediction set.
 
@@ -482,16 +657,39 @@ class ConformalPredictor:
                 f"Probabilities length ({len(probs)}) does not match options ({len(self.options)})"
             )
 
+        if prototype_similarity is None and embedding is not None and self.prototypes is not None:
+            prototype_similarity = self.compute_prototype_similarity(embedding)
+
         n = len(self.calibration_scores)
         sorted_indices = np.argsort(-probs)
         top_prob = float(probs[sorted_indices[0]]) if len(sorted_indices) > 0 else 0.0
         runner_up_prob = float(probs[sorted_indices[1]]) if len(sorted_indices) > 1 else 0.0
         margin = float(top_prob - runner_up_prob) if len(sorted_indices) > 1 else 1.0
 
+        low_familiarity = (
+            familiarity_score is not None
+            and self.familiarity_threshold > 0.0
+            and (not math.isfinite(familiarity_score) or familiarity_score < self.familiarity_threshold - 1e-12)
+        )
+        low_prototype_similarity = (
+            prototype_similarity is not None
+            and self.prototype_threshold > 0.0
+            and (not math.isfinite(prototype_similarity) or prototype_similarity < self.prototype_threshold - 1e-6)
+        )
+        oos_abstain = low_familiarity or low_prototype_similarity
+        abstention_reason: Optional[str] = None
+        if low_familiarity:
+            abstention_reason = "low_feature_familiarity"
+        elif low_prototype_similarity:
+            abstention_reason = "low_semantic_familiarity"
+
         if not self.is_calibrated or n == 0:
-            if strict:
+            if oos_abstain:
+                q_hat = 1.0 if strict else (1.0 - alpha)
+                prediction_set: List[str] = []
+            elif strict:
                 q_hat = 1.0
-                prediction_set: List[str] = list(self.options)
+                prediction_set = list(self.options)
             else:
                 q_hat = 1.0 - alpha
                 prediction_set = []
@@ -515,13 +713,22 @@ class ConformalPredictor:
             prediction_set = []
             cum_mass = 0.0
             total_mass = float(np.sum(probs))
+            if oos_abstain:
+                prediction_set = []
             # Invalid/degenerate probabilities abstain; this is not a calibrated OOD test.
-            if self.score_method == "lac":
+            elif self.score_method == "lac":
                 if k > n:
                     prediction_set = list(self.options)
                 elif np.all(np.isfinite(probs)) and np.all(probs >= 0) and np.isclose(total_mass, 1.0):
-                    prediction_set = [self.options[idx] for idx in sorted_indices
-                                      if 1.0 - float(probs[idx]) <= q_hat + 1e-12]
+                    if self.mondrian and self.class_calibration_scores:
+                        prediction_set = [
+                            self.options[idx]
+                            for idx in sorted_indices
+                            if 1.0 - float(probs[idx]) <= self.class_quantile(self.options[idx], alpha) + 1e-12
+                        ]
+                    else:
+                        prediction_set = [self.options[idx] for idx in sorted_indices
+                                          if 1.0 - float(probs[idx]) <= q_hat + 1e-12]
             elif strict:
                 # Invert the calibrated score s(x,y) = cumulative mass through y.
                 # Including the next label after crossing q_hat inflates every set.
@@ -531,8 +738,10 @@ class ConformalPredictor:
                 elif np.all(np.isfinite(probs)) and np.all(probs >= 0) and np.isclose(total_mass, 1.0):
                     for idx in sorted_indices:
                         cum_mass += float(probs[idx])
-                        if cum_mass <= q_hat + 1e-12:
-                            prediction_set.append(self.options[idx])
+                        opt = self.options[idx]
+                        thresh = self.class_quantile(opt, alpha) if (self.mondrian and self.class_calibration_scores) else q_hat
+                        if cum_mass <= thresh + 1e-12:
+                            prediction_set.append(opt)
             elif total_mass >= q_hat - 1e-7 and total_mass >= 0.5:
                 for idx in sorted_indices:
                     opt = self.options[idx]
@@ -592,7 +801,7 @@ class ConformalPredictor:
             and (top_prob >= conf_floor)
             and (odds_ratio >= eff_gamma)
         )
-        if strict and (not self.is_calibrated or n == 0):
+        if oos_abstain or (strict and (not self.is_calibrated or n == 0)):
             is_ambiguous = True
             needs_escalation = True
         else:
@@ -616,7 +825,66 @@ class ConformalPredictor:
             relative_odds_ratio_threshold=eff_gamma,
             confidence_floor=conf_floor,
             needs_escalation=needs_escalation,
+            abstention_reason=abstention_reason,
+            prototype_similarity=prototype_similarity,
+            prototype_threshold=self.prototype_threshold,
         )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "field_name": self.field_name,
+            "options": list(self.options),
+            "margin_threshold": self.margin_threshold,
+            "calibrated_margin_threshold": self.calibrated_margin_threshold,
+            "relative_odds_ratio": self.relative_odds_ratio,
+            "confidence_floor_tau0": self.confidence_floor_tau0,
+            "score_method": self.score_method,
+            "mondrian": self.mondrian,
+            "mondrian_shrinkage": self.mondrian_shrinkage,
+            "familiarity_threshold": self.familiarity_threshold,
+            "familiarity_scores": [float(s) for s in self.familiarity_scores],
+            "prototype_threshold": self.prototype_threshold,
+            "prototype_scores": [float(s) for s in self.prototype_scores],
+            "calibration_scores": [float(s) for s in self.calibration_scores],
+            "class_calibration_scores": {
+                k: [float(v) for v in vals] for k, vals in self.class_calibration_scores.items()
+            },
+            "is_calibrated": self.is_calibrated,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ConformalPredictor:
+        pred = cls(
+            field_name=str(data["field_name"]),
+            options=list(data["options"]),
+            margin_threshold=data.get("margin_threshold"),
+            relative_odds_ratio=float(data.get("relative_odds_ratio", 1.5)),
+            confidence_floor_tau0=float(data.get("confidence_floor_tau0", 0.15)),
+            score_method=str(data.get("score_method", "lac")),
+            mondrian=bool(data.get("mondrian", False)),
+            mondrian_shrinkage=float(data.get("mondrian_shrinkage", 10.0)),
+            familiarity_threshold=float(data.get("familiarity_threshold", 0.0)),
+            prototype_threshold=float(data.get("prototype_threshold", 0.0)),
+        )
+        pred.calibrated_margin_threshold = float(data.get("calibrated_margin_threshold", 0.20))
+        fam_scores = data.get("familiarity_scores", [])
+        if fam_scores:
+            pred.familiarity_scores = np.sort(np.asarray(fam_scores, dtype=np.float64))
+        proto_scores = data.get("prototype_scores", [])
+        if proto_scores:
+            pred.prototype_scores = np.sort(np.asarray(proto_scores, dtype=np.float64))
+        scores = data.get("calibration_scores", [])
+        if scores:
+            pred.calibration_scores = np.sort(np.asarray(scores, dtype=np.float64))
+            pred.is_calibrated = bool(data.get("is_calibrated", True))
+        class_scores = data.get("class_calibration_scores", {})
+        if isinstance(class_scores, Mapping):
+            pred.class_calibration_scores = {
+                str(k): np.sort(np.asarray(v, dtype=np.float64))
+                for k, v in class_scores.items()
+                if v
+            }
+        return pred
 
 
 @dataclass(frozen=True)

@@ -40,4 +40,4 @@ python benchmarks/quality/verify_banking_source.py /tmp/system1-banking-source/b
 Normal teaching and evaluation use the bundled JSON and require no download.
 The verification script checks upstream checksums, unchanged text and labels,
 the deterministic teaching/calibration partition, and the complete selected test
-slice. See the [1.0.1 results](../../docs/releases/1.0.1.md).
+slice. See the [workload report](../../benchmarks/quality/workloads/README.md).

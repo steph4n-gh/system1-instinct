@@ -1,12 +1,12 @@
 # System 1: teaching bounded decisions for local reuse
 
-**steph4n-gh · System 1 1.2.0 · 1 October 2026**
+**steph4n-gh · System 1 1.4.0 · 13 October 2026**
 Maintainer-authored technical whitepaper; not a peer-reviewed publication.
-[Source repository](https://github.com/steph4n-gh/system1)
+[Source repository](https://github.com/steph4n-gh/system1-instinct)
 
-This document describes [System 1 1.2.0](../releases/1.2.0.md). Measurements retain
+This document describes **System 1 1.4.0** (see the [v1.4 benchmark gauntlet report](../../benchmarks/quality/v1_4_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
 the original source revisions and evidence linked in each experiment; this
-release does not make historical results fresh evaluations.
+release adds the v1.4 6-category benchmark gauntlet alongside historical results.
 
 System 1 is **not an LLM**. Its built-in local path fits small numerical decision
 heads and requires no language-model download, token generation or GPU. It can
@@ -95,13 +95,13 @@ count both parts; the default projector measurements cannot be applied to them.
 
 ### Retained lessons, candidate assessment and explicit adoption
 
-`TeachingSession`, introduced in 1.1.0, adds a reproducible correction workflow for
-one text `ChoiceField`, with ambiguity escalation enabled so uncertain answers
+`TeachingSession`, introduced in 1.1.0 and expanded in 1.4.0, adds a reproducible correction workflow for
+single-field or multi-field schemas (`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`), with ambiguity escalation enabled on at least one field so uncertain answers
 request review. It retains explicitly labeled `teach`, `calibrate` and
-`evaluate` records. A same-input correction replaces a record; normalized inputs
+`evaluate` records (or deterministic 60%/20%/20% `split="auto"` routing). A same-input correction replaces a record; normalized inputs
 cannot cross splits. In 1.2.0, supplied groups also cannot cross splits; related
 threads and paraphrases still require caller-managed grouping. The helper uses
-the existing fitted TF-IDF projector (at most 1,024 features), regularization 0.1,
+the existing fitted TF-IDF or `HybridProjector` representation (defaulting to at most 1,024 features), regularization 0.1,
 and strict inference at `alpha=0.05`. Ridge remains the default; the existing
 optional logistic solver can be selected when creating a session. That solver is
 saved and cannot be changed by reopening the session. These
@@ -282,6 +282,41 @@ serving skill or successful adoption/reopen prediction parity. Published evidenc
 includes every outcome and source hash. Historical news-topic routing does not
 qualify private document filing, unfamiliar-topic rejection or traffic drift.
 
+### 1.4.0 industry-standard benchmark gauntlet
+
+The [v1.4 benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md)
+(`python benchmarks/quality/evaluate_v1_4_gauntlet.py`) evaluates System 1 1.4.0
+against the v1.2 baseline across six offline categories:
+
+1. **High-cardinality `BANKING77` intent routing + typo stress + lazy covariance scaling**:
+   On 32 intents, clean accuracy rises from `76.6%` to `87.9%` (`+11.3%`) and
+   `91.8%` with the `BoundedReviewFallback` flywheel (`66.0% -> 74.6%` under typo
+   stress); on all 77 intents, clean accuracy rises from `59.9%` to `79.5%`
+   (`+19.7%`) and `87.5%` with the flywheel (`44.0% -> 58.3%` under typo stress),
+   while `lazy_covariance=True` reduces `D=8192` memory by `108.4x`.
+2. **Multi-domain `CLINC150-OOS` routing + strict OOS rejection**: Dual
+   `low_feature_familiarity` + `low_prototype_similarity` gates and Mondrian
+   calibration reduce OOS false acceptance from `3.3%` (`4/120`) to `0.0%`
+   (`0/120`), with `86.1%` in-scope raw accuracy (`99.3%` post-flywheel) and
+   `100.0%` accepted accuracy.
+3. **`NotInject` benign-trigger hard negatives & polarity contrasts**: Negation
+   scope tokens and phrase bigrams reduce benign-trigger false positives from
+   `10.0%` to `0.0%` (`100.0%` overall accuracy) and raise minimal polarity
+   contrast accuracy from `70.0%` to `100.0%`.
+4. **Fresh authored drift (`quality_round/cases.json` 106 probes)**: Fresh
+   `banking_support` accepted accuracy rises from `86.2%` (`4` errors) to
+   `100.0%` (`0` errors); `sms_triage` raw accuracy rises from `77.5%` to `82.5%`
+   (`87.5%` post-flywheel); `model_routing` coverage rises from `77.8%` to
+   `88.9%` (`94.4%` post-flywheel) at `100.0%` static accepted accuracy.
+5. **Multi-field structured ticket triage**: Single-pass extraction across
+   `ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField` reaches
+   `100.0%` joint 4-field accuracy (`0.43 ms` P50 latency), converging from
+   `37.1%` Wave 1 teacher escalation to `0.0%` by Wave 2.
+6. **Zero-shot cold-start routing**: Sibling-contrastive stem IDF and
+   multi-exemplar sub-prototypes lift zero-shot `intent_routing` from `51.0%` to
+   `80.0%` (`81.0%` hybrid) and `security_triage` from `50.0%` to `85.0%` (`97.1%`
+   post-flywheel).
+
 ## 6. Statistical and operational boundaries
 
 Split-conformal prediction provides marginal prediction-set coverage when the
@@ -307,7 +342,7 @@ In 1.0.3, authentication requires an independent key; unsigned diagnostics expos
 only an integrity check. The signed envelope binds the committed ledger ID,
 guards check exact inclusion, and writes reverify the whole chain. Saved-skill
 resource budgets and a closed gRPC schema registry constrain input handling.
-See the [security release and migration](../releases/1.0.3.md).
+See [deployment boundaries](../deployment.md).
 
 Local decisions require no teacher API, but callbacks, tools, network services
 and telemetry exporters can communicate externally. The package is not a process
@@ -330,9 +365,9 @@ separate [first-use policy evidence](../../benchmarks/quality/zero_shot/README.m
 not learned strategic competence or verified speed records.
 
 Later experiments widen the scope without establishing universal quality. The
-[full-scope n8n gauntlet](../../benchmarks/quality/n8n_gauntlet/README.md) still fails
+historical [full-scope n8n gauntlet](../../benchmarks/quality/n8n_gauntlet/README.md) baseline fails
 accepted accuracy on all-intent CLINC and BANKING77, plus unfamiliar-input
-rejection on CLINC. Its teacher-disconnection recording is an integration
+rejection on CLINC (addressed in the separate [v1.4 benchmark gauntlet](../../benchmarks/quality/v1_4_gauntlet_report.md)). Its teacher-disconnection recording is an integration
 rehearsal using an unqualified artifact; independent confirmation remains missing.
 The [Inbox Zero pilot](../../examples/inbox_zero/README.md) improves authored email
 results but retains accepted errors and lacks independent mailbox qualification.
@@ -352,5 +387,5 @@ research history, rather than treating later experiments as revisions of older
 measurements.
 
 Suggested citation: steph4n-gh (2026), *System 1: teaching bounded decisions for
-local reuse*, version 1.2.0. Cite the source revision and linked evidence when
+local reuse*, version 1.4.0. Cite the source revision and linked evidence when
 quoting measurements; earlier unsupported benchmark tables have been withdrawn.

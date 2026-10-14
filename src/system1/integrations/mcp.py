@@ -74,12 +74,25 @@ class SystemOneMCPProxy:
         min_confidence: float = 0.50,
         tenant_id: str = "tenant_mcp_default",
         principal_id: str = "agent_mcp_client",
+        model_path: Optional[Any] = None,
+        auto_reload: bool = False,
     ):
-        self.guard = guard or SystemOneGuardHook(
-            ledger=ledger,
-            alpha=alpha,
-            min_confidence=min_confidence,
-        )
+        if guard is None:
+            from system1.guard import DefaultGuardDecisionSchema
+
+            engine = (
+                SystemOneEngine(DefaultGuardDecisionSchema, model_path=model_path, auto_reload=auto_reload)
+                if model_path is not None
+                else None
+            )
+            self.guard = SystemOneGuardHook(
+                engine=engine,
+                ledger=ledger,
+                alpha=alpha,
+                min_confidence=min_confidence,
+            )
+        else:
+            self.guard = guard
         self.tenant_id = tenant_id
         self.principal_id = principal_id
 

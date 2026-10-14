@@ -1,24 +1,23 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/steph4n-gh/system1/main/assets/system1-logo.jpg" alt="System 1 logo" width="128" />
+  <img src="https://raw.githubusercontent.com/steph4n-gh/system1-instinct/main/assets/system1-logo.jpg" alt="System 1 logo" width="128" />
 </p>
 
-# System 1: Teach a decision. Run it locally.
+# System 1: Instinct — Teach a decision. Run it locally.
 
-**System 1 is not an LLM.** Show it examples of a repeatable decision—such as
-which team should receive a message—then check the skill and reuse it locally.
+**System 1 is not an LLM.** Show it examples of a repeatable decision—or start zero-shot from option descriptions—then check the skill and reuse it locally.
 Its default path uses small numerical decision heads and fixed text features:
 no language-model weights to download, no token generation, and no GPU required.
 Optional **MLX support** runs
 decision-head matrix operations on Apple Silicon.
 
-**Choose a decision → show examples → check a candidate → adopt → correct and compare.**
+**Choose a decision → start zero-shot or show examples → check a candidate → adopt → correct and compare.**
 
-[![CI](https://github.com/steph4n-gh/system1/actions/workflows/ci.yml/badge.svg)](https://github.com/steph4n-gh/system1/actions/workflows/ci.yml)
+[![CI](https://github.com/steph4n-gh/system1-instinct/actions/workflows/ci.yml/badge.svg)](https://github.com/steph4n-gh/system1-instinct/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/system1.svg)](https://pypi.org/project/system1/)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://github.com/steph4n-gh/system1/blob/main/pyproject.toml)
-[![License](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](https://github.com/steph4n-gh/system1/blob/main/LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://github.com/steph4n-gh/system1-instinct/blob/main/pyproject.toml)
+[![License](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](https://github.com/steph4n-gh/system1-instinct/blob/main/LICENSE)
 
-[Performance](#why-it-is-fast) · [Start teaching](#quickstart) · [Automatic teachers](#observe-a-teacher-then-take-over) · [Evidence](#benchmarks) · [Integrations](#integrations) · [Documentation](https://github.com/steph4n-gh/system1/blob/main/docs/README.md)
+[Performance](#why-it-is-fast) · [Start teaching](#quickstart) · [Drop-in replacements](examples/drop_in/README.md) · [Automatic teachers](#observe-a-teacher-then-take-over) · [Evidence](#benchmarks) · [Integrations](#integrations) · [Documentation](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/README.md)
 
 ## Why it is fast
 
@@ -39,7 +38,7 @@ costs. They still produce bounded decisions rather than generated text.
 These are NumPy CPU measurements on an Apple M4 Pro, excluding startup, receipt
 signing and downstream work. Skill-file sizes exclude the installed runtime and
 dependencies. Optional MLX supports Apple Silicon acceleration; its speed benefit
-depends on the workload. See the [reproducible results and quality limits](https://github.com/steph4n-gh/system1/blob/main/benchmarks/quality/workloads/README.md).
+depends on the workload. See the [reproducible results and quality limits](https://github.com/steph4n-gh/system1-instinct/blob/main/benchmarks/quality/workloads/README.md).
 
 The payoff is useful for repeated routing, classification and structured choices.
 Quality depends on the taught task; uncertain answers still need review.
@@ -49,8 +48,8 @@ Quality depends on the taught task; uncertain answers still need review.
 Use Python 3.11 or newer. To follow the editable lesson, start from a repository checkout:
 
 ```bash
-git clone https://github.com/steph4n-gh/system1.git
-cd system1
+git clone https://github.com/steph4n-gh/system1-instinct.git
+cd system1-instinct
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e .
@@ -152,7 +151,9 @@ print(report["candidate"], report["regressions"], report["reasons"])
 
 The report separates raw accuracy, accepted mistakes, review rate and regressions.
 Adoption requires the exact passing candidate and unchanged data; a failed revision does not replace the
-working skill. This first workflow supports one text `ChoiceField`. The
+working skill. Since 1.4.0, `TeachingSession` supports both single-field and multi-field schemas
+(`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`) with optional `split="auto"`
+stratified routing. The
 [eight-example starter](docs/guides/first_skill.md) and
 [lower-level teaching APIs](docs/guides/training_experts.md) remain available.
 
@@ -170,6 +171,34 @@ revision explicitly with `session.rollback(revision)`; lessons stay available,
 and another adoption needs a new assessment. `session.decision_details(text)`
 shows the approved revision and observable review reasons. These additions do
 not make a rejected workload qualified.
+
+### 7. 5-Minute Cold-Start Flywheel (`BoundedReviewFallback` + `TeachingSession`)
+
+In System 1 1.4.0, you can start from a schema (`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`) and attach `BoundedReviewFallback` with `auto_record_lessons=True` and `auto_online_update=True`. Uncertain boundary inputs escalate to your teacher/reviewer callable, record stratified lessons into `TeachingSession`, and apply sub-millisecond Rank-1 Sherman-Morrison RLS updates so recurring traffic converges toward local execution:
+
+```python
+from system1 import BoundedReviewFallback, ChoiceField, DecisionSchema, TeachingSession
+
+class TicketRouter(DecisionSchema):
+    queue = ChoiceField(
+        options=["billing", "support"],
+        option_descriptions={
+            "billing": "Invoices, refunds, duplicate charges; payment receipt",
+            "support": "Software crash, login error, API timeout; bug report",
+        },
+    )
+
+session = TeachingSession(".system1/flywheel-session", TicketRouter)
+# After initial seed lessons are assessed and adopted:
+# fallback = BoundedReviewFallback(
+#     session,
+#     review_fn=lambda prompt: "billing" if "invoice" in prompt.lower() else "support",
+#     auto_record_lessons=True,
+#     auto_online_update=True,
+#     lesson_split="auto",
+# )
+# decision = fallback.decide("Please refund my duplicate invoice")
+```
 
 ## Observe a teacher, then take over
 
@@ -238,7 +267,51 @@ python benchmarks/quality/evaluate_release.py
 ```
 
 This runs offline and fails if a primary demonstration misses its 95% accepted
-correctness / 80% acceptance point targets. See the [quality index](https://github.com/steph4n-gh/system1/blob/main/benchmarks/quality/README.md)
+correctness / 80% acceptance point targets.
+
+### System 1 v1.4 6-Category Industry-Standard Benchmark Gauntlet
+
+The [v1.4 benchmark gauntlet report](benchmarks/quality/v1_4_gauntlet_report.md)
+(`python benchmarks/quality/evaluate_v1_4_gauntlet.py`) evaluates System 1 1.4.0
+100% offline against the v1.2 baseline across six categories:
+
+| Category | Workload | Baseline v1.2 | System 1 v1.4 (Static) | System 1 v1.4 (+ Flywheel) |
+| :--- | :--- | :---: | :---: | :---: |
+| **1. High-Cardinality Intent Routing** | `BANKING77` (32 Intents, Clean / Typo) | 76.6% / 66.0% | **87.9%** / **74.6%** | **91.8%** |
+| **1b. Full 77-Class Scaling** | `BANKING77` (77 Intents, Clean / Typo) | 59.9% / 44.0% | **79.5%** / **58.3%** | **87.5%** |
+| **2. Multi-Domain + OOS Rejection** | `CLINC150-OOS` (In-Scope Acc / OOS False Accept) | 84.0% / 3.3% FA | **86.1%** / **0.0% FA** | **99.3%** / **0.0% FA** |
+| **3. Injection & NotInject Negatives** | `NotInject` Benign-Trigger FPR / Polarity Acc | 10.0% FPR / 70.0% | **0.0% FPR** / **100.0%** | **0.0% FPR** / **100.0%** |
+| **4. Fresh Authored Drift (106 Probes)** | `banking_support` / `sms_triage` / `model_routing` | 86.2% acc / 77.5% raw / 77.8% cov | **100.0% acc** / **82.5% raw** / **88.9% cov** | **100.0%** / **87.5%** / **94.4% cov** |
+| **5. Multi-Field Structured Triage** | 4-Field Joint Accuracy (Choice+Bool+Multi+Score) | 97.1% | **100.0%** (0.43 ms) | **100.0%** (0% Wave 3 esc) |
+| **6. Zero-Shot Cold-Start Routing** | `intent_routing` / `security_triage` (0-Shot) | 51.0% / 50.0% | **81.0%** / **85.0%** | **97.1%** |
+
+### Drop-In Replacements & Zero-Shot $\to$ Few-Shot Adaptation Curve
+
+See [examples/drop_in/README.md](examples/drop_in/README.md) and the [drop-in & adaptation report](benchmarks/quality/drop_in_and_adaptation_report.md) (`python benchmarks/quality/evaluate_drop_in_replacements.py`):
+
+| Drop-In Target | Key Metric | Unseen Adaptation | P50 Latency |
+| :--- | :--- | :--- | :---: |
+| **`Semantic Router`** | **100.0%** In-Domain / **100.0%** OOD Reject | **0.0% $\to$ 100.0%** (`adapt_zero_shot`, 0 labels) | **1.36 ms** |
+| **`RouteLLM`** | **100.0%** Tier Routing (`fast` vs `frontier`) | **50.0% $\to$ 100.0%** (1-shot online RLS) | **1.47 ms** |
+| **`Instructor` / `BAML`** | **100.0%** 4-Field Structured Extraction | **0.0% $\to$ 100.0%** (`BoundedReviewFallback`) | **2.73 ms** |
+| **`Llama-Prompt-Guard` / `Guardrails`** | **0.0% `NotInject` FPR** / **100.0%** Attack Recall | **0.0% $\to$ 100.0%** (1-shot online RLS) | **0.81 ms** |
+
+| Multi-Class Benchmark | `0`-Shot (Schema Only) | `0`-Shot + `adapt_zero_shot` | `1`-Shot Online RLS | `3`-Shot Online RLS | `5`-Shot Online RLS | Compiled `.s1m` |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`BANKING77` (24 Intents)** | `53.6%` | **`55.2%`** | **`57.3%`** | **`65.6%`** | **`70.3%`** | **`90.1%`** (`0.22 ms`) |
+| **`CLINC150` (24 Intents)** | `61.7%` | **`62.5%`** | **`65.8%`** | **`72.5%`** | **`82.5%`** | **`87.5%`** (`0.20 ms`) |
+
+### Standard `poke-env` + Pokémon Showdown Benchmark (`gen9randombattle`)
+
+See the [`poke-env` Showdown benchmark report](benchmarks/quality/poke_env_showdown_report.md) (`python benchmarks/quality/evaluate_poke_env_showdown.py --battles 50`):
+
+| Agent | vs `RandomPlayer` | vs `MaxBasePowerPlayer` | vs `SimpleHeuristicsPlayer` | P50 Decision Latency |
+| :--- | :---: | :---: | :---: | :---: |
+| **`System 1 Zero-Shot (0 Examples)`** | **100.0%** (50/50) | **98.0%** (49/50) | **42.0%** (21/50) | `3.21 ms` |
+| **`System 1 Zero-Shot Adaptive (Online)`** | **100.0%** (50/50) | **92.0%** (46/50) | **62.0%** (31/50) | `3.20 ms` |
+| **`System 1 Compiled (.s1m)`** | **98.0%** (49/50) | **82.0%** (41/50) | **60.0%** (30/50) | **`0.093 ms`** |
+
+See the [quality index](https://github.com/steph4n-gh/system1-instinct/blob/main/benchmarks/quality/README.md)
 for all reproduction commands, confidence intervals and historical experiments.
 
 ## Integrations
@@ -255,21 +328,22 @@ application when to request review.
 
 | Need | Next step |
 |---|---|
-| Teach a different task or use your own data | [Teaching API and file formats](https://github.com/steph4n-gh/system1/blob/main/docs/guides/training_experts.md) |
-| Learn by observing a running teacher | [Teacher callbacks and automatic takeover](https://github.com/steph4n-gh/system1/blob/main/docs/typesafe.md) |
-| Use Apple Silicon decision-head operations | Install `system1[metal]`; see [backend scope](https://github.com/steph4n-gh/system1/blob/main/docs/architecture/technical_specification.md) |
-| Connect LangChain, MCP, ASGI or gRPC | [Integration guide](https://github.com/steph4n-gh/system1/blob/main/docs/integrations.md) |
-| Pilot local email categories in Inbox Zero | [Working integration and measured quality limits](https://github.com/steph4n-gh/system1/blob/main/examples/inbox_zero/README.md) |
-| Monitor local decisions | [Metrics and tracing](https://github.com/steph4n-gh/system1/blob/main/docs/observability/README.md) |
+| Replace Semantic Router, RouteLLM, Instructor, or Prompt-Guard | [1-line drop-in replacements](examples/drop_in/README.md) |
+| Teach a different task or use your own data | [Teaching API and file formats](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/guides/training_experts.md) |
+| Learn by observing a running teacher | [Teacher callbacks and automatic takeover](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/typesafe.md) |
+| Use Apple Silicon decision-head operations | Install `system1[metal]`; see [backend scope](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/architecture/technical_specification.md) |
+| Connect LangChain, MCP, ASGI or gRPC | [Integration guide](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/integrations.md) |
+| Pilot local email categories in Inbox Zero | [Working integration and measured quality limits](https://github.com/steph4n-gh/system1-instinct/blob/main/examples/inbox_zero/README.md) |
+| Monitor local decisions | [Metrics and tracing](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/observability/README.md) |
 
 ### Policy guard
 
 If a decision would execute a tool, add an explicit permission policy. The
-[executable guard quickstart](https://github.com/steph4n-gh/system1/blob/main/docs/guides/policy_guard.md)
+[executable guard quickstart](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/guides/policy_guard.md)
 shows `PolicyEngine`, an enforcement guard and a durable ledger. Optional
 software Ed25519 signatures (RFC 8032) and a SHA-256 hash-chained ledger provide
 audit evidence. A classifier's suggested answer alone is not permission to act.
-See [deployment boundaries](https://github.com/steph4n-gh/system1/blob/main/docs/deployment.md)
+See [deployment boundaries](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/deployment.md)
 for identity, network and enforcement responsibilities.
 
 ## Examples and research
@@ -279,35 +353,35 @@ results remain in Git and are excluded from the Python package distributions.
 
 | Lab | What it demonstrates | Boundary |
 |---|---|---|
+| [Drop-in suite](examples/drop_in/README.md) | Local drop-in replacements for Semantic Router, RouteLLM, Instructor, and Prompt-Guard | Zero-shot, online-adaptive, and `.s1m` compiled modes |
 | [Document workspace](examples/teaching_by_doing/README.md) | Filing lessons, candidate comparison and explicit adoption | Authored recurring checks, with retained mistakes; not production qualification |
 | [n8n workflow](benchmarks/quality/n8n_gauntlet/N8N.md) | Saved-skill integration and teacher disconnection | Full-scope quality gates still fail; the recording is a development rehearsal |
 | [Courier playground](examples/gaming/skill_playground/README.md) | Three wired skills and an isolated terrain correction | Constructed missions, explicit application logic and matched baselines |
 | [Pokémon lab](examples/gaming/pokemon_teaching/README.md) | Bounded move/healing skills and paired ROM replays | Real-engine wins improve 6/18 → 7/18, with a regression and more potion use |
 | [Snake arena](examples/gaming/snake_arena/README.md) | Local System1, Laya-MLX and Jev execution in a live GUI | All receive planner hints; it measures execution cost, not independent game reasoning |
 
-The [example catalog](https://github.com/steph4n-gh/system1/blob/main/examples/README.md)
+The [example catalog](https://github.com/steph4n-gh/system1-instinct/blob/main/examples/README.md)
 links every teaching, observation, game and integration example with its scope.
-The [architecture](https://github.com/steph4n-gh/system1/blob/main/docs/architecture/technical_specification.md),
-[technical brief](https://github.com/steph4n-gh/system1/blob/main/docs/paper/system1_technical_brief.md)
-and [whitepaper](https://github.com/steph4n-gh/system1/blob/main/docs/paper/system1_whitepaper.md)
+The [architecture](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/architecture/technical_specification.md),
+[technical brief](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/paper/system1_technical_brief.md)
+and [whitepaper](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/paper/system1_whitepaper.md)
 explain the implementation and evidence. The papers are maintainer-authored,
 not peer-reviewed publications. Established numerical methods power the product;
 the practical value is the complete path from examples to a checked local skill.
 
 ## Release and development
 
-**Version 1.2.0:** adds candidate-bound independent qualification, retained approved
-revisions and explicit rollback, clearer review evidence, and optional logistic
-fitting in teaching sessions. Python, CLI and the document workspace share the
-same lifecycle. Existing compiler/engine APIs and saved skills remain supported;
-TF-IDF skills require a 1.1.0-or-newer reader.
-
-The document workspace and gaming/integration labs remain experimental examples
-run from a repository checkout. Publishing the runtime does not qualify their
-workloads or include every research artifact in Python distributions. See the
-[1.2.0 release report](docs/releases/1.2.0.md), [changelog](CHANGELOG.md),
-[1.0.3 security release](docs/releases/1.0.3.md) and
-[1.0 migration guide](docs/releases/1.0.md).
+**Version 1.4.0:** adds out-of-the-box sibling-contrastive multi-exemplar cold-start routing,
+unsupervised zero-shot test-time adaptation (`adapt_zero_shot`), contrastively-centered multi-class
+online prototype updates (`learn_from_tier2`), corpus-fitted spectral `PPMI + SVD` and class-prototype
+subspace projection (`HybridProjector.fit`), coarse-to-fine hierarchical `ChoiceField` heads (`--hierarchical`),
+dual-gate out-of-distribution abstention (`--familiarity-alpha` and `--prototype-alpha`), multi-field
+`TeachingSession` lifecycle support (`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`),
+lazy covariance `.s1m` serialization, and the closed-loop `BoundedReviewFallback` boundary flywheel.
+See the [v1.4 benchmark gauntlet report](benchmarks/quality/v1_4_gauntlet_report.md),
+[drop-in & adaptation curve report](benchmarks/quality/drop_in_and_adaptation_report.md),
+[`poke-env` Showdown benchmark report](benchmarks/quality/poke_env_showdown_report.md),
+and [changelog](CHANGELOG.md).
 The legacy `reflex` import namespace remains a compatibility alias.
 
 ```bash
@@ -316,7 +390,7 @@ python -m pytest tests/ -q
 ```
 
 CI checks Linux/macOS tests, documentation, built distributions and real
-LangChain dispatch. See [contributing](https://github.com/steph4n-gh/system1/blob/main/CONTRIBUTING.md)
-and [security reporting](https://github.com/steph4n-gh/system1/blob/main/SECURITY.md).
+LangChain dispatch. See [contributing](https://github.com/steph4n-gh/system1-instinct/blob/main/CONTRIBUTING.md)
+and [security reporting](https://github.com/steph4n-gh/system1-instinct/blob/main/SECURITY.md).
 
-[Apache License 2.0](https://github.com/steph4n-gh/system1/blob/main/LICENSE).
+[Apache License 2.0](https://github.com/steph4n-gh/system1-instinct/blob/main/LICENSE).

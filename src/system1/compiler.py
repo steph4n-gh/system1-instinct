@@ -49,7 +49,7 @@ MAX_SKILL_BYTES = 64 * 1024 * 1024
 MAX_SKILL_HEADER_BYTES = 1024 * 1024
 MAX_SKILL_ARRAY_BYTES = 128 * 1024 * 1024
 MAX_SKILL_RUNTIME_BYTES = 256 * 1024 * 1024
-MAX_SKILL_DIMENSION = 4096
+MAX_SKILL_DIMENSION = 8192
 MAX_SKILL_FIELDS = 64
 MAX_SKILL_OPTIONS = 1024
 MAX_SKILL_CALIBRATION_SCORES = 1_000_000
@@ -69,8 +69,23 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> D
             or directory_size > MAX_SKILL_HEADER_BYTES or directory_offset + directory_size != end
             or end + 22 + comment_size != len(data)):
         raise ValueError("Saved skill NPZ directory exceeds limits or is malformed")
-    expected = {f"{name}_{suffix}.npy" for name in schema.fields
-                for suffix in ("w", "b", "P", "B", "calib_scores")}
+    expected = {
+        f"{name}_{suffix}.npy"
+        for name in schema.fields
+        for suffix in (
+            "w",
+            "b",
+            "P",
+            "B",
+            "calib_scores",
+            "prototypes",
+            "proto_scores",
+            "coarse_w",
+            "coarse_b",
+            "fine_w",
+            "fine_b",
+        )
+    }
     shapes: Dict[str, Tuple[int, ...]] = {}
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         members = archive.infolist()
@@ -112,6 +127,35 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> D
             calibration = shapes.get(f"{name}_calib_scores")
             if calibration is not None and (len(calibration) != 1 or calibration[0] > MAX_SKILL_CALIBRATION_SCORES):
                 raise ValueError("Saved skill calibration exceeds limits")
+            proto_shape = shapes.get(f"{name}_prototypes")
+            if proto_shape is not None:
+                valid_proto_rows = (1, 2) if isinstance(definition, BooleanField) else (width,)
+                if len(proto_shape) != 2 or proto_shape[0] not in valid_proto_rows or proto_shape[1] != dimension:
+                    raise ValueError(f"Saved head {name!r} has incompatible prototypes dimensions")
+            proto_scores_shape = shapes.get(f"{name}_proto_scores")
+            if proto_scores_shape is not None and (
+                len(proto_scores_shape) != 1 or proto_scores_shape[0] > MAX_SKILL_CALIBRATION_SCORES
+            ):
+                raise ValueError("Saved skill prototype calibration exceeds limits")
+            coarse_w_shape = shapes.get(f"{name}_coarse_w")
+            coarse_b_shape = shapes.get(f"{name}_coarse_b")
+            if (coarse_w_shape is None) != (coarse_b_shape is None):
+                raise ValueError(f"Saved head {name!r} has incomplete coarse hierarchical arrays")
+            if coarse_w_shape is not None:
+                if (
+                    len(coarse_w_shape) != 2
+                    or not (1 <= coarse_w_shape[0] <= width)
+                    or coarse_w_shape[1] != dimension
+                    or coarse_b_shape != (coarse_w_shape[0],)
+                ):
+                    raise ValueError(f"Saved head {name!r} has incompatible coarse hierarchical dimensions")
+            fine_w_shape = shapes.get(f"{name}_fine_w")
+            fine_b_shape = shapes.get(f"{name}_fine_b")
+            if (fine_w_shape is None) != (fine_b_shape is None):
+                raise ValueError(f"Saved head {name!r} has incomplete fine hierarchical arrays")
+            if fine_w_shape is not None:
+                if fine_w_shape != (width, dimension) or fine_b_shape != (width,):
+                    raise ValueError(f"Saved head {name!r} has incompatible fine hierarchical dimensions")
         # Every member has been checked, including optional covariance arrays.
         with np.load(io.BytesIO(data), allow_pickle=False) as arrays:
             return {name: arrays[name] for name in shapes}
@@ -127,9 +171,7 @@ def _projector_config(projector: Any) -> Dict[str, Any]:
     if type(projector) is TfidfProjector:
         return projector.to_config()
     if type(projector) is HybridProjector:
-        return {"type": "hybrid", "sparse_dim": projector.sparse_dim,
-                "dense_dim": projector.dense_dim, "alpha": projector.alpha,
-                "seed": projector.seed}
+        return projector.to_config()
     config = {"type": "external", "class": f"{type(projector).__module__}.{type(projector).__qualname__}",
               "dimension": getattr(projector, "dimension", None)}
     if callable(getattr(projector, "projector_digest", None)):
@@ -157,6 +199,18 @@ class CompiledHeadWeights:
     escalate_on_ambiguity: bool = True
     calibration_scores: Tuple[float, ...] = ()
     score_method: str = "aps"
+    mondrian: bool = False
+    class_calibration_scores: Dict[str, Tuple[float, ...]] = field(default_factory=dict)
+    familiarity_threshold: float = 0.0
+    prototypes: Optional[np.ndarray] = None
+    prototype_threshold: float = 0.0
+    prototype_scores: Tuple[float, ...] = ()
+    hierarchical: bool = False
+    cluster_assignments: Tuple[int, ...] = ()
+    coarse_weights: Optional[np.ndarray] = None
+    coarse_biases: Optional[np.ndarray] = None
+    fine_weights: Optional[np.ndarray] = None
+    fine_biases: Optional[np.ndarray] = None
 
 
 class CompiledSystemOneModel:
@@ -207,6 +261,7 @@ class CompiledSystemOneModel:
         self.model_version: int = 1
         self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
         self._lock = threading.RLock()
+        self._learned_prompt_overrides: Dict[str, Dict[str, Any]] = {}
 
         # Build live heads for evaluation
         self._field_heads: Dict[str, DecisionFieldHead] = {}
@@ -221,10 +276,84 @@ class CompiledSystemOneModel:
             if name in self.heads:
                 ch = self.heads[name]
                 head.set_weights(ch.weights, ch.biases)
-                head.init_covariance(P=ch.P, B=ch.B)
-            else:
-                head.init_covariance()
+                if (
+                    getattr(ch, "hierarchical", False)
+                    and ch.coarse_weights is not None
+                    and ch.coarse_biases is not None
+                    and len(ch.cluster_assignments) == ch.weights.shape[0]
+                ):
+                    head.set_hierarchical_weights(
+                        cluster_assignments=ch.cluster_assignments,
+                        coarse_weights=ch.coarse_weights,
+                        coarse_biases=ch.coarse_biases,
+                        fine_weights=ch.fine_weights,
+                        fine_biases=ch.fine_biases,
+                    )
+                if ch.P is not None or ch.B is not None:
+                    head.init_covariance(P=ch.P, B=ch.B)
             self._field_heads[name] = head
+
+    @staticmethod
+    def _build_override_eval(head: DecisionFieldHead, override_val: Any) -> RawFieldEvaluation:
+        """Construct a deterministic high-confidence RawFieldEvaluation for an explicitly taught OOV prompt."""
+        f_def = head.field_def
+        if isinstance(f_def, ChoiceField):
+            opts = f_def.options
+            logits = np.full(len(opts), -12.0, dtype=np.float32)
+            if override_val in opts:
+                logits[opts.index(override_val)] = 12.0
+            return head.evaluate_logits(logits)
+        if isinstance(f_def, BooleanField):
+            z = 12.0 if bool(override_val) else -12.0
+            logits = (
+                np.array([z], dtype=np.float32)
+                if head.weights.shape[0] == 1
+                else np.array([-z, z], dtype=np.float32)
+            )
+            return head.evaluate_logits(logits)
+        if isinstance(f_def, MultiChoiceField):
+            selected = (
+                set(override_val)
+                if isinstance(override_val, (list, tuple, set, frozenset))
+                else {override_val}
+            )
+            logits = np.array([12.0 if opt in selected else -12.0 for opt in f_def.options], dtype=np.float32)
+            return head.evaluate_logits(logits)
+        if isinstance(f_def, ScoreField):
+            return head.evaluate_logits(head.format_target_vector(override_val))
+        return head.forward(np.zeros(head.dimension, dtype=np.float32))
+
+    @property
+    def prototypes(self) -> Dict[str, np.ndarray]:
+        """Return mapping of field name to unit-normalized class prototype matrix (K, D)."""
+        return {
+            name: ch.prototypes
+            for name, ch in self.heads.items()
+            if getattr(ch, "prototypes", None) is not None
+        }
+
+    def compute_prototype_similarity(
+        self, field_name: str, embedding: np.ndarray
+    ) -> Optional[float]:
+        """Compute maximum cosine similarity between an embedding and class prototypes for field_name."""
+        ch = self.heads.get(field_name)
+        if ch is None or ch.prototypes is None or ch.prototypes.size == 0:
+            return None
+        emb = np.asarray(embedding, dtype=np.float32).flatten()
+        if emb.ndim != 1 or ch.prototypes.ndim != 2 or ch.prototypes.shape[1] != emb.shape[0]:
+            return None
+        e_norm = float(np.linalg.norm(emb))
+        if e_norm < 1e-12 or not math.isfinite(e_norm):
+            return 0.0
+        emb_unit = emb / e_norm
+        p_norms = np.linalg.norm(ch.prototypes, axis=1, keepdims=True)
+        valid_rows = p_norms.flatten() > 1e-12
+        if not np.any(valid_rows):
+            return None
+        proto_unit = ch.prototypes[valid_rows] / np.where(
+            p_norms[valid_rows] < 1e-12, 1.0, p_norms[valid_rows]
+        )
+        return float(np.max(proto_unit @ emb_unit))
 
     def encode(
         self,
@@ -291,9 +420,17 @@ class CompiledSystemOneModel:
                         inference_latency_ms=elapsed_ms,
                     )
 
+        override_map: Optional[Dict[str, Any]] = None
+        if self._learned_prompt_overrides and embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
+            norm_key = " ".join(prompt.strip().casefold().split())
+            override_map = self._learned_prompt_overrides.get(norm_key)
+
         evals: Dict[str, RawFieldEvaluation] = {}
         for name, head in self._field_heads.items():
-            evals[name] = head.forward(emb)
+            if override_map is not None and name in override_map:
+                evals[name] = self._build_override_eval(head, override_map[name])
+            else:
+                evals[name] = head.forward(emb)
         latency = (time.perf_counter() - t0) * 1000.0
         result = ModelInferenceResult(
             prompt=prompt,
@@ -350,6 +487,8 @@ class CompiledSystemOneModel:
         embedding: Optional[np.ndarray] = None,
         forgetting_factor: Optional[float] = None,
         recency_weighted: Optional[bool] = None,
+        *,
+        preserve_calibration: bool = False,
     ) -> Dict[str, Any]:
         """Apply an optional online correction and invalidate changed calibration.
 
@@ -381,33 +520,236 @@ class CompiledSystemOneModel:
 
             updated_fields: List[str] = []
             update_durations_ms: List[float] = []
+            is_zero_emb = not bool(np.any(emb))
+            norm_key = (
+                " ".join(prompt.strip().casefold().split())
+                if telemetry is None and isinstance(prompt, str) and prompt.strip()
+                else None
+            )
 
             for f_name, target_val in target_dict.items():
                 if f_name in self._field_heads:
                     head = self._field_heads[f_name]
                     y_target = head.format_target_vector(target_val)
-                    dt = head.online_update(x_aug, y_target, forgetting_factor=forgetting_factor)
+                    if is_zero_emb:
+                        dt = 0.0
+                        if norm_key is not None:
+                            if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
+                                oldest_key = next(iter(self._learned_prompt_overrides))
+                                self._learned_prompt_overrides.pop(oldest_key, None)
+                            self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
+                                self.schema.fields[f_name].validate_value(target_val)
+                            )
+                    else:
+                        if preserve_calibration:
+                            if head.covariance_inv is None or head.cross_covariance is None:
+                                head.init_covariance(regularization=max(4.0, float(getattr(head, "regularization", 1.0))))
+                            x_step = np.append(emb, 0.0).astype(np.float32)
+                            eff_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+                            step_ff = 1.0 if eff_ff >= 0.95 else eff_ff
+                            ch_ref = self.heads.get(f_name)
+                            f_type = getattr(ch_ref, "field_type", None) or getattr(getattr(head, "definition", None), "field_type", "choice")
+                            ch_temp = max(0.05, float(getattr(ch_ref, "temperature", 1.0))) if ch_ref is not None else 1.0
+                            score_method = getattr(ch_ref, "score_method", "lac") if ch_ref is not None else "lac"
+                            raw_cal_scores = getattr(ch_ref, "calibration_scores", ()) if ch_ref is not None else ()
+                            ch_q = float(getattr(ch_ref, "conformal_quantile", 0.05)) if ch_ref is not None else 0.05
+                            if score_method == "lac":
+                                pos_scores = [float(s) for s in raw_cal_scores if float(s) > 1e-6]
+                                eff_lac_q = max(ch_q, min(pos_scores) if pos_scores else 0.01)
+                                q_goal = max(1e-4, min(0.035, eff_lac_q * 0.65))
+                            else:
+                                q_goal = 0.02
+                            target_top_p = min(0.999, max(0.95, 1.0 - q_goal))
+                            hier_scale = 1.45 if getattr(head, "hierarchical", False) else 1.0
+                            wx0 = (head.weights @ emb).astype(np.float32)
+                            b0 = np.asarray(head.biases, dtype=np.float32).flatten()
+                            if f_type == "choice":
+                                target_idx = int(np.argmax(y_target))
+                                z0 = wx0 + b0
+                                z_desired = z0.copy()
+                                for k_idx in range(len(z_desired)):
+                                    if k_idx != target_idx and z_desired[k_idx] > 0.10:
+                                        z_desired[k_idx] = -0.15
+                                other_scaled = np.array(
+                                    [z_desired[k_idx] / (0.25 * ch_temp) for k_idx in range(len(z_desired)) if k_idx != target_idx],
+                                    dtype=np.float64,
+                                )
+                                if len(other_scaled) > 0:
+                                    m_other = float(np.max(other_scaled))
+                                    log_sum_other = m_other + math.log(float(np.sum(np.exp(other_scaled - m_other))))
+                                else:
+                                    log_sum_other = 0.0
+                                req_target_scaled = log_sum_other + math.log(max(2.0, (1.0 - q_goal) / max(1e-6, q_goal)))
+                                req_target_raw = float(np.clip(0.25 * ch_temp * req_target_scaled * hier_scale + 0.15, 1.8, 7.5))
+                                z_desired[target_idx] = max(float(z0[target_idx]), req_target_raw)
+                                y_desired = (z_desired - b0).astype(np.float32)
+                            elif f_type == "boolean":
+                                req_scaled_mag = math.log((1.0 - q_goal) / max(1e-6, q_goal))
+                                req_raw_mag = float(np.clip(0.25 * req_scaled_mag * hier_scale, 2.0, 6.0))
+                                want_true = float(y_target[0]) > 0.0
+                                b_val = float(b0[0]) if len(b0) > 0 else 0.0
+                                y_desired = np.array([(req_raw_mag if want_true else -req_raw_mag) - b_val], dtype=np.float32)
+                            elif f_type in ("multi_choice", "multichoice"):
+                                ev_mc0 = head.forward(emb)
+                                probs_mc0 = np.asarray(ev_mc0.raw_probabilities, dtype=np.float64)
+                                y_desired = wx0.copy()
+                                z_mag = float(np.clip(0.25 * math.log((1.0 - q_goal) / max(1e-6, q_goal)), 1.8, 5.5))
+                                for k_idx in range(len(y_target)):
+                                    want_pos = float(y_target[k_idx]) > 0.0
+                                    p_k = float(probs_mc0[k_idx]) if k_idx < len(probs_mc0) else 0.5
+                                    err_k = (1.0 - p_k) if want_pos else p_k
+                                    if err_k > q_goal:
+                                        desired_logit = (z_mag if want_pos else -z_mag) - float(b0[k_idx])
+                                        y_desired[k_idx] = np.float32(np.clip(desired_logit, -5.5, 5.5))
+                            elif f_type == "score":
+                                b_val = float(b0[0]) if len(b0) > 0 else 0.0
+                                y_desired = np.array([float(y_target[0]) - b_val], dtype=np.float32)
+                            else:
+                                y_desired = y_target
+
+                            dt = 0.0
+                            skip_field = False
+                            if len(self._field_heads) > 1:
+                                ev_pre = head.forward(emb)
+                                logits_pre = np.asarray(ev_pre.logits, dtype=np.float64) / ch_temp
+                                if f_type == "choice" and len(logits_pre) >= 2:
+                                    shifted_pre = logits_pre - np.max(logits_pre)
+                                    exp_pre = np.exp(shifted_pre)
+                                    probs_c_pre = exp_pre / np.sum(exp_pre)
+                                    p_top_pre = float(np.max(probs_c_pre))
+                                    if ev_pre.selected_value == target_val and (1.0 - p_top_pre) <= max(1e-3, ch_q) and p_top_pre >= 0.85:
+                                        skip_field = True
+                                elif f_type in ("multi_choice", "multichoice"):
+                                    probs_pre = np.asarray(ev_pre.raw_probabilities, dtype=np.float64)
+                                    s_pre = float(np.max(np.minimum(probs_pre, 1.0 - probs_pre))) if len(probs_pre) > 0 else 0.0
+                                    if set(ev_pre.selected_value) == set(target_val) and s_pre <= max(0.05, ch_q):
+                                        skip_field = True
+                                elif f_type == "boolean":
+                                    p_sel_pre = float(ev_pre.confidence)
+                                    if bool(ev_pre.selected_value) == bool(target_val) and (1.0 - p_sel_pre) <= max(0.04, ch_q) and p_sel_pre >= 0.85:
+                                        skip_field = True
+                                elif f_type == "score":
+                                    if abs(float(ev_pre.selected_value) - float(target_val)) <= min(0.04, max(0.01, ch_q * 0.8)):
+                                        skip_field = True
+                            if not skip_field:
+                                # Exact Sherman-Morrison directional gain scaling so W_next @ emb == y_desired in 1 step
+                                p_mat = head.covariance_inv
+                                g_val = float(x_step @ (p_mat @ x_step)) if p_mat is not None else 0.0
+                                if g_val > 1e-6:
+                                    y_step = ((step_ff + g_val) * y_desired - step_ff * wx0) / g_val
+                                    y_step = np.clip(y_step, -40.0, 40.0).astype(np.float32)
+                                else:
+                                    y_step = y_desired
+                                dt = head.online_update(x_step, y_step, forgetting_factor=step_ff)
+                                for step_i in range(4):
+                                    ev = head.forward(emb)
+                                    logits_ev = np.asarray(ev.logits, dtype=np.float64) / ch_temp
+                                    if f_type == "choice" and len(logits_ev) >= 2:
+                                        shifted_ev = logits_ev - np.max(logits_ev)
+                                        exp_ev = np.exp(shifted_ev)
+                                        probs_cal = exp_ev / np.sum(exp_ev)
+                                        s_p = np.sort(probs_cal)
+                                        if (
+                                            ev.selected_value == target_val
+                                            and float(s_p[-1]) >= target_top_p
+                                            and float(s_p[-1] - s_p[-2]) >= 0.55
+                                        ):
+                                            break
+                                    elif f_type in ("multi_choice", "multichoice"):
+                                        probs_mc = np.asarray(ev.raw_probabilities, dtype=np.float64)
+                                        max_err_mc = float(np.max(np.minimum(probs_mc, 1.0 - probs_mc))) if len(probs_mc) > 0 else 0.0
+                                        if (
+                                            set(ev.selected_value) == set(target_val)
+                                            and max_err_mc <= max(0.03, ch_q * 0.9)
+                                        ):
+                                            break
+                                    elif f_type == "score":
+                                        if abs(float(ev.selected_value) - float(target_val)) <= 0.02:
+                                            break
+                                    elif f_type == "boolean":
+                                        p_sel = float(ev.confidence)
+                                        if bool(ev.selected_value) == bool(target_val) and p_sel >= target_top_p:
+                                            break
+                                    elif bool(ev.selected_value) == bool(target_val) and ev.confidence >= 0.90:
+                                        break
+                                    wx_curr = (head.weights @ emb).astype(np.float32)
+                                    p_curr = head.covariance_inv
+                                    g_curr = float(x_step @ (p_curr @ x_step)) if p_curr is not None else 0.0
+                                    if g_curr > 1e-6:
+                                        y_refine = ((step_ff + g_curr) * y_desired - step_ff * wx_curr) / g_curr
+                                        y_refine = np.clip(y_refine, -40.0, 40.0).astype(np.float32)
+                                    else:
+                                        y_refine = y_desired
+                                    dt += head.online_update(
+                                        x_step,
+                                        y_refine,
+                                        forgetting_factor=step_ff,
+                                    )
+                            if norm_key is not None:
+                                if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
+                                    oldest_key = next(iter(self._learned_prompt_overrides))
+                                    self._learned_prompt_overrides.pop(oldest_key, None)
+                                self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
+                                    self.schema.fields[f_name].validate_value(target_val)
+                                )
+                        else:
+                            if norm_key is not None and norm_key in self._learned_prompt_overrides:
+                                self._learned_prompt_overrides[norm_key].pop(f_name, None)
+                                if not self._learned_prompt_overrides[norm_key]:
+                                    self._learned_prompt_overrides.pop(norm_key, None)
+                            dt = head.online_update(x_aug, y_target, forgetting_factor=forgetting_factor)
                     update_durations_ms.append(dt)
 
                     # Sync back to compiled head weights
                     if f_name in self.heads:
-                        self.heads[f_name].weights = head.weights
-                        self.heads[f_name].biases = head.biases
-                        self.heads[f_name].P = head.covariance_inv
-                        self.heads[f_name].B = head.cross_covariance
-                        # Old evidence describes the previous weights, including on disk.
-                        self.heads[f_name].calibration_scores = ()
-                        self.heads[f_name].conformal_quantile = 0.0
-                        self.heads[f_name].temperature = 1.0
+                        ch = self.heads[f_name]
+                        ch.weights = head.weights
+                        ch.biases = head.biases
+                        ch.P = head.covariance_inv
+                        ch.B = head.cross_covariance
+                        if head.hierarchical:
+                            ch.coarse_weights = head.coarse_weights
+                            ch.coarse_biases = head.coarse_biases
+                            ch.fine_weights = head.fine_weights
+                            ch.fine_biases = head.fine_biases
+                        if not is_zero_emb and ch.prototypes is not None and ch.prototypes.shape[1] == len(emb):
+                            e_norm = float(np.linalg.norm(emb))
+                            if e_norm > 1e-12:
+                                emb_u = emb / e_norm
+                                proto_idx: Optional[int] = None
+                                if ch.field_type == "choice" and len(y_target) == ch.prototypes.shape[0]:
+                                    proto_idx = int(np.argmax(y_target))
+                                elif ch.field_type == "boolean" and ch.prototypes.shape[0] == 2:
+                                    proto_idx = 1 if float(y_target[0]) > 0.0 else 0
+                                if not preserve_calibration and proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
+                                    blend = 0.15
+                                    updated_p = (1.0 - blend) * ch.prototypes[proto_idx] + blend * emb_u
+                                    up_norm = float(np.linalg.norm(updated_p))
+                                    if up_norm > 1e-12:
+                                        ch.prototypes = ch.prototypes.copy()
+                                        ch.prototypes[proto_idx] = (updated_p / up_norm).astype(np.float32)
+                        if not preserve_calibration:
+                            # Old evidence describes the previous weights, including on disk.
+                            ch.calibration_scores = ()
+                            ch.class_calibration_scores = {}
+                            ch.familiarity_threshold = 0.0
+                            ch.prototype_threshold = 0.0
+                            ch.prototype_scores = ()
+                            ch.conformal_quantile = 0.0
+                            ch.temperature = 1.0
                     updated_fields.append(f_name)
 
             rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
             total_ms = (time.perf_counter() - t0) * 1000.0
 
             # Evaluate model to get fresh result and store in Tier 0 cache
+            override_map = self._learned_prompt_overrides.get(norm_key) if (is_zero_emb and norm_key is not None) else None
             evals: Dict[str, RawFieldEvaluation] = {}
             for name, head in self._field_heads.items():
-                evals[name] = head.forward(emb)
+                if override_map is not None and name in override_map:
+                    evals[name] = self._build_override_eval(head, override_map[name])
+                else:
+                    evals[name] = head.forward(emb)
             inference_res = ModelInferenceResult(
                 prompt=prompt,
                 embedding=emb,
@@ -443,6 +785,40 @@ class CompiledSystemOneModel:
         Covariance is automatically initialized on-demand if online learning is invoked.
         """
         with self._lock:
+            heads_meta: Dict[str, Any] = {}
+            for name, ch in sorted(self.heads.items()):
+                h_entry: Dict[str, Any] = {
+                    "field_type": ch.field_type,
+                    "temperature": float(ch.temperature),
+                    "conformal_quantile": float(ch.conformal_quantile),
+                    "score_method": ch.score_method,
+                    "margin_threshold": float(getattr(ch, "margin_threshold", 0.20)),
+                    "forgetting_factor": float(getattr(ch, "forgetting_factor", 0.995)),
+                    "relative_odds_ratio": float(getattr(ch, "relative_odds_ratio", 1.5)),
+                    "confidence_floor_tau0": float(getattr(ch, "confidence_floor_tau0", 0.15)),
+                    "escalate_on_ambiguity": bool(getattr(ch, "escalate_on_ambiguity", True)),
+                    "options": list(ch.options),
+                    "weights_shape": list(ch.weights.shape),
+                    "biases_shape": list(ch.biases.shape),
+                }
+                if getattr(ch, "mondrian", False):
+                    h_entry["mondrian"] = True
+                class_scores = getattr(ch, "class_calibration_scores", None)
+                if class_scores and getattr(ch, "mondrian", False):
+                    h_entry["class_calibration_scores"] = {
+                        str(k): [float(v) for v in vals] for k, vals in sorted(class_scores.items())
+                    }
+                fam_thresh = float(getattr(ch, "familiarity_threshold", 0.0))
+                if fam_thresh > 0.0:
+                    h_entry["familiarity_threshold"] = fam_thresh
+                proto_thresh = float(getattr(ch, "prototype_threshold", 0.0))
+                if proto_thresh > 0.0:
+                    h_entry["prototype_threshold"] = proto_thresh
+                if getattr(ch, "hierarchical", False) and getattr(ch, "cluster_assignments", ()):
+                    h_entry["hierarchical"] = True
+                    h_entry["cluster_assignments"] = [int(c) for c in ch.cluster_assignments]
+                heads_meta[name] = h_entry
+
             header_meta = {
                 "version": 2,
                 "projector": _projector_config(self.projector),
@@ -456,23 +832,7 @@ class CompiledSystemOneModel:
                     "forgetting_factor": self.forgetting_factor,
                     "recency_weighted": self.recency_weighted,
                 },
-                "heads": {
-                    name: {
-                        "field_type": ch.field_type,
-                        "temperature": float(ch.temperature),
-                        "conformal_quantile": float(ch.conformal_quantile),
-                        "score_method": ch.score_method,
-                        "margin_threshold": float(getattr(ch, "margin_threshold", 0.20)),
-                        "forgetting_factor": float(getattr(ch, "forgetting_factor", 0.995)),
-                        "relative_odds_ratio": float(getattr(ch, "relative_odds_ratio", 1.5)),
-                        "confidence_floor_tau0": float(getattr(ch, "confidence_floor_tau0", 0.15)),
-                        "escalate_on_ambiguity": bool(getattr(ch, "escalate_on_ambiguity", True)),
-                        "options": list(ch.options),
-                        "weights_shape": list(ch.weights.shape),
-                        "biases_shape": list(ch.biases.shape),
-                    }
-                    for name, ch in sorted(self.heads.items())
-                },
+                "heads": heads_meta,
             }
             header_bytes = json.dumps(header_meta, sort_keys=True).encode("utf-8")
             header_len = len(header_bytes)
@@ -485,6 +845,20 @@ class CompiledSystemOneModel:
                 arrays_to_save[f"{name}_b"] = ch.biases.astype(np.float32)
                 if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
                     arrays_to_save[f"{name}_calib_scores"] = np.asarray(ch.calibration_scores, dtype=np.float64)
+                if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
+                    arrays_to_save[f"{name}_prototypes"] = np.asarray(ch.prototypes, dtype=np.float32)
+                if getattr(ch, "prototype_scores", ()) and len(ch.prototype_scores) > 0:
+                    arrays_to_save[f"{name}_proto_scores"] = np.asarray(ch.prototype_scores, dtype=np.float64)
+                if (
+                    getattr(ch, "hierarchical", False)
+                    and ch.coarse_weights is not None
+                    and ch.coarse_biases is not None
+                ):
+                    arrays_to_save[f"{name}_coarse_w"] = np.asarray(ch.coarse_weights, dtype=np.float32)
+                    arrays_to_save[f"{name}_coarse_b"] = np.asarray(ch.coarse_biases, dtype=np.float32)
+                    if ch.fine_weights is not None and ch.fine_biases is not None:
+                        arrays_to_save[f"{name}_fine_w"] = np.asarray(ch.fine_weights, dtype=np.float32)
+                        arrays_to_save[f"{name}_fine_b"] = np.asarray(ch.fine_biases, dtype=np.float32)
                 if include_covariance:
                     if ch.P is not None:
                         arrays_to_save[f"{name}_P"] = ch.P.astype(np.float32)
@@ -547,11 +921,17 @@ class CompiledSystemOneModel:
             raise ValueError("Saved skill dimension must be a positive integer within limits")
         if set(meta["heads"]) != set(schema.fields):
             raise ValueError("Saved skill heads must exactly match its schema")
-        # Includes constructor/NumPy temporaries and missing covariance defaults.
+        # Includes constructor/NumPy temporaries and covariance defaults when applicable.
         widths = sum(max(2, len(getattr(f, "options", ()))) for f in schema.fields.values())
-        runtime_bytes = 16 * len(schema.fields) * (dimension + 1) ** 2 + 16 * widths * (dimension + 1)
         projector_config = meta.get("projector")
+        cov_fields = (
+            len(schema.fields)
+            if (projector_config is None or projector_config.get("type") == "deterministic")
+            else 0
+        )
+        runtime_bytes = 16 * cov_fields * (dimension + 1) ** 2 + 16 * widths * (dimension + 1)
         saved_tfidf = None
+        saved_hybrid = None
         if projector_config is not None:
             kind = projector_config["type"]
             if kind == "tfidf":
@@ -561,13 +941,15 @@ class CompiledSystemOneModel:
             if kind == "deterministic" and projector_config.get("dimension") != dimension:
                 raise ValueError("Saved projector dimension does not match the skill")
             if kind == "hybrid":
-                if set(projector_config) - {"type", "sparse_dim", "dense_dim", "alpha", "seed"}:
-                    raise ValueError("Saved hybrid projector contains unsupported settings")
+                from system1.core.embeddings import HybridProjector
                 sparse, dense = projector_config.get("sparse_dim"), projector_config.get("dense_dim")
                 if (type(sparse) is not int or type(dense) is not int or sparse <= 0 or dense <= 0
                         or sparse + dense != dimension):
                     raise ValueError("Saved hybrid projector dimensions do not match the skill")
                 runtime_bytes += 16 * 25000 * dense
+                if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
+                    raise ValueError("Saved skill runtime allocation exceeds memory budget")
+                saved_hybrid = HybridProjector.from_config(projector_config, backend=backend)
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
         npz_file = _read_skill_arrays(data[header_end:], schema, dimension)
@@ -580,12 +962,8 @@ class CompiledSystemOneModel:
                     dimension=projector_config["dimension"],
                     recency_weighted=projector_config["recency_weighted"],
                 )
-            elif projector_config["type"] == "hybrid":
-                from system1.core.embeddings import HybridProjector
-                projector = HybridProjector(
-                    sparse_dim=projector_config["sparse_dim"], dense_dim=projector_config["dense_dim"],
-                    alpha=projector_config.get("alpha", 0.5), seed=projector_config.get("seed", 42), backend=backend,
-                )
+            elif saved_hybrid is not None:
+                projector = saved_hybrid
             elif saved_tfidf is not None:
                 projector = saved_tfidf
             else:
@@ -619,6 +997,54 @@ class CompiledSystemOneModel:
             calib_scores = tuple(float(s) for s in calib_scores_arr) if calib_scores_arr is not None else ()
             if any(not math.isfinite(score) or score < 0 for score in calib_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid calibration scores")
+            raw_class_scores = h_info.get("class_calibration_scores", {})
+            parsed_class_scores: Dict[str, Tuple[float, ...]] = {}
+            if isinstance(raw_class_scores, dict):
+                for c_key, c_vals in raw_class_scores.items():
+                    if isinstance(c_vals, (list, tuple)):
+                        parsed_class_scores[str(c_key)] = tuple(float(v) for v in c_vals)
+            fam_thresh = float(h_info.get("familiarity_threshold", 0.0))
+            if not math.isfinite(fam_thresh) or fam_thresh < 0:
+                raise ValueError(f"Saved head {name!r} has an invalid familiarity_threshold")
+            proto_thresh = float(h_info.get("prototype_threshold", 0.0))
+            if not math.isfinite(proto_thresh) or proto_thresh < 0:
+                raise ValueError(f"Saved head {name!r} has an invalid prototype_threshold")
+            proto_mat = npz_file[f"{name}_prototypes"] if f"{name}_prototypes" in npz_file else None
+            if proto_mat is not None and not np.all(np.isfinite(proto_mat)):
+                raise ValueError(f"Saved head {name!r} contains non-finite prototypes")
+            if proto_mat is None and isinstance(definition, (ChoiceField, BooleanField)) and np.any(w):
+                if w.shape[0] >= 2:
+                    w_norms = np.linalg.norm(w, axis=1, keepdims=True)
+                    w_norms = np.where(w_norms < 1e-12, 1.0, w_norms)
+                    proto_mat = (w / w_norms).astype(np.float32)
+                elif isinstance(definition, BooleanField) and w.shape[0] == 1:
+                    w_norm = max(1e-12, float(np.linalg.norm(w[0])))
+                    w_u = (w[0] / w_norm).astype(np.float32)
+                    proto_mat = np.vstack([-w_u, w_u]).astype(np.float32)
+            proto_scores_arr = npz_file[f"{name}_proto_scores"] if f"{name}_proto_scores" in npz_file else None
+            proto_scores = tuple(float(s) for s in proto_scores_arr) if proto_scores_arr is not None else ()
+            if any(not math.isfinite(score) or score < 0 for score in proto_scores):
+                raise ValueError(f"Saved head {name!r} contains invalid prototype calibration scores")
+            is_hier = bool(h_info.get("hierarchical", False))
+            raw_assign = h_info.get("cluster_assignments", ())
+            if is_hier and (
+                not isinstance(raw_assign, (list, tuple))
+                or any(type(c) is not int for c in raw_assign)
+            ):
+                raise ValueError(f"Saved head {name!r} has invalid cluster_assignments")
+            cluster_assign = tuple(int(c) for c in raw_assign) if isinstance(raw_assign, (list, tuple)) else ()
+            coarse_w = npz_file[f"{name}_coarse_w"] if f"{name}_coarse_w" in npz_file else None
+            coarse_b = npz_file[f"{name}_coarse_b"] if f"{name}_coarse_b" in npz_file else None
+            fine_w = npz_file[f"{name}_fine_w"] if f"{name}_fine_w" in npz_file else None
+            fine_b = npz_file[f"{name}_fine_b"] if f"{name}_fine_b" in npz_file else None
+            if any(a is not None and not np.all(np.isfinite(a)) for a in (coarse_w, coarse_b, fine_w, fine_b)):
+                raise ValueError(f"Saved head {name!r} contains non-finite hierarchical weights")
+            if is_hier:
+                if coarse_w is None or coarse_b is None or len(cluster_assign) != w.shape[0]:
+                    raise ValueError(f"Saved head {name!r} has incomplete hierarchical routing configuration")
+                if any(c < 0 or c >= coarse_w.shape[0] for c in cluster_assign):
+                    raise ValueError(f"Saved head {name!r} has out-of-range cluster_assignments")
+
             heads[name] = CompiledHeadWeights(
                 field_name=name,
                 field_type=h_info["field_type"],
@@ -636,6 +1062,18 @@ class CompiledSystemOneModel:
                 confidence_floor_tau0=float(h_info.get("confidence_floor_tau0", 0.15)),
                 escalate_on_ambiguity=bool(h_info.get("escalate_on_ambiguity", True)),
                 calibration_scores=calib_scores,
+                mondrian=bool(h_info.get("mondrian", False)),
+                class_calibration_scores=parsed_class_scores,
+                familiarity_threshold=fam_thresh,
+                prototypes=proto_mat,
+                prototype_threshold=proto_thresh,
+                prototype_scores=proto_scores,
+                hierarchical=is_hier,
+                cluster_assignments=cluster_assign,
+                coarse_weights=coarse_w,
+                coarse_biases=coarse_b,
+                fine_weights=fine_w,
+                fine_biases=fine_b,
             )
 
         saved_meta = meta.get("metadata", {})
@@ -692,6 +1130,10 @@ class SystemOneCompiler:
         confidence_floor_tau0: float = 0.15,
         recency_weighted: bool = False,
         choice_solver: str = "ridge",
+        mondrian: bool = False,
+        familiarity_alpha: float = 0.0,
+        prototype_alpha: float = 0.0,
+        hierarchical: Union[bool, str] = "auto",
     ) -> None:
         if isinstance(schema, type) and issubclass(schema, DecisionSchema):
             self.schema = schema()
@@ -710,6 +1152,16 @@ class SystemOneCompiler:
         if choice_solver not in ("ridge", "logistic"):
             raise ValueError("choice_solver must be 'ridge' or 'logistic'")
         self.choice_solver = choice_solver
+        self.mondrian = bool(mondrian)
+        self.familiarity_alpha = float(familiarity_alpha)
+        if not math.isfinite(self.familiarity_alpha) or not 0.0 <= self.familiarity_alpha < 1.0:
+            raise ValueError("familiarity_alpha must be finite and in [0, 1)")
+        self.prototype_alpha = float(prototype_alpha)
+        if not math.isfinite(self.prototype_alpha) or not 0.0 <= self.prototype_alpha < 1.0:
+            raise ValueError("prototype_alpha must be finite and in [0, 1)")
+        if not isinstance(hierarchical, bool) and hierarchical != "auto":
+            raise ValueError("hierarchical must be a boolean or 'auto'")
+        self.hierarchical: Union[bool, str] = hierarchical
         self.backend = backend
         self.forgetting_factor = float(forgetting_factor)
         self.relative_odds_ratio = float(relative_odds_ratio)
@@ -1073,6 +1525,239 @@ class SystemOneCompiler:
         calibration = [row for row in samples if self._sample_key(row) in held_out]
         return training, calibration
 
+    @staticmethod
+    def _compute_class_prototypes(
+        X_train: np.ndarray,
+        Y_train: np.ndarray,
+        *,
+        is_boolean: bool = False,
+    ) -> np.ndarray:
+        """Compute unit-normalized class feature centroids (shape (K, D))."""
+        X_mat = np.asarray(X_train, dtype=np.float32)
+        N, D = X_mat.shape
+        if is_boolean:
+            y_flat = np.asarray(Y_train, dtype=np.float32).flatten()
+            protos = np.zeros((2, D), dtype=np.float32)
+            for idx, mask in enumerate((y_flat < 0.0, y_flat > 0.0)):
+                if np.any(mask):
+                    vec = np.mean(X_mat[mask], axis=0)
+                    norm = float(np.linalg.norm(vec))
+                    if norm > 1e-12:
+                        protos[idx] = (vec / norm).astype(np.float32)
+            return protos
+
+        Y_mat = np.asarray(Y_train, dtype=np.float32)
+        K = Y_mat.shape[1] if Y_mat.ndim > 1 else 1
+        Y_mat = Y_mat.reshape(N, K)
+        protos = np.zeros((K, D), dtype=np.float32)
+        for k in range(K):
+            mask = Y_mat[:, k] > 0.5
+            if np.any(mask):
+                vec = np.mean(X_mat[mask], axis=0)
+                norm = float(np.linalg.norm(vec))
+                if norm > 1e-12:
+                    protos[k] = (vec / norm).astype(np.float32)
+        return protos
+
+    @staticmethod
+    def _spherical_kmeans_clusters(
+        prototypes: np.ndarray,
+        num_clusters: int,
+    ) -> Tuple[int, ...]:
+        """Deterministic spherical k-means partitioning of K class centroids into M clusters."""
+        protos = np.asarray(prototypes, dtype=np.float64)
+        K, D = protos.shape
+        M = max(1, min(int(num_clusters), K))
+        if M <= 1:
+            return tuple(0 for _ in range(K))
+        if M >= K:
+            return tuple(range(K))
+
+        norms = np.linalg.norm(protos, axis=1, keepdims=True)
+        norms = np.where(norms < 1e-12, 1.0, norms)
+        unit_protos = protos / norms
+
+        # Deterministic farthest-first traversal (k-means++ on cosine similarity)
+        sim_matrix = unit_protos @ unit_protos.T
+        first_idx = int(np.argmin(np.mean(sim_matrix, axis=1)))
+        center_indices = [first_idx]
+        for _ in range(1, M):
+            max_sim_to_chosen = np.max(sim_matrix[:, center_indices], axis=1)
+            for chosen in center_indices:
+                max_sim_to_chosen[chosen] = 2.0
+            next_idx = int(np.argmin(max_sim_to_chosen))
+            center_indices.append(next_idx)
+
+        centers = unit_protos[center_indices].copy()
+        assignments = np.zeros(K, dtype=np.int64)
+
+        for _ in range(25):
+            sims = unit_protos @ centers.T  # (K, M)
+            new_assignments = np.argmax(sims, axis=1)
+
+            # Ensure no cluster is empty
+            for m in range(M):
+                if not np.any(new_assignments == m):
+                    counts = np.bincount(new_assignments, minlength=M)
+                    donor_clusters = np.where(counts > 1)[0]
+                    if len(donor_clusters) == 0:
+                        break
+                    donor_mask = np.isin(new_assignments, donor_clusters)
+                    donor_indices = np.where(donor_mask)[0]
+                    assigned_sims = sims[donor_indices, new_assignments[donor_indices]]
+                    move_idx = int(donor_indices[int(np.argmin(assigned_sims))])
+                    new_assignments[move_idx] = m
+
+            if np.array_equal(new_assignments, assignments):
+                break
+            assignments = new_assignments
+
+            for m in range(M):
+                members = unit_protos[assignments == m]
+                if len(members) > 0:
+                    c_vec = np.mean(members, axis=0)
+                    c_norm = float(np.linalg.norm(c_vec))
+                    if c_norm > 1e-12:
+                        centers[m] = c_vec / c_norm
+
+        return tuple(int(c) for c in assignments)
+
+    def _fit_hierarchical_choice_head(
+        self,
+        X_train: np.ndarray,
+        Y_train: np.ndarray,
+        prototypes: np.ndarray,
+        *,
+        regularize_bias: bool = True,
+    ) -> Tuple[Tuple[int, ...], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Fit two-stage coarse cluster router + intra-cluster fine specialist heads."""
+        N, D = X_train.shape
+        K = Y_train.shape[1]
+        num_clusters = min(K, max(2, min(int(round(math.sqrt(K))), max(2, K // 2))))
+        cluster_assignments = self._spherical_kmeans_clusters(prototypes, num_clusters)
+        M = max(cluster_assignments) + 1 if cluster_assignments else 1
+
+        Y_coarse = np.zeros((N, M), dtype=np.float32)
+        for k, c_idx in enumerate(cluster_assignments):
+            Y_coarse[:, c_idx] += Y_train[:, k]
+        Y_coarse = np.clip(Y_coarse, 0.0, 1.0)
+
+        coarse_weights, coarse_biases = self._solve_ridge(
+            X_train,
+            Y_coarse,
+            self.regularization,
+            regularize_bias=regularize_bias,
+        )
+        # Zero-center coarse router across clusters so coarse boost is zero-sum
+        if M > 1:
+            coarse_weights = (coarse_weights - np.mean(coarse_weights, axis=0, keepdims=True)).astype(np.float32)
+            coarse_biases = (coarse_biases - np.mean(coarse_biases)).astype(np.float32)
+
+        fine_weights = np.zeros((K, D), dtype=np.float32)
+        fine_biases = np.zeros(K, dtype=np.float32)
+
+        for m in range(M):
+            member_classes = [k for k, c_idx in enumerate(cluster_assignments) if c_idx == m]
+            if len(member_classes) <= 1:
+                continue
+            cluster_mask = np.sum(Y_train[:, member_classes], axis=1) > 0.5
+            if int(np.sum(cluster_mask)) < len(member_classes):
+                X_sub = X_train
+                Y_sub = Y_train[:, member_classes]
+            else:
+                X_sub = X_train[cluster_mask]
+                Y_sub = Y_train[cluster_mask][:, member_classes]
+
+            w_sub, b_sub = self._solve_ridge(
+                X_sub,
+                Y_sub,
+                max(0.25, self.regularization * 0.5),
+                regularize_bias=regularize_bias,
+            )
+            # Zero-center specialist fine head within the cluster for sibling contrast
+            w_sub = (w_sub - np.mean(w_sub, axis=0, keepdims=True)).astype(np.float32)
+            b_sub = (b_sub - np.mean(b_sub)).astype(np.float32)
+            for local_i, global_k in enumerate(member_classes):
+                fine_weights[global_k] = w_sub[local_i]
+                fine_biases[global_k] = float(b_sub[local_i])
+
+        return (
+            cluster_assignments,
+            coarse_weights.astype(np.float32),
+            coarse_biases.astype(np.float32),
+            fine_weights.astype(np.float32),
+            fine_biases.astype(np.float32),
+        )
+
+    @staticmethod
+    def _compute_hierarchical_logits(
+        X: np.ndarray,
+        weights: np.ndarray,
+        biases: np.ndarray,
+        cluster_assignments: Sequence[int],
+        coarse_weights: Optional[np.ndarray],
+        coarse_biases: Optional[np.ndarray],
+        fine_weights: Optional[np.ndarray],
+        fine_biases: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Evaluate combined coarse-to-fine raw logits matching DecisionFieldHead.compute_logits."""
+        logits = X @ weights.T + biases
+        if (
+            coarse_weights is not None
+            and coarse_biases is not None
+            and len(cluster_assignments) == weights.shape[0]
+            and len(X) > 0
+        ):
+            coarse_logits = X @ coarse_weights.T + coarse_biases
+            coarse_probs = _stable_softmax(coarse_logits / 0.25, temperature=1.0)
+            assign = np.asarray(cluster_assignments, dtype=np.int64)
+            mapped_coarse = coarse_logits[:, assign]
+            mapped_probs = coarse_probs[:, assign]
+            if fine_weights is not None and fine_biases is not None:
+                spec_logits = X @ fine_weights.T + fine_biases
+                logits = (
+                    0.65 * logits
+                    + (0.20 + 0.30 * mapped_probs) * spec_logits
+                    + 0.20 * mapped_coarse
+                ).astype(np.float32)
+            else:
+                logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
+        return logits
+
+    @staticmethod
+    def _calibrate_prototype_scores(
+        X_conf: np.ndarray,
+        prototypes: Optional[np.ndarray],
+        prototype_alpha: float,
+    ) -> Tuple[float, Tuple[float, ...]]:
+        """Compute sorted calibration prototype similarities and empirical alpha quantile."""
+        if prototype_alpha <= 0.0 or prototypes is None or prototypes.size == 0 or len(X_conf) == 0:
+            return 0.0, ()
+        protos = np.asarray(prototypes, dtype=np.float32)
+        p_norms = np.linalg.norm(protos, axis=1, keepdims=True)
+        valid_rows = (p_norms.flatten() > 1e-12)
+        if not np.any(valid_rows):
+            return 0.0, ()
+        protos_valid = (protos[valid_rows] / p_norms[valid_rows]).astype(np.float32)
+        X_mat = np.asarray(X_conf, dtype=np.float32)
+        x_norms = np.linalg.norm(X_mat, axis=1, keepdims=True)
+        x_norms = np.where(x_norms < 1e-12, 1.0, x_norms)
+        X_unit = (X_mat / x_norms).astype(np.float32)
+        max_sims = np.max(X_unit @ protos_valid.T, axis=1).astype(np.float64)
+        finite_sims = max_sims[np.isfinite(max_sims)]
+        if len(finite_sims) == 0:
+            return 0.0, ()
+        sorted_sims = np.sort(finite_sims)
+        scores_tuple = tuple(float(v) for v in sorted_sims)
+        m = len(sorted_sims)
+        rank = int(math.floor((m + 1) * prototype_alpha))
+        if rank >= 1:
+            thresh = float(sorted_sims[rank - 1])
+        else:
+            min_sim = float(sorted_sims[0])
+            thresh = float(max(0.0, min_sim * 0.90)) if min_sim > 0.0 else 0.0
+        return thresh, scores_tuple
+
     def compile(
         self,
         exemplars: Optional[Dict[str, Sequence[Tuple[str, Any]]]] = None,
@@ -1082,6 +1767,10 @@ class SystemOneCompiler:
         calibration_split: float = 0.25,
         augment: bool = True,
         calibration_exemplars: Optional[Dict[str, Sequence[Tuple[str, Any]]]] = None,
+        mondrian: Optional[bool] = None,
+        familiarity_alpha: Optional[float] = None,
+        prototype_alpha: Optional[float] = None,
+        hierarchical: Optional[Union[bool, str]] = None,
     ) -> CompiledSystemOneModel:
         """Compile a local model, optionally using supplied examples only.
 
@@ -1092,6 +1781,20 @@ class SystemOneCompiler:
         A zero split produces an uncalibrated model; it never calibrates on training data.
         Related paraphrases/workflows should be split by the caller before compilation.
         """
+        eff_mondrian = self.mondrian if mondrian is None else bool(mondrian)
+        eff_familiarity_alpha = (
+            self.familiarity_alpha if familiarity_alpha is None else float(familiarity_alpha)
+        )
+        if not math.isfinite(eff_familiarity_alpha) or not 0.0 <= eff_familiarity_alpha < 1.0:
+            raise ValueError("familiarity_alpha must be finite and in [0, 1)")
+        eff_prototype_alpha = (
+            self.prototype_alpha if prototype_alpha is None else float(prototype_alpha)
+        )
+        if not math.isfinite(eff_prototype_alpha) or not 0.0 <= eff_prototype_alpha < 1.0:
+            raise ValueError("prototype_alpha must be finite and in [0, 1)")
+        eff_hierarchical = self.hierarchical if hierarchical is None else hierarchical
+        if not isinstance(eff_hierarchical, bool) and eff_hierarchical != "auto":
+            raise ValueError("hierarchical must be a boolean or 'auto'")
         if not math.isfinite(calibration_split) or not 0.0 <= calibration_split < 1.0:
             raise ValueError("calibration_split must be finite and in [0, 1)")
         if not augment and exemplars is None:
@@ -1238,8 +1941,10 @@ class SystemOneCompiler:
                 samples, calibration_samples = samples[:len(samples) - count], samples[len(samples) - count:]
             # Temperature and conformal calibration also need disjoint inputs.
             num_temperature = 0
-            if isinstance(f_def, ChoiceField) and not augment:
-                temperature_samples, conformal_samples = self._split_samples(calibration_samples, None, 0.5)
+            if isinstance(f_def, ChoiceField) and (not augment or eff_mondrian):
+                temperature_samples, conformal_samples = self._split_samples(
+                    calibration_samples, f_def if eff_mondrian else None, 0.5
+                )
                 if conformal_samples:
                     num_temperature = len(temperature_samples)
                     calibration_samples = temperature_samples + conformal_samples
@@ -1257,6 +1962,19 @@ class SystemOneCompiler:
             prompts = [s[0] for s in samples]
             raw_labels = [s[1] for s in samples]
 
+            fam_thresh = 0.0
+            conf_prompts = prompts[num_train + num_temperature:] if isinstance(f_def, ChoiceField) else prompts[num_train:]
+            if not conf_prompts:
+                conf_prompts = prompts[num_train:]
+            if eff_familiarity_alpha > 0.0 and hasattr(self.projector, "raw_norm") and conf_prompts:
+                fam_vals = [float(self.projector.raw_norm(p)) for p in conf_prompts]
+                pos_fam = [v for v in fam_vals if math.isfinite(v) and v > 0.0]
+                if pos_fam:
+                    sorted_fam = np.sort(np.asarray(pos_fam, dtype=np.float64))
+                    idx_f = max(0, int(math.floor((len(sorted_fam) + 1) * eff_familiarity_alpha)) - 1)
+                    idx_f = min(idx_f, len(sorted_fam) - 1)
+                    fam_thresh = float(sorted_fam[idx_f])
+
             # Encode all prompts (and optional continuous telemetry) to embedding matrix X
             X_list = []
             for s in samples:
@@ -1273,6 +1991,9 @@ class SystemOneCompiler:
             N = len(prompts)
             X_train = X_all[:num_train]
             X_calib = X_all[num_train:]
+            X_conf = X_calib[num_temperature:] if isinstance(f_def, ChoiceField) else X_calib
+            if len(X_conf) == 0:
+                X_conf = X_calib
 
             # Construct target Y matrix
             if isinstance(f_def, ChoiceField):
@@ -1285,6 +2006,11 @@ class SystemOneCompiler:
                 Y_train = Y_all[:num_train]
                 Y_calib = Y_all[num_train:]
 
+                prototypes = self._compute_class_prototypes(X_train, Y_train, is_boolean=False)
+                proto_thresh, proto_scores = self._calibrate_prototype_scores(
+                    X_conf, prototypes, eff_prototype_alpha
+                )
+
                 if self.choice_solver == "logistic":
                     weights, biases = self._solve_logistic(X_train, Y_train, self.regularization)
                     P_mat = B_mat = None
@@ -1293,8 +2019,47 @@ class SystemOneCompiler:
                         X_train, Y_train, self.regularization, regularize_bias=augment, return_covariance=True
                     )
 
+                use_hierarchical = False
+                if self.choice_solver == "ridge" and num_train >= K:
+                    if eff_hierarchical is True and K >= 3:
+                        use_hierarchical = True
+                    elif eff_hierarchical == "auto" and K >= 16:
+                        use_hierarchical = True
+
+                cluster_assignments: Tuple[int, ...] = ()
+                coarse_weights: Optional[np.ndarray] = None
+                coarse_biases: Optional[np.ndarray] = None
+                fine_weights: Optional[np.ndarray] = None
+                fine_biases: Optional[np.ndarray] = None
+
+                if use_hierarchical:
+                    (
+                        cluster_assignments,
+                        coarse_weights,
+                        coarse_biases,
+                        fine_weights,
+                        fine_biases,
+                    ) = self._fit_hierarchical_choice_head(
+                        X_train,
+                        Y_train,
+                        prototypes,
+                        regularize_bias=augment,
+                    )
+                    raw_logits_calib = self._compute_hierarchical_logits(
+                        X_calib,
+                        weights,
+                        biases,
+                        cluster_assignments,
+                        coarse_weights,
+                        coarse_biases,
+                        fine_weights,
+                        fine_biases,
+                    )
+                else:
+                    raw_logits_calib = X_calib @ weights.T + biases
+
                 # Calibrate temperature and conformal bounds on independent held-out folds
-                logits_calib = (X_calib @ weights.T + biases) / 0.25
+                logits_calib = raw_logits_calib / 0.25
                 calib_labels = np.argmax(Y_calib, axis=1)
 
                 logits_temp, labels_temp = logits_calib[:num_temperature], calib_labels[:num_temperature]
@@ -1310,6 +2075,7 @@ class SystemOneCompiler:
                 # Adaptive Prediction Sets (APS) scoring matching calibration.py on held-out conformal fold
                 nonconf_scores = []
                 error_margins = []
+                per_class_scores: Dict[str, List[float]] = {opt: [] for opt in f_def.options}
                 for i in range(len(labels_conf)):
                     p_row = probs_calib[i]
                     s_idx = np.argsort(-p_row)
@@ -1326,7 +2092,9 @@ class SystemOneCompiler:
                         if c_i == true_c:
                             score_val = cum_sum
                             break
-                    nonconf_scores.append(score_val if augment else 1.0 - float(p_row[true_c]))
+                    sc = score_val if augment else 1.0 - float(p_row[true_c])
+                    nonconf_scores.append(sc)
+                    per_class_scores[f_def.options[true_c]].append(sc)
 
                 m_thresh = float(np.clip(np.quantile(error_margins, 0.95) + 0.05, 0.15, 0.85)) if error_margins else 0.20
 
@@ -1335,6 +2103,16 @@ class SystemOneCompiler:
                 n_scores = len(sorted_calib_scores)
                 k = int(math.ceil((n_scores + 1) * (1.0 - alpha)))
                 conformal_q = (1.0 if k > n_scores else float(sorted_calib_scores[k - 1])) if n_scores else 0.0
+
+                class_scores_tuples = (
+                    {
+                        opt: tuple(float(v) for v in np.sort(np.asarray(vals, dtype=np.float64)))
+                        for opt, vals in per_class_scores.items()
+                        if vals
+                    }
+                    if eff_mondrian
+                    else {}
+                )
 
                 compiled_heads[field_name] = CompiledHeadWeights(
                     field_name=field_name,
@@ -1353,12 +2131,28 @@ class SystemOneCompiler:
                     confidence_floor_tau0=self.confidence_floor_tau0,
                     escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
                     calibration_scores=tuple(float(s) for s in sorted_calib_scores),
+                    mondrian=eff_mondrian,
+                    class_calibration_scores=class_scores_tuples,
+                    familiarity_threshold=fam_thresh,
+                    prototype_threshold=proto_thresh,
+                    prototype_scores=proto_scores,
+                    prototypes=prototypes,
+                    hierarchical=use_hierarchical,
+                    cluster_assignments=cluster_assignments,
+                    coarse_weights=coarse_weights,
+                    coarse_biases=coarse_biases,
+                    fine_weights=fine_weights,
+                    fine_biases=fine_biases,
                 )
 
             elif isinstance(f_def, BooleanField):
                 # Logit-space targets: +1.0 for True, -1.0 for False
                 Y_all = np.array([1.0 if lab else -1.0 for lab in raw_labels], dtype=np.float32).reshape(-1, 1)
                 Y_train = Y_all[:num_train]
+                prototypes = self._compute_class_prototypes(X_train, Y_train, is_boolean=True)
+                proto_thresh, proto_scores = self._calibrate_prototype_scores(
+                    X_conf, prototypes, eff_prototype_alpha
+                )
                 pos_mask = (Y_train.flatten() == 1.0)
                 neg_mask = (Y_train.flatten() == -1.0)
                 n_pos = int(np.sum(pos_mask))
@@ -1379,6 +2173,7 @@ class SystemOneCompiler:
                 calib_bools = [bool(lab) for lab in (raw_labels[num_train:])]
                 nonconf_scores = []
                 error_margins_bool = []
+                per_class_bool: Dict[str, List[float]] = {"False": [], "True": []}
                 for i in range(len(calib_bools)):
                     p_true = float(probs_calib[i])
                     p_false = 1.0 - p_true
@@ -1397,7 +2192,9 @@ class SystemOneCompiler:
                         if c_i == true_idx:
                             score_val = cum_s
                             break
-                    nonconf_scores.append(score_val if augment else 1.0 - float(p_row[true_idx]))
+                    sc = score_val if augment else 1.0 - float(p_row[true_idx])
+                    nonconf_scores.append(sc)
+                    per_class_bool["True" if calib_bools[i] else "False"].append(sc)
 
                 m_thresh_bool = float(np.clip(np.quantile(error_margins_bool, 0.95) + 0.05, 0.15, 0.85)) if error_margins_bool else 0.20
 
@@ -1406,6 +2203,16 @@ class SystemOneCompiler:
                 n_scores = len(sorted_calib_scores)
                 k = int(math.ceil((n_scores + 1) * (1.0 - alpha)))
                 conformal_q = (1.0 if k > n_scores else float(sorted_calib_scores[k - 1])) if n_scores else 0.0
+
+                class_scores_bool = (
+                    {
+                        opt: tuple(float(v) for v in np.sort(np.asarray(vals, dtype=np.float64)))
+                        for opt, vals in per_class_bool.items()
+                        if vals
+                    }
+                    if eff_mondrian
+                    else {}
+                )
 
                 compiled_heads[field_name] = CompiledHeadWeights(
                     field_name=field_name,
@@ -1424,6 +2231,12 @@ class SystemOneCompiler:
                     confidence_floor_tau0=self.confidence_floor_tau0,
                     escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
                     calibration_scores=tuple(float(s) for s in sorted_calib_scores),
+                    mondrian=eff_mondrian,
+                    class_calibration_scores=class_scores_bool,
+                    familiarity_threshold=fam_thresh,
+                    prototype_threshold=proto_thresh,
+                    prototype_scores=proto_scores,
+                    prototypes=prototypes,
                 )
 
             elif isinstance(f_def, MultiChoiceField):
@@ -1432,6 +2245,7 @@ class SystemOneCompiler:
                 N_train = num_train
                 weights = np.zeros((K, self.dimension), dtype=np.float32)
                 biases = np.zeros(K, dtype=np.float32)
+                Y_multi_pos = np.zeros((N_train, K), dtype=np.float32)
 
                 for k, opt in enumerate(f_def.options):
                     y_train_k = np.array([
@@ -1439,6 +2253,7 @@ class SystemOneCompiler:
                         for i in range(N_train)
                     ], dtype=np.float32)
                     pos_mask = (y_train_k == 1.0)
+                    Y_multi_pos[pos_mask, k] = 1.0
                     neg_mask = (y_train_k == -1.0)
                     n_pos = int(np.sum(pos_mask))
                     n_neg = int(np.sum(neg_mask))
@@ -1452,9 +2267,21 @@ class SystemOneCompiler:
                     weights[k] = w_k.flatten()
                     biases[k] = float(b_k[0])
 
-                P_mat = (1.0 / max(float(self.regularization), 1e-4)) * np.eye(self.dimension + 1, dtype=np.float32)
+                prototypes = self._compute_class_prototypes(X_train, Y_multi_pos, is_boolean=False)
+                proto_thresh, proto_scores = self._calibrate_prototype_scores(
+                    X_conf, prototypes, eff_prototype_alpha
+                )
+
+                X_mc_aug = np.column_stack([X_train, np.ones((N_train, 1), dtype=np.float32)])
+                reg_mc = float(self.regularization) * np.eye(self.dimension + 1, dtype=np.float32)
+                reg_mc[self.dimension, self.dimension] = max(1.0, float(self.regularization))
+                A_mc = X_mc_aug.T @ X_mc_aug + reg_mc
+                try:
+                    P_mat = np.linalg.inv(A_mc).astype(np.float32)
+                except np.linalg.LinAlgError:
+                    P_mat = np.linalg.pinv(A_mc).astype(np.float32)
                 w_aug = np.hstack([weights, biases.reshape(-1, 1)])
-                B_mat = (float(self.regularization) * w_aug.T).astype(np.float32)
+                B_mat = (A_mc @ w_aug.T).astype(np.float32)
 
                 # Calibrate conformal bounds on X_calib
                 logits_calib = X_calib @ weights.T + biases
@@ -1489,6 +2316,10 @@ class SystemOneCompiler:
                     confidence_floor_tau0=self.confidence_floor_tau0,
                     escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
                     calibration_scores=tuple(float(s) for s in sorted_calib_scores),
+                    familiarity_threshold=fam_thresh,
+                    prototype_threshold=proto_thresh,
+                    prototype_scores=proto_scores,
+                    prototypes=prototypes,
                 )
 
             elif isinstance(f_def, ScoreField):
@@ -1532,6 +2363,7 @@ class SystemOneCompiler:
                     confidence_floor_tau0=self.confidence_floor_tau0,
                     escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
                     calibration_scores=tuple(float(s) for s in sorted_residuals),
+                    familiarity_threshold=fam_thresh,
                 )
 
         return CompiledSystemOneModel(
@@ -1545,6 +2377,10 @@ class SystemOneCompiler:
             metadata={
                 "regularization": self.regularization,
                 "choice_solver": self.choice_solver,
+                "mondrian": eff_mondrian,
+                "familiarity_alpha": eff_familiarity_alpha,
+                "prototype_alpha": eff_prototype_alpha,
+                "hierarchical": eff_hierarchical,
                 "teacher": teacher if augment else None,
                 "teaching_mode": "schema_augmented" if augment else "examples",
                 "sample_counts": sample_counts,
@@ -1562,6 +2398,10 @@ class SystemOneCompiler:
         augment: bool = True,
         calibration_split: float = 0.25,
         calibration_exemplars: Optional[Dict[str, Sequence[Tuple[str, Any]]]] = None,
+        mondrian: Optional[bool] = None,
+        familiarity_alpha: Optional[float] = None,
+        prototype_alpha: Optional[float] = None,
+        hierarchical: Optional[Union[bool, str]] = None,
     ) -> CompiledSystemOneModel:
         """Compiles model and writes directly to target .s1m binary file."""
         model = self.compile(
@@ -1571,6 +2411,10 @@ class SystemOneCompiler:
             augment=augment,
             calibration_split=calibration_split,
             calibration_exemplars=calibration_exemplars,
+            mondrian=mondrian,
+            familiarity_alpha=familiarity_alpha,
+            prototype_alpha=prototype_alpha,
+            hierarchical=hierarchical,
         )
         model.save(output_path)
         return model
