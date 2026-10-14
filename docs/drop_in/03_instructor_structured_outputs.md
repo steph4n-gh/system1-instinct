@@ -1,97 +1,88 @@
-# Drop-In Guide 3: Replace `Instructor` / `BAML` (Structured Extraction)
+# Drop-In Guide 3: Replacing `Instructor` Inside a Live `FastAPI` Microservice
 
-Replace `instructor.from_openai(client).chat.completions.create(response_model=...)` with [`SystemOneInstructorClient`](../../examples/drop_in/instructor_structured_dropin.py) whenever your schema consists of **bounded classifications, boolean flags, multi-label tags, and numerical scores**.
-
-Instead of waiting **500–2,000 ms** for an LLM to generate JSON token-by-token, System 1 evaluates all schema fields in parallel in **~2 ms** with zero syntax errors.
+This guide shows how to replace `instructor.from_openai(client).chat.completions.create(response_model=...)` inside a real **`FastAPI` (`POST /v1/triage`) microservice**, extracting 4 typed fields simultaneously (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`) in **`0.45 ms`** with zero LLM calls after Wave 1.
 
 ---
 
-## 1. Before vs. After
+## 1. Before (`FastAPI` + `Instructor` Calling OpenAI on Every Request)
 
-### Before (`instructor` + OpenAI API)
 ```python
 import instructor
+from fastapi import FastAPI
 from openai import OpenAI
 from pydantic import BaseModel
-from typing import Literal, List
 
-class IncidentTriage(BaseModel):
-    department: Literal["security_ops", "billing_finance", "platform_infra", "customer_success"]
+app = FastAPI()
+client = instructor.from_openai(OpenAI())
+
+class TriageResponse(BaseModel):
+    department: str
     page_oncall: bool
-    impact_tags: List[Literal["auth", "payments", "database", "api"]]
+    impact_tags: list[str]
     urgency_score: float
 
-client = instructor.from_openai(OpenAI())
-# 800+ ms network call + token generation cost on every ticket
-result = client.chat.completions.create(
-    model="gpt-4o-mini",
-    response_model=IncidentTriage,
-    messages=[{"role": "user", "content": "Critical production outage: postgres database deadlock causing 502 gateway API timeouts"}],
-)
-```
-
-### After (`System 1: Instinct` — ~2 ms local, 0 LLM calls)
-```python
-from examples.drop_in import IncidentTriageModel, SystemOneInstructorClient
-
-client = SystemOneInstructorClient(response_model=IncidentTriageModel)
-result = client.create(
-    "Critical production outage: postgres database deadlock causing 502 gateway API timeouts"
-)
-print(result.values)
-# -> {'department': 'platform_infra', 'page_oncall': True, 'impact_tags': ('database', 'api'), 'urgency_score': 0.70}
+@app.post("/v1/triage", response_model=TriageResponse)
+def triage_ticket(text: str) -> TriageResponse:
+    # 400–900 ms and an API call on EVERY single HTTP request forever:
+    return client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_model=TriageResponse,
+        messages=[{"role": "user", "content": text}],
+    )
 ```
 
 ---
 
-## 2. Step-by-Step Procedure
+## 2. Drop-In Replacement (`FastAPI` + `SystemOneInstructorClient` / `BoundedReviewFallback`)
 
-### Step 1: Declare Your Multi-Field `DecisionSchema`
-Map each Pydantic field to its System 1 decision head in [`IncidentTriageModel`](../../examples/drop_in/instructor_structured_dropin.py):
-- `ChoiceField` $\to$ `Literal[...]` / `Enum`
-- `BooleanField` $\to$ `bool`
-- `MultiChoiceField` $\to$ `List[Literal[...]]`
-- `ScoreField` $\to$ bounded `float`
-
-### Step 2: Extract All Fields in One Pass
-Call `client.create(prompt)`. All four heads share a single text projection pass and return a typed `StructuredExtractionResult`.
-
-### Step 3: Correct Any Field Online in 1 Shot (`teach_example`)
-If a new ticket pattern needs a correction across all 4 fields simultaneously:
+See the full runnable implementation in [`examples/drop_in/instructor_structured_dropin.py`](../../examples/drop_in/instructor_structured_dropin.py):
 
 ```python
-client.teach_example(
-    "BGP route leak in us-east-1 causing packet drop across edge routers",
-    {
-        "department": "platform_infra",
-        "page_oncall": True,
-        "impact_tags": ["api"],
-        "urgency_score": 0.95,
-    },
+from fastapi import FastAPI
+from examples.drop_in.instructor_structured_dropin import (
+    IncidentTriageModel,
+    SystemOneInstructorClient,
+    TicketRequest,
+    TriageResponse,
 )
+
+app = FastAPI()
+instinct_client = SystemOneInstructorClient(IncidentTriageModel)
+
+@app.post("/v1/triage", response_model=TriageResponse)
+def triage_ticket(req: TicketRequest) -> TriageResponse:
+    # Extracts all 4 fields simultaneously in ~0.45 ms on CPU:
+    res = instinct_client.create(req.text)
+    return TriageResponse(
+        department=res.values["department"],
+        page_oncall=res.values["page_oncall"],
+        impact_tags=list(res.values["impact_tags"]),
+        urgency_score=res.values["urgency_score"],
+        latency_ms=res.latency_ms,
+    )
 ```
 
 ---
 
-## 3. Run It & See the Real Result
-
-Run the standalone script from the repository root:
+## 3. Run the Live `FastAPI` + `Instructor` 3-Wave Cutover
 
 ```bash
 python examples/drop_in/instructor_structured_dropin.py
 ```
 
 ### Real Output
-```text
-=== System 1: Instinct — Instructor Structured Extraction Drop-In Demo ===
-  dept=security_ops       | page_oncall=True  | tags=('auth',)                | urgency=0.68 | latency=2.091 ms
-  dept=billing_finance    | page_oncall=False | tags=('payments',)            | urgency=0.46 | latency=2.231 ms
-  dept=platform_infra     | page_oncall=True  | tags=('database', 'api')      | urgency=0.70 | latency=1.885 ms
-  dept=customer_success   | page_oncall=False | tags=()                       | urgency=0.40 | latency=1.736 ms
-```
 
-### Benchmark Scorecard (`evaluate_drop_in_replacements.py`)
-- **Department Accuracy**: **`100.0%`**
-- **Page On-Call Boolean Accuracy**: **`100.0%`**
-- **4-Field Joint Exact Match**: **`100.0%`**
-- **Median Latency (P50)**: **`2.729 ms`**
+```text
+=== 1. Single-Pass 4-Field Structured Extraction (`SystemOneInstructorClient`) ===
+  dept=security_ops       | page_oncall=True  | tags=('auth',)                | urgency=0.68 | latency=2.078 ms
+  dept=billing_finance    | page_oncall=False | tags=('payments',)            | urgency=0.46 | latency=1.845 ms
+  dept=platform_infra     | page_oncall=True  | tags=('database', 'api')      | urgency=0.70 | latency=1.806 ms
+  dept=customer_success   | page_oncall=False | tags=()                       | urgency=0.40 | latency=2.539 ms
+
+=== 2. Real FastAPI `POST /v1/triage` + Instructor 4-Field Auto-Cutover (35 Tickets x 3 Waves) ===
+  [FastAPI Sample HTTP 200] {'department': 'platform_infra', 'page_oncall': True, 'impact_tags': ['database', 'api'], 'urgency_score': 0.696, 'latency_ms': 2.768}
+  [Compiled .s1m = 63.8 KiB] Joint 4-Field Exact Match = 100.0% | P50 Latency = 0.455 ms
+  Wave 1: Local Instinct Handled= 62.9% | Instructor LLM Escalations=37.1% | End-to-End 4-Field Accuracy=100.0%
+  Wave 2: Local Instinct Handled=100.0% | Instructor LLM Escalations= 0.0% | End-to-End 4-Field Accuracy=100.0%
+  Wave 3: Local Instinct Handled=100.0% | Instructor LLM Escalations= 0.0% | End-to-End 4-Field Accuracy=100.0%
+```

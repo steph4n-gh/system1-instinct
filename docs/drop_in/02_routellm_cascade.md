@@ -1,77 +1,69 @@
-# Drop-In Guide 2: Replace `RouteLLM` (Model Cascade Controller)
+# Drop-In Guide 2: Replacing `RouteLLM` & Routing Inside `langchain-core` LCEL
 
-Replace `routellm.controller.Controller` with [`SystemOneRouteController`](../../examples/drop_in/routellm_dropin.py) to dispatch incoming prompts across **three cost/capability tiers** in **~1.4 ms** using a joint multi-field schema (`ChoiceField` tier + `BooleanField` deep-reasoning flag + `ScoreField` complexity score).
+This guide shows how to replace `routellm.controller.Controller` or an LLM router inside a real **`langchain_core` (`RunnableLambda`) LCEL pipeline**, evaluated across **`256` held-out `BANKING77` customer tickets (`32` intents, clean + character-typo stress)** against `sentence-transformers/all-MiniLM-L6-v2` (`91.1 MB` ONNX).
 
 ---
 
-## 1. Before vs. After
+## 1. Before (`RouteLLM` / Standard LangChain LLM Router)
 
-### Before (`routellm`)
 ```python
 from routellm.controller import Controller
 
-# Requires external router weights or API calls to score prompt complexity
+# Requires external API keys or 80-500 MB router checkpoints:
 controller = Controller(
     routers=["mf"],
     strong_model="gpt-5-reasoning",
     weak_model="gpt-4o-mini",
 )
+response = controller.chat.completions.create(
+    model="router-mf-0.11593",
+    messages=[{"role": "user", "content": "Simple status check on my account balance"}],
+)
 ```
 
-### After (`System 1: Instinct`)
+---
+
+## 2. Drop-In Replacement (`SystemOneRouteController` & `langchain_core` LCEL)
+
 ```python
-from examples.drop_in import SystemOneRouteController
+from langchain_core.runnables import RunnableLambda
+from examples.drop_in.routellm_dropin import SystemOneRouteController
 
 controller = SystemOneRouteController(
     strong_model="gpt-5-reasoning",
     weak_model="gpt-4o-mini",
     local_model="system1-instinct-local",
 )
-decision = controller.route("Prove why a distributed consensus cluster deadlocks under race condition")
-print(decision.selected_tier, decision.selected_model, decision.complexity_score)
-# -> "frontier_reasoning_model", "gpt-5-reasoning", 0.75
+
+# Drop directly into any LangChain LCEL pipeline:
+lcel_router = RunnableLambda(lambda prompt: controller.route(prompt))
+decision = lcel_router.invoke("Debug this subtle concurrency deadlock in our distributed cluster")
+print(decision.selected_tier, decision.selected_model, decision.latency_ms)
+# -> frontier_reasoning_model  gpt-5-reasoning  1.47 ms
+
+# Teach overrides online in <1 ms:
+controller.record_feedback("Write a formal proof for Raft leader election safety", "frontier_reasoning_model")
 ```
 
 ---
 
-## 2. Step-by-Step Procedure
-
-### Step 1: Initialize the 3-Tier Cascade Controller
-`SystemOneRouteController` evaluates three fields simultaneously in a single non-autoregressive pass:
-1. `target_tier`: `"system1_local"` (FAQ/status/triage), `"fast_small_model"` (drafting/summarization), or `"frontier_reasoning_model"` (formal proofs/distributed systems debugging).
-2. `requires_deep_reasoning`: Calibrated `BooleanField`.
-3. `complexity_score`: Continuous `0.0–1.0` `ScoreField`.
-
-### Step 2: Teach Custom Routing Rules Online in 1 Shot
-If a domain-specific task (e.g., `"Write a regex for RFC-5322 email validation"`) should always go to `fast_small_model` or `frontier_reasoning_model`, update the router in place without retraining:
-
-```python
-controller.engine.learn_from_tier2(
-    "Verify the Coq proof for linearizability in our Paxos state machine",
-    {"target_tier": "frontier_reasoning_model", "requires_deep_reasoning": True, "complexity_score": 0.95},
-    preserve_calibration=True,
-)
-```
-
----
-
-## 3. Run It & See the Real Result
-
-Run the standalone script from the repository root:
+## 3. Run the Live `langchain-core` `BANKING77` Benchmark (`256` Held-Out Tickets)
 
 ```bash
 python examples/drop_in/routellm_dropin.py
 ```
 
 ### Real Output
-```text
-=== System 1: Instinct — RouteLLM Drop-In Replacement Demo ===
-  [system1_local            -> system1-instinct-local] (expected=system1_local, complexity=0.26, latency=1.661 ms)
-  [fast_small_model         -> gpt-4o-mini           ] (expected=fast_small_model, complexity=0.47, latency=1.470 ms)
-  [frontier_reasoning_model -> gpt-5-reasoning       ] (expected=frontier_reasoning_model, complexity=0.75, latency=2.043 ms)
-```
 
-### Benchmark Scorecard (`evaluate_drop_in_replacements.py`)
-- **0-Shot Tier Routing Accuracy**: **`100.0%`**
-- **Unseen Edge-Case Adaptation**: **`50.0%` $\to$ `100.0%`** after 1-shot online RLS update
-- **Median Latency (P50)**: **`1.468 ms`**
+```text
+=== 1. RouteLLM 3-Tier Cascade Drop-In (`SystemOneRouteController`) ===
+  [system1_local            -> system1-instinct-local] (expected=system1_local, complexity=0.26, latency=2.328 ms)
+  [fast_small_model         -> gpt-4o-mini           ] (expected=fast_small_model, complexity=0.47, latency=1.893 ms)
+  [frontier_reasoning_model -> gpt-5-reasoning       ] (expected=frontier_reasoning_model, complexity=0.75, latency=4.018 ms)
+
+=== 2. Real `langchain_core` LCEL Pipeline on BANKING77 (32 Intents, 256 Held-Out Tickets) ===
+  [Classical Unigram TF-IDF (85 KiB)]         Clean=77.3% | Typo=66.0% | P50=0.18 ms
+  [all-MiniLM-L6-v2 (91.1 MB ONNX, 22M)]      Clean=91.0% | Typo=70.7% (-20.3% drop!) | P50=1.32 ms
+  [System 1: Instinct Static (120 KiB .s1m)]  Clean=87.9% | Typo=74.2% (+3.5% vs MiniLM!) | P50=0.22 ms
+  [System 1: Instinct + Online Flywheel]      Clean=91.4% (surpasses MiniLM after 48/256 teacher reviews!)
+```
