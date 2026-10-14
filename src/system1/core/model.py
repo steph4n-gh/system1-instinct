@@ -288,6 +288,7 @@ class DecisionFieldHead:
         projector: Optional[Any] = None,
         contrastive_whitening: bool = True,
         forgetting_factor: float = 0.995,
+        initialize_weights: bool = True,
     ) -> None:
         self.field_def = field_def
         self.dimension = dimension
@@ -314,7 +315,12 @@ class DecisionFieldHead:
         self._initial_weights: Optional[np.ndarray] = None
         self._online_shots_p: Optional[List[List[np.ndarray]]] = None
         self._online_shots_c: Optional[List[List[np.ndarray]]] = None
-        self._init_head()
+        if initialize_weights:
+            self._init_head()
+        else:
+            width = len(field_def.options) if isinstance(field_def, (ChoiceField, MultiChoiceField)) else 1
+            self.weights = np.zeros((width, dimension), dtype=np.float32)
+            self.biases = np.zeros(width, dtype=np.float32)
 
     def _build_concept_aware_exemplar_bank(self) -> None:
         """Constructs the concept-aware prototype and sub-prototype bank for a ChoiceField."""
@@ -649,6 +655,53 @@ class DecisionFieldHead:
                 y[opts.index(target_value)] = 1.0
             return y
         return np.asarray(target_value, dtype=np.float32)
+
+    def export_exemplar_state(self) -> Optional[Dict[str, Any]]:
+        """Snapshot the nonlinear routing state that cannot be recovered from weights."""
+        if self._exemplar_bank is None:
+            return None
+        centroids, banks = self._exemplar_bank
+        arrays = {"exemplar_centroids": centroids.copy()}
+        counts: Dict[str, List[int]] = {}
+        for key, groups in (("exemplar_vectors", banks), ("shots_p", self._online_shots_p), ("shots_c", self._online_shots_c)):
+            if groups is not None:
+                counts[key] = [len(group) for group in groups]
+                arrays[key] = np.concatenate([
+                    np.asarray(group).reshape(-1, self.dimension) for group in groups
+                ], axis=0)
+        if self._exemplar_mean is not None:
+            arrays["exemplar_mean"] = self._exemplar_mean.copy()
+        if self._initial_weights is not None:
+            arrays["initial_w"] = self._initial_weights.copy()
+        return {"arrays": arrays, "counts": counts,
+                "online_shots_are_pseudo": bool(getattr(self, "_online_shots_are_pseudo", False))}
+
+    def restore_exemplar_state(self, state: Dict[str, Any]) -> None:
+        arrays, counts = state["arrays"], state["counts"]
+        width = len(self.field_def.options) if isinstance(self.field_def, ChoiceField) else 0
+        if not width or self.hierarchical or "exemplar_centroids" not in arrays or "exemplar_vectors" not in arrays:
+            raise ValueError("Saved exemplar state requires a non-hierarchical choice head")
+        for key, arr in arrays.items():
+            expected = (self.dimension,) if key == "exemplar_mean" else (width, self.dimension)
+            if key in ("exemplar_vectors", "shots_p", "shots_c"):
+                sizes = counts.get(key)
+                if (not isinstance(sizes, (list, tuple)) or len(sizes) != width
+                        or any(type(n) is not int or n < 0 for n in sizes)):
+                    raise ValueError("Saved exemplar group counts are invalid")
+                expected = (sum(sizes), self.dimension)
+            if arr.shape != expected or not np.all(np.isfinite(arr)):
+                raise ValueError(f"Saved exemplar array {key!r} is invalid")
+        groups: Dict[str, List[np.ndarray]] = {}
+        for key in ("exemplar_vectors", "shots_p", "shots_c"):
+            if key in arrays:
+                groups[key] = list(np.split(arrays[key], np.cumsum(counts[key])[:-1]))
+        self._exemplar_bank = (arrays["exemplar_centroids"], groups["exemplar_vectors"])
+        self._exemplar_mean = arrays.get("exemplar_mean")
+        self._initial_weights = arrays.get("initial_w")
+        self._online_shots_p = [list(group) for group in groups["shots_p"]] if "shots_p" in groups else None
+        self._online_shots_c = [list(group) for group in groups["shots_c"]] if "shots_c" in groups else None
+        self._online_shots_are_pseudo = state.get("online_shots_are_pseudo", False)
+        self._exemplar_projector = DeterministicSemanticProjector(dimension=self.dimension)
 
     def _update_exemplar_bank_entry(
         self,
@@ -1436,6 +1489,7 @@ class SystemOneModel:
     ) -> Dict[str, Any]:
         """Closed-form rank-1 Sherman-Morrison online update on the metal (<0.1ms)."""
         with self._lock:
+            target = self.schema.validate_lesson(target)
             t0 = time.perf_counter()
             if embedding is not None:
                 emb = np.asarray(embedding, dtype=np.float32).flatten()

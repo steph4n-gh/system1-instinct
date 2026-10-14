@@ -1106,6 +1106,9 @@ class HybridProjector:
     implementation also normalizes its final vector. The default dimensions
     are 1024 lexical plus 256 dense, with alpha=0.5. No latency guarantee."""
 
+    CONFIG_KEYS = frozenset({"type", "sparse_dim", "dense_dim", "alpha", "seed", "fitted", "spectral_terms",
+                             "spectral_weights", "spectral_vectors", "subspace_components", "subspace_weight"})
+
     def __init__(
         self,
         dimension: Optional[int] = None,
@@ -1651,20 +1654,7 @@ class HybridProjector:
     def from_config(cls, config: Mapping[str, Any], *, backend: str = "auto") -> HybridProjector:
         if not isinstance(config, Mapping) or config.get("type") != "hybrid":
             raise ValueError("Unsupported hybrid projector settings")
-        allowed_keys = {
-            "type",
-            "sparse_dim",
-            "dense_dim",
-            "alpha",
-            "seed",
-            "fitted",
-            "spectral_terms",
-            "spectral_weights",
-            "spectral_vectors",
-            "subspace_components",
-            "subspace_weight",
-        }
-        if set(config.keys()) - allowed_keys:
+        if set(config.keys()) - cls.CONFIG_KEYS:
             raise ValueError("Saved hybrid projector contains unsupported settings")
         sparse = config.get("sparse_dim")
         dense = config.get("dense_dim")
@@ -1672,6 +1662,9 @@ class HybridProjector:
             raise ValueError("Saved hybrid projector dimensions do not match the skill")
         alpha = float(config.get("alpha", 0.5))
         seed = int(config.get("seed", 42))
+        terms = tuple(config.get("spectral_terms", ()))
+        if any(not isinstance(term, str) or not term.strip() for term in terms) or len(set(terms)) != len(terms):
+            raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
         proj = cls(
             sparse_dim=sparse,
             dense_dim=dense,
@@ -1680,7 +1673,6 @@ class HybridProjector:
             backend=backend,
         )
         if config.get("fitted"):
-            terms = tuple(str(t) for t in config.get("spectral_terms", ()))
             weights = tuple(float(w) for w in config.get("spectral_weights", ()))
             if len(terms) != len(weights):
                 raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")

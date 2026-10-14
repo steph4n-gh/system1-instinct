@@ -523,8 +523,24 @@ class BoundedReviewFallback:
         decision: Dict[str, Any],
         awaitable_answer: Awaitable[Any],
     ) -> ReviewFallbackDecision:
+        started = False
+        dispatch_refusal: Optional[str] = None
         try:
+            # decide() may have returned this coroutine before the caller revokes
+            # permission, changes context or closes the runner. Check before I/O.
             async def invoke() -> Any:
+                nonlocal started, dispatch_refusal
+                if self._halted:
+                    dispatch_refusal = "runner_stopped"
+                elif _checked_value(self.observe_state, context) != state:
+                    dispatch_refusal = "stale_context"
+                elif not _checked(self.allowed, context):
+                    dispatch_refusal = "recovery_not_allowed"
+                elif self._halted or _checked_value(self.observe_state, context) != state:
+                    dispatch_refusal = "stale_context"
+                if dispatch_refusal is not None:
+                    return None
+                started = True
                 return await awaitable_answer
 
             task = self._pending = asyncio.create_task(invoke())
@@ -541,6 +557,8 @@ class BoundedReviewFallback:
                 answer = task.result()
             except Exception:
                 return self._stop(decision, "expert_failed")
+            if dispatch_refusal is not None:
+                return self._stop(decision, dispatch_refusal)
             if _checked_value(self.observe_state, context) != state:
                 return self._stop(decision, "stale_context")
             if not _checked(self.allowed, context):
@@ -562,6 +580,8 @@ class BoundedReviewFallback:
         except Exception:
             return self._stop(decision, "callback_or_context_failed")
         finally:
+            if not started and inspect.iscoroutine(awaitable_answer):
+                awaitable_answer.close()
             self._busy = False
 
     def decide(self, context: Any) -> Any:

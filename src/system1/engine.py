@@ -234,9 +234,9 @@ class SystemOneEngine:
         self._model_stat: Optional[Tuple[int, int, str]] = None
 
         if model is None and self.model_path is not None and self.model_path.exists():
-            from system1.compiler import CompiledSystemOneModel
+            from system1.compiler import CompiledSystemOneModel, _read_skill_bytes
 
-            raw = self.model_path.read_bytes()
+            raw = _read_skill_bytes(self.model_path)
             st = self.model_path.stat()
             loaded = CompiledSystemOneModel.from_bytes(
                 raw,
@@ -382,9 +382,10 @@ class SystemOneEngine:
             return False
         if self._model_stat is not None and (st.st_mtime_ns, st.st_size) == self._model_stat[:2]:
             return False
+        from system1.compiler import CompiledSystemOneModel, _read_skill_bytes
         try:
-            raw = self.model_path.read_bytes()
-        except OSError:
+            raw = _read_skill_bytes(self.model_path)
+        except (OSError, ValueError):
             return False
         if not raw:
             return False
@@ -392,8 +393,6 @@ class SystemOneEngine:
         if self._model_stat is not None and digest == self._model_stat[2]:
             self._model_stat = (st.st_mtime_ns, st.st_size, digest)
             return False
-        from system1.compiler import CompiledSystemOneModel
-
         try:
             new_model = CompiledSystemOneModel.from_bytes(
                 raw,
@@ -1322,6 +1321,7 @@ class SystemOneEngine:
         ``preserve_calibration=True`` is specified.
         """
         with self._lock, getattr(self.model, "_lock", nullcontext()):
+            target = self.schema.validate_lesson(target)
             eff_forgetting = forgetting_factor if forgetting_factor is not None else self.forgetting_factor
             t0 = time.perf_counter()
 
@@ -1632,10 +1632,11 @@ class SystemOneEngine:
         outcome: Optional[Any] = None,
         reward: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """First-class online teaching method that preserves calibration by default.
+        """Online teaching that retains heuristic acceptance gates by default.
 
         Supports teaching directly from LLM fallback outputs, user corrections,
-        or application outcomes without invalidating conformal calibration.
+        or application outcomes. Retained or synthesized thresholds do not
+        preserve split-conformal coverage; use independent recalibration for it.
         """
         eff_ff = forgetting_factor
         if reward is not None:
@@ -1845,6 +1846,7 @@ class SystemOneEngine:
                     coarse_biases=getattr(head, "coarse_biases", None),
                     fine_weights=getattr(head, "fine_weights", None),
                     fine_biases=getattr(head, "fine_biases", None),
+                    exemplar_state=head.export_exemplar_state(),
                 )
 
             compiled = CompiledSystemOneModel(

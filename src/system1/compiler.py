@@ -54,9 +54,18 @@ MAX_SKILL_FIELDS = 64
 MAX_SKILL_OPTIONS = 1024
 MAX_SKILL_CALIBRATION_SCORES = 1_000_000
 MAX_SKILL_COMPRESSION_RATIO = 1024
+EXEMPLAR_ARRAYS = ("exemplar_centroids", "exemplar_vectors", "exemplar_mean", "initial_w", "shots_p", "shots_c")
 
 
-def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> Dict[str, np.ndarray]:
+def _read_skill_bytes(path: Union[str, Path]) -> bytes:
+    with Path(path).open("rb") as stream:
+        data = stream.read(MAX_SKILL_BYTES + 1)
+    if len(data) > MAX_SKILL_BYTES:
+        raise ValueError("Saved skill file exceeds size limit")
+    return data
+
+
+def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runtime_bytes: int = 0) -> Dict[str, np.ndarray]:
     """Preflight ZIP and NPY headers before NumPy can allocate any array."""
     # Bound central-directory parsing too: ZipFile creates one object per entry.
     end = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
@@ -65,7 +74,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> D
     _, disk, directory_disk, disk_count, count, directory_size, directory_offset, comment_size = struct.unpack(
         "<4s4H2LH", data[end:end + 22]
     )
-    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * 5
+    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS))
             or directory_size > MAX_SKILL_HEADER_BYTES or directory_offset + directory_size != end
             or end + 22 + comment_size != len(data)):
         raise ValueError("Saved skill NPZ directory exceeds limits or is malformed")
@@ -84,7 +93,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> D
             "coarse_b",
             "fine_w",
             "fine_b",
-        )
+        ) + EXEMPLAR_ARRAYS
     }
     shapes: Dict[str, Tuple[int, ...]] = {}
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -156,6 +165,25 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int) -> D
             if fine_w_shape is not None:
                 if fine_w_shape != (width, dimension) or fine_b_shape != (width,):
                     raise ValueError(f"Saved head {name!r} has incompatible fine hierarchical dimensions")
+            if f"{name}_B" in shapes and f"{name}_P" not in shapes:
+                runtime_bytes += 8 * (dimension + 1) ** 2
+            for suffix in ("calib_scores", "proto_scores"):
+                runtime_bytes += 32 * shapes.get(f"{name}_{suffix}", (0,))[0]
+            for suffix in EXEMPLAR_ARRAYS:
+                shape = shapes.get(f"{name}_{suffix}")
+                if shape is None:
+                    continue
+                valid = (shape == (dimension,)) if suffix == "exemplar_mean" else (
+                    len(shape) == 2 and shape[1] == dimension
+                    and (suffix not in ("exemplar_centroids", "initial_w") or shape[0] == width)
+                )
+                if not isinstance(definition, ChoiceField) or not valid:
+                    raise ValueError(f"Saved head {name!r} has incompatible exemplar dimensions")
+                if suffix in ("shots_p", "shots_c"):
+                    runtime_bytes += 160 * shape[0]  # Retained per-row ndarray views and list slots.
+        runtime_bytes += 2 * sum(info.file_size for info in members)
+        if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
+            raise ValueError("Saved skill runtime allocation exceeds memory budget")
         # Every member has been checked, including optional covariance arrays.
         with np.load(io.BytesIO(data), allow_pickle=False) as arrays:
             return {name: arrays[name] for name in shapes}
@@ -211,6 +239,7 @@ class CompiledHeadWeights:
     coarse_biases: Optional[np.ndarray] = None
     fine_weights: Optional[np.ndarray] = None
     fine_biases: Optional[np.ndarray] = None
+    exemplar_state: Optional[Dict[str, Any]] = None
 
 
 class CompiledSystemOneModel:
@@ -285,10 +314,13 @@ class CompiledSystemOneModel:
                 backend=self.backend,
                 projector=self.projector,
                 forgetting_factor=self.forgetting_factor,
+                initialize_weights=False,
             )
             if name in self.heads:
                 ch = self.heads[name]
                 head.set_weights(ch.weights, ch.biases)
+                if ch.exemplar_state is not None:
+                    head.restore_exemplar_state(ch.exemplar_state)
                 if (
                     getattr(ch, "hierarchical", False)
                     and ch.coarse_weights is not None
@@ -443,7 +475,7 @@ class CompiledSystemOneModel:
             if override_map is not None and name in override_map:
                 evals[name] = self._build_override_eval(head, override_map[name])
             else:
-                evals[name] = head.forward(emb)
+                evals[name] = head.forward(emb, prompt=prompt if embedding is None else None)
         latency = (time.perf_counter() - t0) * 1000.0
         result = ModelInferenceResult(
             prompt=prompt,
@@ -508,6 +540,7 @@ class CompiledSystemOneModel:
         Separate recalibration is needed before strict local acceptance. Retaining
         examples and recompiling is the simplest reproducible update workflow."""
         with self._lock:
+            target = self.schema.validate_lesson(target)
             t0 = time.perf_counter()
 
             # Bump model_version and evict prompt before reevaluation
@@ -841,7 +874,7 @@ class CompiledSystemOneModel:
         outcome: Optional[Any] = None,
         reward: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """First-class online teaching method that preserves calibration by default."""
+        """Online teaching with retained heuristic gates, not preserved coverage."""
         eff_ff = forgetting_factor
         if reward is not None:
             r_val = float(reward)
@@ -924,6 +957,7 @@ class CompiledSystemOneModel:
         """
         with self._lock:
             heads_meta: Dict[str, Any] = {}
+            exemplar_states = {name: head.export_exemplar_state() for name, head in self._field_heads.items()}
             for name, ch in sorted(self.heads.items()):
                 h_entry: Dict[str, Any] = {
                     "field_type": ch.field_type,
@@ -955,6 +989,9 @@ class CompiledSystemOneModel:
                 if getattr(ch, "hierarchical", False) and getattr(ch, "cluster_assignments", ()):
                     h_entry["hierarchical"] = True
                     h_entry["cluster_assignments"] = [int(c) for c in ch.cluster_assignments]
+                state = exemplar_states.get(name)
+                if state is not None:
+                    h_entry["exemplar_state"] = {key: value for key, value in state.items() if key != "arrays"}
                 heads_meta[name] = h_entry
 
             serialized_meta: Dict[str, Any] = {
@@ -991,6 +1028,10 @@ class CompiledSystemOneModel:
             for name, ch in sorted(self.heads.items()):
                 arrays_to_save[f"{name}_w"] = ch.weights.astype(np.float32)
                 arrays_to_save[f"{name}_b"] = ch.biases.astype(np.float32)
+                state = exemplar_states.get(name)
+                if state is not None:
+                    for suffix, arr in state["arrays"].items():
+                        arrays_to_save[f"{name}_{suffix}"] = np.asarray(arr)
                 if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
                     arrays_to_save[f"{name}_calib_scores"] = np.asarray(ch.calibration_scores, dtype=np.float64)
                 if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
@@ -1090,17 +1131,23 @@ class CompiledSystemOneModel:
                 raise ValueError("Saved projector dimension does not match the skill")
             if kind == "hybrid":
                 from system1.core.embeddings import HybridProjector
+                if set(projector_config) - HybridProjector.CONFIG_KEYS:
+                    raise ValueError("Saved hybrid projector contains unsupported settings")
                 sparse, dense = projector_config.get("sparse_dim"), projector_config.get("dense_dim")
                 if (type(sparse) is not int or type(dense) is not int or sparse <= 0 or dense <= 0
                         or sparse + dense != dimension):
                     raise ValueError("Saved hybrid projector dimensions do not match the skill")
                 runtime_bytes += 16 * 25000 * dense
+                runtime_bytes += 16 * len(projector_config.get("spectral_terms", ())) * dense
+                runtime_bytes += 8 * sum(len(row) for key in ("spectral_vectors", "subspace_components")
+                                         for row in (projector_config.get(key) or ()))
                 if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
                     raise ValueError("Saved skill runtime allocation exceeds memory budget")
-                saved_hybrid = HybridProjector.from_config(projector_config, backend=backend)
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
-        npz_file = _read_skill_arrays(data[header_end:], schema, dimension)
+        npz_file = _read_skill_arrays(data[header_end:], schema, dimension, runtime_bytes)
+        if projector_config is not None and projector_config["type"] == "hybrid":
+            saved_hybrid = HybridProjector.from_config(projector_config, backend=backend)
         if projector_config is not None:
             if projector is not None:
                 if _projector_config(projector) != projector_config:
@@ -1222,6 +1269,10 @@ class CompiledSystemOneModel:
                 coarse_biases=coarse_b,
                 fine_weights=fine_w,
                 fine_biases=fine_b,
+                exemplar_state={
+                    **h_info.get("exemplar_state", {}),
+                    "arrays": {suffix: npz_file[f"{name}_{suffix}"] for suffix in EXEMPLAR_ARRAYS if f"{name}_{suffix}" in npz_file},
+                } if "exemplar_state" in h_info else None,
             )
 
         saved_meta = meta.get("metadata", {})
@@ -1247,8 +1298,7 @@ class CompiledSystemOneModel:
         target = Path(path)
         if not target.is_file():
             raise FileNotFoundError(f"Model file not found: {target}")
-        with target.open("rb") as stream:
-            data = stream.read(MAX_SKILL_BYTES + 1)
+        data = _read_skill_bytes(target)
         return cls.from_bytes(data, projector=projector, backend=backend)
 
 

@@ -623,6 +623,8 @@ class SemanticSystemOneCache:
             return False
         entry = self._exact_index.pop(key)
         self._evictions += 1
+        for base_key in [base for base, actual in self._base_to_key.items() if actual == key]:
+            del self._base_to_key[base_key]
         if key in self._key_to_emb_idx:
             idx = self._key_to_emb_idx.pop(key)
             self._embedding_entries.pop(idx)
@@ -631,27 +633,9 @@ class SemanticSystemOneCache:
                     self._embeddings = None
                 else:
                     self._embeddings = np.delete(self._embeddings, idx, axis=0)
-            self._key_to_emb_idx.clear()
-            for i, e in enumerate(self._embedding_entries):
-                k = self._make_key(
-                    e.prompt,
-                    telemetry=e.telemetry,
-                    embedding=e.embedding,
-                    schema_digest=e.schema_digest,
-                    model_version=e.model_version,
-                    policy_scope=e.policy_scope,
-                    alpha=e.alpha,
-                    margin_threshold=e.margin_threshold,
-                    strict=e.strict,
-                    relative_odds_ratio=e.relative_odds_ratio,
-                    confidence_floor_tau0=e.confidence_floor_tau0,
-                    recency_weighted=e.recency_weighted,
-                    model_digest=e.model_digest,
-                    projector_digest=e.projector_digest,
-                    calibration_digest=e.calibration_digest,
-                    policy_epoch=e.policy_epoch,
-                )
-                self._key_to_emb_idx[k] = i
+            # Retain the original keys: recomputing from normalized embeddings
+            # would change their digests, even with identical execution context.
+            self._key_to_emb_idx = {k: i - (i > idx) for k, i in self._key_to_emb_idx.items()}
         return True
 
     def evict_prompt(self, prompt: str) -> int:
@@ -690,39 +674,13 @@ class SemanticSystemOneCache:
 
     def _evict_one(self) -> None:
         """Evicts the least recently used entry from exact and vector indices."""
-        oldest_key, oldest_entry = self._exact_index.popitem(last=False)
-        self._evictions += 1
-
-        if oldest_key in self._key_to_emb_idx:
-            idx = self._key_to_emb_idx.pop(oldest_key)
-            # Remove from _embedding_entries and _embeddings
-            self._embedding_entries.pop(idx)
-            if self._embeddings is not None:
-                if len(self._embedding_entries) == 0:
-                    self._embeddings = None
-                else:
-                    self._embeddings = np.delete(self._embeddings, idx, axis=0)
-
-            # Re-index remaining entries
-            self._key_to_emb_idx.clear()
-            for i, e in enumerate(self._embedding_entries):
-                k = self._make_key(
-                    e.prompt,
-                    telemetry=e.telemetry,
-                    embedding=e.embedding,
-                    schema_digest=e.schema_digest,
-                    model_version=e.model_version,
-                    policy_scope=e.policy_scope,
-                    alpha=e.alpha,
-                    margin_threshold=e.margin_threshold,
-                    strict=e.strict,
-                )
-                self._key_to_emb_idx[k] = i
+        self._remove_key(next(iter(self._exact_index)))
 
     def clear(self) -> None:
         """Clears all entries and resets statistics."""
         with self._lock:
             self._exact_index.clear()
+            self._base_to_key.clear()
             self._embeddings = None
             self._embedding_entries.clear()
             self._key_to_emb_idx.clear()

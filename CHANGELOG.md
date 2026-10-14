@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Bound cache vectors and aliases during eviction, invalidation and clearing.
+- Validate complete online lessons before updating any field or model version.
+- Preserve cold-start exemplar banks and online prototype state across skill saves and reloads. Newly saved exemplar arrays require the updated reader; existing skills remain readable.
+- Recheck permission and context before deferred async reviewers start.
+- Bound every skill file read and account for covariance, calibration objects, exemplar state and spectral reconstruction during model admission. Loaded heads no longer rebuild discarded seed embeddings.
+- Include FastAPI test dependencies, refresh the lockfile and constrain BLAS test threads in CI.
+
 ## 1.0.0 — 2026-10-14
 
 **System 1: Instinct (`1.0.0`)** — Sub-millisecond non-autoregressive decision runtime, zero-shot unsupervised adaptation (`adapt_zero_shot`), and calibration-preserving online RLS skills.
