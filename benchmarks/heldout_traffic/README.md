@@ -11,6 +11,13 @@ plus one logistic regression classifier, a flat lexical Instinct ablation, and
 the hybrid/hierarchical Instinct configuration used in the existing gauntlet.
 `protocol.json` fixes settings before fitting or final scoring.
 
+The first runner revision stopped before final inference when a full hybrid
+skill exceeded the reader's header limit. A pre-score harness amendment retains
+that deployment failure and evaluates this model in memory. Predictor settings,
+data, thresholds, risk accounting and decision rule are unchanged. Reloadable
+models undergo save/load parity checks; unsupported hybrid artifacts do not
+receive a successful deployment claim.
+
 ## Data and phases
 
 Use the published HWU64 train/valid/test split from Zhang et al.'s

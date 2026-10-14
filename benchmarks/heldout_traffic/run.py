@@ -9,6 +9,7 @@ import math
 import pickle
 import platform
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -167,6 +168,7 @@ def main():
     socket.create_connection = blocked
     delta = PROTOCOL["family_failure_probability"]/(len(PROTOCOL["methods"])*len(PROTOCOL["noise_seeds"]))
     records, gates, costs = {}, {}, {}
+    in_memory = {}
     with threadpool_limits(limits=1), tempfile.TemporaryDirectory(prefix="heldout-models-") as temp:
         model_dir = Path(temp)
         # All thresholds are fixed and committed to the receipt before final inference.
@@ -190,13 +192,24 @@ def main():
                                   qualified=threshold is not None and upper <= PROTOCOL["local_error_budget"])
                 path = model_dir / key
                 save_model(method, model, path)
-                costs[key] = dict(fit_seconds=fit_s, serialized_bytes=path.stat().st_size)
+                costs[key] = dict(fit_seconds=fit_s, serialized_bytes=path.stat().st_size, reloadable=True)
                 records[key] = dict(dev=dev, qualify=qual)
                 # Replay parity checks save/reload independently of final labels.
-                replay = predict(method, load_model(method, path), cohorts["dev"][:10])
-                for a, b in zip(dev[:10], replay):
-                    if a["prediction"] != b["prediction"] or a["eligible"] != b["eligible"] or not math.isclose(a["confidence"], b["confidence"], abs_tol=1e-6):
-                        raise ValueError(f"Serialization changed {key}")
+                try:
+                    restored = load_model(method, path)
+                except ValueError as error:
+                    if method != "instinct_hybrid" or str(error) != "Saved skill header exceeds size limit":
+                        raise
+                    costs[key].update(reloadable=False, reload_error=str(error),
+                                      serialized_header_bytes=struct.unpack(">I", path.read_bytes()[4:8])[0])
+                    in_memory[key] = model
+                    print(f"DEPLOYMENT FAILURE {key}: {error}; continuing in memory", flush=True)
+                else:
+                    replay = predict(method, restored, cohorts["dev"][:10])
+                    for a, b in zip(dev[:10], replay):
+                        if a["prediction"] != b["prediction"] or a["eligible"] != b["eligible"] or not math.isclose(a["confidence"], b["confidence"], abs_tol=1e-6):
+                            raise ValueError(f"Serialization changed {key}")
+                    del restored
                 print(f"FROZEN {key}: fit={fit_s:.2f}s qualify={len(accepted)} errors={errors} upper={upper:.4%} approved={gates[key]['qualified']}", flush=True)
                 del model
                 gc.collect()
@@ -205,7 +218,7 @@ def main():
         for seed in PROTOCOL["noise_seeds"]:
             for method in PROTOCOL["methods"]:
                 key = f"{method}:{seed}"
-                model = load_model(method, model_dir/key)
+                model = in_memory.pop(key) if key in in_memory else load_model(method, model_dir/key)
                 records[key]["test"] = predict(method, model, cohorts["test"])
                 records[key]["repeat"] = predict(method, model, cohorts["teach"])
                 print(f"PREDICTED {key}: fresh={len(cohorts['test'])} repeat={len(cohorts['teach'])}; final answers unopened", flush=True)
