@@ -132,7 +132,14 @@ ACT 3: 'TEACH ME' — Teaching a Brand-New Jargon Term in 1 Line (< 4 ms)
      • System 1: Instinct (Taught)  : refund_duplicate_charge (urgent=True) in 0.512 ms ✅
 ```
 
-You can also run the 3-wave teacher auto-cutover demo in [`examples/drop_in/llm_cutover_dropin.py`](examples/drop_in/llm_cutover_dropin.py).
+You can also run:
+- **Live GitHub Issue Triage Dogfood (`astral-sh/uv` + `facebook/react` OOS)** ([`examples/dogfood/live_github_triage.py`](examples/dogfood/live_github_triage.py), snapshot in [`examples/dogfood/uv_live_issues_snapshot.json`](examples/dogfood/uv_live_issues_snapshot.json)): replays `260` real chronologically ordered `astral-sh/uv` issues (`#491 -> #22542`, zero synthetic strings, zero temporal leakage) plus `25` real `facebook/react` out-of-scope issues from **`0` examples (`0.0%` offload, `100%` escalated)** $\to$ **online warm-up (`40.0%` offload)** $\to$ **compiled `.s1m` (`56.7%` at `15/class` $\to$ `76.7%` at `25/class` $\to$ `93.3%` local offload at `40/class` in `0.23 ms` with `100.0%` local precision, `96.0%` OOS abstention, and `100%` `.s1m` reload parity)**:
+  ```bash
+  python examples/dogfood/live_github_triage.py
+  # Or pull fresh live issues on demand via GitHub CLI (`gh api`):
+  python examples/dogfood/live_github_triage.py --live --repo astral-sh/uv
+  ```
+- **3-Wave Teacher Auto-Cutover Demo** ([`examples/drop_in/llm_cutover_dropin.py`](examples/drop_in/llm_cutover_dropin.py)).
 
 ### How Many Examples Does It Actually Take?
 

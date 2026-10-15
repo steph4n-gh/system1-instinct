@@ -1,0 +1,3277 @@
+{
+ "schema_version": "1.0",
+ "source": "github_rest_api_v3",
+ "primary_repo": "astral-sh/uv",
+ "oos_repo": "facebook/react",
+ "categories": [
+  "bug",
+  "performance",
+  "documentation",
+  "enhancement",
+  "ci_and_build"
+ ],
+ "category_label_mapping": {
+  "bug": [
+   "bug"
+  ],
+  "performance": [
+   "performance"
+  ],
+  "documentation": [
+   "documentation"
+  ],
+  "enhancement": [
+   "enhancement"
+  ],
+  "ci_and_build": [
+   "internal:testing",
+   "internal:ci",
+   "internal:automations",
+   "build:skip-release",
+   "build:skip-docker"
+  ]
+ },
+ "chronological_order": "oldest_to_newest_by_issue_number",
+ "issues": [
+  {
+   "number": 491,
+   "title": "Nest cache directories to avoid too large directories",
+   "body_snippet": "Instead of e.g. placing all pypi metadata in a directory, we should consider adding subdirectory levels to avoid large directories with multiple thousand entries that slow down fs operations. cache and git e.g. do this by using the first to letter of",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2023-11-22T19:06:20Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/491"
+  },
+  {
+   "number": 537,
+   "title": "Invalid unpack operation when building source distribution",
+   "body_snippet": "Running `cargo run -p puffin-cli -- pip-sync ../ruff-lsp/requirements-dev.txt` is giving me: ```text error: Failed to download distributions Caused by: Failed to build: ujson==5.7.0 Caused by: Failed to install requirements from build-system.requires",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2023-12-04T04:57:48Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/537"
+  },
+  {
+   "number": 554,
+   "title": "Repeatedly building local source distribution fails",
+   "body_snippet": "I'm getting, e.g.: ```text error: Failed to download distributions Caused by: Failed to build: service @ file:///Users/crmarsh/workspace/path/service Caused by: failed to rename file from /Users/crmarsh/Library/Caches/puffin/built-wheels-v0/c61d38458",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2023-12-04T22:17:30Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/554"
+  },
+  {
+   "number": 721,
+   "title": "Add support for relative URLs in simple metadata responses",
+   "body_snippet": "## Summary This PR adds support for relative URLs in the simple JSON responses. We already support relative URLs for HTML responses, but the handling has been consolidated between the two. Similar to index URLs, we now store the base alongside the me",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2023-12-24T20:44:59Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/721"
+  },
+  {
+   "number": 817,
+   "title": "Improve contributing documentation",
+   "body_snippet": "- Add a link to the README - Add some basic guidelines to CONTRIBUTING - Describe the architecture of the project - Ensure `scripts` projects have README files - Link to relevant scripts in CONTRIBUTING",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-01-06T16:28:35Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/817"
+  },
+  {
+   "number": 856,
+   "title": "Unzip while downloading",
+   "body_snippet": "Results: ``` torch==1.12.1: 1.13 ± 0.03 times faster trio.txt: 1.10 ± 0.11 times faster flyte.txt: 1.07 ± 0.02 times faster boto3.txt: 1.09 ± 0.11 times faster black.txt: 1.05 ± 0.24 times faster boto3==1.34.14: 1.04 ± 0.16 times faster pdm2193.txt: ",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-01-09T18:45:43Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/856"
+  },
+  {
+   "number": 1053,
+   "title": "Run tests in CI on macOS",
+   "body_snippet": "Currently we only run CI tests on Linux. We could include tests for macOS, but it's expensive. Regardless, the project fails to compile https://github.com/astral-sh/puffin/actions/runs/7618370740/job/20749516326",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2024-01-22T23:02:09Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1053"
+  },
+  {
+   "number": 1063,
+   "title": "Improve retry of pip install scenario tests",
+   "body_snippet": "Follow-up to #996 with retries of the full `pip_install_scenario` module since there are a few tests that flake and tracking down the non-determinism is proving to be quite complicated. Adds a profile that can be used to disable retries, e.g. `--prof",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2024-01-23T15:30:58Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1063"
+  },
+  {
+   "number": 1234,
+   "title": "Document profiling and tracing-durations-export",
+   "body_snippet": "Profiling is already extensively documented in ruff, so we can just link to that guide. I added `tracing-durations-export` to the guide because i found it a useful tool for optimizing.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-02-02T17:49:48Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1234"
+  },
+  {
+   "number": 1339,
+   "title": "`pip install --trusted-host` support",
+   "body_snippet": "`pip install` has the `trusted-host` flag: ``` --trusted-host <hostname> Mark this host or host:port pair as trusted, even though it does not have valid or any HTTPS. ``` Seems like a nice-to-have for `uv pip install` to also support this flag.",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "help wanted",
+    "area:network"
+   ],
+   "created_at": "2024-02-15T21:00:04Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1339"
+  },
+  {
+   "number": 1411,
+   "title": "Update README.md to include venv activate",
+   "body_snippet": "This is just a small readme change to include venv activation. In case someone just follows the docs as-is, they will end up installing packages outside of the desired virtual env.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-02-16T02:11:31Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1411"
+  },
+  {
+   "number": 1431,
+   "title": "Docs: `contributing.md` Python section anchor does not exist",
+   "body_snippet": "> See the [Python](#python) section for instructions on installing the Python versions. `#python` does not currently exist in this file. https://github.com/JacobCoffee/uv/blob/2586f655bbf650a9797c8f88b6d9066eefe7a3dc/CONTRIBUTING.md#L30",
+   "category": "documentation",
+   "labels": [
+    "documentation",
+    "good first issue"
+   ],
+   "created_at": "2024-02-16T05:13:01Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1431"
+  },
+  {
+   "number": 1434,
+   "title": "fix(docs): adjust link",
+   "body_snippet": "## What Fixes a missing link in `contributing.md` to the Python installation section by rearranging the section and adding a 3rd-level heading for #Python ## Closes Closes #1431",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-02-16T05:24:59Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1434"
+  },
+  {
+   "number": 1442,
+   "title": "Implement `--report` for `uv pip install`",
+   "body_snippet": "From the `pip` docs: > The `--report` option of the pip install command produces a detailed JSON report of what it did install (or what it would have installed, if used with the `--dry-run` option). This produces a nice JSON report that's essentially",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "area:cli",
+    "area:json-output"
+   ],
+   "created_at": "2024-02-16T06:16:55Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1442"
+  },
+  {
+   "number": 1455,
+   "title": "`uv` fails to install `pyyaml==5.4.1`",
+   "body_snippet": "`uv pip install \"pyyaml<6\"` ``` Resolved 1 package in 0ms error: Failed to download distributions Caused by: Failed to fetch wheel: pyyaml==5.4.1 Caused by: Failed to build: pyyaml==5.4.1 Caused by: Build backend failed to determine extra requires wi",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2024-02-16T08:54:30Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1455"
+  },
+  {
+   "number": 1491,
+   "title": "uv pip install inconsistent failure on Windows",
+   "body_snippet": "- Windows 22H2 - Using PowerShell env (in either Windows Terminal or powershell.exe, non-elevated) When using `uv pip install -r requirements.txt`, I will frequently get the following error: ``` error: Failed to download distributions Caused by: Fail",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:windows"
+   ],
+   "created_at": "2024-02-16T14:07:16Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1491"
+  },
+  {
+   "number": 1514,
+   "title": "Private git dependency URLs with credentials do not resolve",
+   "body_snippet": "Working with private git repos that require a username and token to resolve seems to fail in `uv`: ``` uv pip install '{packagename} @ git+https://{username}@github.com/{organization}/{packagename}.git' Updating https://{username}/ (github.com/{organ",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2024-02-16T16:59:38Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1514"
+  },
+  {
+   "number": 1516,
+   "title": "Feature request: add a way to install only build dependencies",
+   "body_snippet": "ref: https://github.com/pypa/pip/issues/11440#issuecomment-1615211774 In our CI, we often need to install build-dependencies for a project, without installing the project itself. At the moment, there is no easy way of telling pip to do that. We've re",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2024-02-16T17:14:21Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1516"
+  },
+  {
+   "number": 1517,
+   "title": "Add `-t/--target` flag for `uv pip install`",
+   "body_snippet": "This option is used a lot for vendoring and for custom build systems. From `pip install --help`: ```sh -t, --target <dir> Install packages into <dir>. By default this will not replace existing files/folders in <dir>. Use --upgrade to replace existing",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "compatibility"
+   ],
+   "created_at": "2024-02-16T17:28:41Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1517"
+  },
+  {
+   "number": 1520,
+   "title": "No keyring support for authentication",
+   "body_snippet": "It appears `uv` does not have support for keyring like pip does. https://pip.pypa.io/en/stable/topics/authentication/#keyring-support",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "compatibility"
+   ],
+   "created_at": "2024-02-16T18:05:17Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1520"
+  },
+  {
+   "number": 1525,
+   "title": "Uninstalling then reinstalling a package produces METADATA error",
+   "body_snippet": "Steps to reproduce: * Installing some package, let's say `pandas` ``` uv venv env1 -p 3.10 source env1/bin/activate uv pip install pandas ``` * Uninstalling it and installing it again: ``` uv pip uninstall pandas uv pip install pandas ``` * Produces ",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "needs-mre"
+   ],
+   "created_at": "2024-02-16T18:47:21Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1525"
+  },
+  {
+   "number": 1656,
+   "title": "Virtualenv creation is failing on Python embedded versions",
+   "body_snippet": "Hi, When I try to create a virtualenv from a Python Embedded version on Windows I get the following error: ```cmd Using Python 3.7.9 interpreter at C:\\Users\\alex\\Documents\\Python\\python-3.7.9-embed-amd64\\python.exe Creating virtualenv at: .venv uv::v",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:windows",
+    "area:environments"
+   ],
+   "created_at": "2024-02-18T16:49:54Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1656"
+  },
+  {
+   "number": 1668,
+   "title": "fix: use --override rather than -o to specify overrides in README.md",
+   "body_snippet": "## Summary Fix documentation (Readme.md): `-o` is the short for `--output-file`, so using `-o overrides.txt` would store the output in `overrides.txt` rather than using that as overrides. ## Test Plan no tests for docs (yet?)",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-02-18T22:28:23Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1668"
+  },
+  {
+   "number": 1737,
+   "title": "Performance with large git repos",
+   "body_snippet": "Hi, I found a situation where uv is significantly slower than pip: installing from a large git repo. Reproducer: `uv -v pip install \"odoo @ git+https://github.com/odoo/odoo@17.0\"` (warning: this requires ~6GB disk space and a ~4GB download). After th",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-02-20T07:21:17Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1737"
+  },
+  {
+   "number": 1753,
+   "title": "Tracking Issue: Make test suite pass on alpine",
+   "body_snippet": "For better musl support, we should add alpine to CI. The first step to that is making the test suite pass on alpine. We are currently at 8 failures. Each test failure needs to be triaged and either fixed or the test ignored. Afterwards, we need a scr",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing",
+    "area:musl"
+   ],
+   "created_at": "2024-02-20T14:33:25Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1753"
+  },
+  {
+   "number": 1760,
+   "title": "Question about space efficiency of the git cache",
+   "body_snippet": "If I understand correctly, installing from git URL creates the following in the uv cache: 1. the git objects in `git-v0/db` 2. a git checkout in `git-v0/checkouts` (with hardlinks to the git objects but copies of the source files) 3. the built wheel ",
+   "category": "performance",
+   "labels": [
+    "performance",
+    "area:cache"
+   ],
+   "created_at": "2024-02-20T15:10:28Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1760"
+  },
+  {
+   "number": 1774,
+   "title": "No changelog after 0.1.3",
+   "body_snippet": "Seems there's no longer a changelog anywhere past 0.1.3. https://github.com/astral-sh/uv/releases/tag/0.1.3. It would be nice to have a place to easily see what changes are in new versions.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-02-20T18:40:58Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/1774"
+  },
+  {
+   "number": 1806,
+   "title": "[docs] Update README.md to include extras example",
+   "body_snippet": "## Summary There was no example of to hint support for extras in the README.md. I added one example in the install section that is used in the uv tests.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-02-21T13:30:30Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1806"
+  },
+  {
+   "number": 1830,
+   "title": "Use Windows 2019 runner instead of 2022",
+   "body_snippet": "Testing, per: - https://github.com/actions/runner-images/issues/7320 - https://github.com/actions/runner-images/issues/5166",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2024-02-21T21:01:58Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1830"
+  },
+  {
+   "number": 1832,
+   "title": "Disable Windows defender in CI",
+   "body_snippet": "Testing, per: - https://github.com/actions/runner-images/issues/7320 See also: - #1830",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2024-02-21T21:07:55Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1832"
+  },
+  {
+   "number": 1844,
+   "title": "Add docs for git authentication",
+   "body_snippet": "[Rendered](https://github.com/astral-sh/uv/blob/zb/auth-docs/README.md#git-authentication) Adds docs for - #1781 - #1717",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-02-22T01:12:25Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1844"
+  },
+  {
+   "number": 1954,
+   "title": "docs: clarify lowest vs lowest-direct resolutions",
+   "body_snippet": "## Summary Closes #1915 Small change to clarify lowest vs lowest-direct.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-02-24T19:28:46Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/1954"
+  },
+  {
+   "number": 2014,
+   "title": "[Feature request] A way to see which packages took long to resolve",
+   "body_snippet": "Dear team 🙇‍♂️ ! Thank you for this amazing development and congratulations with the launch of `uv`. I'm following your work closely and am eager to bake it into many projects! I've stumbled upon a small feature request that I hope you could implemen",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "area:resolver"
+   ],
+   "created_at": "2024-02-27T13:53:23Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/2014"
+  },
+  {
+   "number": 2145,
+   "title": "uv fails to build qcore==1.10.0 on Python 3.12, but pip is happy to",
+   "body_snippet": "``` (v312-ydmj) ~/tmp/v312 λ uv pip install 'qcore==1.10.0' Resolved 1 package in 10ms error: Failed to download distributions Caused by: Failed to fetch wheel: qcore==1.10.0 Caused by: Failed to build: qcore==1.10.0 Caused by: Build backend failed t",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:macos"
+   ],
+   "created_at": "2024-03-04T06:24:32Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/2145"
+  },
+  {
+   "number": 2220,
+   "title": "Small reads in uv_distribution::distribution_database::download producing v. slow download performance when installing torch",
+   "body_snippet": "Hey, this is a successor to https://github.com/astral-sh/uv/pull/1978 as I'm still trying to integrate `uv` with Modal's internal mirror. But this time I don't yet have a solution to this problem 🙂. I'm observed extremely degraded install performance",
+   "category": "performance",
+   "labels": [
+    "performance",
+    "great writeup"
+   ],
+   "created_at": "2024-03-05T20:44:12Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/2220"
+  },
+  {
+   "number": 2255,
+   "title": "Cache wheel metadata in no-PEP 658 fallback",
+   "body_snippet": "## Summary If we fallback to streaming the wheel (because the registry doesn't support range requests), we currently don't cache the metadata at all. This PR fixes that, ensuring that we cache based on the same HTTP policies, etc.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-03-07T00:41:00Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/2255"
+  },
+  {
+   "number": 2308,
+   "title": "Automatically run system install tests on labeled pull requests and main",
+   "body_snippet": "Toggles inclusion of the tests with the `test-extra` label and runs on push to `main`.",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing",
+    "test:extended"
+   ],
+   "created_at": "2024-03-08T21:53:18Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/2308"
+  },
+  {
+   "number": 2309,
+   "title": "Prebuild binaries for `system-install` tests",
+   "body_snippet": "Rather than build the binaries in every test case, we build the necessary binaries up-front then perform the tests on downloaded artifacts.",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing",
+    "test:extended"
+   ],
+   "created_at": "2024-03-08T22:10:19Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/2309"
+  },
+  {
+   "number": 2319,
+   "title": "Address #2220 (slow download perf against PyPi mirror)",
+   "body_snippet": "## Summary Addressing the extremely slow performance detailed in https://github.com/astral-sh/uv/issues/2220. There are two changes to increase download performance: 1. setting `accept-encoding: identity`, in the spirit of https://github.com/pypa/pip",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-03-10T00:40:57Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/2319"
+  },
+  {
+   "number": 2452,
+   "title": "Speed up cold cache urllib3/boto3/botocore with batched prefetching",
+   "body_snippet": "With pubgrub being fast for complex ranges, we can now compute the next n candidates without taking a performance hit. This speeds up cold cache `urllib3<1.25.4` `boto3` from maybe 40s - 50s to ~2s. See docstrings for details on the heuristics. **Bef",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-03-14T11:01:17Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/2452"
+  },
+  {
+   "number": 2672,
+   "title": "Flaky test `compile_invalid_pyc_invalidation_mode`",
+   "body_snippet": "I see this relatively frequently on macOS ``` Snapshot: compile_invalid_pyc_invalidation_mode Source: crates/uv/tests/pip_sync.rs:2934 ──────────────────────────────────────────────────────────────────────────────── Expression: snapshot ─────────────",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2024-03-26T17:30:44Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/2672"
+  },
+  {
+   "number": 2678,
+   "title": "Bring harmony to the test snapshot filtering situation",
+   "body_snippet": "The snapshot filtering situation has gotten way out of hand, with each test hand-rolling it's own filters on top of copied cruft from previous tests. I've attempted to address this holistically: - `TestContext.filters()` has everything you should nee",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2024-03-26T22:41:34Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/2678"
+  },
+  {
+   "number": 2697,
+   "title": "Don't use exclude newer manually in test functions",
+   "body_snippet": "With this change, all usages of `EXCLUDE_NEWER` are now in command wrappers, not in the test functions themselves. For the venv test, i refactored them into the same kind of test context abstraction that the other test modules have in the second comm",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2024-03-27T17:57:50Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/2697"
+  },
+  {
+   "number": 2706,
+   "title": "slower than poetry on downloading wheels",
+   "body_snippet": "Comparing `poetry install` with `uv install` a `poetry export`ed `requirments.txt`: * `poetry` takes 4m5s, peak network speed is 528 Mibps * `uv` takes 4m17s, peak network speed is 229 Mibps (Resolve is fast, only took 1.39s) ``` Resolved 173 package",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-03-28T05:58:46Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/2706"
+  },
+  {
+   "number": 2744,
+   "title": "Bad interpreter due to incorrect shebang when running scripts from setuptools setup scripts",
+   "body_snippet": "# Issue Executing a bin installed from \"scripts\" tag at `setup` from setuptools errors ```bash ❯ my_package zsh: /Users/hodeinavarro/Developer/astral.sh/uv-bin-scripts-mre/with-uv/bin/my_package: bad interpreter: /Users/hodeinavarro/Library/Caches/uv",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "external"
+   ],
+   "created_at": "2024-03-31T23:47:22Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/2744"
+  },
+  {
+   "number": 2813,
+   "title": "Feature Request: Expose python and venv discovery as a machine interpretable uv subcommand",
+   "body_snippet": "Many tools in the python development process could benefit from a consistent way of resolving the current project's python executable and virtual env. Since uv already has [documented logic for python discovery](https://github.com/astral-sh/uv?tab=re",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "wish"
+   ],
+   "created_at": "2024-04-03T16:19:22Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/2813"
+  },
+  {
+   "number": 3063,
+   "title": "Installing packages from custom pypi server fails on 0.1.32",
+   "body_snippet": "Highly likely that the root issue is on our end but figured it's still worth an issue since others might be facing the same issue soon: upon upgrading to `uv==0.1.32`, our docker builds started failing with ``` error: HTTP status server error (502 Ba",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "external"
+   ],
+   "created_at": "2024-04-16T15:11:52Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/3063"
+  },
+  {
+   "number": 3097,
+   "title": "Add strict command mode to `uv run`",
+   "body_snippet": "This would only allow you to run a command provided by a package in the current environment. Maybe we'd want to use a new flag `--strict` or re-use the `--isolated` flag.",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "help wanted",
+    "needs-design"
+   ],
+   "created_at": "2024-04-17T16:44:28Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/3097"
+  },
+  {
+   "number": 3121,
+   "title": "Feature request: local git dependencies",
+   "body_snippet": "`uv` doesn't seem to support local git dependencies: https://github.com/astral-sh/uv/blob/7688f464c8377f7d4c67c371f0aa9550bb0b86ac/crates/distribution-types/src/lib.rs#L312 e.g. ``` foo_lib==git+file://../foo_lib#egg=foo_lib-3.1.4 ``` It'd be awesome",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "wish"
+   ],
+   "created_at": "2024-04-18T13:48:07Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/3121"
+  },
+  {
+   "number": 3287,
+   "title": "[perf] uv pip install resolution is slow when installing from VCS",
+   "body_snippet": "Ciao! I am installing a library from VCS and I _feel_ it should be faster. The library in question is functime, a forecasting library I maintain. I installed first a version from a [PR I am about to merge](https://github.com/functime-org/functime/pul",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-04-27T09:11:33Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/3287"
+  },
+  {
+   "number": 3687,
+   "title": "Failed to download whl due to the missing of credentials in URL",
+   "body_snippet": "cmd: ``` export UV_INDEX_URL=https://username:password@pypi.whatever.cn/whatever/pypi/+simple uv pip install -U whatever ``` output: ``` error: Failed to download `whatever==2.1.1` Caused by: Failed to unzip wheel: whatever-2.1.1-py3-none-any.whl Cau",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2024-05-21T08:02:45Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/3687"
+  },
+  {
+   "number": 3937,
+   "title": "Cache workspace discovery in-process",
+   "body_snippet": "Currently, every time we compute a `Metadata` instance, we performance workspace discovery anew. Instead, we should cache the paths we know are part of a workspace and reuse them.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-05-31T12:12:50Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/3937"
+  },
+  {
+   "number": 4128,
+   "title": "UV doesn't crash if there is operation timeout and error",
+   "body_snippet": "I was trying to execute uv pip install requirements on latest version of uv. If there was a operation timeout error , uv didn't crash and instead just printed the error like below and said all is successful ![image](https://github.com/astral-sh/uv/as",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "needs-mre",
+    "area:network"
+   ],
+   "created_at": "2024-06-07T11:19:30Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/4128"
+  },
+  {
+   "number": 4567,
+   "title": "Allow updating sources with `uv add`",
+   "body_snippet": "Follow up to https://github.com/astral-sh/uv/pull/4566, `uv add git+https://..foo` followed by `uv add foo --branch foo` should work as expected. Currently it errors. `cargo add` supports this.",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "good first issue",
+    "help wanted"
+   ],
+   "created_at": "2024-06-26T21:25:04Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/4567"
+  },
+  {
+   "number": 4921,
+   "title": "Add universal resolution to continuous benchmarking",
+   "body_snippet": "Currently, we only benchmark single-platform resolution on codspeed. We need to add universal resolution to avoid performance regressions.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-07-09T10:31:02Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/4921"
+  },
+  {
+   "number": 5448,
+   "title": "UV 0.2.29 Permission error",
+   "body_snippet": "I'm using uv with tox to build multiple versions of the same packet on Ubuntu Linux 22.04 LTS. The tox.ini works well with uv 0.2.28, but starts to fail with 0.2.29. Changing back to uv 0.2.28 fixes the problem: The command that causes the error: any",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2024-07-25T15:25:42Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/5448"
+  },
+  {
+   "number": 5460,
+   "title": "uv self update: failed to execute installer (status: exit code: 1) on Windows",
+   "body_snippet": "When running `uv self update --verbose` on my Windows 11 machine, I get the following output: ``` DEBUG uv 0.2.28 info: Checking for updates... error: failed to execute installer (status: exit code: 1) ``` Installing and updating `uv` through the fol",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "external",
+    "internal:releases"
+   ],
+   "created_at": "2024-07-25T19:25:18Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/5460"
+  },
+  {
+   "number": 6469,
+   "title": "Include environment variables that can be used for CLI options in reference docs",
+   "body_snippet": "The CLI reference documentation doesn't include environment variables for flags like `uv help` does.",
+   "category": "documentation",
+   "labels": [
+    "documentation",
+    "help wanted"
+   ],
+   "created_at": "2024-08-22T23:12:41Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/6469"
+  },
+  {
+   "number": 6518,
+   "title": "Constraint flag for `uv add`",
+   "body_snippet": "Hi, can we instead add a new flag `-c / --constraint` to `uv add`, so that you can pass in constraint files directly? I think currently you can do this by adding a constraint to a `requirements.txt` file, then running `uv add --requirements requireme",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2024-08-23T14:04:30Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/6518"
+  },
+  {
+   "number": 6523,
+   "title": "docs: Add PyTorch installation guide",
+   "body_snippet": "Hello there! First real docs PR for uv. 1. I expect this will be rewritten a gazillion times to have a consistent tone with the rest of the docs, despite me trying to stick to it as best as I could. Feel free to edit! 2. I went super on the verbose m",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-08-23T14:54:28Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/6523"
+  },
+  {
+   "number": 6855,
+   "title": "Feature Request [tool]: allow dumping installed packages to a file and re-installing from that file",
+   "body_snippet": "A useful feature of `pipx` is the ability to both: - list all of its installed packages in JSON format - install everything listed in a JSON file This allows for backing up (and checking in) of an entire set of tools: ```bash pipx list --json > my.js",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2024-08-30T07:38:45Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/6855"
+  },
+  {
+   "number": 6894,
+   "title": "UV fails to fetch wheel when package is specified in build-system requires",
+   "body_snippet": "I've tested this with uv version 4.0.1 with `uv sync --reinstall`. It successfully installs the package when specified under `[dependencies]` but get the error below when it's under `[build-system] requires` (anonymized output): ``` error: Failed to ",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2024-08-31T17:28:29Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/6894"
+  },
+  {
+   "number": 6940,
+   "title": "Spurious test failures related to Windows permissions on temporary directory",
+   "body_snippet": "``` running 1 test ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot: uv_run_isolate Source: E:\\uv:533 ─────────────────────────────────────────────────────────────────────────────── Expression: snapshot ───────",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2024-09-02T18:21:11Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/6940"
+  },
+  {
+   "number": 6951,
+   "title": "Add `static` assets to docs pages",
+   "body_snippet": "## Summary This PR points the docs towards the static assets that we use for `astral.sh`, so that we can use shared assets for the Ruff and uv docs.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-09-02T23:54:21Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/6951"
+  },
+  {
+   "number": 6985,
+   "title": "Support `allow-insecure-host` in `uv python`",
+   "body_snippet": "Currently, we do not read this setting during Python downloads. See https://github.com/astral-sh/uv/pull/6983 for some beginning changes. We'll need to change the internal structuring of the settings a bit to support this.",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "help wanted"
+   ],
+   "created_at": "2024-09-03T22:45:56Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/6985"
+  },
+  {
+   "number": 6986,
+   "title": "docs(configuration): clarify `uv.toml` precedence",
+   "body_snippet": "## Summary Add a note in the documentation to clarify that `uv.toml` files take precedence over `[tool.uv]` section in `pyproject.toml`, based on the warning shown in the CLI: ```console $ uv version warning: Found both a `uv.toml` file and a `[tool.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-09-03T23:02:12Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/6986"
+  },
+  {
+   "number": 7004,
+   "title": "Running out of memory with uv pip install",
+   "body_snippet": "We are using uv inside CI/CD, and we are constantly hitting Memory kills by the kubernetes executor. We don't really want to increase the memory requests to high because it's not needed outside of uv install and it's costly. We were trying to set con",
+   "category": "performance",
+   "labels": [
+    "performance",
+    "needs-mre"
+   ],
+   "created_at": "2024-09-04T10:39:34Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/7004"
+  },
+  {
+   "number": 7062,
+   "title": "perf: `uv build` is slower on the second run compared to `uvx hatch build`",
+   "body_snippet": "## Reproduce Steps ### 1. Using `uv build` ```bash cookiecutter gh:x-pt/template --directory template/py --no-input && \\ cd my-awesome-project && \\ uv sync && \\ time uv build && \\ time uv build && \\ time uv build && \\ time uv build && \\ cd .. && rm -",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-09-05T02:08:31Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/7062"
+  },
+  {
+   "number": 7105,
+   "title": "When I click `Docs ⌄` from the blog I'm taken to the ruff docs, but I was looking for the uv docs",
+   "body_snippet": "1. Go to https://astral.sh/blog 2. Click here: ![image](https://github.com/user-attachments/assets/37d92cbb-7c2a-4232-9e1a-730206808e36) 3. End up on ruff docs: https://docs.astral.sh/ruff/ 🙁 This happens because I google \"uv python\" , which gives me",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2024-09-05T23:22:13Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/7105"
+  },
+  {
+   "number": 7214,
+   "title": "Add excluded dependencies",
+   "body_snippet": "I want to request functionality to exclude dependencies, even if it's a sub dependency. I would like to see the `--excluded` flag in the `uv add` command, and `excluded-dependencies` in `pyproject.toml`. This functionality is in <samp>rye</samp>, but",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "wish",
+    "needs-design"
+   ],
+   "created_at": "2024-09-09T11:01:23Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/7214"
+  },
+  {
+   "number": 8224,
+   "title": "Reuse the result of `which git`",
+   "body_snippet": "## Summary Cache the path to git executable in a `LazyLock` and reuse it throughout the process. This might reduce some costs on finding the git executable.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-10-15T16:18:13Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/8224"
+  },
+  {
+   "number": 8241,
+   "title": "Non-deterministic snapshot in build test",
+   "body_snippet": "``` --- STDOUT: uv::it build::tool_uv_sources --- running 1 test ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot: tool_uv_sources Source: E:\\uv:[1838](https://github.com/astral-sh/uv/actions/runs/11358695393/j",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2024-10-16T04:14:24Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/8241"
+  },
+  {
+   "number": 8288,
+   "title": "Read timeout in publish integration test",
+   "body_snippet": "e.g. https://github.com/astral-sh/uv/actions/runs/11386806549/job/31680084192?pr=8269 ``` DEBUG Writing Python versions to `/home/runner/work/uv/uv/scripts/publish/astral-test-token/.python-version` DEBUG Detected existing version control system: git",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2024-10-17T14:20:09Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/8288"
+  },
+  {
+   "number": 8418,
+   "title": "Flakes in `uv publish` integration test",
+   "body_snippet": "``` Run ./uv run -p 3.12 scripts/publish/test_publish.py --uv ./uv all DEBUG uv 0.4.24 (4d2f31cb7 2024-10-21) Reading inline script metadata from `scripts/publish/test_publish.py` DEBUG Searching for Python 3.12 in managed installations or system pat",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2024-10-21T16:38:37Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/8418"
+  },
+  {
+   "number": 8668,
+   "title": "uv/tests: try harder to isolate tests from parent git repositories",
+   "body_snippet": "Previously, when tests were run in `~/.local/share/uv`, the behavior of some tests could be impacted by a git repository in `~` (as on my system). To avoid this, we set `GIT_CEILING_DIRECTORIES` to forcefully prevent git from climbing out of its test",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2024-10-29T16:41:54Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/8668"
+  },
+  {
+   "number": 9744,
+   "title": "uv add chromadb fails, error Compiling with an SDK that doesn't seem to exist /Applications/Xcode",
+   "body_snippet": "Hi, when I tried to run `uv add chromadb` on macOS, it fails and returns error: ``` esolved 91 packages in 261ms × Failed to download and build `chroma-hnswlib==0.7.6` ╰─▶ Build backend failed to build wheel through `build_wheel` (exit status: 1) 37 ",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2024-12-09T18:57:23Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/9744"
+  },
+  {
+   "number": 9822,
+   "title": "Git submodule cloning not working when using relative paths",
+   "body_snippet": "Hey, I am really enjoying `uv` because I think it's the best Python package manager around. However, I have one problem which keeps me from using it at the moment. I might have found a bug or I am doing something wrong. Let's assume I have a repo `my",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "help wanted"
+   ],
+   "created_at": "2024-12-11T18:31:47Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/9822"
+  },
+  {
+   "number": 9980,
+   "title": "Speed of uv-managed python",
+   "body_snippet": "Thx again for the tool. I think having uv-managed python is very convenient, and I'd be happy to have this level of control which is less independent on OS, and more straightforward than using deadsnakes. When I benchmark speed of uv-managed python v",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2024-12-17T19:08:06Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/9980"
+  },
+  {
+   "number": 10215,
+   "title": "Error reading requirements.txt",
+   "body_snippet": "Hello there, I wanted to install the requirements for a well known [github project](https://github.com/pymedusa/Medusa/blob/master/requirements.txt), but I got this error : ``` $ uv pip install --break-system-packages --system -r requirements.txt err",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "compatibility"
+   ],
+   "created_at": "2024-12-28T18:40:50Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/10215"
+  },
+  {
+   "number": 10269,
+   "title": "Actually use jemalloc",
+   "body_snippet": "The uv-performance-memory-allocator is currently optimized out at least on musl due to the crate being otherwise unused (https://github.com/rust-lang/rust/issues/64402), causing musl to not use jemalloc and being slow. Command: ``` cargo build --targ",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2025-01-02T10:00:53Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/10269"
+  },
+  {
+   "number": 10344,
+   "title": "Optimize apache-airflow (warm cache)",
+   "body_snippet": "I've implemented a series of optimizations for the apache-airflow resolver case, focussed on the resolver thread. Each step targets something that showed up as slow during profiling. Since the benchmarks are path dependent (the speedup of commit B lo",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2025-01-07T09:24:34Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/10344"
+  },
+  {
+   "number": 10361,
+   "title": "Don't revalidate Python interpreter cache entry with `--upgrade`",
+   "body_snippet": "We were always revalidating the Python interpreter cache entry when using `--upgrade`, since the cache timestamp is too recent. Instead, we ignore the usual caching semantics for packages and only compare the timestamp of the interpreter with the rec",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2025-01-07T13:52:08Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/10361"
+  },
+  {
+   "number": 10476,
+   "title": "Avoid allocating for names in the PEP 508 parser",
+   "body_snippet": "## Summary We can read from the slice directly. I don't think this will affect performance today, because `from_str` will then allocate, but it _should_ be a speedup once #10475 merges, since we can then avoid allocating a `String` and go straight fr",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2025-01-10T19:23:44Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/10476"
+  },
+  {
+   "number": 10816,
+   "title": "Avoid build backend for lockfile validation with Hatchling with recursive extras and dynamic metadata",
+   "body_snippet": "This is a mouthful but the PR will make it clearer. Partly a note to self: we can avoid the \"slow path\" from #10797 if we compare both the flattened and unflattened metadata.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2025-01-21T14:19:04Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/10816"
+  },
+  {
+   "number": 10824,
+   "title": "Move smoke tests into dedicated jobs and build `uvx` explicitly",
+   "body_snippet": "In the interest of expanding these tests and debugging weird behaviors, I've moved the smoke tests out of the `cargo test` job and into dedicated `smoke test` jobs. We explicitly build `uvx` in the `build binary` jobs instead of relying on the implic",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2025-01-21T20:40:15Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/10824"
+  },
+  {
+   "number": 10881,
+   "title": "Use Hashbrown's raw entry API to reduce hashes and clone in priority",
+   "body_snippet": "## Summary I'm open to not merging this -- I was kind of just interested in what the API looked like. But the idea is: we can avoid hashing values twice and unnecessarily cloning within the priority map by using the raw entry API.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2025-01-23T02:40:35Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/10881"
+  },
+  {
+   "number": 11018,
+   "title": "failed to rename file [...] Permission denied (os error 13)",
+   "body_snippet": "### Summary Hello ! I am currently using `uv` on a private project (sorry for reproducibility...), and I often get the following error : ```python failed to rename file from /home/pepmts/.cache/uv/.tmpZy5CEP to /home/pepmts/.cache/uv/archive-v0/_zo0z",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:windows",
+    "needs-mre"
+   ],
+   "created_at": "2025-01-28T12:49:19Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/11018"
+  },
+  {
+   "number": 11025,
+   "title": "A group of tests is not robust to some external state",
+   "body_snippet": "``` FAIL [ 1.413s] uv::it edit::add_index ──── STDOUT: uv::it edit::add_index running 1 test ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot Summary ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Snapshot: add_index-4 Source: crates/uv/tests/it/edit.rs:7020 ──────────────",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2025-01-28T17:28:26Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/11025"
+  },
+  {
+   "number": 11156,
+   "title": "Unable to install nvidia-cudnn-cu12==9.7.0.66",
+   "body_snippet": "## Summary ### Bug Failing to install `nvidia-cudnn-cu12` as part of pytorch. - [Logs and instructions to reproduce here](https://github.com/OliverKillane/bug-reports/tree/main/uv-install-pytorch) ### Logs ```bash UV_CONCURRENT_DOWNLOADS=1 uv add nvi",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2025-02-01T20:32:50Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/11156"
+  },
+  {
+   "number": 11184,
+   "title": "Using `uv pip install` to install pytorch from its source code fails, while `pip install` works.",
+   "body_snippet": "### Summary I am trying to build and install `pytorch` from its source code. When using `uv pip install .`, I got a error message: ```bash [stdout] Building wheel torch-2.6.0a0+git1eba9b3 -- Building version torch-2.6.0a0+git1eba9b3 cmake --build . -",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2025-02-03T16:04:30Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/11184"
+  },
+  {
+   "number": 11349,
+   "title": "BUG: `uv tree --invert --package ...` sometimes also displays packages I didn't ask for",
+   "body_snippet": "### Summary When I run `uv tree --invert --package ...` against astropy, I sometimes get more packages to show up in the displayed tree than I asked for, which seems like a bug. This is obvious when requesting a single package as root and limiting th",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2025-02-09T09:03:05Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/11349"
+  },
+  {
+   "number": 11454,
+   "title": "Moved venv causes: Failed to spawn: `pytest` Caused by: No such file or directory (os error 2)",
+   "body_snippet": "### Summary I'm kind of stumped with the following issue, we use development containers as our uv environment, the following command works for the same container for one user, but not for another: ```bash uv run --link-mode=copy --active pytest ``` S",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2025-02-12T16:54:49Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/11454"
+  },
+  {
+   "number": 11764,
+   "title": "Avoid using owned `String` in deserializers",
+   "body_snippet": "## Summary This is the pattern I see in a variety of crates, and I believe this is preferred if you don't _need_ an owned `String`, since you can avoid the allocation. This could be pretty impactful for us?",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2025-02-25T05:41:42Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/11764"
+  },
+  {
+   "number": 11800,
+   "title": "uv 0.6.3 fails to install python on Windows Server 2016",
+   "body_snippet": "### Summary Recently, I have seen that uv 0.6.3 has failed to install python on Windows Server 2016 (Datacenter Edition), due to an inability to rename the temp file to the venv. This is not a problem with uv 0.6.2 or 0.6.1 on Server 2016, or on Wind",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:windows"
+   ],
+   "created_at": "2025-02-26T15:20:33Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/11800"
+  },
+  {
+   "number": 11822,
+   "title": "uv does not use correct Python version, fails to find wheel, tries to build package, fails",
+   "body_snippet": "### Summary We have an internal tool that installs Python 3.10, `virtualenv`, creates virtual environment, installs `uv` and then installs `skypilot` using `uv`. This worked for many people before, but it stopped working now. I traced the issue to th",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2025-02-27T06:48:12Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/11822"
+  },
+  {
+   "number": 11938,
+   "title": "Run the Docker build workflow when we touch project or toolchain metadata",
+   "body_snippet": "I noticed that https://github.com/astral-sh/uv/pull/11936 did not run the Docker builds, nor did #11934 We should run these when the relevant files change so there aren't surprises at release time! Updates the `build-binaries` workflow to include too",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2025-03-03T23:17:02Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/11938"
+  },
+  {
+   "number": 13533,
+   "title": "[docs] Fix Publishing Packages, Next = \"Index\"",
+   "body_snippet": "The Next footer tab on the Publishing Packages docs page just says \"Index\" which is not helpful. The page it links to is headed \"Integration guides\".",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2025-05-19T12:44:43Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/13533"
+  },
+  {
+   "number": 13667,
+   "title": "`uv cache clean package` is very slow for me",
+   "body_snippet": "Cleaning up one package takes about 3 minutes ``` λ uv cache clean mpi4py Removed 541 files (36.2MiB) uv cache clean mpi4py 5.12s user 97.29s system 56% cpu 3:01.32 total ``` ``` λ uv cache clean requests Removed 27 files (313.4KiB) uv cache clean re",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2025-05-26T21:47:27Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/13667"
+  },
+  {
+   "number": 13817,
+   "title": "Debug `sync_dry_run` flake by panicking with verbose output on failure",
+   "body_snippet": "Investigating #13744 I tried reproducing here by running the test in a loop, but could not. I presume it's an interaction with other tests. This drops the snapshot, but I think it's worth it to try to examine the flake?",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2025-06-03T14:17:58Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/13817"
+  },
+  {
+   "number": 14242,
+   "title": "Add a link to PyPI FAQ to clarify what per-project token is.",
+   "body_snippet": "## Summary This change adds a link to PyPI FAQ about API tokens on the package publishing guide page. To me it wasn't clear what are meant in this section of the docs and it required a little bit of research. Adding explicit link might help beginners",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2025-06-24T15:09:42Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/14242"
+  },
+  {
+   "number": 14480,
+   "title": "Move fragment preservation test to directly test our redirect handling logic",
+   "body_snippet": "When [updating](https://github.com/astral-sh/uv/pull/14475) to the latest `reqwest` version, our fragment propagation test broke. That test was partially testing the `reqwest` behavior, so this PR moves the fragment test to directly test our logic fo",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2025-07-07T08:23:52Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/14480"
+  },
+  {
+   "number": 14536,
+   "title": "Conditionalize version_extras test on the pypi feature",
+   "body_snippet": "## Summary The `version_extras` test added in 85c0fc963b1d4f6c8130c4b4446d15b8f6ac8ac4 needs to connect to PyPI. This PR conditionalizes it on the `pypi` extra so that people running the tests offline don’t have to skip that test explicitly. ## Test ",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2025-07-10T11:10:37Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/14536"
+  },
+  {
+   "number": 14845,
+   "title": "Typos in documentation on data includes for the uv-build backend",
+   "body_snippet": "### Summary The [documentation](https://docs.astral.sh/uv/reference/settings/#build-backend_data) on data inclusion for the build backend has two typos: ## Typo in purelib/platlib description (\"uses\" vs \"use\") \"purelib and platlib: Installed to the s",
+   "category": "documentation",
+   "labels": [
+    "documentation",
+    "good first issue"
+   ],
+   "created_at": "2025-07-23T13:23:30Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/14845"
+  },
+  {
+   "number": 15204,
+   "title": " Filter date in GitHub release URLs for `python_install_no_cache` test",
+   "body_snippet": "## Summary fixes https://github.com/astral-sh/uv/issues/15172 This change adds a regex filter to normalize dates in GitHub release URLs within the `python_install_no_cache` test snapshot. **Problem:** The test was hardcoding the date `20250808` in th",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2025-08-10T17:02:35Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/15204"
+  },
+  {
+   "number": 15407,
+   "title": "The \"Running commands\" page should link to the \"Locking and syncing\" page",
+   "body_snippet": "e.g., at `concepts/projects/run/` we're not referring to the locking and syncing docs. That'd be helpful content here. We should also probably link to the guide?",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2025-08-21T13:18:37Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/15407"
+  },
+  {
+   "number": 16377,
+   "title": "Docs navigation displays \"Index\" instead of page name in nested nav structure",
+   "body_snippet": "# Description While I was reading trough [the docs](https://docs.astral.sh/uv/getting-started/), I noticed that some next page navigation buttons were missing the page title and defaulting to \"Index\". Please see a few examples below: **Example 1** <i",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2025-10-20T22:43:43Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/16377"
+  },
+  {
+   "number": 16625,
+   "title": "Fix typo in uv tool list doc",
+   "body_snippet": "## Summary Fixed a typo in the docs. Regenerated the docs, with the fix.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2025-11-06T22:30:41Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/16625"
+  },
+  {
+   "number": 16801,
+   "title": "Fix documentation links for crates",
+   "body_snippet": "Part of https://github.com/astral-sh/uv/issues/4392 We shouldn't link to PyPI, and dropping the workspace-level documentation link should mean that we get the auto-generated `docs.rs` links.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2025-11-21T02:01:54Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/16801"
+  },
+  {
+   "number": 16864,
+   "title": "Use Bearer authentication for pyx publish test",
+   "body_snippet": "## Summary This is a no-op semantically, I'm using it to force the CI to run the publishing tests 🙂 ## Test Plan See what happens in CI (and confirm it matches my local behavior).",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2025-11-26T16:52:12Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/16864"
+  },
+  {
+   "number": 17079,
+   "title": "Better documentation for `exclude-newer*`",
+   "body_snippet": "## Summary Following the changes in https://github.com/astral-sh/uv/pull/16814, documentation for [`--exclude-newer`](https://docs.astral.sh/uv/reference/cli/#uv-sync--exclude-newer) and [`--exclude-newer-package`](https://docs.astral.sh/uv/reference",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2025-12-10T21:22:38Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/17079"
+  },
+  {
+   "number": 17831,
+   "title": "Unexpected uv performance results on the \"Python Package Manager Shootout\" benchmark",
+   "body_snippet": "Hi! I by chance happened to take another glance at this Python package manager performance comparison: https://lincolnloop.github.io/python-package-manager-shootout/ ...and was surprised to see that the cold install benchmark (the first one on the pa",
+   "category": "performance",
+   "labels": [
+    "performance",
+    "external"
+   ],
+   "created_at": "2026-02-03T13:23:24Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/17831"
+  },
+  {
+   "number": 18029,
+   "title": "`uv lock` and `uv sync` expected behaviour is poorly documented and not clearly inferable from the \"locking and syncing\" docs page",
+   "body_snippet": "### Summary To the ordinary reader of the docs, the expected behaviour of `uv lock` - and by extension, first calls of other commands such as `uv sync` - cannot be gleaned from the primary documentation page for `lock` and `sync` in a clear way.. The",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-02-15T18:45:10Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/18029"
+  },
+  {
+   "number": 18300,
+   "title": "documentation for valid `required-environments` values",
+   "body_snippet": "[the documentation](https://docs.astral.sh/uv/reference/settings/#required-environments) contains an example for macOS, but not windows. for example i mistakenly tried this at first, before i remembered that the correct value is `win32` ```toml requi",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-03-05T03:46:40Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/18300"
+  },
+  {
+   "number": 18379,
+   "title": "Update crate-ci/typos action to v1.44.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [crate-ci/typos](https://redirect.github.com/crate-ci/typos) | action | minor | `v1.43.5` → `v1.44.0` | --- ### Release Notes <details> <summary>crate-ci",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-03-09T01:48:21Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/18379"
+  },
+  {
+   "number": 18516,
+   "title": "allow splitting uv.lock into multiply files to better interact with GitHub \"restrict file size\" rule",
+   "body_snippet": "### Summary GitHub has a very useful feature \"restrict file size\" that help keep monorepos lean. we run into `uv.lock` running over 2Mb and I had to bump the github setting \"file size\" from 2Mb to 3Mb. Unfortunately GitHub doesn't support \"only enabl",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-03-16T17:25:36Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/18516"
+  },
+  {
+   "number": 18541,
+   "title": "Support Bearer Authentication for Package Registry",
+   "body_snippet": "### Summary Add support for the use of bearer authentication for package registry. This is to support the use of oauth2 authentication to a private Gitlab PyPy registry via a custom keyring provider. Currently having to use private access tokens to a",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "needs-mre"
+   ],
+   "created_at": "2026-03-18T07:27:54Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/18541"
+  },
+  {
+   "number": 18730,
+   "title": "Add support for ROCm 7.2",
+   "body_snippet": "## Summary In the same vein as https://github.com/astral-sh/uv/pull/17681/, this adds support for setting rocm7.2 as a torch backend. I have used the following script in the comments to enumerate the architectures. ``` $ python Python 3.12.3 (main, M",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-03-26T17:40:27Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/18730"
+  },
+  {
+   "number": 18741,
+   "title": "Add TOML v1.1 -> v1.0 backwards compatibility for source distributions",
+   "body_snippet": "[TOML 1.1](https://github.com/toml-lang/toml/releases/tag/1.1.0) introduces support for new syntax that older tools with only TOML 1.0 support don't understand. Usually, the user is either in control of which tools need to read the TOML files or the ",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-03-27T18:18:39Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/18741"
+  },
+  {
+   "number": 18799,
+   "title": "Enable opt out of exclude_newer for trusted package sources to enable use of AWS CodeArtifact",
+   "body_snippet": "### Summary I have tried to enable `exclude_newer` in a repo that sources packages from both PyPI and a private AWS CodeArtifact source. I am doing this to mitigate risks associated with recent supply chain attacks, I believe this is a common use of ",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-04-01T14:21:18Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/18799"
+  },
+  {
+   "number": 18986,
+   "title": "Update crate-ci/typos action to v1.45.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [crate-ci/typos](https://redirect.github.com/crate-ci/typos) | action | minor | `v1.44.0` → `v1.45.0` | --- ### Release Notes <details> <summary>crate-ci",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-04-13T01:08:25Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/18986"
+  },
+  {
+   "number": 18996,
+   "title": "Add `uv tool upgrade --with <new_pkg>` or `--add-with <new_pkg>` to add packages to an install",
+   "body_snippet": "### Summary Add `uv tool upgrade --with <new_pkg>` or `--add-with <new_pkg>` to add packages to an install. I propose the following being valid: ```bash uv tool install ipython --with requests uv tool upgrade ipython --with polars # Now, I can use bo",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-04-13T20:22:11Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/18996"
+  },
+  {
+   "number": 19077,
+   "title": "Can uv uninstall support -y flag ?",
+   "body_snippet": "### Question For easier transition it will be beneficial to support `uv pip uninstall -y` similar to `pip uninstall -y` . This is no-op for uv but nicer transition. ### Platform _No response_ ### Version _No response_",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "area:cli",
+    "area:uv-pip"
+   ],
+   "created_at": "2026-04-20T08:49:25Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19077"
+  },
+  {
+   "number": 19136,
+   "title": "Support RFC 8628 device auth flow with `uv auth login`",
+   "body_snippet": "## Summary It would be great if `uv auth login` could support the OAuth2 Device Authorization Grant ([RFC 8628](https://datatracker.ietf.org/doc/html/rfc8628)) for authenticating to package indexes that support OIDC. This is the \"go to a URL and ente",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-04-23T22:00:29Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19136"
+  },
+  {
+   "number": 19140,
+   "title": "Feature Request: Support querying dependencies of uninstalled packages",
+   "body_snippet": "### Summary ## Feature Request It would be very useful if `uv` could provide a way to query the dependencies of a Python package without installing it. This would allow users to inspect dependency trees for packages before deciding to install them, s",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-04-24T03:56:47Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19140"
+  },
+  {
+   "number": 19153,
+   "title": "Add support for AuthScheme::None to opt-out of authentication",
+   "body_snippet": "### Summary Add a new `None` authentication scheme to uv, allowing to explicitly disable authentication for specific services. This would prevent unwanted credential lookups or prompts for public indices that may require an unauthenticated request. T",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-04-25T21:12:13Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19153"
+  },
+  {
+   "number": 19241,
+   "title": "Re-add `pytorch-triton-rocm` to PyTorch ROCm docs",
+   "body_snippet": "See: https://github.com/astral-sh/uv/pull/19095#issuecomment-4363999668",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-05-02T14:51:50Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19241"
+  },
+  {
+   "number": 19260,
+   "title": "optional uv source, if local path not existing search in uv index",
+   "body_snippet": "### Summary i want option to give path to uv sources to my libs for local debugging, and dont modity the pyproject.toml every time so if make option to add uv sources with path and arg that say ignore if path missing then it will search it in uv inde",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-05-04T10:55:17Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19260"
+  },
+  {
+   "number": 19309,
+   "title": "Fix bug from inconsistent workflow name in GHA-PyPI guide example",
+   "body_snippet": "This is a very minor doc change but fixes a bug for diligent but unknowing new users following the guide. The UV guide on publishing to PyPI from GHA has a screenshot showing that users reference a \"release.yml\" GHA workflow file when setting up a ne",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-05-07T00:46:31Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19309"
+  },
+  {
+   "number": 19344,
+   "title": "Smarter fork reuse and/or prefetching across forks",
+   "body_snippet": "In theory, subsequent forks after the first fork should be extremely fast, most of the metadata should be already loaded and most of the versions should come from preferences. In practice, it seems we spend a notable overhead in each fork for airflow",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-05-10T23:43:37Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19344"
+  },
+  {
+   "number": 19380,
+   "title": "Support PEP 794/Core Metadata 2.5: Import names and import namespaces",
+   "body_snippet": "Support PEP 794 in the uv build backend, when publishing and when parsing metadata, while checking for the banned conditions from the PEP. This is rebase of #16598 with additional fixes.",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-05-12T19:51:12Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19380"
+  },
+  {
+   "number": 19411,
+   "title": "Support NO_PROGRESS Standard",
+   "body_snippet": "### Summary Similar to how there is an informal standard for [`NO_COLOR`](https://no-color.org/), there is also an additional informal standard for [`NO_PROGRESS`](https://no-progress.org/). This feature request is to either replace the `UV_NO_PROGRE",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "needs-decision",
+    "area:cli"
+   ],
+   "created_at": "2026-05-15T08:16:39Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19411"
+  },
+  {
+   "number": 19420,
+   "title": "Add support for Azure request signing",
+   "body_snippet": "We already support AWS and GCS.",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "preview"
+   ],
+   "created_at": "2026-05-15T18:41:23Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19420"
+  },
+  {
+   "number": 19421,
+   "title": "Add support for Azure request signing",
+   "body_snippet": "## Summary This follows the pattern we use for GCS and AWS: set `UV_AZURE_ENDPOINT_URL`, then we use `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE` to sign requests to that endpoint (or the CLI authentication, based on `reqsig",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "preview"
+   ],
+   "created_at": "2026-05-15T18:45:40Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19421"
+  },
+  {
+   "number": 19428,
+   "title": "Support a `--fix` type flag for `audit` to allow automatic fixing of vulnerabilities according to semantic versioning",
+   "body_snippet": "### Summary I propose a `--fix` flag (or command) that would automatically fix vulnerabilities caught by the new `audit` command. Where I currently work, I wrote a script that uses a combination of the [uv-secure](https://github.com/owenlamont/uv-sec",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "area:uv-audit"
+   ],
+   "created_at": "2026-05-16T16:47:53Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19428"
+  },
+  {
+   "number": 19519,
+   "title": "Document malware check behavior",
+   "body_snippet": "The public docs should document https://github.com/astral-sh/uv/issues/18781 (particularly after we remove it from preview). Some key things we should document: * We use OSV for malware reports, and users can configure their own API-compatible OSV se",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-05-21T19:00:43Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19519"
+  },
+  {
+   "number": 19575,
+   "title": "Fix malformed positional anchors in the CLI reference",
+   "body_snippet": "Fix the malformed `<a href=...>` tag emitted for positional arguments in `crates/uv-dev/src/generate_cli_reference.rs`, which produced invalid HTML in the generated CLI reference.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-05-27T10:56:55Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19575"
+  },
+  {
+   "number": 19585,
+   "title": "Document `--find-links` caching behavior",
+   "body_snippet": "Closes #12425 This PR is AI-generated.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-05-28T03:43:38Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19585"
+  },
+  {
+   "number": 19680,
+   "title": "Add a small documentation section for malware checks",
+   "body_snippet": "## Summary We landed this with #18936, so it probably makes sense to have _some_ docs for it. Not 100% sure if this is the best place, but it seems pretty close 🙂 See #18781 Closes https://github.com/astral-sh/uv/issues/19519. ## Test Plan NFC, docs ",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-06-04T17:20:30Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19680"
+  },
+  {
+   "number": 19721,
+   "title": "Update Rust crate test-log to v0.2.21",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [test-log](https://redirect.github.com/d-e-s-o/test-log) | workspace.dependencies | patch | `0.2.20` → `0.2.21` | --- ### Release Notes <details> <summar",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-06-08T02:40:54Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19721"
+  },
+  {
+   "number": 19727,
+   "title": "Update crate-ci/typos action to v1.47.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | Pending | |---|---|---|---|---| | [crate-ci/typos](https://redirect.github.com/crate-ci/typos) | action | minor | `v1.46.2` → `v1.47.0` | `v1.47.2` (+1) | --- ### Release No",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-06-08T02:41:58Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19727"
+  },
+  {
+   "number": 19729,
+   "title": "Update docker/login-action action to v4.2.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [docker/login-action](https://redirect.github.com/docker/login-action) | action | minor | `v4.1.0` → `v4.2.0` | --- ### Release Notes <details> <summary>",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-06-08T02:42:15Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19729"
+  },
+  {
+   "number": 19730,
+   "title": "Update docker/metadata-action action to v6.1.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [docker/metadata-action](https://redirect.github.com/docker/metadata-action) | action | minor | `v6.0.0` → `v6.1.0` | --- ### Release Notes <details> <su",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-06-08T02:42:22Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19730"
+  },
+  {
+   "number": 19731,
+   "title": "Update docker/setup-buildx-action action to v4.1.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [docker/setup-buildx-action](https://redirect.github.com/docker/setup-buildx-action) | action | minor | `v4.0.0` → `v4.1.0` | --- ### Release Notes <deta",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-06-08T02:42:29Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19731"
+  },
+  {
+   "number": 19813,
+   "title": "Archive the 0.10.x changelog",
+   "body_snippet": "## Summary - move the uv 0.10 release notes into `changelogs/0.10.x.md` - order the archived releases from oldest to newest, matching the existing archives - replace the 0.10 entries in `CHANGELOG.md` with a link to the archive ## Test plan - `npx pr",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-06-11T20:57:48Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19813"
+  },
+  {
+   "number": 19842,
+   "title": "Update crate-ci/typos action to v1.47.2",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [crate-ci/typos](https://redirect.github.com/crate-ci/typos) | action | patch | `v1.47.0` → `v1.47.2` | --- ### Release Notes <details> <summary>crate-ci",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-06-15T01:12:09Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/19842"
+  },
+  {
+   "number": 19859,
+   "title": "`uv add`: Add --all-packages option",
+   "body_snippet": "### Summary When using uv version with workspaces, it would be very useful to have a `--all-packages` option like the sync / lock / build / run commands have. This would modify the dependencies of all projects Similar request exists for other command",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-06-15T13:16:29Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19859"
+  },
+  {
+   "number": 19886,
+   "title": "Support `uv tool audit`",
+   "body_snippet": "### Summary We should support `uv tool audit` for auditing installed tools, similarly to how we support `uv audit`. Two basic flows: - `uv tool audit` audits _all_ installed tools; - `uv tool audit <tool>` audits the locked resolution for just `<tool",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "preview",
+    "area:uv-audit"
+   ],
+   "created_at": "2026-06-16T19:43:48Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19886"
+  },
+  {
+   "number": 19916,
+   "title": "Regression in workspace source override between uv 0.11.19 and 0.11.20",
+   "body_snippet": "### Summary # Bug Description I found a small regression between 0.11.19 and 0.11.20+ involving workspace members that also support standalone installation, causing a `Workspace members must be declared as workspace sources` error. My best guess is t",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-06-18T20:30:41Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19916"
+  },
+  {
+   "number": 19918,
+   "title": "Support project-local task aliases in pyproject.toml",
+   "body_snippet": "### Summary Add support for defining project-local task aliases in `pyproject.toml` that can be executed through `uv run`. ### Example Instead of repeatedly running: ```bash uv run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000 ``` Allow us",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-06-19T04:05:30Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19918"
+  },
+  {
+   "number": 19929,
+   "title": "`--exclude-newer` and `UV_EXCLUDE_NEWER` fail to override `exclude-newer` setting",
+   "body_snippet": "### Summary Thank you for the fantastic job on **uv** and Astral's other projects! I manage a private, workspace-enabled project. Workspace members rely on the **hatchling** build backend. Builds are performed on AWS CodeBuild using AWS CodeArtifact ",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-06-20T08:49:30Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19929"
+  },
+  {
+   "number": 19956,
+   "title": "install.ps1 on Windows: Failed to download uv 0.11.23",
+   "body_snippet": "### Summary > powershell -ExecutionPolicy ByPass -c \"irm https://astral.sh/uv/install.ps1 | iex\" downloading uv 0.11.23 (x86_64-pc-windows-msvc) failed to download from https://releases.astral.sh/github/uv/releases/download/0.11.23 trying alternative",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:windows",
+    "needs-mre"
+   ],
+   "created_at": "2026-06-23T06:32:39Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19956"
+  },
+  {
+   "number": 19963,
+   "title": "Cross-building win->linux using explicit ``--python-platform=`` installs to wrong site-packages dir",
+   "body_snippet": "### Summary I'm cross-building a bundled python environment on a windows host using uv. This is then deployed via a tarball to a debian box. This allows us to bootstrap custom wrapper and authentication logic for our controlplane (including a private",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-06-23T16:05:25Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/19963"
+  },
+  {
+   "number": 20006,
+   "title": "Add warm cache uv startup benchmark with a large workspace",
+   "body_snippet": "This is a synthetic version of https://github.com/astral-sh/uv/pull/18409, which measures uv startup overhead in a large workspace. The workspace is modeled based on airflow, but less pypi dependencies to avoid timeouts.",
+   "category": "performance",
+   "labels": [
+    "performance",
+    "internal"
+   ],
+   "created_at": "2026-06-26T16:08:30Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20006"
+  },
+  {
+   "number": 20055,
+   "title": "`uv workspace list` minor bug ?",
+   "body_snippet": "### Summary I have the following root pyproject.toml which defines the uv workspace in the project root. ```toml [project] name = \"proj-root\" version = \"9.3.1\" requires-python = \">=3.14,<3.15\" [tool.uv] required-version = \"==0.11.25\" workspace.member",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-06-29T23:00:01Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/20055"
+  },
+  {
+   "number": 20060,
+   "title": "Expose `UV_PROJECT_ENVIRONMENT` as flag to `uv sync`",
+   "body_snippet": "### Summary I've noticed that `UV_PROJECT_ENVIRONMENT` has no corresponding flag ([docs](https://docs.astral.sh/uv/reference/environment/#uv_prerelease)) to specify it via a flag to the command as e.g. `uv sync --venv <my_env>`. Is there a reason for",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-06-30T13:29:40Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/20060"
+  },
+  {
+   "number": 20120,
+   "title": "Read cache entries into exact-sized buffers",
+   "body_snippet": "## Summary Warm cache hits currently read into an empty `AlignedVec` via `extend_from_reader`. This PR instead reads file-backed cache entries at their known size instead. ## Performance | Project | Wall-time change | Bootstrap 95% CI | | --- | ---: ",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-05T00:19:38Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20120"
+  },
+  {
+   "number": 20146,
+   "title": "Generate hashes for pylock.toml exports when they are missing",
+   "body_snippet": "Avoid emitting invalid pylock.toml files when locked archive artifacts have no hashes, as at least one hash is required, see https://packaging.python.org/en/latest/specifications/pylock-toml/#packages-archive-hashes. This is potentially slow as we ha",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-07-06T10:10:14Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20146"
+  },
+  {
+   "number": 20196,
+   "title": "Avoid allocating shell strings that need no escaping",
+   "body_snippet": "Return borrowed shell strings when no escaping is required and carry that borrowing through virtual environment activation generation. Escaped output remains unchanged while common paths avoid an intermediate allocation.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-07T16:44:50Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20196"
+  },
+  {
+   "number": 20202,
+   "title": "Avoid allocating unchanged Python download architectures",
+   "body_snippet": "Keep architecture names borrowed while parsing Python download metadata and allocate only when appending an architecture variant. This removes an unnecessary allocation for each ordinary catalog entry without changing architecture normalization.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-07T16:44:50Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20202"
+  },
+  {
+   "number": 20204,
+   "title": "Avoid allocating custom Astral mirror URLs",
+   "body_snippet": "Borrow the trimmed custom Astral mirror base URL instead of copying it into an owned String. The returned Cow now avoids allocation for both the default mirror and user-provided mirror URLs.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-07T16:44:50Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20204"
+  },
+  {
+   "number": 20207,
+   "title": "Avoid redundant direct URL clones",
+   "body_snippet": "Reuse the owned direct URL while constructing its PEP 508 representation, retaining only the clone needed for the original location. This removes two redundant URL clones without changing fragments or extension detection.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-07T17:00:27Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20207"
+  },
+  {
+   "number": 20209,
+   "title": "Avoid cloning dry-run distributions",
+   "body_snippet": "Move the remote distribution vector into dry-run reporting rather than cloning it before it is consumed. This removes an unnecessary vector allocation and reference-count updates from dry-run installs.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-07T17:00:27Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20209"
+  },
+  {
+   "number": 20210,
+   "title": "Avoid cloning credential lookup services",
+   "body_snippet": "Move the normalized service into the temporary credential lookup key instead of cloning it before the lookup. This avoids an unnecessary URL-backed allocation on exact credential lookups.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-07T17:00:27Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20210"
+  },
+  {
+   "number": 20212,
+   "title": "Avoid cloning owned dependency metadata",
+   "body_snippet": "Pass owned dependency metadata directly into lowering instead of cloning it first. This avoids duplicating requirements and extras when static dependency metadata is supplied.",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-07T17:00:27Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20212"
+  },
+  {
+   "number": 20234,
+   "title": "Clarify no-build docs for editable requirements",
+   "body_snippet": "The `--no-build` help says resolving will not run arbitrary Python code and operations that require building distributions will fail. This conflicts with `docs/pip/compatibility.md` and the implementation: `--no-build` aliases `--only-binary :all:`, ",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-07-08T10:10:05Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20234"
+  },
+  {
+   "number": 20235,
+   "title": "Add support for Pytorch cu132 backend",
+   "body_snippet": "### Summary uv is lagging on pytorch support, I noticed someone asking in 2025 too. Please add support for cu132 to allow setting UV_PYTORCH_BACKEND to this value. https://download.pytorch.org/whl/cu132/ detecting a newly supported backend is easy, j",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-07-08T10:15:56Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/20235"
+  },
+  {
+   "number": 20248,
+   "title": "Use Packse for dependency group tests",
+   "body_snippet": "Replace the live-PyPI packages in the `pip install` and `pip compile` dependency-group tests with a local Packse scenario. The tests still cover path syntax, combining project and group dependencies, and selecting multiple groups. In [CI](https://git",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2026-07-08T16:29:13Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20248"
+  },
+  {
+   "number": 20249,
+   "title": "Use Packse for source hash tests",
+   "body_snippet": "Replace the live-PyPI source distributions in two hash-checking tests with Packse’s local `a` package. The tests still verify that an sdist hash is accepted with `--no-binary` and that build dependencies do not require hashes. In [CI](https://github.",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2026-07-08T16:31:42Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20249"
+  },
+  {
+   "number": 20252,
+   "title": "Skip universal tests on macOS and Windows",
+   "body_snippet": "## Summary This PR adds a `test-universal` feature for test cases whose results do not depend on the host platform. It remains in `test-defaults` and is explicitly enabled on Linux, but omitted on macOS and Windows (which continue to use `--no-defaul",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:testing"
+   ],
+   "created_at": "2026-07-08T17:12:02Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20252"
+  },
+  {
+   "number": 20267,
+   "title": "Add CUDA 13.2 support",
+   "body_snippet": "## Summary Add CUDA 13.2 to the supported PyTorch backends. `--torch-backend=cu132` and `UV_TORCH_BACKEND=cu132` now use the CUDA 13.2 index, and `auto` prefers it on compatible Linux and Windows drivers. Closes https://github.com/astral-sh/uv/issues",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-07-09T02:21:08Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20267"
+  },
+  {
+   "number": 20308,
+   "title": "Workspace discovery cache is rebuilt after settings resolution",
+   "body_snippet": "## Summary A command can build the workspace discovery cache twice even when settings resolution leaves the cache root unchanged. The early discovery performed while resolving settings populates a WorkspaceCache. run() then creates a new default Work",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-12T15:30:45Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/20308"
+  },
+  {
+   "number": 20327,
+   "title": "Update crate-ci/typos action to v1.48.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [crate-ci/typos](https://redirect.github.com/crate-ci/typos) | action | minor | `v1.47.2` → `v1.48.0` | --- ### Release Notes <details> <summary>crate-ci",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-07-13T02:14:22Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20327"
+  },
+  {
+   "number": 20328,
+   "title": "Update docker/login-action action to v4.4.0 - autoclosed",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [docker/login-action](https://redirect.github.com/docker/login-action) | action | minor | `v4.2.0` → `v4.4.0` | --- ### Release Notes <details> <summary>",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-07-13T02:14:31Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20328"
+  },
+  {
+   "number": 20329,
+   "title": "Update docker/metadata-action action to v6.2.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [docker/metadata-action](https://redirect.github.com/docker/metadata-action) | action | minor | `v6.1.0` → `v6.2.0` | --- ### Release Notes <details> <su",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-07-13T02:14:39Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20329"
+  },
+  {
+   "number": 20330,
+   "title": "Update docker/setup-buildx-action action to v4.2.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [docker/setup-buildx-action](https://redirect.github.com/docker/setup-buildx-action) | action | minor | `v4.1.0` → `v4.2.0` | --- ### Release Notes <deta",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-07-13T02:14:47Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20330"
+  },
+  {
+   "number": 20351,
+   "title": "Error on unsupported `--cert` in pip compat layer",
+   "body_snippet": "## Summary `uv pip compile` and `uv pip sync` accept pip's `--cert` flag but silently ignore it — no warning, no error, no effect. The `cert` field is parsed into `PipCompileCompatArgs` / `PipSyncCompatArgs` in `crates/uv-cli/src/compat.rs`, but neit",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "compatibility"
+   ],
+   "created_at": "2026-07-13T19:42:59Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20351"
+  },
+  {
+   "number": 20356,
+   "title": "Reuse workspace discovery after settings resolution",
+   "body_snippet": "## Summary When settings resolution discovers a workspace, carry its `WorkspaceCache` into command dispatch when the resolved cache root matches the provisional root. This avoids rebuilding the same workspace discovery cache twice during a single com",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-13T23:03:12Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20356"
+  },
+  {
+   "number": 20360,
+   "title": "Avoid unnecessary setup for version reads",
+   "body_snippet": "## Summary Reading a project version only requires `pyproject.toml`, or the lockfile under `--frozen`, but we previously initialized the cache for every `uv version` invocation. The frozen path also discovered a Python interpreter solely to construct",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-14T00:00:24Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20360"
+  },
+  {
+   "number": 20374,
+   "title": "Avoid panic for invalid audit service URLs",
+   "body_snippet": "An invalid `uv audit --service-url` value currently panics during URL parsing. Parse the service URL in the CLI layer and return the standard argument error instead.",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "preview",
+    "area:uv-audit"
+   ],
+   "created_at": "2026-07-14T11:50:03Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20374"
+  },
+  {
+   "number": 20405,
+   "title": "Scan platlib when purelib is missing",
+   "body_snippet": "On split installation schemes, a missing `purelib` directory ends site-packages discovery before a valid `platlib` is scanned, hiding installed distributions from commands that inspect the environment. Continue scanning the remaining locations. See [",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:installer"
+   ],
+   "created_at": "2026-07-14T18:41:33Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20405"
+  },
+  {
+   "number": 20434,
+   "title": "Preserve Python variants in equality requests",
+   "body_snippet": "Explicit equality requests such as `uv python find --managed-python '==3.14t'` can lose the requested Python variant and select the wrong interpreter. Preserve the variant when parsing equality requests. This does not change free-threaded interpreter",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-07-15T15:50:09Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20434"
+  },
+  {
+   "number": 20441,
+   "title": "Use aborting panics for Linux tests",
+   "body_snippet": "Linux test builds currently compile the test graph with unwinding enabled. Use a pinned nightly toolchain and `-Z panic-abort-tests` so the Linux `fast-build` profile can abort on panics, reducing unnecessary unwind code during test builds without af",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2026-07-15T16:16:45Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20441"
+  },
+  {
+   "number": 20464,
+   "title": "Decode cached payloads on the cache-read pool",
+   "body_snippet": "## Summary Large cached Simple API responses spend significant time validating/decoding their archived payload on the async runtime. This moves both fresh-cache and revalidated-cache payload decoding onto the existing bounded cache-read runtime, keep",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-16T03:16:01Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20464"
+  },
+  {
+   "number": 20466,
+   "title": "Stop escaping `extends-environment` in pyvenv.cfg",
+   "body_snippet": "## Summary This would produce broken results on *nix. I also made it error on UTF-8 encoding but maybe a warning (and not writing the result) is more appropriate? ## Test Plan I adjusted the test, I moved the filter inline so it could be tailored to ",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-07-16T07:59:37Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20466"
+  },
+  {
+   "number": 20507,
+   "title": "Avoid Tokio startup for synchronous CLI commands",
+   "body_snippet": "## Summary Small informational commands currently pay to start Tokio and a dedicated main thread even though their execution never yields. This PR classifies those commands (`self version`, `tool dir`, `auth dir`, `help`, `cache dir`, `cache size`, a",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-07-17T23:53:54Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20507"
+  },
+  {
+   "number": 20511,
+   "title": "Add contributing section to docs",
+   "body_snippet": "## Summary Adds a contributing section to Mkdocs, and removes a paragraph regarding `good first issue` ## Test Plan Built Mkdocs and checked manually.",
+   "category": "documentation",
+   "labels": [
+    "documentation",
+    "ep-2026-sprints"
+   ],
+   "created_at": "2026-07-18T09:49:19Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20511"
+  },
+  {
+   "number": 20512,
+   "title": "Add prettier install step to developer docs",
+   "body_snippet": "Currently when doing the steps in contributing.MD under Documentation, the `cargo dev generate-all` fails when prettier is not installed. I have added a step with a link to the node installation documentation so npx is installed and can be used to ru",
+   "category": "documentation",
+   "labels": [
+    "documentation",
+    "internal",
+    "ep-2026-sprints"
+   ],
+   "created_at": "2026-07-18T09:50:27Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20512"
+  },
+  {
+   "number": 20552,
+   "title": "docs: Move contributing to references",
+   "body_snippet": "#20511 added the contributing guide to the top-level Guides section, which is otherwise user-facing. This moves the guide to Reference and updates the navigation, section indexes, and `llms.txt` configuration. `CONTRIBUTING.md` remains the source for",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-07-20T16:07:17Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20552"
+  },
+  {
+   "number": 20571,
+   "title": "Misleading message when trying to use `--emit-options`",
+   "body_snippet": "When we try `--emit-options` with `uv pip compile`, we get: ``` error: pip-compile's `--emit-options` is unsupported (uv never emits options) ``` This message is misleading, because there actually exists the slightly renamed [`--emit-build-options`](",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:error-messages"
+   ],
+   "created_at": "2026-07-21T16:06:39Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/20571"
+  },
+  {
+   "number": 20684,
+   "title": "Remove stray slash before anchors in docs cross-references",
+   "body_snippet": "Three documentation cross-references use the form `file.md/#anchor` — with a stray `/` between the page and the fragment: - `docs/concepts/python-versions.md` (×2): `../reference/cli.md/#uv-python-pin` - `docs/guides/integration/renovate.md`: `../scr",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-07-25T10:55:16Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20684"
+  },
+  {
+   "number": 20692,
+   "title": "docs: correct path to uv and uvx binaries",
+   "body_snippet": "## Summary The path has changed, updating reference in the documentation. ## Test Plan On my local machine it was failing to build my image until I changed it like documented in this PR.",
+   "category": "documentation",
+   "labels": [
+    "documentation",
+    "needs-mre"
+   ],
+   "created_at": "2026-07-26T00:54:26Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20692"
+  },
+  {
+   "number": 20700,
+   "title": "Update pypa/gh-action-pypi-publish action to v1.14.1",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [pypa/gh-action-pypi-publish](https://redirect.github.com/pypa/gh-action-pypi-publish) | action | patch | `v1.14.0` → `v1.14.1` | --- ### Release Notes <",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-07-27T02:42:41Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20700"
+  },
+  {
+   "number": 20734,
+   "title": "uv is expecting wrong module name when building stubs package: Expected a Python module at: src\\foo-stubs\\__init__.pyi",
+   "body_snippet": "### Summary When building a stubs package with uv it fails with the following error: error: Failed to build `***REDACTED***\\foo` Caused by: Expected a Python module at: src\\foo-stubs\\__init__.pyi In contrast to normal builds it seems to expect a src ",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-07-27T13:16:42Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/20734"
+  },
+  {
+   "number": 20744,
+   "title": "Backslash continuation before version specifier fails in requirements file",
+   "body_snippet": "### Summary uv pip install -r requirements.txt rejects this valid pip syntax: ``` project \\ >1.0.0 ``` It fails with found '\\'. pip install -r requirements.txt accepts it. Reproduces with uv 0.11.32. ### Platform mac os ### Version 0.11.32 ### Python",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-07-27T17:48:37Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/20744"
+  },
+  {
+   "number": 20752,
+   "title": "Cleanup managed Python temporary directory on error",
+   "body_snippet": "## Description This PR resolves issue #20675 by replacing `temp_dir.keep()` with `temp_dir.path().to_path_buf()` in `crates/uv-python/src/downloads.rs`. ## Details - Prevents temporary directories in `~/.local/share/uv/python/.temp/` from persisting ",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-07-27T20:28:15Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20752"
+  },
+  {
+   "number": 20762,
+   "title": "Flag to ignore local directory config",
+   "body_snippet": "### Summary Please add a `--no-cwd-config` flag or similar to disable picking up uv config from working-directory-relative paths. I've used [a uv run shebang](https://docs.astral.sh/uv/guides/scripts/#using-a-shebang-to-create-an-executable-file) to ",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-07-28T07:30:42Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/20762"
+  },
+  {
+   "number": 20763,
+   "title": "Provide a `--with-uv-shebang` option to `uv init --script` to add an uv shebang",
+   "body_snippet": "### Summary Currently `uv init --script` prepares a script with a preamble starting with `# /// script` and ending with `# ///` with no shebang preceeding it. Would be great to have an option to add the standard uv run shebang (`#!/usr/bin/env -S uv ",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-07-28T09:19:13Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/20763"
+  },
+  {
+   "number": 20779,
+   "title": "Add documentation links to uv 0.12 release notes",
+   "body_snippet": "The uv 0.12 release notes reference older releases and changed behavior without linking readers to the corresponding guidance. Add direct links for project initialization, source distributions, pre-release resolution, certificates, Python upgrades, d",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-07-28T18:51:25Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20779"
+  },
+  {
+   "number": 20785,
+   "title": "Document Astral GPU indexes in the PyTorch guide",
+   "body_snippet": "## Summary This PR adds documentation for the GPU indexes, both as a section within the existing PyTorch integration guide and via mentions in the relevant package-specific sections (e.g., for DeepSpeed and FlashAttention).",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-07-28T23:44:56Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20785"
+  },
+  {
+   "number": 20790,
+   "title": "Support proxy indexes through reversible artifact URLs",
+   "body_snippet": "Add support for using a proxy for an existing package index without changing the URLs stored in lockfiles. Configure proxies on ordinary `[[tool.uv.index]]` or `[[index]]` entries with `proxy-for` and `artifact-base-url`. PyPI works without additiona",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-07-29T11:42:27Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20790"
+  },
+  {
+   "number": 20817,
+   "title": "Keep paths passed via `--index` to `uv add` as paths when modifying `pyproject.toml`",
+   "body_snippet": "## Summary Previously doing `uv add --index ./path` would edit the `pyproject.toml` to insert `file://.../path` but this seemed wrong. This change will produce different `pyproject.toml` contents when using this feature but the result shouldn't break",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-07-30T14:04:47Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20817"
+  },
+  {
+   "number": 20823,
+   "title": "Make dependency group argument CLI documentation uniform",
+   "body_snippet": "## Summary The documentation note which indicated that project dependency group CLI arguments (`--[no-]dev`, `--[no-]group`, `--no-default-groups`, `--only-group`, and `--all-groups`) only work on projects was missing in a few places. This PR dedupli",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-07-30T15:22:39Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20823"
+  },
+  {
+   "number": 20900,
+   "title": "Update docker/login-action action to v4.6.0",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [docker/login-action](https://redirect.github.com/docker/login-action) | action | minor | `v4.4.0` → `v4.6.0` | --- ### Release Notes <details> <summary>",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-08-03T02:20:02Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20900"
+  },
+  {
+   "number": 20942,
+   "title": "Cross-link to the resolution docs from sync docs",
+   "body_snippet": "## Summary This is meant to be a pared down version of #18363. The idea is to not reintroduce \"universal lockfiles\" as a concept in the project-level docs (since they're largely an implementation detail), but to cross-link to the resolution docs so a",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-08-04T18:43:46Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20942"
+  },
+  {
+   "number": 20973,
+   "title": "docs: tighten tag pattern for GH publish example",
+   "body_snippet": "## Summary Docs only, closes https://github.com/astral-sh/uv/pull/20958 ## Test Plan NFC",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-08-05T19:19:15Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20973"
+  },
+  {
+   "number": 20986,
+   "title": "docs: add attest-action to GHA publishing example",
+   "body_snippet": "## Summary Like https://github.com/astral-sh/trusted-publishing-examples/pull/11. ## Test Plan NFC, docs only.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-08-06T13:22:21Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/20986"
+  },
+  {
+   "number": 21016,
+   "title": "--find-links with a relative path in a requirements file fails with \"relative URL without a base\" (regression since 0.12.x)",
+   "body_snippet": "### Summary A `--find-links` line with a relative path inside a requirements.in/requirements.txt file fails to resolve, regardless of whether the path has a `./` prefix, no prefix, or is passed to `uv pip compile` or `uv pip install -r`: ``` error: I",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-08-09T22:28:45Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21016"
+  },
+  {
+   "number": 21022,
+   "title": "Update pypa/gh-action-pypi-publish action to v1.14.2",
+   "body_snippet": "This PR contains the following updates: | Package | Type | Update | Change | |---|---|---|---| | [pypa/gh-action-pypi-publish](https://redirect.github.com/pypa/gh-action-pypi-publish) | action | patch | `v1.14.1` → `v1.14.2` | --- ### Release Notes <",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "build:skip-release",
+    "build:skip-docker"
+   ],
+   "created_at": "2026-08-10T00:43:44Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21022"
+  },
+  {
+   "number": 21063,
+   "title": "Unformatted error messages on `uv version --bump`",
+   "body_snippet": "### Summary When running the command `uv version --bump foo` with an invalid argument to the `--bump` option an error occurs. Unfortunately the error does not seem to be formatted or printed the same way as most other errors. As of `v0.12.3` of `uv` ",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-08-12T08:52:42Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21063"
+  },
+  {
+   "number": 21085,
+   "title": "Allow `uv check` without installing the project",
+   "body_snippet": "Projects with checked-in type stubs may not require building their native extensions for type checking, but `uv check` always installs the project while synchronizing its dependencies. Support `--no-install-project` and `UV_NO_INSTALL_PROJECT` so tho",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "preview"
+   ],
+   "created_at": "2026-08-13T13:59:13Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21085"
+  },
+  {
+   "number": 21103,
+   "title": "Keep build snapshot filters on test contexts",
+   "body_snippet": "Build integration tests repeatedly construct separate snapshot-filter vectors and rebind contexts even though the existing test-context builder already supports these filters. Configure build-output normalization when each context is created and cons",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2026-08-13T19:06:26Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21103"
+  },
+  {
+   "number": 21104,
+   "title": "Use test contexts for cache file-count filters",
+   "body_snippet": "Cache cleanup tests assemble custom snapshot filters or mutate the test context inside snapshot assertions, and the existing count helper also hides package counts that these tests should retain. Add a focused removed-file-count context builder and a",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2026-08-13T19:07:13Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21104"
+  },
+  {
+   "number": 21114,
+   "title": "Configure snapshot filters without rebinding test contexts",
+   "body_snippet": "Several integration tests create a test context and immediately shadow it solely to install static snapshot filters, which obscures setup and scatters context configuration through the test. Attach those filters when constructing the original context",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2026-08-13T22:33:09Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21114"
+  },
+  {
+   "number": 21116,
+   "title": "Configure redirect snapshot filters on test contexts",
+   "body_snippet": "Cross-origin redirect tests repeatedly build standalone localhost snapshot-filter vectors after creating their test contexts. Register the existing localhost normalization directly on each context and read its filters at the assertion site, preservin",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2026-08-13T22:33:59Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21116"
+  },
+  {
+   "number": 21117,
+   "title": "Add exact sync support to workspace metadata",
+   "body_snippet": "Allow `uv workspace metadata --sync --exact` to remove packages outside the selected resolution while preserving the existing inexact behavior of `--sync`. Match `uv run --exact` semantics and ensure exact synchronization also cleans environments for",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "preview"
+   ],
+   "created_at": "2026-08-13T22:40:48Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21117"
+  },
+  {
+   "number": 21165,
+   "title": "Provide a `--show-executables-from` option to uv tool list",
+   "body_snippet": "### Summary When you have some tool installed, it is nice to be able to know exactly how it was installed. We already have the quite useful `--show-with` and `--show-extras`, but we miss an option to know how to get the same executable files. As an a",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-08-17T17:09:52Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21165"
+  },
+  {
+   "number": 21299,
+   "title": "Request to add s390x and ppc64le as `--python-platform` targets",
+   "body_snippet": "## Summary `--python-platform` does not accept `s390x-unknown-linux-gnu` or `powerpc64le-unknown-linux-gnu` as values, even though uv's internal platform-tags crate already has full support for both architectures (`Arch::S390X`, `Arch::Powerpc64Le`) ",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-08-25T20:02:31Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21299"
+  },
+  {
+   "number": 21300,
+   "title": "perf(marker): reduce interner work",
+   "body_snippet": "Avoid redundant marker interner cloning and lock acquisition. Benchmarks show faster warm resolution across Jupyter and Airflow. optimization found and verified by the [WarpForge](https://warpforge.co) agent",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-08-25T21:43:51Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21300"
+  },
+  {
+   "number": 21304,
+   "title": "Warm the interpreter cache when syncing workspace metadata",
+   "body_snippet": "`uv workspace metadata --sync` currently creates environments without caching their interpreter metadata, so the next metadata invocation still has to query Python. We can cache in the first run using the parent interpreter and inferring the rest (we",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-08-26T09:02:48Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21304"
+  },
+  {
+   "number": 21393,
+   "title": "Fails to init when parent folder name is \"Python\"",
+   "body_snippet": "### Summary I created a folder named **Python** and wanted to initialize uv within, which failed with an inconclusive error message. # Reproduce ```bash > mkdir Python > cd Python > uv init --python 3.13 error: failed to install: python-0.1.0-py3-non",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-09-01T10:44:54Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21393"
+  },
+  {
+   "number": 21399,
+   "title": "Avoid tracking unrelated extras in conflict simplification",
+   "body_snippet": "## Why? Adding a conflict, such as CPU versus CUDA, can make locking a large workspace extremely slow. After resolving dependencies, uv simplifies the conditions written to uv.lock. That step also tracks unrelated extras, creating unnecessary work ac",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-09-01T14:40:35Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21399"
+  },
+  {
+   "number": 21437,
+   "title": "Use papaya without fast-barrier",
+   "body_snippet": "Remove the fast-barrier feature from seize through papaya, to remove the performance bottleneck identified in https://github.com/astral-sh/uv/pull/20989. Initializing the hashmap is fast, but I didn't see walltime changes, due to the workaround https",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-09-03T15:40:08Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21437"
+  },
+  {
+   "number": 21491,
+   "title": "Update Python test interpreter patch versions",
+   "body_snippet": "Keep uv's regular test interpreters on the latest patch release for each supported Python minor. Update exact-version test inputs and expectations to use these releases; retain 3.13.0 for the two-patch comparison and 3.14.0rc2 for prerelease coverage",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2026-09-06T14:37:07Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21491"
+  },
+  {
+   "number": 21499,
+   "title": "Reuse ZIP readers across extraction jobs",
+   "body_snippet": "## Summary Reuse the ZIP reader within each Rayon job with `map_init`, avoiding a fresh 64 KiB buffer allocation for every archive entry. Local-wheel installs were 5.6% faster for botocore and 11.2% faster for SymPy. NumPy's 3.2% gain was inconclusiv",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-09-06T17:13:59Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21499"
+  },
+  {
+   "number": 21534,
+   "title": "Fix syntax highlighting in `exclude-newer` docs",
+   "body_snippet": "## Summary Fix TOML syntax highlighting in `resolution.md` docs for `exclude-newer` examples ### Details - unlike the rest of the docs above this that [used](https://github.com/astral-sh/uv/blob/faad6dc3a89cc39a42cb36b2eb62c00911a86bf2/docs/concepts/",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-09-08T03:47:30Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21534"
+  },
+  {
+   "number": 21566,
+   "title": "Preserve hints in tool upgrade failures",
+   "body_snippet": "`uv tool upgrade` renders each failed upgrade with an empty hint list, so resolver guidance such as missing registry credentials is lost. It also uses ordinary stderr, which hides the final failure under `-q`. Use the command-layer error renderer for",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:error-messages"
+   ],
+   "created_at": "2026-09-09T19:02:51Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21566"
+  },
+  {
+   "number": 21601,
+   "title": "uv audit: pylock.toml support",
+   "body_snippet": "## Summary WIP, not ready for review yet. This adds `uv audit -r pylock.toml` support. I've elected for the same CLI design as `uv pip install`, i.e. an explicit `-r` option rather than a positional. Note: I intentionally didn't include requirements ",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "preview",
+    "area:uv-audit"
+   ],
+   "created_at": "2026-09-10T22:21:55Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21601"
+  },
+  {
+   "number": 21618,
+   "title": "Add support for batched exports from a shared lockfile",
+   "body_snippet": "## Summary Repeated `uv export` calls rediscover the workspace and load the same lockfile for every output. We add a hidden, experimental `--batch` option to export multiple selections from one workspace and lockfile load: ```sh uv export --frozen --",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "preview"
+   ],
+   "created_at": "2026-09-11T20:26:22Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21618"
+  },
+  {
+   "number": 21650,
+   "title": "Borrow build exclude patterns to avoid quadratic deduplication",
+   "body_snippet": "Alternative to https://github.com/astral-sh/uv/pull/21638 This instead streams borrowed exclusion patterns into the glob matcher, using a fast hash set to skip duplicates, and preserve input order, avoiding unnecessary string copies. This should avoi",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-09-13T23:27:44Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21650"
+  },
+  {
+   "number": 21694,
+   "title": "0.12.14: `uv pip install --target=.` fails for every wheel with \"The wheel is invalid: Wheel directory entry escapes its destination\"",
+   "body_snippet": "### Summary Since 0.12.14, uv pip install --target=. fails for every wheel that contains a directory entry, which is most of them. 0.12.13 and earlier install fine. Behaviour comes from [#21569](https://github.com/astral-sh/uv/pull/21569) (\"Reject sy",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-09-15T09:40:05Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21694"
+  },
+  {
+   "number": 21727,
+   "title": "Require system tests for labeled pull requests",
+   "body_snippet": "The `test:system` label enables system tests, but their result is omitted from `all required jobs passed`. Include `test-system` in the rollup and require its result when the label is present. A job-to-condition map keeps other system-test runs advis",
+   "category": "ci_and_build",
+   "labels": [
+    "internal:ci"
+   ],
+   "created_at": "2026-09-15T20:42:57Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21727"
+  },
+  {
+   "number": 21808,
+   "title": "Assign release pull requests to the workflow initiator",
+   "body_snippet": "Release preparation creates pull requests as the automation bot without assigning a release owner. Assign the person who triggered the workflow when creating the pull request, and add that person when updating an existing release pull request. Use `G",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:automations"
+   ],
+   "created_at": "2026-09-17T22:19:21Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/21808"
+  },
+  {
+   "number": 21833,
+   "title": "Provide a way to add/remove additional requirements after installation of tools",
+   "body_snippet": "### Summary #### Summary Provide a straightforward way to modify (add, remove, or update) additional dependencies (`--with`) associated with an already installed tool without requiring users to manually reconstruct the original installation command. ",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-09-19T06:22:53Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21833"
+  },
+  {
+   "number": 21849,
+   "title": "Add a series of  `uv workspace xxx` commands for the workspace feature",
+   "body_snippet": "### Summary Workspace has become an essential tool for managing multiple packages. Therefore, we need `uv workspace xxx` to provide more concise and clear functionality in workspace management scenarios. Although some features may only require adding",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-09-20T02:35:14Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21849"
+  },
+  {
+   "number": 21905,
+   "title": "\"RECORD file is invalid\" recurrent error on Windows",
+   "body_snippet": "### Summary We're getting recurrent errors of that kind, on several developers machines + Windows Jenkins nodes, when we use uv from scratch to create a new venv ``` > uv venv Using CPython 3.14.6 Creating virtual environment at: .venv error: Failed ",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:windows"
+   ],
+   "created_at": "2026-09-22T07:33:30Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21905"
+  },
+  {
+   "number": 21938,
+   "title": "Clarify the relation between --no-sync and other options that affects the sync",
+   "body_snippet": "### Summary Coming from https://github.com/readthedocs/readthedocs.org/pull/13336#issuecomment-5793204051 It seems that when `--no-sync` is present, other options that affect what is synced are ignored but the option documentation doesn't mention / e",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-09-23T10:39:48Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21938"
+  },
+  {
+   "number": 21976,
+   "title": "Adding AWS SSO support for S3 Endpoints",
+   "body_snippet": "### Summary Hey Astra team The S3 preview feature is great! I would like to make my humble requets to include support for AWS_PROFILE, AWS_DEFAULT_PROFILE and SSO based token refresh. Currently how we work around this: ```bash export UV_S3_ENDPOINT_U",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-09-24T21:52:34Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/21976"
+  },
+  {
+   "number": 22035,
+   "title": "Fix panic on whitespace-only requirements",
+   "body_snippet": "A requirement containing only non-ASCII whitespace causes a panic while formatting the parse error. Use a byte span covering the first character so uv reports the invalid requirement instead.",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-09-28T08:33:51Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22035"
+  },
+  {
+   "number": 22052,
+   "title": "Refresh HTTP cache policies in place",
+   "body_snippet": "We now update the HTTP cache policy in place on a 304 response, avoiding a rewrite of the cached payload. The format change bumps the six cache buckets containing HTTP responses. Warm-cache benchmarks on Linux/ext4, with 96 entries and 16 concurrent ",
+   "category": "performance",
+   "labels": [
+    "performance",
+    "internal"
+   ],
+   "created_at": "2026-09-28T19:32:23Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22052"
+  },
+  {
+   "number": 22066,
+   "title": "Refresh HTTP cache policies without bumping cache buckets",
+   "body_snippet": "Alternative to #22052. We refresh HTTP cache policies in place after 304 responses and use `.cache-v2` filenames without bumping cache buckets. Old and new clients maintain separate HTTP records and wheel archive links. Responses must be fetched once",
+   "category": "performance",
+   "labels": [
+    "performance",
+    "internal"
+   ],
+   "created_at": "2026-09-28T23:29:22Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22066"
+  },
+  {
+   "number": 22078,
+   "title": "Pack HTTP cache policy flags and optional integers",
+   "body_snippet": "We store the same HTTP cache information in fewer bytes, without changing cache freshness or revalidation behavior. - **Booleans become bits.** Ten fields like `no_cache`, `no_store`, and `immutable` each occupied a byte. We pack them into bits of on",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-09-29T17:41:45Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22078"
+  },
+  {
+   "number": 22079,
+   "title": "Align cached HTTP policies within the payload buffer",
+   "body_snippet": "We align HTTP cache policies within the payload buffer and access them directly after validation, removing a separate allocation and copy from every cache read. Extracting the payload reuses the same allocation. The file adds up to 15 bytes of paddin",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-09-29T17:41:52Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22079"
+  },
+  {
+   "number": 22130,
+   "title": "Refresh HTTP cache policies in place",
+   "body_snippet": "Reapplies #22052 for 0.13. We now update the HTTP cache policy in place on a 304 response, avoiding a rewrite of the cached payload. The format change bumps the six cache buckets containing HTTP responses. Original benchmarks from #22052 on Linux/ext",
+   "category": "performance",
+   "labels": [
+    "performance",
+    "internal"
+   ],
+   "created_at": "2026-10-01T16:38:17Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22130"
+  },
+  {
+   "number": 22136,
+   "title": "Align cached HTTP policies within the payload buffer",
+   "body_snippet": "Reapplies #22079 for 0.13. We align HTTP cache policies within the payload buffer and access them directly after validation, removing a separate allocation and copy from every cache read. Extracting the payload reuses the same allocation. The file ad",
+   "category": "performance",
+   "labels": [
+    "performance"
+   ],
+   "created_at": "2026-10-01T16:38:35Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22136"
+  },
+  {
+   "number": 22240,
+   "title": "Add opt-in Git ignore filtering to `uv_build`",
+   "body_snippet": "## Summary This PR adds a `respect-ignore` option to exclude files matching `.gitignore` rules when building source distributions and wheels. The setting is disabled by default, and enabled as follows: ```toml [tool.uv.build-backend] respect-ignore =",
+   "category": "enhancement",
+   "labels": [
+    "enhancement",
+    "area:build-backend"
+   ],
+   "created_at": "2026-10-06T14:19:53Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22240"
+  },
+  {
+   "number": 22266,
+   "title": "Feature Request: Support environment markers / conditions for `include-group` in Dependency Groups",
+   "body_snippet": "### Summary ### **Problem Statement / Background** Currently, PEP 735 dependency groups allow including other groups using `{ include-group = \"group-name\" }`. However, unlike standard dependency specifications (e.g., `package; python_version <= '3.13",
+   "category": "enhancement",
+   "labels": [
+    "enhancement"
+   ],
+   "created_at": "2026-10-07T11:36:05Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/22266"
+  },
+  {
+   "number": 22305,
+   "title": "Fix documentation links in extracted crates",
+   "body_snippet": "The extracted crates expose stale type references and a malformed `zipapp` link in their public documentation. Update the type references to `Pep723ItemRef` and `RequirementsSpecification`, and link directly to Python's `zipapp` documentation.",
+   "category": "documentation",
+   "labels": [
+    "documentation",
+    "internal"
+   ],
+   "created_at": "2026-10-07T19:03:21Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22305"
+  },
+  {
+   "number": 22314,
+   "title": "Report missing `--find-links` directories in requirements files",
+   "body_snippet": "A missing local `--find-links` directory in a requirements file is reparsed as a URL, producing `relative URL without a base`. Keep inputs classified as local paths by `RequirementsInput` on the filesystem path so the error identifies the missing dir",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-10-07T19:25:30Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22314"
+  },
+  {
+   "number": 22352,
+   "title": "`uv python list --only-installed` cause: Querying Python at `D:/path/to/.uv/shims\\python3.8.exe` failed with exit status exit code: 1",
+   "body_snippet": "### Summary ``` # uv python list --only-installed warning: Failed to inspect Python interpreter from search path at `D:/path/to/.uv/shims\\python3.8.exe` cause: Querying Python at `D:/path/to/.uv/shims\\python3.8.exe` failed with exit status exit code:",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "area:windows"
+   ],
+   "created_at": "2026-10-08T07:33:25Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/22352"
+  },
+  {
+   "number": 22361,
+   "title": "Fix Python discovery documentation references",
+   "body_snippet": "The Python discovery docs still refer to renamed methods and the old map type. Point readers to `PythonRequest::parse` and `PythonEnvironment::find`, name the private `find_python_installation` helper without creating a public documentation link, and",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-10-08T14:51:33Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22361"
+  },
+  {
+   "number": 22399,
+   "title": "Write lockfiles atomically for concurrent frozen readers",
+   "body_snippet": "## Summary When `uv lock` rewrites a lockfile, a concurrent `uv export --frozen` can read the file after truncation and fail with a TOML error such as `missing field version`. We copy Git's atomic publication pattern for project and script lockfiles:",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-10-09T16:46:19Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22399"
+  },
+  {
+   "number": 22405,
+   "title": "Expand preview feature documentation",
+   "body_snippet": "Make the available preview features easier to browse by giving each one a heading and a paragraph describing its behavior and usage. The reference remains generated from the Rust doc comments on `PreviewFeature`, and existing feature links continue t",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-10-09T17:12:35Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22405"
+  },
+  {
+   "number": 22419,
+   "title": "Update Docker examples for uv 0.13",
+   "body_snippet": "The minor-version Docker example and the reproduction guide pins are not updated by the release version substitution. Advance them to the 0.13 series so the examples use the new release.",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-10-09T17:56:51Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22419"
+  },
+  {
+   "number": 22437,
+   "title": "Skip benchmarks for Rust integration test changes",
+   "body_snippet": "Test-only pull requests currently schedule benchmarks because every `.rs` file triggers them. Track non-test code changes separately and require them alongside Rust changes to schedule benchmarks, allowing changes confined to crate tests, fixtures, a",
+   "category": "ci_and_build",
+   "labels": [
+    "area:benchmarks",
+    "internal:ci"
+   ],
+   "created_at": "2026-10-09T18:20:10Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22437"
+  },
+  {
+   "number": 22445,
+   "title": "Require explicitly requested CI jobs",
+   "body_snippet": "The `test:integration` and `build:release` labels schedule jobs whose failures do not block `all required jobs passed`. Include `test-integration` and `build-release-artifacts` in the required dependencies and require their results when the correspon",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:ci"
+   ],
+   "created_at": "2026-10-09T19:38:38Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22445"
+  },
+  {
+   "number": 22492,
+   "title": "v0.13.0 fails to install pybabel-json==0.2.0",
+   "body_snippet": "### Summary ```bash uv sync Resolved 200 packages in 1ms error: Failed to download and build `pybabel-json==0.2.0` cause: Failed to extract archive: pybabel-json==0.2.0 cause: Invalid tar file cause: at byte 25088: extraction policy rejected input: h",
+   "category": "bug",
+   "labels": [
+    "bug"
+   ],
+   "created_at": "2026-10-12T14:21:10Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/22492"
+  },
+  {
+   "number": 22510,
+   "title": "0.13.0: `uv build` rejects sdists whose group name is ≥32 characters (\"invalid ustar gname field: missing NUL terminator\")",
+   "body_snippet": "### Summary Since 0.13.0 made the new tar backend the default, `uv build` fails to build a wheel from an sdist created by CPython's `tarfile` (and therefore setuptools) when the file group name is 32 characters or longer. CPython's `tarfile` fills th",
+   "category": "bug",
+   "labels": [
+    "bug",
+    "great writeup"
+   ],
+   "created_at": "2026-10-13T12:33:23Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/22510"
+  },
+  {
+   "number": 22513,
+   "title": "Fix broken .netrc documentation link",
+   "body_snippet": "The `.netrc` link in the [netrc files](https://docs.astral.sh/uv/concepts/authentication/http/#netrc-files) section points to https://everything.curl.dev/usingcurl/netrc. <img width=\"1914\" height=\"910\" alt=\"Image\" src=\"https://github.com/user-attachm",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-10-13T13:27:55Z",
+   "html_url": "https://github.com/astral-sh/uv/issues/22513"
+  },
+  {
+   "number": 22519,
+   "title": "Isolate commands that use repository test fixtures",
+   "body_snippet": "Several integration tests run commands from repository fixture directories or resolve local fixtures from the repository checkout. Copy those fixtures into `TestContext` with `copy_dir_ignore` so builds and dependency resolution use isolated files an",
+   "category": "ci_and_build",
+   "labels": [
+    "internal",
+    "internal:testing"
+   ],
+   "created_at": "2026-10-13T17:20:40Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22519"
+  },
+  {
+   "number": 22542,
+   "title": "Clarify documentation and correct stale guidance",
+   "body_snippet": "Several documentation pages have ambiguous wording and stale guidance, including when uv looks up credentials and which packages `uv sync` removes. Clarify those explanations, fix grammar and redundant phrasing, and correct the managed Python list, i",
+   "category": "documentation",
+   "labels": [
+    "documentation"
+   ],
+   "created_at": "2026-10-14T16:23:33Z",
+   "html_url": "https://github.com/astral-sh/uv/pull/22542"
+  }
+ ],
+ "oos_issues": [
+  {
+   "number": 37822,
+   "title": "[Flight Reply] Check that a typed array's backing entry is a Blob",
+   "body_snippet": "## Summary Refs #37560. `parseTypedArray` in `ReactFlightReplyServer` looks up the backing entry for a typed array or `ArrayBuffer` reference (`$A`, `$O`, `$o`, `$U`, `$S`, …) and calls `.arrayBuffer()` on it without checking its type. If a reply bod",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-13T01:50:46Z",
+   "html_url": "https://github.com/react/react/pull/37822"
+  },
+  {
+   "number": 37823,
+   "title": "[DevTools] Render the highlight overlay in the top layer",
+   "body_snippet": "## Summary Fixes #37534. The element highlight overlay (used by the Inspect button and when hovering the Components tree) sits above the page with `z-index: 10000000`. A z-index can't stack anything above top layer elements, so when a modal `<dialog>",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-13T03:07:03Z",
+   "html_url": "https://github.com/react/react/pull/37823"
+  },
+  {
+   "number": 37825,
+   "title": "[compiler] Memoize past a literal destructuring default",
+   "body_snippet": "Fixes #37735. A destructuring default such as `{items = []}` or `const {data: {user} = {}} = useQuery()` lowers to `value === undefined ? [] : value`. The fresh literal was inferred as mutable. A later call that might store into that binding extended",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-13T11:33:13Z",
+   "html_url": "https://github.com/react/react/pull/37825"
+  },
+  {
+   "number": 37826,
+   "title": "[DevTools] Handle roots without children consistently",
+   "body_snippet": "## Summary React reports a root that renders `false`, an empty array, or an empty Fragment as mounted in `hook.getFiberRoots()`. DevTools doesn't mount roots without children (#34467), so such a root has no instance in `rootToFiberInstanceMap`. Every",
+   "labels": [
+    "CLA Signed",
+    "React Core Team"
+   ],
+   "created_at": "2026-10-13T12:30:59Z",
+   "html_url": "https://github.com/react/react/pull/37826"
+  },
+  {
+   "number": 37827,
+   "title": "[DevTools] Stop filtering by an Activity slice once its Activity unmounts",
+   "body_snippet": "## Summary Stacked on #37826. When an Activity slice filter is applied (#34908), everything outside of the focused Activity is filtered. If that Activity unmounted, the backend kept filtering by it. The Components tree stayed empty. A new Activity re",
+   "labels": [
+    "CLA Signed",
+    "React Core Team"
+   ],
+   "created_at": "2026-10-13T12:31:05Z",
+   "html_url": "https://github.com/react/react/pull/37827"
+  },
+  {
+   "number": 37829,
+   "title": "[compiler] Compile tagged templates with interpolations",
+   "body_snippet": "Fixes #35029. ## What was going wrong A tagged template with an interpolation, such as `` css`color: ${color}` ``, stopped HIR lowering with `Handle tagged template with interpolations`. That `UnsupportedNode` skips the rest of the component. A `setS",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-13T13:12:42Z",
+   "html_url": "https://github.com/react/react/pull/37829"
+  },
+  {
+   "number": 37830,
+   "title": "Transition never commits: a Flight chunk's synchronous then() pings from inside the render phase while the root is already suspended-with-delay, and the ping is dropped (React 19.2.8, Next 15.5 same-route navigation)",
+   "body_snippet": "**Versions.** react 19.2.8 · react-dom 19.2.8 · next 15.5.25 (webpack build, deployed on Vercel; the app router). Not reproducible under `next dev`. **Symptom.** On a production build, a `<Link>` click to the same pathname with different search param",
+   "labels": [],
+   "created_at": "2026-10-13T15:36:01Z",
+   "html_url": "https://github.com/react/react/issues/37830"
+  },
+  {
+   "number": 37831,
+   "title": "[Flight] Reader fuzz",
+   "body_snippet": "Adds some fuzzing for the reader, and then some speculative fixes. Some of these are complicated which makes me wonder if we should explicitly reduce support instead. The commits are roughly: - Add a fuzz with skipped cases - \"Extract\" commits should",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-13T21:26:29Z",
+   "html_url": "https://github.com/react/react/pull/37831"
+  },
+  {
+   "number": 37832,
+   "title": "[DevTools] Keep x_react_sources metadata aligned with sources",
+   "body_snippet": "## Summary Named hooks reads React metadata out of the extended source map fields. For `x_react_sources` it skipped the nulls before walking the array: ```js const reactMetadataArray = sourcemap[REACT_SOURCES_EXTENSION_KEY]; reactMetadataArray.filter",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-14T00:22:15Z",
+   "html_url": "https://github.com/react/react/pull/37832"
+  },
+  {
+   "number": 37834,
+   "title": "[compiler] Assign hoisted function declarations that escape their scope",
+   "body_snippet": "## Summary Fixes #37833. When a nested function declaration gets the hoisted flag but no real reference to it survives (a `typeof fn` type annotation, or a closure that is never called), the compiler doesn't bail out. It still declares `let fn;` outs",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-14T05:10:06Z",
+   "html_url": "https://github.com/react/react/pull/37834"
+  },
+  {
+   "number": 37835,
+   "title": "Defer document hydration mismatches while parsing",
+   "body_snippet": "## Summary When a full-document root is hydrated before the HTML parser has finished streaming the response, React can see an incomplete DOM tree and report a hydration mismatch. This waits for DOMContentLoaded before recovering from a mismatch for a",
+   "labels": [],
+   "created_at": "2026-10-14T07:36:19Z",
+   "html_url": "https://github.com/react/react/pull/37835"
+  },
+  {
+   "number": 37838,
+   "title": "[Fizz] Read the action attribute when replaying form submissions",
+   "body_snippet": "Fixes #37837 ## Summary Before hydration, the inline Fizz runtime catches submits of forms with a function action and queues them for replay. It recognizes those forms by comparing `form.action` to the `javascript:` placeholder. A field named `action",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-14T08:23:33Z",
+   "html_url": "https://github.com/react/react/pull/37838"
+  },
+  {
+   "number": 37839,
+   "title": "[compiler] Treat use() as a hook call when detecting hooks and components",
+   "body_snippet": "## Summary In `compilationMode: 'infer'`, `callsHooksOrCreatesJsx` decides whether a function is a hook or component by looking for hook calls. It matches names with `/^use[A-Z0-9]/`, which never matches the bare `use`. A custom hook whose only hook ",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-14T08:45:52Z",
+   "html_url": "https://github.com/react/react/pull/37839"
+  },
+  {
+   "number": 37840,
+   "title": "[Fiber] Reset isFlushingWork when flushing sync work throws",
+   "body_snippet": "## Summary `flushSyncWorkAcrossRoots_impl` sets the module-level `isFlushingWork` reentrancy guard before looping over the scheduled roots and resets it after the loop, but not in a `finally`: ```js isFlushingWork = true; do { // ... performSyncWorkO",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-14T12:03:05Z",
+   "html_url": "https://github.com/react/react/pull/37840"
+  },
+  {
+   "number": 37841,
+   "title": "[Draft] Flight Result integration experiment",
+   "body_snippet": "",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-14T15:34:06Z",
+   "html_url": "https://github.com/react/react/pull/37841"
+  },
+  {
+   "number": 37842,
+   "title": "[19.0.x][Flight] Improve transport protocol",
+   "body_snippet": "",
+   "labels": [
+    "CLA Signed",
+    "React Core Team"
+   ],
+   "created_at": "2026-10-14T15:48:36Z",
+   "html_url": "https://github.com/react/react/pull/37842"
+  },
+  {
+   "number": 37843,
+   "title": "[19.1.x][Flight] Improve transport protocol",
+   "body_snippet": "",
+   "labels": [
+    "CLA Signed",
+    "React Core Team"
+   ],
+   "created_at": "2026-10-14T15:48:43Z",
+   "html_url": "https://github.com/react/react/pull/37843"
+  },
+  {
+   "number": 37844,
+   "title": "[19.2.x][Flight] Improve transport protocol",
+   "body_snippet": "",
+   "labels": [
+    "CLA Signed",
+    "React Core Team"
+   ],
+   "created_at": "2026-10-14T15:48:44Z",
+   "html_url": "https://github.com/react/react/pull/37844"
+  },
+  {
+   "number": 37845,
+   "title": "[19.3.x][Flight] Improve transport protocol",
+   "body_snippet": "",
+   "labels": [
+    "CLA Signed",
+    "React Core Team"
+   ],
+   "created_at": "2026-10-14T15:48:46Z",
+   "html_url": "https://github.com/react/react/pull/37845"
+  },
+  {
+   "number": 37846,
+   "title": "[Flight] Improve transport protocol",
+   "body_snippet": "eps1lon/react-secured-mirror#78 eps1lon/react-secured-mirror#80 eps1lon/react-secured-mirror#89",
+   "labels": [
+    "CLA Signed",
+    "React Core Team"
+   ],
+   "created_at": "2026-10-14T15:48:48Z",
+   "html_url": "https://github.com/react/react/pull/37846"
+  },
+  {
+   "number": 37848,
+   "title": "[DevTools] Stop polling the backend manager from the content script",
+   "body_snippet": "## Summary Fixes #27992. The proxy content script runs on every page and posted `{source: 'react-devtools-content-script', hello: true}` to the page every 500ms until a backend initialized. The backend manager is only injected once DevTools is opened",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-14T18:20:48Z",
+   "html_url": "https://github.com/react/react/pull/37848"
+  },
+  {
+   "number": 37849,
+   "title": "Do not select the first option in list box <select> with unmatched value",
+   "body_snippet": "## Summary When a controlled `<select>` renders as a list box (`size > 1`) and the `value` does not match any `<option>`, `updateOptions` fell back to selecting the first non-disabled option on every render. List boxes are allowed to have no selectio",
+   "labels": [],
+   "created_at": "2026-10-14T19:14:46Z",
+   "html_url": "https://github.com/react/react/pull/37849"
+  },
+  {
+   "number": 37851,
+   "title": "Prune descendant replay paths after a parent postpone",
+   "body_snippet": "Follow-up to #37850. Extracting the suspended and aborting children into a component still leaves a nested child replay path beneath a Suspense boundary whose whole content was postponed. Resume rerenders that content but then finds the stale child p",
+   "labels": [
+    "CLA Signed",
+    "React Core Team"
+   ],
+   "created_at": "2026-10-14T21:45:00Z",
+   "html_url": "https://github.com/react/react/pull/37851"
+  },
+  {
+   "number": 37853,
+   "title": "Preserve the rendered shell on synchronous prerender abort",
+   "body_snippet": "#37709 showed that a synchronous prerender abort can discard a retried task's rendered shell, then resume only an inner slot. #37710 addressed the missing markup by postponing the whole task, but that could overlap replay paths from child tasks; #378",
+   "labels": [
+    "CLA Signed",
+    "React Core Team"
+   ],
+   "created_at": "2026-10-14T22:20:11Z",
+   "html_url": "https://github.com/react/react/pull/37853"
+  },
+  {
+   "number": 37856,
+   "title": "[Flight] Strip the full `<anonymous>.` type name prefix from I/O names",
+   "body_snippet": "## Summary `serializeIONode` picks the name of an I/O entry from the name of the first first-party function in the stack. That name can include the type name that the function was called on. Since that context is usually not useful, the name is reduc",
+   "labels": [
+    "CLA Signed"
+   ],
+   "created_at": "2026-10-15T00:32:30Z",
+   "html_url": "https://github.com/react/react/pull/37856"
+  }
+ ]
+}

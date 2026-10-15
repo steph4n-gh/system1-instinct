@@ -2530,3 +2530,55 @@ def test_reward_scaling_and_cold_start_multichoice_score_s1m_roundtrip(tmp_path)
     assert dec.values["queue"] == "billing"
     assert dec.values["urgent"] is False
     assert tuple(dec.values["tags"]) == ("refund",)
+
+
+def test_live_github_triage_dogfood_lifecycle():
+    import importlib.util
+    from pathlib import Path
+
+    script_path = Path(__file__).resolve().parents[1] / "examples" / "dogfood" / "live_github_triage.py"
+    spec = importlib.util.spec_from_file_location("live_github_triage", script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    report = mod.run_live_github_triage(quiet=True)
+
+    # 1. Dataset & strict chronological split integrity (zero temporal leakage)
+    assert report["primary_repo"] == "astral-sh/uv"
+    assert report["oos_repo"] == "facebook/react"
+    assert report["total_primary_issues"] == 260
+    assert report["total_oos_issues"] == 25
+    t_lo, t_hi = report["train_chronological_range"]
+    h_lo, h_hi = report["heldout_chronological_range"]
+    assert t_lo < t_hi < h_lo < h_hi
+
+    # 2. Stage 1: Cold Start (0 examples, first 10 issues) safely abstains 100%
+    s1 = report["stage1_cold_start"]
+    assert s1["local_offload_count"] == 0
+    assert s1["local_offload_rate"] == 0.0
+    assert s1["escalated_count"] == 10
+    assert s1["end_to_end_accuracy"] == 1.0
+
+    # 3. Stage 2: Online Warm-Up (Issues 11-50) begins offloading repeat patterns locally
+    s2 = report["stage2_online_warmup"]
+    assert s2["local_offload_rate"] >= 0.30
+    assert s2["end_to_end_accuracy"] >= 0.90
+
+    # 4. Stage 3 & Stage 4: Auto-Cutover Checkpoints (15/class -> 25/class -> 40/class) + OOS Gate
+    c15, c25, c40 = report["stage3_checkpoints"]
+    assert c15["local_offload_rate"] < c25["local_offload_rate"] < c40["local_offload_rate"]
+    assert c15["local_offload_rate"] >= 0.50
+    assert c40["local_offload_rate"] >= 0.85
+    for ckpt in (c15, c25, c40):
+        assert ckpt["local_precision"] >= 0.95
+        assert ckpt["end_to_end_accuracy"] >= 0.96
+        assert ckpt["oos_abstention_rate"] >= 0.92
+        assert ckpt["p50_latency_ms"] < 2.0
+
+    # 5. Stage 5: .s1m Save & Reload Parity
+    s5 = report["stage5_reload_parity"]
+    assert s5["parity_matches"] == 60
+    assert s5["parity_rate"] == 1.0
+    assert 20.0 <= s5["artifact_size_kb"] <= 200.0
+
