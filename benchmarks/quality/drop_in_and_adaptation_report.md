@@ -10,8 +10,8 @@ Evaluated on held-out public intent datasets (`BANKING77` and `CLINC150`). Start
 
 | Public Dataset (`24` Intents) | `0`-Shot (Label Names Only) | `0`-Shot + Unsupervised `adapt_zero_shot` | `1`-Shot Online | `3`-Shot Online | `5`-Shot Online | `8`-Shot Online | `10`-Shot Online | Compiled `.s1m` (`all`) | Compiled P50 Latency |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`BANKING77`** (`192` test queries) | 53.6% | 55.2% | **57.3%** | **65.6%** | **70.3%** | **72.4%** | **77.1%** | **90.1%** | **0.334 ms** |
-| **`CLINC150`** (`120` test queries) | 61.7% | 62.5% | **65.8%** | **72.5%** | **82.5%** | **85.8%** | **85.8%** | **87.5%** | **0.337 ms** |
+| **`BANKING77`** (`192` test queries) | 53.6% | 55.2% | **57.3%** | **65.6%** | **70.3%** | **72.4%** | **75.0%** | **89.6%** | **0.267 ms** |
+| **`CLINC150`** (`120` test queries) | 61.7% | 62.5% | **65.8%** | **72.5%** | **82.5%** | **85.8%** | **83.3%** | **87.5%** | **0.262 ms** |
 
 ### 7-Point Sample-Efficiency Progression (`0, 1, 3, 5, 8, 10, all` Examples / Class)
 
@@ -22,8 +22,8 @@ Evaluated on held-out public intent datasets (`BANKING77` and `CLINC150`). Start
 | **`3`** | 65.6% | 27.6% | **97.9%** | 72.5% | 36.7% | **97.5%** |
 | **`5`** | 70.3% | 33.9% | **97.4%** | 82.5% | 37.5% | **97.5%** |
 | **`8`** | 72.4% | 40.1% | **96.9%** | 85.8% | 40.0% | **99.2%** |
-| **`10`** | 77.1% | 78.1% | **90.1%** | 85.8% | 80.0% | **97.5%** |
-| **`all`** | 90.1% | 68.8% | **99.5%** | 87.5% | 79.2% | **95.8%** |
+| **`10`** | 78.1% | 75.5% | **92.2%** | 85.8% | 77.5% | **98.3%** |
+| **`all`** | 89.6% | 71.9% | **99.5%** | 87.5% | 80.0% | **95.8%** |
 
 ---
 
@@ -57,7 +57,7 @@ on the exact same held-out splits from the [6-category benchmark gauntlet](insti
 
 | Procedural Drop-In Example | Verified Capability | Smoke Check | Secondary Verification | P50 CPU Latency |
 | :--- | :--- | :---: | :---: | :---: |
-| **`semantic-router`** ([guide](../../docs/drop_in/01_semantic_router.md)) | In-Domain + OOD + `adapt_zero_shot` | **100.0%** | OOD Reject: **100.0%** · Unseen Jargon: `0% -> 100%` | **1.817 ms** |
-| **`RouteLLM`** ([guide](../../docs/drop_in/02_routellm_cascade.md)) | 3-Tier Complexity Cascade | **100.0%** | Zero External API Calls | **1.310 ms** |
-| **`Instructor` / `BAML`** ([guide](../../docs/drop_in/03_instructor_structured_outputs.md)) | 4-Field Joint Extraction | **100.0%** | Dept: **100.0%** / Alert: **100.0%** | **1.738 ms** |
-| **`Llama-Prompt-Guard`** ([guide](../../docs/drop_in/04_prompt_guard_security.md)) | Attack Recall + `NotInject` Guard | **100.0%** | `NotInject` Benign FPR: **0.0%** | **0.789 ms** |
+| **`semantic-router`** ([guide](../../docs/drop_in/01_semantic_router.md)) | In-Domain + OOD + `adapt_zero_shot` | **100.0%** | OOD Reject: **100.0%** · Unseen Jargon: `0% -> 100%` | **1.280 ms** |
+| **`RouteLLM`** ([guide](../../docs/drop_in/02_routellm_cascade.md)) | 3-Tier Complexity Cascade | **100.0%** | Zero External API Calls | **1.421 ms** |
+| **`Instructor` / `BAML`** ([guide](../../docs/drop_in/03_instructor_structured_outputs.md)) | 4-Field Joint Extraction | **100.0%** | Dept: **100.0%** / Alert: **100.0%** | **1.655 ms** |
+| **`Llama-Prompt-Guard`** ([guide](../../docs/drop_in/04_prompt_guard_security.md)) | Attack Recall + `NotInject` Guard | **100.0%** | `NotInject` Benign FPR: **0.0%** | **0.548 ms** |

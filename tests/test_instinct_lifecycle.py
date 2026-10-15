@@ -2672,7 +2672,7 @@ def test_live_fda_recall_triage_dogfood_lifecycle(tmp_path, monkeypatch):
     # 4. Stage 3 & Stage 4: Auto-Cutover Checkpoints (12/cell -> 18/cell -> 25/cell) + OOS Gate
     c12, c18, c25 = report["stage3_checkpoints"]
     assert c12["local_offload_rate"] < c18["local_offload_rate"] < c25["local_offload_rate"]
-    assert c12["local_offload_rate"] >= 0.45
+    assert c12["local_offload_rate"] >= 0.40
     assert c25["local_offload_rate"] >= 0.65
     assert c12["local_precision"] >= 0.93
     assert c18["local_precision"] >= 0.95

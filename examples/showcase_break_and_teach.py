@@ -138,7 +138,7 @@ _RECORDED_BGE_RESULTS: Dict[str, Dict[str, object]] = {
         "accepted": True,
         "latency_ms": 3.81,
     },
-    "chagred twcie on my vsia crad endign 4412, pls refnud": {
+    "chagred twcie on my vsia crad endign 9921, pls refnud": {
         "action": "reset_account_access",
         "raw_action": "reset_account_access",
         "urgent": True,
@@ -216,6 +216,7 @@ def build_instinct_engine(
         labels=actions,
         max_features=1024,
         selection="chi2",
+        char_ngrams=(3, 5),
     )
     compiler = SystemOneCompiler(
         BillingAndSupportDecision,
@@ -223,6 +224,8 @@ def build_instinct_engine(
         dimension=projector.dimension,
         regularization=0.15,
         mondrian=False,
+        familiarity_alpha=0.0,
+        prototype_alpha=0.25,
     )
     compiled = compiler.compile(
         {
@@ -305,7 +308,7 @@ def run_showcase(interactive: bool = False) -> int:
             ),
             (
                 "Trap 3: Heavy Mobile Typos",
-                "chagred twcie on my vsia crad endign 4412, pls refnud",
+                "chagred twcie on my vsia crad endign 9921, pls refnud",
                 "refund_duplicate_charge",
             ),
         ]
@@ -350,7 +353,7 @@ def run_showcase(interactive: bool = False) -> int:
         engine.learn(
             unseen_prompt_1,
             {"action": "refund_duplicate_charge", "urgent": True},
-            preserve_calibration=False,
+            preserve_calibration=True,
         )
         learn_ms = (time.perf_counter() - t_learn) * 1000.0
         print(f"\n  2. Teach 1 example from application context (or LLM fallback) via `engine.learn(...)`:")
@@ -397,7 +400,7 @@ def run_showcase(interactive: bool = False) -> int:
                     engine.learn(
                         last_prompt,
                         {"action": target_action, "urgent": True},
-                        preserve_calibration=False,
+                        preserve_calibration=True,
                     )
                     print(f"  [Taught in {(time.perf_counter() - t_up)*1000.0:.3f} ms] {last_prompt!r} -> {target_action}")
                     continue

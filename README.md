@@ -106,30 +106,30 @@ python examples/showcase_break_and_teach.py --interactive
 ```text
 [Setup from 6 examples/option (30 total teacher logs)]
   • Neural Vector Router (`BAAI/bge-small-en-v1.5`) : 67,200 KiB ONNX | Init:  208.8 ms
-  • System 1: Instinct (`.s1m` compiled skill)      :   23.7 KiB .s1m | Init:   40.3 ms
+  • System 1: Instinct (`.s1m` compiled skill)      :   48.6 KiB .s1m | Init:   27.7 ms
 
 ACT 1: ROUTINE TRAFFIC — Replacing 450 ms LLM Calls in ~0.2 ms ($0 API Cost)
-  Query: 'Please cancel my monthly subscription and stop billing me' -> LOCAL .s1m (0.377 ms): cancel_subscription ✅
-  Query: 'My Visa card was billed twice for the same invoice today'  -> LOCAL .s1m (0.213 ms): refund_duplicate_charge ✅
+  Query: 'Please cancel my monthly subscription and stop billing me' -> LOCAL .s1m (0.356 ms): cancel_subscription ✅
+  Query: 'My Visa card was billed twice for the same invoice today'  -> LOCAL .s1m (0.245 ms): refund_duplicate_charge ✅
 
 ACT 2: 'BREAK ME' — 3 Real-World Curveballs Where Static Vector Routers Fail
   [Trap 1: Negation Flip] 'Please do NOT cancel my subscription, I want to upgrade to Pro instead'
     • bge-small-en-v1.5 (4.23 ms, cos=0.80) -> cancel_subscription      ❌ MISROUTED!
-    • System 1: Instinct (0.40 ms, fam=12.10) -> upgrade_plan             ✅
+    • System 1: Instinct (0.17 ms, fam=13.95) -> upgrade_plan             ✅
   [Trap 2: Out-of-Scope Garbage] 'What is the best temperature to bake sourdough bread in a Dutch oven?'
     • bge-small-en-v1.5 (3.81 ms, cos=0.46) -> upgrade_plan             ❌ MISROUTED!
-    • System 1: Instinct (0.32 ms, fam=4.80) -> ABSTAIN_TO_LLM           ✅
-  [Trap 3: Heavy Mobile Typos] 'chagred twcie on my vsia crad endign 4412, pls refnud'
+    • System 1: Instinct (0.16 ms, fam=5.83) -> ABSTAIN_TO_LLM           ✅
+  [Trap 3: Heavy Mobile Typos] 'chagred twcie on my vsia crad endign 9921, pls refnud'
     • bge-small-en-v1.5 (3.94 ms, cos=0.67) -> reset_account_access     ❌ MISROUTED!
-    • System 1: Instinct (0.39 ms, fam=5.85) -> refund_duplicate_charge  ✅
+    • System 1: Instinct (0.16 ms, fam=5.98) -> refund_duplicate_charge  ✅
 
-ACT 3: 'TEACH ME' — Teaching a Brand-New Jargon Term in 1 Line (< 4 ms)
+ACT 3: 'TEACH ME' — Teaching a Brand-New Jargon Term in 1 Line (< 5 ms)
   1. Unseen codeword ('Customer is asking for a Project-Sunburst adjustment on their account'):
-     Before : ABSTAIN_TO_LLM (Safe! 0.313 ms)
+     Before : ABSTAIN_TO_LLM (Safe! 0.171 ms)
   2. Teach 1 example: engine.learn(prompt, {'action': 'refund_duplicate_charge', 'urgent': True})
   3. Next ticket ('Please apply the Project-Sunburst adjustment for this workspace'):
      • bge-small-en-v1.5 (Static)   : upgrade_plan (cos=0.73) ❌ MISROUTED!
-     • System 1: Instinct (Taught)  : refund_duplicate_charge (urgent=True) in 0.512 ms ✅
+     • System 1: Instinct (Taught)  : refund_duplicate_charge (urgent=True) in 0.329 ms ✅
 ```
 
 Run these end-to-end replay scripts to inspect real-world behavior:
@@ -141,7 +141,7 @@ python examples/dogfood/live_github_triage.py
 python examples/dogfood/live_github_triage.py --live --repo astral-sh/uv
 ```
 
-- **Live US FDA enforcement recall triage (`openFDA` and `astral-sh/uv` OOS).** Run [`examples/dogfood/live_fda_recall_triage.py`](examples/dogfood/live_fda_recall_triage.py), which uses the snapshot in [`examples/dogfood/fda_live_recalls_snapshot.json`](examples/dogfood/fda_live_recalls_snapshot.json). The script replays `297` chronologically ordered US FDA enforcement recall reports (`20121212` through `20261007`, `33 per cell` across `food`, `drug`, and `device` crossed with `Class I`, `Class II`, and `Class III`) plus `25` `astral-sh/uv` out-of-scope software issues, with zero synthetic strings and zero temporal leakage. Each decision predicts a **3-field multi-head schema** (`regulatory_center`, `hazard_class`, and `urgent_class_i_escalation`). Traffic progresses from **`0` examples (`0.0%` offload, `100%` escalated)** to **online warm-up (`10.0%` offload at `100.0%` precision)**. Compiling `.s1m` checkpoints reaches **`51.4%` offload at `12 per cell`, `61.1%` at `18 per cell`, and `70.8%` local offload at `25 per cell` in `0.30 ms` with `98.0%` joint 3-field precision, `100.0%` center precision, `100.0%` OOS abstention, and `100%` `.s1m` reload parity**:
+- **Live US FDA enforcement recall triage (`openFDA` and `astral-sh/uv` OOS).** Run [`examples/dogfood/live_fda_recall_triage.py`](examples/dogfood/live_fda_recall_triage.py), which uses the snapshot in [`examples/dogfood/fda_live_recalls_snapshot.json`](examples/dogfood/fda_live_recalls_snapshot.json). The script replays `297` chronologically ordered US FDA enforcement recall reports (`20121212` through `20261007`, `33 per cell` across `food`, `drug`, and `device` crossed with `Class I`, `Class II`, and `Class III`) plus `25` `astral-sh/uv` out-of-scope software issues, with zero synthetic strings and zero temporal leakage. Each decision predicts a **3-field multi-head schema** (`regulatory_center`, `hazard_class`, and `urgent_class_i_escalation`). Traffic progresses from **`0` examples (`0.0%` offload, `100%` escalated)** to **online warm-up (`10.0%` offload at `100.0%` precision)**. Compiling `.s1m` checkpoints reaches **`40.3%` offload at `12 per cell`, `51.4%` at `18 per cell`, and `65.3%` local offload at `25 per cell` in `0.33 ms` with `95.7%` joint 3-field precision, `100.0%` center precision, `100.0%` OOS abstention, and `100%` `.s1m` reload parity**:
 
 ```bash
 python examples/dogfood/live_fda_recall_triage.py
@@ -164,7 +164,7 @@ The table below shows how local offload and accuracy scale from **`0` examples**
 | **`25 to 50` examples per option** | Standalone `.s1m` saturates. Out-of-scope inputs still abstain (`0.0%` OOS false accept). | **`80% to 100%`** | `0% to 20%` | **`~99% to 100%`** |
 | **`10,000+` examples** | **Wrong tool for new gains.** Linear and spectral hyperplanes plateau around `50 to 100` examples per option. | *Plateau* | None | Use a fine-tuned model or local LLM |
 
-> **Scope and fallible-teacher boundary.** The progression above summarizes `CLINC150` and `BANKING77` adaptation curves with an oracle teacher fallback at $\alpha = 0.10$ marginal conformal gating. We also tested a **fallible teacher** (`10%` label noise on `64`-class `HWU64`) on `1,394` fresh qualification items. Under a strict **`1%` (`0.01`) family-wise conditional local error budget**, neither Instinct nor a classical logistic classifier can statistically certify `<= 1%` upper-bound risk. At a **`5%` (`0.05`) local error budget**, all generalizing methods qualify on `5 of 5` seeds. `instinct_lexical` offloads `24.41%` vs. `simple_classifier`'s `20.46%` at `1.75%` error, and `instinct_hybrid` reaches the lowest local error rate at `1.36%` with `5 of 5` `.s1m` reloadability. See [Fresh HWU64 traffic with a fallible teacher (`benchmarks/heldout_traffic/REPORT.md`)](benchmarks/heldout_traffic/REPORT.md).
+> **Scope and fallible-teacher boundary.** The progression above summarizes `CLINC150` and `BANKING77` adaptation curves with an oracle teacher fallback at $\alpha = 0.10$ marginal conformal gating. We also tested a **fallible teacher** (`10%` label noise on `64`-class `HWU64`) across `7,031` independent qualification items and `1,076` fresh test requests. Under a strict **`1%` (`0.01`) family-wise conditional local error budget** (`delta = 0.0025`), neither Instinct nor a classical logistic classifier can statistically certify `<= 1%` upper-bound risk (`0.0%` coverage). At the **`5%` (`0.05`) local error budget**, all three learned methods qualify on `5 of 5` seeds with `0` budget misses. `instinct_lexical` offloads `27.68%` at `1.68%` local error rate vs. `simple_classifier`'s `20.46%` at `1.73%` error (`+7.21 pp` gain, `earns_complexity = true`), and `instinct_hybrid` reaches the lowest local error rate at `1.37%` (`20.37%` coverage) with `5 of 5` `.s1m` reloadability. See [Fresh HWU64 traffic with a fallible teacher (`benchmarks/heldout_traffic/REPORT.md`)](benchmarks/heldout_traffic/REPORT.md).
 
 ---
 

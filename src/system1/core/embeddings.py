@@ -1261,9 +1261,14 @@ class HybridProjector:
         subspace_dim: int = 16,
         subspace_weight: float = 0.20,
         min_df: int = 1,
+        ngram_range: Optional[Tuple[int, int]] = None,
         **kwargs: Any,
     ) -> HybridProjector:
         """Fit PPMI/SVD spectral co-occurrence and optional supervised class-prototype subspace."""
+        _ = ngram_range
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(f"HybridProjector.fit() got an unexpected keyword argument {unexpected!r}")
         if isinstance(texts, (str, bytes)) or texts is None:
             raise TypeError("texts must be a collection of strings")
         text_list = list(texts)
@@ -1471,6 +1476,7 @@ class HybridProjector:
         *,
         dimension: Optional[int] = None,
         sparse_dim: int = 1024,
+        max_features: Optional[int] = None,
         dense_dim: int = 256,
         alpha: float = 0.5,
         seed: int = 42,
@@ -1480,11 +1486,13 @@ class HybridProjector:
         subspace_dim: int = 16,
         subspace_weight: float = 0.20,
         min_df: int = 1,
+        ngram_range: Optional[Tuple[int, int]] = None,
         **kwargs: Any,
     ) -> HybridProjector:
+        eff_sparse_dim = int(max_features) if max_features is not None else int(sparse_dim)
         projector = cls(
             dimension=dimension,
-            sparse_dim=sparse_dim,
+            sparse_dim=eff_sparse_dim,
             dense_dim=dense_dim,
             alpha=alpha,
             seed=seed,
@@ -1498,6 +1506,7 @@ class HybridProjector:
             subspace_dim=subspace_dim,
             subspace_weight=subspace_weight,
             min_df=min_df,
+            ngram_range=ngram_range,
             **kwargs,
         )
 

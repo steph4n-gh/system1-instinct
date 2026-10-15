@@ -295,20 +295,29 @@ def fetch_live_github_snapshot(
     issues: List[Dict[str, Any]] = []
     used_nums = set()
     if can_use_uv_windows:
-        for lo, hi, req in uv_windows:
+        for w_idx, (lo, hi, req) in enumerate(uv_windows):
+            is_heldout_window = w_idx == len(uv_windows) - 1
             for cat in CATEGORIES:
-                cands = [
-                    (sc, num, it)
-                    for sc, num, it in scored_by_cat[cat]
-                    if lo <= num < hi and num not in used_nums and sc >= 0.4
-                ]
-                if len(cands) < req:
+                if is_heldout_window:
                     cands = [
                         (sc, num, it)
                         for sc, num, it in scored_by_cat[cat]
                         if lo <= num < hi and num not in used_nums
                     ]
-                cands.sort(key=lambda x: (-x[0], x[1]))
+                    cands.sort(key=lambda x: x[1])
+                else:
+                    cands = [
+                        (sc, num, it)
+                        for sc, num, it in scored_by_cat[cat]
+                        if lo <= num < hi and num not in used_nums and sc >= 0.4
+                    ]
+                    if len(cands) < req:
+                        cands = [
+                            (sc, num, it)
+                            for sc, num, it in scored_by_cat[cat]
+                            if lo <= num < hi and num not in used_nums
+                        ]
+                    cands.sort(key=lambda x: (-x[0], x[1]))
                 for _, _, it in cands[:req]:
                     used_nums.add(int(it["number"]))
                     issues.append(it)
@@ -330,6 +339,7 @@ def fetch_live_github_snapshot(
             for f in cum_fracs[:-1]
         ] + [int(all_nums_sorted[-1]) + 1]
         for w_idx, req in enumerate(reqs):
+            is_heldout_window = w_idx == len(reqs) - 1
             lo, hi = bounds[w_idx], bounds[w_idx + 1]
             for cat in CATEGORIES:
                 cands = [
@@ -343,14 +353,16 @@ def fetch_live_github_snapshot(
                         for sc, num, it in scored_by_cat[cat]
                         if num not in used_nums
                     ]
-                cands.sort(key=lambda x: (-x[0], x[1]))
+                if is_heldout_window:
+                    cands.sort(key=lambda x: x[1])
+                else:
+                    cands.sort(key=lambda x: (-x[0], x[1]))
                 for _, _, it in cands[:req]:
                     used_nums.add(int(it["number"]))
                     issues.append(it)
 
     issues.sort(key=lambda x: int(x["number"]))
 
-    # Fetch OOS issues from unrelated repository
     oos_endpoint = f"repos/{oos_repo}/issues?state=all&direction=desc&per_page=100"
     oos_candidates = _gh_api_get(oos_endpoint)
     oos_issues: List[Dict[str, Any]] = []
@@ -360,12 +372,6 @@ def fetch_live_github_snapshot(
                 continue
             title = str(it.get("title") or "").strip()
             body_snippet = _clean_body_snippet(it.get("body"))
-            combined = f"{title} {body_snippet}".lower()
-            if re.search(
-                r"\b(ci|release|gh|npmscan|workflow|docker|fail|error|bug|crash|test|fix|broken|perf|performance|cache|docs|readme)\b",
-                combined,
-            ):
-                continue
             oos_issues.append(
                 {
                     "number": int(it["number"]),

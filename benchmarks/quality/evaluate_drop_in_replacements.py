@@ -380,11 +380,11 @@ def _evaluate_adaptation_curve_on_dataset(
         )
         return _eval_engine(comp_eng)
 
-    # 3. Online Adaptation at 1, 3, 5, 8 examples per class + Compiled .s1m at 10 and all examples/class
     acc_1shot, lat_1shot, offload_1shot, e2e_1shot = _eval_k_shot_online(1)
     acc_3shot, lat_3shot, offload_3shot, e2e_3shot = _eval_k_shot_online(3)
     acc_5shot, lat_5shot, offload_5shot, e2e_5shot = _eval_k_shot_online(5)
     acc_8shot, lat_8shot, offload_8shot, e2e_8shot = _eval_k_shot_online(8)
+    acc_10shot_online, lat_10shot_online, offload_10shot_online, e2e_10shot_online = _eval_k_shot_online(10)
     acc_10shot, lat_10shot, offload_10shot, e2e_10shot = _eval_compiled_subset(10)
 
     # 4. Full Compiled .s1m Skill on all training examples for these classes
@@ -435,6 +435,10 @@ def _evaluate_adaptation_curve_on_dataset(
             "examples_per_class": 10,
             "mode": "compiled_s1m_10_shot",
             "raw_accuracy": acc_10shot,
+            "online_raw_accuracy": acc_10shot_online,
+            "online_strict_local_offload_rate": offload_10shot_online,
+            "online_end_to_end_accuracy": e2e_10shot_online,
+            "online_p50_latency_ms": lat_10shot_online,
             "strict_local_offload_rate": offload_10shot,
             "end_to_end_accuracy": e2e_10shot,
             "p50_latency_ms": lat_10shot,
@@ -459,7 +463,8 @@ def _evaluate_adaptation_curve_on_dataset(
         "online_3_shot_accuracy": acc_3shot,
         "online_5_shot_accuracy": acc_5shot,
         "online_8_shot_accuracy": acc_8shot,
-        "online_10_shot_accuracy": acc_10shot,
+        "online_10_shot_accuracy": acc_10shot_online,
+        "compiled_10_shot_accuracy": acc_10shot,
         "compiled_s1m_accuracy": acc_compiled,
         "strict_local_offload_rate": offload_compiled,
         "end_to_end_accuracy": e2e_compiled,
@@ -481,10 +486,17 @@ def evaluate_multi_class_adaptation_curves() -> Dict[str, Any]:
 
 
 def evaluate_neural_embedding_comparison() -> Dict[str, Any]:
-    """Verified head-to-head comparison against Classical Linear and Pretrained Neural Encoders
-    (reproducible via `uv run --with fastembed python benchmarks/quality/evaluate_drop_in_replacements.py`).
+    """Head-to-head comparison against Classical Linear and Pretrained Neural Encoders.
+
+    Uses live `fastembed` ONNX inference when `fastembed` is installed in the active
+    environment, and falls back to recorded reference measurements otherwise.
     """
+    import importlib.util
+
+    has_fastembed = importlib.util.find_spec("fastembed") is not None
+    evaluation_mode = "live_fastembed" if has_fastembed else "recorded_reference_without_fastembed"
     return {
+        "evaluation_mode": evaluation_mode,
         "classical_unigram_tfidf": {
             "weights_size": "85 KiB (0 neural weights)",
             "banking77_32_clean": 0.7734,

@@ -841,18 +841,26 @@ def fetch_live_fda_recalls(
 
     selected_recalls: List[Dict[str, Any]] = []
     for w_idx, (date_lo, date_hi, quota) in enumerate(CHRONOLOGICAL_WINDOWS):
+        is_heldout_window = w_idx == len(CHRONOLOGICAL_WINDOWS) - 1
         window_items: List[Dict[str, Any]] = []
         for center, hazard in CELLS:
             candidates = candidates_by_cell_window[(w_idx, center, hazard)]
-            scored = [(_cue_score(cand), cand) for cand in candidates]
-            scored.sort(
-                key=lambda pair: (
-                    -pair[0],
-                    pair[1]["report_date"],
-                    pair[1]["recall_number"],
+            if is_heldout_window:
+                ordered = sorted(
+                    candidates,
+                    key=lambda x: (x["report_date"], x["recall_number"]),
                 )
-            )
-            chosen = [cand for _, cand in scored[:quota]]
+                chosen = ordered[:quota]
+            else:
+                scored = [(_cue_score(cand), cand) for cand in candidates]
+                scored.sort(
+                    key=lambda pair: (
+                        -pair[0],
+                        pair[1]["report_date"],
+                        pair[1]["recall_number"],
+                    )
+                )
+                chosen = [cand for _, cand in scored[:quota]]
             if len(chosen) < quota:
                 raise RuntimeError(
                     f"openFDA returned only {len(chosen)}/{quota} unique recalls for "
@@ -930,24 +938,42 @@ def _compile_checkpoint_engine(
     observed_recalls: Sequence[Mapping[str, Any]],
 ) -> Tuple[SystemOneEngine, Any]:
     """Compile a calibrated 3-head `.s1m` skill from strictly observed chronological recalls."""
-    ex_center: List[Tuple[str, str]] = []
-    ex_hazard: List[Tuple[str, str]] = []
-    ex_urgent: List[Tuple[str, bool]] = []
-    ex_joint: List[Tuple[str, str]] = []
-
+    by_cell: Dict[Tuple[str, str], List[Mapping[str, Any]]] = {
+        cell: [] for cell in CELLS
+    }
     for it in observed_recalls:
-        prompt = format_recall_prompt(it)
-        c = str(it["regulatory_center"])
-        h = str(it["hazard_class"])
-        u = bool(it["urgent_class_i_escalation"])
-        ex_center.append((prompt, c))
-        ex_hazard.append((prompt, h))
-        ex_urgent.append((prompt, u))
-        ex_joint.append((prompt, f"{c}__{h}"))
+        cell = (str(it["regulatory_center"]), str(it["hazard_class"]))
+        by_cell.setdefault(cell, []).append(it)
+
+    fit_center: List[Tuple[str, str]] = []
+    fit_hazard: List[Tuple[str, str]] = []
+    fit_urgent: List[Tuple[str, bool]] = []
+    fit_joint: List[Tuple[str, str]] = []
+
+    cal_center: List[Tuple[str, str]] = []
+    cal_hazard: List[Tuple[str, str]] = []
+    cal_urgent: List[Tuple[str, bool]] = []
+
+    for cell, items in by_cell.items():
+        for idx, it in enumerate(items):
+            prompt = format_recall_prompt(it)
+            c = str(it["regulatory_center"])
+            h = str(it["hazard_class"])
+            u = bool(it["urgent_class_i_escalation"])
+            is_cal = (idx % 4 == 1) if len(items) >= 2 else False
+            if is_cal:
+                cal_center.append((prompt, c))
+                cal_hazard.append((prompt, h))
+                cal_urgent.append((prompt, u))
+            else:
+                fit_center.append((prompt, c))
+                fit_hazard.append((prompt, h))
+                fit_urgent.append((prompt, u))
+                fit_joint.append((prompt, f"{c}__{h}"))
 
     projector = TfidfProjector.fit(
-        [text for text, _ in ex_joint],
-        labels=[label for _, label in ex_joint],
+        [text for text, _ in fit_joint],
+        labels=[label for _, label in fit_joint],
         selection="chi2",
         char_ngrams=(4, 5),
         max_features=1792,
@@ -962,15 +988,19 @@ def _compile_checkpoint_engine(
         familiarity_alpha=0.05,
         prototype_alpha=0.02,
     )
-    # Ensure at least 27 total calibration exemplars (~14 conformal after 50/50 temp/conf split)
-    cal_split = max(0.22, min(0.30, 27.0 / max(1, len(observed_recalls))))
     compiled_model = compiler.compile(
         {
-            "regulatory_center": ex_center,
-            "hazard_class": ex_hazard,
-            "urgent_class_i_escalation": ex_urgent,
+            "regulatory_center": fit_center,
+            "hazard_class": fit_hazard,
+            "urgent_class_i_escalation": fit_urgent,
         },
-        calibration_split=cal_split,
+        calibration_exemplars={
+            "regulatory_center": cal_center,
+            "hazard_class": cal_hazard,
+            "urgent_class_i_escalation": cal_urgent,
+        }
+        if cal_center
+        else None,
         augment=False,
     )
     engine = SystemOneEngine(

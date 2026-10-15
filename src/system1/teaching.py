@@ -971,20 +971,60 @@ class TeachingSession:
         calibration = [row for row in state["records"] if row["split"] == "calibrate"]
         if require_calibration and len(calibration) < 2:
             raise ValueError("Supply at least two separate calibrate examples")
-        for fname, f_def in self.schema.fields.items():
-            f_labels = [self._field_label(row["label"], fname) for row in fitting]
-            if isinstance(f_def, ChoiceField):
-                if set(f_labels) != set(f_def.options):
-                    raise ValueError("Supply teaching examples for every choice before assessing")
-            elif isinstance(f_def, BooleanField):
-                if set(f_labels) != {False, True}:
-                    raise ValueError("Supply teaching examples for every choice before assessing")
-            elif isinstance(f_def, MultiChoiceField):
-                if len(fitting) < 2 or not {opt for labs in f_labels for opt in labs}:
-                    raise ValueError("Supply teaching examples for every choice before assessing")
-            elif isinstance(f_def, ScoreField):
-                if len(fitting) < 2 or len({float(v) for v in f_labels}) < 2:
-                    raise ValueError("Supply teaching examples for every choice before assessing")
+
+        def _has_full_coverage(rows: list[dict]) -> bool:
+            for fname, f_def in self.schema.fields.items():
+                f_labels = [self._field_label(row["label"], fname) for row in rows]
+                if isinstance(f_def, ChoiceField):
+                    if set(f_labels) != set(f_def.options):
+                        return False
+                elif isinstance(f_def, BooleanField):
+                    if set(f_labels) != {False, True}:
+                        return False
+                elif isinstance(f_def, MultiChoiceField):
+                    if len(rows) < 2 or not {opt for labs in f_labels for opt in labs}:
+                        return False
+                elif isinstance(f_def, ScoreField):
+                    if len(rows) < 2 or len({float(v) for v in f_labels}) < 2:
+                        return False
+            return True
+
+        if not _has_full_coverage(fitting):
+            raise ValueError("Supply teaching examples for every choice before assessing")
+
+        if not calibration and not require_calibration:
+            by_label: dict[str, list[dict]] = {}
+            for row in fitting:
+                lkey = (
+                    row["label"]
+                    if isinstance(row["label"], str)
+                    else json.dumps(row["label"], sort_keys=True)
+                )
+                by_label.setdefault(lkey, []).append(row)
+            auto_fit: list[dict] = []
+            auto_cal: list[dict] = []
+            for group in by_label.values():
+                by_input: dict[str, list[dict]] = {}
+                for row in group:
+                    by_input.setdefault(str(row["input"]), []).append(row)
+                unique_inputs = list(by_input.keys())
+                if len(unique_inputs) >= 2:
+                    min_cal = 2 if len(unique_inputs) >= 4 else 1
+                    n_cal = min(
+                        len(unique_inputs) - 1,
+                        max(min_cal, int(round(0.25 * len(unique_inputs)))),
+                    )
+                    cal_inputs = set(unique_inputs[-n_cal:])
+                    for inp, inp_rows in by_input.items():
+                        if inp in cal_inputs:
+                            auto_cal.extend(inp_rows)
+                        else:
+                            auto_fit.extend(inp_rows)
+                else:
+                    auto_fit.extend(group)
+            if len(auto_cal) >= 2 and _has_full_coverage(auto_fit):
+                fitting = auto_fit
+                calibration = auto_cal
 
         selection = state.get("selection", "frequency")
         char_ngrams_raw = state.get("char_ngrams")

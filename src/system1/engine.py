@@ -312,10 +312,16 @@ class SystemOneEngine:
         self._init_calibrators_and_predictors()
         # Lessons belong to the active skill; a replacement retires the old ones.
         self._learned_prompt_overrides = {}
+        self._learned_prompt_override_recency: Dict[str, bool] = {}
+        model_rec = getattr(model, "_learned_prompt_override_recency", {})
         if hasattr(model, "_learned_prompt_overrides") and isinstance(model._learned_prompt_overrides, Mapping):
             for p_key, f_map in model._learned_prompt_overrides.items():
                 if isinstance(p_key, str) and isinstance(f_map, Mapping):
                     self._learned_prompt_overrides[p_key] = copy.deepcopy(dict(f_map))
+                    if isinstance(model_rec, Mapping) and p_key in model_rec:
+                        self._learned_prompt_override_recency[p_key] = bool(model_rec[p_key])
+                    else:
+                        self._learned_prompt_override_recency[p_key] = bool(self.recency_weighted)
 
         if hasattr(model, "heads"):
             for name, ch in model.heads.items():
@@ -656,6 +662,8 @@ class SystemOneEngine:
             recency_weighted = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
             version = getattr(self.model, "model_version", self.model_version)
             if version != self.model_version:
+                if hasattr(self.model, "_field_heads"):
+                    self._sync_from_model(self.model)
                 self.model_version = version
                 for name in self.schema.fields:
                     head = getattr(self.model, "heads", {}).get(name)
@@ -865,19 +873,15 @@ class SystemOneEngine:
             is_ambiguous = False
 
             from system1.core.text import TfidfProjector
-            prompt_raw_norm: Optional[float] = None
-            has_cached_raw_norm = (
-                hasattr(self.projector, "_last_raw_norm")
-                or hasattr(getattr(self.projector, "tfidf", None), "_last_raw_norm")
-            )
-            needs_raw_norm = has_cached_raw_norm or any(
+            prompt_raw_norm: Optional[float] = getattr(raw_result, "raw_norm", None)
+            needs_raw_norm = any(
                 float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
                 for cp in self.conformal_predictors.values()
             ) or any(
                 float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
                 for ch in getattr(self.model, "heads", {}).values()
             )
-            if embedding is None and needs_raw_norm and hasattr(self.projector, "raw_norm"):
+            if prompt_raw_norm is None and embedding is None and needs_raw_norm and hasattr(self.projector, "raw_norm"):
                 try:
                     prompt_raw_norm = float(self.projector.raw_norm(prompt))
                 except Exception:
@@ -887,11 +891,15 @@ class SystemOneEngine:
             if embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
                 norm_key = " ".join(prompt.strip().casefold().split())
                 model_ov = getattr(self.model, "_learned_prompt_overrides", {})
+                model_rec = getattr(self.model, "_learned_prompt_override_recency", {})
                 if isinstance(model_ov, Mapping) and norm_key in model_ov:
-                    learned_overrides.update(model_ov[norm_key])
+                    if model_rec.get(norm_key, bool(self.recency_weighted)) == bool(recency_weighted):
+                        learned_overrides.update(model_ov[norm_key])
                 eng_ov = getattr(self, "_learned_prompt_overrides", {})
+                eng_rec = getattr(self, "_learned_prompt_override_recency", {})
                 if isinstance(eng_ov, Mapping) and norm_key in eng_ov:
-                    learned_overrides.update(eng_ov[norm_key])
+                    if eng_rec.get(norm_key, bool(self.recency_weighted)) == bool(recency_weighted):
+                        learned_overrides.update(eng_ov[norm_key])
 
             prototype_similarities: Dict[str, float] = {}
             abstention_reasons: Dict[str, str] = {}
@@ -1180,7 +1188,7 @@ class SystemOneEngine:
             validated_values = self.schema.validate_decision(values)
             total_latency_ms = (time.perf_counter() - t_start) * 1000.0
 
-            if record_receipt or (self.use_cache and not is_ambiguous):
+            if record_receipt or self.use_cache:
                 safe_values = copy.deepcopy(validated_values)
                 safe_confidences = dict(confidences)
                 safe_conformal_sets = {k: list(v) for k, v in conformal_sets.items()}
@@ -1349,6 +1357,8 @@ class SystemOneEngine:
         forgetting_factor: Optional[float] = None,
         recency_weighted: Optional[bool] = None,
         preserve_calibration: bool = False,
+        *,
+        reward_scale: float = 1.0,
     ) -> Dict[str, Any]:
         """Apply an online correction using the model's supported update path.
 
@@ -1362,6 +1372,7 @@ class SystemOneEngine:
             eff_forgetting = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
             if not math.isfinite(eff_forgetting) or not (0.0 < eff_forgetting <= 1.0):
                 raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_forgetting}")
+            eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
             t0 = time.perf_counter()
 
             if embedding is not None:
@@ -1389,6 +1400,7 @@ class SystemOneEngine:
                         forgetting_factor=eff_forgetting,
                         recency_weighted=recency_weighted,
                         preserve_calibration=preserve_calibration,
+                        reward_scale=eff_reward_scale,
                     )
                 except TypeError:
                     try:
@@ -1399,16 +1411,27 @@ class SystemOneEngine:
                             embedding=model_emb,
                             forgetting_factor=eff_forgetting,
                             recency_weighted=recency_weighted,
+                            preserve_calibration=preserve_calibration,
                         )
                     except TypeError:
                         try:
                             res_dict = self.model.learn_from_tier2(
-                                prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
+                                prompt,
+                                target,
+                                telemetry=telemetry,
+                                embedding=model_emb,
+                                forgetting_factor=eff_forgetting,
+                                recency_weighted=recency_weighted,
                             )
                         except TypeError:
-                            res_dict = self.model.learn_from_tier2(
-                                prompt, target, telemetry=telemetry, embedding=model_emb
-                            )
+                            try:
+                                res_dict = self.model.learn_from_tier2(
+                                    prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
+                                )
+                            except TypeError:
+                                res_dict = self.model.learn_from_tier2(
+                                    prompt, target, telemetry=telemetry, embedding=model_emb
+                                )
                 updated_fields = res_dict.get("updated_fields", [])
                 rank1_ms = res_dict.get("update_latency_ms", 0.0)
             else:
@@ -1430,50 +1453,29 @@ class SystemOneEngine:
                             y_target = head.format_target_vector(target_val)
                             if is_zero_emb:
                                 dt = 0.0
-                                if norm_key is not None:
+                                if norm_key is not None and eff_reward_scale >= 0.5:
                                     if not hasattr(self, "_learned_prompt_overrides"):
                                         self._learned_prompt_overrides = {}
+                                    if not hasattr(self, "_learned_prompt_override_recency"):
+                                        self._learned_prompt_override_recency = {}
                                     self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
                                         self.schema.fields[f_name].validate_value(target_val)
                                     )
+                                    self._learned_prompt_override_recency[norm_key] = bool(recency_weighted)
                             else:
                                 try:
-                                    dt = head.online_update(x_aug, y_target, forgetting_factor=eff_forgetting)
+                                    dt = head.online_update(
+                                        x_aug,
+                                        y_target,
+                                        forgetting_factor=eff_forgetting,
+                                        preserve_calibration=preserve_calibration,
+                                        reward_scale=eff_reward_scale,
+                                    )
                                 except TypeError:
-                                    dt = head.online_update(x_aug, y_target)
-                                if preserve_calibration and hasattr(head, "forward"):
-                                    f_type = getattr(getattr(head, "definition", None), "field_type", None) or getattr(self.schema.fields.get(f_name), "field_type", "choice")
-                                    for step_i in range(8):
-                                        ev = head.forward(emb)
-                                        probs_ev = ev.raw_probabilities
-                                        if f_type == "choice" and len(probs_ev) >= 2:
-                                            s_p = np.sort(probs_ev)
-                                            if (
-                                                ev.selected_value == target_val
-                                                and float(s_p[-1]) >= 0.94
-                                                and float(s_p[-1] - s_p[-2]) >= 0.55
-                                            ):
-                                                break
-                                        elif f_type in ("multi_choice", "multichoice"):
-                                            if (
-                                                set(ev.selected_value) == set(target_val)
-                                                and float(np.min(np.abs(np.asarray(probs_ev, dtype=np.float64) - 0.5))) >= 0.38
-                                            ):
-                                                break
-                                        elif f_type == "score":
-                                            if abs(float(ev.selected_value) - float(target_val)) <= 0.04:
-                                                break
-                                        elif bool(ev.selected_value) == bool(target_val) and ev.confidence >= 0.90:
-                                            break
-                                        step_ff = 1.0 if step_i < 4 else min(float(eff_forgetting), 0.70)
-                                        try:
-                                            dt += head.online_update(
-                                                x_aug,
-                                                y_target,
-                                                forgetting_factor=step_ff,
-                                            )
-                                        except TypeError:
-                                            dt += head.online_update(x_aug, y_target)
+                                    try:
+                                        dt = head.online_update(x_aug, y_target, forgetting_factor=eff_forgetting)
+                                    except TypeError:
+                                        dt = head.online_update(x_aug, y_target)
                             update_durations_ms.append(dt)
                             updated_fields.append(f_name)
 
@@ -1496,6 +1498,8 @@ class SystemOneEngine:
                             self._learned_prompt_overrides[norm_key_clear].pop(f_name, None)
                             if not self._learned_prompt_overrides[norm_key_clear]:
                                 self._learned_prompt_overrides.pop(norm_key_clear, None)
+                                if hasattr(self, "_learned_prompt_override_recency"):
+                                    self._learned_prompt_override_recency.pop(norm_key_clear, None)
                     if f_name in self.calibrators:
                         self.calibrators[f_name] = DecisionCalibrator()
                     if f_name in self.conformal_predictors:
@@ -1516,15 +1520,24 @@ class SystemOneEngine:
                     else None
                 )
                 for f_name in updated_fields:
-                    if norm_key_override is not None and f_name in target_dict_for_override and f_name in self.schema.fields:
+                    if (
+                        eff_reward_scale >= 0.5
+                        and norm_key_override is not None
+                        and f_name in target_dict_for_override
+                        and f_name in self.schema.fields
+                    ):
                         if not hasattr(self, "_learned_prompt_overrides"):
                             self._learned_prompt_overrides = {}
+                        if not hasattr(self, "_learned_prompt_override_recency"):
+                            self._learned_prompt_override_recency = {}
                         while len(self._learned_prompt_overrides) >= 4096 and norm_key_override not in self._learned_prompt_overrides:
                             oldest_k = next(iter(self._learned_prompt_overrides))
                             del self._learned_prompt_overrides[oldest_k]
+                            self._learned_prompt_override_recency.pop(oldest_k, None)
                         self._learned_prompt_overrides.setdefault(norm_key_override, {})[f_name] = (
                             self.schema.fields[f_name].validate_value(target_dict_for_override[f_name])
                         )
+                        self._learned_prompt_override_recency[norm_key_override] = bool(recency_weighted)
                     ch = getattr(self.model, "heads", {}).get(f_name)
                     cp = self.conformal_predictors.get(f_name)
                     if cp is not None:
@@ -1552,7 +1565,7 @@ class SystemOneEngine:
                                 if e_norm > 1e-12:
                                     emb_u = emb / e_norm
                                     sim_after = float(np.max(cp.prototypes @ emb_u))
-                                    if cp.prototype_threshold > 0.0 and sim_after < cp.prototype_threshold:
+                                    if eff_reward_scale >= 0.5 and cp.prototype_threshold > 0.0 and sim_after < cp.prototype_threshold:
                                         cp.prototype_threshold = max(0.0, sim_after - 1e-4)
                         if not cp.is_calibrated:
                             k_opts = max(2, len(cp.options))
@@ -1594,8 +1607,7 @@ class SystemOneEngine:
                 policy_scope=self.policy_scope,
             )
 
-            # Store the corrected result in the cache
-            if self.use_cache:
+            if self.use_cache and (not res.is_ambiguous or not self.strict_mode):
                 eff_m_thresh = self.margin_threshold
                 m_dig = self._model_digest()
                 p_dig = self._projector_digest()
@@ -1693,6 +1705,7 @@ class SystemOneEngine:
             if not math.isfinite(ff_val) or not (0.0 < ff_val <= 1.0):
                 raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_val}")
         eff_ff = forgetting_factor
+        eff_reward_scale = 1.0
         if reward is not None:
             r_val = float(reward)
             if not math.isfinite(r_val):
@@ -1708,6 +1721,7 @@ class SystemOneEngine:
                 if outcome is not None:
                     skipped["outcome_recorded"] = True
                 return skipped
+            eff_reward_scale = float(np.clip(r_val, 0.0, 1.0))
             if r_val != 1.0:
                 base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
                 eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
@@ -1732,6 +1746,7 @@ class SystemOneEngine:
             forgetting_factor=eff_ff,
             recency_weighted=recency_weighted,
             preserve_calibration=preserve_calibration,
+            reward_scale=eff_reward_scale,
         )
         if outcome is not None:
             res["outcome_recorded"] = True

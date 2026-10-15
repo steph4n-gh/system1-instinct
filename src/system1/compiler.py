@@ -308,7 +308,9 @@ class CompiledSystemOneModel:
         self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
         self._lock = threading.RLock()
         self._learned_prompt_overrides: Dict[str, Dict[str, Any]] = {}
+        self._learned_prompt_override_recency: Dict[str, bool] = {}
         raw_overrides = self.metadata.get("learned_prompt_overrides")
+        raw_override_recency = self.metadata.get("learned_prompt_override_recency")
         if isinstance(raw_overrides, Mapping):
             for p_key, f_map in raw_overrides.items():
                 if isinstance(p_key, str) and isinstance(f_map, Mapping):
@@ -321,6 +323,10 @@ class CompiledSystemOneModel:
                                 pass
                     if valid_f:
                         self._learned_prompt_overrides[p_key] = valid_f
+                        if isinstance(raw_override_recency, Mapping) and p_key in raw_override_recency:
+                            self._learned_prompt_override_recency[p_key] = bool(raw_override_recency[p_key])
+                        else:
+                            self._learned_prompt_override_recency[p_key] = bool(self.recency_weighted)
 
         # Build live heads for evaluation
         self._field_heads: Dict[str, DecisionFieldHead] = {}
@@ -415,19 +421,45 @@ class CompiledSystemOneModel:
         proto_unit = ch.prototypes[valid_rows] / np.where(
             p_norms[valid_rows] < 1e-12, 1.0, p_norms[valid_rows]
         )
-        return float(np.max(proto_unit @ emb_unit))
+        best_sim = float(np.max(proto_unit @ emb_unit))
+        online_bank = getattr(self, "_online_prototype_bank", {}).get(field_name)
+        if online_bank:
+            for shot in online_bank:
+                s_arr = np.asarray(shot, dtype=np.float32).flatten()
+                if s_arr.shape[0] == emb_unit.shape[0]:
+                    sim_s = float(np.dot(s_arr, emb_unit))
+                    if sim_s > best_sim:
+                        best_sim = sim_s
+        head = self._field_heads.get(field_name)
+        online_shots = getattr(head, "_online_shots_p", None) if head is not None else None
+        if online_shots:
+            for group in online_shots:
+                for shot in group:
+                    s_arr = np.asarray(shot, dtype=np.float32).flatten()
+                    if s_arr.shape[0] == emb_unit.shape[0]:
+                        s_norm = float(np.linalg.norm(s_arr))
+                        if s_norm > 1e-12:
+                            sim_s = float(np.dot(s_arr / s_norm, emb_unit))
+                            if sim_s > best_sim:
+                                best_sim = sim_s
+        return best_sim
 
-    def encode(
+    def _encode_with_norm(
         self,
         prompt: str,
         telemetry: Optional[Any] = None,
         recency_weighted: Optional[bool] = None,
-    ) -> np.ndarray:
-        """Projects input prompt into normalized dense vector, fusing continuous telemetry if present."""
+    ) -> Tuple[np.ndarray, Optional[float]]:
         if not isinstance(prompt, str):
             raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
-        if hasattr(self.projector, "project"):
+        raw_norm: Optional[float] = None
+        if hasattr(self.projector, "project_with_norm") and telemetry is None:
+            try:
+                emb, raw_norm = self.projector.project_with_norm(prompt, recency_weighted=use_recency)
+            except TypeError:
+                emb, raw_norm = self.projector.project_with_norm(prompt)
+        elif hasattr(self.projector, "project"):
             try:
                 emb = self.projector.project(prompt, recency_weighted=use_recency)
             except TypeError:
@@ -443,7 +475,16 @@ class CompiledSystemOneModel:
                 emb[0] = 1.0
         if telemetry is not None:
             emb = self.telemetry_projector.fuse(emb, telemetry)
-        return emb
+        return emb, raw_norm
+
+    def encode(
+        self,
+        prompt: str,
+        telemetry: Optional[Any] = None,
+        recency_weighted: Optional[bool] = None,
+    ) -> np.ndarray:
+        """Projects input prompt into normalized dense vector, fusing continuous telemetry if present."""
+        return self._encode_with_norm(prompt, telemetry=telemetry, recency_weighted=recency_weighted)[0]
 
     def encode_batch(
         self,
@@ -480,10 +521,11 @@ class CompiledSystemOneModel:
         t0 = time.perf_counter()
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         eff_use_cache = self.use_cache if use_cache is None else bool(use_cache)
+        raw_norm: Optional[float] = None
         if embedding is not None:
             emb = np.asarray(embedding, dtype=np.float32).flatten()
         else:
-            emb = self.encode(prompt, telemetry=telemetry, recency_weighted=use_recency)
+            emb, raw_norm = self._encode_with_norm(prompt, telemetry=telemetry, recency_weighted=use_recency)
 
         # Check Tier 0 Semantic System 1 Cache
         cur_version = getattr(self, "model_version", 1)
@@ -506,21 +548,22 @@ class CompiledSystemOneModel:
                         embedding=emb,
                         fields=entry.result.fields,
                         inference_latency_ms=elapsed_ms,
+                        raw_norm=raw_norm if raw_norm is not None else entry.result.raw_norm,
                     )
 
         override_map: Optional[Dict[str, Any]] = None
         if self._learned_prompt_overrides and embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
             norm_key = " ".join(prompt.strip().casefold().split())
-            override_map = self._learned_prompt_overrides.get(norm_key)
+            if self._learned_prompt_override_recency.get(norm_key, bool(self.recency_weighted)) == bool(use_recency):
+                override_map = self._learned_prompt_overrides.get(norm_key)
 
         is_zero_emb_eval = not bool(np.any(emb))
-        is_cold_skill = bool(self.metadata.get("cold_start", False))
         evals: Dict[str, RawFieldEvaluation] = {}
         for name, head in self._field_heads.items():
             if (
                 override_map is not None
                 and name in override_map
-                and (is_zero_emb_eval or (head._exemplar_bank is None and not is_cold_skill))
+                and (is_zero_emb_eval or (not np.any(head.weights) and not np.any(head.biases)))
             ):
                 evals[name] = self._build_override_eval(head, override_map[name])
             else:
@@ -531,6 +574,7 @@ class CompiledSystemOneModel:
             embedding=emb,
             fields=evals,
             inference_latency_ms=latency,
+            raw_norm=raw_norm,
         )
 
         if eff_use_cache:
@@ -585,6 +629,7 @@ class CompiledSystemOneModel:
         recency_weighted: Optional[bool] = None,
         *,
         preserve_calibration: bool = False,
+        reward_scale: float = 1.0,
     ) -> Dict[str, Any]:
         """Apply an optional online correction and invalidate changed calibration.
 
@@ -595,6 +640,7 @@ class CompiledSystemOneModel:
             eff_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
             if not math.isfinite(eff_ff) or not (0.0 < eff_ff <= 1.0):
                 raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_ff}")
+            eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
             t0 = time.perf_counter()
             use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
 
@@ -638,33 +684,39 @@ class CompiledSystemOneModel:
                     skip_field = False
                     if is_zero_emb:
                         dt = 0.0
-                        if norm_key is not None:
+                        if norm_key is not None and eff_reward_scale >= 0.5:
                             if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
                                 oldest_key = next(iter(self._learned_prompt_overrides))
                                 self._learned_prompt_overrides.pop(oldest_key, None)
+                                self._learned_prompt_override_recency.pop(oldest_key, None)
                             self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
                                 self.schema.fields[f_name].validate_value(target_val)
                             )
+                            self._learned_prompt_override_recency[norm_key] = bool(use_recency)
                     elif is_cold_head:
-                        if preserve_calibration:
+                        if preserve_calibration and eff_reward_scale >= 0.5:
                             if norm_key is not None:
                                 if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
                                     oldest_key = next(iter(self._learned_prompt_overrides))
                                     self._learned_prompt_overrides.pop(oldest_key, None)
+                                    self._learned_prompt_override_recency.pop(oldest_key, None)
                                 self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
                                     self.schema.fields[f_name].validate_value(target_val)
                                 )
-                        else:
+                                self._learned_prompt_override_recency[norm_key] = bool(use_recency)
+                        elif not preserve_calibration:
                             if norm_key is not None and norm_key in self._learned_prompt_overrides:
                                 self._learned_prompt_overrides[norm_key].pop(f_name, None)
                                 if not self._learned_prompt_overrides[norm_key]:
                                     self._learned_prompt_overrides.pop(norm_key, None)
+                                    self._learned_prompt_override_recency.pop(norm_key, None)
                         dt = head.online_update(
                             x_aug,
                             y_target,
                             forgetting_factor=eff_ff,
                             prompt=prompt_for_head,
                             preserve_calibration=preserve_calibration,
+                            reward_scale=eff_reward_scale,
                         )
                     else:
                         if preserve_calibration:
@@ -732,6 +784,9 @@ class CompiledSystemOneModel:
                             else:
                                 y_desired = y_target
 
+                            if eff_reward_scale < 1.0:
+                                y_desired = (wx0 + eff_reward_scale * (y_desired - wx0)).astype(np.float32)
+
                             dt = 0.0
                             if len(self._field_heads) > 1:
                                 ev_pre = head.forward(emb, prompt=prompt_for_eval)
@@ -772,63 +827,67 @@ class CompiledSystemOneModel:
                                     forgetting_factor=step_ff,
                                     prompt=prompt_for_head,
                                 )
-                                for step_i in range(4):
-                                    ev = head.forward(emb, prompt=prompt_for_eval)
-                                    logits_ev = np.asarray(ev.logits, dtype=np.float64) / ch_temp
-                                    if f_type == "choice" and len(logits_ev) >= 2:
-                                        shifted_ev = logits_ev - np.max(logits_ev)
-                                        exp_ev = np.exp(shifted_ev)
-                                        probs_cal = exp_ev / np.sum(exp_ev)
-                                        s_p = np.sort(probs_cal)
-                                        if (
-                                            ev.selected_value == target_val
-                                            and float(s_p[-1]) >= target_top_p
-                                            and float(s_p[-1] - s_p[-2]) >= 0.55
-                                        ):
+                                if eff_reward_scale >= 0.5:
+                                    for step_i in range(4):
+                                        ev = head.forward(emb, prompt=prompt_for_eval)
+                                        logits_ev = np.asarray(ev.logits, dtype=np.float64) / ch_temp
+                                        if f_type == "choice" and len(logits_ev) >= 2:
+                                            shifted_ev = logits_ev - np.max(logits_ev)
+                                            exp_ev = np.exp(shifted_ev)
+                                            probs_cal = exp_ev / np.sum(exp_ev)
+                                            s_p = np.sort(probs_cal)
+                                            if (
+                                                ev.selected_value == target_val
+                                                and float(s_p[-1]) >= target_top_p
+                                                and float(s_p[-1] - s_p[-2]) >= 0.55
+                                            ):
+                                                break
+                                        elif f_type in ("multi_choice", "multichoice"):
+                                            probs_mc = np.asarray(ev.raw_probabilities, dtype=np.float64)
+                                            max_err_mc = float(np.max(np.minimum(probs_mc, 1.0 - probs_mc))) if len(probs_mc) > 0 else 0.0
+                                            if (
+                                                set(ev.selected_value) == set(target_val)
+                                                and max_err_mc <= max(0.03, ch_q * 0.9)
+                                            ):
+                                                break
+                                        elif f_type == "score":
+                                            if abs(float(ev.selected_value) - float(target_val)) <= 0.02:
+                                                break
+                                        elif f_type == "boolean":
+                                            p_sel = float(ev.confidence)
+                                            if bool(ev.selected_value) == bool(target_val) and p_sel >= target_top_p:
+                                                break
+                                        elif bool(ev.selected_value) == bool(target_val) and ev.confidence >= 0.90:
                                             break
-                                    elif f_type in ("multi_choice", "multichoice"):
-                                        probs_mc = np.asarray(ev.raw_probabilities, dtype=np.float64)
-                                        max_err_mc = float(np.max(np.minimum(probs_mc, 1.0 - probs_mc))) if len(probs_mc) > 0 else 0.0
-                                        if (
-                                            set(ev.selected_value) == set(target_val)
-                                            and max_err_mc <= max(0.03, ch_q * 0.9)
-                                        ):
-                                            break
-                                    elif f_type == "score":
-                                        if abs(float(ev.selected_value) - float(target_val)) <= 0.02:
-                                            break
-                                    elif f_type == "boolean":
-                                        p_sel = float(ev.confidence)
-                                        if bool(ev.selected_value) == bool(target_val) and p_sel >= target_top_p:
-                                            break
-                                    elif bool(ev.selected_value) == bool(target_val) and ev.confidence >= 0.90:
-                                        break
-                                    wx_curr = (head.weights @ emb).astype(np.float32)
-                                    p_curr = head.covariance_inv
-                                    g_curr = float(x_step @ (p_curr @ x_step)) if p_curr is not None else 0.0
-                                    if g_curr > 1e-6:
-                                        y_refine = ((step_ff + g_curr) * y_desired - step_ff * wx_curr) / g_curr
-                                        y_refine = np.clip(y_refine, -40.0, 40.0).astype(np.float32)
-                                    else:
-                                        y_refine = y_desired
-                                    dt += head.online_update(
-                                        x_step,
-                                        y_refine,
-                                        forgetting_factor=step_ff,
-                                        prompt=prompt_for_head,
-                                    )
-                            if norm_key is not None:
+                                        wx_curr = (head.weights @ emb).astype(np.float32)
+                                        p_curr = head.covariance_inv
+                                        g_curr = float(x_step @ (p_curr @ x_step)) if p_curr is not None else 0.0
+                                        if g_curr > 1e-6:
+                                            y_refine = ((step_ff + g_curr) * y_desired - step_ff * wx_curr) / g_curr
+                                            y_refine = np.clip(y_refine, -40.0, 40.0).astype(np.float32)
+                                        else:
+                                            y_refine = y_desired
+                                        dt += head.online_update(
+                                            x_step,
+                                            y_refine,
+                                            forgetting_factor=step_ff,
+                                            prompt=prompt_for_head,
+                                        )
+                            if norm_key is not None and eff_reward_scale >= 0.5:
                                 if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
                                     oldest_key = next(iter(self._learned_prompt_overrides))
                                     self._learned_prompt_overrides.pop(oldest_key, None)
+                                    self._learned_prompt_override_recency.pop(oldest_key, None)
                                 self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
                                     self.schema.fields[f_name].validate_value(target_val)
                                 )
+                                self._learned_prompt_override_recency[norm_key] = bool(use_recency)
                         else:
                             if norm_key is not None and norm_key in self._learned_prompt_overrides:
                                 self._learned_prompt_overrides[norm_key].pop(f_name, None)
                                 if not self._learned_prompt_overrides[norm_key]:
                                     self._learned_prompt_overrides.pop(norm_key, None)
+                                    self._learned_prompt_override_recency.pop(norm_key, None)
                             dt = head.online_update(
                                 x_aug,
                                 y_target,
@@ -861,19 +920,28 @@ class CompiledSystemOneModel:
                                     proto_idx = 1 if float(y_target[0]) > 0.0 else 0
                                 if not skip_field and proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
                                     cur_p = ch.prototypes[proto_idx]
+                                    sim_before = float(np.max(ch.prototypes @ emb_u)) if np.any(cur_p) else 0.0
                                     if not preserve_calibration or ch.prototype_threshold <= 0.0 or not np.any(cur_p):
-                                        blend = 0.25 if preserve_calibration else 0.15
+                                        blend = (0.25 if preserve_calibration else 0.15) * eff_reward_scale
                                         updated_p = emb_u if not np.any(cur_p) else ((1.0 - blend) * cur_p + blend * emb_u)
                                         up_norm = float(np.linalg.norm(updated_p))
                                         if up_norm > 1e-12:
                                             ch.prototypes = ch.prototypes.copy()
                                             ch.prototypes[proto_idx] = (updated_p / up_norm).astype(np.float32)
-                                if preserve_calibration and ch.prototype_threshold > 0.0:
-                                    sim_after = float(np.max(ch.prototypes @ emb_u))
-                                    if sim_after < ch.prototype_threshold:
+                                    elif eff_reward_scale >= 0.5 and sim_before < ch.prototype_threshold:
+                                        if not hasattr(self, "_online_prototype_bank"):
+                                            self._online_prototype_bank = {}
+                                        bank = self._online_prototype_bank.setdefault(f_name, [])
+                                        if len(bank) >= 256:
+                                            bank.pop(0)
+                                        bank.append(emb_u.astype(np.float32))
+                                if preserve_calibration and eff_reward_scale >= 0.5 and ch.prototype_threshold > 0.0:
+                                    sim_after = self.compute_prototype_similarity(f_name, emb_u)
+                                    if sim_after is not None and sim_after < ch.prototype_threshold:
                                         ch.prototype_threshold = max(0.0, sim_after - 1e-4)
                         if (
                             preserve_calibration
+                            and eff_reward_scale >= 0.5
                             and ch.familiarity_threshold > 0.0
                             and hasattr(self.projector, "raw_norm")
                             and isinstance(prompt, str)
@@ -917,13 +985,15 @@ class CompiledSystemOneModel:
             total_ms = (time.perf_counter() - t0) * 1000.0
 
             # Evaluate model to get fresh result and store in Tier 0 cache
-            override_map = self._learned_prompt_overrides.get(norm_key) if norm_key is not None else None
+            override_map = None
+            if norm_key is not None and self._learned_prompt_override_recency.get(norm_key, bool(self.recency_weighted)) == bool(use_recency):
+                override_map = self._learned_prompt_overrides.get(norm_key)
             evals: Dict[str, RawFieldEvaluation] = {}
             for name, head in self._field_heads.items():
                 if (
                     override_map is not None
                     and name in override_map
-                    and (is_zero_emb or (head._exemplar_bank is None and not is_cold_skill))
+                    and (is_zero_emb or (not np.any(head.weights) and not np.any(head.biases)))
                 ):
                     evals[name] = self._build_override_eval(head, override_map[name])
                 else:
@@ -1031,6 +1101,7 @@ class CompiledSystemOneModel:
             if not math.isfinite(ff_val) or not (0.0 < ff_val <= 1.0):
                 raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_val}")
         eff_ff = forgetting_factor
+        eff_reward_scale = 1.0
         if reward is not None:
             r_val = float(reward)
             if not math.isfinite(r_val):
@@ -1046,6 +1117,7 @@ class CompiledSystemOneModel:
                 if outcome is not None:
                     skipped["outcome_recorded"] = True
                 return skipped
+            eff_reward_scale = float(np.clip(r_val, 0.0, 1.0))
             if r_val != 1.0:
                 base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
                 eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
@@ -1070,6 +1142,7 @@ class CompiledSystemOneModel:
             forgetting_factor=eff_ff,
             recency_weighted=recency_weighted,
             preserve_calibration=preserve_calibration,
+            reward_scale=eff_reward_scale,
         )
         if outcome is not None:
             res["outcome_recorded"] = True
@@ -1155,6 +1228,7 @@ class CompiledSystemOneModel:
             }
             # Loaded metadata may describe lessons that have since been cleared.
             serialized_meta.pop("learned_prompt_overrides", None)
+            serialized_meta.pop("learned_prompt_override_recency", None)
             if self._learned_prompt_overrides:
                 serialized_meta["learned_prompt_overrides"] = {
                     p_k: {
@@ -1162,6 +1236,10 @@ class CompiledSystemOneModel:
                         for f_k, f_v in f_map.items()
                     }
                     for p_k, f_map in self._learned_prompt_overrides.items()
+                }
+                serialized_meta["learned_prompt_override_recency"] = {
+                    p_k: bool(self._learned_prompt_override_recency.get(p_k, self.recency_weighted))
+                    for p_k in self._learned_prompt_overrides
                 }
 
             header_meta = {
@@ -2781,29 +2859,6 @@ class SystemOneCompiler:
                 logits_calib = raw_logits_calib / 0.25
                 calib_labels = np.argmax(Y_calib, axis=1).copy()
 
-                if (
-                    calibration_data is None
-                    and not augment
-                    and eff_noise_robust
-                    and sw_choice is not None
-                    and len(calib_labels) >= 8
-                ):
-                    raw_top_cal = np.max(raw_logits_calib, axis=1)
-                    raw_true_cal = raw_logits_calib[np.arange(len(calib_labels)), calib_labels]
-                    raw_def_cal = raw_top_cal - raw_true_cal
-                    suspect_cal = (
-                        (raw_top_cal >= 0.55)
-                        & (raw_def_cal >= 0.45)
-                        & (raw_true_cal < (1.0 / max(2, K)))
-                    )
-                    if np.any(suspect_cal):
-                        max_fix = max(1, int(0.20 * len(calib_labels)))
-                        suspect_idx = np.where(suspect_cal)[0]
-                        if len(suspect_idx) > max_fix:
-                            order = np.argsort(-raw_def_cal[suspect_idx])
-                            suspect_idx = suspect_idx[order[:max_fix]]
-                        calib_labels[suspect_idx] = np.argmax(raw_logits_calib[suspect_idx], axis=1)
-
                 logits_temp, labels_temp = logits_calib[:num_temperature], calib_labels[:num_temperature]
                 logits_conf, labels_conf = logits_calib[num_temperature:], calib_labels[num_temperature:]
 
@@ -2927,25 +2982,6 @@ class SystemOneCompiler:
                 logits_calib = (X_calib @ weights.T + biases).flatten()
                 probs_calib = _stable_sigmoid(logits_calib, temperature=0.25)
                 calib_bools = [bool(lab) for lab in (raw_labels[num_train:])]
-                if (
-                    calibration_data is None
-                    and not augment
-                    and eff_noise_robust
-                    and sw_noise is not None
-                    and len(calib_bools) >= 8
-                ):
-                    signed_margin = np.array(
-                        [logits_calib[i] * (1.0 if calib_bools[i] else -1.0) for i in range(len(calib_bools))],
-                        dtype=np.float64,
-                    )
-                    suspect_b = signed_margin < -0.55
-                    if np.any(suspect_b):
-                        max_fix_b = max(1, int(0.20 * len(calib_bools)))
-                        sus_b_idx = np.where(suspect_b)[0]
-                        if len(sus_b_idx) > max_fix_b:
-                            sus_b_idx = sus_b_idx[np.argsort(signed_margin[sus_b_idx])[:max_fix_b]]
-                        for idx_b in sus_b_idx:
-                            calib_bools[int(idx_b)] = bool(logits_calib[int(idx_b)] >= 0.0)
                 nonconf_scores = []
                 error_margins_bool = []
                 per_class_bool: Dict[str, List[float]] = {"False": [], "True": []}

@@ -299,11 +299,25 @@ def handle_calibrate_command(args: argparse.Namespace) -> int:
         elif isinstance(item, dict) and "prompt" in item and "labels" in item:
             formatted_dataset.append((str(item["prompt"]), dict(item["labels"])))
 
-    schema = _load_schema(getattr(args, "schema", None))
+    model_path = getattr(args, "model", None)
+    schema_arg = getattr(args, "schema", None)
     bins = int(getattr(args, "bins", 10))
 
-    engine = SystemOneEngine(schema)
+    if model_path:
+        if not Path(model_path).is_file():
+            print(f"[SYSTEM1 ERROR] Model file not found: {model_path}", file=sys.stderr)
+            return 1
+        schema = _load_schema(schema_arg) if schema_arg else None
+        engine = SystemOneEngine.load(model_path, schema=schema)
+    else:
+        schema = _load_schema(schema_arg)
+        engine = SystemOneEngine(schema)
+
     metrics = engine.calibrate(formatted_dataset, n_bins=bins)
+
+    output_path = getattr(args, "output", None)
+    if output_path:
+        engine.save(output_path)
 
     output = {k: v.to_dict() for k, v in metrics.items()}
     if getattr(args, "json", False):
@@ -842,6 +856,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Command: calibrate
     calib_parser = subparsers.add_parser("calibrate", help="Fit temperature scaling and conformal prediction sets")
     calib_parser.add_argument("--dataset", required=True, help="Path to JSON calibration dataset file")
+    calib_parser.add_argument("--model", help="Optional path to an existing compiled .s1m model to calibrate")
+    calib_parser.add_argument("--output", "-o", help="Optional output path to save the calibrated .s1m model")
     calib_parser.add_argument("--schema", help="Schema preset ('triage', 'guard'), import path, or path to JSON schema file")
     calib_parser.add_argument("--bins", type=int, default=10, help="Number of calibration probability bins")
     calib_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")

@@ -384,7 +384,6 @@ class TfidfProjector:
         object.__setattr__(self, "_char_ngrams", validated_ngrams)
         object.__setattr__(self, "_vocabulary", MappingProxyType({term: i for i, term in enumerate(terms)}))
         object.__setattr__(self, "_digest", hashlib.sha256(json.dumps(self.to_config(), sort_keys=True).encode()).hexdigest())
-        object.__setattr__(self, "_last_raw_norm", None)
 
     @property
     def dimension(self) -> int:
@@ -505,20 +504,20 @@ class TfidfProjector:
         """Return pre-normalization L2 norm of matched TF-IDF features."""
         if not isinstance(text, str):
             raise TypeError("TF-IDF input must be text")
-        last = getattr(self, "_last_raw_norm", None)
-        if last is not None and (last[0] is text or last[0] == text):
-            return last[1]
-        norm = float(np.linalg.norm(self.raw_vector(text)))
-        object.__setattr__(self, "_last_raw_norm", (text, norm))
-        return norm
+        return float(np.linalg.norm(self.raw_vector(text)))
 
-    def project(self, text: str, recency_weighted: bool | None = None) -> np.ndarray:
+    def project_with_norm(self, text: str, recency_weighted: bool | None = None) -> tuple[np.ndarray, float]:
+        """Return unit-normalized TF-IDF vector and pre-normalization L2 norm in one pass."""
         if recency_weighted:
             raise ValueError("TF-IDF uses document frequencies, not recency weighting")
+        if not isinstance(text, str):
+            raise TypeError("TF-IDF input must be text")
         vector = self.raw_vector(text)
         norm = float(np.linalg.norm(vector))
-        object.__setattr__(self, "_last_raw_norm", (text, norm))
-        return vector / norm if norm > 0 else vector
+        return (vector / norm if norm > 0 else vector), norm
+
+    def project(self, text: str, recency_weighted: bool | None = None) -> np.ndarray:
+        return self.project_with_norm(text, recency_weighted)[0]
 
     def project_batch(self, texts: Sequence[str], recency_weighted: bool | None = None) -> np.ndarray:
         return np.stack([self.project(text, recency_weighted) for text in texts]) if len(texts) else np.empty((0, self.dimension), dtype=np.float32)

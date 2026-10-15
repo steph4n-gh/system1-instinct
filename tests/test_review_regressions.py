@@ -594,8 +594,7 @@ def test_cache_resolves_default_recency_before_lookup_and_learning(warm_with_les
     uncached = engine.decide(prompt, recency_weighted=False, record_receipt=False)
     assert not other.is_cache_hit
     assert other.values == uncached.values
-    if not warm_with_lesson:
-        assert other.values == {"route": "password"}
+    assert other.values == {"route": "password"}
     assert other.probabilities == uncached.probabilities
     assert other.is_ambiguous == uncached.is_ambiguous
 
@@ -818,7 +817,6 @@ def test_compiler_auto_regularization_and_noise_robust_under_teacher_label_noise
     assert robust_acc >= fragile_acc + 0.05
     assert robust_acc >= 0.85
 
-    # Also verify auto-split calibration hygiene when calibration_exemplars is omitted
     autosplit_robust = SystemOneCompiler(
         schema,
         projector=projector,
@@ -833,9 +831,16 @@ def test_compiler_auto_regularization_and_noise_robust_under_teacher_label_noise
         auto_regularization=False,
         noise_robust=False,
     ).compile(fit_exemplars, augment=False, calibration_split=0.25)
-    assert max(autosplit_robust.heads["intent"].calibration_scores) < 0.10
-    assert max(autosplit_robust.heads["intent"].calibration_scores) < max(autosplit_fragile.heads["intent"].calibration_scores)
-    assert autosplit_robust.heads["intent"].margin_threshold < autosplit_fragile.heads["intent"].margin_threshold
+    autosplit_robust_acc = np.mean([
+        autosplit_robust.forward_single(t).fields["intent"].selected_value == y
+        for t, y in test_rows
+    ])
+    autosplit_fragile_acc = np.mean([
+        autosplit_fragile.forward_single(t).fields["intent"].selected_value == y
+        for t, y in test_rows
+    ])
+    assert autosplit_robust_acc >= autosplit_fragile_acc
+    assert max(autosplit_robust.heads["intent"].calibration_scores) > 0.50
 
 
 def test_compiler_noise_robust_extreme_class_imbalance():
@@ -848,7 +853,6 @@ def test_compiler_noise_robust_extreme_class_imbalance():
         w = rng.choice(maj_words, size=3, replace=False)
         texts.append(f"request {w[0]} {w[1]} {w[2]} common")
         labels.append("billing")
-    # 2 clean minority examples with distinct vocabulary — must NOT be falsely downweighted
     texts.append("request breach firewall phishing common")
     labels.append("security")
     texts.append("request malware ransomware exploit common")
@@ -864,7 +868,6 @@ def test_compiler_noise_robust_extreme_class_imbalance():
     _, sw_clean = comp._compute_loo_ridge_and_sample_weights(X, Y)
     assert sw_clean is None or np.allclose(sw_clean[-2:], 1.0)
 
-    # Now add 1 corrupted billing example into a 3-example minority class
     texts_noisy = list(texts[:-1]) + ["request breach firewall malware common", "request invoice payment charge common"]
     labels_noisy = list(labels[:-1]) + ["security", "security"]
     proj_noisy = TfidfProjector.from_texts(texts_noisy, max_features=256)
@@ -927,5 +930,390 @@ def test_teaching_session_noise_robust_and_compile_under_teacher_corruption(tmp_
     report = session.assess(min_accuracy=0.80, min_coverage=0.50, max_accepted_errors=2)
     assert report["candidate"]["raw_accuracy"] >= 0.85
 
+
+def test_compiler_autosplit_never_overwrites_heldout_calibration_labels_with_argmax():
+    from system1.compiler import SystemOneCompiler
+
+    all_pairs = (
+        [(f"alpha item_a_{i} billing invoice charge", "billing") for i in range(24)]
+        + [(f"alpha edge_a_{i} billing invoice charge", "technical") for i in range(6)]
+        + [(f"beta item_b_{i} technical crash stacktrace", "technical") for i in range(24)]
+        + [(f"beta edge_b_{i} technical crash stacktrace", "billing") for i in range(6)]
+    )
+    texts = [t for t, _ in all_pairs]
+    proj = TfidfProjector.from_texts(texts, max_features=128)
+
+    schema = DecisionSchema(
+        fields={
+            "intent": ChoiceField(options=["billing", "technical"]),
+            "urgent": BooleanField(),
+        }
+    )
+    bool_pairs = [(t, y == "technical") for t, y in all_pairs]
+    compiled = SystemOneCompiler(
+        schema,
+        projector=proj,
+        regularization=0.1,
+        auto_regularization=True,
+        noise_robust=True,
+    ).compile(
+        {"intent": all_pairs, "urgent": bool_pairs},
+        augment=False,
+        calibration_split=0.25,
+    )
+    assert max(compiled.heads["intent"].calibration_scores) > 0.50
+    assert max(compiled.heads["urgent"].calibration_scores) > 0.50
+
+
+def test_tfidf_projector_is_truly_immutable_without_mutable_last_raw_norm():
+    proj = TfidfProjector.from_texts(
+        ["billing invoice charge", "technical crash stacktrace"],
+        max_features=32,
+    )
+    assert not hasattr(proj, "_last_raw_norm")
+    vec, norm = proj.project_with_norm("billing invoice")
+    assert norm > 0.0
+    assert np.allclose(vec, proj.project("billing invoice"))
+    assert pytest.approx(norm, rel=1e-6) == proj.raw_norm("billing invoice")
+    assert not hasattr(proj, "_last_raw_norm")
+
+
+def test_compiled_model_online_learning_uses_real_head_and_scales_small_reward():
+    from system1.compiler import SystemOneCompiler
+
+    schema = DecisionSchema(fields={"route": ChoiceField(options=["billing", "tech"])})
+    examples = {
+        "route": [
+            ("invoice refund billing charge", "billing"),
+            ("billing statement payment receipt", "billing"),
+            ("duplicate invoice billing refund", "billing"),
+            ("overcharged billing card statement", "billing"),
+            ("server crash stacktrace timeout", "tech"),
+            ("database connection error bug", "tech"),
+            ("kernel panic memory leak crash", "tech"),
+            ("api gateway 502 timeout error", "tech"),
+        ]
+    }
+    proj = TfidfProjector.from_texts([t for t, _ in examples["route"]], max_features=32)
+    compiler = SystemOneCompiler(schema=schema, projector=proj, backend="numpy")
+    model = compiler.compile(examples, augment=False, calibration_split=0.25)
+    engine = SystemOneEngine(schema, model=model, strict_mode=True, backend="numpy")
+
+    before_logits = model.forward_single("invoice refund billing charge").fields["route"].logits.copy()
+    engine.learn("invoice refund billing charge", {"route": "tech"}, reward=0.01)
+    after_small = engine.decide("invoice refund billing charge", record_receipt=False)
+    assert after_small.values["route"] == "billing"
+    after_logits = model.forward_single("invoice refund billing charge").fields["route"].logits.copy()
+    assert not np.allclose(after_logits, np.array([-48.0, 48.0]))
+    assert after_logits[1] > before_logits[1]
+
+
+def test_engine_learn_from_tier2_does_not_cache_ambiguous_and_decide_syncs_model_updates():
+    from system1.compiler import SystemOneCompiler
+
+    schema = DecisionSchema(fields={"route": ChoiceField(options=["billing", "tech"])})
+    examples = {
+        "route": [
+            ("invoice refund billing charge", "billing"),
+            ("billing statement payment receipt", "billing"),
+            ("duplicate invoice billing refund", "billing"),
+            ("overcharged billing card statement", "billing"),
+            ("server crash stacktrace timeout", "tech"),
+            ("database connection error bug", "tech"),
+            ("kernel panic memory leak crash", "tech"),
+            ("api gateway 502 timeout error", "tech"),
+        ]
+    }
+    proj = TfidfProjector.from_texts([t for t, _ in examples["route"]], max_features=32)
+    model = SystemOneCompiler(schema=schema, projector=proj, backend="numpy").compile(
+        examples, augment=False, calibration_split=0.25
+    )
+    engine = SystemOneEngine(schema, model=model, strict_mode=True, backend="numpy", use_cache=True)
+
+    engine.learn_from_tier2("invoice refund billing charge", {"route": "tech"}, preserve_calibration=False)
+    res_ambig = engine.decide("invoice refund billing charge", record_receipt=False)
+    assert res_ambig.is_ambiguous
+    assert not res_ambig.is_cache_hit
+
+    engine2 = SystemOneEngine(schema, model=model, strict_mode=True, backend="numpy")
+    engine2.model.learn("zxqv_oov_token", {"route": "tech"}, preserve_calibration=True)
+    res_synced = engine2.decide("zxqv_oov_token", record_receipt=False)
+    assert res_synced.values["route"] == "tech"
+    assert not res_synced.is_ambiguous
+
+
+def test_teaching_session_compile_without_explicit_calibrate_split_produces_calibrated_model(tmp_path):
+    from system1.teaching import TeachingSession
+
+    schema = DecisionSchema(fields={"route": ChoiceField(options=["billing", "tech"])})
+    session = TeachingSession(tmp_path / "teach_only_session", schema, max_features=64)
+    for i in range(6):
+        session.record(f"invoice billing charge refund item_{i}", "billing", split="teach")
+        session.record(f"server crash timeout stacktrace bug_{i}", "tech", split="teach")
+
+    compiled = session.compile()
+    assert len(compiled.heads["route"].calibration_scores) >= 2
+    assert compiled.heads["route"].conformal_quantile > 0.0
+    engine = SystemOneEngine(schema, model=compiled, strict_mode=True, backend="numpy")
+    dec = engine.decide("invoice billing charge refund", alpha=0.35, record_receipt=False)
+    assert dec.values["route"] == "billing"
+    assert not dec.is_ambiguous
+
+
+def test_cli_calibrate_loads_and_saves_compiled_s1m_model(tmp_path):
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    from system1.compiler import SystemOneCompiler
+
+    repo_root = Path(__file__).resolve().parents[1]
+    schema = DecisionSchema(fields={"route": ChoiceField(options=["billing", "tech"])})
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text(json.dumps(schema.to_dict()), encoding="utf-8")
+
+    examples = {
+        "route": [
+            ("invoice refund billing charge", "billing"),
+            ("billing statement payment receipt", "billing"),
+            ("server crash stacktrace timeout", "tech"),
+            ("database connection error bug", "tech"),
+        ]
+    }
+    proj = TfidfProjector.from_texts([t for t, _ in examples["route"]], max_features=32)
+    uncalibrated_model = SystemOneCompiler(schema=schema, projector=proj, backend="numpy").compile(
+        examples, augment=False, calibration_split=0.0
+    )
+    assert len(uncalibrated_model.heads["route"].calibration_scores) == 0
+    in_model_path = tmp_path / "uncalibrated.s1m"
+    out_model_path = tmp_path / "calibrated.s1m"
+    uncalibrated_model.save(in_model_path)
+
+    calib_data = [
+        {"prompt": f"invoice billing charge payment receipt {i}", "labels": {"route": "billing"}}
+        for i in range(20)
+    ] + [
+        {"prompt": f"server crash timeout database error stacktrace {i}", "labels": {"route": "tech"}}
+        for i in range(20)
+    ]
+    calib_path = tmp_path / "calib.json"
+    calib_path.write_text(json.dumps(calib_data), encoding="utf-8")
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(repo_root / "src")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "system1.cli",
+            "calibrate",
+            "--dataset",
+            str(calib_path),
+            "--model",
+            str(in_model_path),
+            "--output",
+            str(out_model_path),
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    reloaded = SystemOneEngine.load(out_model_path, strict_mode=True)
+    assert len(reloaded.model.heads["route"].calibration_scores) >= 2
+    dec = reloaded.decide("invoice refund billing charge", record_receipt=False)
+    assert dec.values["route"] == "billing"
+    assert not dec.is_ambiguous
+
+
+def test_hybrid_projector_fit_maps_max_features_and_rejects_unknown_kwargs():
+    from system1.core.embeddings import HybridProjector
+
+    texts = ["billing invoice refund charge", "server crash stacktrace timeout"]
+    proj = HybridProjector.fit(texts, labels=["billing", "tech"], max_features=128, dense_dim=32)
+    assert proj.sparse_dim == 128
+    assert proj.dense_dim == 32
+    assert proj.dimension == 160
+
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        HybridProjector.fit(texts, labels=["billing", "tech"], nonexistent_option=True)
+
+
+def test_prompt_guard_uses_disjoint_training_and_calibration_sets():
+    from system1.integrations.drop_in import SystemOnePromptGuard
+
+    guard = SystemOnePromptGuard(compiled=True)
+    train_prompts = {p for p, _ in guard.training_rows}
+    calib_prompts = {p for p, _ in guard.calibration_rows}
+    assert len(train_prompts) >= 6
+    assert len(calib_prompts) >= 6
+    assert train_prompts.isdisjoint(calib_prompts)
+
+
+def test_instructor_client_honors_per_call_response_model():
+    from typing import Any, cast
+    from system1.integrations.drop_in import SystemOneInstructorClient
+
+    class CustomBillingSchema(DecisionSchema):
+        intent = ChoiceField(
+            options=["refund", "upgrade"],
+            descriptions={
+                "refund": "refund duplicate charge overcharge invoice",
+                "upgrade": "upgrade enterprise plan add seats",
+            },
+        )
+        urgent = BooleanField(
+            true_description="urgent immediate blocked",
+            false_description="routine standard",
+        )
+
+    client = SystemOneInstructorClient()
+    res = client.create(
+        "urgent refund for duplicate charge on my invoice",
+        response_model=CustomBillingSchema,
+    )
+    assert set(res.values.keys()) == {"intent", "urgent"}
+    assert res.values["intent"] == "refund"
+
+    with pytest.raises(TypeError):
+        client.create("refund my charge", response_model=cast(Any, dict))
+
+
+def test_instinct_route_layer_preserves_fallback_answer_and_honors_strict_mode():
+    from system1.integrations.drop_in import InstinctRouteLayer, SemanticRoute
+
+    routes = [
+        SemanticRoute(name="billing", utterances=["refund duplicate charge on invoice"]),
+        SemanticRoute(name="tech", utterances=["kubernetes pod crashloop and 502 error"]),
+    ]
+    strict_router = InstinctRouteLayer(routes, strict_mode=True, compiled=False)
+    res_strict = strict_router("refund duplicate charge on invoice")
+    assert res_strict.name is None
+
+    fallback_router = InstinctRouteLayer(
+        routes,
+        strict_mode=True,
+        compiled=False,
+        confidence_threshold=0.99,
+        fallback_fn=lambda _text: "billing",
+    )
+    res_fb = fallback_router("completely novel ambiguous phrasing")
+    assert res_fb.used_fallback is True
+    assert res_fb.name == "billing"
+
+
+def test_showcase_break_and_teach_matches_readme_and_preserves_oos_after_learn(tmp_path):
+    import importlib.util
+    from pathlib import Path
+
+    showcase_path = Path(__file__).resolve().parents[1] / "examples" / "showcase_break_and_teach.py"
+    spec = importlib.util.spec_from_file_location("showcase_break_and_teach", showcase_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    engine, s1m_bytes = mod.build_instinct_engine(mod.INITIAL_TEACHER_LOGS, tmp_path / "support_gateway.s1m")
+    assert s1m_bytes > 0
+
+    t1 = engine.decide("Please do NOT cancel my subscription, I want to upgrade to Pro instead", record_receipt=False)
+    assert not t1.is_ambiguous
+    assert t1.values["action"] == "upgrade_plan"
+
+    t2 = engine.decide("What is the best temperature to bake sourdough bread in a Dutch oven?", record_receipt=False)
+    assert t2.is_ambiguous
+
+    t3 = engine.decide("chagred twcie on my vsia crad endign 9921, pls refnud", record_receipt=False)
+    assert not t3.is_ambiguous
+    assert t3.values["action"] == "refund_duplicate_charge"
+
+    unseen_1 = "Customer is asking for a Project-Sunburst adjustment on their account"
+    unseen_2 = "Please apply the Project-Sunburst adjustment for this workspace"
+    before_d = engine.decide(unseen_1, record_receipt=False)
+    assert before_d.is_ambiguous
+
+    engine.learn(unseen_1, {"action": "refund_duplicate_charge", "urgent": True})
+    after_d = engine.decide(unseen_2, record_receipt=False)
+    assert not after_d.is_ambiguous
+    assert after_d.values["action"] == "refund_duplicate_charge"
+    assert after_d.values["urgent"] is True
+
+    t2_after = engine.decide("What is the best temperature to bake sourdough bread in a Dutch oven?", record_receipt=False)
+    assert t2_after.is_ambiguous
+
+
+def test_dogfood_fda_and_github_no_calibration_or_test_cue_leakage(monkeypatch):
+    import importlib.util
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    fda_path = repo_root / "examples" / "dogfood" / "live_fda_recall_triage.py"
+    gh_path = repo_root / "examples" / "dogfood" / "live_github_triage.py"
+
+    fda_spec = importlib.util.spec_from_file_location("live_fda_recall_triage", fda_path)
+    assert fda_spec is not None and fda_spec.loader is not None
+    fda_mod = importlib.util.module_from_spec(fda_spec)
+    fda_spec.loader.exec_module(fda_mod)
+
+    gh_spec = importlib.util.spec_from_file_location("live_github_triage", gh_path)
+    assert gh_spec is not None and gh_spec.loader is not None
+    gh_mod = importlib.util.module_from_spec(gh_spec)
+    gh_spec.loader.exec_module(gh_mod)
+
+    snapshot = fda_mod.load_or_fetch_snapshot()
+    observed = snapshot["recalls"][:108]
+    fit_doc_counts: list[int] = []
+    orig_fit = fda_mod.TfidfProjector.fit
+
+    def spy_fit(texts, *args, **kwargs):
+        text_list = list(texts)
+        fit_doc_counts.append(len(text_list))
+        return orig_fit(text_list, *args, **kwargs)
+
+    monkeypatch.setattr(fda_mod.TfidfProjector, "fit", spy_fit)
+    _, compiled_fda = fda_mod._compile_checkpoint_engine(observed)
+    assert len(fit_doc_counts) == 1
+    assert fit_doc_counts[0] == compiled_fda.metadata["sample_counts"]["regulatory_center"]["fit"]
+    assert fit_doc_counts[0] < len(observed)
+
+    gh_source = gh_path.read_text(encoding="utf-8")
+    fda_source = fda_path.read_text(encoding="utf-8")
+    assert "npmscan|workflow|docker|fail|error|bug|crash|test|fix" not in gh_source
+    assert "is_heldout_window = w_idx == len(uv_windows) - 1" in gh_source
+    assert "is_heldout_window = w_idx == len(CHRONOLOGICAL_WINDOWS) - 1" in fda_source
+
+
+def test_benchmark_and_docs_consistency():
+    import importlib.util
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    eval_path = repo_root / "benchmarks" / "quality" / "evaluate_drop_in_replacements.py"
+    eval_source = eval_path.read_text(encoding="utf-8")
+
+    assert "_eval_k_shot_online(10)" in eval_source
+
+    eval_spec = importlib.util.spec_from_file_location("evaluate_drop_in_replacements", eval_path)
+    assert eval_spec is not None and eval_spec.loader is not None
+    eval_mod = importlib.util.module_from_spec(eval_spec)
+    eval_spec.loader.exec_module(eval_mod)
+    neural_comp = eval_mod.evaluate_neural_embedding_comparison()
+    assert neural_comp.get("evaluation_mode") in ("live_fastembed", "recorded_reference_without_fastembed")
+
+    readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
+    assert "1,394" not in readme_text
+    assert "24.41%" not in readme_text
+    assert "7,031" in readme_text
+    assert "1,076" in readme_text
+    assert "27.68%" in readme_text
+    assert "1.68%" in readme_text
+    assert "1.37%" in readme_text
+
+    ht_readme = (repo_root / "benchmarks" / "heldout_traffic" / "README.md").read_text(encoding="utf-8")
+    ht_report = (repo_root / "benchmarks" / "heldout_traffic" / "REPORT.md").read_text(encoding="utf-8")
+    assert "20,977 B" not in ht_readme
+    assert "20,954 B" in ht_readme
+    assert "14" in ht_report and "19" in ht_report
 
 

@@ -17,9 +17,9 @@ before final inference when a full hybrid skill exceeded the reader's 1 MiB JSON
 header limit. Subsequent runtime fixes moved `HybridProjector` spectral and
 subspace matrices out of the JSON header into binary `.npz` arrays and optimized
 the ridge/subword/hybrid pipeline (shrinking the 64-class JSON header to
-`20,977 B` `< 50 KB`, reducing `.s1m` size to `2.811 MiB`, cutting fit time from
-`4.68 s` to `0.62 s` (`7.6x` faster), cutting p50 latency from `2.41 ms` to
-`0.37 ms` (`6.5x` faster), and achieving `5/5` reloadability with exact parity).
+`20,954 B` `< 50 KB`, reducing `.s1m` size to `2.810 MiB`, cutting fit time from
+`4.68 s` to `0.66 s` (`7.0x` faster), cutting p50 latency from `2.41 ms` to
+`0.36 ms` (`6.7x` faster), and achieving `5/5` reloadability with exact parity).
 
 ## Data and phases
 
@@ -113,13 +113,14 @@ The runner refuses an existing results directory. Replays use another output
 directory; timings need not reproduce bit for bit. Source and gate receipts
 identify the evaluated revision. The final report is added only after scoring.
 
-Recorded result: [fresh-traffic report](REPORT.md). To check the archived evidence
-without refitting, download the data and invoke `verify.py` against
-`benchmarks/heldout_traffic/results`. The exact evaluated code is commit
-`a660f1e1c59a25eace725c5dd6b2a7bc97f2308f`; later commits add reporting and
-corruption checks without changing the predictor settings or frozen protocol.
+Recorded result: [fresh-traffic report](REPORT.md). The 11 MiB per-request
+`results/predictions.json.gz` archive is gitignored and generated locally by
+`run.py`. Once `predictions.json.gz` is generated, `verify.py` validates all
+archived evidence without refitting.
 
-Run focused checks, including the five archived-evidence corruption controls:
+Run focused checks (`14` protocol and gate checks on a clean git checkout, and all
+`19` checks including the five archived-prediction corruption controls when
+`results/predictions.json.gz` is present):
 
 ```bash
 uv pip install --python scratch/heldout-venv/bin/python pytest

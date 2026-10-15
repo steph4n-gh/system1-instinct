@@ -275,6 +275,7 @@ class ModelInferenceResult:
     embedding: np.ndarray
     fields: Dict[str, RawFieldEvaluation]
     inference_latency_ms: float
+    raw_norm: Optional[float] = None
 
 
 class DecisionFieldHead:
@@ -978,6 +979,7 @@ class DecisionFieldHead:
         *,
         prompt: Optional[str] = None,
         preserve_calibration: bool = False,
+        reward_scale: float = 1.0,
     ) -> float:
         r"""Closed-form rank-1 Sherman-Morrison update with exponential forgetting factor.
 
@@ -1017,6 +1019,7 @@ class DecisionFieldHead:
         P = self.covariance_inv
         B = self.cross_covariance
 
+        eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
         x_step = x
         y_step = y
         if not preserve_calibration and isinstance(self.field_def, ChoiceField) and K > 8:
@@ -1049,6 +1052,8 @@ class DecisionFieldHead:
                         z_desired[i] = sign * max(abs(float(z0[i])), 0.90)
                 elif isinstance(self.field_def, ScoreField):
                     z_desired[0] = float(y[0])
+                if eff_reward_scale < 1.0:
+                    z_desired = z0 + eff_reward_scale * (z_desired - z0)
                 y_des = z_desired - b0
                 z_curr_dir = z0 - b0
                 y_step = (((lam_f + g) * y_des - lam_f * z_curr_dir) / g).astype(np.float32)
@@ -1094,10 +1099,10 @@ class DecisionFieldHead:
                             x[:D],
                             target_k,
                             prompt=prompt,
-                            blend_rate=0.35 if preserve_calibration else 0.28,
-                            attenuate_competitors=True,
+                            blend_rate=(0.35 if preserve_calibration else 0.28) * eff_reward_scale,
+                            attenuate_competitors=(eff_reward_scale >= 0.5),
                         )
-                    elif isinstance(self.projector, DeterministicSemanticProjector):
+                    elif eff_reward_scale >= 0.5 and isinstance(self.projector, DeterministicSemanticProjector):
                         if self._online_shots_p is None or getattr(self, "_online_shots_are_pseudo", False):
                             self._online_shots_p = [[] for _ in range(K)]
                             self._online_shots_c = [[] for _ in range(K)]
@@ -1403,17 +1408,22 @@ class SystemOneModel:
             return "mlx"
         return "numpy"
 
-    def encode(
+    def _encode_with_norm(
         self,
         prompt: str,
         telemetry: Optional[Any] = None,
         recency_weighted: Optional[bool] = None,
-    ) -> np.ndarray:
-        """Encodes prompt into a normalized dense embedding vector, fusing continuous telemetry if present."""
+    ) -> Tuple[np.ndarray, Optional[float]]:
         if not isinstance(prompt, str):
             raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
-        if hasattr(self.projector, "project"):
+        raw_norm: Optional[float] = None
+        if hasattr(self.projector, "project_with_norm") and telemetry is None:
+            try:
+                emb, raw_norm = self.projector.project_with_norm(prompt, recency_weighted=use_recency)
+            except TypeError:
+                emb, raw_norm = self.projector.project_with_norm(prompt)
+        elif hasattr(self.projector, "project"):
             try:
                 emb = self.projector.project(prompt, recency_weighted=use_recency)
             except TypeError:
@@ -1425,7 +1435,16 @@ class SystemOneModel:
             emb = emb / norm
         if telemetry is not None:
             emb = self.telemetry_projector.fuse(emb, telemetry)
-        return emb
+        return emb, raw_norm
+
+    def encode(
+        self,
+        prompt: str,
+        telemetry: Optional[Any] = None,
+        recency_weighted: Optional[bool] = None,
+    ) -> np.ndarray:
+        """Encodes prompt into a normalized dense embedding vector, fusing continuous telemetry if present."""
+        return self._encode_with_norm(prompt, telemetry=telemetry, recency_weighted=recency_weighted)[0]
 
     def encode_batch(
         self,
@@ -1467,10 +1486,11 @@ class SystemOneModel:
         """Executes a single non-autoregressive forward pass over the schema."""
         start_t = time.perf_counter()
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
+        raw_norm: Optional[float] = None
         if embedding is not None:
             emb = np.asarray(embedding, dtype=np.float32).flatten()
         else:
-            emb = self.encode(prompt, telemetry=telemetry, recency_weighted=use_recency)
+            emb, raw_norm = self._encode_with_norm(prompt, telemetry=telemetry, recency_weighted=use_recency)
 
         field_results: Dict[str, RawFieldEvaluation] = {}
         prompt_for_head = prompt if embedding is None else None
@@ -1483,6 +1503,7 @@ class SystemOneModel:
             embedding=emb,
             fields=field_results,
             inference_latency_ms=elapsed_ms,
+            raw_norm=raw_norm,
         )
 
     def evaluate(
@@ -1509,6 +1530,8 @@ class SystemOneModel:
         forgetting_factor: Optional[float] = None,
         recency_weighted: Optional[bool] = None,
         preserve_calibration: bool = False,
+        *,
+        reward_scale: float = 1.0,
     ) -> Dict[str, Any]:
         """Closed-form rank-1 Sherman-Morrison online update on the metal (<0.1ms)."""
         with self._lock:
@@ -1543,6 +1566,7 @@ class SystemOneModel:
                         forgetting_factor=eff_ff,
                         prompt=prompt_for_head,
                         preserve_calibration=preserve_calibration,
+                        reward_scale=reward_scale,
                     )
                     update_durations_ms.append(dt)
                     updated_fields.append(f_name)
@@ -1622,6 +1646,7 @@ class SystemOneModel:
             if not math.isfinite(ff_check) or not (0.0 < ff_check <= 1.0):
                 raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_check}")
         eff_ff = forgetting_factor
+        eff_reward_scale = 1.0
         if reward is not None:
             r_val = float(reward)
             if not math.isfinite(r_val):
@@ -1637,6 +1662,7 @@ class SystemOneModel:
                 if outcome is not None:
                     skipped["outcome_recorded"] = True
                 return skipped
+            eff_reward_scale = float(np.clip(r_val, 0.0, 1.0))
             if r_val != 1.0:
                 base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
                 eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
@@ -1663,6 +1689,7 @@ class SystemOneModel:
             forgetting_factor=eff_ff,
             recency_weighted=recency_weighted,
             preserve_calibration=preserve_calibration,
+            reward_scale=eff_reward_scale,
         )
         if outcome is not None:
             res["outcome_recorded"] = True
