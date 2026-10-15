@@ -86,173 +86,173 @@
   },
   "instinct_hybrid:101": {
     "delta": 0.0025,
-    "qualification_count": 952,
-    "qualification_errors": 19,
-    "qualification_upper_bound": 0.036302178371733045,
+    "qualification_count": 877,
+    "qualification_errors": 20,
+    "qualification_upper_bound": 0.04085156772667349,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 952,
-      "qualification_errors": 19,
-      "qualification_upper_bound": 0.036302178371733045,
+      "qualification_count": 877,
+      "qualification_errors": 20,
+      "qualification_upper_bound": 0.04085156772667349,
       "qualified": true,
-      "threshold": 0.9968402597095227
+      "threshold": 0.997445630203375
     },
-    "threshold": 0.9968402597095227
+    "threshold": 0.997445630203375
   },
   "instinct_hybrid:17": {
     "delta": 0.0025,
-    "qualification_count": 885,
-    "qualification_errors": 18,
-    "qualification_upper_bound": 0.03755653244367231,
+    "qualification_count": 1098,
+    "qualification_errors": 26,
+    "qualification_upper_bound": 0.03964057953359136,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 885,
-      "qualification_errors": 18,
-      "qualification_upper_bound": 0.03755653244367231,
+      "qualification_count": 1501,
+      "qualification_errors": 38,
+      "qualification_upper_bound": 0.038919875624904565,
       "qualified": true,
-      "threshold": 0.9967675636122111
+      "threshold": 0.9903860867707797
     },
-    "threshold": 0.9967675636122111
+    "threshold": 0.9950658484363398
   },
   "instinct_hybrid:29": {
     "delta": 0.0025,
-    "qualification_count": 1095,
-    "qualification_errors": 18,
-    "qualification_upper_bound": 0.03040535340995956,
+    "qualification_count": 910,
+    "qualification_errors": 13,
+    "qualification_upper_bound": 0.02922455163372349,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 1213,
-      "qualification_errors": 21,
-      "qualification_upper_bound": 0.030674771707582083,
+      "qualification_count": 1571,
+      "qualification_errors": 33,
+      "qualification_upper_bound": 0.033313299720192556,
       "qualified": true,
-      "threshold": 0.9946869248631104
+      "threshold": 0.9917888599550481
     },
-    "threshold": 0.9958496362873577
+    "threshold": 0.9976763543764066
   },
   "instinct_hybrid:43": {
     "delta": 0.0025,
-    "qualification_count": 939,
-    "qualification_errors": 16,
-    "qualification_upper_bound": 0.03261443658337231,
+    "qualification_count": 1200,
+    "qualification_errors": 18,
+    "qualification_upper_bound": 0.027762199209664457,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 1789,
+      "qualification_count": 1783,
       "qualification_errors": 52,
-      "qualification_upper_bound": 0.042051148174467284,
+      "qualification_upper_bound": 0.04219170185163135,
       "qualified": true,
-      "threshold": 0.9773263574384922
+      "threshold": 0.9802444054796478
     },
-    "threshold": 0.9943356497160986
+    "threshold": 0.9915933720781297
   },
   "instinct_hybrid:71": {
     "delta": 0.0025,
-    "qualification_count": 1177,
-    "qualification_errors": 24,
-    "qualification_upper_bound": 0.03485785811231494,
+    "qualification_count": 711,
+    "qualification_errors": 9,
+    "qualification_upper_bound": 0.029517847927143518,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 1346,
-      "qualification_errors": 27,
-      "qualification_upper_bound": 0.033317990216294516,
+      "qualification_count": 1396,
+      "qualification_errors": 34,
+      "qualification_upper_bound": 0.03833766562464332,
       "qualified": true,
-      "threshold": 0.9913214865142012
+      "threshold": 0.9920550191483214
     },
-    "threshold": 0.993607119318118
+    "threshold": 0.9980715139549149
   },
   "instinct_lexical:101": {
     "delta": 0.0025,
-    "qualification_count": 585,
-    "qualification_errors": 11,
-    "qualification_upper_bound": 0.040599023840539254,
+    "qualification_count": 501,
+    "qualification_errors": 6,
+    "qualification_upper_bound": 0.03300416202663151,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 1579,
-      "qualification_errors": 38,
-      "qualification_upper_bound": 0.037010105074695,
+      "qualification_count": 1561,
+      "qualification_errors": 37,
+      "qualification_upper_bound": 0.03665641257899414,
       "qualified": true,
-      "threshold": 0.9952354808942521
+      "threshold": 0.9959703868980048
     },
-    "threshold": 0.9995425161996108
+    "threshold": 0.9997058353653266
   },
   "instinct_lexical:17": {
     "delta": 0.0025,
-    "qualification_count": 851,
-    "qualification_errors": 14,
-    "qualification_upper_bound": 0.032822785853037315,
+    "qualification_count": 674,
+    "qualification_errors": 6,
+    "qualification_upper_bound": 0.02460030677788409,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 1267,
-      "qualification_errors": 21,
-      "qualification_upper_bound": 0.02937594754336079,
+      "qualification_count": 1938,
+      "qualification_errors": 51,
+      "qualification_upper_bound": 0.03822792948535835,
       "qualified": true,
-      "threshold": 0.9971703137185906
+      "threshold": 0.9926160796215043
     },
-    "threshold": 0.9989692427220271
+    "threshold": 0.9995468432941577
   },
   "instinct_lexical:29": {
     "delta": 0.0025,
-    "qualification_count": 576,
-    "qualification_errors": 8,
-    "qualification_upper_bound": 0.03387394529326986,
+    "qualification_count": 453,
+    "qualification_errors": 4,
+    "qualification_upper_bound": 0.029611062104368813,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 2322,
-      "qualification_errors": 70,
-      "qualification_upper_bound": 0.04150968043835126,
+      "qualification_count": 2473,
+      "qualification_errors": 78,
+      "qualification_upper_bound": 0.04271646439196553,
       "qualified": true,
-      "threshold": 0.9799479957064356
+      "threshold": 0.979555028071265
     },
-    "threshold": 0.9994431006192349
+    "threshold": 0.9997679688856175
   },
   "instinct_lexical:43": {
     "delta": 0.0025,
-    "qualification_count": 1051,
-    "qualification_errors": 17,
-    "qualification_upper_bound": 0.03042070251518135,
+    "qualification_count": 1211,
+    "qualification_errors": 16,
+    "qualification_upper_bound": 0.025334215802703588,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 1840,
-      "qualification_errors": 46,
-      "qualification_upper_bound": 0.037022298968549874,
+      "qualification_count": 2009,
+      "qualification_errors": 49,
+      "qualification_upper_bound": 0.035704290372185137,
       "qualified": true,
-      "threshold": 0.9888118829365551
+      "threshold": 0.9885682041935393
     },
-    "threshold": 0.9972962187339433
+    "threshold": 0.9969569514728441
   },
   "instinct_lexical:71": {
     "delta": 0.0025,
-    "qualification_count": 795,
-    "qualification_errors": 10,
-    "qualification_upper_bound": 0.028205464292101686,
+    "qualification_count": 668,
+    "qualification_errors": 8,
+    "qualification_upper_bound": 0.02924971668294778,
     "qualified": false,
     "standard_budget_gate": {
       "budget": 0.05,
       "delta": 0.0025,
-      "qualification_count": 1330,
-      "qualification_errors": 22,
-      "qualification_upper_bound": 0.02895829965577059,
+      "qualification_count": 1604,
+      "qualification_errors": 35,
+      "qualification_upper_bound": 0.03416032223403911,
       "qualified": true,
-      "threshold": 0.9954614557389537
+      "threshold": 0.9945121185655527
     },
-    "threshold": 0.9986466383597747
+    "threshold": 0.9993063877263085
   },
   "simple_classifier:101": {
     "delta": 0.0025,

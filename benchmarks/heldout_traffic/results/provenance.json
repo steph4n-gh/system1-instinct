@@ -107,6 +107,6 @@
   },
   "inputs_sha256": "b74dde80134de327bfb5e65e4a5acea381a94b908fc61917a91da77d4bf65f0c",
   "protocol_sha256": "4df2ff5a290db6909af3d4cbbcf3e72677d785dd540d3f8e1a61e2a35bf94c1d",
-  "revision": "6065361c43f6d2275fb0561923d5caeab3a3ef4b",
+  "revision": "0f38def6d49be2e3892f1b574eab11b333362485",
   "runtime_base": "0b1072453749855f78669b73c54b938959627e3a"
 }

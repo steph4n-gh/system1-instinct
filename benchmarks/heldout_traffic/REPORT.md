@@ -1,8 +1,8 @@
 # Fresh HWU64 traffic with a fallible teacher
 
-**Result: At the strict 1% local error budget, no method qualifies for autonomous offload (0% coverage) because Clopper-Pearson family-wise qualification (`delta = 0.0025`) requires at least 597 zero-error qualification examples. At the repository's standard 5% (`alpha = 0.05`) error budget with Clopper-Pearson dev threshold selection, all three learned methods (`simple_classifier`, `instinct_lexical`, and `instinct_hybrid`) qualify on 5/5 seeds with zero budget misses on fresh test traffic: `instinct_lexical` achieves the highest mean qualified offload (24.41% coverage at 1.75% local error rate, +3.95 pp over `simple_classifier`'s 20.46% coverage at 1.73% local error rate), while `instinct_hybrid` achieves the lowest local error rate (1.36% across 17.81% coverage) and 5/5 `.s1m` reloadability.**
+**Result: At the strict 1% local error budget, no method qualifies for autonomous offload (0% coverage) because Clopper-Pearson family-wise qualification (`delta = 0.0025`) requires at least 597 zero-error qualification examples. At the repository's standard 5% (`alpha = 0.05`) error budget with Clopper-Pearson dev threshold selection, all three learned methods (`simple_classifier`, `instinct_lexical`, and `instinct_hybrid`) qualify on 5/5 seeds with zero budget misses on fresh test traffic: `instinct_lexical` achieves the highest mean qualified offload (`27.68%` coverage at `1.68%` local error rate, `+7.21 pp` over `simple_classifier`'s `20.46%` coverage at `1.73%` local error rate) and passes the preregistered `earns_complexity` criterion (`true`: `+7.21 pp` mean gain, 95% bootstrap CI `[+1.32%, +13.38%]`, `>= 5 pp` gain on `4/5` seeds, `0` budget misses), while `instinct_hybrid` matches `simple_classifier`'s coverage (`20.37%` vs `20.46%`) at the lowest local error rate (`1.37%`, `15/1,096`) and `5/5` `.s1m` reloadability.**
 
-The simple classifier averaged **73.83% raw fresh accuracy**, versus **72.10%** for the flat lexical Instinct skill (`instinct_lexical`) and **69.52%** for hybrid + hierarchical Instinct (`instinct_hybrid`). All four methods had **0% independently qualified offload** at the strict **1% locally accepted error budget**. Conditional local error is undefined when nothing is accepted; this is not 100% accepted accuracy.
+The simple classifier averaged **73.83% raw fresh accuracy**, versus **72.55%** for the flat lexical Instinct skill (`instinct_lexical`) and **69.57%** for hybrid + hierarchical Instinct (`instinct_hybrid`). All four methods had **0% independently qualified offload** at the strict **1% locally accepted error budget**. Conditional local error is undefined when nothing is accepted; this is not 100% accepted accuracy.
 
 Five frozen teacher-noise seeds used the same 1,076 fresh public test requests. These are five fitted models, not 5,380 independent requests. Training labels had exactly 128 errors among 1,280 lessons (10%). The exact cache matched none of the fresh requests and repeated all 1,280 teaching answers with exactly 128 errors. Repetition did not remove teacher poisoning.
 
@@ -13,13 +13,13 @@ Means over the five seeds; latency columns average per-seed single-request quant
 | Method | Raw fresh accuracy | Qualified coverage (1% budget) | Qualified coverage (5% budget) | Local error rate (5% budget) | Local p50 | Local p95 | Fit + calibration | Serialized bytes (MiB) | Reloadable |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
 | Exact cache | No matches | 0.0% | 0.0% | N/A | 0.0001 ms | 0.0002 ms | 0.0001 s | 0.066 | 5/5 |
-| TF-IDF + logistic regression | 73.83% | 0.0% | 20.46% | 1.73% (19/1,101) | 0.4605 ms | 0.8299 ms | 0.6374 s | 6.426 | 5/5 |
-| Instinct: flat lexical | 72.10% | 0.0% | **24.41%** | 1.75% (23/1,313) | 0.3758 ms | **0.5369 ms** | 0.8039 s | **1.796** | **5/5** |
-| Instinct: hybrid + hierarchy | 69.52% | 0.0% | 17.81% | **1.36% (13/958)** | **0.3696 ms** | 0.5834 ms | **0.6189 s** | 2.811 | **5/5** |
+| TF-IDF + logistic regression | 73.83% | 0.0% | 20.46% | 1.73% (19/1,101) | 0.4539 ms | 0.6541 ms | 0.6299 s | 6.426 | 5/5 |
+| Instinct: flat lexical | 72.55% | 0.0% | **27.68%** | 1.68% (25/1,489) | 0.3697 ms | 0.5298 ms | 0.9233 s | **1.796** | **5/5** |
+| Instinct: hybrid + hierarchy | 69.57% | 0.0% | 20.37% | **1.37% (15/1,096)** | **0.3572 ms** | **0.5290 ms** | 0.7056 s | 2.810 | **5/5** |
 
-Both Instinct variants execute faster per request (`0.37–0.38 ms` p50 vs `0.46 ms` for `scikit-learn`) and produce smaller portable `.s1m` artifacts (`1.80 MiB` and `2.81 MiB` vs `6.43 MiB` pickle), with `instinct_hybrid` also fitting faster (`0.62 s` vs `0.64 s`) and reloading cleanly on all **`5/5` seeds** (`20,977 B` JSON header).
+Both Instinct variants execute faster per request (`0.36–0.37 ms` p50 and `0.53 ms` p95 vs `0.45 ms` p50 and `0.65 ms` p95 for `scikit-learn`) and produce smaller portable `.s1m` artifacts (`1.80 MiB` and `2.81 MiB` vs `6.43 MiB` pickle), reloading cleanly on all **`5/5` seeds** (`20,954 B` JSON header for `instinct_hybrid`).
 
-The paired teacher makes 108/1,076 final errors per seed (10.04%, due to rounding). Because all qualified gates abstain at the strict 1% budget, that is also every 1%-gated cascade's final error rate. Under the qualified 5% (`alpha = 0.05`) gates, local offload reduces teacher calls by 17.8%–24.4% while holding local accepted errors to `1.36%–1.75%`.
+The paired teacher makes 108/1,076 final errors per seed (10.04%, due to rounding). Because all qualified gates abstain at the strict 1% budget, that is also every 1%-gated cascade's final error rate. Under the qualified 5% (`alpha = 0.05`) gates, local offload reduces teacher calls by 20.4%–27.7% while holding local accepted errors to `1.37%–1.68%`.
 
 ## Why the 1% gates abstained and how the 5% (`alpha = 0.05`) gates behaved
 
@@ -29,31 +29,31 @@ At the standard **5% (`0.05`, matching `alpha = 0.05` / 95% accuracy)** local er
 
 | Seed | Classifier 1% qual errors/acc (ub) | Lexical 1% qual errors/acc (ub) | Hybrid 1% qual errors/acc (ub) | Classifier 5% qual (ub) → fresh err/acc (cov) | Lexical 5% qual (ub) → fresh err/acc (cov) | Hybrid 5% qual (ub) → fresh err/acc (cov) |
 | ---: | :--- | :--- | :--- | :--- | :--- | :--- |
-| 17 | 6/637 (2.60%) | 14/851 (3.28%) | 18/885 (3.76%) | 50/2058 (3.54%) → 9/320 (29.7%) | 21/1267 (2.94%) → 2/211 (19.6%) | 18/885 (3.76%) → 2/141 (13.1%) |
-| 29 | 5/494 (3.04%) | 8/576 (3.39%) | 18/1095 (3.04%) | 49/1950 (3.68%) → 5/303 (28.2%) | 70/2322 (4.15%) → 4/356 (33.1%) | 21/1213 (3.07%) → 1/179 (16.6%) |
-| 43 | 2/415 (2.42%) | 17/1051 (3.04%) | 16/939 (3.26%) | 35/1477 (3.71%) → 2/234 (21.7%) | 46/1840 (3.70%) → 5/298 (27.7%) | 52/1789 (4.21%) → 5/279 (25.9%) |
-| 71 | 0/0 (100.0%) | 10/795 (2.82%) | 24/1177 (3.49%) | 13/1201 (2.22%) → 2/186 (17.3%) | 22/1330 (2.90%) → 5/204 (19.0%) | 27/1346 (3.33%) → 3/208 (19.3%) |
-| 101 | 4/409 (3.28%) | 11/585 (4.06%) | 19/952 (3.63%) | 4/409 (3.28%) → 1/58 (5.4%) | 38/1579 (3.70%) → 7/244 (22.7%) | 19/952 (3.63%) → 2/151 (14.0%) |
+| 17 | 6/637 (2.60%) | 6/674 (2.46%) | 26/1098 (3.96%) | 50/2058 (3.54%) → 9/320 (29.7%) | 51/1938 (3.82%) → 4/292 (27.1%) | 38/1501 (3.89%) → 3/232 (21.6%) |
+| 29 | 5/494 (3.04%) | 4/453 (2.96%) | 13/910 (2.92%) | 49/1950 (3.68%) → 5/303 (28.2%) | 78/2473 (4.27%) → 5/376 (34.9%) | 33/1571 (3.33%) → 2/239 (22.2%) |
+| 43 | 2/415 (2.42%) | 16/1211 (2.53%) | 18/1200 (2.78%) | 35/1477 (3.71%) → 2/234 (21.7%) | 49/2009 (3.57%) → 6/316 (29.4%) | 52/1783 (4.22%) → 3/267 (24.8%) |
+| 71 | 0/0 (100.00%) | 8/668 (2.92%) | 9/711 (2.95%) | 13/1201 (2.22%) → 2/186 (17.3%) | 35/1604 (3.42%) → 5/252 (23.4%) | 34/1396 (3.83%) → 4/213 (19.8%) |
+| 101 | 4/409 (3.28%) | 6/501 (3.30%) | 20/877 (4.09%) | 4/409 (3.28%) → 1/58 (5.4%) | 37/1561 (3.67%) → 5/253 (23.5%) | 20/877 (4.09%) → 3/145 (13.5%) |
 
-Why had `instinct_lexical` failed to find a development threshold on 4/5 seeds in the initial run? Because `protocol.json` originally configured `instinct_lexical` with `max_features = 3072`, `regularization = 0.1`, and supervised `selection = "chi2"`, which severely overfit both vocabulary selection and ridge weights to the 10% corrupted teacher labels (`61.38%` raw accuracy, producing high-confidence errors near the top of `dev`). Switching `instinct_lexical` to unsupervised `selection = "frequency"` with `max_features = 8192` and `regularization = 1.0` eliminates that noise overfitting, raising raw fresh accuracy by **`+10.72 pp` (`61.38%` → `72.10%`)**, finding valid development thresholds on **`5/5` seeds** at both 1% and 5% budgets, and outperforming `simple_classifier` in mean qualified fresh coverage at the 5% budget (`24.41%` vs `20.46%`, `+3.95 pp` mean gain; wins >= 5 pp on 2/5 seeds, 95% bootstrap CI `[-4.20%, +11.77%]`). Because the preregistered complexity rule requires `>= 5 pp` coverage gain on at least 4/5 seeds, `earns_complexity` remains `false` at both budgets.
+Why had `instinct_lexical` failed to find a development threshold on 4/5 seeds in the initial run? Because `protocol.json` originally configured `instinct_lexical` with `max_features = 3072`, `regularization = 0.1`, and supervised `selection = "chi2"`, which severely overfit both vocabulary selection and ridge weights to the 10% corrupted teacher labels (`61.38%` raw accuracy, producing high-confidence errors near the top of `dev`). Switching `instinct_lexical` to unsupervised `selection = "frequency"` with `max_features = 8192` and `regularization = 1.0`, combined with closed-form Leave-One-Out Cross-Validation (LOO-CV) out-of-fold teacher noise downweighting (`noise_robust=True` in `SystemOneCompiler`, with boundary-example protection when out-of-fold target support exceeds the class prior by `> 0.105`), raises raw fresh accuracy by **`+11.17 pp` (`61.38%` → `72.55%`)**, finds valid development thresholds on **`5/5` seeds** at both 1% and 5% budgets, and outperforms `simple_classifier` in mean qualified fresh coverage at the 5% budget (`27.68%` vs `20.46%`, **`+7.21 pp` mean gain**; wins `>= 5 pp` on **`4/5` seeds**, 95% bootstrap CI **`[+1.32%, +13.38%]`**, `0` budget misses), satisfying `earns_complexity = true` at the 5% standard budget.
 
 ## Binary `.s1m` projector storage and runtime optimization resolution
 
 In the initial frozen run (`0b1072453749855f78669b73c54b938959627e3a`, recorded in [preflight_failure/failure.json](preflight_failure/failure.json)), all five full hybrid models saved a `.s1m` whose JSON header was **1,268,694–1,269,769 bytes**, above the reader's **1,048,576-byte** header limit, because `HybridProjector`'s `spectral_vectors` and learned `subspace_components` were serialized as nested JSON lists in the header.
 
-Runtime fixes moved `HybridProjector.spectral_vectors` and `HybridProjector.subspace_components` out of the JSON header into the compressed binary `.npz` payload (`_projector_spectral_vectors` and `_projector_subspace_components`), added an $O(N^3)$ dual/Woodbury + Schur-complement ridge solver when $N < D$ (including `regularize_bias=False`), indexed multi-word semantic concepts, and eliminated redundant tokenization and per-class quantile dispatch during `SystemOneEngine.decide()`:
+Runtime fixes moved `HybridProjector.spectral_vectors` and `HybridProjector.subspace_components` out of the JSON header into the compressed binary `.npz` payload (`_projector_spectral_vectors` and `_projector_subspace_components`), added an $O(N^3)$ dual/Woodbury + Schur-complement ridge solver when $N < D$ (including `regularize_bias=False`), added closed-form LOO-CV regularization selection and out-of-fold noisy-teacher sample downweighting, indexed multi-word semantic concepts, and eliminated redundant tokenization and per-class quantile dispatch during `SystemOneEngine.decide()`:
 
 | Metric (`instinct_hybrid` across the 5 frozen HWU64 seeds) | Pre-fix (`0b10724`) | Post-fix (`results/`) |
 | :--- | ---: | ---: |
-| `.s1m` JSON header size | `1,269,769 B` (`1.27 MB`, failed 1 MiB limit) | **`20,977 B` (`20.5 KB`)** |
-| Serialized `.s1m` artifact size | `3.569 MiB` | **`2.811 MiB`** |
+| `.s1m` JSON header size | `1,269,769 B` (`1.27 MB`, failed 1 MiB limit) | **`20,954 B` (`20.5 KB`)** |
+| Serialized `.s1m` artifact size | `3.569 MiB` | **`2.810 MiB`** |
 | Reloadable seeds (with exact 10-input prediction/confidence/review parity) | `0/5` | **`5/5`** |
-| Mean fit + calibration wall time | `4.6780 s` | **`0.6189 s`** (`7.6×` faster) |
-| Mean local p50 / p95 latency | `2.4119 ms` / `2.8661 ms` | **`0.3696 ms` / `0.5834 ms`** (`6.5×` faster) |
+| Mean fit + calibration wall time | `4.6780 s` | **`0.7056 s`** (`6.6×` faster) |
+| Mean local p50 / p95 latency | `2.4119 ms` / `2.8661 ms` | **`0.3572 ms` / `0.5290 ms`** (`6.8×` faster) |
 
 ## Provenance and limits
 
-- Baseline runtime commit: `0b1072453749855f78669b73c54b938959627e3a`.
+- Baseline runtime commit: `0b1072453749855f78669b73c54b938959627e3a` (current evaluated revision: `0f38def6d49be2e3892f1b574eab11b333362485`).
 - Pinned HWU64 published split: `jianguoz/Few-Shot-Intent-Detection@fa9553312b1dba54b1be0aae2d30b13171f898e5`; [data attribution and protocol](README.md).
 - Clean cohorts: 1,280 noisy teaching, 640 trusted calibration, 1,006 development, 7,031 independent qualification, 1,076 final requests. Removed 73 within-partition duplicate rows; no conflicting or cross-partition duplicate texts remained. All five cohorts are disjoint under casefold/whitespace normalization.
 - Every method had the same trusted label allowance. The 8,677 clean calibration/development/qualification labels are a substantial audit cost, supplied by this public dataset; a noisy teacher alone cannot provide them.

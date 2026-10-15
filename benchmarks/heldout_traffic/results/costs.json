@@ -1,111 +1,111 @@
 {
   "exact_cache:101": {
-    "fit_seconds": 0.00011512497439980507,
+    "fit_seconds": 0.00010391604155302048,
     "reloadable": true,
     "serialized_bytes": 69433
   },
   "exact_cache:17": {
-    "fit_seconds": 0.00017179083079099655,
+    "fit_seconds": 0.00019554095342755318,
     "reloadable": true,
     "serialized_bytes": 69440
   },
   "exact_cache:29": {
-    "fit_seconds": 0.00010637473315000534,
+    "fit_seconds": 0.00012158369645476341,
     "reloadable": true,
     "serialized_bytes": 69454
   },
   "exact_cache:43": {
-    "fit_seconds": 0.00010308297351002693,
+    "fit_seconds": 0.00011033285409212112,
     "reloadable": true,
     "serialized_bytes": 69418
   },
   "exact_cache:71": {
-    "fit_seconds": 0.00010425038635730743,
+    "fit_seconds": 0.00010766694322228432,
     "reloadable": true,
     "serialized_bytes": 69413
   },
   "instinct_hybrid:101": {
-    "fit_seconds": 0.6052298340946436,
+    "fit_seconds": 0.6944524999707937,
     "reloadable": true,
-    "serialized_bytes": 2946576,
-    "serialized_header_bytes": 20896
+    "serialized_bytes": 2945975,
+    "serialized_header_bytes": 20902
   },
   "instinct_hybrid:17": {
-    "fit_seconds": 0.6059124995954335,
+    "fit_seconds": 0.6801187503151596,
     "reloadable": true,
-    "serialized_bytes": 2947573,
-    "serialized_header_bytes": 20977
+    "serialized_bytes": 2947467,
+    "serialized_header_bytes": 20954
   },
   "instinct_hybrid:29": {
-    "fit_seconds": 0.6012647920288146,
+    "fit_seconds": 0.6910546249710023,
     "reloadable": true,
-    "serialized_bytes": 2947990,
-    "serialized_header_bytes": 20908
+    "serialized_bytes": 2947718,
+    "serialized_header_bytes": 20933
   },
   "instinct_hybrid:43": {
-    "fit_seconds": 0.6016708328388631,
+    "fit_seconds": 0.7994804582558572,
     "reloadable": true,
-    "serialized_bytes": 2947513,
-    "serialized_header_bytes": 20916
+    "serialized_bytes": 2947612,
+    "serialized_header_bytes": 20895
   },
   "instinct_hybrid:71": {
-    "fit_seconds": 0.6802134998142719,
+    "fit_seconds": 0.6627722498960793,
     "reloadable": true,
-    "serialized_bytes": 2946633,
-    "serialized_header_bytes": 20922
+    "serialized_bytes": 2946175,
+    "serialized_header_bytes": 20948
   },
   "instinct_lexical:101": {
-    "fit_seconds": 0.7082496248185635,
+    "fit_seconds": 0.9497102093882859,
     "reloadable": true,
-    "serialized_bytes": 1883275,
-    "serialized_header_bytes": 250261
+    "serialized_bytes": 1882967,
+    "serialized_header_bytes": 250259
   },
   "instinct_lexical:17": {
-    "fit_seconds": 0.8422912922687829,
+    "fit_seconds": 0.8936759163625538,
     "reloadable": true,
-    "serialized_bytes": 1882885,
-    "serialized_header_bytes": 250240
+    "serialized_bytes": 1883353,
+    "serialized_header_bytes": 250258
   },
   "instinct_lexical:29": {
-    "fit_seconds": 0.8907747501507401,
+    "fit_seconds": 0.924067750107497,
     "reloadable": true,
-    "serialized_bytes": 1883357,
-    "serialized_header_bytes": 250256
+    "serialized_bytes": 1883657,
+    "serialized_header_bytes": 250265
   },
   "instinct_lexical:43": {
-    "fit_seconds": 0.7993647921830416,
+    "fit_seconds": 1.0397122083231807,
     "reloadable": true,
     "serialized_bytes": 1883512,
-    "serialized_header_bytes": 250248
+    "serialized_header_bytes": 250234
   },
   "instinct_lexical:71": {
-    "fit_seconds": 0.7786635416559875,
+    "fit_seconds": 0.8094097916036844,
     "reloadable": true,
-    "serialized_bytes": 1882943,
-    "serialized_header_bytes": 250221
+    "serialized_bytes": 1883096,
+    "serialized_header_bytes": 250254
   },
   "simple_classifier:101": {
-    "fit_seconds": 0.6006386252120137,
+    "fit_seconds": 0.5822752080857754,
     "reloadable": true,
     "serialized_bytes": 6738074
   },
   "simple_classifier:17": {
-    "fit_seconds": 0.7671610419638455,
+    "fit_seconds": 0.7706837910227478,
     "reloadable": true,
     "serialized_bytes": 6738074
   },
   "simple_classifier:29": {
-    "fit_seconds": 0.6243058745749295,
+    "fit_seconds": 0.6160299996845424,
     "reloadable": true,
     "serialized_bytes": 6738074
   },
   "simple_classifier:43": {
-    "fit_seconds": 0.5963838342577219,
+    "fit_seconds": 0.5944767501205206,
     "reloadable": true,
     "serialized_bytes": 6738074
   },
   "simple_classifier:71": {
-    "fit_seconds": 0.5987080843187869,
+    "fit_seconds": 0.5859624999575317,
     "reloadable": true,
     "serialized_bytes": 6738074
   }
