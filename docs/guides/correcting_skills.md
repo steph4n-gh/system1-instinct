@@ -238,7 +238,25 @@ print(report.coverage, report.abstain_rate, report.unfamiliar_rate)
 To run dataset evaluation and post-hoc recalibration from the CLI, execute:
 
 ```bash
-system1 eval .system1/support-session/current.s1m heldout.jsonl --recalibrate calib.jsonl -o support-recalibrated.s1m --alpha 0.05
-system1 eval support-recalibrated.s1m heldout.jsonl --alpha 0.05 --json
+system1 eval fda_triage.s1m heldout.jsonl --recalibrate calib.jsonl -o fda_triage_recal.s1m --alpha 0.10
+system1 eval fda_triage_recal.s1m heldout.jsonl --alpha 0.10 --json
+```
+
+```text
+[SYSTEM 1 EVALUATION REPORT] EvaluationReport Schema: FdaRecallTriageSchema (alpha=0.100, n=80)
+Recalibration:       ECE 0.0626 -> 0.0575 | NLL 0.2180 -> 0.1767 | T=0.400, qhat=0.4939
+--------------------------------------------------------------------------------------------
+Overall Accuracy:    76.25%   | Accepted Accuracy:   90.20%   | Conformal Coverage:  71.25%
+Fast-Path Coverage:  63.75%   | Ambiguity Abstain:   23.75%   | Unfamiliar (OOD):    12.50%
+Calibration ECE:     0.0617    | Brier Score:         0.1787    | Negative Log-Lik:    0.3216
+Avg Set Size:        0.97      | Singleton Rate:      79.58%   | Latency p50 / p95:   0.324 / 0.436 ms
+Deferral Breakdown:  conformal_ambiguity=19, low_feature_familiarity=5, low_semantic_familiarity=5
+--------------------------------------------------------------------------------------------
+Field                   Acc  Acc(Acc)  ConfCov  SetSz      ECE    Brier      NLL        Cov/Abs/Unf
+--------------------------------------------------------------------------------------------
+hazard_class         81.2%    91.4%   81.2%   1.10   0.0935   0.2913   0.5452        72%/18%/10%
+regulatory_center    97.5%   100.0%   81.2%   0.81   0.0173   0.0312   0.0610         81%/8%/11%
+urgent_class_i_escalation   86.2%    88.2%   82.5%   1.00   0.0742   0.2137   0.3588          85%/8%/8%
+--------------------------------------------------------------------------------------------
 ```
 

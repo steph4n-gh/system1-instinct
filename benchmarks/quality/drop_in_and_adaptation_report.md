@@ -35,11 +35,11 @@ on the exact same held-out splits from the [6-category benchmark gauntlet](insti
 
 | Router Architecture | Model / Artifact Size | `BANKING77` (32c Clean) | `BANKING77` (32c Typo Stress) | `CLINC150-OOS` False Accept | Negation / Polarity Acc | P50 CPU Latency | `<1 ms` Online RLS Update |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Classical Linear Baseline** (`Unigram TF-IDF`) | `85 KiB` (`0` weights) | 77.3% | 66.0% | 3.3% | 70.0% | `0.18 ms` | No |
+| **Classical Linear Baseline** (`Unigram TF-IDF`) | `85 KiB` (no neural weights) | 77.3% | 66.0% | 3.3% | 70.0% | `0.18 ms` | No |
 | **`all-MiniLM-L6-v2`** (`22M` Dense Bi-Encoder) | `91.1 MB` ONNX | 91.0% | 70.7% (`-20.3%` drop) | 8.0% | 60.0% | `1.32 ms` (`~10 ms` PyTorch) | No |
 | **`BAAI/bge-small-en-v1.5`** (`33M` Dense Bi-Encoder) | `67.2 MB` ONNX | **94.5%** | **77.0%** (`-17.5%` drop) | 5.0% (cal) / 100% (`@0.5`) | 90.0% | `2.96 ms` (`~14 ms` PyTorch) | No |
-| **System 1: Instinct (Static `.s1m`)** | **`120 KiB`** (`0` weights) | **87.9%** | **74.2%** (`+3.5%` vs MiniLM) | **0.0%** (`0/120`) | **90.0%** | **`0.22 ms`** | **Yes** |
-| **System 1: Instinct (`+ Online Flywheel`)** | **`120 KiB`** (`0` weights) | **91.4%** (`+0.4%` vs MiniLM) | **74.2%** | **0.0%** (`0/120`) | **100.0%** | **`0.22 ms`** | **Yes** |
+| **System 1: Instinct (Static `.s1m`)** | **`120 KiB`** (no neural weights) | **87.9%** | **74.2%** (`+3.5%` vs MiniLM) | **0.0%** (`0/120`) | **90.0%** | **`0.22 ms`** | **Yes** |
+| **System 1: Instinct (`+ Online Flywheel`)** | **`120 KiB`** (no neural weights) | **91.4%** (`+0.4%` vs MiniLM) | **74.2%** | **0.0%** (`0/120`) | **100.0%** | **`0.22 ms`** | **Yes** |
 
 **Key Takeaways:**
 - **Competitive with `all-MiniLM-L6-v2` at `750x` smaller size and `6x–45x` lower latency**: On clean `BANKING77` (`32` intents), System 1: Instinct (`120 KiB`, `0` neural weights, `0.22 ms`) reaches `87.9%` statically and **`91.4%`** with one pass of online RLS adaptation—surpassing `all-MiniLM-L6-v2` (`91.0%`, `91.1 MB` ONNX).

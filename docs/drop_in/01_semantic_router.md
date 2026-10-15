@@ -81,9 +81,9 @@ The script prints:
 
 | Metric | `semantic-router` (`bge-small-en-v1.5`) | `System 1: Instinct` (`InstinctRouteLayer`) |
 | :--- | :---: | :---: |
-| **Artifact size** | `67.2 MB` ONNX (`33M` parameters) | **`93.3 KiB` `.s1m` (`0` neural weights)** |
+| **Artifact size** | `67.2 MB` ONNX (`33M` parameters) | **`93.3 KiB` `.s1m` (no neural network weights)** |
 | **Cold initialization time** | `2,471 ms` | **`115 ms` compile and `<2 ms` load** |
 | **P50 CPU latency** | `4.31 ms` | **`0.14 ms` (`30x` faster)** |
 | **`CLINC150` in-scope accuracy (`144` queries)** | **93.1%** raw | **87.5%** raw (**100.0%** on accepted decisions, **99.3%** with online correction) |
-| **`CLINC150-OOS` false acceptance (`120` OOS queries)** | `100.0%` (`120 of 120` misrouted, even after `sr.fit()`) | **`0.0% to 0.8%`** (abstains with `None` on unfamiliar inputs) |
+| **`CLINC150-OOS` false acceptance (`120` OOS queries)** | `100.0%` (`120 of 120` misrouted, even after `sr.fit()`) | **`0.0%`** (`0 of 120` on calibrated `.s1m`, `0.8%` / `1 of 120` on `6`-utterance routes) |
 | **Online weight updates** | No (requires re-embedding and refitting) | **Yes (`adapt_zero_shot` and `<1 ms` `learn_from_tier2`)** |

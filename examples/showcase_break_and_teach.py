@@ -56,7 +56,7 @@ from system1 import (
 
 
 # ============================================================================
-# 1. Define the Decision Schema (Just plain Python — 0 weights, 0 config files)
+# 1. Define the Decision Schema (plain Python, no neural network weights)
 # ============================================================================
 class BillingAndSupportDecision(DecisionSchema):
     action = ChoiceField(

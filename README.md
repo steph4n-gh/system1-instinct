@@ -6,28 +6,28 @@
 
 **Stop paying an LLM `500 ms` and an API call to make the same repeatable decision 10,000 times a day.**
 
-**System 1: Instinct** is a sub-millisecond (`0.1 to 0.4 ms`), zero-weight (`~100 KiB`) decision runtime for Python. Place it in front of your LLM, local model, or tool router:
+**System 1: Instinct** is a sub-millisecond (`0.1 to 0.4 ms`) decision runtime for Python with **no neural network weights** (`~100 KiB` `.s1m` skill). Place it in front of your LLM, local model, or tool router:
 - **Start at `0` examples.** Define a typed schema with `ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`.
-- **Teach `3 to 10` real examples per option.** Update weights online as your LLM answers live traffic, or pass labeled examples directly.
-- **Run `70% to 95%+` of repeatable traffic locally in `0.2 ms` on CPU.** Escalate ambiguous or unfamiliar inputs (`is_ambiguous=True`) back to your LLM.
+- **Teach `3 to 10` real examples per option.** Update linear and spectral weights online as your LLM answers live traffic, or pass labeled examples directly.
+- **Run repeatable traffic locally in `0.2 ms` on CPU.** Escalate ambiguous or unfamiliar inputs (`is_ambiguous=True`) back to your LLM.
 
 [![CI](https://github.com/steph4n-gh/system1-instinct/actions/workflows/ci.yml/badge.svg)](https://github.com/steph4n-gh/system1-instinct/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](LICENSE)
 
-[How teaching works (0 to 10 examples)](#go-from-zero-examples-to-local-execution) · [Instinct vs. local LLMs](#choose-between-instinct-and-a-local-llm) · [Drop-in replacements](#drop-instinct-into-existing-projects) · [Benchmarks and receipts](#verify-public-benchmarks-and-receipts) · [Documentation](docs/README.md)
+[How teaching works](#go-from-zero-examples-to-local-execution) · [Instinct vs. local LLMs](#choose-between-instinct-and-a-local-llm) · [Drop-in replacements](#drop-instinct-into-existing-projects) · [Benchmarks and receipts](#verify-public-benchmarks-and-receipts) · [Documentation](docs/README.md)
 
 ---
 
 ## Go from zero examples to local execution
 
-A raw zero-shot classifier is not enough on its own. If you force a zero-shot model to guess across 20 or more intents with zero examples, it reaches only `53% to 62%` accuracy. Nobody wants a `53%` router in production.
+A raw zero-shot classifier is not enough on its own. If you force a zero-shot model to guess across 20 or more intents with zero examples, it gets roughly half of them wrong. Nobody wants an uncalibrated router guessing in production.
 
 **System 1: Instinct** combines conformal abstention with sub-millisecond online updates so you can deploy safely from the first request.
 
 ### Teach a schema in five seconds
 
-Define your decision schema with `ChoiceField`, `BooleanField`, `MultiChoiceField`, or `ScoreField`. At **`0` examples**, `SystemOneEngine` abstains (`is_ambiguous=True`) on uncertain requests so it never guesses blindly on day zero. After you teach it **`3 to 10` examples per option** from application outcomes or an LLM teacher, the engine generalizes to unseen phrasings in `< 1 ms` and still rejects out-of-scope inputs:
+Define your decision schema with `ChoiceField`, `BooleanField`, `MultiChoiceField`, or `ScoreField`. At **`0` examples**, `SystemOneEngine` abstains (`is_ambiguous=True`) on uncertain requests so it never guesses blindly on day zero. After you teach it a few examples per option from application outcomes or an LLM teacher, the engine generalizes to unseen phrasings in `< 1 ms` and still rejects out-of-scope inputs:
 
 ```python
 from system1 import BooleanField, BoundedReviewFallback, ChoiceField, DecisionSchema, SystemOneEngine
@@ -87,35 +87,37 @@ reloaded = SystemOneEngine.load("triage.s1m")
 
 ### Evaluate and recalibrate a skill on held-out traffic
 
-Before promoting a `.s1m` skill or adjusting your abstention target `alpha`, run `system1.evaluate()` (or `system1 eval` from the CLI) on a held-out JSONL or JSON dataset. To update temperature scaling and conformal quantiles on fresh calibration rows without retraining RLS weights (`weights`, `biases`, `P`, `B`) or projector parameters, call `engine.recalibrate(calib_rows, alpha=0.05)` or pass `--recalibrate`:
+Before promoting a `.s1m` skill or adjusting your abstention target `alpha`, run `system1.evaluate()` (or `system1 eval` from the CLI) on a held-out JSONL or JSON dataset. It reports overall accuracy alongside selective accepted accuracy (`Acc(Acc)`), separating local fast-path coverage from in-distribution conformal ambiguity (`Ambiguity Abstain`) and out-of-distribution rejection (`Unfamiliar (OOD)`). To refit temperature scaling and conformal quantiles on fresh calibration rows without retraining decision weights (`weights`, `biases`, `P`, `B`), call `engine.recalibrate(calib_rows, alpha=0.10)` or pass `--recalibrate`:
 
 ```python
 import system1
 
-recal = reloaded.recalibrate("calib.jsonl", alpha=0.05)
-reloaded.save("triage_recal.s1m")
+recal = reloaded.recalibrate("calib.jsonl", alpha=0.10)
+reloaded.save("fda_triage_recal.s1m")
 
-report = system1.evaluate("triage_recal.s1m", "heldout.jsonl", alpha=0.05)
+report = system1.evaluate("fda_triage_recal.s1m", "heldout.jsonl", alpha=0.10)
 print(report.summary_table())
 ```
 
 ```bash
-system1 eval triage.s1m heldout.jsonl --recalibrate calib.jsonl -o triage_recal.s1m --alpha 0.05
+system1 eval fda_triage.s1m heldout.jsonl --recalibrate calib.jsonl -o fda_triage_recal.s1m --alpha 0.10
 ```
 
 ```text
-[SYSTEM 1 EVALUATION REPORT] EvaluationReport Schema: SupportTriage (alpha=0.050, n=6)
-Recalibration:       ECE 0.0142 -> 0.0000 | NLL 0.0144 -> 0.0000 | T=0.150, qhat=0.0000
+[SYSTEM 1 EVALUATION REPORT] EvaluationReport Schema: FdaRecallTriageSchema (alpha=0.100, n=80)
+Recalibration:       ECE 0.0626 -> 0.0575 | NLL 0.2180 -> 0.1767 | T=0.400, qhat=0.4939
 --------------------------------------------------------------------------------------------
-Overall Accuracy:    100.00%   | Accepted Accuracy:   100.00%   | Conformal Coverage:  100.00%
-Fast-Path Coverage:  100.00%   | Ambiguity Abstain:   0.00%   | Unfamiliar (OOD):    0.00%
-Calibration ECE:     0.0000    | Brier Score:         0.0000    | Negative Log-Lik:    0.0000
-Avg Set Size:        1.00      | Singleton Rate:      100.00%   | Latency p50 / p95:   0.407 / 0.534 ms
+Overall Accuracy:    76.25%   | Accepted Accuracy:   90.20%   | Conformal Coverage:  71.25%
+Fast-Path Coverage:  63.75%   | Ambiguity Abstain:   23.75%   | Unfamiliar (OOD):    12.50%
+Calibration ECE:     0.0617    | Brier Score:         0.1787    | Negative Log-Lik:    0.3216
+Avg Set Size:        0.97      | Singleton Rate:      79.58%   | Latency p50 / p95:   0.324 / 0.436 ms
+Deferral Breakdown:  conformal_ambiguity=19, low_feature_familiarity=5, low_semantic_familiarity=5
 --------------------------------------------------------------------------------------------
 Field                   Acc  Acc(Acc)  ConfCov  SetSz      ECE    Brier      NLL        Cov/Abs/Unf
 --------------------------------------------------------------------------------------------
-queue               100.0%   100.0%  100.0%   1.00   0.0000   0.0000   0.0000         100%/0%/0%
-urgent              100.0%   100.0%  100.0%   1.00   0.0000   0.0000   0.0000         100%/0%/0%
+hazard_class         81.2%    91.4%   81.2%   1.10   0.0935   0.2913   0.5452        72%/18%/10%
+regulatory_center    97.5%   100.0%   81.2%   0.81   0.0173   0.0312   0.0610         81%/8%/11%
+urgent_class_i_escalation   86.2%    88.2%   82.5%   1.00   0.0742   0.2137   0.3588          85%/8%/8%
 --------------------------------------------------------------------------------------------
 ```
 
@@ -127,7 +129,7 @@ An LLM teacher (`GPT-4o`, `Claude`, or `Gemini`) guesses from text before execut
 | :--- | :--- | :---: | :--- |
 | **1. Application context and outcomes** | `engine.learn_from_outcome(prompt, outcome=...)`<br>`engine.learn(prompt, labels)` | **`$0` LLM cost**<br>`< 0.5 ms` RLS update | Ground-truth outcomes: UI clicks, user edits, tool exit codes (`200 OK`), support ticket resolutions, or game rewards. |
 | **2. Shadowing an LLM teacher** | `BoundedReviewFallback(engine, review_fn=..., auto_online_update=True)`<br>`TypeSafeClient(...)` | **`0` manual labeling**<br>Auto-cuts over to `.s1m` | Wrapping an OpenAI, Anthropic, or local LLM call so uncertain requests teach Instinct automatically. |
-| **3. Historical logs or unlabeled traffic** | `SystemOneCompiler(Schema).compile(exemplars)`<br>`engine.adapt_zero_shot(unlabeled_prompts)` | **Offline CPU fit**<br>`< 120 KiB` `.s1m` file | Compiling `10 to 50` historical logs per option into a versioned `.s1m` artifact, or adapting to domain jargon without labels. |
+| **3. Historical logs or unlabeled traffic** | `SystemOneCompiler(Schema).compile(exemplars)`<br>`engine.adapt_zero_shot(unlabeled_prompts)` | **Offline CPU fit**<br>`< 120 KiB` `.s1m` file | Compiling historical logs per option into a versioned `.s1m` artifact, or adapting to domain jargon without labels. |
 
 To compare online teaching against `BAAI/bge-small-en-v1.5` (`67.2 MB` ONNX), run [`examples/showcase_break_and_teach.py`](examples/showcase_break_and_teach.py). Pass `--interactive` to enter your own prompts and teach the engine in one line:
 
@@ -166,52 +168,23 @@ ACT 3: 'TEACH ME' — Teaching a Brand-New Jargon Term in 1 Line (< 5 ms)
      • System 1: Instinct (Taught)  : refund_duplicate_charge (urgent=True) in 0.329 ms ✅
 ```
 
-Run these end-to-end replay scripts to inspect real-world behavior:
-- **Live GitHub issue triage (`astral-sh/uv` and `facebook/react` OOS).** Run [`examples/dogfood/live_github_triage.py`](examples/dogfood/live_github_triage.py), which uses the snapshot in [`examples/dogfood/uv_live_issues_snapshot.json`](examples/dogfood/uv_live_issues_snapshot.json). The script replays `260` chronologically ordered `astral-sh/uv` issues (`#491` through `#22542`) plus `25` `facebook/react` out-of-scope issues, with zero synthetic strings and zero temporal leakage. Traffic progresses from **`0` examples (`0.0%` offload, `100%` escalated)** to **online warm-up (`40.0%` offload)**. Compiling `.s1m` checkpoints reaches **`56.7%` offload at `15 per class`, `76.7%` at `25 per class`, and `93.3%` local offload at `40 per class` in `0.23 ms` with `100.0%` local precision, `96.0%` OOS abstention, and `100%` `.s1m` reload parity**:
-
-```bash
-python examples/dogfood/live_github_triage.py
-# Or pull fresh live issues on demand via GitHub CLI (`gh api`):
-python examples/dogfood/live_github_triage.py --live --repo astral-sh/uv
-```
-
-- **Live US FDA enforcement recall triage (`openFDA` and `astral-sh/uv` OOS).** Run [`examples/dogfood/live_fda_recall_triage.py`](examples/dogfood/live_fda_recall_triage.py), which uses the snapshot in [`examples/dogfood/fda_live_recalls_snapshot.json`](examples/dogfood/fda_live_recalls_snapshot.json). The script replays `297` chronologically ordered US FDA enforcement recall reports (`20121212` through `20261007`, `33 per cell` across `food`, `drug`, and `device` crossed with `Class I`, `Class II`, and `Class III`) plus `25` `astral-sh/uv` out-of-scope software issues, with zero synthetic strings and zero temporal leakage. Each decision predicts a **3-field multi-head schema** (`regulatory_center`, `hazard_class`, and `urgent_class_i_escalation`). Traffic progresses from **`0` examples (`0.0%` offload, `100%` escalated)** to **online warm-up (`10.0%` offload at `100.0%` precision)**. Compiling `.s1m` checkpoints reaches **`40.3%` offload at `12 per cell`, `51.4%` at `18 per cell`, and `65.3%` local offload at `25 per cell` in `0.33 ms` with `95.7%` joint 3-field precision, `100.0%` center precision, `100.0%` OOS abstention, and `100%` `.s1m` reload parity**:
-
-```bash
-python examples/dogfood/live_fda_recall_triage.py
-# Or pull fresh live enforcement recall reports on demand from api.fda.gov:
-python examples/dogfood/live_fda_recall_triage.py --live
-```
-
+Run these end-to-end replay scripts to inspect real-world behavior on chronological public data:
+- **Live GitHub issue triage (`astral-sh/uv` and `facebook/react` OOS).** Run [`examples/dogfood/live_github_triage.py`](examples/dogfood/live_github_triage.py) (or pass `--live` to fetch fresh issues via `gh api`). It replays `260` chronologically ordered `astral-sh/uv` issues plus `25` out-of-scope `facebook/react` issues from cold start (`100%` escalated) through online warm-up to a compiled `.s1m` skill that handles `93.3%` of held-out issues locally in `0.23 ms` (`100.0%` accepted precision, `96.0%` OOS abstention).
+- **Live US FDA enforcement recall triage (`openFDA` and `astral-sh/uv` OOS).** Run [`examples/dogfood/live_fda_recall_triage.py`](examples/dogfood/live_fda_recall_triage.py) (or pass `--live` to query `api.fda.gov`). It replays `297` chronological FDA recall reports across a 3-field schema (`regulatory_center`, `hazard_class`, and `urgent_class_i_escalation`) plus `25` out-of-scope software issues, reaching `65.3%` local offload in `0.33 ms` (`95.7%` joint 3-field precision, `100.0%` OOS abstention).
 - **Three-wave teacher auto-cutover demo.** Run [`examples/drop_in/llm_cutover_dropin.py`](examples/drop_in/llm_cutover_dropin.py) to observe an upstream teacher and cut over to a local `.s1m` skill.
-
-### Measure sample efficiency from 0 to 50 examples
-
-The table below shows how local offload and accuracy scale from **`0` examples** to a compiled **`.s1m` skill**:
-
-| Examples per option | What happens inside Instinct | Traffic handled locally (`0.2 ms`) | Traffic sent to teacher LLM | End-to-end accuracy |
-| :---: | :--- | :---: | :---: | :---: |
-| **`0` examples** | Cold start from option descriptions. Abstains on non-obvious inputs. | **`0% to 20%`** | `80% to 100%` | **`100%`** *(Teacher answers)* |
-| **`1 to 2` examples per option** | Sherman-Morrison rank-1 RLS update (`<0.5 ms` per example). | **`40% to 60%`** | `40% to 60%` | **`~90% to 95%`** |
-| **`3 to 5` examples per option** | Captures domain jargon, character typos (`char 3 to 5` n-grams), and `#` negation scope. | **`55% to 85%`** | `15% to 45%` | **`~93% to 98%`** |
-| **`8 to 15` examples per option** | Auto-compiles a calibrated **`.s1m` skill (`~50 to 120 KiB`)** with spectral `PPMI+SVD` features. | **`70% to 95%+`** | `5% to 30%` | **`~96% to 100%`** |
-| **`25 to 50` examples per option** | Standalone `.s1m` saturates. Out-of-scope inputs still abstain (`0.0%` OOS false accept). | **`80% to 100%`** | `0% to 20%` | **`~99% to 100%`** |
-| **`10,000+` examples** | **Wrong tool for new gains.** Linear and spectral hyperplanes plateau around `50 to 100` examples per option. | *Plateau* | None | Use a fine-tuned model or local LLM |
-
-> **Scope and fallible-teacher boundary.** The progression above summarizes `CLINC150` and `BANKING77` adaptation curves with an oracle teacher fallback at $\alpha = 0.10$ marginal conformal gating. We also tested a **fallible teacher** (`10%` label noise on `64`-class `HWU64`) across `7,031` independent qualification items and `1,076` fresh test requests. Under a strict **`1%` (`0.01`) family-wise conditional local error budget** (`delta = 0.0025`), neither Instinct nor a classical logistic classifier can statistically certify `<= 1%` upper-bound risk (`0.0%` coverage). At the **`5%` (`0.05`) local error budget**, all three learned methods qualify on `5 of 5` seeds with `0` budget misses. `instinct_lexical` offloads `27.68%` at `1.68%` local error rate vs. `simple_classifier`'s `20.46%` at `1.73%` error (`+7.21 pp` gain, `earns_complexity = true`), and `instinct_hybrid` reaches the lowest local error rate at `1.37%` (`20.37%` coverage) with `5 of 5` `.s1m` reloadability. See [Fresh HWU64 traffic with a fallible teacher (`benchmarks/heldout_traffic/REPORT.md`)](benchmarks/heldout_traffic/REPORT.md).
 
 ---
 
 ## Choose between Instinct and a local LLM
 
-A `100 KiB` non-autoregressive runtime has clear boundaries. Use the table below to pick the right model for your workload:
+A `~100 KiB` non-autoregressive runtime has clear boundaries. Use the table below to pick the right model for your workload:
 
 | Scenario | Best tool | Rationale |
 | :--- | :--- | :--- |
-| **"I have `3 to 30` examples per option (or a live teacher LLM) and want to stop paying `500 ms` for repeatable routing, triage, tool selection, or guardrails."** | **System 1: Instinct**<br>(`~100 KiB` `.s1m`, `0.2 ms` CPU) | Offloads `70% to 100%` of repetitive structured decisions in `0.2 ms` on CPU with `0` neural weights, `0.0%` out-of-scope false acceptance, character-typo resilience, and `<0.5 ms` rank-1 online updates (`learn_from_tier2`). |
-| **"I have `3` static examples per class, no teacher model in the loop, and users use open-vocabulary synonyms (`'automobile'` when my examples only said `'car'`)."** | **Pretrained bi-encoder**<br>(`bge-small` or `all-MiniLM`, `70 to 90 MB`, `1.5 to 4 ms`) | Pretraining already maps `'automobile'` to `'car'` on day zero (`+3% to +5%` higher static clean recall). The trade-off is `70 to 90 MB` of weights, no `<1 ms` online updates, and `100%` false acceptance on out-of-scope queries unless wrapped by a conformal gate. |
-| **"The decision requires multi-hop logic, reading comprehension across paragraphs, arithmetic, or `50,000` complex labeled examples."** | **Local small LLM or fine-tuned decision model**<br>(`0.5B to 8B`, `20 to 200 ms` GPU or NPU) | An n-gram and spectral hyperplane cannot reason through a four-page contract or perform multi-step deduction. |
-| **"How do Instinct and a local LLM work together?"** | **`Tier 1 Instinct` (`0.2 ms`) to `Tier 2 Local LLM` (`50 ms`)** | Put Instinct in front of your local LLM via `BoundedReviewFallback`. Instinct handles `70% to 85%` of fast decisions and rejects out-of-scope traffic in `0.2 ms`, waking your local LLM only on the `15% to 30%` of ambiguous inputs (`is_ambiguous=True`). |
+| **"I have `3 to 30` examples per option (or a live teacher LLM) and want to stop paying `500 ms` for repeatable routing, triage, tool selection, or guardrails."** | **System 1: Instinct**<br>(`~100 KiB` `.s1m`, `0.2 ms` CPU) | Offloads repetitive structured decisions in `0.2 ms` on CPU with no neural network weights, conformal OOD abstention, character-typo resilience, and `<0.5 ms` rank-1 online updates. |
+| **"I have `3` static examples per class, no teacher model in the loop, and users use open-vocabulary synonyms (`'automobile'` when my examples only said `'car'`)."** | **Pretrained bi-encoder**<br>(`bge-small` or `all-MiniLM`, `70 to 90 MB`, `1.5 to 4 ms`) | Pretraining maps `'automobile'` to `'car'` on day zero. The trade-off is `70 to 90 MB` of neural weights, no `<1 ms` online updates, and false acceptance on out-of-scope queries unless wrapped by a conformal gate. |
+| **"The decision requires multi-hop logic, reading comprehension across paragraphs, arithmetic, or `50,000` complex labeled examples."** | **Local small LLM or fine-tuned decision model**<br>(`0.5B to 8B`, `20 to 200 ms` GPU or NPU) | Linear and spectral hyperplanes plateau around `50 to 100` examples per option and cannot reason through a four-page contract or perform multi-step deduction. |
+| **"How do Instinct and a local LLM work together?"** | **`Tier 1 Instinct` (`0.2 ms`) to `Tier 2 Local LLM` (`50 ms`)** | Put Instinct in front of your local LLM via `BoundedReviewFallback`. Instinct handles clear repeat traffic and rejects out-of-scope inputs in `0.2 ms`, waking your local LLM only on ambiguous inputs (`is_ambiguous=True`). |
 
 ---
 
@@ -221,23 +194,23 @@ The [`examples/drop_in/`](examples/drop_in/) and [`docs/drop_in/`](docs/drop_in/
 
 ### 1. Replace `Instructor` in a `FastAPI` endpoint (`POST /v1/triage`)
 - **Guide and code.** Read [`docs/drop_in/03_instructor_structured_outputs.md`](docs/drop_in/03_instructor_structured_outputs.md) and run `python examples/drop_in/instructor_structured_dropin.py`.
-- **Behavior.** A `FastAPI` endpoint returns a four-field Pydantic model (`department`, `page_oncall`, `impact_tags`, and `urgency_score`). In Wave 1, Instinct handles confident tickets in `0.45 ms` and escalates uncertain ones (`37.1%`) to the `Instructor` teacher. In Wave 2 and Wave 3, Instinct handles **`100.0%` (`35 of 35`) of tickets locally in `0.455 ms` with `0` LLM calls and `100.0%` four-field exact match**.
+- **Behavior.** A `FastAPI` endpoint returns a four-field Pydantic model (`department`, `page_oncall`, `impact_tags`, and `urgency_score`), escalating uncertain Wave 1 requests to the `Instructor` teacher and cutting over to local `<0.5 ms` `.s1m` execution once taught.
 
 ### 2. Replace `aurelio-labs/semantic-router`
 - **Guide and code.** Read [`docs/drop_in/01_semantic_router.md`](docs/drop_in/01_semantic_router.md) and run `python examples/drop_in/semantic_router_dropin.py`.
-- **Behavior.** Pass your existing `semantic_router.Route(name=..., utterances=...)` objects directly into `InstinctRouteLayer(routes)`. Instinct runs **`30x` faster (`0.14 ms` vs. `4.31 ms`)**, cuts artifact size from `67.2 MB` ONNX to a **`93.3 KiB` `.s1m` file**, and reduces out-of-scope false acceptance from `100%` to **`0.0% to 0.8%`**.
+- **Behavior.** Pass your existing `semantic_router.Route(name=..., utterances=...)` objects directly into `InstinctRouteLayer(routes)` to cut routing latency to `0.14 ms` (`93.3 KiB` `.s1m` vs. `67.2 MB` ONNX) while abstaining on out-of-scope queries.
 
 ### 3. Replace `RouteLLM` cascades in `langchain-core`
 - **Guide and code.** Read [`docs/drop_in/02_routellm_cascade.md`](docs/drop_in/02_routellm_cascade.md) and run `python examples/drop_in/routellm_dropin.py`.
-- **Behavior.** Plug `RunnableLambda` into your LangChain LCEL pipeline to route queries at `0.22 ms` CPU latency, tolerate character-typo corruption (`+3.5%` higher accuracy under typos than `all-MiniLM-L6-v2`), and learn online from frontier fallback answers.
+- **Behavior.** Plug `RunnableLambda` into your LangChain LCEL pipeline to route queries on CPU, tolerate character-typo corruption, and learn online from frontier fallback answers.
 
 ### 4. Replace `Llama-Prompt-Guard` for polarity and security checks
 - **Guide and code.** Read [`docs/drop_in/04_prompt_guard_security.md`](docs/drop_in/04_prompt_guard_security.md) and run `python examples/drop_in/prompt_guard_dropin.py`.
-- **Behavior.** Pre-screen prompts in `0.21 ms` with `#` negation-scope token transformations. Instinct reaches **`0.0%` false positives** on benign technical prompts containing words like `"ignore"` or `"system"`, and **`90%` to `100%` accuracy on negation flips** (`"do not cancel, upgrade"`), where `all-MiniLM-L6-v2` scores `60.0%`.
+- **Behavior.** Pre-screen prompts in `0.21 ms` with `#` negation-scope token transformations so benign technical prompts containing words like `"ignore"` or `"system"` are not falsely blocked and negation flips (`"do not cancel, upgrade"`) route accurately.
 
 ### 5. Run a `poke-env` agent on live Pokémon Showdown (`gen9randombattle`)
 - **Guide and code.** Read [`docs/drop_in/06_poke_env_showdown_agent.md`](docs/drop_in/06_poke_env_showdown_agent.md) and run `python benchmarks/quality/evaluate_poke_env_showdown.py --battles 50`.
-- **Behavior.** Subclass `poke_env.player.Player` in 15 lines of Python. Starting from `0` examples and four tactical option descriptions, Instinct beats `RandomPlayer` (`100%`) and `MaxBasePowerPlayer` (`98%`). Online turn-by-turn updates (`adapt_zero_shot` and `learn_from_tier2`) raise its win rate from **`42%` (cold zero-shot) to `62%` against `SimpleHeuristicsPlayer`**, compiling into a **`23 KiB` `.s1m` policy that runs in `0.093 ms` (`93 µs`) per turn**.
+- **Behavior.** Subclass `poke_env.player.Player` in 15 lines of Python; online turn-by-turn adaptation compiles into a `23 KiB` `.s1m` policy that runs in `0.093 ms` per turn against `SimpleHeuristicsPlayer`.
 
 ---
 
@@ -267,46 +240,19 @@ python examples/drop_in/prompt_guard_dropin.py
 
 ## Verify public benchmarks and receipts
 
-Every benchmark below runs offline on public datasets (`BANKING77`, `CLINC150-OOS`, and `NotInject`) and live `smogon/pokemon-showdown` battles.
+Every benchmark runs offline on public datasets (`BANKING77`, `CLINC150-OOS`, `HWU64`, and `NotInject`) and live `smogon/pokemon-showdown` battles. To reproduce the head-to-head encoder comparison below, run `python benchmarks/quality/evaluate_drop_in_replacements.py`:
 
-### 1. Compare against pretrained neural encoders (`all-MiniLM-L6-v2` and `BAAI/bge-small-en-v1.5`)
-To reproduce this table, run `python benchmarks/quality/evaluate_drop_in_replacements.py` ([full report](benchmarks/quality/drop_in_and_adaptation_report.md)):
-
-| Router architecture | Artifact size | `BANKING77` (32 classes clean) | `BANKING77` (32 classes typo stress) | `CLINC150-OOS` false accept | Negation and polarity accuracy | P50 CPU latency | `<1 ms` online RLS |
+| Router architecture | Artifact size | `BANKING77` (32 classes clean) | `BANKING77` (32 classes typo stress) | `CLINC150-OOS` false accept (`120` OOS) | Negation and polarity accuracy | P50 CPU latency | `<1 ms` online RLS |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Classical linear baseline** (`Unigram TF-IDF`) | `85 KiB` (`0` weights) | 77.3% | 66.0% | 3.3% | 70.0% | `0.18 ms` | No |
-| **`all-MiniLM-L6-v2`** (`22M` dense bi-encoder) | `91.1 MB` ONNX | 91.0% | 70.7% (`-20.3%` drop) | 8.0% | 60.0% | `1.32 ms` (`~10 ms` PyTorch) | No |
-| **`BAAI/bge-small-en-v1.5`** (`33M` dense bi-encoder) | `67.2 MB` ONNX | **94.5%** | **77.0%** (`-17.5%` drop) | 5.0% calibrated, 100% at `0.5` | 90.0% | `2.96 ms` (`~14 ms` PyTorch) | No |
-| **System 1: Instinct (Static `.s1m`)** | **`120 KiB`** (`0` weights) | **87.9%** | **74.2%** (`+3.5%` vs. MiniLM) | **0.0%** (`0 of 120`) | **90.0%** | **`0.22 ms`** | **Yes** |
-| **System 1: Instinct (`+ Online correction`)** | **`120 KiB`** (`0` weights) | **91.4%** (`+0.4%` vs. MiniLM) | **74.2%** | **0.0%** (`0 of 120`) | **100.0%** | **`0.22 ms`** | **Yes** |
+| **Classical linear baseline** (`Unigram TF-IDF`) | `85 KiB` (no neural weights) | 77.3% | 66.0% | 3.3% | 70.0% | `0.18 ms` | No |
+| **`all-MiniLM-L6-v2`** (`22M` dense bi-encoder) | `91.1 MB` ONNX | 91.0% | 70.7% | 8.0% | 60.0% | `1.32 ms` | No |
+| **`BAAI/bge-small-en-v1.5`** (`33M` dense bi-encoder) | `67.2 MB` ONNX | **94.5%** | **77.0%** | 5.0% calibrated (100% at `0.5`) | 90.0% | `2.96 ms` | No |
+| **System 1: Instinct (Static `.s1m`)** | **`120 KiB`** (no neural weights) | **87.9%** | **74.2%** | **0.0%** (`0 of 120`) | **90.0%** | **`0.22 ms`** | **Yes** |
+| **System 1: Instinct (`+ Online correction`)** | **`120 KiB`** (no neural weights) | **91.4%** | **74.2%** | **0.0%** (`0 of 120`) | **100.0%** | **`0.22 ms`** | **Yes** |
 
-### 2. Inspect sample-efficiency curves on public datasets (`0` to `40` examples per class)
-Measured on `24` intents from `CLINC150` (`120` test queries) and `BANKING77` (`192` test queries):
-
-| Examples per class | Total examples (`24` classes) | `CLINC150` raw online accuracy | `CLINC150` local offload % | `CLINC150` end-to-end accuracy | `BANKING77` raw online accuracy | `BANKING77` local offload % | `BANKING77` end-to-end accuracy |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`0` (Cold)** | **`0`** | `61.7%` | `0.0%` *(100% teacher)* | **`100.0%`** | `53.6%` | `0.0%` *(100% teacher)* | **`100.0%`** |
-| **`1` per class** | **`24`** | `65.8%` | **`42.5%` local** | **`92.5%`** | `57.3%` | **`27.6%` local** | **`96.4%`** |
-| **`3` per class** | **`72`** | `72.5%` | **`36.7%` local** | **`97.5%`** | `65.6%` | **`27.6%` local** | **`97.9%`** |
-| **`5` per class** | **`120`** | `82.5%` | **`37.5%` local** | **`97.5%`** | `70.3%` | **`33.9%` local** | **`97.4%`** |
-| **`8` per class** | **`192`** | `85.8%` | **`40.0%` local** | **`99.2%`** | `72.4%` | **`40.1%` local** | **`96.9%`** |
-| **`10` per class** | **`240`** | `85.8%` (`.s1m`) | **`80.0%` local** *(compiled)* | **`97.5%`** | `77.1%` (`.s1m`) | **`78.1%` local** *(compiled)* | **`90.1%`** |
-| **`all` (`10 to 25` per class)** | **`240 to 600`** | **`87.5%`** (`.s1m`) | **`79.2%` local** *(compiled)* | **`95.8%`** | **`90.1%`** (`.s1m`) | **`68.8%` local** *(compiled)* | **`99.5%`** |
-
-### 3. Run the six-category offline benchmark suite
-To reproduce this table offline (`block_network()`), run `python benchmarks/quality/evaluate_instinct_gauntlet.py` ([full report](benchmarks/quality/instinct_gauntlet_report.md)):
-
-| Category | Workload | Classical linear baseline | System 1: Instinct (Static) | System 1: Instinct (+ Online replay) |
-| :--- | :--- | :---: | :---: | :---: |
-| **1. High-cardinality intent routing** | `BANKING77` (32 intents, clean and typo) | 77.3% clean, 66.0% typo | **87.9%** clean, **74.2%** typo | **91.4%** |
-| **1b. Full 77-class scaling** | `BANKING77` (77 intents, clean and typo) | 62.0% clean, 45.5% typo | **79.5%** clean, **58.3%** typo | **88.1%** |
-| **2. Multi-domain and OOS rejection** | `CLINC150-OOS` (in-scope accuracy and OOS false accept) | 84.7%, 3.3% false accept | **86.1%**, **0.0% false accept** | **99.3%**, **0.0% false accept** |
-| **3. Injection and NotInject negatives** | `NotInject` benign-trigger FPR and polarity accuracy | 10.0% FPR, 70.0% accuracy | **0.0% FPR**, **90.0% accuracy** | **0.0% FPR**, **100.0% accuracy** |
-| **4. Authored drift probes (106)** | `banking_support`, `sms_triage`, and `model_routing` coverage | 86.2%, 77.5%, 77.8% | **100.0%**, **82.5%**, **88.9%** | **100.0%**, **87.5%**, **94.4%** |
-| **5. Multi-field structured triage** | 4-field joint accuracy (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`) | 97.1% | **100.0%** (`0.40 ms`) | **100.0%** (`0%` Wave 3 escalation) |
-| **6. Zero-shot cold-start routing** | `intent_routing` and `security_triage` (0-shot) | 51.0%, 50.0% | **81.0%**, **85.0%** | **100.0%** |
-
-> **Closed-loop replay vs. fresh noisy-teacher traffic.** In the table above, `+ Online replay` columns measure closed-loop oracle correction and replay on the evaluated prompt set. The end-to-end curves in Section 2 use an oracle fallback at $\alpha = 0.10$. We also evaluated **fresh held-out `HWU64` traffic (`64` intents) taught by a `10%`-noisy teacher under strict `1%` (`0.01`) and standard `5%` (`0.05`) family-wise local accepted-error gates**. See [`benchmarks/heldout_traffic/REPORT.md`](benchmarks/heldout_traffic/REPORT.md) and its [protocol and verifier](benchmarks/heldout_traffic/README.md).
+> **Full benchmark tables and fallible-teacher boundary.**
+> - **Shot-by-shot adaptation curves (`0` to `40` examples/class) and the 6-category gauntlet.** See [`benchmarks/quality/README.md`](benchmarks/quality/README.md), [`drop_in_and_adaptation_report.md`](benchmarks/quality/drop_in_and_adaptation_report.md), and [`instinct_gauntlet_report.md`](benchmarks/quality/instinct_gauntlet_report.md).
+> - **Fresh `64`-class `HWU64` traffic taught by a `10%`-noisy teacher.** Under a strict `1%` (`0.01`) family-wise conditional local error budget across `7,031` qualification items and `1,076` test requests, neither Instinct nor a classical logistic classifier can certify `<= 1%` risk (`0.0%` coverage). At the standard `5%` (`0.05`) local error budget, all learned methods qualify on `5 of 5` seeds with `0` budget misses, `instinct_lexical` offloads `27.68%` at `1.68%` local error vs. `simple_classifier`'s `20.46%` at `1.73%` error, and `instinct_hybrid` reaches `1.37%` local error (`5 of 5` `.s1m` reloadable). See [`benchmarks/heldout_traffic/REPORT.md`](benchmarks/heldout_traffic/REPORT.md).
 
 ---
 
