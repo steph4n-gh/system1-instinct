@@ -1,111 +1,111 @@
 {
   "exact_cache:101": {
-    "fit_seconds": 0.00010391604155302048,
+    "fit_seconds": 9.516580030322075e-05,
     "reloadable": true,
     "serialized_bytes": 69433
   },
   "exact_cache:17": {
-    "fit_seconds": 0.00019554095342755318,
+    "fit_seconds": 0.00016475003212690353,
     "reloadable": true,
     "serialized_bytes": 69440
   },
   "exact_cache:29": {
-    "fit_seconds": 0.00012158369645476341,
+    "fit_seconds": 0.00010975031182169914,
     "reloadable": true,
     "serialized_bytes": 69454
   },
   "exact_cache:43": {
-    "fit_seconds": 0.00011033285409212112,
+    "fit_seconds": 9.966688230633736e-05,
     "reloadable": true,
     "serialized_bytes": 69418
   },
   "exact_cache:71": {
-    "fit_seconds": 0.00010766694322228432,
+    "fit_seconds": 0.00010891584679484367,
     "reloadable": true,
     "serialized_bytes": 69413
   },
   "instinct_hybrid:101": {
-    "fit_seconds": 0.6944524999707937,
+    "fit_seconds": 0.6535463747568429,
     "reloadable": true,
     "serialized_bytes": 2945975,
     "serialized_header_bytes": 20902
   },
   "instinct_hybrid:17": {
-    "fit_seconds": 0.6801187503151596,
+    "fit_seconds": 0.6639955001883209,
     "reloadable": true,
-    "serialized_bytes": 2947467,
-    "serialized_header_bytes": 20954
+    "serialized_bytes": 2947466,
+    "serialized_header_bytes": 20953
   },
   "instinct_hybrid:29": {
-    "fit_seconds": 0.6910546249710023,
+    "fit_seconds": 0.6573210000060499,
     "reloadable": true,
     "serialized_bytes": 2947718,
     "serialized_header_bytes": 20933
   },
   "instinct_hybrid:43": {
-    "fit_seconds": 0.7994804582558572,
+    "fit_seconds": 0.6808789581991732,
     "reloadable": true,
     "serialized_bytes": 2947612,
     "serialized_header_bytes": 20895
   },
   "instinct_hybrid:71": {
-    "fit_seconds": 0.6627722498960793,
+    "fit_seconds": 0.6649053329601884,
     "reloadable": true,
-    "serialized_bytes": 2946175,
-    "serialized_header_bytes": 20948
+    "serialized_bytes": 2946176,
+    "serialized_header_bytes": 20949
   },
   "instinct_lexical:101": {
-    "fit_seconds": 0.9497102093882859,
+    "fit_seconds": 0.7020902503281832,
     "reloadable": true,
-    "serialized_bytes": 1882967,
-    "serialized_header_bytes": 250259
+    "serialized_bytes": 1882968,
+    "serialized_header_bytes": 250260
   },
   "instinct_lexical:17": {
-    "fit_seconds": 0.8936759163625538,
+    "fit_seconds": 0.7666645837016404,
     "reloadable": true,
-    "serialized_bytes": 1883353,
-    "serialized_header_bytes": 250258
+    "serialized_bytes": 1883355,
+    "serialized_header_bytes": 250260
   },
   "instinct_lexical:29": {
-    "fit_seconds": 0.924067750107497,
+    "fit_seconds": 0.708853957708925,
     "reloadable": true,
     "serialized_bytes": 1883657,
     "serialized_header_bytes": 250265
   },
   "instinct_lexical:43": {
-    "fit_seconds": 1.0397122083231807,
+    "fit_seconds": 0.785342457704246,
     "reloadable": true,
-    "serialized_bytes": 1883512,
-    "serialized_header_bytes": 250234
+    "serialized_bytes": 1883514,
+    "serialized_header_bytes": 250236
   },
   "instinct_lexical:71": {
-    "fit_seconds": 0.8094097916036844,
+    "fit_seconds": 0.9143669162876904,
     "reloadable": true,
-    "serialized_bytes": 1883096,
-    "serialized_header_bytes": 250254
+    "serialized_bytes": 1883095,
+    "serialized_header_bytes": 250253
   },
   "simple_classifier:101": {
-    "fit_seconds": 0.5822752080857754,
+    "fit_seconds": 0.5770943751558661,
     "reloadable": true,
     "serialized_bytes": 6738074
   },
   "simple_classifier:17": {
-    "fit_seconds": 0.7706837910227478,
+    "fit_seconds": 0.7304293750785291,
     "reloadable": true,
     "serialized_bytes": 6738074
   },
   "simple_classifier:29": {
-    "fit_seconds": 0.6160299996845424,
+    "fit_seconds": 0.5737868752330542,
     "reloadable": true,
     "serialized_bytes": 6738074
   },
   "simple_classifier:43": {
-    "fit_seconds": 0.5944767501205206,
+    "fit_seconds": 0.5789600410498679,
     "reloadable": true,
     "serialized_bytes": 6738074
   },
   "simple_classifier:71": {
-    "fit_seconds": 0.5859624999575317,
+    "fit_seconds": 0.5692477920092642,
     "reloadable": true,
     "serialized_bytes": 6738074
   }

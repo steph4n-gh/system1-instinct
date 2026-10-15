@@ -13,11 +13,11 @@ Means over the five seeds; latency columns average per-seed single-request quant
 | Method | Raw fresh accuracy | Qualified coverage (1% budget) | Qualified coverage (5% budget) | Local error rate (5% budget) | Local p50 | Local p95 | Fit + calibration | Serialized bytes (MiB) | Reloadable |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
 | Exact cache | No matches | 0.0% | 0.0% | N/A | 0.0001 ms | 0.0002 ms | 0.0001 s | 0.066 | 5/5 |
-| TF-IDF + logistic regression | 73.83% | 0.0% | 20.46% | 1.73% (19/1,101) | 0.4539 ms | 0.6541 ms | 0.6299 s | 6.426 | 5/5 |
-| Instinct: flat lexical | 72.55% | 0.0% | **27.68%** | 1.68% (25/1,489) | 0.3697 ms | 0.5298 ms | 0.9233 s | **1.796** | **5/5** |
-| Instinct: hybrid + hierarchy | 69.57% | 0.0% | 20.37% | **1.37% (15/1,096)** | **0.3572 ms** | **0.5290 ms** | 0.7056 s | 2.810 | **5/5** |
+| TF-IDF + logistic regression | 73.83% | 0.0% | 20.46% | 1.73% (19/1,101) | 0.4501 ms | 0.6109 ms | 0.6059 s | 6.426 | 5/5 |
+| Instinct: flat lexical | 72.55% | 0.0% | **27.68%** | 1.68% (25/1,489) | 0.3641 ms | 0.4878 ms | 0.7755 s | **1.796** | **5/5** |
+| Instinct: hybrid + hierarchy | 69.57% | 0.0% | 20.37% | **1.37% (15/1,096)** | **0.3613 ms** | **0.5018 ms** | 0.6641 s | 2.810 | **5/5** |
 
-Both Instinct variants execute faster per request (`0.36–0.37 ms` p50 and `0.53 ms` p95 vs `0.45 ms` p50 and `0.65 ms` p95 for `scikit-learn`) and produce smaller portable `.s1m` artifacts (`1.80 MiB` and `2.81 MiB` vs `6.43 MiB` pickle), reloading cleanly on all **`5/5` seeds** (`20,954 B` JSON header for `instinct_hybrid`).
+Both Instinct variants execute faster per request (`0.36 ms` p50 and `0.49–0.50 ms` p95 vs `0.45 ms` p50 and `0.61 ms` p95 for `scikit-learn`) and produce smaller portable `.s1m` artifacts (`1.80 MiB` and `2.81 MiB` vs `6.43 MiB` pickle), reloading cleanly on all **`5/5` seeds** (`20,954 B` JSON header for `instinct_hybrid`).
 
 The paired teacher makes 108/1,076 final errors per seed (10.04%, due to rounding). Because all qualified gates abstain at the strict 1% budget, that is also every 1%-gated cascade's final error rate. Under the qualified 5% (`alpha = 0.05`) gates, local offload reduces teacher calls by 20.4%–27.7% while holding local accepted errors to `1.37%–1.68%`.
 
@@ -48,12 +48,12 @@ Runtime fixes moved `HybridProjector.spectral_vectors` and `HybridProjector.subs
 | `.s1m` JSON header size | `1,269,769 B` (`1.27 MB`, failed 1 MiB limit) | **`20,954 B` (`20.5 KB`)** |
 | Serialized `.s1m` artifact size | `3.569 MiB` | **`2.810 MiB`** |
 | Reloadable seeds (with exact 10-input prediction/confidence/review parity) | `0/5` | **`5/5`** |
-| Mean fit + calibration wall time | `4.6780 s` | **`0.7056 s`** (`6.6×` faster) |
-| Mean local p50 / p95 latency | `2.4119 ms` / `2.8661 ms` | **`0.3572 ms` / `0.5290 ms`** (`6.8×` faster) |
+| Mean fit + calibration wall time | `4.6780 s` | **`0.6641 s`** (`7.0×` faster) |
+| Mean local p50 / p95 latency | `2.4119 ms` / `2.8661 ms` | **`0.3613 ms` / `0.5018 ms`** (`6.7×` faster) |
 
 ## Provenance and limits
 
-- Baseline runtime commit: `0b1072453749855f78669b73c54b938959627e3a` (current evaluated revision: `0f38def6d49be2e3892f1b574eab11b333362485`).
+- Baseline runtime commit: `0b1072453749855f78669b73c54b938959627e3a` (current evaluated revision: `7e2f16755744d38557819783987fe31ac5a3b592`).
 - Pinned HWU64 published split: `jianguoz/Few-Shot-Intent-Detection@fa9553312b1dba54b1be0aae2d30b13171f898e5`; [data attribution and protocol](README.md).
 - Clean cohorts: 1,280 noisy teaching, 640 trusted calibration, 1,006 development, 7,031 independent qualification, 1,076 final requests. Removed 73 within-partition duplicate rows; no conflicting or cross-partition duplicate texts remained. All five cohorts are disjoint under casefold/whitespace normalization.
 - Every method had the same trusted label allowance. The 8,677 clean calibration/development/qualification labels are a substantial audit cost, supplied by this public dataset; a noisy teacher alone cannot provide them.
