@@ -1,10 +1,8 @@
 # Add an explicit tool policy
 
-A taught skill suggests an answer. If that answer would trigger a tool, the
-application also needs an explicit permission decision. This is an optional step
-after [teaching and checking your first skill](first_skill.md).
+A taught skill predicts a structured decision, not permission to execute a privileged tool. When a decision triggers a tool call, use `SystemOneGuard` with `enforcement_profile=True`, `PolicyEngine`, an Ed25519 signing key, and `ActionLedger` to enforce deterministic permissions after [teaching your first skill](first_skill.md).
 
-This executable example permits one configuration lookup for one application-supplied principal, records the actual lookup result, and verifies the ledger. Other keys or tools have no grant. It persists a local demonstration key across runs.
+To authorize a single `read_config` lookup for `"agent-worker"`, record the execution outcome in a hash-chained SQLite ledger, and verify the signed chain, run:
 
 ```python
 from pathlib import Path
@@ -44,7 +42,7 @@ with ActionLedger(".system1/demo-audit.sqlite", require_durable=True) as ledger:
     if auth.outcome != DecisionOutcome.ALLOW:
         raise PermissionError(auth.reason)
 
-    # Execute exactly the authorized operation and arguments.
+    # Execute the authorized operation and arguments.
     result = {"service_name": "system1-demo"}[proposal.arguments["key"]]
     ledger.record_execution_outcome(
         action_id=proposal.action_id,
@@ -57,4 +55,4 @@ with ActionLedger(".system1/demo-audit.sqlite", require_durable=True) as ledger:
     print(result)
 ```
 
-The application must derive identity from its authenticated session, constrain tool arguments and targets, and keep agent code from bypassing the guard. Policy correctness is the operator's responsibility. The default guard without `enforcement_profile=True` can use statistical classification to allow actions. See [deployment boundaries](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/deployment.md) before granting consequential permissions.
+Derive `tenant_id`, `principal_id`, and `scope` from your authenticated application session, restrict tool arguments and targets in `PolicyRule`, and prevent agent code from calling tools outside `SystemOneGuard`. Without `enforcement_profile=True`, `SystemOneGuard` runs in diagnostic mode and can allow actions through statistical classification. Before granting consequential tool permissions, review [Deployment boundaries](../deployment.md).

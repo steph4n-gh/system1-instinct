@@ -1,10 +1,12 @@
-# Drop-In Guide 3: Replacing `Instructor` Inside a Live `FastAPI` Microservice
+# How to replace `Instructor` inside a `FastAPI` endpoint
 
-This guide shows how to replace `instructor.from_openai(client).chat.completions.create(response_model=...)` inside a real **`FastAPI` (`POST /v1/triage`) microservice**, extracting 4 typed fields simultaneously (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`) in **`0.45 ms`** with zero LLM calls after Wave 1.
+Use [`SystemOneInstructorClient`](../../examples/drop_in/instructor_structured_dropin.py) inside a `FastAPI` (`POST /v1/triage`) route to extract four typed fields (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`) in `0.45 ms` on CPU, escalating to `Instructor` only when the local decision is ambiguous.
 
 ---
 
-## 1. Before (`FastAPI` + `Instructor` Calling OpenAI on Every Request)
+## 1. Review the existing `FastAPI` and `Instructor` route
+
+In a standard `Instructor` microservice, every `POST /v1/triage` request calls the upstream LLM:
 
 ```python
 import instructor
@@ -23,7 +25,7 @@ class TriageResponse(BaseModel):
 
 @app.post("/v1/triage", response_model=TriageResponse)
 def triage_ticket(text: str) -> TriageResponse:
-    # 400–900 ms and an API call on EVERY single HTTP request forever:
+    # Spends 400 to 900 ms and an API call on every HTTP request:
     return client.chat.completions.create(
         model="gpt-4o-mini",
         response_model=TriageResponse,
@@ -33,9 +35,9 @@ def triage_ticket(text: str) -> TriageResponse:
 
 ---
 
-## 2. Drop-In Replacement (`FastAPI` + `SystemOneInstructorClient` / `BoundedReviewFallback`)
+## 2. Replace the route handler with `SystemOneInstructorClient`
 
-See the full runnable implementation in [`examples/drop_in/instructor_structured_dropin.py`](../../examples/drop_in/instructor_structured_dropin.py):
+To serve confident tickets locally in `0.45 ms` and escalate only uncertain tickets (`is_ambiguous=True`) to `Instructor`, call `SystemOneInstructorClient(IncidentTriageModel)` inside your route handler (full code in [`examples/drop_in/instructor_structured_dropin.py`](../../examples/drop_in/instructor_structured_dropin.py)):
 
 ```python
 from fastapi import FastAPI
@@ -51,7 +53,7 @@ instinct_client = SystemOneInstructorClient(IncidentTriageModel)
 
 @app.post("/v1/triage", response_model=TriageResponse)
 def triage_ticket(req: TicketRequest) -> TriageResponse:
-    # Extracts all 4 fields simultaneously in ~0.45 ms on CPU:
+    # Extracts all 4 fields in ~0.45 ms on CPU:
     res = instinct_client.create(req.text)
     return TriageResponse(
         department=res.values["department"],
@@ -64,13 +66,15 @@ def triage_ticket(req: TicketRequest) -> TriageResponse:
 
 ---
 
-## 3. Run the Live `FastAPI` + `Instructor` 3-Wave Cutover
+## 3. Run the three-wave `FastAPI` cutover script
+
+To run the three-wave `FastAPI` and `Instructor` cutover across `35` incident tickets per wave, execute:
 
 ```bash
 python examples/drop_in/instructor_structured_dropin.py
 ```
 
-### Real Output
+### Expected output
 
 ```text
 === 1. Single-Pass 4-Field Structured Extraction (`SystemOneInstructorClient`) ===

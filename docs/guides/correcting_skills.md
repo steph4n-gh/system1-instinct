@@ -1,54 +1,33 @@
 # Correct, compare, and adopt a skill
 
-System 1 gives you two complementary ways to correct a skill when you see a mistake or a new edge case:
+When a skill makes a mistake or encounters a new edge case, you can update it in two ways:
 
-1. **Instant Online Correction (`<1 ms` in-place Rank-1 RLS)**: Call `engine.learn(prompt, {"team": "support"})` or `engine.learn_from_outcome(prompt, {"team": "support"}, outcome="resolved", reward=1.0)` (or wrap your upstream LLM/reviewer with `BoundedReviewFallback(..., auto_online_update=True)`). By default (`preserve_calibration=True`), System 1 applies an exact Sherman-Morrison Rank-1 covariance update and scales calibration quantiles in place, then lets you persist immediately with `engine.save("support-route.s1m")`.
-2. **Governed Candidate Promotion (`TeachingSession`)**: Keep the lessons, a working incumbent skill, and a proposed candidate revision together: **Correct a lesson → build a candidate → compare answers → explicitly adopt.** Editing a lesson or assessing a candidate does not replace the skill already serving your application until `session.adopt()` passes your regression and error gates.
+1. **Apply an online rank-1 RLS update (`<1 ms`).** Call `engine.learn(prompt, {"team": "support"})` or `engine.learn_from_outcome(prompt, {"team": "support"}, outcome="resolved", reward=1.0)`, or wrap your upstream LLM or reviewer with `BoundedReviewFallback(..., auto_online_update=True)`. By default (`preserve_calibration=True`), `SystemOneEngine` applies a Sherman-Morrison rank-1 covariance update and scales calibration quantiles in place. To persist the updated skill, call `engine.save("support-route.s1m")`.
+2. **Run a governed candidate session (`TeachingSession`).** Store your lessons, incumbent skill, and candidate revision in one directory. Record a correction, compile a candidate, compare its evaluation answers against the incumbent skill, and call `session.adopt()` only after the candidate passes your regression and error gates.
 
-This governed workflow is available in **System 1 1.0.0**:
+To install System 1 1.0.0 or newer, run:
 
 ```bash
 python -m pip install 'system1>=1.0.0'
 ```
 
-`TeachingSession` supports both single-field text classification (`ChoiceField`,
-`BooleanField`, `MultiChoiceField`, `ScoreField`) and multi-field structured
-extraction schemas (where at least one field has ambiguity escalation enabled,
-the schema default). A schema that disables escalation on all fields is rejected
-because the session requires review of uncertain answers. Existing compiler and
-engine APIs, numerical algorithms, and `.s1m` format remain unchanged; no
-additional dependency is required. Existing hashed skills remain readable. This helper uses the
-existing TF-IDF projector with at most 1,024 features, ridge regularization
-0.1, and strict decisions at `alpha=0.05` (with optional `selection="chi2"`, `char_ngrams`, `mondrian=True`, `familiarity_alpha`, `prototype_alpha`, `hierarchical` routing, and `split="auto"` stratified routing). These choices are confined to the helper;
-the compiler's existing defaults remain unchanged.
+`TeachingSession` supports single-field and multi-field schemas (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`) when at least one field enables ambiguity escalation (the schema default). The session rejects schemas that disable escalation on all fields. By default, `TeachingSession` fits a `TfidfProjector` with up to 1,024 features, ridge regularization `0.1`, and strict decisions at `alpha=0.05`. You can also configure `selection="chi2"`, `char_ngrams`, `mondrian=True`, `familiarity_alpha`, `prototype_alpha`, `hierarchical` routing, and `split="auto"` stratified routing.
 
-For the experimental visual version, use a repository checkout and run
-`python -m examples.teaching_by_doing`. Use
-**Review candidate** to check a proposed document-filing skill and **Adopt
-candidate** to activate a passing revision. The
-[workspace guide](../../examples/teaching_by_doing/README.md) explains its authored
-sample data and retained historical evidence.
+To launch the browser workspace from a repository checkout, run `python -m examples.teaching_by_doing`. Click **Review candidate** to check a proposed document-filing skill and **Adopt candidate** to activate a passing revision. See the [workspace guide](../../examples/teaching_by_doing/README.md) for details on its sample data.
 
-## Start with the decision and its lessons
+## Prepare the decision splits
 
-For this example, payment questions belong to `billing` and broken software
-belongs to `support`. An example pairs the message with the answer you want.
+Keep your labeled examples in three disjoint splits:
 
-Keep three groups separate:
+| Split | Purpose |
+|---|---|
+| `teach` | Fit the numerical decision head |
+| `calibrate` | Set review thresholds on held-out examples |
+| `evaluate` | Compare candidate and incumbent answers on unseen examples |
 
-| Group | Session split | Purpose |
-|---|---|---|
-| Teach the decision | `teach` | Fit the numerical head |
-| Recognize uncertainty | `calibrate` | Set review behavior on separate examples |
-| Compare old and new answers | `evaluate` | Measure a candidate on examples outside teaching and calibration |
+Keep related customer threads and near-duplicate messages in the same split. Once you inspect an evaluation failure and add a lesson for it, treat that check as regression evidence and reserve fresh examples for final verification.
 
-A session stores labels and source notes; it does not obtain correct answers for
-you. Related customer threads and near-duplicate messages should stay in one
-group. Once you use an evaluation result to decide a correction, that check is
-regression evidence. Keep fresh, independently labeled cases for later confirmation.
-
-Create `lessons.json` using this layout, replacing the short illustrative lists
-with representative examples of **both** choices in each group:
+Create `lessons.json` with representative examples for every option in each split:
 
 ```json
 {
@@ -67,11 +46,11 @@ with representative examples of **both** choices in each group:
 }
 ```
 
-These six rows demonstrate the file format, not a reliably taught skill. The
-report may withhold adoption because of mistakes or insufficient acceptance.
-There is no universal number of examples that makes a task reliable.
+The six rows above show the JSON layout. A real task requires enough calibration and evaluation rows to pass your coverage and accuracy gates.
 
-## Use the Python workflow
+## Assess a candidate in Python
+
+To load `lessons.json` into a `TeachingSession` and compile a candidate skill, run:
 
 ```python
 import json
@@ -92,50 +71,21 @@ report = session.assess()
 print(json.dumps(report, indent=2))
 ```
 
-`assess()` compiles, saves, and reloads a separate candidate. It compares the
-candidate and the current adopted skill, if one exists, on the same evaluation
-rows using strict review. All three splits are required for assessment.
-An initial session can be assessed before it has an adopted skill. Assessment
-requires teaching examples for every choice, at least two calibration examples,
-and evaluation examples. These are input requirements, not a useful evidence
-budget: tiny calibration sets will usually withhold decisions.
+`session.assess()` compiles, saves, and reloads a candidate `.s1m` file, then evaluates both the candidate and the adopted incumbent skill (if one exists) on the `evaluate` split in strict mode. Assessment requires teaching examples for every option, at least two calibration examples, and at least one evaluation example.
 
-Reopen the same session with `TeachingSession(".system1/support-session")`.
-The retained records are available through `session.records`; `session.report`
-and `session.snapshot()` expose the assessment and current state. The session
-also exposes `current_path` and `candidate_path` for its saved artifacts.
-`snapshot()` distinguishes an adopted candidate from a stale pending assessment.
-Records and artifacts are ordinary local files: keep this a single-writer session,
-not a shared multi-user database. Inputs are limited to 8,192 characters.
+To reopen an existing session directory, call `TeachingSession(".system1/support-session")`. Inspect `session.records` for stored lessons, `session.report` and `session.snapshot()` for assessment status, and `session.current_path` and `session.candidate_path` for artifact paths. Treat a session directory as a single-writer local workspace. Each input is capped at 8,192 characters.
 
-## Read the before-and-after report
+## Inspect the assessment report
 
-Three questions matter:
+Check three metrics in the dictionary returned by `session.assess()`:
 
-- **Does the raw guess choose the right label?** `raw_accuracy` counts all
-  evaluation rows, including reviewed guesses. Weak raw accuracy points to
-  incomplete or inconsistent lessons, an unclear task, or inadequate features.
-- **How much work can proceed without review?** `coverage` is the accepted
-  fraction. `accepted_errors` counts wrong guesses that would be acted on.
-  Accurate guesses with little acceptance call for checking calibration and
-  representative evidence, not silently ignoring review.
-- **Did the correction break earlier useful behavior?** `regressions` counts
-  cases that the adopted skill previously answered correctly without review but
-  the candidate now gets wrong **or sends to review**. `raw_regressions` separately
-  counts previously correct raw guesses that became wrong.
+- **Raw accuracy (`raw_accuracy`).** The fraction of `evaluate` rows where the top guess matches the label, including guesses flagged for review. Low raw accuracy indicates conflicting labels, missing lessons, or insufficient features.
+- **Coverage and accepted errors (`coverage` and `accepted_errors`).** `coverage` is the fraction of `evaluate` rows accepted without review (`is_ambiguous=False`). `accepted_errors` counts wrong predictions that were accepted without review.
+- **Regressions (`regressions` and `raw_regressions`).** `regressions` counts `evaluate` rows that the incumbent skill answered right without review, but the candidate now gets wrong or sends to review. `raw_regressions` counts previously right top guesses that became wrong.
 
-The `candidate` and `incumbent` summaries also report counts, review rate, accepted
-correct answers, and raw correct answers. `cases` lists each checked input and
-expected label, both predictions, review decisions, prediction sets and regression
-flags, so you can inspect the actual changed answers. `diagnostics` explains
-observed patterns; `reasons` lists failed checks. These are descriptive measurements, not proof of
-what caused a failure, out-of-distribution detection, or a confidence guarantee.
-For a skill controlling a workflow or game, check the actual completed task too:
-correct answers on a fixed list do not establish successful execution.
+The report also includes `candidate` and `incumbent` summaries, per-row comparisons in `cases`, pattern summaries in `diagnostics`, and failed gate names in `reasons`.
 
-The default demonstration policy requires raw accuracy of at least 0.8, coverage
-of at least 0.5, no accepted errors, and no regressions. You can state your own
-policy explicitly:
+By default, `session.assess()` requires `min_accuracy=0.8`, `min_coverage=0.5`, `max_accepted_errors=0`, and `max_regressions=0`. To set custom gates for your workload, pass them to `session.assess()`:
 
 ```python
 report = session.assess(
@@ -146,14 +96,11 @@ report = session.assess(
 )
 ```
 
-Choose thresholds for your task before reviewing candidate outcomes. Passing
-these finite checks is not certification of production accuracy. Do not lower a
-threshold merely to make an unsuccessful candidate pass.
+Set your thresholds before inspecting candidate results. Do not lower a gate just to force a failing candidate through.
 
-## Correct one lesson
+## Correct a lesson and reassess
 
-Suppose the skill suggests `billing` for **“The payment page crashes.”** Under our
-rule the answer is `support` because the software is broken:
+Suppose the skill predicts `billing` for `"The payment page crashes"`. Under our routing rule, broken software belongs to `support`. To record the lesson and re-run assessment, call `session.record(...)`:
 
 ```python
 session.record("The payment page crashes", "support", source="human")
@@ -161,20 +108,13 @@ report = session.assess()
 print(json.dumps(report, indent=2))
 ```
 
-The default split is `teach`. Recording the same normalized input in the same
-split replaces its earlier label; it does not add contradictory copies. An input
-already assigned to another split is rejected, so a correction cannot quietly
-become its own evaluation evidence. `session.remove(text)` explicitly removes a
-record. If moving a known case into teaching, supply different evaluation cases
-and disclose that the original case is now a lesson.
+`session.record(...)` writes to the `teach` split by default. Recording the same normalized input in the same split replaces its previous label instead of creating duplicate entries. If that input already exists in `calibrate` or `evaluate`, `session.record(...)` raises an error so a lesson cannot also serve as its own evaluation test. To delete an entry, call `session.remove(text)`.
 
-A failed candidate leaves the adopted skill available. Keep representative older
-lessons while adding a few different examples of the confusing distinction, then
-check both teams again. One corrected sentence does not establish generalization.
+If the new candidate fails a gate, the previously adopted skill remains active. Add several distinct examples of the boundary case rather than repeating one sentence, then check `session.assess()` again.
 
-## Adopt deliberately
+## Adopt a passing candidate
 
-After reviewing a passing report, activate that exact candidate:
+When `report["passed"]` is `True`, promote the candidate to the active skill by calling `session.adopt()`:
 
 ```python
 session.adopt()
@@ -182,26 +122,20 @@ answer = session.predict("Please send my payment receipt")
 print(answer)
 ```
 
-`adopt()` requires a passing assessment with unchanged lessons, candidate, and
-current skill. Editing data or replacing an artifact makes the earlier approval
-stale: assess again. `session.engine` and `session.predict()` use the adopted skill,
-never an unapproved candidate. Before the first adoption `session.engine` is
-`None`, and `session.predict()` asks you to assess and adopt first. Predictions
-can still need review after adoption.
+`session.adopt()` verifies that the lessons, candidate artifact, and incumbent artifact have not changed since the passing `session.assess()` call. If you edit lessons or files after assessment, run `session.assess()` again before adopting. `session.engine` and `session.predict()` always run the adopted skill and never run an unapproved candidate. Before the first adoption, `session.engine` is `None`.
 
-This explicit adoption is separate from the existing
-[automatic teacher-promotion policy](../typesafe.md). It does not change that
-adapter or turn a predicted label into permission to execute an action.
+Explicit adoption in `TeachingSession` is separate from the automatic promotion policy in [`TypeSafeClient`](../typesafe.md) and from deterministic tool permissions in [`SystemOneGuard`](policy_guard.md).
 
-## The same workflow from the CLI
+<a id="the-same-workflow-from-the-cli"></a>
+## Run the session workflow from the CLI
 
-Export the schema once:
+First, write your schema to `schema.json`:
 
 ```python
 Path("schema.json").write_text(json.dumps(SupportRoute().to_dict()))
 ```
 
-Then run:
+Next, initialize the session, load `lessons.json`, add a correction, and run assessment from the command line:
 
 ```bash
 system1 teach .system1/support-session --schema schema.json
@@ -210,78 +144,40 @@ system1 teach .system1/support-session --record "The payment page crashes" --lab
 system1 teach .system1/support-session --assess --json
 ```
 
-The dataset format is the `teach` / `calibrate` / `evaluate` object shown above,
-with arrays of `[text, label]` pairs. It is different from the lower-level
-compiler's field-mapping format. `--split` selects a split for one record and
-defaults to `teach`; `--remove "text"` removes a record. With no action flag,
-`system1 teach .system1/support-session --json` reports the session state.
-The CLI returns exit code 0 for success and 2 when an assessment fails its checks
-(with the report retained). Handled operational or data errors return 1;
-argument syntax errors also return 2.
+Use `--split` to target `teach`, `calibrate`, or `evaluate` when recording a single example, or `--remove "text"` to delete a record. Running `system1 teach .system1/support-session --json` with no action flag prints the current session snapshot. The CLI exits with code `0` when assessment passes, `2` when assessment fails its gates or receives invalid CLI flags, and `1` on operational or data errors.
 
-After reviewing a passing assessment:
+To adopt a passing candidate from the CLI, run:
 
 ```bash
 system1 teach .system1/support-session --adopt --json
 ```
 
-For multi-field schemas (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and
-`ScoreField`), pass a mapping of field values to `session.record(text, {"field_a": ..., "field_b": ...}, split="auto")`
-or attach the session to `BoundedReviewFallback(teaching_session=session, review_fn=..., auto_record_lessons=True, auto_online_update=True)`
-to automatically record teacher-reviewed boundary decisions and apply sub-millisecond
-online updates. For lower-level compilation or continuous numerical telemetry, see the
-[teaching API guide](training_experts.md).
+For multi-field schemas (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`), pass a dictionary of field labels to `session.record(text, {"field_a": ..., "field_b": ...}, split="auto")`, or pass `teaching_session=session` to `BoundedReviewFallback(teaching_session=session, review_fn=..., auto_record_lessons=True, auto_online_update=True)`. For lower-level compilation options, see [Teach and compile a decision skill](training_experts.md). For an empirical study of iterative corrections on real documents, see the [BBC correction workflow report](../../benchmarks/quality/document_workflow/README.md).
 
-For a measured real-document example, see the
-[BBC correction-workflow experiment](../../benchmarks/quality/document_workflow/README.md).
-Targeted feedback reduced accepted mistakes on its separate holdout, with more
-reviews; every candidate still failed the default zero-error adoption checks.
-That result illustrates why a quality improvement and permission to adopt are
-separate decisions.
+## Qualify a candidate on held-out traffic
 
-
-## Independent qualification
-
-`TeachingSession` also supports a separate one-shot qualification step. Choose the workload
-policy before inspecting the cohort, keep this data outside fitting, calibration,
-and recurring evaluation, and collect independently reviewed representative rows.
+To require statistical qualification on an independent cohort before adoption, pass `require_qualification=True` to `session.assess()` and then call `session.qualify(...)`:
 
 ```python
 report = session.assess(require_qualification=True)
-# Only a passing development assessment can be qualified.
+# Only a passing development assessment can proceed to qualification.
 fresh = json.loads(Path("fresh-cases.json").read_text())
 qualification = session.qualify(
-    fresh, source="Reserved independently reviewed requests; collection dates and method",
-    min_accepted_accuracy=.95, min_coverage=.8, confidence=.95,
+    fresh,
+    source="Reserved independently reviewed requests with collection dates",
+    min_accepted_accuracy=0.95,
+    min_coverage=0.80,
+    confidence=0.95,
 )
 print(qualification["candidate"], qualification["reasons"])
-# Review the passing evidence before explicitly calling session.adopt().
+# Review the qualification output before calling session.adopt().
 ```
 
-Each fresh row is an object with `input`, `label`, and optional `group`. Related
-records can have a nonempty `group` in all session splits, but a group cannot cross
-splits. Qualification requires one row per supplied independent group. Omitting
-groups is a declaration that individual rows are independent; the software cannot
-verify that, detect all paraphrases, or establish label correctness.
+Each item in `fresh-cases.json` is an object with `input`, `label`, and an optional `group` identifier. Related records can share a `group` within one split, but a `group` cannot span multiple splits. Qualification accepts at most one row per independent group.
 
-Both accepted-correctness and coverage lower bounds must pass. The exact one-sided
-binomial bounds share the specified confidence error budget across all attempts
-in this session. The first request fixes the confidence target. Attempt `k`
-allocates `(1 - confidence) / (2 * k * (k + 1))` to each bound, so repeated
-qualification cannot reset the error budget. A few perfect answers
-are insufficient; zero acceptance leaves accepted correctness undefined. These
-bounds assume independent representative units and a fixed candidate. They are
-not a promise under arbitrary changes in traffic. Development bounds are descriptive
-only because checks may be correlated and have influenced repeated revisions.
+Both the accepted-accuracy lower bound and the coverage lower bound must pass. `TeachingSession` computes exact one-sided binomial bounds and splits the total error budget `1 - confidence` across all qualification attempts in the session. Attempt `k` allocates `(1 - confidence) / (2 * k * (k + 1))` to each bound, so repeated attempts cannot reset the statistical error budget. Every qualification attempt freezes its cohort, source, and policy before running the first prediction, and consumes those rows and groups for the life of the session.
 
-The request, source, policy, and cohort are frozen before the first prediction.
-A failed or interrupted attempt consumes its rows/groups across this session,
-including later candidates. They cannot be imported as lessons or replaced with
-another policy. Other copies of a session and semantic overlap cannot be controlled
-by software; reserve genuinely fresh data rather than copying inspected tests.
-The confidence scope does not extend to separate session directories. Adoption
-rechecks the exact frozen evidence when qualification is required.
-Default `assess()` retains the existing development-only approval policy.
+To run qualification and adoption from the CLI, execute:
 
 ```bash
 system1 teach .system1/support-session --assess --require-qualification
@@ -289,22 +185,20 @@ system1 teach .system1/support-session --qualification fresh-cases.json --source
 system1 teach .system1/support-session --adopt
 ```
 
-## Approved revisions and recovery
+## Roll back to an approved revision
+
+To inspect previously adopted revisions and restore an earlier `.s1m` artifact while keeping all recorded lessons, call `session.rollback(revision)`:
 
 ```python
 print(session.history)
 revision = session.history[0]["revision"]
-session.rollback(revision)  # Explicitly restore approved bytes, keeping all lessons.
+session.rollback(revision)
 print(session.decision_details("Please refund my payment"))
 ```
 
-`history` retains artifact digests, approval dates, and whether qualification
-was part of the approval. Recovery validates the artifact, schema, approval policy
-and required qualification. A missing or altered archive is refused. Rollback
-invalidates the pending assessment even if the restored skill was its original
-incumbent. Reassess before another adoption; restore is not automatic promotion.
-An existing approved skill is retained during adoption with its
-legacy status when its earlier assessment is unavailable.
+`session.history` lists each approved revision digest, timestamp, and qualification status. `session.rollback(revision)` verifies the archive digest, schema, and approval metadata before restoring the artifact, and marks any pending candidate assessment stale.
+
+To view history and roll back from the CLI, run:
 
 ```bash
 system1 teach .system1/support-session --history
@@ -312,16 +206,12 @@ system1 teach .system1/support-session --rollback FULL_APPROVED_REVISION_DIGEST
 system1 teach .system1/support-session --predict "Please refund my payment" --json
 ```
 
-## Choose the fitting method
+## Select the choice solver
 
-Ridge remains the default. A new session can opt into the existing logistic solver:
+`TeachingSession` uses ridge regression by default. To fit `ChoiceField` heads with cross-entropy logistic optimization instead, pass `choice_solver="logistic"` when creating a new session:
 
 ```python
 session = TeachingSession(".system1/logistic-session", SupportRoute, choice_solver="logistic")
 ```
 
-Install `system1[teaching]` for its SciPy fitting dependency. The chosen setting is
-retained, and reopening with a different supplied setting is refused. Default
-teaching, qualification, rollback, and inference on saved logistic heads need no
-SciPy. Old version-one session state reopens without rewriting; missing solver
-settings mean ridge. Reassess old active candidate reports before adoption.
+To use `choice_solver="logistic"`, install `python -m pip install 'system1[teaching]'` (which adds SciPy for fitting). Saved `.s1m` artifacts run inference with NumPy alone and do not require SciPy at decision time.

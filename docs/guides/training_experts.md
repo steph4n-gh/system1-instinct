@@ -1,49 +1,23 @@
-# Teaching a decision skill
+# Teach and compile a decision skill
 
-If you are new to labeling examples or correcting a skill, start with
-[Teach your first skill](first_skill.md). It explains those terms using a copyable
-message-and-answer file. This page covers the underlying API and data contracts.
+If you are building your first skill, start with the [Teach your first skill](first_skill.md) tutorial. To manage teaching, calibration, and evaluation splits with candidate promotion gates, use [`TeachingSession`](correcting_skills.md). Use this how-to guide when you want to call `SystemOneCompiler`, `TfidfProjector`, or the online learning methods on `SystemOneEngine` directly.
 
-For single-field and multi-field schemas (`ChoiceField`, `BooleanField`,
-`MultiChoiceField`, `ScoreField`), System 1 provides the
-[correction workflow](correcting_skills.md) (`TeachingSession`): retain lessons, assess a separate
-candidate, compare it with the approved skill, and adopt explicitly. It wraps the
-existing compiler and strict engine without changing their APIs or saved format.
-This page remains the reference for lower-level compilation, custom projectors,
-and continuous numerical telemetry.
+`SystemOneCompiler` and `SystemOneEngine` fit lightweight numerical decision heads over fixed text and numeric features, save them to `.s1m` files, and run them locally with NumPy. You can build a skill in three steps:
 
-System 1 learns a particular decision from labeled examples, saves it as a small
-`.s1m` file, and applies it locally. A person, an existing system, or a reasoning
-model can supply the examples. An LLM is not required.
+1. **Initialize a strict engine at zero examples.** Call `engine = SystemOneEngine(SupportRoute, strict_mode=True)`. Before you teach it, the engine abstains (`is_ambiguous=True`) on every input instead of guessing.
+2. **Teach online or compile a batch dataset.** For online updates in `<1 ms`, call `engine.learn(prompt, labels)` or `engine.learn_from_outcome(prompt, labels, outcome="resolved", reward=1.0)`, or wrap an LLM with `BoundedReviewFallback(..., auto_online_update=True)`. For batch compilation, call `SystemOneCompiler(SupportRoute).compile(examples, augment=False)`.
+3. **Save and reload the `.s1m` artifact.** Call `engine.save("support-route.s1m")` or `skill.save("support-route.s1m")`, and reload the artifact with `SystemOneEngine.load("support-route.s1m")` or `CompiledSystemOneModel.load("support-route.s1m")`.
 
-The compiler and online learner fit small numerical decision heads over fixed
-text features. They do not train a language model or acquire general language
-understanding. The product loop follows a simple progression:
+## Compile and run a skill in Python
 
-1. **Cold-Start (`0 examples`)**: `engine = SystemOneEngine(SupportRoute, strict_mode=True)` safely abstains (`is_ambiguous=True`) on every input instead of guessing.
-2. **Online Teaching (`3–10 examples`)**: Call `engine.learn(prompt, labels)` or `engine.learn_from_outcome(prompt, labels, outcome="resolved", reward=1.0)` (or wrap an LLM with `BoundedReviewFallback(..., auto_online_update=True)`). Each Rank-1 Sherman-Morrison RLS update completes in `<1 ms` and preserves conformal calibration (`preserve_calibration=True` by default).
-3. **Portable `.s1m` Artifact (`engine.save` / `SystemOneEngine.load`)**: Persist the online-taught engine or batch-compiled model to a compact `.s1m` file (`engine.save("support-route.s1m")`) and reload it anywhere (`SystemOneEngine.load("support-route.s1m")`).
-
-## Try one skill
-
-For complete demonstrations with separate teaching, calibration, and evaluation
-cases, run [the four teaching examples](../../examples/teaching/README.md).
-The smaller example below introduces both online teaching (`engine.learn_from_outcome`)
-and batch compilation (`SystemOneCompiler.compile`).
-
-From the repository root:
+To run a complete batch compilation from the repository root, execute:
 
 ```bash
 python examples/teach_skill.py
 system1 decide "Please refund this payment" --model .system1/support-route.s1m --json
 ```
 
-The [example](../../examples/teach_skill.py) teaches eight billing/support examples,
-saves the skill, reloads it, and evaluates a new sentence. It deliberately reports
-that review is needed: eight examples split across fitting and calibration demonstrate
-the batch API, not reliable coverage of a full support workload.
-
-The essential Python calls in `examples/teach_skill.py` are:
+For multi-split demonstrations, see [the four teaching examples](../../examples/teaching/README.md). To compile eight examples in Python, save the `.s1m` artifact, and run a strict decision, execute:
 
 ```python
 from system1 import ChoiceField, DecisionSchema, SystemOneEngine
@@ -73,22 +47,11 @@ print(decision.values)
 print("Needs review:", decision.is_ambiguous)
 ```
 
-`augment=False` means only the supplied examples are used. Invalid labels,
-unknown fields, and missing classes are errors. Python's existing
-`compile(...)` default still augments with schema-derived templates for backward
-compatibility; explicitly disable augmentation when teaching your own skill.
+Pass `augment=False` so `SystemOneCompiler` uses only your supplied examples and raises an error on invalid labels, unknown fields, or missing options. With `strict_mode=True`, `SystemOneEngine` uses held-out calibration scores to construct conformal prediction sets. Check `decision.is_ambiguous` on every call and route ambiguous inputs to a human reviewer or upstream LLM.
 
-With `strict_mode=True`, the engine uses held-out calibration evidence to form
-prediction sets. Always inspect `decision.is_ambiguous`: a best-guess value is
-still returned when the skill needs review. Your application chooses how to ask
-a person or call an upstream LLM.
+### Teach a skill online from zero examples
 
-### Online Cold-Start (`0 -> 6 examples -> .s1m`)
-
-Instead of batch-compiling upfront, you can also start at `0` examples and teach
-the engine online in `<1 ms` per example using `engine.learn(...)` or
-`engine.learn_from_outcome(...)` (`preserve_calibration=True` by default), then
-save directly with `engine.save(...)` and reload with `SystemOneEngine.load(...)`:
+To teach an engine online without batch compilation, call `engine.learn_from_outcome(...)` or `engine.learn(...)` (`preserve_calibration=True` by default), then save with `engine.save(...)`:
 
 ```python
 from system1 import ChoiceField, DecisionSchema, SystemOneEngine
@@ -116,21 +79,14 @@ decision = loaded_engine.decide("My credit card was billed twice for the subscri
 print(decision.values, "Needs review:", decision.is_ambiguous)
 ```
 
-## Choose text features for a taught skill
+## Configure a TF-IDF or hybrid projector
 
-The default hashed features remain useful without fitting a vocabulary. For a
-text classification task with teaching examples, you can instead use the optional
-`TfidfProjector`. It learns which words and adjacent word pairs to retain, weighs
-common words less, and normalizes each document. It is classical text processing,
-not a language model. Both teaching and inference use only NumPy.
+By default, `SystemOneCompiler` uses a deterministic feature hashing projector. To fit an explicit vocabulary with supervised feature selection and character n-grams, pass a fitted `TfidfProjector` (or `HybridProjector` for TF-IDF plus spectral `PPMI+SVD` features) to `SystemOneCompiler`:
 
 ```python
 from system1 import TfidfProjector
 
-# Fit the vocabulary ONLY on the examples reserved for teaching.
-# You can optionally pass selection="chi2", labels=[...], and char_ngrams=(3, 5)
-# for supervised feature selection and character n-gram typo resilience, or use
-# HybridProjector.fit(...) to combine chi2 TF-IDF with a spectral PPMI+SVD dense subspace.
+# Fit the vocabulary only on the teaching split.
 projector = TfidfProjector.fit(
     [text for text, label in examples["team"]],
     selection="chi2",
@@ -140,7 +96,6 @@ projector = TfidfProjector.fit(
 calibration = {"team": [
     ("Please correct my invoice total", "billing"),
     ("The application crashes during startup", "support"),
-    # Supply enough separate, representative examples for useful calibration.
 ]}
 skill = SystemOneCompiler(
     SupportRoute,
@@ -155,54 +110,35 @@ skill.save("support-route.s1m")
 loaded = CompiledSystemOneModel.load("support-route.s1m")
 ```
 
-The default vocabulary cap is 2,048 terms. Text is lowercased and limited to its
-first 8,192 characters; tokens use Unicode word characters with at least two
-characters. Terms longer than 128 characters are ignored. Unseen words are
-ignored, and an input with no known features requires review. That check alone
-does not detect every out-of-scope input containing familiar words. TF-IDF does
-not support recency weighting.
+`TfidfProjector` caps its vocabulary at 2,048 terms by default, lowercases the first 8,192 characters of each input, and extracts Unicode word tokens of length 2 to 128. If an input contains no known vocabulary features, strict mode marks the decision as needing review.
 
-Vocabulary and IDF weights are frozen and embedded in `.s1m`. Refit and recompile
-when teaching new vocabulary; online head corrections do not expand it. Keep
-vocabulary fitting, head fitting, calibration, and evaluation appropriately
-separated. In particular, fitting vocabulary before asking the compiler to
-split those same rows internally would expose calibration text to vocabulary
-selection; use explicit separate calibration as above. Existing hashed skills
-remain readable. Saved skills using the TF-IDF projector
-require System 1 1.0.0 or newer.
+Because `TfidfProjector` freezes its vocabulary and IDF weights inside the `.s1m` file, always fit the projector on your teaching split alone and pass a separate `calibration_exemplars` mapping to `compile(...)`. Fitting `TfidfProjector` on all rows before letting `compile(...)` split calibration internally leaks calibration vocabulary into the projector.
 
-## Optional classification fitting
+<a id="optional-classification-fitting"></a>
+## Fit a choice head with logistic regression
 
-Install the optional teaching dependency with
-`python -m pip install 'system1[teaching]>=1.0.0'`. From a checkout, use
-`python -m pip install -e '.[teaching]'`. For a choice skill, compare the
-default ridge fit with a cross-entropy fit by setting
-`SystemOneCompiler(SupportRoute, projector=projector, choice_solver="logistic",
-regularization=.1)` in the example above. This uses SciPy's iterative optimizer
-during teaching and the same NumPy decision head during inference. It does not
-download a language model. The saved `.s1m` loads without SciPy.
+To fit `ChoiceField` heads with cross-entropy optimization instead of the default ridge solver, install the `teaching` extra and pass `choice_solver="logistic"`:
 
-Every choice needs fitting examples. Lower `regularization` permits a more
-flexible fit; select it using separate development data. Temperature and
-conformal calibration still use separate held-out folds. A better fitting loss
-does not itself qualify the skill or detect unfamiliar inputs. Evaluate accuracy,
-acceptance and unsupported-input rejection together. The CLI and automatic
-observation adapters retain their existing ridge fit; this option is currently
-on the Python compiler. Online corrections still use the existing recursive
-least-squares update and invalidate calibration; recompiling retained lessons is
-the preferred way to preserve the selected fitting method.
+```bash
+python -m pip install 'system1[teaching]>=1.0.0'
+```
 
-See the [email comparison](../../examples/inbox_zero/README.md) for measured gains,
-remaining accepted errors, and the distinction between authored and real-world
-evidence. The tiny snippet above only demonstrates the API.
+In Python, pass `choice_solver="logistic"` and `regularization` to `SystemOneCompiler`:
+
+```python
+compiler = SystemOneCompiler(
+    SupportRoute,
+    projector=projector,
+    choice_solver="logistic",
+    regularization=0.1,
+)
+```
+
+`choice_solver="logistic"` uses SciPy during compilation and writes standard NumPy weights to the `.s1m` file, so inference requires only NumPy. See the [Inbox Zero email comparison](../../examples/inbox_zero/README.md) for benchmark results comparing ridge and logistic heads.
 
 ## Teach your data
 
-Define a narrow task and consistent labels. Include ordinary cases, confusing
-near-matches, and examples of each label. For instance, distinguish an invoice
-refund from a request for a new product quote using your own routing rules.
-
-The CLI accepts a JSON field mapping:
+To compile a skill from the command line, format your dataset as a JSON field mapping:
 
 ```json
 {
@@ -213,106 +149,43 @@ The CLI accepts a JSON field mapping:
 }
 ```
 
-It also accepts records of the form
-`{"prompt": "...", "labels": {"team": "billing"}}`, with optional `telemetry`.
-The two rows above illustrate the format; use a representative collection for
-an actual skill. Export the schema with
-`Path("schema.json").write_text(json.dumps(SupportRoute().to_dict()))`
-after importing `json` and `Path`.
+You can also supply a JSON list of record objects with `{"prompt": "...", "labels": {"team": "billing"}}` and optional numeric `telemetry`. First, export your schema to `schema.json` with `Path("schema.json").write_text(json.dumps(SupportRoute().to_dict()))`, then run:
 
 ```bash
 system1 compile --schema schema.json --dataset examples.json --output support-route.s1m --json
 system1 decide "Please refund this payment" --model support-route.s1m --json
 ```
 
-With `--dataset`, the CLI uses only those examples by default. Missing files and
-malformed examples fail instead of falling back to invented data. `--augment`
-explicitly opts into synthetic templates; compilation without a dataset remains
-a synthetic demo.
+When you pass `--dataset`, `system1 compile` disables synthetic template augmentation by default and fails if the file is missing or malformed. Pass `--augment` only if you want synthetic templates added.
 
-## Check before relying on it
+## Separate teaching, calibration, and evaluation data
 
-Keep three uses of examples separate:
+Divide your labeled data into three disjoint partitions:
 
-1. **Teach:** examples used to fit the skill.
-2. **Calibrate:** separate examples used to assess uncertainty.
-3. **Evaluate:** unseen examples used to measure the finished skill.
+1. **Teaching.** Examples used to fit the projector and decision weights.
+2. **Calibration.** Held-out examples used to fit temperature scaling and conformal quantiles.
+3. **Evaluation.** Unseen examples held out of both teaching and calibration to measure accuracy, coverage, and accepted errors.
 
-The compiler reserves about 25% of the supplied unique inputs for calibration by
-default. For categorical and Boolean fields it divides that portion again between temperature
-and conformal calibration; MultiChoice also separates temperature fitting from
-its joint assignment score. An input is the normalized prompt plus its optional
-numeric telemetry. Repeated inputs, ignoring prompt whitespace and case and
-mapping key order, stay in the same partition. A repeated question with a different
-numeric state can be a different example. This does not establish independence:
-the compiler does not detect paraphrases, related customer threads, shared source
-documents, or adjacent observations from one game run.
+When you do not pass `calibration_exemplars`, `SystemOneCompiler` reserves roughly 25% of unique normalized `(prompt, telemetry)` inputs for calibration. For `ChoiceField`, `BooleanField`, and `MultiChoiceField`, the compiler splits that calibration fold again between temperature scaling and conformal quantile estimation.
 
-For related examples, split those groups yourself before compilation. Pass
-`calibration_exemplars=held_out_examples` in Python, or
-`--calibration-dataset calibration.json` in the CLI. Keep the final evaluation
-examples outside both files. Explicit teaching and calibration inputs must be
-disjoint. A Python `calibration_split=0` produces an uncalibrated skill;
-strict mode then asks for review.
+Because `SystemOneCompiler` groups only exact normalized inputs, it cannot detect paraphrases, multi-message customer threads, or adjacent states from the same game episode. Split related groups yourself and pass `calibration_exemplars=held_out_examples` in Python or `--calibration-dataset calibration.json` on the CLI. Passing `calibration_split=0` in Python produces an uncalibrated skill that always requests review in strict mode.
 
-Measure raw accuracy, accepted errors and acceptance coverage separately.
-Low raw accuracy points to the learned decision or input representation; more
-calibration alone cannot correct the chosen labels. High raw accuracy with low
-coverage calls for examining the withheld cases and calibration evidence. Those
-patterns guide investigation, not a proven diagnosis. Examine mistakes by label,
-especially costly mistakes. There is no guaranteed example count that makes a
-skill reliable, and calibration is not proof of correct permissions.
+Note that `system1 compile --dataset` expects a field mapping (`{"team": [[prompt, label], ...]}`) or record list, whereas `system1 teach --dataset` expects a split mapping (`{"teach": [...], "calibrate": [...], "evaluate": [...]}`). See [Run the session workflow from the CLI](correcting_skills.md#the-same-workflow-from-the-cli) for the `system1 teach` format.
 
-For current measured behavior, use the [public-workload evidence](../../benchmarks/quality/workloads/README.md).
-The [teacher adapter guide](../typesafe.md) covers observing an upstream LLM or another
-callback, including the completed Gemini demonstration. A bundle such as
-`examples/teaching/support_triage.json` contains `teach`, `calibration` and
-`evaluate` splits; its example helper converts these into compiler field mappings.
-Pass a field mapping or record list, not the whole bundle, to CLI `--dataset`.
-
-That is the **`system1 compile`** format. The new **`system1 teach`** session
-command instead accepts a JSON object with `teach`, `calibrate` and `evaluate`
-keys, each containing `[text, label]` pairs. These formats are deliberately
-separate; see the [session walkthrough](correcting_skills.md#the-same-workflow-from-the-cli).
-
-To reproduce the smaller historical development comparison:
+To run the offline teaching benchmark comparison, execute:
 
 ```bash
 python benchmarks/quality/evaluate_teaching.py
 ```
 
-See [results and limitations](../../benchmarks/quality/README.md#teaching-comparison).
-The default feature dimension remains 384. The comparison also measures 2048;
-larger features can reduce collisions but do not supply language understanding.
-Use workload evidence before changing this setting.
+See [Benchmark suite index](../../benchmarks/quality/README.md#teaching-comparison) and [Public-workload evidence](../../benchmarks/quality/workloads/README.md) for full results.
 
-## Improve the same skill
+## Update and recalibrate a skill
 
-Review a mistake, correct its label, add representative examples of that case,
-and compile again. Recheck with separate calibration and evaluation examples.
-Saving the revised skill (`engine.save(...)` or `skill.save(...)`) uses the same
-runtime. Version 1.0+ writes format v2 and reads older v1 skills; older runtimes
-must be upgraded before reading v2.
+To fix an error in a deployed skill, correct the mislabeled example, add representative examples of the failure pattern, recompile, and verify on held-out evaluation data.
 
-High-level online teaching methods (`engine.learn(...)` and
-`engine.learn_from_outcome(...)`, as well as `BoundedReviewFallback(..., auto_online_update=True)`)
-default to `preserve_calibration=True`: they apply exact Sherman-Morrison
-directional gain scaling to preserve calibration quantiles during online boundary
-adaptation and initialize cold-start LAC thresholds when teaching from zero
-examples. Low-level `learn_from_tier2(...)`, `learn_from_system2(...)`, and
-`learn_from_tier3(...)` default to `preserve_calibration=False` (invalidating the
-changed heads' calibration so strict mode requires review until recalibration)
-unless `preserve_calibration=True` is explicitly passed.
+When you update a live engine in place:
+- **High-level online learning (`engine.learn(...)`, `engine.learn_from_outcome(...)`, and `BoundedReviewFallback(..., auto_online_update=True)`).** Defaults to `preserve_calibration=True`, applying Sherman-Morrison directional gain scaling to preserve conformal quantiles across rank-1 updates.
+- **Low-level tier updates (`learn_from_tier2(...)`, `learn_from_system2(...)`, and `learn_from_tier3(...)`).** Defaults to `preserve_calibration=False`, which invalidates calibration on modified heads so strict mode requests review until you call `engine.calibrate(...)` or pass `preserve_calibration=True`.
 
-`TeachingSession` retains examples across single-field or multi-field schemas
-(`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`) and compiles
-a separate candidate. Its report compares raw accuracy, coverage, accepted
-errors and regressions on the same recurring checks. `adopt()` requires a passing
-report and unchanged candidate, data and current skill. The
-[walkthrough](correcting_skills.md) covers defaults and their evidence limits.
-For continuous telemetry or custom compilation pipelines, retain your examples
-and recompile with this lower-level API.
-
-The broader [expert examples](../../examples/train_expert.py) explore synthetic
-bootstrapping, online updates, and composition. They are optional. Teaching one
-useful skill does not require any of those mechanisms.
+For multi-step synthetic bootstrapping, online updates, and skill composition, see [`examples/train_expert.py`](../../examples/train_expert.py).

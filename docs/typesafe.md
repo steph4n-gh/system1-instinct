@@ -1,60 +1,36 @@
-# Observe a teacher and reuse a local skill
+# Teacher observation and `TypeSafeClient` reference
 
-System 1's TypeSafe adapter supports the basic Jev decision workflow: typed
-questions in, typed answers out. A teacher can be Jev, another API or LLM through a callback, or labeled local data.
-The adapter observes answers, teaches a small decision head, validates it, and
-switches the same call site to local execution. It does not fine-tune an LLM.
+`system1.compat.typesafe.Client` and `AsyncClient` implement the Jev structured decision interface: typed state and questions in, typed answers out. In `auto_cutover` mode, the client observes answers from an upstream teacher (Jev, an OpenAI, Anthropic, or Gemini callback, or recorded labels), compiles and validates a local skill, and switches the call site to local `.s1m` execution once its promotion policy passes.
 
-## Start with the complete offline example
+## Offline and live observation examples
+
+Run the deterministic offline observation script from the repository root:
 
 ```bash
 python examples/observe_routing.py
 ```
 
-The teacher in this example is a deterministic rule over synthetic structured
-support tickets. It is deliberately easy to inspect. The example uses normal
-promotion defaults, disconnects the teacher after promotion, evaluates 40 fresh
-tickets, saves `routing.s1m`, and checks identical answers, probabilities,
-prediction sets, and review decisions after reload. It writes a complete JSON
-report under `.system1/observe-routing/`.
+`examples/observe_routing.py` observes a synthetic support-ticket rule teacher under default promotion settings, disconnects the teacher after promotion, evaluates `40` held-out tickets locally, saves `routing.s1m`, verifies identical outputs after reload, and writes a JSON report to `.system1/observe-routing/`.
 
-The recorded offline and live Jev runs both promoted after 357 observations:
-215 fitting cases, 71 calibration cases, and 71 validation cases. Calibration
-splits again between temperature and conformal scoring. All 71 validation
-decisions agreed and were accepted on attempt ten; all 40 subsequent local
-cases were correct and accepted. The saved skill is about 5 KB. The live run
-took 116 seconds to observe and teach, then about 0.4 ms per local decision.
+In both the offline run and the recorded live Jev run ([`benchmarks/quality/results/jev_live_cutover.json`](../benchmarks/quality/results/jev_live_cutover.json)), the client promoted after `357` observations:
+- **Fitting split.** `215` observations.
+- **Calibration split.** `71` observations (divided between temperature scaling and conformal quantile estimation).
+- **Validation split.** `71` observations (`71/71` agreed and were accepted on validation attempt `10`).
+- **Post-cutover local evaluation.** `40/40` held-out tickets matched and were accepted in `~0.4 ms` per decision from a `5 KiB` `.s1m` file.
 
-These inputs reuse a small topic vocabulary with new ticket IDs: this proves the
-lifecycle on that structured workload. Ticket IDs do not establish independent
-real-world scenario diversity. See the [live evidence](../benchmarks/quality/results/jev_live_cutover.json).
-
-To observe real Jev answers with the same example:
+To run the same script against the live Jev API (requires `TYPESAFE_API_KEY` and makes billable API calls):
 
 ```bash
-# Set TYPESAFE_API_KEY in your environment first. This makes billable API calls.
 python examples/observe_routing.py --teacher jev --output-dir .system1/observe-jev
 ```
 
-There is no simulated fallback in that mode. Insufficient evidence leaves the
-teacher active. The fresh evaluation compares against the example's stated routing policy; it does
-not call Jev again after disconnection.
+## Public-workload cutover results
 
-## Public-data takeover with Jev and Gemini
+On the six-intent assistant workload ([`benchmarks/quality/workloads/README.md`](../benchmarks/quality/workloads/README.md)), live Jev `1.13.0` and Gemini `2.5 Flash` each qualified after `358` observations. With teacher callbacks and network access disabled after cutover, each compiled `.s1m` skill accepted `171/180` unseen test requests with `167/171` (`97.7%`) correct and `9` requests flagged for review.
 
-On the six-intent assistant task, actual Jev 1.13.0 and Gemini 2.5 Flash each
-qualified after 358 observations. With teacher callbacks and network access
-disabled, each skill accepted 171/180 unseen official test requests, with 167/171
-correct. Nine requests required review. Saving and reloading preserved results.
+On the banking workload (`412` observations), the client remained on the teacher and did not promote. On the SMS workload, the skill promoted under the default `80%` agreement threshold but missed the separate `95%` accepted-accuracy target (`PromotionPolicy(min_accepted_agreement=0.95)`).
 
-The [workload report](../benchmarks/quality/workloads/README.md) includes the
-protocol, real response records and offline replay commands. Banking did not
-promote with the available 412 observations. SMS observed from original labels
-promoted but missed the independent 95% correctness target; live Jev SMS did not
-promote within 1,000 observations. The normal 80% promotion thresholds do not
-qualify a skill for a separate 95% accepted-correctness requirement.
-
-## Integrate the same lifecycle
+## Python integration contract
 
 ```python
 from system1.compat.typesafe import Client, Choice
@@ -66,144 +42,55 @@ questions = {
     )
 }
 
-# Jev answers until the observed skill passes validation.
+# The upstream teacher answers until the candidate skill passes validation.
 with Client(mode="auto_cutover", zero_egress=False) as client:
     response = client.systemone(state={"topic": "invoice"}, questions=questions)
     print(response.choices.queue.choice)
     print(client.is_cutover)
-    # Call systemone for each real request. Export succeeds only after promotion.
+    # Export succeeds only after promotion completes.
     if client.is_cutover:
         client.export_model("queue.s1m")
 ```
 
-For another teacher, pass `baseline_handler=teacher` to the same constructor.
-It receives `(state, questions)` and returns a response mapping containing
-`answers`, with each answer carrying `type` and `choice`, `noul`, or `score`
-(or the adapter's normalized `value`). A callback is preferred when supplied.
-Its network behavior remains the application's responsibility; `zero_egress`
-blocks the adapter's own HTTP transport, not arbitrary callback code.
+- **Custom teacher callback (`baseline_handler`).** Pass `baseline_handler=teacher` to `Client(...)` to observe any Python callable instead of the Jev HTTP API. The callable receives `(state, questions)` and returns a mapping with an `"answers"` dictionary where each entry contains `"type"` and `"choice"`, `"noul"`, `"score"`, or `"value"`. Setting `zero_egress=True` blocks the built-in Jev HTTP transport, not custom code inside `baseline_handler`.
+- **Reloading a promoted `.s1m` skill (`model_path`).** `Client(mode="auto_cutover", model_path="queue.s1m")` loads a saved `.s1m` file without a teacher or API key. The `questions` mapping passed to `client.systemone(...)` must match the saved schema. The `.s1m` artifact restores built-in hashed, `TfidfProjector`, and `HybridProjector` settings, weights, temperatures, conformal scores, and strict-mode flags. If you use a custom external projector, pass it to `Client(...)` and implement `projector_digest()`.
+- **Multi-exemplar option criteria.** `Choice(criteria=...)` accepts either a description string per option, a semicolon-separated string of phrases, or a list or tuple of example strings per option. Multiple phrases per option compile into sibling-contrastive sub-prototypes for zero-shot cold-start routing before cutover.
 
-`Client(mode="auto_cutover", model_path="queue.s1m")` reopens the validated skill
-without a teacher or API key. The questions must match its complete saved schema.
-The file restores built-in deterministic, TF-IDF and hybrid projectors and their settings,
-weights, temperature, conformal scores, and the adapter's evaluated strict-mode
-setting. In System 1 1.4.0, `Choice(criteria=...)` also accepts a list or tuple
-of example strings per option (or semicolon-separated phrases), which are
-compiled into sibling-contrastive multi-exemplar sub-prototypes for zero-shot
-cold-start routing before teacher cutover. A mismatched projector or schema raises an error. External projectors
-must be supplied explicitly; implement `projector_digest()` to validate their
-configuration. Older files without projector metadata retain legacy loading
-behavior and cannot verify the original feature space.
-
+<a id="what-promotion-means"></a>
 ## What promotion means
 
-The default observation path uses **only observed labels** (`augment=False`).
-A missing class or insufficient disjoint evidence defers promotion. Normalized
-repeated prompts, request IDs and lineage groups must not cross fitting,
-calibration and validation folds. Supply group/lineage identifiers for related
-requests; the runtime cannot discover every paraphrase automatically.
+By default, `auto_cutover` compiles candidates from observed teacher labels only (`augment=False`). Normalized duplicate prompts, request IDs, and lineage groups cannot cross the fitting, calibration, and validation folds. Pass explicit lineage or group identifiers when requests belong to the same conversation thread or document.
 
-The normal policy checks complete-decision agreement, critical false-allows,
-at least 80% agreement, and at least 80% local acceptance. All fields must agree, including exact
-MultiChoice sets. Related observations count as one validation group; repeating
-an easy request cannot inflate either agreement or acceptance. Agreement among
-accepted decisions must also meet the threshold.
+### Default `PromotionPolicy` thresholds
 
-For a task needing higher agreement on unattended decisions, use
-`PromotionPolicy(min_accepted_agreement=.95)` in the client's `promotion_policy`
-argument. Its point estimate and exact lower bound must both pass. No accepted
-validation groups means no qualification. The report includes
-`accepted_agreement_rate` and `accepted_agreement_lower_bound`, and the promotion
-manifest records the chosen thresholds. This measures agreement with the teacher;
-check independent labels separately to measure correctness.
+- **Complete-decision agreement.** Every field in the schema must match the teacher's output on a validation item, including exact `MultiChoice` sets.
+- **Minimum agreement (`min_agreement=0.80`).** At least `80%` of validation groups must match the teacher, and agreement among locally accepted validation groups must also be at least `80%`.
+- **Minimum local acceptance (`min_local_acceptance=0.80`).** At least `80%` of validation groups must be accepted locally (`is_ambiguous=False`).
+- **Zero critical false-allows.** Security or critical fields must record zero false-allow errors on the validation split.
+- **High-agreement override (`min_accepted_agreement`).** Pass `PromotionPolicy(min_accepted_agreement=0.95)` to require both a `95%` point estimate and a one-sided binomial lower bound on accepted validation decisions. See the [`1.0.2` quality round report](../benchmarks/quality/quality_round/README.md) for measurements with `dimension=2048`, `regularization=0.1`, and `cutover_threshold=400`.
 
-The new requirement is opt-in; `None` preserves the original policy. Setting
-`require_statistical_bound=False` explicitly requests point checks only. The
-[1.0.2 experiment](../benchmarks/quality/quality_round/README.md) uses the stronger
-requirement with `dimension=2048`, `regularization=.1` and
-`cutover_threshold=400`. The adapter now exposes the compiler's existing
-regularization setting (default 1.0) in both sync and async clients. More examples
-and a suitable fit can help, but these settings do not promise promotion.
+### Statistical error-budget allocation
 
-For the default statistical gate, both agreement and acceptance must pass exact
-one-sided binomial lower bounds. At validation attempt `k`, each bound spends
-`(1 - confidence) / (2 * k * (k + 1))`; the total across attempts is bounded by
-`1 - confidence`. With `min_accepted_agreement` set, three exact bounds share
-the budget instead: `(1 - confidence) / (3 * k * (k + 1))` for each bound.
-Each attempt needs an entirely fresh validation block. This
-controls repeated checks only under independent, representative validation
-groups and a candidate fixed before its validation. Correlated templates,
-adaptive traffic, or changed workloads do not satisfy those assumptions merely
-because their IDs differ. The Wilson lower bound remains a diagnostic and an
-additional conservative gate.
+When `require_statistical_bound=True` (the default), validation attempt `k` allocates `(1 - confidence) / (2 * k * (k + 1))` to the agreement lower bound and to the acceptance lower bound (or `(1 - confidence) / (3 * k * (k + 1))` across three bounds when `min_accepted_agreement` is set). The sum across all attempts `k >= 1` is bounded by `1 - confidence`. Each validation attempt requires a fresh disjoint validation block.
 
-Validation and drift state are per schema. `cutover_threshold=50` is the earliest
-attempt, not a promise that 50 observations suffice. The default statistical
-policy may need hundreds of examples. Deployment validation remains necessary.
+`cutover_threshold=50` sets only the minimum observation count before validation attempt `1` can run. Under the default binomial bounds, promotion requires hundreds of independent observations. After promotion, `client.systemone(...)` executes locally and can still flag individual requests with `is_ambiguous` or `abstain`.
 
-Promotion enables local execution, which can still return `is_ambiguous` or
-`abstain`. Applications must honor review requests. Cloud fallback is off by
-default and cannot be combined with `zero_egress=True`. HTTP errors propagate
-unless the caller explicitly opts into a labeled simulation with
-`fallback_baseline=True`. `compare()` reports no speedup for simulated responses
-and does not manufacture pricing or performance data after a failed request.
+## Public API and SDK differences
 
-Explicit `PromotionPolicy` objects can override the defaults, including opting
-out of the acceptance-rate check when `min_local_acceptance=0`. An explicit
-`min_accepted_agreement` still requires accepted evidence in that configuration. The older enterprise
-showcases explicitly retain synthetic augmentation, heuristic non-strict gates,
-and relaxed promotion settings. Their output demonstrates integration mechanics;
-use the flagship example for the normal observation path.
+`system1.compat.typesafe` targets the decision interface of [`typesafe-sdk-python` at commit `2ce5c65`](https://github.com/typesafe-ai/typesafe-sdk-python/tree/2ce5c65f13646cab6e6f782328194c9d85f3300a).
 
-## Supported SDK surface and differences
-
-The reference is the [official Python SDK at commit 2ce5c65](https://github.com/typesafe-ai/typesafe-sdk-python/tree/2ce5c65f13646cab6e6f782328194c9d85f3300a).
-This is compatibility with its basic decision API, not its entire transport or
-Pydantic model contract.
-
-| Surface | Behavior |
+| Component | Behavior |
 |---|---|
-| `Client`, `AsyncClient` | Sync/async context managers, `close()` / `aclose()`, `systemone`, constructor model default and request override, optional `background_compile=True`, `wait_for_compilation()`, and `export_teaching_session()`. |
-| Structured `state` | Strings, JSON objects and arrays. Canonical JSON text supplies local features; HTTP preserves the original JSON value. |
-| Questions | `Choice`, `Noul`, `NoulCriteria`, ordinal `Score`; mappings and objects exposing `model_dump()` also work. JSON-valued descriptions/instructions are retained on the wire. |
-| Responses | `.answers`, `.choices`, `.nouls`, `.scores`, nested attribute access and token usage. Responses are mutable dicts, not the SDK's immutable Pydantic models. |
-| Ordinal `Score` | Two to ten ordered levels; actual per-level probabilities, integer-keyed legend, and probability-weighted mean score. Every level participates in the local head. Observed scalar scores teach the nearest level, so this is not full teacher-distribution distillation. |
-| Local extensions | Explicit-range continuous scores, `MultiChoice`, receipts, uncertainty sets, local batch helpers, `background_compile=True` non-blocking candidate compilation, `export_teaching_session()`, and portable skills. These are not promises about Jev's HTTP API. |
-| Unsupported extensions | SDK retry policies, custom HTTP clients/transports, custom headers, extra request bodies, custom response models, and model-management endpoints. Supplied transport/response options raise `NotImplementedError`. |
+| `Client` and `AsyncClient` | Sync and async context managers, `close()` and `aclose()`, `systemone(...)`, constructor model defaults, `background_compile=True`, `wait_for_compilation()`, and `export_teaching_session(path)`. |
+| Structured `state` | Accepts strings, JSON objects, and JSON arrays. Canonical JSON text feeds local feature extraction, and the original JSON value is sent over HTTP when calling Jev. |
+| Questions | Supports `Choice`, `Noul`, `NoulCriteria`, and ordinal `Score`, plus dicts and objects implementing `model_dump()`. |
+| Responses | Provides `.answers`, `.choices`, `.nouls`, `.scores`, attribute access, and token usage on mutable response dictionaries. |
+| Ordinal `Score` | Supports `2` to `10` ordered integer levels, returning per-level probabilities, an integer-keyed legend, and the probability-weighted mean score. Observed scalar scores map to the nearest level during fitting. |
+| Local extensions | Supports continuous `ScoreField` ranges, `MultiChoice`, signed receipts, conformal sets, `background_compile=True`, `export_teaching_session(path)`, and `.s1m` export. |
+| Unsupported SDK options | Custom HTTP transports, retry policies, custom headers, extra request bodies, custom Pydantic response models, and remote model-management endpoints raise `NotImplementedError`. |
 
-Local confidence is the local head's probability, not a promise to reproduce
-Jev's confidence computation or semantic quality. For ordinal scores, receipts
-bind the underlying chosen level and level probabilities; the returned mean
-score is derived from that distribution. Strict calibration is marginal under
-appropriate exchangeability assumptions, not a guarantee for each accepted
-answer. Newly taught examples-only skills use the standard LAC score
-`1 - probability(label)`. Legacy and schema-augmented skills retain APS cumulative
-probability scores. Both invert their saved score in strict mode; an empty set
-also requires review. See the
-[conformal prediction procedure](https://arxiv.org/html/2107.07511v6#S2.SS1).
+## Artifact format and online updates
 
-
-## Saved skills and corrections in 1.0–1.4
-
-New `.s1m` files use format v2 so older runtimes cannot silently interpret LAC
-scores as APS. System 1 1.0+ reads v1 artifacts using their original APS semantics;
-0.2.x cannot read v2. Upgrade readers before distributing newly saved skills.
-Invalid versions, schema identity, shapes, and nonfinite weights or temperatures
-are rejected. Keep a copy of the original artifact when migrating.
-
-`engine.calibrate(...)` saves the resulting evidence into the compiled model.
-By default (`preserve_calibration=False`), `learn_from_tier2(...)` invalidates the
-changed heads' calibration, including in saved files, so strict decisions request
-review until those heads are recalibrated on separate examples. In System 1 1.4.0,
-`learn_from_tier2(..., preserve_calibration=True)` (also used by
-`BoundedReviewFallback(..., auto_online_update=True)`) applies exact Sherman-Morrison
-directional gain scaling to update the target class margin while preserving existing
-conformal quantiles. You can also export an adapter's observed history into a
-persistent `TeachingSession` workspace via `client.export_teaching_session(path)`.
-Calibration, correction, inference, and serialization of a
-shared compiled model are synchronized. Retaining examples and recompiling is
-the simplest reproducible update workflow.
-
-The [workload comparison](../benchmarks/quality/workloads/README.md) separately measures three natural-language
-skills taught from actual recorded Jev responses. It does not claim all three
-automatically promoted from a live stream or that local confidence equals Jev's.
+- **`.s1m` v2 format.** Newly saved skills write format v2 with Least Ambiguous Set Classifier (LAC) conformal scores (`1 - probability(label)`). System 1: Instinct 1.0.0 reads both v1 (APS) and v2 (LAC) artifacts and rejects corrupted headers, mismatched schemas, or nonfinite weights.
+- **Calibration and online updates.** `engine.calibrate(...)` stores conformal scores in the compiled model. Low-level `learn_from_tier2(...)` defaults to `preserve_calibration=False` (invalidating calibration on updated heads until recalibrated), whereas `learn_from_tier2(..., preserve_calibration=True)`, `engine.learn(...)`, `engine.learn_from_outcome(...)`, and `BoundedReviewFallback(..., auto_online_update=True)` apply Sherman-Morrison directional gain scaling to preserve conformal quantiles.
+- **Exporting to `TeachingSession`.** Call `client.export_teaching_session(path)` to export all observed fitting, calibration, and validation records into a persistent [`TeachingSession`](guides/correcting_skills.md) directory.

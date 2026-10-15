@@ -1,20 +1,21 @@
-# Drop-In Guide 5: Wrap Any Live LLM Call $\to$ Auto-Cutover to `.s1m`
+# How to wrap a live LLM call and cut over to a `.s1m` skill
 
-Have an existing OpenAI, Anthropic, or Gemini function that classifies tickets, flags urgency, or routes requests? Wrap it with [`BoundedReviewFallback`](../../examples/drop_in/llm_cutover_dropin.py) so System 1 **learns online from your LLM on uncertain traffic** and cuts over to **100% local sub-millisecond decisions**.
+To offload an OpenAI, Anthropic, or Gemini classification function to local CPU execution, wrap it with [`BoundedReviewFallback`](../../examples/drop_in/llm_cutover_dropin.py). `SystemOneEngine` escalates uncertain requests (`is_ambiguous=True`) to your LLM callable, updates its weights online in `<1 ms`, and saves a portable `.s1m` skill.
 
 ---
 
-## 1. Step-by-Step Procedure
+## 1. Wrap your LLM function with `BoundedReviewFallback`
 
-### Step 1: Wrap Your Existing LLM Function with `BoundedReviewFallback`
+Instantiate `SystemOneEngine` with `strict_mode=True` and pass your LLM callable as `review_fn` to `BoundedReviewFallback`:
+
 ```python
 from system1 import BoundedReviewFallback, SystemOneEngine
 from examples.drop_in.llm_cutover_dropin import SupportTicketSchema, upstream_llm_teacher
 
-# Start with a strict System 1 engine (0-shot cold-start or optional starter examples)
+# Start with a strict SystemOneEngine at 0 examples or with starter examples.
 engine = SystemOneEngine(SupportTicketSchema, strict_mode=True, use_cache=False)
 
-# Wrap your LLM callable: uncertain inputs call upstream_llm_teacher and update System 1 online
+# Wrap your LLM callable so uncertain inputs call upstream_llm_teacher and update weights online.
 fallback = BoundedReviewFallback(
     engine,
     review_fn=upstream_llm_teacher,
@@ -23,17 +24,23 @@ fallback = BoundedReviewFallback(
 )
 ```
 
-### Step 2: Send Traffic Through `fallback.decide(prompt)` (or Teach Directly with `engine.learn`)
-- **Wave 1 (Novel Traffic)**: When unfamiliar jargon arrives (e.g., `"Kafka consumer lag"`, `"SIEM alert"`, `"SSO SAML login"`), System 1 detects ambiguity (`is_ambiguous=True`), calls `upstream_llm_teacher`, and applies an exact Rank-1 Sherman-Morrison RLS update (`preserve_calibration=True`) in `<1 ms`. (You can also teach directly without a wrapper via `engine.learn(prompt, labels)` or `engine.learn_from_outcome(prompt, labels, reward=1.0)`.)
-- **Wave 2 (Recurring Traffic)**: When the same operational patterns recur, System 1 resolves them locally with high confidence — **LLM calls drop to `0`** and latency drops to **`~0.4 ms`**.
-- **Wave 3 (Unseen Generalized Phrasings)**: When brand-new phrasings of those newly learned patterns arrive (e.g., `"Redis cluster crash and Kafka consumer lag triggering 502 gateway timeouts"` or `"Unauthorized API token compromise and CVE exploit flagged in SIEM alert"`), System 1 generalizes across them with **100% joint accuracy and `0` LLM calls**.
+## 2. Route live traffic through `fallback.decide(prompt)`
 
-### Step 3: Save & Reload the Portable `.s1m` Skill
+Call `fallback.decide(prompt)` for each incoming request (or call `engine.learn(prompt, labels)` and `engine.learn_from_outcome(prompt, labels, reward=1.0)` directly):
+
+- **Wave 1 (novel traffic).** When unfamiliar jargon arrives (such as `"Kafka consumer lag"`, `"SIEM alert"`, or `"SSO SAML login"`), `engine.decide(...)` returns `is_ambiguous=True`. `BoundedReviewFallback` calls `upstream_llm_teacher` and applies a rank-1 Sherman-Morrison RLS update (`preserve_calibration=True`) in `<1 ms`.
+- **Wave 2 (recurring traffic).** When those patterns recur, `SystemOneEngine` resolves them locally in `~0.9 ms` with `0` LLM calls.
+- **Wave 3 (unseen phrasings).** When new phrasings of those learned patterns arrive (such as `"Redis cluster crash and Kafka consumer lag triggering 502 gateway timeouts"`), `SystemOneEngine` resolves them locally with `100%` joint accuracy and `0` LLM calls.
+
+## 3. Save and reload the `.s1m` skill
+
+To persist the online-updated engine to disk and reload it in another process without an LLM client, call `engine.save(...)` and `SystemOneEngine.load(...)`:
+
 ```python
-# Save directly from the engine (preserves strict_mode=True and online-learned weights)
+# Save the engine state, including strict_mode=True and online-learned weights.
 engine.save("support_ticket_instinct.s1m")
 
-# Reload anywhere with zero external dependencies
+# Reload the skill with zero external dependencies.
 reloaded_engine = SystemOneEngine.load("support_ticket_instinct.s1m")
 decision = reloaded_engine.decide(
     "Redis cluster crash and Kafka consumer lag triggering 502 gateway timeouts",
@@ -44,15 +51,16 @@ assert not decision.is_ambiguous
 
 ---
 
-## 2. Run It & See the Real Result
+## 4. Run the standalone three-wave cutover script
 
-Run the standalone script from the repository root:
+To run the complete three-wave simulation from the repository root, execute:
 
 ```bash
 python examples/drop_in/llm_cutover_dropin.py
 ```
 
-### Real Output
+### Expected output
+
 ```text
 === System 1: Instinct — LLM Observe -> Online RLS -> Local Cutover Demo ===
   Wave 1 (Initial Stream + Novel Jargon): Joint Accuracy=6/6 (100%) | Served Locally=83% (LLM Calls=1) | Avg Latency=1.354 ms

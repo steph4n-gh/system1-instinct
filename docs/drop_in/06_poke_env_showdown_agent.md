@@ -1,40 +1,42 @@
-# Drop-In Guide 6: `poke-env` Pokémon Showdown Reflex Agent
+# How to build and evaluate a `poke-env` Pokémon Showdown agent
 
-[`SystemOneShowdownPlayer`](../../benchmarks/quality/evaluate_poke_env_showdown.py) subclasses `poke_env.player.Player` to compete in live **`gen9randombattle`** matches on a standard Pokémon Showdown server — demonstrating how System 1: Instinct goes from **0-shot cold start** to **online battle adaptation** to a **93-microsecond (`.s1m`) reflex policy**.
-
----
-
-## 1. What Do Our `poke-env` Results Mean?
-
-In competitive Pokémon AI research (such as *PokéLLMon*, *Metamon*, and *poke-env* baselines), agents are evaluated in `gen9randombattle` against three standardized `poke-env` benchmark bots:
-
-1. **`RandomPlayer` (Sanity Baseline — `100.0%` Win Rate, `50/50`)**:
-   - Picks legal moves and switches uniformly at random. Winning `50/50` confirms 100% legal action selection and zero stalling.
-2. **`MaxBasePowerPlayer` (Greedy Damage Baseline — `98.0%` Win Rate, `49/50`)**:
-   - Always clicks the highest base-power move, ignoring type immunities, status, and switching. Winning `98%` proves System 1's tactical state encoder + type-effectiveness reasoning dominates greedy play.
-3. **`SimpleHeuristicsPlayer` (Competitive Expert Baseline — `42%` Cold 0-Shot $\to$ `62%` Online Adaptive $\to$ `60%` Compiled `.s1m`)**:
-   - `SimpleHeuristicsPlayer` is `poke-env`'s strongest built-in rule bot. It calculates type multipliers, physical/special stat ratios, entry hazards (`Stealth Rock`, `Spikes`, `Rapid Spin`, `Defog`), stat boosts (`Swords Dance`, `Nasty Plot`), speed tiers, and Terastallization.
-   - **Why `42%` $\to$ `62%` $\to$ `60%` at `0.093 ms` matters**:
-     - **Cold 0-Shot (`42.0%`, `21/50`)**: Starting with **zero training examples** (pure schema descriptions), System 1 already takes 42% of games off the hand-crafted expert bot.
-     - **Zero-Shot Online Adaptation (`62.0%`, `31/50`)**: By adapting online during live battles (`adapt_zero_shot` + `learn_from_tier2` from turn outcomes), System 1 gains **+20 percentage points** and decisively beats `SimpleHeuristicsPlayer`.
-     - **Compiled `.s1m` Skill (`60.0%`, `30/50` at `0.093 ms` P50)**: Once compiled into a portable `.s1m` skill, System 1 maintains a **60% win rate** while making each turn decision in **93 microseconds** — over **10,000× faster** than LLM battle agents (which take 1–3 seconds per turn).
+[`SystemOneShowdownPlayer`](../../benchmarks/quality/evaluate_poke_env_showdown.py) subclasses `poke_env.player.Player` to play live `gen9randombattle` matches on a Pokémon Showdown server. It starts at zero examples from four tactical option descriptions, adapts online during battles via `adapt_zero_shot` and `learn_from_tier2`, and compiles into a `23 KiB` `.s1m` skill that selects moves in `0.093 ms` (`93 µs`) per turn.
 
 ---
 
-## 2. Run It Yourself
+## 1. Compare `SystemOneShowdownPlayer` against the `poke-env` baseline bots
 
-### Offline Tactical & Zero-Shot Jargon Adaptation Suite (No Server Needed)
+Standard Pokémon Showdown evaluations (*PokéLLMon*, *Metamon*, and `poke-env`) test `gen9randombattle` agents against three built-in `poke-env` opponents:
+
+1. **`RandomPlayer` (`100.0%` win rate, `50/50`).** Selects legal moves and switches uniformly at random. Winning `50/50` verifies legal action selection and zero stalling.
+2. **`MaxBasePowerPlayer` (`98.0%` win rate, `49/50`).** Selects the highest base-power move on every turn without checking type immunities, status moves, or switches. Winning `49/50` verifies that the tactical state encoder and type-effectiveness features beat greedy move selection.
+3. **`SimpleHeuristicsPlayer` (`42.0%` cold zero-shot to `62.0%` online adaptive to `60.0%` compiled `.s1m`).** `SimpleHeuristicsPlayer` is `poke-env`'s strongest built-in rule bot. It computes type multipliers, physical and special stat ratios, entry hazards (`Stealth Rock`, `Spikes`, `Rapid Spin`, and `Defog`), stat boosts (`Swords Dance` and `Nasty Plot`), speed tiers, and Terastallization:
+   - **Cold zero-shot (`42.0%`, `21/50`).** With zero training examples (only schema option descriptions), `SystemOneShowdownPlayer` wins `21/50` matches against `SimpleHeuristicsPlayer`.
+   - **Online adaptation (`62.0%`, `31/50`).** Updating weights online during live battles (`adapt_zero_shot` and `learn_from_tier2` from turn outcomes) adds `20` percentage points and beats `SimpleHeuristicsPlayer`.
+   - **Compiled `.s1m` skill (`60.0%`, `30/50` at `0.093 ms` P50).** After compiling into a `.s1m` artifact, the agent wins `30/50` matches at `93 µs` per turn.
+
+---
+
+## 2. Run the offline and live Showdown benchmarks
+
+### Run the offline tactical and jargon adaptation suite
+
+To run the offline tactical evaluation without a local Pokémon Showdown server, execute:
+
 ```bash
 python benchmarks/quality/evaluate_poke_env_showdown.py --offline-only
 ```
 
-### Full Live Pokémon Showdown Benchmark (`gen9randombattle`)
-If a local Pokémon Showdown server is running on `127.0.0.1:8000`:
+### Run live `gen9randombattle` matches on Pokémon Showdown
+
+When a local Pokémon Showdown server is listening on `127.0.0.1:8000`, run `50` battles per matchup:
+
 ```bash
 python benchmarks/quality/evaluate_poke_env_showdown.py --battles 50
 ```
 
-### Real Output
+### Expected output
+
 ```text
 === System 1: Instinct — poke-env + Pokémon Showdown Benchmark ===
 [Offline Tactical Suite] 0-Shot Canonical=100.0% | Unseen Jargon: 20.0% -> 100.0% (adapt_zero_shot) -> 100.0% (1-shot online) | Compiled .s1m=100.0% (1.230 ms)

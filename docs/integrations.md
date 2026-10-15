@@ -1,59 +1,52 @@
-# Connect a checked skill to your application
+# Application integrations reference
 
-Start with a [taught, checked skill](guides/first_skill.md) and honor its review
-requests. The integrations below connect local decisions or explicit permissions
-to an existing application. For tool execution, first configure the
-[policy guard](guides/policy_guard.md).
+This reference describes the runtime adapters that connect a [compiled skill](guides/first_skill.md) or a configured [`SystemOneGuard`](guides/policy_guard.md) to LangChain, Model Context Protocol (MCP), FastAPI and ASGI, gRPC, and OpenTelemetry or Prometheus.
 
-### LangChain
+## LangChain (`system1[langchain]`)
 
-Install `python -m pip install 'system1[langchain]'`. Attach a configured guard to actual tool invocations:
+Install `python -m pip install 'system1[langchain]'`. `SystemOneGuardCallbackHandler` intercepts LangChain tool invocations and evaluates each call against a configured `SystemOneGuard`:
 
 ```python
 from system1.integrations import SystemOneGuardCallbackHandler
 
-# guard is your configured SystemOneGuard, with a live ledger and signing key.
+# guard is a configured SystemOneGuard with an active ActionLedger and signing key.
 handler = SystemOneGuardCallbackHandler(
     guard=guard, tenant_id="demo", principal_id="agent-worker",
 )
 result = your_tool.invoke(tool_arguments, config={"callbacks": [handler]})
 ```
 
-The callback uses scope `langchain:tools:exec` and the serialized tool input in its proposal. Match policy rules to that contract. `SystemOneGuardBlockedException` propagates to the caller on a deny or approval requirement. `wrap_langchain_tool` also supports guarding Python callables directly.
+- **Proposal scope.** `SystemOneGuardCallbackHandler` sets `scope="langchain:tools:exec"` and passes the serialized tool input in the `ActionProposal`. Policy rules in `PolicyEngine` must match `langchain:tools:exec`.
+- **Failure behavior.** When `guard.evaluate_proposal(...)` returns `DecisionOutcome.DENY` or `DecisionOutcome.REQUIRE_APPROVAL`, the callback raises `SystemOneGuardBlockedException`.
+- **Direct callable wrapper.** `wrap_langchain_tool` wraps a Python callable with the same `SystemOneGuard` check.
 
-### MCP
+## Model Context Protocol (`System1MCPProxy`)
 
-`System1MCPProxy` intercepts JSON-RPC tool calls. Supply your configured guard and authenticated identity, then use `handle_call(request, executor)` or `async_handle_call(request, executor)` to connect it to your application's executor. See [integration tests](https://github.com/steph4n-gh/system1-instinct/blob/main/tests/test_integrations.py) for the dispatch contract. Diagnostic mode does not produce trusted signed enforcement evidence by default.
+`System1MCPProxy` intercepts JSON-RPC tool calls before dispatch. Initialize the proxy with a configured `SystemOneGuard` and authenticated caller identity, then call `handle_call(request, executor)` or `async_handle_call(request, executor)`. See [`tests/test_integrations.py`](https://github.com/steph4n-gh/system1-instinct/blob/main/tests/test_integrations.py) for the request and response schema. Diagnostic guard mode (`enforcement_profile=False`) does not produce signed enforcement receipts.
 
-### FastAPI / ASGI
+## FastAPI and ASGI (`add_system1_gateway`)
 
-`add_system1_gateway(app, schema=YourSchema)` can respond to confident classification requests locally and pass uncertain requests to the downstream application. Install your ASGI framework separately. Configure authentication and request-size limits **outside** this middleware: local responses bypass downstream endpoint dependencies. This is a classification gateway, not a tool authorization boundary. See [deployment guidance](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/deployment.md#asgi-gateway).
+`add_system1_gateway(app, schema=YourSchema)` registers `SystemOneGatewayMiddleware` on an ASGI application. The middleware returns a local HTTP response when `SystemOneEngine` produces an unambiguous decision (`is_ambiguous=False`) and forwards ambiguous requests to the downstream ASGI application.
 
-### gRPC
+- **Dependencies.** Install your ASGI framework (`fastapi` or `starlette`) separately.
+- **Security boundary.** `SystemOneGatewayMiddleware` runs before downstream route dependencies. Configure authentication, authorization, and request-body size limits in an outer middleware or reverse proxy. See [Deployment boundaries](deployment.md#asgi-gateway).
+
+## gRPC (`system1[grpc]`)
+
+Install the gRPC extra and start the local diagnostic server:
 
 ```bash
 python -m pip install 'system1[grpc]'
 system1 serve --grpc --host 127.0.0.1 --port 50051
 ```
 
-The bundled [protobuf contract](https://github.com/steph4n-gh/system1-instinct/blob/main/src/system1/proto/system1.proto) supports clients generated for other languages. The CLI server is a local diagnostic service with insecure gRPC transport. Configure signing, ledger, and policy through the Python `serve(...)` API for a custom deployment. The repository includes experimental [container and Kubernetes templates](https://github.com/steph4n-gh/system1-instinct/blob/main/deploy/README.md), but does not supply a published image or an authenticated service.
+- **Protocol buffer definition.** [`src/system1/proto/system1.proto`](https://github.com/steph4n-gh/system1-instinct/blob/main/src/system1/proto/system1.proto) defines the wire contract for generated clients in Python and other languages.
+- **Transport and security.** The `system1 serve --grpc` CLI command binds to `127.0.0.1` over plaintext gRPC without caller authentication, persistent signing keys, or a durable `ActionLedger`. For production services, call `system1.grpc_server.serve(...)` in Python with explicit `schemas`, `guard`, and transport security. Experimental container templates live in [`deploy/README.md`](https://github.com/steph4n-gh/system1-instinct/blob/main/deploy/README.md).
 
-### Observability
+## Observability (`system1[observability]` and `system1[otel]`)
 
-Install `system1[observability]` for Prometheus or `system1[otel]` for OpenTelemetry. See the [observability guide](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/observability/README.md) and [Grafana dashboard](https://github.com/steph4n-gh/system1-instinct/blob/main/docs/observability/grafana-dashboard.json). Starting a metrics server or configuring an exporter changes the application's network behavior.
+Install `system1[observability]` for Prometheus metrics or `system1[otel]` for OpenTelemetry tracing. See the [observability reference](observability/README.md) and [`grafana-dashboard.json`](observability/grafana-dashboard.json). Enabling a metrics server or trace exporter opens network listeners or outbound connections in the host process.
 
-### Inbox Zero email categories
+## Inbox Zero email classification (`system1[http]`)
 
-The [Inbox Zero pilot](../examples/inbox_zero/README.md) supplies JSON teaching
-files, an authenticated local endpoint, and a provider patch for its seven
-standard email categories. Install the optional server with `system1[http]`.
-The current candidate uses portable TF-IDF features and the existing ridge head,
-with no new runtime dependency. It is roughly ten times faster than the initial
-hashed email skill. The fresh authored cohort meets point quality targets, while
-the upstream regression cohort still misses acceptance; independent evidence for
-all seven categories is also missing. The separate
-[public spam/ham experiment](../benchmarks/quality/public_email/README.md) offers a
-real-email teaching recipe without credentials, but has a different label contract.
-The Inbox Zero provider therefore starts in review-only mode and leaves
-uncertain or failed classifications unprocessed without an LLM fallback.
-Other Inbox Zero LLM features remain outside this classification integration.
+The [Inbox Zero integration](../examples/inbox_zero/README.md) provides JSON lesson sets, an authenticated local HTTP endpoint (`system1[http]`), and a provider patch for seven email categories. It uses `TfidfProjector` and a ridge decision head with no external model weights. The provider starts in review-only mode and leaves uncertain classifications unprocessed when no LLM fallback is configured. For a credential-free public dataset baseline, see the [public spam and ham experiment](../benchmarks/quality/public_email/README.md).

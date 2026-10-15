@@ -1,121 +1,81 @@
-# Deployment boundaries and release limitations
+# Configure deployment boundaries and runtime limits
 
-System 1: Instinct 1.0.0 supports NumPy teaching, calibration, local decisions, portable
-skills, observation/cutover, closed-loop boundary fallback (`BoundedReviewFallback`),
-and explicit policy/audit paths. It includes retained multi-field teaching sessions
-with candidate assessment, dual-gate OOD abstention, and explicit adoption. See the
-[6-category benchmark gauntlet](../benchmarks/quality/instinct_gauntlet_report.md),
-[drop-in guides](drop_in/README.md),
-[changelog](../CHANGELOG.md) and
-[workload evidence index](../benchmarks/quality/README.md). Experimental labs and
-successful workflow checks do not establish production quality for their tasks.
-Current papers describe these same boundaries; earlier release reports retain
-their version-specific measurements.
+System 1: Instinct 1.0.0 provides NumPy-based compilation, conformal calibration, local `.s1m` inference, teacher observation, closed-loop review fallback (`BoundedReviewFallback`), and deterministic tool authorization (`SystemOneGuard`). See the [six-category benchmark report](../benchmarks/quality/instinct_gauntlet_report.md), [drop-in replacement guides](drop_in/README.md), [changelog](../CHANGELOG.md), and [benchmark suite index](../benchmarks/quality/README.md). Follow the procedures below to enforce security boundaries, statistical checks, and resource limits in production.
 
-## Deterministic tool authorization
+## Enforce deterministic tool authorization
 
-Use `SystemOneGuard(enforcement_profile=True)` with explicit `PolicyEngine` grants, an Ed25519 signing key, and a persistent `ActionLedger`. No matching deterministic permission produces `DENY`. Rules compose with `DENY` taking precedence over `REQUIRE_APPROVAL`, then `ALLOW`.
+To gate tool execution in production, instantiate `SystemOneGuard` with `enforcement_profile=True`, explicit `PolicyEngine` rules, a persistent Ed25519 signing key, and a durable `ActionLedger`:
 
-A guard result evaluates the policy you configured. It does not authenticate the `tenant_id`, `principal_id`, or `scope` supplied to it. Derive those values from a trusted application session, keep policy and key material outside agent control, and constrain tool arguments as well as names. Treat paths, commands, and remote targets according to the actual executor's semantics. A rule allowing every invocation of a shell or file tool is a broad grant.
+1. **Require explicit policy matches.** In `enforcement_profile=True`, any proposal without a matching `PolicyRule` returns `DecisionOutcome.DENY`. When multiple rules match, `DENY` overrides `REQUIRE_APPROVAL`, which overrides `ALLOW`.
+2. **Bind caller identity from your session.** `SystemOneGuard` evaluates the `tenant_id`, `principal_id`, and `scope` fields on `ActionProposal`, but does not authenticate the caller. Populate those fields from your authenticated session and keep signing keys and `PolicyEngine` rules outside agent control.
+3. **Restrict tool arguments and targets.** Constrain argument values in `PolicyRule(argument_limits=...)` and normalize file paths, shell arguments, and URLs according to the target executor before calling `guard.evaluate_proposal(proposal)`.
+4. **Enforce outcomes in the host application.** Check `auth.outcome == DecisionOutcome.ALLOW` before executing the tool, and pass only the authorized arguments to the tool. `SystemOneGuard` is an in-process Python check, not an operating-system sandbox. To prevent replay of a captured receipt, track consumed `action_id` values in your application.
+5. **Reserve diagnostic mode for local testing.** When `enforcement_profile=False` (the default), `SystemOneGuard` can approve proposals using its statistical classifier and does not require a durable ledger or signing key. Do not use diagnostic mode to gate privileged tools.
 
-The application must check the outcome and execute only the authorized operation with the authorized arguments. The library is an in-process hook, not an OS sandbox; it cannot stop code that bypasses it. A receipt is evidence of a recorded decision, not a one-use execution capability. Add application-level replay prevention when it is required.
+## Calibrate and validate statistical skills
 
-Default/diagnostic guard mode can grant permission through a sufficiently calibrated statistical path and does not require durable storage or signing. Its ten built-in calibration examples are insufficient for default strict acceptance; repeated examples no longer manufacture confidence. Use it for experiments, not as a substitute for an enforcement configuration.
+Follow these rules when deploying statistical decisions from `SystemOneEngine`:
 
-## Statistical limits
+1. **Do not use the zero-shot seed classifier as a security boundary.** On the historical `0.2.2` security-triage benchmark, the untaught seed classifier reached `50%` raw accuracy and misclassified `8` of `35` `BLOCK` prompts as `ALLOW`. Always use `SystemOneGuard(enforcement_profile=True)` for tool permissions.
+2. **Maintain exchangeability between calibration and live traffic.** Split-conformal prediction (`strict_mode=True`) guarantees marginal label coverage only when calibration examples and live inputs are exchangeable and the scoring head is fixed before calibration. It does not guarantee conditional correctness on every accepted singleton, joint coverage across all fields simultaneously, or adversarial robustness. An empty conformal set (`conformal_sets[field] == []`) signals abstention, not proof of distribution shift. See [Angelopoulos and Bates (2021)](https://arxiv.org/abs/2107.07511).
+3. **Keep teaching, calibration, and evaluation data disjoint.** Measure accuracy, coverage, and accepted-error rates on held-out traffic from your target environment. Setting `alpha` does not fix a constant escalation rate. `SystemOneEngine.decide()` returns structured values and `is_ambiguous` flags, leaving fallback execution to your application or `BoundedReviewFallback`.
+4. **Recalibrate when strict coverage guarantees are required.** `engine.learn(...)` and `engine.learn_from_outcome(...)` default to `preserve_calibration=True`, which scales existing quantiles via Sherman-Morrison directional gain (or synthesizes twenty initial scores when starting from zero examples). When you require formal split-conformal coverage after model updates, pass `preserve_calibration=False` and call `engine.calibrate(...)` on fresh held-out examples.
 
-The seed projector uses local features and schema descriptions. The recorded historical 0.2.2 security-triage benchmark achieved 50% raw accuracy, including 8 of 35 BLOCK examples classified as ALLOW. This is evidence that the seed classifier must not be used as a standalone security boundary. The benchmark does not measure the error rate of the separate deterministic guard.
+## Verify audit receipts and protect ledger files
 
-Split-conformal coverage requires calibration examples and future examples to be exchangeable, with the scoring model fixed independently of the conformal calibration fold. Its finite-sample guarantee concerns marginal membership of the true label in a prediction set. It does not guarantee correctness conditional on accepting a singleton, simultaneous coverage across every field, or adversarial robustness. An empty set is an abstention signal, not proof of distribution shift. See [Angelopoulos and Bates](https://arxiv.org/abs/2107.07511).
+To verify signed receipts and maintain an intact `ActionLedger` chain:
 
-Use separate teaching, calibration, and evaluation data. Recalibrate after model updates and measure behavior on your deployment distribution. Neither the significance level `alpha` nor a confidence threshold implies a fixed escalation or local-retention rate. Optional fallback routing is application behavior; `System1Engine.decide()` itself returns structured values and uncertainty rather than executing a frontier model or tool.
+1. **Supply an independently trusted public key.** Call `verify_decision_witness_receipt(receipt, public_key=trusted_key)` in Python or `system1 verify-receipt receipt.json --public-key trusted.pub` on the CLI. Calling `verify_decision_witness_receipt` without `public_key` returns `False`. Never trust a public key extracted from the receipt itself. For unsigned local integrity checks, use `check_decision_receipt_integrity(receipt)`.
+2. **Verify ledger inclusion against the SQLite chain.** `ActionLedger` stores a linear SHA-256 hash chain in SQLite and binds `ledger_record_id` inside the signed receipt envelope. Call `ledger.verify_receipt_record(receipt, trusted_public_key=trusted_key)` to verify both the stored record and the full hash chain. Because a linear SQLite chain is not a hardware enclave or external Merkle log, export periodic ledger-head digests to external append-only storage if you need truncation detection on a compromised host.
+3. **Persist your Ed25519 keypair across restarts.** Generating a new signing key on every process start breaks single-key verification across ledger history. Store the private key with restricted filesystem permissions and back it up alongside the SQLite ledger.
+4. **Log policy denials separately if required.** Deterministic policy denials and approval requests do not always emit signed witness receipts. Record those events in your application logs if your audit policy requires a log of every rejected attempt.
+5. **Restrict access to ledger and receipt files.** Receipts and SQLite ledgers store prompts, tool arguments, and execution results in plaintext. Apply filesystem permissions and encryption at rest according to your data-handling policy.
+6. **Audit outbound network paths.** `SystemOneEngine.decide()` makes no network calls. When you use `TypeSafeClient`, `BoundedReviewFallback`, OpenTelemetry or Prometheus exporters, or custom projectors, audit their outbound network connections. Setting `zero_egress=True` on `TypeSafeClient` disables only that client's HTTP transport, not the entire Python process.
 
-`learn()` defaults to `preserve_calibration=True`, which retains acceptance
-thresholds and may synthesize twenty identical scores when no calibration exists.
-These are heuristic online acceptance gates, not independent calibration data;
-they do not preserve split-conformal coverage after the model changes. Use
-`preserve_calibration=False` and independent recalibration when that guarantee is
-required. Exact learned-prompt overrides are also corrections, not held-out evidence.
+<a id="asgi-gateway"></a>
+## Place authentication outside the ASGI gateway
 
-## Audit evidence and privacy
+When you attach `SystemOneGatewayMiddleware` (via `add_system1_gateway`):
 
-Signed receipts allow a verifier with an independently trusted public key to detect changes to the signed payload. The SQLite ledger is a linear SHA-256 hash chain, not a Merkle tree or hardware attestation. It cannot prove that an external tool executed correctly or that a compromised host recorded every event. Preserve trusted ledger-head checkpoints outside the writable ledger if detecting truncation or rollback is required.
+1. **Enforce authentication and request-size limits in outer middleware.** Because `SystemOneGatewayMiddleware` returns local HTTP responses before FastAPI route dependencies run, place authentication, rate limiting, and body-size caps in your reverse proxy or outer ASGI middleware.
+2. **Scope `route_paths` to classification endpoints.** `SystemOneGatewayMiddleware` matches path prefixes and any `POST` carrying `x-reflex-route: true`. Use it only on classification endpoints. If you pass a custom `is_fastpath_fn`, verify its acceptance criteria on held-out traffic.
 
-`verify_decision_witness_receipt(receipt, public_key=trusted_key)` requires that
-independent key; omitting it returns `False`. The CLI likewise requires
-`verify-receipt --public-key trusted.pub`. For local diagnostics,
-`check_decision_receipt_integrity(receipt)` checks internal consistency without
-authenticating a signer. A key included in a receipt is never an independent
-source of trust.
+## Bind principal identity in LangChain and MCP adapters
 
-The committed `ledger_record_id` is bound in the receipt's signed envelope after
-append. This is the signer's attestation of inclusion; use
-`ledger.verify_receipt_record(receipt, trusted_public_key=trusted_key)` to check
-the exact stored record and the complete chain. Guards perform that lookup
-before accepting recorded decisions. Each ledger write rechecks the complete
-history in its transaction. Receipts from older versions with an unbound
-nonempty record ID fail current verification; retain the original evidence and
-validate it against its original ledger, or issue a fresh decision.
+When you attach `SystemOneGuardCallbackHandler` or `System1MCPProxy`:
 
-Keep signing keys persistent and protected; regenerating a key on every process start breaks a single-key trust chain. Maintain backups and an application-specific rotation strategy. Outcome records are linked to their prior authorization through the ledger; they are not independent hardware execution proofs. Explicit policy denials and approval requirements do not always produce receipts, so applications that need a complete denial audit must record those events separately.
+1. **Assign one `principal_id` per authenticated user or service.** Do not use per-request LangChain `run_id` values as `principal_id`.
+2. **Attach callbacks directly to tool objects and keep `raise_error=True`.** Allow `SystemOneGuardBlockedException` to propagate so blocked tool calls cannot execute.
 
-Receipts and ledgers can contain prompts, tool arguments, and results. Local processing does not remove the need to control access to those files. The package does not provide regulatory certification or establish an organization's compliance by itself.
+<a id="grpc"></a>
+## Secure the gRPC service boundary
 
-The core local decision path does not initiate external network calls. Optional teacher/fallback clients, observability exporters, user-provided projectors, and wrapped tools can do so. A `zero_egress` setting controls the relevant library fallback path, not the entire Python process or operating system.
+When you deploy the gRPC server (`system1[grpc]`):
 
-## ASGI gateway
+1. **Do not expose the CLI diagnostic server to untrusted networks.** `system1 serve --grpc` binds to `127.0.0.1` over plaintext gRPC without TLS, caller authentication, a persistent signing key, or a durable `ActionLedger`.
+2. **Configure production servers through `system1.grpc_server.serve(...)`.** Register explicit schema objects with `serve(schemas={"support": schema})`, attach a configured `SystemOneGuard`, and terminate TLS and caller authentication at your service proxy.
+3. **Pre-register every `schema_name`.** Remote gRPC requests can select only built-in schemas (`triage`, `guard`, and their canonical aliases) or exact names passed to `serve(schemas=...)`. Unknown schema names fail immediately and never load Python modules, local files, or inline JSON from remote input.
 
-`SystemOneGatewayMiddleware` can generate a local HTTP response before the downstream app runs. Put authentication, authorization, request-size limits, and any required logging outside this middleware. FastAPI endpoint dependencies do not run on its local response path.
+<a id="saved-skill-resource-limits"></a>
+## Enforce `.s1m` loader resource budgets
 
-Configure the intended `route_paths`; matching uses path prefixes, and the `x-reflex-route: true` header can also opt a POST into classification. Treat this middleware as a classification endpoint rather than a proxy that preserves arbitrary endpoint semantics. A custom `is_fastpath_fn` takes responsibility for its own acceptance rules.
+`CompiledSystemOneModel.load(...)` and `SystemOneEngine.load(...)` enforce fixed admission budgets before materializing arrays:
 
-The middleware buffers matched request bodies. Apply request-size limits in your front proxy or outer middleware. On escalation it replays the body once and then forwards subsequent ASGI receive events, including disconnects.
+| Resource | Maximum allowed value |
+| :--- | :--- |
+| `.s1m` file size | `64 MiB` |
+| JSON header size | `1 MiB` |
+| Fields per schema | `64` |
+| Options per field | `1,024` |
+| Feature dimension | `8,192` |
+| Calibration scores per field | `1,000,000` |
+| NPZ archive members per field | `17` |
+| Expanded array payload | `128 MiB` |
+| Per-member compression ratio | `1,024:1` |
+| Estimated model allocation budget | `256 MiB` |
 
-## LangChain and MCP
+The loader disables Python `pickle`, verifies NPY header shapes and `float32` or `float64` dtypes before reading arrays, and raises `ValueError` on malformed or over-budget files. `HybridProjector` skills store their spectral and subspace matrices as binary `.npz` members (`_projector_spectral_vectors` and `_projector_subspace_components`). Both v1 (APS) and v2 (LAC) `.s1m` files remain readable in System 1: Instinct 1.0.0.
 
-Use one configured principal per authenticated application context. LangChain run IDs correlate tool runs; they are not principal identities. LangChain callbacks must be attached to actual tool invocations, with blocking exceptions allowed to propagate. Keep `raise_error=True` enabled on the guard callback.
+## Measure end-to-end latency on target hardware
 
-The wrappers are adapters rather than a complete agent host or MCP authentication layer. Inspect their proposal contracts when writing argument policies. The gRPC Guard RPC's prompt/schema contract is distinct from an application-bound MCP or Python tool authorization proposal.
-
-## gRPC
-
-The CLI server binds to loopback by default using insecure gRPC transport. It has no built-in caller authentication or TLS, and the CLI does not configure a persistent signing key, ledger, or deterministic policy. Keep diagnostic instances local. A service deployment needs an authenticated transport boundary and explicit application configuration through `system1.grpc_server.serve(...)`.
-
-RPC `schema_name` accepts only built-ins (`triage`, `guard`, and their canonicalized
-aliases) and exact names registered with `serve(schemas={"support": schema})` at
-startup. Unknown names fail; remote inputs cannot load Python modules, local
-files or inline JSON, and no default guard is substituted for an unknown name.
-The trusted CLI `--schema` loader still supports those local formats. Register
-every custom name used by your clients, including policy tool names used in the
-diagnostic Guard RPC. Configure caller authentication and request limits at the
-service boundary.
-
-Experimental [Docker and Kubernetes templates](../deploy/README.md) are included. No published container image, authenticated service configuration, HSM integration or hardware enclave attestation is supplied.
-
-## Saved-skill resource limits
-
-The `.s1m` loader accepts at most 64 MiB of file data, a 1 MiB JSON header,
-64 fields, 1,024 options per field, dimension 8,192, and 1,000,000 calibration
-scores per field. It checks a maximum of seventeen NPZ members per field, 128 MiB of
-expanded arrays, a 1,024:1 per-member compression ratio, and a 256 MiB estimated
-model-construction allocation budget. NPY headers must describe correctly shaped
-float32 or float64 arrays before any array is materialized; pickle is disabled.
-Projector dimensions must match the model, and the allocation estimate includes
-covariance matrices, calibration score objects, exemplar state and hybrid-projector reconstruction buffers. Loaded heads use their saved weights without rebuilding description embeddings. File reads are bounded on startup and reload. These are loader admission
-budgets, not a process-wide memory ceiling; stricter application limits can be
-applied outside the loader. Ordinary v1/v2 skills continue to load; over-budget
-files raise `ValueError` and malformed files are rejected.
-
-Newly saved cold-start skills retain exemplar banks and online prototype state, and
-`HybridProjector` skills store their spectral and learned subspace matrices as
-binary `.npz` members (`_projector_spectral_vectors`, `_projector_subspace_components`)
-rather than inline JSON lists in the header.
-Readers predating these optional arrays reject those files. Existing v1/v2
-skills (including legacy JSON-inline projector fields) remain readable; inference
-state omitted by an older writer cannot be recovered from that artifact.
-
-## Performance and optional backends
-
-Sub-millisecond timings in the recorded runs are median decisions for the specific seed or taught workloads, with their measurement settings disclosed. They do not include durable authorization, complete tool execution, or network services. Measure whole-operation latency and throughput on your own hardware; the ledger's integrity checks can grow with ledger history.
-
-The base package uses NumPy and cryptography. MLX acceleration, neural-head experiments, gaming environments, and Game Boy emulation remain experimental and depend on platform support and user-provided assets. Their inclusion does not imply the stable core has learned those tasks. The `reflex` compatibility namespace shares a name with a separate web framework; avoid installing both distributions in the same environment.
+Reported sub-millisecond latencies (`0.1 to 0.4 ms`) measure median in-memory `engine.decide(...)` calls on CPU. They do not include SQLite disk syncs in `ActionLedger`, network hops in gRPC or HTTP, or downstream tool execution. Benchmark your full request path on your target hardware, and monitor `ActionLedger` write latency as the SQLite hash chain grows. Avoid installing the unrelated `reflex` web framework in the same virtual environment as `system1`, because `system1` provides the legacy `reflex` compatibility namespace.

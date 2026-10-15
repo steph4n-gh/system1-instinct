@@ -1,53 +1,53 @@
-# System 1: Instinct Documentation
+# System 1: Instinct documentation
 
 Current stable runtime: **1.0.0**.
 
-**System 1: Instinct** is a sub-millisecond non-autoregressive decision runtime. Define a structured decision (`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`), start **zero-shot** from option descriptions or teach from examples, adapt online via `adapt_zero_shot` and `BoundedReviewFallback`, and deploy portable `.s1m` skills locally with zero LLM calls.
+**System 1: Instinct** is a sub-millisecond non-autoregressive decision runtime. Each skill uses a `DecisionSchema` (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`), runs zero-shot from option descriptions or fits weights from labeled examples, updates online via `adapt_zero_shot` and `BoundedReviewFallback`, and serializes to a `.s1m` artifact.
 
 ---
 
-## 1. Real Drop-In Replacement Guides
+## 1. Framework drop-in replacement guides
 
-Start with a real, runnable procedure in **[docs/drop_in/README.md](drop_in/README.md)**:
+The index in [docs/drop_in/README.md](drop_in/README.md) covers drop-in integrations for external Python libraries:
 
-| Guide | What You Replace | Runnable Example |
+| Guide | Target interface | Runnable script |
 | :--- | :--- | :--- |
-| **[1. Semantic Router Drop-In](drop_in/01_semantic_router.md)** | `semantic_router.RouteLayer` | [`examples/drop_in/semantic_router_dropin.py`](../examples/drop_in/semantic_router_dropin.py) |
-| **[2. RouteLLM Cascade Drop-In](drop_in/02_routellm_cascade.md)** | `routellm.controller.Controller` | [`examples/drop_in/routellm_dropin.py`](../examples/drop_in/routellm_dropin.py) |
-| **[3. Instructor / BAML Structured Drop-In](drop_in/03_instructor_structured_outputs.md)** | `instructor.from_openai(...).create()` | [`examples/drop_in/instructor_structured_dropin.py`](../examples/drop_in/instructor_structured_dropin.py) |
-| **[4. Prompt-Guard Security Drop-In](drop_in/04_prompt_guard_security.md)** | `Llama-Prompt-Guard` / `Guardrails` | [`examples/drop_in/prompt_guard_dropin.py`](../examples/drop_in/prompt_guard_dropin.py) |
-| **[5. Live LLM Observe $\to$ `.s1m` Cutover](drop_in/05_llm_observe_and_cutover.md)** | Recurring OpenAI / Anthropic / Gemini calls | [`examples/drop_in/llm_cutover_dropin.py`](../examples/drop_in/llm_cutover_dropin.py) |
-| **[6. `poke-env` Showdown Reflex Agent](drop_in/06_poke_env_showdown_agent.md)** | Slow LLM / static game bots | [`benchmarks/quality/evaluate_poke_env_showdown.py`](../benchmarks/quality/evaluate_poke_env_showdown.py) |
+| [1. Semantic Router drop-in](drop_in/01_semantic_router.md) | `semantic_router.RouteLayer` | [`examples/drop_in/semantic_router_dropin.py`](../examples/drop_in/semantic_router_dropin.py) |
+| [2. RouteLLM cascade drop-in](drop_in/02_routellm_cascade.md) | `routellm.controller.Controller` | [`examples/drop_in/routellm_dropin.py`](../examples/drop_in/routellm_dropin.py) |
+| [3. Instructor structured output drop-in](drop_in/03_instructor_structured_outputs.md) | `instructor.from_openai(...).create()` | [`examples/drop_in/instructor_structured_dropin.py`](../examples/drop_in/instructor_structured_dropin.py) |
+| [4. Prompt-Guard security drop-in](drop_in/04_prompt_guard_security.md) | `Llama-Prompt-Guard` and `Guardrails` | [`examples/drop_in/prompt_guard_dropin.py`](../examples/drop_in/prompt_guard_dropin.py) |
+| [5. Live LLM observation and `.s1m` cutover](drop_in/05_llm_observe_and_cutover.md) | OpenAI, Anthropic, and Gemini calls | [`examples/drop_in/llm_cutover_dropin.py`](../examples/drop_in/llm_cutover_dropin.py) |
+| [6. `poke-env` Showdown reflex agent](drop_in/06_poke_env_showdown_agent.md) | `poke_env.player.Player` battle bots | [`benchmarks/quality/evaluate_poke_env_showdown.py`](../benchmarks/quality/evaluate_poke_env_showdown.py) |
 
 ---
 
-## 2. Core Guides & Integrations
+## 2. Core guides and integrations
 
-| Guide | Purpose |
+| Guide | Scope |
 | :--- | :--- |
-| [Quickstart](../README.md#quickstart) | Install System 1: Instinct and run your first zero-shot or taught skill |
-| [Your first skill](guides/first_skill.md) | Editable lesson file, candidate checks, and local reuse |
-| [Correct, compare, and adopt](guides/correcting_skills.md) | Multi-field `TeachingSession` lifecycle, qualification, and rollback |
-| [Teaching guide](guides/training_experts.md) | Label formats, compilation flags (`--hierarchical`, `--mondrian`), and online updates |
-| [Teacher observation (`TypeSafeClient`)](typesafe.md) | Observe a live teacher and automatically cut over to local `.s1m` execution |
-| [Application integrations](integrations.md) | Connect a skill to LangChain, MCP, FastAPI/ASGI, or gRPC (with live hot-reload) |
-| [Deterministic policy guard](guides/policy_guard.md) | Enforce explicit tool permissions, Ed25519 receipts, and SHA-256 hash-chained ledgers |
-| [Deployment boundaries](deployment.md) | Security boundaries, resource limits, and production checklists |
+| [Quickstart](../README.md#quickstart) | Environment setup and runnable quickstart commands |
+| [Teach your first skill](guides/first_skill.md) | Tutorial for building a two-choice routing skill from an editable JSON file |
+| [Correct, compare, and adopt a skill](guides/correcting_skills.md) | `TeachingSession` lifecycle, candidate assessment, qualification, and rollback |
+| [Teach and compile a decision skill](guides/training_experts.md) | Label formats, `SystemOneCompiler`, `TfidfProjector`, and online updates |
+| [Teacher observation (`TypeSafeClient`)](typesafe.md) | Reference for `system1.compat.typesafe.Client`, promotion policies, and `.s1m` export |
+| [Application integrations](integrations.md) | Reference for LangChain, MCP, FastAPI, ASGI, and gRPC adapters |
+| [Add an explicit tool policy](guides/policy_guard.md) | How to configure `SystemOneGuard`, `PolicyEngine`, Ed25519 receipts, and `ActionLedger` |
+| [Deployment boundaries](deployment.md) | Security boundaries, `.s1m` loader limits, and production checklists |
 | [Observability](observability/README.md) | Prometheus metrics and OpenTelemetry tracing |
-| [Example catalog](../examples/README.md) | Complete index of runnable examples and interactive labs |
+| [Example catalog](../examples/README.md) | Index of runnable scripts and interactive labs |
 
 ---
 
-## 3. Architecture, Mathematics & Benchmarks
+## 3. Architecture, mathematics, and benchmarks
 
 | Document | Scope |
 | :--- | :--- |
-| [Fresh Traffic with a Fallible Teacher](../benchmarks/heldout_traffic/REPORT.md) | HWU64, 10% noisy lessons, matched 1% local error budget, exact cache/classifier/Instinct comparison, frozen gates, binary `.s1m` hybrid fix, and independent verification |
-| [6-Category Benchmark Gauntlet](../benchmarks/quality/instinct_gauntlet_report.md) | `BANKING77` (32/77), `CLINC150-OOS`, `NotInject`, authored drift probes, 4-field extraction, and 0-shot routing |
-| [Drop-In & Adaptation Curve Report](../benchmarks/quality/drop_in_and_adaptation_report.md) | `0`-shot $\to$ `adapt_zero_shot` $\to$ `1`-shot $\to$ `3`-shot $\to$ `5`-shot $\to$ `.s1m` curves on `BANKING77` & `CLINC150` |
-| [`poke-env` Showdown Benchmark Report](../benchmarks/quality/poke_env_showdown_report.md) | Live `gen9randombattle` Showdown results against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer` |
-| [Architecture Reference](architecture/technical_specification.md) | Runtime components, `.s1m` v2 binary format, and module map |
-| [Technical Brief](paper/system1_technical_brief.md) | Concise overview of the runtime and empirical results |
+| [Fresh traffic with a fallible teacher](../benchmarks/heldout_traffic/REPORT.md) | `HWU64` with `10%` noisy lessons, `1%` and `5%` local error budgets, cache and classifier comparisons, and binary `.s1m` verification |
+| [Six-category benchmark report](../benchmarks/quality/instinct_gauntlet_report.md) | `BANKING77` (32 and 77 intents), `CLINC150-OOS`, `NotInject`, authored drift probes, four-field extraction, and zero-shot routing |
+| [Drop-in and adaptation curve report](../benchmarks/quality/drop_in_and_adaptation_report.md) | Zero-shot, `adapt_zero_shot`, few-shot, and compiled `.s1m` curves on `BANKING77` and `CLINC150` |
+| [`poke-env` Showdown benchmark report](../benchmarks/quality/poke_env_showdown_report.md) | Live `gen9randombattle` Showdown results against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer` |
+| [Architecture reference](architecture/technical_specification.md) | Runtime components, `.s1m` v2 binary format, and module map |
+| [Technical brief](paper/system1_technical_brief.md) | Summary of the runtime and empirical results |
 | [Whitepaper](paper/system1_whitepaper.md) | Full design, mathematical formulation, and workload evaluations |
-| [Mathematical Notes](paper/conformal_gating.md) | Split-conformal prediction, Mondrian calibration, dual OOD gating, and rank-1 RLS updates |
-| [Benchmark Suite Index](../benchmarks/quality/README.md) | All reproducible benchmark runners and datasets |
+| [Mathematical notes](paper/conformal_gating.md) | Split-conformal prediction, Mondrian calibration, dual OOD gating, and rank-1 RLS updates |
+| [Benchmark suite index](../benchmarks/quality/README.md) | Reproducible benchmark runners and datasets |

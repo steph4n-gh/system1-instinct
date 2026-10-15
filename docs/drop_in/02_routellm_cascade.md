@@ -1,15 +1,17 @@
-# Drop-In Guide 2: Replacing `RouteLLM` & Routing Inside `langchain-core` LCEL
+# How to replace `RouteLLM` inside a `langchain-core` LCEL pipeline
 
-This guide shows how to replace `routellm.controller.Controller` or an LLM router inside a real **`langchain_core` (`RunnableLambda`) LCEL pipeline**, evaluated across **`256` held-out `BANKING77` customer tickets (`32` intents, clean + character-typo stress)** against `sentence-transformers/all-MiniLM-L6-v2` (`91.1 MB` ONNX).
+Use [`SystemOneRouteController`](../../examples/drop_in/routellm_dropin.py) with `langchain_core.runnables.RunnableLambda` to route queries across local, fast, and frontier model tiers in `0.22 ms` without external API calls or `91.1 MB` ONNX checkpoints.
 
 ---
 
-## 1. Before (`RouteLLM` / Standard LangChain LLM Router)
+## 1. Review the existing `RouteLLM` controller
+
+With `routellm.controller.Controller`, routing requires external API keys or downloading an `80 to 500 MB` router checkpoint:
 
 ```python
 from routellm.controller import Controller
 
-# Requires external API keys or 80-500 MB router checkpoints:
+# Requires external API keys or 80 to 500 MB router checkpoints:
 controller = Controller(
     routers=["mf"],
     strong_model="gpt-5-reasoning",
@@ -23,7 +25,9 @@ response = controller.chat.completions.create(
 
 ---
 
-## 2. Drop-In Replacement (`SystemOneRouteController` & `langchain_core` LCEL)
+## 2. Wire `SystemOneRouteController` into `langchain_core` LCEL
+
+To route inside a LangChain Expression Language (LCEL) pipeline and teach overrides online in `<1 ms`, wrap `controller.route` in `RunnableLambda`:
 
 ```python
 from langchain_core.runnables import RunnableLambda
@@ -35,25 +39,27 @@ controller = SystemOneRouteController(
     local_model="system1-instinct-local",
 )
 
-# Drop directly into any LangChain LCEL pipeline:
+# Attach the router to a LangChain LCEL pipeline:
 lcel_router = RunnableLambda(lambda prompt: controller.route(prompt))
 decision = lcel_router.invoke("Debug this subtle concurrency deadlock in our distributed cluster")
 print(decision.selected_tier, decision.selected_model, decision.latency_ms)
 # -> frontier_reasoning_model  gpt-5-reasoning  1.47 ms
 
-# Teach overrides online in <1 ms:
+# Teach an override online in <1 ms:
 controller.record_feedback("Write a formal proof for Raft leader election safety", "frontier_reasoning_model")
 ```
 
 ---
 
-## 3. Run the Live `langchain-core` `BANKING77` Benchmark (`256` Held-Out Tickets)
+## 3. Run the `BANKING77` clean and typo-stress benchmark
+
+To compare `SystemOneRouteController` against `sentence-transformers/all-MiniLM-L6-v2` (`91.1 MB` ONNX) across `256` held-out `BANKING77` tickets (`32` intents), execute:
 
 ```bash
 python examples/drop_in/routellm_dropin.py
 ```
 
-### Real Output
+### Expected output
 
 ```text
 === 1. RouteLLM 3-Tier Cascade Drop-In (`SystemOneRouteController`) ===
