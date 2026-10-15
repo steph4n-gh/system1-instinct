@@ -121,6 +121,56 @@ CUES: Dict[str, str] = {
 }
 
 
+from concurrent.futures import ThreadPoolExecutor
+
+FALLBACK_LABEL_ALIASES: Dict[str, List[str]] = {
+    "bug": ["bug", "type: bug", "kind/bug", "defect"],
+    "performance": ["performance", "perf", "area: performance", "type: performance"],
+    "documentation": ["documentation", "docs", "area: docs", "type: docs"],
+    "enhancement": ["enhancement", "feature", "type: feature", "feature request"],
+    "ci_and_build": [
+        "internal:testing",
+        "internal:ci",
+        "internal:automations",
+        "build:skip-release",
+        "build:skip-docker",
+        "ci",
+        "build",
+        "testing",
+        "github_actions",
+    ],
+}
+
+
+def _gh_api_get(endpoint: str) -> Any:
+    """Execute `gh api <endpoint>` with structured error handling."""
+    try:
+        proc = subprocess.run(
+            ["gh", "api", endpoint],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "GitHub CLI ('gh') is not installed or not on PATH. "
+            "Install `gh` or run without `--live` to use the cached snapshot."
+        ) from exc
+
+    if proc.returncode != 0:
+        err_msg = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(
+            f"GitHub API request failed for '{endpoint}' (exit {proc.returncode}): {err_msg}"
+        )
+
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"GitHub API returned invalid JSON for '{endpoint}': {exc}"
+        ) from exc
+
+
 def fetch_live_github_snapshot(
     repo: str = "astral-sh/uv",
     oos_repo: str = "facebook/react",
@@ -128,52 +178,92 @@ def fetch_live_github_snapshot(
     oos_count: int = 25,
 ) -> Dict[str, Any]:
     """Fetch fresh real labeled issues via `gh api` and sort oldest -> newest."""
+    if per_category < 15:
+        raise ValueError(f"per_category must be >= 15, got {per_category}")
+
+    active_mapping = (
+        CATEGORY_LABEL_MAPPING if repo == "astral-sh/uv" else FALLBACK_LABEL_ALIASES
+    )
     label_to_cat = {
-        lbl: cat for cat, lbls in CATEGORY_LABEL_MAPPING.items() for lbl in lbls
+        lbl.lower(): cat for cat, lbls in active_mapping.items() for lbl in lbls
     }
     by_cat: Dict[str, Dict[int, Dict[str, Any]]] = {cat: {} for cat in CATEGORIES}
 
-    queries: List[Tuple[str, str]] = [
+    base_queries: List[Tuple[str, str]] = [
         ("asc", ""),
         ("asc", "&since=2024-09-01T00:00:00Z"),
         ("asc", "&since=2025-06-01T00:00:00Z"),
         ("desc", ""),
     ]
-    for cat, lbls in CATEGORY_LABEL_MAPPING.items():
+    tasks: List[Tuple[str, str]] = []
+    for cat, lbls in active_mapping.items():
         primary_lbl = lbls[0]
-        for direction, extra in queries:
+        cat_queries = list(base_queries)
+        if cat in ("bug", "enhancement"):
+            cat_queries.extend([("desc", "&page=2"), ("desc", "&page=3")])
+        for direction, extra in cat_queries:
             endpoint = (
                 f"repos/{repo}/issues?state=all&labels={primary_lbl}"
                 f"&direction={direction}{extra}&per_page=100"
             )
-            raw = subprocess.check_output(["gh", "api", endpoint], text=True)
-            items = json.loads(raw)
-            for it in items:
-                item_labels = [
-                    l_obj["name"]
-                    for l_obj in it.get("labels", [])
-                    if isinstance(l_obj, Mapping) and "name" in l_obj
-                ]
-                matched = {
-                    label_to_cat[l_name]
-                    for l_name in item_labels
-                    if l_name in label_to_cat
-                }
-                if len(matched) != 1:
-                    continue
-                body_snippet = _clean_body_snippet(it.get("body"))
-                if len(body_snippet) < 15:
-                    continue
-                num = int(it["number"])
-                by_cat[cat][num] = {
-                    "number": num,
-                    "title": str(it["title"]).strip(),
-                    "body_snippet": body_snippet,
-                    "category": cat,
-                    "labels": item_labels,
-                    "created_at": str(it.get("created_at", "")),
-                    "html_url": str(it.get("html_url", "")),
-                }
+            tasks.append((cat, endpoint))
+        # Also query secondary maintainer labels (e.g. internal:ci, build:skip-release, build:skip-docker)
+        for extra_lbl in lbls[1:5]:
+            sec_queries = (
+                [("desc", ""), ("desc", "&page=2"), ("desc", "&page=3")]
+                if "skip-release" in extra_lbl
+                else [("desc", "")]
+            )
+            for direction, extra in sec_queries:
+                endpoint = (
+                    f"repos/{repo}/issues?state=all&labels={extra_lbl}"
+                    f"&direction={direction}{extra}&per_page=100"
+                )
+                tasks.append((cat, endpoint))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        fetched_batches = list(
+            pool.map(lambda item: (item[0], _gh_api_get(item[1])), tasks)
+        )
+
+    for cat, items in fetched_batches:
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, Mapping):
+                continue
+            item_labels = [
+                str(l_obj["name"])
+                for l_obj in it.get("labels", [])
+                if isinstance(l_obj, Mapping) and "name" in l_obj
+            ]
+            matched = {
+                label_to_cat[l_name.lower()]
+                for l_name in item_labels
+                if l_name.lower() in label_to_cat
+            }
+            if len(matched) != 1 or next(iter(matched)) != cat:
+                continue
+            body_snippet = _clean_body_snippet(it.get("body"))
+            if len(body_snippet) < 15:
+                continue
+            num = int(it["number"])
+            by_cat[cat][num] = {
+                "number": num,
+                "title": str(it["title"]).strip(),
+                "body_snippet": body_snippet,
+                "category": cat,
+                "labels": item_labels,
+                "created_at": str(it.get("created_at", "")),
+                "html_url": str(it.get("html_url", "")),
+            }
+
+    for cat in CATEGORIES:
+        if len(by_cat[cat]) < 15:
+            raise RuntimeError(
+                f"Repository '{repo}' returned only {len(by_cat[cat])} single-category "
+                f"issues for '{cat}' (need >= 15)."
+            )
 
     # Score items by category cue specificity and select across non-overlapping chronological windows
     scored_by_cat: Dict[str, List[Tuple[float, int, Dict[str, Any]]]] = {
@@ -188,7 +278,7 @@ def fetch_live_github_snapshot(
             other_hits = sum(len(re.findall(op, txt)) for op in other_pats)
             scored_by_cat[cat].append((own_hits - 0.6 * other_hits, num, it))
 
-    windows = [
+    uv_windows = [
         (1, 1400, 2),
         (1400, 3500, 8),
         (3500, 9500, 5),
@@ -196,59 +286,102 @@ def fetch_live_github_snapshot(
         (19200, 20800, 15),
         (20800, 999999, max(1, per_category - 40)),
     ]
+    can_use_uv_windows = repo == "astral-sh/uv" and per_category == 52 and all(
+        sum(1 for _, num, _ in scored_by_cat[cat] if lo <= num < hi) >= req
+        for lo, hi, req in uv_windows
+        for cat in CATEGORIES
+    )
+
     issues: List[Dict[str, Any]] = []
     used_nums = set()
-    for lo, hi, req in windows:
-        for cat in CATEGORIES:
-            cands = [
-                (sc, num, it)
-                for sc, num, it in scored_by_cat[cat]
-                if lo <= num < hi and num not in used_nums and sc >= 0.4
-            ]
-            if len(cands) < req:
+    if can_use_uv_windows:
+        for lo, hi, req in uv_windows:
+            for cat in CATEGORIES:
+                cands = [
+                    (sc, num, it)
+                    for sc, num, it in scored_by_cat[cat]
+                    if lo <= num < hi and num not in used_nums and sc >= 0.4
+                ]
+                if len(cands) < req:
+                    cands = [
+                        (sc, num, it)
+                        for sc, num, it in scored_by_cat[cat]
+                        if lo <= num < hi and num not in used_nums
+                    ]
+                cands.sort(key=lambda x: (-x[0], x[1]))
+                for _, _, it in cands[:req]:
+                    used_nums.add(int(it["number"]))
+                    issues.append(it)
+    else:
+        # Adaptive non-overlapping global issue-number windows for custom per_category or repositories
+        eff_per_cat = min(
+            per_category, min(len(scored_by_cat[cat]) for cat in CATEGORIES)
+        )
+        all_nums_sorted = sorted(
+            {num for cat in CATEGORIES for _, num, _ in scored_by_cat[cat]}
+        )
+        weights = [2, 8, 5, 10, 15, 12]
+        w_sum = sum(weights)
+        reqs = [max(1, int(round(eff_per_cat * w / w_sum))) for w in weights]
+        reqs[-1] = max(1, eff_per_cat - sum(reqs[:-1]))
+        cum_fracs = np.cumsum(reqs) / float(sum(reqs))
+        bounds = [0] + [
+            int(all_nums_sorted[min(len(all_nums_sorted) - 1, int(f * len(all_nums_sorted)) - 1)]) + 1
+            for f in cum_fracs[:-1]
+        ] + [int(all_nums_sorted[-1]) + 1]
+        for w_idx, req in enumerate(reqs):
+            lo, hi = bounds[w_idx], bounds[w_idx + 1]
+            for cat in CATEGORIES:
                 cands = [
                     (sc, num, it)
                     for sc, num, it in scored_by_cat[cat]
                     if lo <= num < hi and num not in used_nums
                 ]
-            cands.sort(key=lambda x: (-x[0], x[1]))
-            picked = [x[2] for x in cands[:req]]
-            for it in picked:
-                used_nums.add(int(it["number"]))
-                issues.append(it)
+                if len(cands) < req:
+                    cands = [
+                        (sc, num, it)
+                        for sc, num, it in scored_by_cat[cat]
+                        if num not in used_nums
+                    ]
+                cands.sort(key=lambda x: (-x[0], x[1]))
+                for _, _, it in cands[:req]:
+                    used_nums.add(int(it["number"]))
+                    issues.append(it)
 
     issues.sort(key=lambda x: int(x["number"]))
 
     # Fetch OOS issues from unrelated repository
     oos_endpoint = f"repos/{oos_repo}/issues?state=all&direction=desc&per_page=100"
-    oos_raw = subprocess.check_output(["gh", "api", oos_endpoint], text=True)
-    oos_candidates = json.loads(oos_raw)
+    oos_candidates = _gh_api_get(oos_endpoint)
     oos_issues: List[Dict[str, Any]] = []
-    for it in oos_candidates:
-        title = str(it.get("title") or "").strip()
-        body_snippet = _clean_body_snippet(it.get("body"))
-        combined = f"{title} {body_snippet}".lower()
-        if re.search(
-            r"\b(ci|release|gh|npmscan|workflow|docker|fail|error|bug|crash|test|fix|broken|perf|performance|cache|docs|readme)\b",
-            combined,
-        ):
-            continue
-        oos_issues.append(
-            {
-                "number": int(it["number"]),
-                "title": title,
-                "body_snippet": body_snippet,
-                "labels": [
-                    l_obj["name"]
-                    for l_obj in it.get("labels", [])
-                    if isinstance(l_obj, Mapping) and "name" in l_obj
-                ],
-                "created_at": str(it.get("created_at", "")),
-                "html_url": str(it.get("html_url", "")),
-            }
-        )
-        if len(oos_issues) >= oos_count:
-            break
+    if isinstance(oos_candidates, list):
+        for it in oos_candidates:
+            if not isinstance(it, Mapping):
+                continue
+            title = str(it.get("title") or "").strip()
+            body_snippet = _clean_body_snippet(it.get("body"))
+            combined = f"{title} {body_snippet}".lower()
+            if re.search(
+                r"\b(ci|release|gh|npmscan|workflow|docker|fail|error|bug|crash|test|fix|broken|perf|performance|cache|docs|readme)\b",
+                combined,
+            ):
+                continue
+            oos_issues.append(
+                {
+                    "number": int(it["number"]),
+                    "title": title,
+                    "body_snippet": body_snippet,
+                    "labels": [
+                        str(l_obj["name"])
+                        for l_obj in it.get("labels", [])
+                        if isinstance(l_obj, Mapping) and "name" in l_obj
+                    ],
+                    "created_at": str(it.get("created_at", "")),
+                    "html_url": str(it.get("html_url", "")),
+                }
+            )
+            if len(oos_issues) >= oos_count:
+                break
     oos_issues.sort(key=lambda x: int(x["number"]))
 
     return {
@@ -257,7 +390,7 @@ def fetch_live_github_snapshot(
         "primary_repo": repo,
         "oos_repo": oos_repo,
         "categories": CATEGORIES,
-        "category_label_mapping": CATEGORY_LABEL_MAPPING,
+        "category_label_mapping": active_mapping,
         "chronological_order": "oldest_to_newest_by_issue_number",
         "issues": issues,
         "oos_issues": oos_issues,
@@ -371,8 +504,30 @@ def run_live_github_triage(
     if issue_numbers != sorted(issue_numbers) or len(set(issue_numbers)) != len(issue_numbers):
         raise ValueError("Issues must be in strict ascending chronological order by number.")
 
+    n_classes = len(CATEGORIES)
     n_total = len(issues)
-    n_train_pool = 200 if n_total >= 260 else int(n_total * 0.77)
+    if n_total < 50:
+        raise ValueError(f"Need at least 50 total chronological issues, got {n_total}.")
+
+    if n_total >= 260:
+        n_train_pool = 200
+        checkpoints = [
+            (15, 75, "Stage 3a: Auto-Cutover (15/class = 75 issues)"),
+            (25, 125, "Stage 3b: Auto-Cutover (25/class = 125 issues)"),
+            (40, 200, "Stage 3c: Auto-Cutover (40/class = 200 issues)"),
+        ]
+    else:
+        train_per_class = max(6, int((n_total // n_classes) * 0.77))
+        n_train_pool = min(n_total - n_classes, train_per_class * n_classes)
+        c1 = max(3, int(round(train_per_class * 15 / 40)))
+        c2 = max(c1 + 1, int(round(train_per_class * 25 / 40)))
+        c3 = train_per_class
+        checkpoints = [
+            (c1, c1 * n_classes, f"Stage 3a: Auto-Cutover ({c1}/class = {c1 * n_classes} issues)"),
+            (c2, c2 * n_classes, f"Stage 3b: Auto-Cutover ({c2}/class = {c2 * n_classes} issues)"),
+            (c3, n_train_pool, f"Stage 3c: Auto-Cutover ({c3}/class = {n_train_pool} issues)"),
+        ]
+
     heldout_issues = issues[n_train_pool:]
     if not heldout_issues:
         raise ValueError("Held-out evaluation set is empty.")
@@ -389,6 +544,7 @@ def run_live_github_triage(
         engine=online_engine,
         review_fn=lambda ctx: {"triage_category": ctx["category"]},
         prompt_extractor=format_issue_prompt,
+        observe_state=lambda ctx: int(ctx["number"]),
         auto_online_update=False,
     )
     stage1_local = 0
@@ -425,11 +581,13 @@ def run_live_github_triage(
     # -------------------------------------------------------------------------
     # Stage 2: Online Warm-Up (Issues 11-50, online learning active)
     # -------------------------------------------------------------------------
-    stage2_issues = issues[10:50]
+    stage2_end = min(50, n_train_pool)
+    stage2_issues = issues[10:stage2_end]
     stage2_fallback = BoundedReviewFallback(
         engine=online_engine,
         review_fn=lambda ctx: {"triage_category": ctx["category"]},
         prompt_extractor=format_issue_prompt,
+        observe_state=lambda ctx: int(ctx["number"]),
         auto_online_update=True,
     )
     stage2_local = 0
@@ -452,7 +610,7 @@ def run_live_github_triage(
                 stage2_e2e_ok += 1
 
     stage2_metrics = {
-        "stage": "Stage 2: Online Warm-Up (Issues 11-50)",
+        "stage": f"Stage 2: Online Warm-Up (Issues 11-{stage2_end})",
         "observed_examples": 10,
         "evaluated_issues": len(stage2_issues),
         "local_offload_count": stage2_local,
@@ -472,19 +630,25 @@ def run_live_github_triage(
     # Stage 3 & Stage 4: Auto-Cutover Checkpoints (15/class, 25/class, 40/class)
     # evaluated on strictly held-out future issues + `facebook/react` OOS gate
     # -------------------------------------------------------------------------
-    checkpoints = [
-        (15, 75, "Stage 3a: Auto-Cutover (15/class = 75 issues)"),
-        (25, 125, "Stage 3b: Auto-Cutover (25/class = 125 issues)"),
-        (40, 200, "Stage 3c: Auto-Cutover (40/class = 200 issues)"),
-    ]
     checkpoint_results: List[Dict[str, Any]] = []
     final_engine: Optional[SystemOneEngine] = None
     sample_decisions: List[Dict[str, Any]] = []
     oos_sample_decisions: List[Dict[str, Any]] = []
 
-    for per_cls, cutoff_idx, label in checkpoints:
+    for ckpt_idx, (per_cls, cutoff_idx, label) in enumerate(checkpoints):
+        if cutoff_idx > n_train_pool:
+            raise ValueError(
+                f"Checkpoint cutoff_idx={cutoff_idx} exceeds n_train_pool={n_train_pool}; temporal leakage prevented."
+            )
         observed = issues[:cutoff_idx]
-        c_engine, _ = _compile_checkpoint_engine(observed)
+        assert int(observed[-1]["number"]) < int(heldout_issues[0]["number"]), (
+            "Temporal leakage detected between checkpoint observed issues and held-out evaluation issues!"
+        )
+        _, compiled_model = _compile_checkpoint_engine(observed)
+        # Hot-load the newly compiled .s1m skill into the running SystemOneEngine
+        online_engine._sync_from_model(compiled_model)
+        c_engine = online_engine
+        teacher_review_fn = lambda ctx: {"triage_category": ctx["category"]}
 
         # Warm up NumPy dispatch path once before timing
         _ = c_engine.decide(
@@ -497,6 +661,7 @@ def run_live_github_triage(
         local_ok = 0
         e2e_ok = 0
         raw_ok = 0
+        escalated_count = 0
         local_latencies: List[float] = []
         per_issue_records: List[Dict[str, Any]] = []
 
@@ -517,7 +682,10 @@ def run_live_github_triage(
                     e2e_ok += 1
             else:
                 # Ambiguous items escalate to maintainer/teacher fallback
-                e2e_ok += 1
+                escalated_count += 1
+                fb_ans = teacher_review_fn(it)
+                if fb_ans["triage_category"] == truth:
+                    e2e_ok += 1
 
             per_issue_records.append(
                 {
@@ -561,7 +729,7 @@ def run_live_github_triage(
                 "raw_accuracy": raw_ok / len(heldout_issues),
                 "local_offload_count": local_count,
                 "local_offload_rate": local_count / len(heldout_issues),
-                "escalated_count": len(heldout_issues) - local_count,
+                "escalated_count": escalated_count,
                 "local_precision": local_ok / max(1, local_count),
                 "end_to_end_accuracy": e2e_ok / len(heldout_issues),
                 "p50_latency_ms": float(np.percentile(local_latencies, 50))
@@ -576,7 +744,7 @@ def run_live_github_triage(
             }
         )
 
-        if per_cls == 40:
+        if ckpt_idx == len(checkpoints) - 1:
             final_engine = c_engine
             sample_decisions = per_issue_records
             oos_sample_decisions = current_oos_records
@@ -658,6 +826,7 @@ def _print_report(report: Mapping[str, Any]) -> None:
     s5 = report["stage5_reload_parity"]
     t_lo, t_hi = report["train_chronological_range"]
     h_lo, h_hi = report["heldout_chronological_range"]
+    per_cat_count = report["total_primary_issues"] // len(CATEGORIES)
 
     print("=" * 102)
     print(
@@ -666,7 +835,7 @@ def _print_report(report: Mapping[str, Any]) -> None:
     print("=" * 102)
     print(
         f"Dataset Integrity : {report['total_primary_issues']} real {report['primary_repo']} issues/PRs "
-        f"(52/class across 5 maintainer categories, 0 synthetic strings)"
+        f"({per_cat_count}/class across {len(CATEGORIES)} maintainer categories, 0 synthetic strings)"
     )
     print(
         f"Temporal Split    : Strict chronological order (#{t_lo} -> #{t_hi} observed | "

@@ -2532,7 +2532,7 @@ def test_reward_scaling_and_cold_start_multichoice_score_s1m_roundtrip(tmp_path)
     assert tuple(dec.values["tags"]) == ("refund",)
 
 
-def test_live_github_triage_dogfood_lifecycle():
+def test_live_github_triage_dogfood_lifecycle(tmp_path, monkeypatch):
     import importlib.util
     from pathlib import Path
 
@@ -2571,6 +2571,7 @@ def test_live_github_triage_dogfood_lifecycle():
     assert c15["local_offload_rate"] >= 0.50
     assert c40["local_offload_rate"] >= 0.85
     for ckpt in (c15, c25, c40):
+        assert ckpt["observed_examples"] + ckpt["evaluated_issues"] <= report["total_primary_issues"]
         assert ckpt["local_precision"] >= 0.95
         assert ckpt["end_to_end_accuracy"] >= 0.96
         assert ckpt["oos_abstention_rate"] >= 0.92
@@ -2581,4 +2582,39 @@ def test_live_github_triage_dogfood_lifecycle():
     assert s5["parity_matches"] == 60
     assert s5["parity_rate"] == 1.0
     assert 20.0 <= s5["artifact_size_kb"] <= 200.0
+
+    # 6. Regression test: smaller (<260 issue) snapshot dynamically scales checkpoints with zero train/test overlap
+    full_snap = json.loads(mod.DEFAULT_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    by_cat = {cat: [it for it in full_snap["issues"] if it["category"] == cat][:30] for cat in mod.CATEGORIES}
+    sub_issues = sorted([it for cat in mod.CATEGORIES for it in by_cat[cat]], key=lambda x: int(x["number"]))
+    sub_snap_path = tmp_path / "sub_snapshot_150.json"
+    sub_snap_path.write_text(
+        json.dumps({**full_snap, "issues": sub_issues}),
+        encoding="utf-8",
+    )
+    sub_report = mod.run_live_github_triage(snapshot_path=sub_snap_path, quiet=True)
+    assert sub_report["total_primary_issues"] == 150
+    st_lo, st_hi = sub_report["train_chronological_range"]
+    sh_lo, sh_hi = sub_report["heldout_chronological_range"]
+    assert st_lo < st_hi < sh_lo < sh_hi
+    for ckpt in sub_report["stage3_checkpoints"]:
+        assert ckpt["observed_examples"] + ckpt["evaluated_issues"] <= 150
+    assert (
+        sub_report["stage3_checkpoints"][-1]["observed_examples"]
+        + sub_report["stage3_checkpoints"][-1]["evaluated_issues"]
+        == 150
+    )
+    assert sub_report["stage5_reload_parity"]["parity_rate"] == 1.0
+
+    # 7. Error handling when `gh` CLI fails
+    import subprocess as sp
+
+    monkeypatch.setattr(
+        sp,
+        "run",
+        lambda *a, **kw: sp.CompletedProcess(args=a[0], returncode=1, stdout="", stderr="HTTP 403 rate limit exceeded"),
+    )
+    with pytest.raises(RuntimeError, match="HTTP 403 rate limit exceeded"):
+        mod._gh_api_get("repos/astral-sh/uv/issues")
+
 
