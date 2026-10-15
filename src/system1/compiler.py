@@ -1176,6 +1176,70 @@ class CompiledSystemOneModel:
             reward=reward,
         )
 
+    def recalibrate(
+        self,
+        examples: Union[Sequence[Any], str, Path],
+        alpha: float = 0.05,
+        *,
+        n_bins: int = 10,
+        familiarity_alpha: Optional[float] = None,
+        prototype_alpha: Optional[float] = None,
+        mondrian: Optional[bool] = None,
+    ) -> Any:
+        """Recalibrate temperature scaling and conformal quantiles on held-out examples without modifying weights."""
+        from system1.engine import SystemOneEngine
+
+        engine = SystemOneEngine(
+            schema=self.schema,
+            model=self,
+            dimension=self.dimension,
+            backend=self.backend,
+            projector=self.projector,
+            forgetting_factor=self.forgetting_factor,
+            recency_weighted=self.recency_weighted,
+            use_cache=False,
+        )
+        return engine.recalibrate(
+            examples,
+            alpha=alpha,
+            n_bins=n_bins,
+            familiarity_alpha=familiarity_alpha,
+            prototype_alpha=prototype_alpha,
+            mondrian=mondrian,
+        )
+
+    def evaluate_dataset(
+        self,
+        rows: Union[Sequence[Any], str, Path],
+        *,
+        alpha: Optional[float] = None,
+        n_bins: int = 10,
+        strict_mode: Optional[bool] = None,
+        use_cache: bool = False,
+    ) -> Any:
+        """Evaluate the compiled model on a labeled dataset and return an EvaluationReport."""
+        from system1.engine import SystemOneEngine
+
+        eff_strict = bool(self.metadata.get("strict_mode", True)) if strict_mode is None else bool(strict_mode)
+        engine = SystemOneEngine(
+            schema=self.schema,
+            model=self,
+            dimension=self.dimension,
+            backend=self.backend,
+            projector=self.projector,
+            forgetting_factor=self.forgetting_factor,
+            recency_weighted=self.recency_weighted,
+            strict_mode=eff_strict,
+            use_cache=use_cache,
+        )
+        return engine.evaluate_dataset(
+            rows,
+            alpha=alpha,
+            n_bins=n_bins,
+            strict_mode=eff_strict,
+            use_cache=use_cache,
+        )
+
     def to_bytes(self, include_covariance: bool = False) -> bytes:
         """Serializes the compiled model into compact .s1m binary bytes.
 
@@ -1203,7 +1267,10 @@ class CompiledSystemOneModel:
                 if getattr(ch, "mondrian", False):
                     h_entry["mondrian"] = True
                 class_scores = getattr(ch, "class_calibration_scores", None)
-                if class_scores and getattr(ch, "mondrian", False):
+                if class_scores and (
+                    getattr(ch, "mondrian", False)
+                    or sum(len(v) for v in class_scores.values()) <= 2048
+                ):
                     h_entry["class_calibration_scores"] = {
                         str(k): [float(v) for v in vals] for k, vals in sorted(class_scores.items())
                     }
@@ -1461,10 +1528,30 @@ class CompiledSystemOneModel:
                 raise ValueError(f"Saved head {name!r} contains invalid calibration scores")
             raw_class_scores = h_info.get("class_calibration_scores", {})
             parsed_class_scores: Dict[str, Tuple[float, ...]] = {}
-            if isinstance(raw_class_scores, dict):
+            if raw_class_scores is not None:
+                if not isinstance(raw_class_scores, dict):
+                    raise ValueError(f"Saved head {name!r} class_calibration_scores must be a mapping")
+                allowed_classes = (
+                    set(definition.options)
+                    if isinstance(definition, (ChoiceField, MultiChoiceField))
+                    else ({"False", "True"} if isinstance(definition, BooleanField) else set())
+                )
+                total_class_scores = 0
                 for c_key, c_vals in raw_class_scores.items():
-                    if isinstance(c_vals, (list, tuple)):
-                        parsed_class_scores[str(c_key)] = tuple(float(v) for v in c_vals)
+                    if str(c_key) not in allowed_classes or not isinstance(c_vals, (list, tuple)):
+                        raise ValueError(f"Saved head {name!r} has invalid class_calibration_scores entry {c_key!r}")
+                    total_class_scores += len(c_vals)
+                    if total_class_scores > MAX_SKILL_CALIBRATION_SCORES:
+                        raise ValueError(f"Saved head {name!r} class_calibration_scores exceeds limit")
+                    parsed_vals: List[float] = []
+                    for v in c_vals:
+                        if isinstance(v, bool) or not isinstance(v, (int, float)):
+                            raise ValueError(f"Saved head {name!r} contains non-numeric class calibration score")
+                        fv = float(v)
+                        if not math.isfinite(fv) or fv < 0.0:
+                            raise ValueError(f"Saved head {name!r} contains invalid class calibration score")
+                        parsed_vals.append(fv)
+                    parsed_class_scores[str(c_key)] = tuple(parsed_vals)
             fam_thresh = float(h_info.get("familiarity_threshold", 0.0))
             if not math.isfinite(fam_thresh) or fam_thresh < 0:
                 raise ValueError(f"Saved head {name!r} has an invalid familiarity_threshold")

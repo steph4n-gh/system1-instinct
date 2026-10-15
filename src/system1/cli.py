@@ -935,7 +935,170 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--schema", action="append", help="Schema to load: 'guard', 'triage', or 'name:path/to/file.s1m'. Can be repeated.")
     serve_parser.set_defaults(func=handle_serve_command)
 
+    eval_parser = subparsers.add_parser("eval", help="Evaluate a compiled .s1m skill or schema on a labeled dataset")
+    eval_parser.add_argument("target_pos", nargs="?", default=None, metavar="target", help="Skill .s1m path, session directory, or schema preset ('triage', 'guard')")
+    eval_parser.add_argument("dataset_pos", nargs="?", default=None, metavar="dataset", help="Path to labeled JSONL or JSON evaluation dataset")
+    eval_parser.add_argument("--model", help="Path to a compiled .s1m model or teaching session directory")
+    eval_parser.add_argument("--schema", help="Optional schema preset ('triage', 'guard'), import path, or JSON schema file")
+    eval_parser.add_argument("--dataset", "--data", dest="dataset", help="Path to labeled JSONL or JSON evaluation dataset")
+    eval_parser.add_argument("--alpha", type=float, default=None, help="Conformal significance level (default: 0.05 or model's calibrated alpha)")
+    eval_parser.add_argument("--recalibrate", help="Optional held-out JSONL/JSON dataset for post-hoc temperature and conformal recalibration before evaluation")
+    eval_parser.add_argument("--output", "-o", help="Optional output path to save the recalibrated .s1m skill")
+    eval_parser.add_argument("--bins", type=int, default=10, help="Number of calibration probability bins (default: 10)")
+    strict_group = eval_parser.add_mutually_exclusive_group()
+    strict_group.add_argument("--strict", dest="strict_mode", action="store_true", default=None, help="Force strict uncertainty gating")
+    strict_group.add_argument("--no-strict", dest="strict_mode", action="store_false", help="Disable strict uncertainty gating")
+    eval_parser.add_argument("--json", action="store_true", help="Output machine-readable JSON evaluation report")
+    eval_parser.set_defaults(func=handle_eval_command)
+
     return parser
+
+
+def handle_eval_command(args: argparse.Namespace) -> int:
+    """CLI handler for 'system1 eval'."""
+    from system1 import evaluate as run_evaluate
+
+    target_pos = getattr(args, "target_pos", None)
+    dataset_pos = getattr(args, "dataset_pos", None)
+    model_arg = getattr(args, "model", None)
+    schema_arg = getattr(args, "schema", None)
+    dataset_arg = getattr(args, "dataset", None)
+    alpha_arg = getattr(args, "alpha", None)
+    recalibrate_arg = getattr(args, "recalibrate", None)
+    output_arg = getattr(args, "output", None)
+    strict_arg = getattr(args, "strict_mode", None)
+    raw_bins = getattr(args, "bins", None)
+    bins_arg = 10 if raw_bins is None else int(raw_bins)
+    as_json = bool(getattr(args, "json", False))
+
+    if dataset_arg is None and dataset_pos is not None:
+        dataset_arg = dataset_pos
+    elif dataset_arg is None and target_pos is not None and (model_arg is not None or schema_arg is not None):
+        dataset_arg = target_pos
+        target_pos = None
+
+    try:
+        if target_pos is not None and model_arg is None and schema_arg is None:
+            t_path = Path(target_pos)
+            if t_path.exists():
+                if t_path.is_file() and t_path.suffix.lower() in {".json", ".py"}:
+                    schema_arg = target_pos
+                else:
+                    model_arg = target_pos
+            else:
+                if (
+                    target_pos.endswith(".s1m")
+                    or target_pos.endswith(".json")
+                    or target_pos.endswith(".py")
+                    or "/" in target_pos
+                    or "\\" in target_pos
+                ):
+                    raise FileNotFoundError(f"Evaluation target file not found: {target_pos}")
+                schema_arg = target_pos
+
+        if not dataset_arg:
+            raise ValueError("Provide a dataset path (positional <dataset> or --dataset <path>) for evaluation")
+        if not model_arg and not schema_arg:
+            raise ValueError("Provide <target>, --model <path.s1m>, or --schema <schema> for evaluation")
+        resolved_schema = _load_schema(schema_arg) if schema_arg else None
+        recal_report = None
+
+        if recalibrate_arg or output_arg:
+            if model_arg:
+                m_path = Path(model_arg)
+                if m_path.is_dir():
+                    for cand in ("current.s1m", "skill.s1m", "candidate.s1m"):
+                        if (m_path / cand).is_file():
+                            m_path = m_path / cand
+                            break
+                load_kwargs: Dict[str, Any] = {}
+                if strict_arg is not None:
+                    load_kwargs["strict_mode"] = bool(strict_arg)
+                engine = SystemOneEngine.load(m_path, schema=resolved_schema, **load_kwargs)
+            else:
+                assert resolved_schema is not None
+                engine = SystemOneEngine(
+                    resolved_schema,
+                    strict_mode=bool(strict_arg) if strict_arg is not None else False,
+                )
+            if recalibrate_arg:
+                recal_alpha = float(alpha_arg) if alpha_arg is not None else float(getattr(engine, "default_alpha", 0.05) or 0.05)
+                recal_report = engine.recalibrate(recalibrate_arg, alpha=recal_alpha, n_bins=bins_arg)
+            if output_arg:
+                engine.save(output_arg)
+            report = engine.evaluate_dataset(
+                dataset_arg,
+                alpha=alpha_arg,
+                n_bins=bins_arg,
+                strict_mode=strict_arg,
+            )
+        else:
+            target: Any = model_arg if model_arg else resolved_schema
+            report = run_evaluate(
+                target,
+                dataset_arg,
+                schema=resolved_schema,
+                alpha=alpha_arg,
+                n_bins=bins_arg,
+                strict_mode=strict_arg,
+            )
+    except Exception as exc:
+        if as_json:
+            print(json.dumps({"error": str(exc)}, indent=2))
+        else:
+            print(f"[SYSTEM1 ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    if as_json:
+        payload = report.to_dict()
+        if recal_report is not None:
+            payload["recalibration"] = recal_report.to_dict()
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print(f"\n[SYSTEM 1 EVALUATION REPORT] EvaluationReport Schema: {report.schema_name} (alpha={report.alpha:.3f}, n={report.total_examples})")
+    if recal_report is not None:
+        print(
+            f"Recalibration:       ECE {recal_report.ece_before:.4f} -> {recal_report.ece_after:.4f} | "
+            f"NLL {recal_report.nll_before:.4f} -> {recal_report.nll_after:.4f} | "
+            f"T={recal_report.temperature:.3f}, qhat={recal_report.qhat:.4f}"
+        )
+    print("-" * 92)
+    print(
+        f"Overall Accuracy:    {report.overall_accuracy:.2%}   | "
+        f"Accepted Accuracy:   {report.accepted_accuracy:.2%}   | "
+        f"Conformal Coverage:  {report.conformal_coverage:.2%}"
+    )
+    print(
+        f"Fast-Path Coverage:  {report.coverage:.2%}   | "
+        f"Ambiguity Abstain:   {report.abstain_rate:.2%}   | "
+        f"Unfamiliar (OOD):    {report.unfamiliar_rate:.2%}"
+    )
+    print(
+        f"Calibration ECE:     {report.ece:.4f}    | "
+        f"Brier Score:         {report.brier_score:.4f}    | "
+        f"Negative Log-Lik:    {report.nll:.4f}"
+    )
+    print(
+        f"Avg Set Size:        {report.average_set_size:.2f}      | "
+        f"Singleton Rate:      {report.singleton_rate:.2%}   | "
+        f"Latency p50 / p95:   {report.p50_latency_ms:.3f} / {report.p95_latency_ms:.3f} ms"
+    )
+    if report.abstention_reasons:
+        reasons_str = ", ".join(f"{k}={v}" for k, v in sorted(report.abstention_reasons.items()))
+        print(f"Deferral Breakdown:  {reasons_str}")
+    print("-" * 92)
+    print(f"{'Field':<18} {'Acc':>8} {'Acc(Acc)':>9} {'ConfCov':>8} {'SetSz':>6} {'ECE':>8} {'Brier':>8} {'NLL':>8} {'Cov/Abs/Unf':>18}")
+    print("-" * 92)
+    for fname, fm in report.fields.items():
+        part_str = f"{fm.coverage:.0%}/{fm.abstain_rate:.0%}/{fm.unfamiliar_rate:.0%}"
+        print(
+            f"{fname:<18} {fm.accuracy:>7.1%} {fm.accepted_accuracy:>8.1%} "
+            f"{fm.conformal_coverage:>7.1%} {fm.average_set_size:>6.2f} "
+            f"{fm.ece:>8.4f} {fm.brier_score:>8.4f} {fm.nll:>8.4f} {part_str:>18}"
+        )
+    print("-" * 92 + "\n")
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -958,6 +1121,7 @@ __all__ = [
     "handle_compile_command",
     "handle_teach_command",
     "handle_serve_command",
+    "handle_eval_command",
     "DefaultTriageSchema",
 ]
 

@@ -85,6 +85,40 @@ engine.save("triage.s1m")
 reloaded = SystemOneEngine.load("triage.s1m")
 ```
 
+### Evaluate and recalibrate a skill on held-out traffic
+
+Before promoting a `.s1m` skill or adjusting your abstention target `alpha`, run `system1.evaluate()` (or `system1 eval` from the CLI) on a held-out JSONL or JSON dataset. To update temperature scaling and conformal quantiles on fresh calibration rows without retraining RLS weights (`weights`, `biases`, `P`, `B`) or projector parameters, call `engine.recalibrate(calib_rows, alpha=0.05)` or pass `--recalibrate`:
+
+```python
+import system1
+
+recal = reloaded.recalibrate("calib.jsonl", alpha=0.05)
+reloaded.save("triage_recal.s1m")
+
+report = system1.evaluate("triage_recal.s1m", "heldout.jsonl", alpha=0.05)
+print(report.summary_table())
+```
+
+```bash
+system1 eval triage.s1m heldout.jsonl --recalibrate calib.jsonl -o triage_recal.s1m --alpha 0.05
+```
+
+```text
+[SYSTEM 1 EVALUATION REPORT] EvaluationReport Schema: SupportTriage (alpha=0.050, n=6)
+Recalibration:       ECE 0.0142 -> 0.0000 | NLL 0.0144 -> 0.0000 | T=0.150, qhat=0.0000
+--------------------------------------------------------------------------------------------
+Overall Accuracy:    100.00%   | Accepted Accuracy:   100.00%   | Conformal Coverage:  100.00%
+Fast-Path Coverage:  100.00%   | Ambiguity Abstain:   0.00%   | Unfamiliar (OOD):    0.00%
+Calibration ECE:     0.0000    | Brier Score:         0.0000    | Negative Log-Lik:    0.0000
+Avg Set Size:        1.00      | Singleton Rate:      100.00%   | Latency p50 / p95:   0.407 / 0.534 ms
+--------------------------------------------------------------------------------------------
+Field                   Acc  Acc(Acc)  ConfCov  SetSz      ECE    Brier      NLL        Cov/Abs/Unf
+--------------------------------------------------------------------------------------------
+queue               100.0%   100.0%  100.0%   1.00   0.0000   0.0000   0.0000         100%/0%/0%
+urgent              100.0%   100.0%  100.0%   1.00   0.0000   0.0000   0.0000         100%/0%/0%
+--------------------------------------------------------------------------------------------
+```
+
 ### Choose how to teach Instinct in production
 
 An LLM teacher (`GPT-4o`, `Claude`, or `Gemini`) guesses from text before execution happens. Your application context is often a better teacher because it observes what worked after execution for `$0` and `0` LLM tokens:

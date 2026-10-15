@@ -10,7 +10,6 @@ def main(directory):
     sources = list(directory.glob('*.tar.gz'))
     assert len(wheels) == len(sources) == 1, 'Expected one wheel and one source archive'
     wheel, source = wheels[0], sources[0]
-    # These archives contain code/examples, not the full research evidence corpus.
     assert wheel.stat().st_size < 2 * 1024**2, 'Wheel unexpectedly exceeds 2 MiB'
     assert source.stat().st_size < 25 * 1024**2, 'Source archive unexpectedly exceeds 25 MiB'
     with zipfile.ZipFile(wheel) as archive:
@@ -37,6 +36,24 @@ def main(directory):
 
 
 if __name__ == '__main__':
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('directory', type=Path)
-    main(parser.parse_args().directory)
+    parser.add_argument('directory', type=Path, nargs='?', default=None)
+    args = parser.parse_args()
+    if args.directory is not None:
+        main(args.directory)
+    else:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            if shutil.which('uv'):
+                subprocess.run(['uv', 'build', '--out-dir', str(tmp_path)], check=True)
+            else:
+                subprocess.run([sys.executable, '-m', 'build', '--outdir', str(tmp_path)], check=True)
+            shutil.rmtree(Path('build'), ignore_errors=True)
+            main(tmp_path)
+
+

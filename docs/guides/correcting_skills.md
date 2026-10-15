@@ -215,3 +215,30 @@ session = TeachingSession(".system1/logistic-session", SupportRoute, choice_solv
 ```
 
 To use `choice_solver="logistic"`, install `python -m pip install 'system1[teaching]'`, which adds SciPy for fitting. Saved `.s1m` artifacts run inference with NumPy alone and do not require SciPy at decision time.
+
+## Evaluate and recalibrate a compiled skill
+
+When you want to audit an existing `.s1m` artifact, `SystemOneEngine`, or `TeachingSession` directory on a held-out JSONL or JSON dataset without modifying recorded lessons, call `system1.evaluate()` or run `system1 eval`:
+
+```python
+import system1
+from system1 import CompiledSystemOneModel
+
+model = CompiledSystemOneModel.load(".system1/support-session/current.s1m")
+recal = model.recalibrate("calib.jsonl", alpha=0.05)
+model.save("support-recalibrated.s1m")
+
+report = system1.evaluate(model, "heldout.jsonl", alpha=0.05)
+print(report.overall_accuracy, report.accepted_accuracy, report.conformal_coverage)
+print(report.coverage, report.abstain_rate, report.unfamiliar_rate)
+```
+
+`model.recalibrate()` and `engine.recalibrate()` refit temperature scaling and conformal nonconformity quantiles (`qhat`, `calibration_scores`, and `class_calibration_scores`) on held-out examples while leaving the linear decision hyperplanes (`weights`, `biases`, `P`, and `B`) and projector state untouched.
+
+To run dataset evaluation and post-hoc recalibration from the CLI, execute:
+
+```bash
+system1 eval .system1/support-session/current.s1m heldout.jsonl --recalibrate calib.jsonl -o support-recalibrated.s1m --alpha 0.05
+system1 eval support-recalibrated.s1m heldout.jsonl --alpha 0.05 --json
+```
+

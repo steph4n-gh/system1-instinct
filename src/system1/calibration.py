@@ -980,12 +980,275 @@ class RegressionConformalPredictor:
         )
 
 
+@dataclass(frozen=True)
+class RecalibrationMetrics:
+    """Per-field post-hoc temperature scaling and conformal quantile recalibration summary."""
+
+    field_name: str
+    ece_before: float
+    ece_after: float
+    nll_before: float
+    nll_after: float
+    temperature_before: float
+    temperature: float
+    qhat_before: float
+    qhat: float
+    alpha: float
+    n_examples: int
+    brier_before: float = 0.0
+    brier_after: float = 0.0
+    familiarity_threshold: float = 0.0
+    prototype_threshold: float = 0.0
+    calibration_scores: Tuple[float, ...] = ()
+    class_calibration_scores: Dict[str, Tuple[float, ...]] = field(default_factory=dict)
+
+    @property
+    def optimal_temperature(self) -> float:
+        return self.temperature
+
+    @property
+    def temperature_after(self) -> float:
+        return self.temperature
+
+    @property
+    def previous_temperature(self) -> float:
+        return self.temperature_before
+
+    @property
+    def updated_temperature(self) -> float:
+        return self.temperature
+
+    @property
+    def calibrated_temperature(self) -> float:
+        return self.temperature
+
+    @property
+    def conformal_quantile(self) -> float:
+        return self.qhat
+
+    @property
+    def qhat_after(self) -> float:
+        return self.qhat
+
+    @property
+    def previous_conformal_quantile(self) -> float:
+        return self.qhat_before
+
+    @property
+    def updated_conformal_quantile(self) -> float:
+        return self.qhat
+
+    @property
+    def calibrated_quantile(self) -> float:
+        return self.qhat
+
+    @property
+    def calibration_sample_count(self) -> int:
+        return self.n_examples
+
+    @property
+    def initial_nll(self) -> float:
+        return self.nll_before
+
+    @property
+    def calibrated_nll(self) -> float:
+        return self.nll_after
+
+    @property
+    def initial_ece(self) -> float:
+        return self.ece_before
+
+    @property
+    def calibrated_ece(self) -> float:
+        return self.ece_after
+
+    @property
+    def initial_brier(self) -> float:
+        return self.brier_before
+
+    @property
+    def calibrated_brier(self) -> float:
+        return self.brier_after
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "field_name": self.field_name,
+            "ece_before": self.ece_before,
+            "ece_after": self.ece_after,
+            "nll_before": self.nll_before,
+            "nll_after": self.nll_after,
+            "temperature_before": self.temperature_before,
+            "temperature": self.temperature,
+            "qhat_before": self.qhat_before,
+            "qhat": self.qhat,
+            "alpha": self.alpha,
+            "n_examples": self.n_examples,
+            "brier_before": self.brier_before,
+            "brier_after": self.brier_after,
+            "familiarity_threshold": self.familiarity_threshold,
+            "prototype_threshold": self.prototype_threshold,
+            "calibration_scores": list(self.calibration_scores),
+            "class_calibration_scores": {k: list(v) for k, v in self.class_calibration_scores.items()},
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        if hasattr(self, key) and not key.startswith("_") and not callable(getattr(self, key)):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def keys(self) -> Any:
+        return self.to_dict().keys()
+
+    def items(self) -> Any:
+        return self.to_dict().items()
+
+    def values(self) -> Any:
+        return self.to_dict().values()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and not key.startswith("_") and hasattr(self, key) and not callable(getattr(self, key))
+
+
+@dataclass(frozen=True)
+class RecalibrationReport:
+    """Aggregate and per-field post-hoc recalibration diagnostics."""
+
+    ece_before: float
+    ece_after: float
+    nll_before: float
+    nll_after: float
+    temperature_before: float
+    temperature: float
+    qhat_before: float
+    qhat: float
+    alpha: float
+    n_examples: int
+    per_field: Dict[str, RecalibrationMetrics] = field(default_factory=dict)
+    schema_name: str = ""
+    brier_before: float = 0.0
+    brier_after: float = 0.0
+
+    @property
+    def per_field_metrics(self) -> Dict[str, RecalibrationMetrics]:
+        return self.per_field
+
+    @property
+    def field_metrics(self) -> Dict[str, RecalibrationMetrics]:
+        return self.per_field
+
+    @property
+    def fields(self) -> Dict[str, RecalibrationMetrics]:
+        return self.per_field
+
+    @property
+    def total_examples(self) -> int:
+        return self.n_examples
+
+    @property
+    def calibration_size(self) -> int:
+        return self.n_examples
+
+    @property
+    def initial_ece(self) -> float:
+        return self.ece_before
+
+    @property
+    def calibrated_ece(self) -> float:
+        return self.ece_after
+
+    @property
+    def initial_nll(self) -> float:
+        return self.nll_before
+
+    @property
+    def calibrated_nll(self) -> float:
+        return self.nll_after
+
+    @property
+    def initial_brier(self) -> float:
+        return self.brier_before
+
+    @property
+    def calibrated_brier(self) -> float:
+        return self.brier_after
+
+    @property
+    def optimal_temperature(self) -> float:
+        return self.temperature
+
+    @property
+    def temperature_after(self) -> float:
+        return self.temperature
+
+    @property
+    def conformal_quantile(self) -> float:
+        return self.qhat
+
+    @property
+    def qhat_after(self) -> float:
+        return self.qhat
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_name": self.schema_name,
+            "ece_before": self.ece_before,
+            "ece_after": self.ece_after,
+            "nll_before": self.nll_before,
+            "nll_after": self.nll_after,
+            "brier_before": self.brier_before,
+            "brier_after": self.brier_after,
+            "temperature_before": self.temperature_before,
+            "temperature": self.temperature,
+            "qhat_before": self.qhat_before,
+            "qhat": self.qhat,
+            "alpha": self.alpha,
+            "n_examples": self.n_examples,
+            "per_field": {k: v.to_dict() for k, v in self.per_field.items()},
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self.per_field:
+            return self.per_field[key]
+        if hasattr(self, key) and not key.startswith("_") and not callable(getattr(self, key)):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def keys(self) -> Any:
+        return self.to_dict().keys()
+
+    def items(self) -> Any:
+        return self.to_dict().items()
+
+    def values(self) -> Any:
+        return self.to_dict().values()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and (
+            key in self.per_field
+            or (not key.startswith("_") and hasattr(self, key) and not callable(getattr(self, key)))
+        )
+
+
 __all__ = [
     "BrierDecomposition",
     "CalibrationMetrics",
     "ConformalPredictionSet",
     "ConformalPredictor",
     "DecisionCalibrator",
+    "RecalibrationMetrics",
+    "RecalibrationReport",
     "RegressionConformalInterval",
     "RegressionConformalPredictor",
     "compute_brier_decomposition",

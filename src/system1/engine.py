@@ -32,8 +32,13 @@ from system1.calibration import (
     ConformalPredictionSet,
     ConformalPredictor,
     DecisionCalibrator,
+    RecalibrationMetrics,
+    RecalibrationReport,
     RegressionConformalInterval,
     RegressionConformalPredictor,
+    compute_brier_decomposition,
+    compute_ece_and_bins,
+    compute_nll,
 )
 from system1.core import (
     BooleanField,
@@ -54,6 +59,402 @@ from system1.receipt import (
     create_decision_receipt,
     public_key_fingerprint,
 )
+
+
+@dataclass(frozen=True)
+class FieldEvaluationMetrics:
+    """Per-field accuracy, selective accuracy, abstention/OOD rates, conformal coverage, and calibration metrics."""
+
+    field_name: str
+    field_type: str
+    total_examples: int
+    accepted_examples: int
+    abstained_examples: int
+    unfamiliar_examples: int
+    accuracy: float
+    accepted_accuracy: float
+    conformal_coverage: float
+    average_set_size: float
+    singleton_rate: float
+    ece: float
+    brier_score: float
+    nll: float
+    coverage: float
+    abstain_rate: float
+    unfamiliar_rate: float
+    abstention_reasons: Dict[str, int] = field(default_factory=dict)
+    mae: float = 0.0
+
+    @property
+    def n_examples(self) -> int:
+        return self.total_examples
+
+    @property
+    def selective_accuracy(self) -> float:
+        return self.accepted_accuracy
+
+    @property
+    def empirical_set_coverage(self) -> float:
+        return self.conformal_coverage
+
+    @property
+    def mean_set_size(self) -> float:
+        return self.average_set_size
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "field_name": self.field_name,
+            "field_type": self.field_type,
+            "total_examples": self.total_examples,
+            "n_examples": self.total_examples,
+            "accepted_examples": self.accepted_examples,
+            "abstained_examples": self.abstained_examples,
+            "unfamiliar_examples": self.unfamiliar_examples,
+            "accuracy": self.accuracy,
+            "accepted_accuracy": self.accepted_accuracy,
+            "selective_accuracy": self.accepted_accuracy,
+            "conformal_coverage": self.conformal_coverage,
+            "empirical_set_coverage": self.conformal_coverage,
+            "average_set_size": self.average_set_size,
+            "mean_set_size": self.average_set_size,
+            "singleton_rate": self.singleton_rate,
+            "ece": self.ece,
+            "brier_score": self.brier_score,
+            "nll": self.nll,
+            "coverage": self.coverage,
+            "abstain_rate": self.abstain_rate,
+            "unfamiliar_rate": self.unfamiliar_rate,
+            "abstention_reasons": dict(self.abstention_reasons),
+            "mae": self.mae,
+        }
+
+    def __getitem__(self, key: str) -> Any:
+        if hasattr(self, key) and not key.startswith("_") and not callable(getattr(self, key)):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def keys(self) -> Any:
+        return self.to_dict().keys()
+
+    def items(self) -> Any:
+        return self.to_dict().items()
+
+    def values(self) -> Any:
+        return self.to_dict().values()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and not key.startswith("_") and hasattr(self, key) and not callable(getattr(self, key))
+
+
+@dataclass(frozen=True)
+class EvaluationReport:
+    """Dataset-level and per-field evaluation summary for a System 1 engine or compiled .s1m skill."""
+
+    schema_name: str
+    alpha: float
+    total_examples: int
+    accepted_examples: int
+    abstained_examples: int
+    unfamiliar_examples: int
+    overall_accuracy: float
+    accepted_accuracy: float
+    conformal_coverage: float
+    average_set_size: float
+    singleton_rate: float
+    ece: float
+    brier_score: float
+    nll: float
+    coverage: float
+    abstain_rate: float
+    unfamiliar_rate: float
+    abstention_reasons: Dict[str, int] = field(default_factory=dict)
+    mean_latency_ms: float = 0.0
+    p50_latency_ms: float = 0.0
+    p95_latency_ms: float = 0.0
+    p99_latency_ms: float = 0.0
+    fields: Dict[str, FieldEvaluationMetrics] = field(default_factory=dict)
+    schema_digest: str = ""
+    strict_mode: bool = False
+
+    @property
+    def n_examples(self) -> int:
+        return self.total_examples
+
+    @property
+    def accuracy(self) -> float:
+        return self.overall_accuracy
+
+    @property
+    def selective_accuracy(self) -> float:
+        return self.accepted_accuracy
+
+    @property
+    def empirical_set_coverage(self) -> float:
+        return self.conformal_coverage
+
+    @property
+    def mean_set_size(self) -> float:
+        return self.average_set_size
+
+    @property
+    def field_metrics(self) -> Dict[str, FieldEvaluationMetrics]:
+        return self.fields
+
+    @property
+    def per_field_metrics(self) -> Dict[str, FieldEvaluationMetrics]:
+        return self.fields
+
+    @property
+    def per_field(self) -> Dict[str, FieldEvaluationMetrics]:
+        return self.fields
+
+    @property
+    def latency_p50_ms(self) -> float:
+        return self.p50_latency_ms
+
+    @property
+    def latency_p95_ms(self) -> float:
+        return self.p95_latency_ms
+
+    @property
+    def latency_p99_ms(self) -> float:
+        return self.p99_latency_ms
+
+    @property
+    def latency_ms_p50(self) -> float:
+        return self.p50_latency_ms
+
+    @property
+    def latency_ms_p95(self) -> float:
+        return self.p95_latency_ms
+
+    def summary_table(self) -> str:
+        lines = [
+            f"EvaluationReport(schema={self.schema_name}, alpha={self.alpha:.3f}, n={self.total_examples})",
+            f"  accuracy={self.overall_accuracy:.2%} accepted_accuracy={self.accepted_accuracy:.2%} conformal_coverage={self.conformal_coverage:.2%}",
+            f"  routing: coverage={self.coverage:.2%} abstain_rate={self.abstain_rate:.2%} unfamiliar_rate={self.unfamiliar_rate:.2%}",
+            f"  calibration: ece={self.ece:.4f} brier={self.brier_score:.4f} nll={self.nll:.4f}",
+        ]
+        for fname, fm in self.fields.items():
+            lines.append(
+                f"  - {fname} ({fm.field_type}): acc={fm.accuracy:.1%} acc_accepted={fm.accepted_accuracy:.1%} "
+                f"conf_cov={fm.conformal_coverage:.1%} set_size={fm.average_set_size:.2f} ece={fm.ece:.4f} "
+                f"cov/abs/unf={fm.coverage:.0%}/{fm.abstain_rate:.0%}/{fm.unfamiliar_rate:.0%}"
+            )
+        return "\n".join(lines)
+
+    def to_dict(self) -> Dict[str, Any]:
+        fields_dict = {k: v.to_dict() for k, v in self.fields.items()}
+        return {
+            "schema_name": self.schema_name,
+            "schema_digest": self.schema_digest,
+            "strict_mode": self.strict_mode,
+            "alpha": self.alpha,
+            "total_examples": self.total_examples,
+            "n_examples": self.total_examples,
+            "accepted_examples": self.accepted_examples,
+            "abstained_examples": self.abstained_examples,
+            "unfamiliar_examples": self.unfamiliar_examples,
+            "overall_accuracy": self.overall_accuracy,
+            "accuracy": self.overall_accuracy,
+            "accepted_accuracy": self.accepted_accuracy,
+            "selective_accuracy": self.accepted_accuracy,
+            "conformal_coverage": self.conformal_coverage,
+            "empirical_set_coverage": self.conformal_coverage,
+            "average_set_size": self.average_set_size,
+            "mean_set_size": self.average_set_size,
+            "singleton_rate": self.singleton_rate,
+            "ece": self.ece,
+            "brier_score": self.brier_score,
+            "nll": self.nll,
+            "coverage": self.coverage,
+            "abstain_rate": self.abstain_rate,
+            "unfamiliar_rate": self.unfamiliar_rate,
+            "abstention_reasons": dict(self.abstention_reasons),
+            "mean_latency_ms": self.mean_latency_ms,
+            "p50_latency_ms": self.p50_latency_ms,
+            "p95_latency_ms": self.p95_latency_ms,
+            "p99_latency_ms": self.p99_latency_ms,
+            "latency_ms_p50": self.p50_latency_ms,
+            "latency_ms_p95": self.p95_latency_ms,
+            "fields": fields_dict,
+            "field_metrics": fields_dict,
+        }
+
+    def to_json(self, indent: Optional[int] = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, default=str)
+
+    def __getitem__(self, key: str) -> Any:
+        if key in self.fields:
+            return self.fields[key]
+        if hasattr(self, key) and not key.startswith("_") and not callable(getattr(self, key)):
+            return getattr(self, key)
+        raise KeyError(key)
+
+    def keys(self) -> Any:
+        return self.to_dict().keys()
+
+    def items(self) -> Any:
+        return self.to_dict().items()
+
+    def values(self) -> Any:
+        return self.to_dict().values()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and (
+            key in self.fields
+            or (not key.startswith("_") and hasattr(self, key) and not callable(getattr(self, key)))
+        )
+
+
+def _normalize_eval_rows(
+    rows: Any,
+    schema: DecisionSchema,
+) -> List[Tuple[str, Dict[str, Any], Optional[Any]]]:
+    if isinstance(rows, (str, Path)):
+        path = Path(rows)
+        if not path.is_file():
+            raise FileNotFoundError(f"Dataset file not found: {path}")
+        raw_text = path.read_text(encoding="utf-8").strip()
+        if not raw_text:
+            raise ValueError(f"Dataset file is empty: {path}")
+        if path.suffix.lower() == ".jsonl":
+            parsed_rows: Any = [
+                json.loads(line)
+                for line in raw_text.splitlines()
+                if line.strip()
+            ]
+        else:
+            try:
+                parsed_rows = json.loads(raw_text)
+            except json.JSONDecodeError:
+                lines = [line for line in raw_text.splitlines() if line.strip()]
+                if len(lines) > 1:
+                    parsed_rows = [json.loads(line) for line in lines]
+                else:
+                    raise
+        rows = parsed_rows
+
+    if isinstance(rows, Mapping):
+        if "evaluate" in rows and isinstance(rows["evaluate"], Sequence) and "evaluate" not in schema.fields:
+            rows = rows["evaluate"]
+        elif "calibrate" in rows and isinstance(rows["calibrate"], Sequence) and len(rows) == 1 and "calibrate" not in schema.fields:
+            rows = rows["calibrate"]
+        elif "examples" in rows and isinstance(rows["examples"], Sequence) and "examples" not in schema.fields:
+            rows = rows["examples"]
+        else:
+            by_prompt: Dict[str, Tuple[str, Dict[str, Any], Optional[Any]]] = {}
+            for field_name, field_items in rows.items():
+                if field_name not in schema.fields:
+                    raise ValueError(f"Unknown field {field_name!r} for schema {schema.schema_name}")
+                if not isinstance(field_items, Sequence) or isinstance(field_items, (str, bytes)):
+                    raise ValueError(f"Field {field_name!r} must map to a sequence of examples")
+                for item in field_items:
+                    if isinstance(item, Mapping):
+                        p_str = item.get("prompt", item.get("text", item.get("input", item.get("query"))))
+                        lbl_val = item.get("label", item.get("answer", item.get("target")))
+                        telem = item.get("telemetry")
+                    elif isinstance(item, (tuple, list)) and len(item) in (2, 3):
+                        p_str = item[0]
+                        lbl_val = item[1]
+                        telem = item[2] if len(item) == 3 else None
+                    else:
+                        raise ValueError(f"Invalid example item in field {field_name!r}: {item!r}")
+                    if not isinstance(p_str, str) or not p_str.strip():
+                        raise ValueError("Example prompt must be a non-empty string")
+                    val_checked = schema.fields[field_name].validate_value(lbl_val)
+                    if p_str not in by_prompt:
+                        by_prompt[p_str] = (p_str, {field_name: val_checked}, telem)
+                    else:
+                        existing_map = by_prompt[p_str][1]
+                        if field_name in existing_map and existing_map[field_name] != val_checked:
+                            raise ValueError(
+                                f"Conflicting labels for repeated prompt {p_str!r} on field {field_name!r}"
+                            )
+                        existing_map[field_name] = val_checked
+            normalized = list(by_prompt.values())
+            if not normalized:
+                raise ValueError("Dataset must contain at least one example")
+            return normalized
+
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise TypeError(f"Expected sequence of examples or path to dataset, got {type(rows).__name__}")
+
+    normalized_list: List[Tuple[str, Dict[str, Any], Optional[Any]]] = []
+    single_field_name = next(iter(schema.fields.keys())) if len(schema.fields) == 1 else None
+
+    for idx, item in enumerate(rows):
+        telemetry: Optional[Any] = None
+        raw_labels: Optional[Dict[str, Any]] = None
+        if isinstance(item, Mapping):
+            prompt = item.get("prompt", item.get("text", item.get("input", item.get("query"))))
+            telemetry = item.get("telemetry")
+            wrapper_mapping: Optional[Dict[str, Any]] = None
+            for w_key in ("labels", "values", "target", "output", "expected"):
+                if w_key in item and isinstance(item[w_key], Mapping) and w_key not in schema.fields:
+                    wrapper_mapping = dict(item[w_key])
+                    break
+            if wrapper_mapping is not None:
+                raw_labels = wrapper_mapping
+            else:
+                direct = {k: item[k] for k in schema.fields if k in item}
+                if direct:
+                    raw_labels = direct
+                elif any(k in item for k in ("label", "answer", "target", "output", "expected")):
+                    lbl_obj = item.get(
+                        "label",
+                        item.get("answer", item.get("target", item.get("output", item.get("expected")))),
+                    )
+                    if isinstance(lbl_obj, Mapping):
+                        raw_labels = dict(lbl_obj)
+                    elif single_field_name is not None:
+                        raw_labels = {single_field_name: lbl_obj}
+                    else:
+                        raise ValueError(
+                            f"Row {idx} provides a scalar label for multi-field schema {schema.schema_name}; pass a dict of field labels"
+                        )
+        elif isinstance(item, (tuple, list)) and len(item) in (2, 3):
+            prompt = item[0]
+            lbl_obj = item[1]
+            telemetry = item[2] if len(item) == 3 else None
+            if isinstance(lbl_obj, Mapping):
+                raw_labels = dict(lbl_obj)
+            elif single_field_name is not None:
+                raw_labels = {single_field_name: lbl_obj}
+            else:
+                raise ValueError(
+                    f"Row {idx} provides a scalar label for multi-field schema {schema.schema_name}; pass a dict of field labels"
+                )
+        else:
+            raise ValueError(f"Row {idx} has unsupported format: {type(item).__name__}")
+
+        if not isinstance(prompt, str):
+            raise ValueError(f"Row {idx} prompt must be a string")
+        if not raw_labels:
+            raise ValueError(f"Row {idx} is missing ground-truth labels")
+
+        validated_labels: Dict[str, Any] = {}
+        for fname, fval in raw_labels.items():
+            if fname not in schema.fields:
+                raise ValueError(f"Row {idx} references unknown field {fname!r} for schema {schema.schema_name}")
+            validated_labels[fname] = schema.fields[fname].validate_value(fval)
+        normalized_list.append((prompt, validated_labels, telemetry))
+
+    if not normalized_list:
+        raise ValueError("Dataset must contain at least one example")
+    return normalized_list
 
 
 @dataclass(frozen=True)
@@ -225,6 +626,7 @@ class SystemOneEngine:
         )
         self.recency_weighted = bool(recency_weighted)
         self.strict_mode = bool(strict_mode)
+        self.default_alpha: float = 0.05
         self.policy_scope = str(policy_scope)
         self.policy_epoch: int = 0
         self.model_version: int = 1
@@ -305,10 +707,16 @@ class SystemOneEngine:
 
     def _sync_from_model(self, model: Any) -> None:
         self.model = model
+        self.model_version = max(getattr(self, "model_version", 1), int(getattr(model, "model_version", 1)))
         self.dimension = getattr(model, "dimension", self.dimension)
         self.backend = getattr(model, "backend", self.backend)
         self.projector = getattr(model, "projector", self.projector)
         self.recency_weighted = getattr(model, "recency_weighted", self.recency_weighted)
+        model_meta = getattr(model, "metadata", None)
+        if isinstance(model_meta, Mapping) and "default_alpha" in model_meta:
+            raw_alpha = model_meta.get("default_alpha")
+            if isinstance(raw_alpha, (int, float)) and not isinstance(raw_alpha, bool) and 0.0 < float(raw_alpha) < 1.0:
+                self.default_alpha = float(raw_alpha)
         self._init_calibrators_and_predictors()
         # Lessons belong to the active skill; a replacement retires the old ones.
         self._learned_prompt_overrides = {}
@@ -633,13 +1041,716 @@ class SystemOneEngine:
                 self.cache.clear()
             return metrics
 
+    def recalibrate(
+        self,
+        examples: Union[Sequence[Any], str, Path],
+        alpha: float = 0.05,
+        *,
+        n_bins: int = 10,
+        familiarity_alpha: Optional[float] = None,
+        prototype_alpha: Optional[float] = None,
+        mondrian: Optional[bool] = None,
+    ) -> RecalibrationReport:
+        """Recalibrate temperature scaling and conformal quantiles on held-out examples without modifying weights."""
+        if (
+            isinstance(alpha, bool)
+            or not isinstance(alpha, (int, float))
+            or not math.isfinite(float(alpha))
+            or not (0.0 < float(alpha) < 1.0)
+        ):
+            raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
+        alpha_val = float(alpha)
+        if n_bins < 1:
+            raise ValueError(f"n_bins must be >= 1, got {n_bins}")
+
+        model_meta = getattr(self.model, "metadata", None)
+        if familiarity_alpha is not None:
+            if not math.isfinite(float(familiarity_alpha)) or not (0.0 <= float(familiarity_alpha) < 1.0):
+                raise ValueError("familiarity_alpha must be finite and in [0, 1)")
+            eff_fam_alpha = float(familiarity_alpha)
+        elif isinstance(model_meta, Mapping) and isinstance(model_meta.get("familiarity_alpha"), (int, float)) and not isinstance(model_meta.get("familiarity_alpha"), bool):
+            cand_fam = float(model_meta["familiarity_alpha"])
+            eff_fam_alpha = cand_fam if (math.isfinite(cand_fam) and 0.0 <= cand_fam < 1.0) else 0.0
+        else:
+            eff_fam_alpha = 0.0
+
+        if prototype_alpha is not None:
+            if not math.isfinite(float(prototype_alpha)) or not (0.0 <= float(prototype_alpha) < 1.0):
+                raise ValueError("prototype_alpha must be finite and in [0, 1)")
+            eff_proto_alpha = float(prototype_alpha)
+        elif isinstance(model_meta, Mapping) and isinstance(model_meta.get("prototype_alpha"), (int, float)) and not isinstance(model_meta.get("prototype_alpha"), bool):
+            cand_proto = float(model_meta["prototype_alpha"])
+            eff_proto_alpha = cand_proto if (math.isfinite(cand_proto) and 0.0 <= cand_proto < 1.0) else 0.0
+        else:
+            eff_proto_alpha = 0.0
+
+        raw_rows = _normalize_eval_rows(examples, self.schema)
+        grouped: Dict[Tuple[str, str], Tuple[str, Dict[str, Any], Optional[Any]]] = {}
+        for prompt, validated, telemetry in raw_rows:
+            if not prompt.strip():
+                raise ValueError("Recalibration prompt must be a non-empty string")
+            telem_key = json.dumps(telemetry, sort_keys=True, default=str) if telemetry is not None else ""
+            key = (" ".join(prompt.casefold().split()), telem_key)
+            if key in grouped and grouped[key][1] != validated:
+                raise ValueError("Conflicting labels for repeated calibration prompt")
+            grouped[key] = (prompt, validated, telemetry)
+
+        with self._lock, getattr(self.model, "_lock", nullcontext()):
+            self.default_alpha = alpha_val
+            if hasattr(self.model, "metadata") and isinstance(self.model.metadata, dict):
+                self.model.metadata["default_alpha"] = alpha_val
+                if familiarity_alpha is not None:
+                    self.model.metadata["familiarity_alpha"] = eff_fam_alpha
+                if prototype_alpha is not None:
+                    self.model.metadata["prototype_alpha"] = eff_proto_alpha
+                if mondrian is not None:
+                    self.model.metadata["mondrian"] = bool(mondrian)
+
+            rows = list(grouped.values())
+            prev_model_cache = getattr(self.model, "use_cache", None)
+            try:
+                if prev_model_cache is not None:
+                    self.model.use_cache = False
+                if any(r[2] is not None for r in rows):
+                    results = [self.model.forward_single(r[0], telemetry=r[2]) for r in rows]
+                else:
+                    results = self.model.forward_batch([r[0] for r in rows])
+            finally:
+                if prev_model_cache is not None:
+                    self.model.use_cache = prev_model_cache
+            report_fields: Dict[str, RecalibrationMetrics] = {}
+
+            for name, definition in self.schema.fields.items():
+                indices = [i for i, row in enumerate(rows) if name in row[1]]
+                if not indices:
+                    continue
+
+                prev_cal = self.calibrators.get(name)
+                prev_temp = float(prev_cal.temperature) if prev_cal is not None else 1.0
+                compiled = getattr(self.model, "heads", {}).get(name)
+                if (
+                    name in self.conformal_predictors
+                    and self.conformal_predictors[name].is_calibrated
+                    and len(self.conformal_predictors[name].calibration_scores) > 0
+                ):
+                    sc_prev = self.conformal_predictors[name].calibration_scores
+                    k_prev = int(math.ceil((len(sc_prev) + 1) * (1.0 - alpha_val)))
+                    prev_q = 1.0 if k_prev > len(sc_prev) else float(sc_prev[k_prev - 1])
+                elif compiled is not None and float(getattr(compiled, "conformal_quantile", 0.0)) > 0.0:
+                    prev_q = float(compiled.conformal_quantile)
+                elif (
+                    name in self.regression_conformal_predictors
+                    and self.regression_conformal_predictors[name].is_calibrated
+                    and len(self.regression_conformal_predictors[name].residuals) > 0
+                ):
+                    res_prev = self.regression_conformal_predictors[name].residuals
+                    k_prev = int(math.ceil((len(res_prev) + 1) * (1.0 - alpha_val)))
+                    upper_p = float(definition.max_value - definition.min_value) if isinstance(definition, ScoreField) else 1.0
+                    prev_q = upper_p if k_prev > len(res_prev) else float(res_prev[k_prev - 1])
+                else:
+                    prev_q = 0.0
+
+                rng = np.random.RandomState(42)
+                n_total = len(indices)
+                logits = np.asarray([results[i].fields[name].logits for i in indices], dtype=np.float64)
+                labels = [rows[i][1][name] for i in indices]
+
+                if n_total >= 4 and isinstance(definition, (ChoiceField, BooleanField)):
+                    buckets: Dict[Any, List[int]] = {}
+                    for pos, lbl in enumerate(labels):
+                        buckets.setdefault(lbl, []).append(pos)
+                    temp_pos: List[int] = []
+                    conf_pos: List[int] = []
+                    if any(len(b) >= 2 for b in buckets.values()):
+                        for b in buckets.values():
+                            b_copy = list(b)
+                            rng.shuffle(b_copy)
+                            if len(b_copy) >= 2:
+                                split_k = len(b_copy) // 2
+                                temp_pos.extend(b_copy[:split_k])
+                                conf_pos.extend(b_copy[split_k:])
+                            else:
+                                conf_pos.append(b_copy[0])
+                        if not temp_pos or not conf_pos:
+                            perm = list(range(n_total))
+                            rng.shuffle(perm)
+                            temp_pos = perm[: n_total // 2]
+                            conf_pos = perm[n_total // 2 :]
+                    else:
+                        perm = list(range(n_total))
+                        rng.shuffle(perm)
+                        temp_pos = perm[: n_total // 2]
+                        conf_pos = perm[n_total // 2 :]
+                elif n_total >= 4:
+                    perm = list(range(n_total))
+                    rng.shuffle(perm)
+                    temp_pos = perm[: n_total // 2]
+                    conf_pos = perm[n_total // 2 :]
+                else:
+                    temp_pos = list(range(n_total))
+                    conf_pos = list(range(n_total))
+
+                calibrator = DecisionCalibrator(temperature=prev_temp)
+                if isinstance(definition, ScoreField):
+                    calibrator.is_binary = False
+                    val_span = max(1e-6, float(definition.max_value - definition.min_value))
+                    p_ratio = _stable_sigmoid(logits.flatten() / max(1e-4, prev_temp), temperature=1.0)
+                    y_ratio = np.clip(
+                        (np.asarray(labels, dtype=np.float64) - float(definition.min_value)) / val_span,
+                        0.0,
+                        1.0,
+                    )
+                    p_clip = np.clip(p_ratio, 1e-12, 1.0 - 1e-12)
+                    init_ece = float(np.mean(np.abs(p_ratio - y_ratio))) if len(logits) > 0 else 0.0
+                    init_brier = float(np.mean((p_ratio - y_ratio) ** 2)) if len(logits) > 0 else 0.0
+                    init_nll = (
+                        float(-np.mean(y_ratio * np.log(p_clip) + (1.0 - y_ratio) * np.log(1.0 - p_clip)))
+                        if len(logits) > 0
+                        else 0.0
+                    )
+                    cal_ece = init_ece
+                    cal_brier = init_brier
+                    cal_nll = init_nll
+                    targets = np.zeros(len(labels), dtype=np.int64)
+                else:
+                    if isinstance(definition, ChoiceField):
+                        targets = np.asarray([definition.options.index(label) for label in labels], dtype=np.int64)
+                    elif isinstance(definition, BooleanField):
+                        targets = np.asarray(labels, dtype=np.int64)
+                    else:
+                        targets = np.asarray([[int(opt in label) for opt in definition.options] for label in labels], dtype=np.int64)
+
+                    temp_logits = logits[temp_pos]
+                    temp_targets = targets[temp_pos]
+                    is_1d_temp = False
+                    if isinstance(definition, MultiChoiceField):
+                        temp_logits, temp_targets = temp_logits.flatten(), temp_targets.flatten()
+                        is_1d_temp = True
+                    elif isinstance(definition, BooleanField) and logits.shape[1] == 1:
+                        temp_logits = temp_logits.flatten()
+                        is_1d_temp = True
+
+                    prev_cal_eval = DecisionCalibrator(temperature=prev_temp)
+                    prev_cal_eval.is_binary = bool(is_1d_temp or temp_logits.ndim == 1)
+                    prev_probs = prev_cal_eval.calibrate_logits(temp_logits)
+                    if prev_probs.ndim == 1:
+                        prev_probs = np.column_stack([1.0 - prev_probs, prev_probs])
+                    init_nll = float(compute_nll(prev_probs, temp_targets)) if len(temp_logits) > 0 else 0.0
+                    init_ece = float(compute_ece_and_bins(prev_probs, temp_targets, n_bins=n_bins)[0]) if len(temp_logits) > 0 else 0.0
+                    init_brier = float(compute_brier_decomposition(prev_probs, temp_targets, n_bins=n_bins).empirical_brier) if len(temp_logits) > 0 else 0.0
+
+                    calibrator.fit(temp_logits, temp_targets, n_bins=n_bins)
+                    post_cal_eval = DecisionCalibrator(temperature=calibrator.temperature)
+                    post_cal_eval.is_binary = bool(is_1d_temp or temp_logits.ndim == 1)
+                    post_probs = post_cal_eval.calibrate_logits(temp_logits)
+                    if post_probs.ndim == 1:
+                        post_probs = np.column_stack([1.0 - post_probs, post_probs])
+                    cal_nll = float(compute_nll(post_probs, temp_targets)) if len(temp_logits) > 0 else 0.0
+                    cal_ece = float(compute_ece_and_bins(post_probs, temp_targets, n_bins=n_bins)[0]) if len(temp_logits) > 0 else 0.0
+                    cal_brier = float(compute_brier_decomposition(post_probs, temp_targets, n_bins=n_bins).empirical_brier) if len(temp_logits) > 0 else 0.0
+                    calibrator.is_binary = False
+
+                    if len(temp_logits) > 0 and init_nll <= cal_nll:
+                        calibrator.temperature = prev_temp
+                        cal_nll = init_nll
+                        cal_ece = init_ece
+                        cal_brier = init_brier
+
+                self.calibrators[name] = calibrator
+
+                conf_logits = logits[conf_pos]
+                conf_labels = [labels[p] for p in conf_pos]
+                conf_indices = [indices[p] for p in conf_pos]
+                conf_embeddings = np.asarray(
+                    [results[i].embedding for i in conf_indices],
+                    dtype=np.float32,
+                )
+                fam_vals: Optional[List[float]] = None
+                if eff_fam_alpha > 0.0 and conf_indices:
+                    proj = getattr(self.model, "projector", self.projector)
+                    if proj is not None and hasattr(proj, "raw_norm"):
+                        fam_vals = [float(proj.raw_norm(rows[i][0])) for i in conf_indices]
+                    else:
+                        fam_vals = [float(np.linalg.norm(e)) for e in conf_embeddings]
+                proto_mat = (
+                    getattr(compiled, "prototypes", None)
+                    if compiled is not None
+                    else getattr(self.conformal_predictors.get(name), "prototypes", None)
+                )
+
+                if isinstance(definition, (ChoiceField, BooleanField)):
+                    if isinstance(definition, BooleanField) and conf_logits.shape[1] == 1:
+                        z = conf_logits.reshape(-1)
+                        conf_logits = np.column_stack([-z / 2, z / 2])
+                    probs = calibrator.calibrate_logits(conf_logits)
+                    predictor = self.conformal_predictors[name]
+                    if mondrian is not None:
+                        predictor.mondrian = bool(mondrian)
+                    if familiarity_alpha is not None and eff_fam_alpha == 0.0:
+                        predictor.familiarity_threshold = 0.0
+                        predictor.familiarity_scores = np.array([], dtype=np.float64)
+                    if prototype_alpha is not None and eff_proto_alpha == 0.0:
+                        predictor.prototype_threshold = 0.0
+                        predictor.prototype_scores = np.array([], dtype=np.float64)
+                    predictor.calibrate(
+                        probs,
+                        [str(label) for label in conf_labels],
+                        familiarity_values=fam_vals,
+                        familiarity_alpha=eff_fam_alpha,
+                        embeddings=conf_embeddings if (eff_proto_alpha > 0.0 and len(conf_embeddings) > 0) else None,
+                        prototypes=proto_mat if eff_proto_alpha > 0.0 else None,
+                        prototype_alpha=eff_proto_alpha,
+                    )
+                    if mondrian is False:
+                        predictor.class_calibration_scores = {}
+                    scores = predictor.calibration_scores
+                    k = int(math.ceil((len(scores) + 1) * (1.0 - alpha_val)))
+                    new_q = 1.0 if k > len(scores) else float(scores[k - 1])
+                    predictor.quantile = new_q
+                elif isinstance(definition, MultiChoiceField):
+                    probs = _stable_sigmoid(conf_logits / calibrator.temperature, temperature=1.0)
+                    conf_targets = targets[conf_pos]
+                    errors = np.where(conf_targets == 1, 1.0 - probs, probs)
+                    predictor = self.conformal_predictors[name]
+                    predictor.calibration_scores = np.sort(np.max(errors, axis=1))
+                    predictor.is_calibrated = True
+                    scores = predictor.calibration_scores
+                    k = int(math.ceil((len(scores) + 1) * (1.0 - alpha_val)))
+                    new_q = 1.0 if k > len(scores) else float(scores[k - 1])
+                    predictor.quantile = new_q
+                else:
+                    probs = _stable_sigmoid(conf_logits.reshape(-1) / calibrator.temperature, temperature=1.0)
+                    predictions = definition.min_value + (definition.max_value - definition.min_value) * probs
+                    predictor = self.regression_conformal_predictors[name]
+                    predictor.calibrate(predictions, conf_labels)
+                    scores = predictor.residuals
+                    k = int(math.ceil((len(scores) + 1) * (1.0 - alpha_val)))
+                    upper = float(definition.max_value - definition.min_value)
+                    new_q = upper if k > len(scores) else float(scores[k - 1])
+
+                fam_thresh_val = float(getattr(predictor, "familiarity_threshold", 0.0)) if isinstance(definition, (ChoiceField, BooleanField)) else 0.0
+                proto_thresh_val = float(getattr(predictor, "prototype_threshold", 0.0)) if isinstance(definition, (ChoiceField, BooleanField)) else 0.0
+                c_scores_dict: Dict[str, Tuple[float, ...]] = {}
+                if isinstance(definition, (ChoiceField, BooleanField)):
+                    raw_c_scores = getattr(predictor, "class_calibration_scores", {})
+                    if raw_c_scores:
+                        c_scores_dict = {
+                            str(k_cls): tuple(float(v) for v in vals)
+                            for k_cls, vals in raw_c_scores.items()
+                        }
+
+                scores_tuple = tuple(float(score) for score in scores)
+                if compiled is not None and hasattr(compiled, "calibration_scores"):
+                    compiled.temperature = float(calibrator.temperature)
+                    compiled.calibration_scores = scores_tuple
+                    compiled.score_method = getattr(predictor, "score_method", "aps")
+                    compiled.conformal_quantile = float(new_q)
+                    if isinstance(definition, (ChoiceField, BooleanField)):
+                        if mondrian is not None:
+                            compiled.mondrian = bool(mondrian)
+                        compiled.margin_threshold = float(
+                            getattr(predictor, "calibrated_margin_threshold", getattr(compiled, "margin_threshold", 0.20))
+                        )
+                        compiled.familiarity_threshold = fam_thresh_val
+                        compiled.prototype_threshold = proto_thresh_val
+                        if getattr(predictor, "prototypes", None) is not None:
+                            compiled.prototypes = np.asarray(predictor.prototypes, dtype=np.float32).copy()
+                        p_scores = getattr(predictor, "prototype_scores", np.array([]))
+                        compiled.prototype_scores = tuple(float(s) for s in p_scores) if len(p_scores) > 0 else ()
+                        compiled.class_calibration_scores = c_scores_dict if c_scores_dict else {}
+
+                report_fields[name] = RecalibrationMetrics(
+                    field_name=name,
+                    ece_before=init_ece,
+                    ece_after=cal_ece,
+                    nll_before=init_nll,
+                    nll_after=cal_nll,
+                    temperature_before=prev_temp,
+                    temperature=float(calibrator.temperature),
+                    qhat_before=prev_q,
+                    qhat=float(new_q),
+                    alpha=alpha_val,
+                    n_examples=n_total,
+                    brier_before=init_brier,
+                    brier_after=cal_brier,
+                    familiarity_threshold=fam_thresh_val,
+                    prototype_threshold=proto_thresh_val,
+                    calibration_scores=scores_tuple,
+                    class_calibration_scores=c_scores_dict,
+                )
+
+            self.model_version = max(self.model_version, int(getattr(self.model, "model_version", 1))) + 1
+            if hasattr(self.model, "model_version"):
+                self.model.model_version = self.model_version
+            if self.cache is not None:
+                self.cache.clear()
+            if hasattr(self.model, "cache") and getattr(self.model, "cache", None) is not None:
+                self.model.cache.clear()
+
+            f_list = list(report_fields.values())
+            n_f_rep = max(1, len(f_list))
+            return RecalibrationReport(
+                ece_before=float(sum(m.ece_before for m in f_list)) / n_f_rep if f_list else 0.0,
+                ece_after=float(sum(m.ece_after for m in f_list)) / n_f_rep if f_list else 0.0,
+                nll_before=float(sum(m.nll_before for m in f_list)) / n_f_rep if f_list else 0.0,
+                nll_after=float(sum(m.nll_after for m in f_list)) / n_f_rep if f_list else 0.0,
+                temperature_before=float(sum(m.temperature_before for m in f_list)) / n_f_rep if f_list else 1.0,
+                temperature=float(sum(m.temperature for m in f_list)) / n_f_rep if f_list else 1.0,
+                qhat_before=float(sum(m.qhat_before for m in f_list)) / n_f_rep if f_list else 0.0,
+                qhat=float(sum(m.qhat for m in f_list)) / n_f_rep if f_list else 0.0,
+                alpha=alpha_val,
+                n_examples=len(rows),
+                per_field=report_fields,
+                schema_name=self.schema.schema_name,
+                brier_before=float(sum(m.brier_before for m in f_list)) / n_f_rep if f_list else 0.0,
+                brier_after=float(sum(m.brier_after for m in f_list)) / n_f_rep if f_list else 0.0,
+            )
+
+    def evaluate_dataset(
+        self,
+        rows: Union[Sequence[Any], str, Path],
+        *,
+        alpha: Optional[float] = None,
+        n_bins: int = 10,
+        strict_mode: Optional[bool] = None,
+        use_cache: bool = False,
+    ) -> EvaluationReport:
+        """Evaluate the engine on a labeled dataset and return an EvaluationReport."""
+        eff_alpha = self.default_alpha if alpha is None else float(alpha)
+        if (
+            isinstance(alpha, bool)
+            or not isinstance(eff_alpha, (int, float))
+            or not math.isfinite(eff_alpha)
+            or not (0.0 < eff_alpha < 1.0)
+        ):
+            raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
+        if n_bins < 1:
+            raise ValueError(f"n_bins must be >= 1, got {n_bins}")
+
+        normalized_rows = _normalize_eval_rows(rows, self.schema)
+        eff_strict = self.strict_mode if strict_mode is None else bool(strict_mode)
+
+        decisions: List[DecisionResult] = [
+            self.decide(
+                prompt,
+                telemetry=telemetry,
+                alpha=eff_alpha,
+                record_receipt=False,
+                strict=eff_strict,
+                use_cache=use_cache,
+            )
+            for prompt, _, telemetry in normalized_rows
+        ]
+
+        total_examples = len(normalized_rows)
+        latencies = sorted(float(d.latency_ms) for d in decisions)
+        percentiles = np.percentile(latencies, [50, 95, 99]) if latencies else [0.0, 0.0, 0.0]
+        mean_lat = float(statistics.mean(latencies)) if latencies else 0.0
+        p50_lat = float(percentiles[0])
+        p95_lat = float(percentiles[1])
+        p99_lat = float(percentiles[2])
+
+        field_reports: Dict[str, FieldEvaluationMetrics] = {}
+        global_abstention_reasons: Dict[str, int] = {}
+        total_field_evals = 0
+        total_set_size_sum = 0.0
+        total_singleton_count = 0
+
+        row_all_correct = [True] * total_examples
+        row_all_covered = [True] * total_examples
+
+        for fname, f_def in self.schema.fields.items():
+            f_rows = [
+                (idx, decisions[idx], normalized_rows[idx][1][fname])
+                for idx in range(total_examples)
+                if fname in normalized_rows[idx][1]
+            ]
+            if not f_rows:
+                continue
+            n_f = len(f_rows)
+            f_correct = 0
+            f_accepted = 0
+            f_accepted_correct = 0
+            f_abstained = 0
+            f_unfamiliar = 0
+            f_covered = 0
+            f_set_size_sum = 0.0
+            f_singleton = 0
+            f_mae_sum = 0.0
+            f_reasons: Dict[str, int] = {}
+
+            for row_idx, res, gt_val in f_rows:
+                is_unfamiliar = fname in res.abstention_reasons
+                is_abstain = (not is_unfamiliar) and (fname in res.ambiguous_fields)
+                is_accepted = (not is_unfamiliar) and (not is_abstain)
+
+                if is_unfamiliar:
+                    f_unfamiliar += 1
+                    r_key = str(res.abstention_reasons[fname])
+                    f_reasons[r_key] = f_reasons.get(r_key, 0) + 1
+                elif is_abstain:
+                    f_abstained += 1
+                    r_key = "conformal_ambiguity"
+                    f_reasons[r_key] = f_reasons.get(r_key, 0) + 1
+                else:
+                    f_accepted += 1
+
+                pred_val = res.values.get(fname)
+                c_set = res.conformal_sets.get(fname, [])
+
+                if isinstance(f_def, ChoiceField):
+                    correct_i = str(pred_val) == str(gt_val)
+                    covered_i = str(gt_val) in c_set
+                    set_size_i = float(len(c_set))
+                    singleton_i = len(c_set) == 1
+                elif isinstance(f_def, BooleanField):
+                    correct_i = bool(pred_val) == bool(gt_val)
+                    gt_str = "True" if bool(gt_val) else "False"
+                    covered_i = (gt_str in c_set) or (bool(gt_val) in c_set)
+                    set_size_i = float(len(c_set))
+                    singleton_i = len(c_set) == 1
+                elif isinstance(f_def, MultiChoiceField):
+                    pred_set = set(pred_val) if isinstance(pred_val, (list, tuple, set)) else {pred_val}
+                    gt_set = set(gt_val) if isinstance(gt_val, (list, tuple, set)) else {gt_val}
+                    correct_i = pred_set == gt_set
+                    mc_cp = self.conformal_predictors.get(fname)
+                    if is_unfamiliar:
+                        covered_i = False
+                    elif mc_cp is not None and mc_cp.is_calibrated and len(mc_cp.calibration_scores) > 0:
+                        mc_scores = mc_cp.calibration_scores
+                        k_mc = int(math.ceil((len(mc_scores) + 1) * (1.0 - eff_alpha)))
+                        if k_mc > len(mc_scores):
+                            covered_i = True
+                        else:
+                            q_mc = float(mc_scores[k_mc - 1])
+                            row_probs = res.probabilities.get(fname, {})
+                            covered_i = all(
+                                ((1.0 - float(row_probs.get(opt, 0.5))) <= q_mc + 1e-6)
+                                if opt in gt_set
+                                else (float(row_probs.get(opt, 0.5)) <= q_mc + 1e-6)
+                                for opt in f_def.options
+                            )
+                    else:
+                        covered_i = gt_set.issubset(set(c_set))
+                    set_size_i = float(len(c_set))
+                    singleton_i = is_accepted
+                else:
+                    val_span = max(1e-6, float(f_def.max_value - f_def.min_value))
+                    covered_i = False
+                    rcp = self.regression_conformal_predictors.get(fname)
+                    if is_unfamiliar or not c_set:
+                        covered_i = False
+                    elif rcp is not None and rcp.is_calibrated:
+                        interval = rcp.predict_interval(float(pred_val), alpha=eff_alpha, strict=eff_strict)
+                        covered_i = (interval.lower_bound - 1e-6) <= float(gt_val) <= (interval.upper_bound + 1e-6)
+                    elif isinstance(c_set[0], str) and c_set[0].startswith("[") and c_set[0].endswith("]"):
+                        try:
+                            parts = c_set[0][1:-1].split(",")
+                            lo_v, hi_v = float(parts[0].strip()), float(parts[1].strip())
+                            covered_i = (lo_v - 1e-4) <= float(gt_val) <= (hi_v + 1e-4)
+                        except (ValueError, IndexError):
+                            covered_i = False
+                    abs_err = abs(float(pred_val) - float(gt_val))
+                    f_mae_sum += abs_err
+                    correct_i = abs_err <= 0.10 * val_span
+                    set_size_i = float(len(c_set))
+                    singleton_i = is_accepted
+
+                if correct_i:
+                    f_correct += 1
+                    if is_accepted:
+                        f_accepted_correct += 1
+                else:
+                    row_all_correct[row_idx] = False
+                if covered_i:
+                    f_covered += 1
+                else:
+                    row_all_covered[row_idx] = False
+                f_set_size_sum += set_size_i
+                if singleton_i:
+                    f_singleton += 1
+
+            if isinstance(f_def, ChoiceField):
+                probs_mat = np.asarray(
+                    [
+                        [float(res.probabilities.get(fname, {}).get(opt, 0.0)) for opt in f_def.options]
+                        for _, res, _ in f_rows
+                    ],
+                    dtype=np.float64,
+                )
+                row_sums = np.sum(probs_mat, axis=1, keepdims=True)
+                probs_mat = np.where(row_sums > 1e-12, probs_mat / np.where(row_sums > 1e-12, row_sums, 1.0), 1.0 / max(1, len(f_def.options)))
+                targets_arr = np.asarray([f_def.options.index(gt_val) for _, _, gt_val in f_rows], dtype=np.int64)
+                f_ece = float(compute_ece_and_bins(probs_mat, targets_arr, n_bins=n_bins)[0])
+                f_brier = float(compute_brier_decomposition(probs_mat, targets_arr, n_bins=n_bins).empirical_brier)
+                f_nll = float(compute_nll(probs_mat, targets_arr))
+            elif isinstance(f_def, BooleanField):
+                probs_pos = np.asarray(
+                    [float(res.probabilities.get(fname, {}).get("True", 0.5)) for _, res, _ in f_rows],
+                    dtype=np.float64,
+                )
+                probs_2d = np.column_stack([1.0 - probs_pos, probs_pos])
+                targets_arr = np.asarray([1 if bool(gt_val) else 0 for _, _, gt_val in f_rows], dtype=np.int64)
+                f_ece = float(compute_ece_and_bins(probs_2d, targets_arr, n_bins=n_bins)[0])
+                f_brier = float(compute_brier_decomposition(probs_2d, targets_arr, n_bins=n_bins).empirical_brier)
+                f_nll = float(compute_nll(probs_2d, targets_arr))
+            elif isinstance(f_def, MultiChoiceField):
+                probs_flat = np.asarray(
+                    [
+                        float(res.probabilities.get(fname, {}).get(opt, 0.5))
+                        for _, res, _ in f_rows
+                        for opt in f_def.options
+                    ],
+                    dtype=np.float64,
+                )
+                probs_2d = np.column_stack([1.0 - probs_flat, probs_flat])
+                targets_flat = np.asarray(
+                    [
+                        1 if opt in (gt_val if isinstance(gt_val, (list, tuple, set)) else (gt_val,)) else 0
+                        for _, _, gt_val in f_rows
+                        for opt in f_def.options
+                    ],
+                    dtype=np.int64,
+                )
+                f_ece = float(compute_ece_and_bins(probs_2d, targets_flat, n_bins=n_bins)[0])
+                f_brier = float(compute_brier_decomposition(probs_2d, targets_flat, n_bins=n_bins).empirical_brier)
+                f_nll = float(compute_nll(probs_2d, targets_flat))
+            else:
+                val_span = max(1e-6, float(f_def.max_value - f_def.min_value))
+                probs_pos = np.clip(
+                    np.asarray(
+                        [float(res.probabilities.get(fname, {}).get("score_ratio", 0.5)) for _, res, _ in f_rows],
+                        dtype=np.float64,
+                    ),
+                    1e-12,
+                    1.0 - 1e-12,
+                )
+                y_ratio = np.clip(
+                    np.asarray(
+                        [(float(gt_val) - float(f_def.min_value)) / val_span for _, _, gt_val in f_rows],
+                        dtype=np.float64,
+                    ),
+                    0.0,
+                    1.0,
+                )
+                f_ece = float(np.mean(np.abs(probs_pos - y_ratio)))
+                f_brier = float(np.mean((probs_pos - y_ratio) ** 2))
+                f_nll = float(-np.mean(y_ratio * np.log(probs_pos) + (1.0 - y_ratio) * np.log(1.0 - probs_pos)))
+
+            f_cov_rate = float(f_accepted) / float(n_f)
+            f_abs_rate = float(f_abstained) / float(n_f)
+            f_unf_rate = float(f_unfamiliar) / float(n_f)
+            f_acc = float(f_correct) / float(n_f)
+            f_acc_accepted = float(f_accepted_correct) / float(f_accepted) if f_accepted > 0 else 0.0
+
+            field_reports[fname] = FieldEvaluationMetrics(
+                field_name=fname,
+                field_type=f_def.field_type,
+                total_examples=n_f,
+                accepted_examples=f_accepted,
+                abstained_examples=f_abstained,
+                unfamiliar_examples=f_unfamiliar,
+                accuracy=f_acc,
+                accepted_accuracy=f_acc_accepted,
+                conformal_coverage=float(f_covered) / float(n_f),
+                average_set_size=float(f_set_size_sum) / float(n_f),
+                singleton_rate=float(f_singleton) / float(n_f),
+                ece=float(f_ece),
+                brier_score=float(f_brier),
+                nll=float(f_nll),
+                coverage=f_cov_rate,
+                abstain_rate=f_abs_rate,
+                unfamiliar_rate=f_unf_rate,
+                abstention_reasons=f_reasons,
+                mae=float(f_mae_sum) / float(n_f) if isinstance(f_def, ScoreField) else 0.0,
+            )
+
+            total_field_evals += n_f
+            total_set_size_sum += f_set_size_sum
+            total_singleton_count += f_singleton
+
+        row_accepted = 0
+        row_accepted_correct = 0
+        row_abstained = 0
+        row_unfamiliar = 0
+        for row_idx, res in enumerate(decisions):
+            if res.abstention_reasons:
+                row_unfamiliar += 1
+                primary_r = next(iter(res.abstention_reasons.values()))
+                global_abstention_reasons[str(primary_r)] = global_abstention_reasons.get(str(primary_r), 0) + 1
+            elif res.is_ambiguous:
+                row_abstained += 1
+                global_abstention_reasons["conformal_ambiguity"] = (
+                    global_abstention_reasons.get("conformal_ambiguity", 0) + 1
+                )
+            else:
+                row_accepted += 1
+                if row_all_correct[row_idx]:
+                    row_accepted_correct += 1
+
+        overall_cov = float(row_accepted) / float(total_examples)
+        overall_abs = float(row_abstained) / float(total_examples)
+        overall_unf = float(row_unfamiliar) / float(total_examples)
+
+        denom_f = max(1, total_field_evals)
+        overall_acc = float(sum(1 for ok in row_all_correct if ok)) / float(total_examples)
+        accepted_acc = (
+            float(row_accepted_correct) / float(row_accepted)
+            if row_accepted > 0
+            else 0.0
+        )
+        overall_emp_cov = float(sum(1 for cov in row_all_covered if cov)) / float(total_examples)
+        mean_ece = (
+            float(statistics.mean(m.ece for m in field_reports.values()))
+            if field_reports
+            else 0.0
+        )
+        mean_brier = (
+            float(statistics.mean(m.brier_score for m in field_reports.values()))
+            if field_reports
+            else 0.0
+        )
+        mean_nll = (
+            float(statistics.mean(m.nll for m in field_reports.values()))
+            if field_reports
+            else 0.0
+        )
+
+        return EvaluationReport(
+            schema_name=self.schema.schema_name,
+            alpha=eff_alpha,
+            total_examples=total_examples,
+            accepted_examples=row_accepted,
+            abstained_examples=row_abstained,
+            unfamiliar_examples=row_unfamiliar,
+            overall_accuracy=overall_acc,
+            accepted_accuracy=accepted_acc,
+            conformal_coverage=overall_emp_cov,
+            average_set_size=float(total_set_size_sum) / float(denom_f),
+            singleton_rate=float(total_singleton_count) / float(denom_f),
+            ece=mean_ece,
+            brier_score=mean_brier,
+            nll=mean_nll,
+            coverage=overall_cov,
+            abstain_rate=overall_abs,
+            unfamiliar_rate=overall_unf,
+            abstention_reasons=global_abstention_reasons,
+            mean_latency_ms=round(mean_lat, 4),
+            p50_latency_ms=round(p50_lat, 4),
+            p95_latency_ms=round(p95_lat, 4),
+            p99_latency_ms=round(p99_lat, 4),
+            fields=field_reports,
+            schema_digest=self.schema.schema_digest(),
+            strict_mode=eff_strict,
+        )
+
     def decide(
         self,
         prompt: str,
         *,
         telemetry: Optional[Any] = None,
         embedding: Optional[np.ndarray] = None,
-        alpha: float = 0.05,
+        alpha: Optional[float] = None,
         record_receipt: bool = True,
         ledger: Optional[ActionLedger] = None,
         margin_threshold: Optional[float] = None,
@@ -649,6 +1760,7 @@ class SystemOneEngine:
         fail_closed_ledger: Optional[bool] = None,
         strict: Optional[bool] = None,
         policy_scope: Optional[str] = None,
+        use_cache: Optional[bool] = None,
     ) -> DecisionResult:
         """Evaluate a prompt in one non-autoregressive pass.
 
@@ -660,6 +1772,7 @@ class SystemOneEngine:
         # A decision, its uncertainty, and its receipt use one model snapshot.
         with self._lock, getattr(self.model, "_lock", nullcontext()):
             recency_weighted = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
+            eff_use_cache = self.use_cache if use_cache is None else bool(use_cache)
             version = getattr(self.model, "model_version", self.model_version)
             if version != self.model_version:
                 if hasattr(self.model, "_field_heads"):
@@ -679,9 +1792,11 @@ class SystemOneEngine:
                             cp_reset.class_calibration_scores = {}
                         if name in self.regression_conformal_predictors:
                             self.regression_conformal_predictors[name].is_calibrated = False
+            if alpha is None:
+                alpha = self.default_alpha
             if not isinstance(prompt, str):
                 raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
-            if not (0.0 < alpha < 1.0) or math.isnan(alpha) or math.isinf(alpha):
+            if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not (0.0 < alpha < 1.0) or math.isnan(alpha) or math.isinf(alpha):
                 raise ValueError(f"alpha must be in (0, 1), got {alpha}")
             if margin_threshold is not None and (margin_threshold < 0.0 or math.isnan(margin_threshold) or math.isinf(margin_threshold)):
                 raise ValueError(f"margin_threshold must be non-negative, got {margin_threshold}")
@@ -726,7 +1841,7 @@ class SystemOneEngine:
                     truth_ledger_head = ""
 
             # 1. Cache lookup with request and model context
-            if self.use_cache:
+            if eff_use_cache:
                 # These digests bind cache entries; uncached decisions do not use them.
                 m_dig = self._model_digest()
                 p_dig = self._projector_digest()
@@ -1188,7 +2303,7 @@ class SystemOneEngine:
             validated_values = self.schema.validate_decision(values)
             total_latency_ms = (time.perf_counter() - t_start) * 1000.0
 
-            if record_receipt or self.use_cache:
+            if record_receipt or eff_use_cache:
                 safe_values = copy.deepcopy(validated_values)
                 safe_confidences = dict(confidences)
                 safe_conformal_sets = {k: list(v) for k, v in conformal_sets.items()}
@@ -1291,7 +2406,7 @@ class SystemOneEngine:
                 },
             )
 
-            if self.use_cache and not is_ambiguous:
+            if eff_use_cache and not is_ambiguous:
                 self.cache.put(
                     prompt,
                     result,
@@ -1318,11 +2433,11 @@ class SystemOneEngine:
 
     def evaluate(
         self,
-        prompt: str,
+        prompt: Union[str, Sequence[Any], Mapping[str, Any], Path],
         telemetry: Optional[Any] = None,
         embedding: Optional[np.ndarray] = None,
         *,
-        alpha: float = 0.05,
+        alpha: Optional[float] = None,
         record_receipt: bool = True,
         ledger: Optional[ActionLedger] = None,
         margin_threshold: Optional[float] = None,
@@ -1331,8 +2446,12 @@ class SystemOneEngine:
         recency_weighted: Optional[bool] = None,
         strict: Optional[bool] = None,
         policy_scope: Optional[str] = None,
-    ) -> DecisionResult:
-        """Evaluates prompt against schema with optional continuous numeric telemetry vector and precomputed embedding."""
+    ) -> Union[DecisionResult, EvaluationReport]:
+        """Evaluates prompt against schema or evaluates a labeled dataset when given rows."""
+        if not isinstance(prompt, str) and isinstance(prompt, (Path, Sequence, Mapping)):
+            return self.evaluate_dataset(prompt, alpha=alpha, strict_mode=strict)
+        if not isinstance(prompt, str):
+            raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
         return self.decide(
             prompt,
             telemetry=telemetry,
@@ -1800,16 +2919,23 @@ class SystemOneEngine:
                         cp = self.conformal_predictors[name]
                         ch.score_method = cp.score_method
                         ch.mondrian = bool(cp.mondrian)
+                        ch.margin_threshold = float(getattr(cp, "calibrated_margin_threshold", getattr(ch, "margin_threshold", 0.20)))
                         ch.familiarity_threshold = float(cp.familiarity_threshold)
                         ch.prototype_threshold = float(cp.prototype_threshold)
-                        if getattr(cp, "prototypes", None) is not None:
-                            ch.prototypes = np.asarray(cp.prototypes, dtype=np.float32)
-                        if getattr(cp, "prototype_scores", None) is not None and len(cp.prototype_scores) > 0:
-                            ch.prototype_scores = tuple(float(s) for s in cp.prototype_scores)
+                        ch.prototypes = (
+                            None
+                            if getattr(cp, "prototypes", None) is None
+                            else np.asarray(cp.prototypes, dtype=np.float32).copy()
+                        )
+                        ch.prototype_scores = (
+                            tuple(float(s) for s in cp.prototype_scores)
+                            if getattr(cp, "prototype_scores", None) is not None and len(cp.prototype_scores) > 0
+                            else ()
+                        )
                         if cp.is_calibrated and len(cp.calibration_scores) > 0:
                             ch.calibration_scores = tuple(float(s) for s in cp.calibration_scores)
                             n_sc = len(cp.calibration_scores)
-                            k_sc = int(math.ceil((n_sc + 1) * 0.95))
+                            k_sc = int(math.ceil((n_sc + 1) * (1.0 - self.default_alpha)))
                             ch.conformal_quantile = 1.0 if k_sc > n_sc else float(cp.calibration_scores[k_sc - 1])
                             if getattr(cp, "class_calibration_scores", None):
                                 ch.class_calibration_scores = {
@@ -1817,15 +2943,18 @@ class SystemOneEngine:
                                     for k, vals in cp.class_calibration_scores.items()
                                     if len(vals) > 0
                                 }
+                            else:
+                                ch.class_calibration_scores = {}
                         elif not cp.is_calibrated:
                             ch.calibration_scores = ()
                             ch.conformal_quantile = 0.0
+                            ch.class_calibration_scores = {}
                     if name in self.regression_conformal_predictors:
                         rcp = self.regression_conformal_predictors[name]
                         if rcp.is_calibrated and len(rcp.residuals) > 0:
                             ch.calibration_scores = tuple(float(s) for s in rcp.residuals)
                             n_res = len(rcp.residuals)
-                            k_res = int(math.ceil((n_res + 1) * 0.95))
+                            k_res = int(math.ceil((n_res + 1) * (1.0 - self.default_alpha)))
                             val_range = float(rcp.max_value - rcp.min_value)
                             ch.conformal_quantile = val_range if k_res > n_res else float(rcp.residuals[k_res - 1])
                         elif not rcp.is_calibrated:
@@ -1835,6 +2964,7 @@ class SystemOneEngine:
                     for p_k, f_map in self._learned_prompt_overrides.items():
                         self.model._learned_prompt_overrides.setdefault(p_k, {}).update(f_map)
                 self.model.metadata["strict_mode"] = bool(self.strict_mode)
+                self.model.metadata["default_alpha"] = float(self.default_alpha)
                 return self.model
 
             heads_dict = getattr(self.model, "heads", getattr(self.model, "_field_heads", {}))
@@ -1855,20 +2985,22 @@ class SystemOneEngine:
                 proto_mat: Optional[np.ndarray] = None
                 proto_thresh = 0.0
                 proto_scores: Tuple[float, ...] = ()
+                eff_head_margin = float(self.margin_threshold if self.margin_threshold is not None else 0.20)
 
                 if cp is not None:
                     score_method = cp.score_method
                     mondrian = bool(cp.mondrian)
+                    eff_head_margin = float(getattr(cp, "calibrated_margin_threshold", eff_head_margin))
                     fam_thresh = float(cp.familiarity_threshold)
                     proto_thresh = float(cp.prototype_threshold)
                     if getattr(cp, "prototypes", None) is not None:
-                        proto_mat = np.asarray(cp.prototypes, dtype=np.float32)
+                        proto_mat = np.asarray(cp.prototypes, dtype=np.float32).copy()
                     if getattr(cp, "prototype_scores", None) is not None and len(cp.prototype_scores) > 0:
                         proto_scores = tuple(float(s) for s in cp.prototype_scores)
                     if cp.is_calibrated and len(cp.calibration_scores) > 0:
                         calib_scores = tuple(float(s) for s in cp.calibration_scores)
                         n_sc = len(cp.calibration_scores)
-                        k_sc = int(math.ceil((n_sc + 1) * 0.95))
+                        k_sc = int(math.ceil((n_sc + 1) * (1.0 - self.default_alpha)))
                         conf_q = 1.0 if k_sc > n_sc else float(cp.calibration_scores[k_sc - 1])
                     if getattr(cp, "class_calibration_scores", None):
                         class_scores = {
@@ -1880,7 +3012,7 @@ class SystemOneEngine:
                     if rcp.is_calibrated and len(rcp.residuals) > 0:
                         calib_scores = tuple(float(s) for s in rcp.residuals)
                         n_res = len(rcp.residuals)
-                        k_res = int(math.ceil((n_res + 1) * 0.95))
+                        k_res = int(math.ceil((n_res + 1) * (1.0 - self.default_alpha)))
                         val_range = float(rcp.max_value - rcp.min_value)
                         conf_q = val_range if k_res > n_res else float(rcp.residuals[k_res - 1])
 
@@ -1902,7 +3034,7 @@ class SystemOneEngine:
                     options=opts,
                     P=getattr(head, "covariance_inv", None),
                     B=getattr(head, "cross_covariance", None),
-                    margin_threshold=float(self.margin_threshold if self.margin_threshold is not None else 0.20),
+                    margin_threshold=eff_head_margin,
                     forgetting_factor=float(self.forgetting_factor),
                     relative_odds_ratio=float(self.relative_odds_ratio if self.relative_odds_ratio is not None else 1.5),
                     confidence_floor_tau0=float(self.confidence_floor_tau0 if self.confidence_floor_tau0 is not None else 0.15),
@@ -1930,7 +3062,11 @@ class SystemOneEngine:
                 dimension=self.dimension,
                 projector=self.projector,
                 backend="numpy" if self.backend == "auto" else self.backend,
-                metadata={"strict_mode": bool(self.strict_mode), "cold_start": True},
+                metadata={
+                    "strict_mode": bool(self.strict_mode),
+                    "cold_start": True,
+                    "default_alpha": float(self.default_alpha),
+                },
                 forgetting_factor=self.forgetting_factor,
                 recency_weighted=self.recency_weighted,
             )
@@ -1965,8 +3101,12 @@ class SystemOneEngine:
             projector=projector,
             backend="numpy" if backend == "auto" else backend,
         )
-        if "strict_mode" not in kwargs and isinstance(compiled.metadata, Mapping) and "strict_mode" in compiled.metadata:
-            kwargs["strict_mode"] = bool(compiled.metadata["strict_mode"])
+        if "strict_mode" not in kwargs:
+            kwargs["strict_mode"] = (
+                bool(compiled.metadata.get("strict_mode", True))
+                if isinstance(compiled.metadata, Mapping)
+                else True
+            )
         resolved_schema = schema if schema is not None else compiled.schema
         return cls(
             schema=resolved_schema,
@@ -1997,8 +3137,12 @@ class SystemOneEngine:
             projector=projector,
             backend="numpy" if backend == "auto" else backend,
         )
-        if "strict_mode" not in kwargs and isinstance(compiled.metadata, Mapping) and "strict_mode" in compiled.metadata:
-            kwargs["strict_mode"] = bool(compiled.metadata["strict_mode"])
+        if "strict_mode" not in kwargs:
+            kwargs["strict_mode"] = (
+                bool(compiled.metadata.get("strict_mode", True))
+                if isinstance(compiled.metadata, Mapping)
+                else True
+            )
         resolved_schema = schema if schema is not None else compiled.schema
         return cls(
             schema=resolved_schema,
@@ -2016,7 +3160,7 @@ class SystemOneEngine:
         prompts: Sequence[str],
         *,
         telemetry: Optional[Sequence[Any]] = None,
-        alpha: float = 0.05,
+        alpha: Optional[float] = None,
         record_receipt: bool = False,
         margin_threshold: Optional[float] = None,
         relative_odds_ratio: Optional[float] = None,
@@ -2141,4 +3285,8 @@ __all__ = [
     "ReflexEngine",
     "DecisionResult",
     "BenchmarkReport",
+    "FieldEvaluationMetrics",
+    "EvaluationReport",
+    "RecalibrationMetrics",
+    "RecalibrationReport",
 ]

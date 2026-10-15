@@ -28,6 +28,8 @@ from system1 import (
     SchemaMeta,
     DecisionCalibrator,
     CalibrationMetrics,
+    RecalibrationMetrics,
+    RecalibrationReport,
     BrierDecomposition,
     ConformalPredictor,
     ConformalPredictionSet,
@@ -188,6 +190,8 @@ _MODULE_MAP = {
     "ReflexEngine": "reflex.engine",
     "DecisionResult": "reflex.engine",
     "BenchmarkReport": "reflex.engine",
+    "FieldEvaluationMetrics": "reflex.engine",
+    "EvaluationReport": "reflex.engine",
     # receipt
     "DecisionWitnessReceipt": "reflex.receipt",
     "create_decision_receipt": "reflex.receipt",

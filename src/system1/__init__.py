@@ -39,6 +39,8 @@ from system1.calibration import (
     ConformalPredictionSet,
     ConformalPredictor,
     DecisionCalibrator,
+    RecalibrationMetrics,
+    RecalibrationReport,
     RegressionConformalInterval,
     RegressionConformalPredictor,
 )
@@ -101,7 +103,197 @@ def decide(
     )
 
 
-evaluate = decide
+def evaluate(
+    target: Any,
+    rows: Any = None,
+    *,
+    schema: Optional[Union[DecisionSchema, Type[DecisionSchema]]] = None,
+    dataset: Any = None,
+    examples: Any = None,
+    telemetry: Optional[Any] = None,
+    alpha: Optional[float] = None,
+    n_bins: int = 10,
+    strict_mode: Optional[bool] = None,
+    strict: Optional[bool] = None,
+    use_cache: bool = False,
+    record_receipt: bool = True,
+    dimension: int = 384,
+    backend: str = "auto",
+    projector: Optional[Any] = None,
+    margin_threshold: Optional[float] = None,
+) -> Any:
+    """Evaluate a System 1 engine, compiled model, or .s1m file on a labeled dataset.
+
+    Supports ``system1.evaluate(engine_or_model_or_path, rows, alpha=0.05)`` returning
+    an ``EvaluationReport``, while remaining backward-compatible with single-prompt
+    ``system1.evaluate(prompt, schema)`` calls.
+    """
+    is_schema_arg = (rows is not None) and (
+        isinstance(rows, DecisionSchema)
+        or (isinstance(rows, type) and issubclass(rows, DecisionSchema))
+    )
+    if isinstance(target, str) and (
+        is_schema_arg
+        or (rows is None and dataset is None and examples is None and schema is not None)
+    ):
+        resolved_schema = rows if is_schema_arg else schema
+        if resolved_schema is None:
+            raise ValueError("Schema is required for single-prompt evaluation")
+        return decide(
+            target,
+            resolved_schema,
+            telemetry=telemetry,
+            alpha=0.05 if alpha is None else alpha,
+            record_receipt=record_receipt,
+            dimension=dimension,
+            backend=backend,
+            projector=projector,
+            margin_threshold=margin_threshold,
+        )
+
+    from pathlib import Path
+    from system1.compiler import CompiledSystemOneModel
+    from system1.engine import SystemOneEngine
+
+    eval_rows = rows if rows is not None else (dataset if dataset is not None else examples)
+    if eval_rows is None and hasattr(target, "examples_path"):
+        ex_path = Path(getattr(target, "examples_path"))
+        if ex_path.is_file():
+            eval_rows = ex_path
+    if eval_rows is None:
+        raise ValueError(
+            "evaluate() requires labeled rows (a sequence of examples or a path to a JSONL/JSON dataset)"
+        )
+
+    eff_strict = strict if strict is not None else strict_mode
+    if isinstance(target, SystemOneEngine):
+        engine_instance = target
+    elif isinstance(target, CompiledSystemOneModel):
+        engine_instance = SystemOneEngine(
+            schema=schema if schema is not None else target.schema,
+            model=target,
+            dimension=target.dimension,
+            backend=backend if backend != "auto" else target.backend,
+            projector=projector if projector is not None else target.projector,
+            strict_mode=bool(target.metadata.get("strict_mode", True)) if eff_strict is None else bool(eff_strict),
+            use_cache=use_cache,
+            margin_threshold=margin_threshold,
+        )
+    elif isinstance(target, SystemOneModel):
+        engine_instance = SystemOneEngine(
+            schema=schema if schema is not None else target.schema,
+            model=target,
+            dimension=target.dimension,
+            backend=backend if backend != "auto" else target.backend,
+            projector=projector if projector is not None else target.projector,
+            strict_mode=False if eff_strict is None else bool(eff_strict),
+            use_cache=use_cache,
+            margin_threshold=margin_threshold,
+        )
+    elif hasattr(target, "current_path") or hasattr(target, "skill_path"):
+        s_path: Optional[Path] = None
+        for attr in ("current_path", "candidate_path", "skill_path"):
+            val = getattr(target, attr, None)
+            if val is not None and Path(val).is_file():
+                s_path = Path(val)
+                break
+        if s_path is None and hasattr(target, "skill_path"):
+            s_path = Path(getattr(target, "skill_path"))
+            if not s_path.is_file() and hasattr(target, "compile"):
+                target.compile()
+        if s_path is None or not s_path.is_file():
+            raise FileNotFoundError("TeachingSession or Skill does not have a compiled .s1m artifact yet")
+        load_kwargs: dict[str, Any] = {"use_cache": use_cache}
+        if eff_strict is not None:
+            load_kwargs["strict_mode"] = bool(eff_strict)
+        if margin_threshold is not None:
+            load_kwargs["margin_threshold"] = margin_threshold
+        engine_instance = SystemOneEngine.load(
+            s_path,
+            schema=schema if schema is not None else getattr(target, "schema", None),
+            projector=projector,
+            backend=backend,
+            **load_kwargs,
+        )
+    elif isinstance(target, (str, Path)):
+        t_path = Path(target)
+        if t_path.is_dir():
+            for cand in ("current.s1m", "skill.s1m", "candidate.s1m"):
+                if (t_path / cand).is_file():
+                    t_path = t_path / cand
+                    break
+        if t_path.is_file():
+            if t_path.suffix.lower() in {".json", ".py"}:
+                from system1.cli import _load_schema
+
+                resolved_schema_file = _load_schema(str(t_path))
+                engine_instance = SystemOneEngine(
+                    schema=resolved_schema_file,
+                    dimension=dimension,
+                    backend=backend,
+                    projector=projector,
+                    strict_mode=False if eff_strict is None else bool(eff_strict),
+                    use_cache=use_cache,
+                    margin_threshold=margin_threshold,
+                )
+            else:
+                load_kwargs = {"use_cache": use_cache}
+                if eff_strict is not None:
+                    load_kwargs["strict_mode"] = bool(eff_strict)
+                if margin_threshold is not None:
+                    load_kwargs["margin_threshold"] = margin_threshold
+                engine_instance = SystemOneEngine.load(
+                    t_path,
+                    schema=schema,
+                    projector=projector,
+                    backend=backend,
+                    **load_kwargs,
+                )
+        elif isinstance(target, str) and not t_path.exists():
+            if (
+                target.endswith(".s1m")
+                or target.endswith(".json")
+                or target.endswith(".py")
+                or "/" in target
+                or "\\" in target
+            ):
+                raise FileNotFoundError(f"Evaluation target file not found: {target}")
+            from system1.cli import _load_schema
+
+            resolved_schema = _load_schema(target)
+            engine_instance = SystemOneEngine(
+                schema=resolved_schema,
+                dimension=dimension,
+                backend=backend,
+                projector=projector,
+                strict_mode=False if eff_strict is None else bool(eff_strict),
+                use_cache=use_cache,
+                margin_threshold=margin_threshold,
+            )
+        else:
+            raise FileNotFoundError(f"Evaluation target file not found: {target}")
+    elif isinstance(target, DecisionSchema) or (
+        isinstance(target, type) and issubclass(target, DecisionSchema)
+    ):
+        engine_instance = SystemOneEngine(
+            schema=target,
+            dimension=dimension,
+            backend=backend,
+            projector=projector,
+            strict_mode=False if eff_strict is None else bool(eff_strict),
+            use_cache=use_cache,
+            margin_threshold=margin_threshold,
+        )
+    else:
+        raise TypeError(f"Unsupported evaluation target type: {type(target).__name__}")
+
+    return engine_instance.evaluate_dataset(
+        eval_rows,
+        alpha=alpha,
+        n_bins=n_bins,
+        strict_mode=eff_strict,
+        use_cache=use_cache,
+    )
 
 
 _SUBMODULE_NAMES = {
@@ -164,6 +356,8 @@ _MODULE_MAP = {
     "ReflexEngine": "system1.engine",
     "DecisionResult": "system1.engine",
     "BenchmarkReport": "system1.engine",
+    "FieldEvaluationMetrics": "system1.engine",
+    "EvaluationReport": "system1.engine",
     # receipt
     "DecisionWitnessReceipt": "system1.receipt",
     "create_decision_receipt": "system1.receipt",
@@ -292,6 +486,8 @@ __all__ = [
     "ReflexEngine",
     "DecisionResult",
     "BenchmarkReport",
+    "FieldEvaluationMetrics",
+    "EvaluationReport",
     "decide",
     # Schemas & Fields
     "DecisionSchema",
@@ -305,6 +501,8 @@ __all__ = [
     # Calibration & Conformal Prediction
     "DecisionCalibrator",
     "CalibrationMetrics",
+    "RecalibrationMetrics",
+    "RecalibrationReport",
     "BrierDecomposition",
     "ConformalPredictor",
     "ConformalPredictionSet",
