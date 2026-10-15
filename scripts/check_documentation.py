@@ -60,7 +60,10 @@ def main():
             if url.netloc == "github.com" and repo_prefix:
                 target = (ROOT / unquote(url.path[len(repo_prefix):])).resolve()
             elif url.netloc == "raw.githubusercontent.com" and raw_prefix:
-                target = (ROOT / unquote(url.path[len(raw_prefix):])).resolve()
+                errors.append(
+                    f"{path.relative_to(ROOT)}: use relative path instead of raw.githubusercontent.com (404s on private repos): {raw}"
+                )
+                continue
             elif url.scheme or url.netloc:
                 continue
             else:

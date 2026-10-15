@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/steph4n-gh/system1-instinct/main/assets/system1-logo.jpg" alt="System 1: Instinct logo" width="128" />
+  <img src="assets/system1-logo.jpg" alt="System 1: Instinct logo" width="128" />
 </p>
 
 # System 1: Instinct
@@ -12,8 +12,8 @@
 - **Run `70% to 95%+` of repeatable traffic locally in `0.2 ms` on CPU.** Escalate ambiguous or unfamiliar inputs (`is_ambiguous=True`) back to your LLM.
 
 [![CI](https://github.com/steph4n-gh/system1-instinct/actions/workflows/ci.yml/badge.svg)](https://github.com/steph4n-gh/system1-instinct/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://github.com/steph4n-gh/system1-instinct/blob/main/pyproject.toml)
-[![License](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](https://github.com/steph4n-gh/system1-instinct/blob/main/LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-Apache_2.0-blue.svg)](LICENSE)
 
 [How teaching works (0 to 10 examples)](#go-from-zero-examples-to-local-execution) · [Instinct vs. local LLMs](#choose-between-instinct-and-a-local-llm) · [Drop-in replacements](#drop-instinct-into-existing-projects) · [Benchmarks and receipts](#verify-public-benchmarks-and-receipts) · [Documentation](docs/README.md)
 
