@@ -2,13 +2,13 @@
 
 Current stable runtime: **1.0.0**.
 
-**System 1: Instinct** is a sub-millisecond non-autoregressive decision runtime. Each skill uses a `DecisionSchema` (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`), runs zero-shot from option descriptions or fits weights from labeled examples, updates online via `adapt_zero_shot` and `BoundedReviewFallback`, and serializes to a `.s1m` artifact.
+**System 1: Instinct** is a sub-millisecond non-autoregressive decision runtime. Each skill defines a `DecisionSchema` (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`). A skill runs zero-shot from option descriptions or fits weights from labeled examples, updates online via `adapt_zero_shot` and `BoundedReviewFallback`, and serializes to a `.s1m` artifact.
 
 ---
 
 ## 1. Framework drop-in replacement guides
 
-The index in [docs/drop_in/README.md](drop_in/README.md) covers drop-in integrations for external Python libraries:
+The index in [`docs/drop_in/README.md`](drop_in/README.md) covers drop-in integrations for external Python libraries:
 
 | Guide | Target interface | Runnable script |
 | :--- | :--- | :--- |

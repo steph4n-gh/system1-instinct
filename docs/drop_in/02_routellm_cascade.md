@@ -59,7 +59,7 @@ To compare `SystemOneRouteController` against `sentence-transformers/all-MiniLM-
 python examples/drop_in/routellm_dropin.py
 ```
 
-### Expected output
+The script prints:
 
 ```text
 === 1. RouteLLM 3-Tier Cascade Drop-In (`SystemOneRouteController`) ===

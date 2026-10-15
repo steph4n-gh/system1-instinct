@@ -133,18 +133,22 @@ ACT 3: 'TEACH ME' — Teaching a Brand-New Jargon Term in 1 Line (< 4 ms)
 ```
 
 Run these end-to-end replay scripts to inspect real-world behavior:
-- **Live GitHub issue triage (`astral-sh/uv` and `facebook/react` OOS).** Run [`examples/dogfood/live_github_triage.py`](examples/dogfood/live_github_triage.py) (snapshot in [`examples/dogfood/uv_live_issues_snapshot.json`](examples/dogfood/uv_live_issues_snapshot.json)). The script replays `260` chronologically ordered `astral-sh/uv` issues (`#491` through `#22542`, with zero synthetic strings and zero temporal leakage) plus `25` `facebook/react` out-of-scope issues. Traffic progresses from **`0` examples (`0.0%` offload, `100%` escalated)** to **online warm-up (`40.0%` offload)** to a **compiled `.s1m` (`56.7%` at `15/class`, `76.7%` at `25/class`, and `93.3%` local offload at `40/class` in `0.23 ms` with `100.0%` local precision, `96.0%` OOS abstention, and `100%` `.s1m` reload parity)**:
-  ```bash
-  python examples/dogfood/live_github_triage.py
-  # Or pull fresh live issues on demand via GitHub CLI (`gh api`):
-  python examples/dogfood/live_github_triage.py --live --repo astral-sh/uv
-  ```
-- **Live US FDA enforcement recall triage (`openFDA` and `astral-sh/uv` OOS).** Run [`examples/dogfood/live_fda_recall_triage.py`](examples/dogfood/live_fda_recall_triage.py) (snapshot in [`examples/dogfood/fda_live_recalls_snapshot.json`](examples/dogfood/fda_live_recalls_snapshot.json)). The script replays `297` chronologically ordered US FDA enforcement recall reports (`20121212` through `20261007`, `33/cell` across `food`, `drug`, and `device` crossed with `Class I`, `Class II`, and `Class III`, with zero synthetic strings and zero temporal leakage) across a **3-field multi-head schema** (`regulatory_center`, `hazard_class`, and `urgent_class_i_escalation`) plus `25` `astral-sh/uv` out-of-scope software issues. Traffic progresses from **`0` examples (`0.0%` offload, `100%` escalated)** to **online warm-up (`10.0%` offload at `100.0%` precision)** to a **compiled `.s1m` (`51.4%` at `12/cell`, `61.1%` at `18/cell`, and `70.8%` local offload at `25/cell` in `0.30 ms` with `98.0%` joint 3-field precision, `100.0%` center precision, `100.0%` OOS abstention, and `100%` `.s1m` reload parity)**:
-  ```bash
-  python examples/dogfood/live_fda_recall_triage.py
-  # Or pull fresh live enforcement recall reports on demand from api.fda.gov:
-  python examples/dogfood/live_fda_recall_triage.py --live
-  ```
+- **Live GitHub issue triage (`astral-sh/uv` and `facebook/react` OOS).** Run [`examples/dogfood/live_github_triage.py`](examples/dogfood/live_github_triage.py), which uses the snapshot in [`examples/dogfood/uv_live_issues_snapshot.json`](examples/dogfood/uv_live_issues_snapshot.json). The script replays `260` chronologically ordered `astral-sh/uv` issues (`#491` through `#22542`) plus `25` `facebook/react` out-of-scope issues, with zero synthetic strings and zero temporal leakage. Traffic progresses from **`0` examples (`0.0%` offload, `100%` escalated)** to **online warm-up (`40.0%` offload)**. Compiling `.s1m` checkpoints reaches **`56.7%` offload at `15 per class`, `76.7%` at `25 per class`, and `93.3%` local offload at `40 per class` in `0.23 ms` with `100.0%` local precision, `96.0%` OOS abstention, and `100%` `.s1m` reload parity**:
+
+```bash
+python examples/dogfood/live_github_triage.py
+# Or pull fresh live issues on demand via GitHub CLI (`gh api`):
+python examples/dogfood/live_github_triage.py --live --repo astral-sh/uv
+```
+
+- **Live US FDA enforcement recall triage (`openFDA` and `astral-sh/uv` OOS).** Run [`examples/dogfood/live_fda_recall_triage.py`](examples/dogfood/live_fda_recall_triage.py), which uses the snapshot in [`examples/dogfood/fda_live_recalls_snapshot.json`](examples/dogfood/fda_live_recalls_snapshot.json). The script replays `297` chronologically ordered US FDA enforcement recall reports (`20121212` through `20261007`, `33 per cell` across `food`, `drug`, and `device` crossed with `Class I`, `Class II`, and `Class III`) plus `25` `astral-sh/uv` out-of-scope software issues, with zero synthetic strings and zero temporal leakage. Each decision predicts a **3-field multi-head schema** (`regulatory_center`, `hazard_class`, and `urgent_class_i_escalation`). Traffic progresses from **`0` examples (`0.0%` offload, `100%` escalated)** to **online warm-up (`10.0%` offload at `100.0%` precision)**. Compiling `.s1m` checkpoints reaches **`51.4%` offload at `12 per cell`, `61.1%` at `18 per cell`, and `70.8%` local offload at `25 per cell` in `0.30 ms` with `98.0%` joint 3-field precision, `100.0%` center precision, `100.0%` OOS abstention, and `100%` `.s1m` reload parity**:
+
+```bash
+python examples/dogfood/live_fda_recall_triage.py
+# Or pull fresh live enforcement recall reports on demand from api.fda.gov:
+python examples/dogfood/live_fda_recall_triage.py --live
+```
+
 - **Three-wave teacher auto-cutover demo.** Run [`examples/drop_in/llm_cutover_dropin.py`](examples/drop_in/llm_cutover_dropin.py) to observe an upstream teacher and cut over to a local `.s1m` skill.
 
 ### Measure sample efficiency from 0 to 50 examples
@@ -160,7 +164,7 @@ The table below shows how local offload and accuracy scale from **`0` examples**
 | **`25 to 50` examples per option** | Standalone `.s1m` saturates. Out-of-scope inputs still abstain (`0.0%` OOS false accept). | **`80% to 100%`** | `0% to 20%` | **`~99% to 100%`** |
 | **`10,000+` examples** | **Wrong tool for new gains.** Linear and spectral hyperplanes plateau around `50 to 100` examples per option. | *Plateau* | None | Use a fine-tuned model or local LLM |
 
-> **Scope and fallible-teacher boundary.** The progression above summarizes `CLINC150` and `BANKING77` adaptation curves with an oracle teacher fallback ($\alpha = 0.10$ marginal conformal gating). When learning from a **fallible teacher** (`10%` label noise on `64`-class `HWU64`) on fresh traffic under a strict **`1%` (`0.01`) family-wise conditional local error budget** (`1,394` qualification items), neither Instinct nor a classical logistic classifier can statistically certify `<= 1%` upper-bound risk. At a **`5%` (`0.05`) local error budget**, all generalizing methods qualify on `5/5` seeds (`instinct_lexical` offloads `24.41%` vs. `simple_classifier`'s `20.46%` at `1.75%` error, and `instinct_hybrid` reaches the lowest local error rate at `1.36%` with `5/5` `.s1m` reloadability). See [Fresh HWU64 traffic with a fallible teacher (`benchmarks/heldout_traffic/REPORT.md`)](benchmarks/heldout_traffic/REPORT.md).
+> **Scope and fallible-teacher boundary.** The progression above summarizes `CLINC150` and `BANKING77` adaptation curves with an oracle teacher fallback at $\alpha = 0.10$ marginal conformal gating. We also tested a **fallible teacher** (`10%` label noise on `64`-class `HWU64`) on `1,394` fresh qualification items. Under a strict **`1%` (`0.01`) family-wise conditional local error budget**, neither Instinct nor a classical logistic classifier can statistically certify `<= 1%` upper-bound risk. At a **`5%` (`0.05`) local error budget**, all generalizing methods qualify on `5 of 5` seeds. `instinct_lexical` offloads `24.41%` vs. `simple_classifier`'s `20.46%` at `1.75%` error, and `instinct_hybrid` reaches the lowest local error rate at `1.36%` with `5 of 5` `.s1m` reloadability. See [Fresh HWU64 traffic with a fallible teacher (`benchmarks/heldout_traffic/REPORT.md`)](benchmarks/heldout_traffic/REPORT.md).
 
 ---
 
@@ -182,24 +186,24 @@ A `100 KiB` non-autoregressive runtime has clear boundaries. Use the table below
 The [`examples/drop_in/`](examples/drop_in/) and [`docs/drop_in/`](docs/drop_in/README.md) directories contain runnable drop-in replacements for `semantic-router`, `langchain-core`, `FastAPI` with `Instructor`, and `poke-env` with `pokemon-showdown`:
 
 ### 1. Replace `Instructor` in a `FastAPI` endpoint (`POST /v1/triage`)
-- **Guide and code.** Read [docs/drop_in/03_instructor_structured_outputs.md](docs/drop_in/03_instructor_structured_outputs.md) and run `python examples/drop_in/instructor_structured_dropin.py`.
-- **Behavior.** A `FastAPI` endpoint returns a four-field Pydantic model (`department`, `page_oncall`, `impact_tags`, and `urgency_score`). In Wave 1, Instinct handles confident tickets in `0.45 ms` and escalates uncertain ones (`37.1%`) to the `Instructor` teacher. In Wave 2 and Wave 3, Instinct handles **`100.0%` (`35/35`) of tickets locally in `0.455 ms` with `0` LLM calls and `100.0%` four-field exact match**.
+- **Guide and code.** Read [`docs/drop_in/03_instructor_structured_outputs.md`](docs/drop_in/03_instructor_structured_outputs.md) and run `python examples/drop_in/instructor_structured_dropin.py`.
+- **Behavior.** A `FastAPI` endpoint returns a four-field Pydantic model (`department`, `page_oncall`, `impact_tags`, and `urgency_score`). In Wave 1, Instinct handles confident tickets in `0.45 ms` and escalates uncertain ones (`37.1%`) to the `Instructor` teacher. In Wave 2 and Wave 3, Instinct handles **`100.0%` (`35 of 35`) of tickets locally in `0.455 ms` with `0` LLM calls and `100.0%` four-field exact match**.
 
 ### 2. Replace `aurelio-labs/semantic-router`
-- **Guide and code.** Read [docs/drop_in/01_semantic_router.md](docs/drop_in/01_semantic_router.md) and run `python examples/drop_in/semantic_router_dropin.py`.
+- **Guide and code.** Read [`docs/drop_in/01_semantic_router.md`](docs/drop_in/01_semantic_router.md) and run `python examples/drop_in/semantic_router_dropin.py`.
 - **Behavior.** Pass your existing `semantic_router.Route(name=..., utterances=...)` objects directly into `InstinctRouteLayer(routes)`. Instinct runs **`30x` faster (`0.14 ms` vs. `4.31 ms`)**, cuts artifact size from `67.2 MB` ONNX to a **`93.3 KiB` `.s1m` file**, and reduces out-of-scope false acceptance from `100%` to **`0.0% to 0.8%`**.
 
 ### 3. Replace `RouteLLM` cascades in `langchain-core`
-- **Guide and code.** Read [docs/drop_in/02_routellm_cascade.md](docs/drop_in/02_routellm_cascade.md) and run `python examples/drop_in/routellm_dropin.py`.
+- **Guide and code.** Read [`docs/drop_in/02_routellm_cascade.md`](docs/drop_in/02_routellm_cascade.md) and run `python examples/drop_in/routellm_dropin.py`.
 - **Behavior.** Plug `RunnableLambda` into your LangChain LCEL pipeline to route queries at `0.22 ms` CPU latency, tolerate character-typo corruption (`+3.5%` higher accuracy under typos than `all-MiniLM-L6-v2`), and learn online from frontier fallback answers.
 
 ### 4. Replace `Llama-Prompt-Guard` for polarity and security checks
-- **Guide and code.** Read [docs/drop_in/04_prompt_guard_security.md](docs/drop_in/04_prompt_guard_security.md) and run `python examples/drop_in/prompt_guard_dropin.py`.
+- **Guide and code.** Read [`docs/drop_in/04_prompt_guard_security.md`](docs/drop_in/04_prompt_guard_security.md) and run `python examples/drop_in/prompt_guard_dropin.py`.
 - **Behavior.** Pre-screen prompts in `0.21 ms` with `#` negation-scope token transformations. Instinct reaches **`0.0%` false positives** on benign technical prompts containing words like `"ignore"` or `"system"`, and **`90%` to `100%` accuracy on negation flips** (`"do not cancel, upgrade"`), where `all-MiniLM-L6-v2` scores `60.0%`.
 
 ### 5. Run a `poke-env` agent on live Pokémon Showdown (`gen9randombattle`)
-- **Guide and code.** Read [docs/drop_in/06_poke_env_showdown_agent.md](docs/drop_in/06_poke_env_showdown_agent.md) and run `python benchmarks/quality/evaluate_poke_env_showdown.py --battles 50`.
-- **Behavior.** Subclass `poke_env.player.Player` in 15 lines of Python. Starting from `0` examples (four tactical option descriptions), Instinct beats `RandomPlayer` (`100%`) and `MaxBasePowerPlayer` (`98%`). Online turn-by-turn updates (`adapt_zero_shot` and `learn_from_tier2`) raise its win rate from **`42%` (cold zero-shot) to `62%` against `SimpleHeuristicsPlayer`**, compiling into a **`23 KiB` `.s1m` policy that runs in `0.093 ms` (`93 µs`) per turn**.
+- **Guide and code.** Read [`docs/drop_in/06_poke_env_showdown_agent.md`](docs/drop_in/06_poke_env_showdown_agent.md) and run `python benchmarks/quality/evaluate_poke_env_showdown.py --battles 50`.
+- **Behavior.** Subclass `poke_env.player.Player` in 15 lines of Python. Starting from `0` examples and four tactical option descriptions, Instinct beats `RandomPlayer` (`100%`) and `MaxBasePowerPlayer` (`98%`). Online turn-by-turn updates (`adapt_zero_shot` and `learn_from_tier2`) raise its win rate from **`42%` (cold zero-shot) to `62%` against `SimpleHeuristicsPlayer`**, compiling into a **`23 KiB` `.s1m` policy that runs in `0.093 ms` (`93 µs`) per turn**.
 
 ---
 
@@ -231,18 +235,18 @@ Every benchmark below runs offline on public datasets (`BANKING77`, `CLINC150-OO
 ### 1. Compare against pretrained neural encoders (`all-MiniLM-L6-v2` and `BAAI/bge-small-en-v1.5`)
 To reproduce this table, run `python benchmarks/quality/evaluate_drop_in_replacements.py` ([full report](benchmarks/quality/drop_in_and_adaptation_report.md)):
 
-| Router architecture | Artifact size | `BANKING77` (32c clean) | `BANKING77` (32c typo stress) | `CLINC150-OOS` false accept | Negation and polarity acc | P50 CPU latency | `<1 ms` online RLS |
+| Router architecture | Artifact size | `BANKING77` (32 classes clean) | `BANKING77` (32 classes typo stress) | `CLINC150-OOS` false accept | Negation and polarity accuracy | P50 CPU latency | `<1 ms` online RLS |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **Classical linear baseline** (`Unigram TF-IDF`) | `85 KiB` (`0` weights) | 77.3% | 66.0% | 3.3% | 70.0% | `0.18 ms` | No |
 | **`all-MiniLM-L6-v2`** (`22M` dense bi-encoder) | `91.1 MB` ONNX | 91.0% | 70.7% (`-20.3%` drop) | 8.0% | 60.0% | `1.32 ms` (`~10 ms` PyTorch) | No |
-| **`BAAI/bge-small-en-v1.5`** (`33M` dense bi-encoder) | `67.2 MB` ONNX | **94.5%** | **77.0%** (`-17.5%` drop) | 5.0% (cal) / 100% (`@0.5`) | 90.0% | `2.96 ms` (`~14 ms` PyTorch) | No |
-| **System 1: Instinct (Static `.s1m`)** | **`120 KiB`** (`0` weights) | **87.9%** | **74.2%** (`+3.5%` vs. MiniLM) | **0.0%** (`0/120`) | **90.0%** | **`0.22 ms`** | **Yes** |
-| **System 1: Instinct (`+ Online correction`)** | **`120 KiB`** (`0` weights) | **91.4%** (`+0.4%` vs. MiniLM) | **74.2%** | **0.0%** (`0/120`) | **100.0%** | **`0.22 ms`** | **Yes** |
+| **`BAAI/bge-small-en-v1.5`** (`33M` dense bi-encoder) | `67.2 MB` ONNX | **94.5%** | **77.0%** (`-17.5%` drop) | 5.0% calibrated, 100% at `0.5` | 90.0% | `2.96 ms` (`~14 ms` PyTorch) | No |
+| **System 1: Instinct (Static `.s1m`)** | **`120 KiB`** (`0` weights) | **87.9%** | **74.2%** (`+3.5%` vs. MiniLM) | **0.0%** (`0 of 120`) | **90.0%** | **`0.22 ms`** | **Yes** |
+| **System 1: Instinct (`+ Online correction`)** | **`120 KiB`** (`0` weights) | **91.4%** (`+0.4%` vs. MiniLM) | **74.2%** | **0.0%** (`0 of 120`) | **100.0%** | **`0.22 ms`** | **Yes** |
 
 ### 2. Inspect sample-efficiency curves on public datasets (`0` to `40` examples per class)
 Measured on `24` intents from `CLINC150` (`120` test queries) and `BANKING77` (`192` test queries):
 
-| Examples per class | Total examples (`24` classes) | `CLINC150` raw online acc | `CLINC150` local offload % | `CLINC150` end-to-end acc | `BANKING77` raw online acc | `BANKING77` local offload % | `BANKING77` end-to-end acc |
+| Examples per class | Total examples (`24` classes) | `CLINC150` raw online accuracy | `CLINC150` local offload % | `CLINC150` end-to-end accuracy | `BANKING77` raw online accuracy | `BANKING77` local offload % | `BANKING77` end-to-end accuracy |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **`0` (Cold)** | **`0`** | `61.7%` | `0.0%` *(100% teacher)* | **`100.0%`** | `53.6%` | `0.0%` *(100% teacher)* | **`100.0%`** |
 | **`1` per class** | **`24`** | `65.8%` | **`42.5%` local** | **`92.5%`** | `57.3%` | **`27.6%` local** | **`96.4%`** |
@@ -257,15 +261,15 @@ To reproduce this table offline (`block_network()`), run `python benchmarks/qual
 
 | Category | Workload | Classical linear baseline | System 1: Instinct (Static) | System 1: Instinct (+ Online replay) |
 | :--- | :--- | :---: | :---: | :---: |
-| **1. High-cardinality intent routing** | `BANKING77` (32 intents, clean and typo) | 77.3% / 66.0% | **87.9%** / **74.2%** | **91.4%** |
-| **1b. Full 77-class scaling** | `BANKING77` (77 intents, clean and typo) | 62.0% / 45.5% | **79.5%** / **58.3%** | **88.1%** |
-| **2. Multi-domain and OOS rejection** | `CLINC150-OOS` (in-scope acc and OOS false accept) | 84.7% / 3.3% FA | **86.1%** / **0.0% FA** | **99.3%** / **0.0% FA** |
-| **3. Injection and NotInject negatives** | `NotInject` benign-trigger FPR and polarity acc | 10.0% FPR / 70.0% | **0.0% FPR** / **90.0%** | **0.0% FPR** / **100.0%** |
-| **4. Authored drift probes (106)** | `banking_support`, `sms_triage`, and `model_routing` | 86.2% / 77.5% / 77.8% cov | **100.0%** / **82.5%** / **88.9% cov** | **100.0%** / **87.5%** / **94.4% cov** |
-| **5. Multi-field structured triage** | 4-field joint accuracy (`Choice`+`Bool`+`Multi`+`Score`) | 97.1% | **100.0%** (`0.40 ms`) | **100.0%** (`0%` Wave 3 esc) |
-| **6. Zero-shot cold-start routing** | `intent_routing` and `security_triage` (0-shot) | 51.0% / 50.0% | **81.0%** / **85.0%** | **100.0%** |
+| **1. High-cardinality intent routing** | `BANKING77` (32 intents, clean and typo) | 77.3% clean, 66.0% typo | **87.9%** clean, **74.2%** typo | **91.4%** |
+| **1b. Full 77-class scaling** | `BANKING77` (77 intents, clean and typo) | 62.0% clean, 45.5% typo | **79.5%** clean, **58.3%** typo | **88.1%** |
+| **2. Multi-domain and OOS rejection** | `CLINC150-OOS` (in-scope accuracy and OOS false accept) | 84.7%, 3.3% false accept | **86.1%**, **0.0% false accept** | **99.3%**, **0.0% false accept** |
+| **3. Injection and NotInject negatives** | `NotInject` benign-trigger FPR and polarity accuracy | 10.0% FPR, 70.0% accuracy | **0.0% FPR**, **90.0% accuracy** | **0.0% FPR**, **100.0% accuracy** |
+| **4. Authored drift probes (106)** | `banking_support`, `sms_triage`, and `model_routing` coverage | 86.2%, 77.5%, 77.8% | **100.0%**, **82.5%**, **88.9%** | **100.0%**, **87.5%**, **94.4%** |
+| **5. Multi-field structured triage** | 4-field joint accuracy (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`) | 97.1% | **100.0%** (`0.40 ms`) | **100.0%** (`0%` Wave 3 escalation) |
+| **6. Zero-shot cold-start routing** | `intent_routing` and `security_triage` (0-shot) | 51.0%, 50.0% | **81.0%**, **85.0%** | **100.0%** |
 
-> **Closed-loop replay vs. fresh noisy-teacher traffic.** In the table above, `+ Online replay` columns measure closed-loop oracle correction and replay on the evaluated prompt set, and end-to-end curves in Section 2 use an oracle fallback at $\alpha = 0.10$. For an evaluation on **fresh held-out `HWU64` traffic (`64` intents) taught by a `10%`-noisy teacher under both strict `1%` (`0.01`) and standard `5%` (`0.05`) family-wise local accepted-error gates**, see [`benchmarks/heldout_traffic/REPORT.md`](benchmarks/heldout_traffic/REPORT.md) and its [protocol and verifier](benchmarks/heldout_traffic/README.md).
+> **Closed-loop replay vs. fresh noisy-teacher traffic.** In the table above, `+ Online replay` columns measure closed-loop oracle correction and replay on the evaluated prompt set. The end-to-end curves in Section 2 use an oracle fallback at $\alpha = 0.10$. We also evaluated **fresh held-out `HWU64` traffic (`64` intents) taught by a `10%`-noisy teacher under strict `1%` (`0.01`) and standard `5%` (`0.05`) family-wise local accepted-error gates**. See [`benchmarks/heldout_traffic/REPORT.md`](benchmarks/heldout_traffic/REPORT.md) and its [protocol and verifier](benchmarks/heldout_traffic/README.md).
 
 ---
 

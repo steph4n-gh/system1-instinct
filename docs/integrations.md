@@ -4,7 +4,7 @@ This reference describes the runtime adapters that connect a [compiled skill](gu
 
 ## LangChain (`system1[langchain]`)
 
-Install `python -m pip install 'system1[langchain]'`. `SystemOneGuardCallbackHandler` intercepts LangChain tool invocations and evaluates each call against a configured `SystemOneGuard`:
+`SystemOneGuardCallbackHandler` intercepts LangChain tool invocations and evaluates each call against a configured `SystemOneGuard`. This adapter requires the `system1[langchain]` extra (`python -m pip install 'system1[langchain]'`):
 
 ```python
 from system1.integrations import SystemOneGuardCallbackHandler
@@ -22,18 +22,18 @@ result = your_tool.invoke(tool_arguments, config={"callbacks": [handler]})
 
 ## Model Context Protocol (`System1MCPProxy`)
 
-`System1MCPProxy` intercepts JSON-RPC tool calls before dispatch. Initialize the proxy with a configured `SystemOneGuard` and authenticated caller identity, then call `handle_call(request, executor)` or `async_handle_call(request, executor)`. See [`tests/test_integrations.py`](https://github.com/steph4n-gh/system1-instinct/blob/main/tests/test_integrations.py) for the request and response schema. Diagnostic guard mode (`enforcement_profile=False`) does not produce signed enforcement receipts.
+`System1MCPProxy` intercepts JSON-RPC tool calls before dispatch. The proxy takes a configured `SystemOneGuard` and an authenticated caller identity, and exposes `handle_call(request, executor)` and `async_handle_call(request, executor)`. [`tests/test_integrations.py`](https://github.com/steph4n-gh/system1-instinct/blob/main/tests/test_integrations.py) defines the request and response schema. Diagnostic guard mode (`enforcement_profile=False`) does not produce signed enforcement receipts.
 
 ## FastAPI and ASGI (`add_system1_gateway`)
 
 `add_system1_gateway(app, schema=YourSchema)` registers `SystemOneGatewayMiddleware` on an ASGI application. The middleware returns a local HTTP response when `SystemOneEngine` produces an unambiguous decision (`is_ambiguous=False`) and forwards ambiguous requests to the downstream ASGI application.
 
-- **Dependencies.** Install your ASGI framework (`fastapi` or `starlette`) separately.
-- **Security boundary.** `SystemOneGatewayMiddleware` runs before downstream route dependencies. Configure authentication, authorization, and request-body size limits in an outer middleware or reverse proxy. See [Deployment boundaries](deployment.md#asgi-gateway).
+- **Dependencies.** Requires an external ASGI framework such as `fastapi` or `starlette`.
+- **Security boundary.** `SystemOneGatewayMiddleware` runs before downstream route dependencies. Authentication, authorization, and request-body size limits belong in an outer middleware or reverse proxy, as detailed in [Deployment boundaries](deployment.md#asgi-gateway).
 
 ## gRPC (`system1[grpc]`)
 
-Install the gRPC extra and start the local diagnostic server:
+The `system1[grpc]` extra provides the gRPC server and CLI entrypoint:
 
 ```bash
 python -m pip install 'system1[grpc]'
@@ -41,12 +41,12 @@ system1 serve --grpc --host 127.0.0.1 --port 50051
 ```
 
 - **Protocol buffer definition.** [`src/system1/proto/system1.proto`](https://github.com/steph4n-gh/system1-instinct/blob/main/src/system1/proto/system1.proto) defines the wire contract for generated clients in Python and other languages.
-- **Transport and security.** The `system1 serve --grpc` CLI command binds to `127.0.0.1` over plaintext gRPC without caller authentication, persistent signing keys, or a durable `ActionLedger`. For production services, call `system1.grpc_server.serve(...)` in Python with explicit `schemas`, `guard`, and transport security. Experimental container templates live in [`deploy/README.md`](https://github.com/steph4n-gh/system1-instinct/blob/main/deploy/README.md).
+- **Transport and security.** The `system1 serve --grpc` CLI command binds to `127.0.0.1` over plaintext gRPC without caller authentication, persistent signing keys, or a durable `ActionLedger`. Production services use `system1.grpc_server.serve(...)` in Python with explicit `schemas`, `guard`, and transport security. Experimental container templates live in [`deploy/README.md`](https://github.com/steph4n-gh/system1-instinct/blob/main/deploy/README.md).
 
 ## Observability (`system1[observability]` and `system1[otel]`)
 
-Install `system1[observability]` for Prometheus metrics or `system1[otel]` for OpenTelemetry tracing. See the [observability reference](observability/README.md) and [`grafana-dashboard.json`](observability/grafana-dashboard.json). Enabling a metrics server or trace exporter opens network listeners or outbound connections in the host process.
+The `system1[observability]` extra enables Prometheus metrics, and `system1[otel]` enables OpenTelemetry tracing. See the [observability reference](observability/README.md) and [`grafana-dashboard.json`](observability/grafana-dashboard.json). Enabling a metrics server or trace exporter opens network listeners or outbound connections in the host process.
 
 ## Inbox Zero email classification (`system1[http]`)
 
-The [Inbox Zero integration](../examples/inbox_zero/README.md) provides JSON lesson sets, an authenticated local HTTP endpoint (`system1[http]`), and a provider patch for seven email categories. It uses `TfidfProjector` and a ridge decision head with no external model weights. The provider starts in review-only mode and leaves uncertain classifications unprocessed when no LLM fallback is configured. For a credential-free public dataset baseline, see the [public spam and ham experiment](../benchmarks/quality/public_email/README.md).
+The [Inbox Zero integration](../examples/inbox_zero/README.md) provides JSON lesson sets, an authenticated local HTTP endpoint (`system1[http]`), and a provider patch for seven email categories. It uses `TfidfProjector` and a ridge decision head with no external model weights. The provider starts in review-only mode and leaves uncertain classifications unprocessed when the configuration omits an LLM fallback. For a credential-free public dataset baseline, see the [public spam and ham experiment](../benchmarks/quality/public_email/README.md).

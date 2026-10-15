@@ -1,6 +1,6 @@
-# Drop-in replacement guides for Python frameworks
+# Replace framework routers and LLM wrappers with Instinct
 
-Each guide below shows how to replace an existing router, classifier, or LLM wrapper (`semantic-router`, `langchain-core`, `FastAPI` with `instructor`, or `poke-env` with `smogon/pokemon-showdown`) with **System 1: Instinct** and compare results against neural encoders (`BAAI/bge-small-en-v1.5` and `sentence-transformers/all-MiniLM-L6-v2`) on public datasets (`CLINC150-OOS`, `BANKING77`, and `NotInject`):
+Each guide below shows how to replace an existing router, classifier, or LLM wrapper (`semantic-router`, `langchain-core`, `FastAPI` with `instructor`, or `poke-env` with `smogon/pokemon-showdown`) with **System 1: Instinct**. The runnable scripts compare latency, accuracy, and out-of-scope rejection against neural encoders (`BAAI/bge-small-en-v1.5` and `sentence-transformers/all-MiniLM-L6-v2`) on public datasets (`CLINC150-OOS`, `BANKING77`, and `NotInject`):
 
 | # | Guide | Target library | Dataset or environment | Runnable script | Measured result |
 | :-: | :--- | :--- | :--- | :--- | :--- |

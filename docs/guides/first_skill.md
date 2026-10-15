@@ -104,6 +104,13 @@ Open `.system1/my-lessons.json` in your editor and add two more `[message, answe
 python examples/teach_skill.py --lessons .system1/my-lessons.json --prompt "Please send my payment receipt" --output .system1/candidate.s1m
 ```
 
+You should see this output:
+
+```text
+Suggested team: billing
+Needs review: True
+```
+
 The script compiles `.system1/my-lessons.json`, writes `.system1/candidate.s1m` without overwriting `.system1/support-route.s1m`, and prints the predicted team and review flag. To define your own output options, see the [teaching guide](training_experts.md#teach-your-data).
 
 ## Step 4: Check a larger four-team example
@@ -114,10 +121,17 @@ To see how a skill behaves when we separate teaching, calibration, and evaluatio
 python examples/support_triage.py
 ```
 
-The script compiles a four-department skill, evaluates held-out messages that were excluded from teaching and calibration, and prints three metrics:
-- **Raw accuracy.** How often the top guess matches the label, including guesses flagged for review.
-- **Accepted errors.** How often an unreviewed answer is wrong.
-- **Review rate.** How often `is_ambiguous` is `True`.
+The script compiles a four-department skill (`billing`, `technical_support`, `account_security`, and `sales`), evaluates `104` held-out messages outside the teaching and calibration splits, and prints a summary header followed by per-message verdicts:
+
+```text
+support_triage: 192 teaching + 112 calibration + 104 unseen cases
+Teach + calibrate: 115.5 ms | Saved skill: 62.8 KiB
+Save: 1.8 ms | Load: 1.0 ms
+Unseen accuracy: starter 76.9% -> taught 94.2%
+Answered without review: 92/104 | Accuracy on those: 98.9%
+```
+
+Here, raw accuracy rises from `76.9%` to `94.2%`. On the `92` messages that the skill accepts without review (`ANSWER`), accuracy reaches `98.9%`, while the remaining `12` uncertain messages print `REVIEW`.
 
 ## Step 5: Load and reuse the saved `.s1m` skill
 
@@ -157,12 +171,29 @@ fixed = engine.decide("The payment page crashes when I open it.", record_receipt
 print("Updated team:", fixed.values["team"])
 ```
 
-To fix the decision in `.system1/my-lessons.json`, add the pair to the `"team"` array (or replace the label if that sentence already exists in the file) and re-run `examples/teach_skill.py`:
+You should see:
+
+```text
+Updated team: support
+```
+
+To persist the correction in `.system1/my-lessons.json`, add the pair to the `"team"` array, or update its label if that sentence already exists in the file:
 
 ```json
 ["The payment page crashes when I open it.", "support"]
 ```
 
-After you add the lesson, test a new phrasing such as `"The checkout screen freezes"` and `"Why was I billed twice?"` to verify that both teams still route as expected.
+Re-run `examples/teach_skill.py` with `--prompt "The payment page crashes when I open it."`:
+
+```bash
+python examples/teach_skill.py --lessons .system1/my-lessons.json --prompt "The payment page crashes when I open it." --output .system1/candidate.s1m
+```
+
+You should see:
+
+```text
+Suggested team: support
+Needs review: True
+```
 
 When you are ready to manage separate teaching, calibration, and evaluation splits with regression gates, continue to [Correct, compare, and adopt a skill](correcting_skills.md). To collect lessons automatically from an upstream LLM, see the [teacher observation reference](../typesafe.md) and [Wrap an LLM call with `BoundedReviewFallback`](../drop_in/05_llm_observe_and_cutover.md).

@@ -6,8 +6,10 @@ Use [`SystemOnePromptGuard`](../../examples/drop_in/prompt_guard_dropin.py) to s
 
 ## 1. Compare keyword filters, bi-encoders, and negation-scoped features
 
-- **Classical unigram and keyword filters.** Flag benign developer questions such as `"How do I configure .gitignore to ignore system log files?"` or `"How do I override a method in C++?"` (`10.0%` false-positive rate on `NotInject`).
-- **Dense bi-encoders (`all-MiniLM-L6-v2`).** Pool token embeddings across the sentence, placing `"do not cancel my subscription, upgrade to pro"` next to `"cancel my subscription"` (`60.0%` accuracy on polarity contrasts).
+Before replacing your prompt guard, check how each architecture handles benign trigger words and negated intents:
+
+- **Classical unigram and keyword filters.** Flag benign developer questions such as `"How do I configure .gitignore to ignore system log files?"` or `"How do I override a method in C++?"`, reaching a `10.0%` false-positive rate on `NotInject`.
+- **Dense bi-encoders (`all-MiniLM-L6-v2`).** Pool token embeddings across the sentence, placing `"do not cancel my subscription, upgrade to pro"` next to `"cancel my subscription"` and scoring `60.0%` on polarity contrasts.
 - **`SystemOnePromptGuard`.** Binds negation scope directly into token features (`neg:cancel` and `#` affirmation markers) so negated clauses and benign technical contexts separate in `0.21 ms`.
 
 ---
@@ -45,7 +47,7 @@ To compare `SystemOnePromptGuard` against `all-MiniLM-L6-v2` (`91.1 MB` ONNX) an
 python examples/drop_in/prompt_guard_dropin.py
 ```
 
-### Expected output
+The script prints:
 
 ```text
 === 1. Prompt-Guard Drop-In (`SystemOnePromptGuard`) ===

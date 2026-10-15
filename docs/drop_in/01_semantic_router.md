@@ -62,7 +62,7 @@ To compare `SemanticRouter` (`BAAI/bge-small-en-v1.5`) and `InstinctRouteLayer` 
 python examples/drop_in/semantic_router_dropin.py
 ```
 
-### Expected output
+The script prints:
 
 ```text
 === 1. Zero-Shot + Unsupervised Drift Adaptation (`adapt_zero_shot`) ===
@@ -85,5 +85,5 @@ python examples/drop_in/semantic_router_dropin.py
 | **Cold initialization time** | `2,471 ms` | **`115 ms` compile and `<2 ms` load** |
 | **P50 CPU latency** | `4.31 ms` | **`0.14 ms` (`30x` faster)** |
 | **`CLINC150` in-scope accuracy (`144` queries)** | **93.1%** raw | **87.5%** raw (**100.0%** on accepted decisions, **99.3%** with online correction) |
-| **`CLINC150-OOS` false acceptance (`120` OOS queries)** | `100.0%` (`120/120` misrouted, even after `sr.fit()`) | **`0.0% to 0.8%`** (abstains with `None` on unfamiliar inputs) |
+| **`CLINC150-OOS` false acceptance (`120` OOS queries)** | `100.0%` (`120 of 120` misrouted, even after `sr.fit()`) | **`0.0% to 0.8%`** (abstains with `None` on unfamiliar inputs) |
 | **Online weight updates** | No (requires re-embedding and refitting) | **Yes (`adapt_zero_shot` and `<1 ms` `learn_from_tier2`)** |

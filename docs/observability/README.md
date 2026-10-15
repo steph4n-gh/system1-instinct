@@ -1,24 +1,18 @@
-# Observability
+# Observability reference
 
-Optional Prometheus metrics and OpenTelemetry spans describe decisions and review
-signals. They do not measure whether an external teacher or human completed a
-review. Starting a metrics server or configuring a remote exporter changes the
-application's network behavior.
+Optional Prometheus metrics and OpenTelemetry spans describe local decisions and review signals. They do not measure whether an external teacher or human reviewer completed a review. Starting a metrics server or configuring a remote exporter changes the network behavior of the host process.
 
-## Install
+## Installation
 
 ```bash
 python -m pip install 'system1[observability,otel]'
 ```
 
-Use just `system1[observability]` or `system1[otel]` if only one is needed. The
-base package does not require these dependencies.
+Install `system1[observability]` or `system1[otel]` individually when you need only one integration. The base package does not require either dependency.
 
-## Prometheus
+## Prometheus metrics (`SystemOneMetricsExporter`)
 
-This self-contained example instruments a diagnostic schema; without teaching
-and calibration it should request review. Substitute your validated engine for
-application use.
+The example below instruments an untaught diagnostic schema, which requests review in strict mode:
 
 ```python
 from system1 import ChoiceField, DecisionSchema, System1Engine
@@ -34,10 +28,7 @@ result = engine.decide("Please correct my invoice")
 print("Needs review:", result.is_ambiguous)
 ```
 
-To expose `/metrics`, call `metrics.start_server(port=9090)` and keep your
-application running. It uses `prometheus_client.start_http_server`'s default
-listen address; restrict network access through your deployment boundary. It
-provides no authentication. Example scrape configuration:
+`metrics.start_server(port=9090)` exposes `/metrics` using the default listen address of `prometheus_client.start_http_server` without authentication. Restrict network access through your deployment boundary. Example Prometheus scrape configuration:
 
 ```yaml
 scrape_configs:
@@ -49,20 +40,16 @@ scrape_configs:
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `system1_decisions_total` | Counter | `schema`, `outcome`, `cache_hit` | Instrumented decision calls; outcome is the first returned field's value |
-| `system1_decision_latency_seconds` | Histogram | `schema` | The result's reported decision latency, converted from milliseconds |
+| `system1_decisions_total` | Counter | `schema`, `outcome`, `cache_hit` | Instrumented decision calls, where `outcome` is the first returned field value |
+| `system1_decision_latency_seconds` | Histogram | `schema` | Reported decision latency converted from milliseconds |
 | `system1_escalations_total` | Counter | `schema`, `reason` | Decisions flagged for review, not completed external escalations |
 | `system1_cache_hit_ratio` | Gauge | None | Cumulative hits divided by decisions since exporter creation |
-| `system1_conformal_set_size` | Histogram | `schema` | Set sizes recorded across fields |
-| `system1_ledger_entries_total` | Gauge | None | Last observed ledger sequence/depth |
+| `system1_conformal_set_size` | Histogram | `schema` | Conformal set sizes recorded across fields |
+| `system1_ledger_entries_total` | Gauge | None | Last observed ledger sequence depth |
 
-Latency buckets are 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1 and 1.0 seconds.
-The reason labels `ambiguous`, `low_margin` and `ood` come from an internal
-heuristic; `ood` is not an independently calibrated distribution-shift detector.
-Do not interpret this histogram as full request, durable authorization or tool
-execution latency. Limit schema/outcome cardinality in your application.
+Latency buckets are `0.0001`, `0.0005`, `0.001`, `0.005`, `0.01`, `0.05`, `0.1`, and `1.0` seconds. The reason labels `ambiguous`, `low_margin`, and `ood` come from an internal heuristic, and `ood` is not an independently calibrated distribution-shift detector. This histogram measures in-memory decision latency rather than full request, durable authorization, or tool execution latency. Bound `schema` and `outcome` label cardinality in your application.
 
-For manual recording instead of wrapping `decide()`:
+`metrics.record_decision(...)` records a decision manually when you do not wrap `decide()`:
 
 ```python
 metrics.record_decision(
@@ -73,14 +60,11 @@ metrics.record_decision(
 )
 ```
 
-Do not also manually record the same call after instrumentation. The wrapper
-updates the ledger gauge on a best-effort basis if the engine has a ledger;
-otherwise call `metrics.update_ledger_gauge(ledger.audit_head()[0])` yourself.
-A ledger-read failure can leave the previous gauge value in place.
+Do not call `metrics.record_decision(...)` on an already instrumented engine. The wrapper updates the ledger gauge on a best-effort basis when the engine has a ledger, or you can call `metrics.update_ledger_gauge(ledger.audit_head()[0])` directly. A ledger-read failure leaves the previous gauge value in place.
 
-## OpenTelemetry
+## OpenTelemetry tracing (`SystemOneOTelInstrumentor`)
 
-A self-contained console example:
+The example below exports spans to the console:
 
 ```python
 from opentelemetry.sdk.trace import TracerProvider
@@ -99,25 +83,12 @@ engine.decide("Please correct my invoice")
 provider.shutdown()
 ```
 
-The legacy `reflex.*` telemetry names are retained for compatibility:
-`reflex.schema`, `reflex.latency_ms`, `reflex.latency_seconds`, `reflex.outcome`,
-`reflex.cache_hit`, `reflex.is_ambiguous` and `reflex.conformal_set_size_max`.
-The span name is `reflex.decide.<schema>`. An ambiguity flag represents a review
-request, not proof that another service was called.
+For compatibility, spans preserve the `reflex.*` attribute names: `reflex.schema`, `reflex.latency_ms`, `reflex.latency_seconds`, `reflex.outcome`, `reflex.cache_hit`, `reflex.is_ambiguous`, and `reflex.conformal_set_size_max`. The span name is `reflex.decide.<schema>`. An ambiguity flag represents a review request, not an external service call.
 
-Remote OTLP export additionally requires a separately installed exporter, for
-example `python -m pip install opentelemetry-exporter-otlp-proto-grpc`. That package
-is not part of `system1[otel]`. Configure its collector, transport and access
-controls in your application. Metrics and OTel can wrap the same engine; attach
-each once to avoid duplicate instrumentation.
+Remote OTLP export requires a separate exporter package such as `opentelemetry-exporter-otlp-proto-grpc`, which is not part of `system1[otel]`. Configure its collector, transport, and access controls in your application. Both `SystemOneMetricsExporter` and `SystemOneOTelInstrumentor` can wrap the same engine when you attach each exporter once.
 
-## Dashboard
+## Grafana dashboard
 
-Import [grafana-dashboard.json](grafana-dashboard.json) and select your Prometheus
-data source. It includes latency quantiles, decisions/second, review-signal rates,
-cumulative cache hit ratio, conformal-set buckets and ledger depth. Its legacy
-`reflex-decision-engine` UID is retained so an import can update an existing dashboard.
+[grafana-dashboard.json](grafana-dashboard.json) defines panels for latency quantiles, decisions per second, review-signal rates, cumulative cache hit ratio, conformal-set buckets, and ledger depth. It preserves the `reflex-decision-engine` UID so importing the file updates existing dashboards.
 
-[Implementation](../../src/system1/integrations/observability.py) ·
-[Tracing implementation](../../src/system1/integrations/otel.py) ·
-[Deployment boundaries](../deployment.md).
+[Metrics implementation](../../src/system1/integrations/observability.py) · [Tracing implementation](../../src/system1/integrations/otel.py) · [Deployment boundaries](../deployment.md).

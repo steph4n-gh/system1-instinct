@@ -71,16 +71,16 @@ report = session.assess()
 print(json.dumps(report, indent=2))
 ```
 
-`session.assess()` compiles, saves, and reloads a candidate `.s1m` file, then evaluates both the candidate and the adopted incumbent skill (if one exists) on the `evaluate` split in strict mode. Assessment requires teaching examples for every option, at least two calibration examples, and at least one evaluation example.
+`session.assess()` compiles, saves, and reloads a candidate `.s1m` file, then evaluates both the candidate and any adopted incumbent skill on the `evaluate` split in strict mode. Assessment requires teaching examples for every option, at least two calibration examples, and at least one evaluation example.
 
-To reopen an existing session directory, call `TeachingSession(".system1/support-session")`. Inspect `session.records` for stored lessons, `session.report` and `session.snapshot()` for assessment status, and `session.current_path` and `session.candidate_path` for artifact paths. Treat a session directory as a single-writer local workspace. Each input is capped at 8,192 characters.
+To reopen an existing session directory, call `TeachingSession(".system1/support-session")`. Inspect `session.records` for stored lessons, `session.report` and `session.snapshot()` for assessment status, and `session.current_path` and `session.candidate_path` for artifact paths. Treat a session directory as a single-writer local workspace. `TeachingSession` caps each input at 8,192 characters.
 
 ## Inspect the assessment report
 
 Check three metrics in the dictionary returned by `session.assess()`:
 
 - **Raw accuracy (`raw_accuracy`).** The fraction of `evaluate` rows where the top guess matches the label, including guesses flagged for review. Low raw accuracy indicates conflicting labels, missing lessons, or insufficient features.
-- **Coverage and accepted errors (`coverage` and `accepted_errors`).** `coverage` is the fraction of `evaluate` rows accepted without review (`is_ambiguous=False`). `accepted_errors` counts wrong predictions that were accepted without review.
+- **Coverage and accepted errors (`coverage` and `accepted_errors`).** `coverage` is the fraction of `evaluate` rows that the engine accepts without review (`is_ambiguous=False`). `accepted_errors` counts wrong predictions that the engine accepted without review.
 - **Regressions (`regressions` and `raw_regressions`).** `regressions` counts `evaluate` rows that the incumbent skill answered right without review, but the candidate now gets wrong or sends to review. `raw_regressions` counts previously right top guesses that became wrong.
 
 The report also includes `candidate` and `incumbent` summaries, per-row comparisons in `cases`, pattern summaries in `diagnostics`, and failed gate names in `reasons`.
@@ -100,7 +100,7 @@ Set your thresholds before inspecting candidate results. Do not lower a gate jus
 
 ## Correct a lesson and reassess
 
-Suppose the skill predicts `billing` for `"The payment page crashes"`. Under our routing rule, broken software belongs to `support`. To record the lesson and re-run assessment, call `session.record(...)`:
+Suppose the skill predicts `billing` for `"The payment page crashes"`. Under your routing rule, broken software belongs to `support`. To record the lesson and re-run assessment, call `session.record(...)`:
 
 ```python
 session.record("The payment page crashes", "support", source="human")
@@ -214,4 +214,4 @@ system1 teach .system1/support-session --predict "Please refund my payment" --js
 session = TeachingSession(".system1/logistic-session", SupportRoute, choice_solver="logistic")
 ```
 
-To use `choice_solver="logistic"`, install `python -m pip install 'system1[teaching]'` (which adds SciPy for fitting). Saved `.s1m` artifacts run inference with NumPy alone and do not require SciPy at decision time.
+To use `choice_solver="logistic"`, install `python -m pip install 'system1[teaching]'`, which adds SciPy for fitting. Saved `.s1m` artifacts run inference with NumPy alone and do not require SciPy at decision time.

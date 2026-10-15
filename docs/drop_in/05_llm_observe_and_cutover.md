@@ -26,11 +26,11 @@ fallback = BoundedReviewFallback(
 
 ## 2. Route live traffic through `fallback.decide(prompt)`
 
-Call `fallback.decide(prompt)` for each incoming request (or call `engine.learn(prompt, labels)` and `engine.learn_from_outcome(prompt, labels, reward=1.0)` directly):
+Call `fallback.decide(prompt)` for each incoming request, or call `engine.learn(prompt, labels)` and `engine.learn_from_outcome(prompt, labels, reward=1.0)` directly:
 
-- **Wave 1 (novel traffic).** When unfamiliar jargon arrives (such as `"Kafka consumer lag"`, `"SIEM alert"`, or `"SSO SAML login"`), `engine.decide(...)` returns `is_ambiguous=True`. `BoundedReviewFallback` calls `upstream_llm_teacher` and applies a rank-1 Sherman-Morrison RLS update (`preserve_calibration=True`) in `<1 ms`.
-- **Wave 2 (recurring traffic).** When those patterns recur, `SystemOneEngine` resolves them locally in `~0.9 ms` with `0` LLM calls.
-- **Wave 3 (unseen phrasings).** When new phrasings of those learned patterns arrive (such as `"Redis cluster crash and Kafka consumer lag triggering 502 gateway timeouts"`), `SystemOneEngine` resolves them locally with `100%` joint accuracy and `0` LLM calls.
+- **Wave 1: novel traffic.** When unfamiliar jargon such as `"Kafka consumer lag"`, `"SIEM alert"`, or `"SSO SAML login"` arrives, `engine.decide(...)` returns `is_ambiguous=True`. `BoundedReviewFallback` calls `upstream_llm_teacher` and applies a rank-1 Sherman-Morrison RLS update (`preserve_calibration=True`) in `<1 ms`.
+- **Wave 2: recurring traffic.** When those patterns recur, `SystemOneEngine` resolves them locally in `~0.9 ms` with `0` LLM calls.
+- **Wave 3: unseen phrasings.** When new phrasings of those learned patterns arrive, such as `"Redis cluster crash and Kafka consumer lag triggering 502 gateway timeouts"`, `SystemOneEngine` resolves them locally with `100%` joint accuracy and `0` LLM calls.
 
 ## 3. Save and reload the `.s1m` skill
 
@@ -59,7 +59,7 @@ To run the complete three-wave simulation from the repository root, execute:
 python examples/drop_in/llm_cutover_dropin.py
 ```
 
-### Expected output
+The script prints:
 
 ```text
 === System 1: Instinct — LLM Observe -> Online RLS -> Local Cutover Demo ===

@@ -2,6 +2,8 @@
 
 A taught skill predicts a structured decision, not permission to execute a privileged tool. When a decision triggers a tool call, use `SystemOneGuard` with `enforcement_profile=True`, `PolicyEngine`, an Ed25519 signing key, and `ActionLedger` to enforce deterministic permissions after [teaching your first skill](first_skill.md).
 
+## Authorize a tool call and record a signed receipt
+
 To authorize a single `read_config` lookup for `"agent-worker"`, record the execution outcome in a hash-chained SQLite ledger, and verify the signed chain, run:
 
 ```python
@@ -54,5 +56,7 @@ with ActionLedger(".system1/demo-audit.sqlite", require_durable=True) as ledger:
     assert ledger.verify_integrity(trusted_public_key=signing_key.public_key())
     print(result)
 ```
+
+## Enforce caller identity and argument limits
 
 Derive `tenant_id`, `principal_id`, and `scope` from your authenticated application session, restrict tool arguments and targets in `PolicyRule`, and prevent agent code from calling tools outside `SystemOneGuard`. Without `enforcement_profile=True`, `SystemOneGuard` runs in diagnostic mode and can allow actions through statistical classification. Before granting consequential tool permissions, review [Deployment boundaries](../deployment.md).

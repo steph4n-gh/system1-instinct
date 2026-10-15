@@ -37,7 +37,7 @@ def triage_ticket(text: str) -> TriageResponse:
 
 ## 2. Replace the route handler with `SystemOneInstructorClient`
 
-To serve confident tickets locally in `0.45 ms` and escalate only uncertain tickets (`is_ambiguous=True`) to `Instructor`, call `SystemOneInstructorClient(IncidentTriageModel)` inside your route handler (full code in [`examples/drop_in/instructor_structured_dropin.py`](../../examples/drop_in/instructor_structured_dropin.py)):
+To serve confident tickets locally in `0.45 ms` and escalate only uncertain tickets (`is_ambiguous=True`) to `Instructor`, call `SystemOneInstructorClient(IncidentTriageModel)` inside your route handler. See [`examples/drop_in/instructor_structured_dropin.py`](../../examples/drop_in/instructor_structured_dropin.py) for the complete script:
 
 ```python
 from fastapi import FastAPI
@@ -74,7 +74,7 @@ To run the three-wave `FastAPI` and `Instructor` cutover across `35` incident ti
 python examples/drop_in/instructor_structured_dropin.py
 ```
 
-### Expected output
+The script prints:
 
 ```text
 === 1. Single-Pass 4-Field Structured Extraction (`SystemOneInstructorClient`) ===

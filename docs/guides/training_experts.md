@@ -51,7 +51,7 @@ Pass `augment=False` so `SystemOneCompiler` uses only your supplied examples and
 
 ### Teach a skill online from zero examples
 
-To teach an engine online without batch compilation, call `engine.learn_from_outcome(...)` or `engine.learn(...)` (`preserve_calibration=True` by default), then save with `engine.save(...)`:
+To teach an engine online without batch compilation, call `engine.learn_from_outcome(...)` or `engine.learn(...)`, then save with `engine.save(...)`. Both methods default to `preserve_calibration=True`:
 
 ```python
 from system1 import ChoiceField, DecisionSchema, SystemOneEngine
@@ -81,7 +81,7 @@ print(decision.values, "Needs review:", decision.is_ambiguous)
 
 ## Configure a TF-IDF or hybrid projector
 
-By default, `SystemOneCompiler` uses a deterministic feature hashing projector. To fit an explicit vocabulary with supervised feature selection and character n-grams, pass a fitted `TfidfProjector` (or `HybridProjector` for TF-IDF plus spectral `PPMI+SVD` features) to `SystemOneCompiler`:
+By default, `SystemOneCompiler` uses a deterministic feature hashing projector. To fit an explicit vocabulary with supervised feature selection and character n-grams, pass a fitted `TfidfProjector` to `SystemOneCompiler`, or pass a `HybridProjector` for TF-IDF plus spectral `PPMI+SVD` features:
 
 ```python
 from system1 import TfidfProjector
