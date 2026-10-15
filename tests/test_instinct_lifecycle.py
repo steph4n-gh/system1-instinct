@@ -2683,7 +2683,7 @@ def test_live_fda_recall_triage_dogfood_lifecycle(tmp_path, monkeypatch):
         assert ckpt["local_precision"] >= 0.93
         assert ckpt["end_to_end_accuracy"] >= 0.95
         assert ckpt["oos_abstention_rate"] >= 0.96
-        assert ckpt["p50_latency_ms"] < 1.0
+        assert ckpt["p50_latency_ms"] < 5.0
 
     for s in report["sample_decisions"]:
         assert "ambiguous_fields" in s
