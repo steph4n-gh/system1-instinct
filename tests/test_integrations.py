@@ -7,9 +7,8 @@ import json
 import pytest
 from typing import Any, Dict
 
-import reflex
 import system1
-from reflex.integrations import (
+from system1.integrations import (
     SystemOneMCPProxy,
     SystemOneMCPBlockedError,
     wrap_mcp_tool,
@@ -26,9 +25,9 @@ from reflex.integrations import (
 # Test Schemas
 # ---------------------------------------------------------------------------
 
-class ToolSafetySchema(reflex.DecisionSchema):
-    is_safe = reflex.BooleanField(description="Whether the proposed action is safe to execute")
-    action = reflex.ChoiceField(
+class ToolSafetySchema(system1.DecisionSchema):
+    is_safe = system1.BooleanField(description="Whether the proposed action is safe to execute")
+    action = system1.ChoiceField(
         options=["execute", "escalate", "block"],
         descriptions={
             "execute": "Safe, read-only or authorized local action",
@@ -38,8 +37,8 @@ class ToolSafetySchema(reflex.DecisionSchema):
     )
 
 
-class RoutingSchema(reflex.DecisionSchema):
-    intent = reflex.ChoiceField(
+class RoutingSchema(system1.DecisionSchema):
+    intent = system1.ChoiceField(
         options=["technical_support", "billing_inquiry", "escalate_to_human"],
         descriptions={
             "technical_support": "Questions about software setup, installation, or debugging",
@@ -79,8 +78,8 @@ def test_mcp_proxy_jsonrpc_allow(read_policy):
     assert "result" in resp
     assert resp["result"]["content"][0]["text"] == "read: README.md"
     assert "_meta" in resp["result"]
-    assert resp["result"]["_meta"]["reflex"]["status"] == "ALLOW"
-    assert resp["result"]["_meta"]["reflex"]["latency_ms"] >= 0.0
+    assert resp["result"]["_meta"]["system1"]["status"] == "ALLOW"
+    assert resp["result"]["_meta"]["system1"]["latency_ms"] >= 0.0
 
 
 def test_mcp_proxy_jsonrpc_block_malicious():
@@ -144,7 +143,7 @@ def test_wrap_mcp_tool_decorator():
 @pytest.mark.asyncio
 async def test_fastapi_gateway_fastpath():
     """Verify ASGI gateway fast-paths confident, routine queries in < 1ms."""
-    engine = reflex.SystemOneEngine(RoutingSchema)
+    engine = system1.SystemOneEngine(RoutingSchema)
 
     # Downstream ASGI app (should not be called on fastpath)
     downstream_called = False
@@ -188,19 +187,19 @@ async def test_fastapi_gateway_fastpath():
 
     # Verify response headers
     headers_dict = dict(sent_messages[0]["headers"])
-    assert headers_dict.get(b"x-reflex-status") == b"fastpath"
-    assert b"x-reflex-latency-ms" in headers_dict
+    assert headers_dict.get(b"x-system1-status") == b"fastpath"
+    assert b"x-system1-latency-ms" in headers_dict
 
     # Verify response body
     resp_data = json.loads(sent_messages[1]["body"].decode("utf-8"))
-    assert resp_data["model"] == "reflex-system1-metal"
-    assert "reflex" in resp_data
+    assert resp_data["model"] == "system1-instinct"
+    assert "system1" in resp_data
 
 
 @pytest.mark.asyncio
 async def test_fastapi_gateway_escalation():
     """Verify ASGI gateway escalates ambiguous/low-confidence requests downstream."""
-    engine = reflex.SystemOneEngine(RoutingSchema)
+    engine = system1.SystemOneEngine(RoutingSchema)
 
     downstream_called = False
     async def downstream_app(scope, receive, send):
@@ -235,7 +234,7 @@ async def test_fastapi_gateway_escalation():
     await middleware(scope, mock_receive, mock_send)
     assert downstream_called is True, "Ambiguous request must escalate downstream"
     headers_dict = dict(sent_messages[0]["headers"])
-    assert headers_dict.get(b"x-reflex-status") == b"escalated"
+    assert headers_dict.get(b"x-system1-status") == b"escalated"
 
 
 @pytest.mark.asyncio
@@ -287,7 +286,7 @@ def test_langchain_callback_handler_allow():
     # Should execute without raising
     handler.on_tool_start(serialized, input_str)
     assert len(handler.interceptions) == 1
-    assert handler.interceptions[0].outcome == reflex.DecisionOutcome.ALLOW
+    assert handler.interceptions[0].outcome == system1.DecisionOutcome.ALLOW
 
 
 def test_langchain_callback_handler_block_dangerous():
@@ -299,7 +298,7 @@ def test_langchain_callback_handler_block_dangerous():
     with pytest.raises(SystemOneGuardBlockedException) as exc_info:
         handler.on_tool_start(serialized, input_str)
 
-    assert exc_info.value.outcome in (reflex.DecisionOutcome.DENY, reflex.DecisionOutcome.REQUIRE_APPROVAL)
+    assert exc_info.value.outcome in (system1.DecisionOutcome.DENY, system1.DecisionOutcome.REQUIRE_APPROVAL)
 
 
 def test_wrap_langchain_tool():
@@ -314,16 +313,13 @@ def test_wrap_langchain_tool():
 
 
 # ---------------------------------------------------------------------------
-# 4. Twin-Namespace Parity Tests
+# 4. Top-Level Integrations Export Tests
 # ---------------------------------------------------------------------------
 
-def test_integrations_namespace_parity():
-    """Verify complete 1:1 symmetry between reflex.integrations and system1.integrations."""
-    import reflex.integrations as r_int
+def test_integrations_top_level_exports():
+    """Verify system1 top-level exports match system1.integrations."""
     import system1.integrations as s_int
 
-    assert r_int.__all__ == s_int.__all__
-    for name in r_int.__all__:
-        r_item = getattr(r_int, name)
-        s_item = getattr(s_int, name)
-        assert r_item is s_item, f"Object identity mismatch for {name}: {r_item} vs {s_item}"
+    for name in s_int.__all__:
+        if hasattr(system1, name):
+            assert getattr(system1, name) is getattr(s_int, name)

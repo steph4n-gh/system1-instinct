@@ -10,8 +10,8 @@ Authoritative Invariants Tested:
 3. Defensive Copies:
    Mutating returned DecisionResult dictionaries (values, confidences, probabilities, conformal_sets)
    never corrupts the internal cached entry.
-4. Twin-namespace parity:
-   Identical behavior when imported via `system1` or `reflex`.
+4. Top-level and submodule export parity:
+   Identical behavior when imported via `system1` or `system1.cache`.
 """
 
 from __future__ import annotations
@@ -20,8 +20,6 @@ import copy
 import numpy as np
 import pytest
 
-import reflex
-import reflex.cache
 import system1
 import system1.cache
 from system1 import (
@@ -249,7 +247,7 @@ def test_cache_version_invalidation_methods():
     assert cache.get("reboot node", embedding=emb, model_version=2) is None
 
 
-def test_twin_namespace_parity_for_cache_components():
-    """Verify system1.cache and reflex.cache export identical classes and functions."""
-    assert system1.cache.SemanticSystemOneCache is reflex.cache.SemanticSystemOneCache
-    assert system1.cache.CacheEntry is reflex.cache.CacheEntry
+def test_namespace_parity_for_cache_components():
+    """Verify system1 and system1.cache export identical classes and functions."""
+    assert system1.SemanticSystemOneCache is system1.cache.SemanticSystemOneCache
+    assert system1.CacheEntry is system1.cache.CacheEntry

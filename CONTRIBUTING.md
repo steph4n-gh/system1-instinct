@@ -19,7 +19,7 @@ With uv, use `uv sync --locked --extra dev --extra langchain` and `uv run --no-s
 
 ## Changes
 
-Keep changes focused and prefer the simplest implementation that addresses a reproduced problem. Add regression coverage for behavior changes, preserve `system1`/`reflex` API parity, and update runnable documentation when the API changes. Do not include private keys, tokens, ledger data, or proprietary ROMs.
+Keep changes focused and prefer the simplest implementation that addresses a reproduced problem. Add regression coverage for behavior changes, and update runnable documentation when the API changes. Do not include private keys, tokens, ledger data, or proprietary ROMs.
 
 Include the problem, resulting behavior, and relevant validation in pull requests. Benchmark claims should include the command, source revision, environment, dataset, overall quality metrics, and raw results. Simulations and cloud measurements must be clearly distinguished.
 

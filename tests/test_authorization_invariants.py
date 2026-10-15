@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from reflex import (
+from system1 import (
     ActionLedger,
     ActionProposal,
     DecisionOutcome,
@@ -97,7 +97,7 @@ def test_invariant_1_mcp_initialize_does_not_invoke_executor():
     assert response["jsonrpc"] == "2.0"
     assert response["id"] == "req-init-1"
     assert response["result"]["protocolVersion"] == "2024-11-05"
-    assert response["result"]["serverInfo"]["name"] == "reflex-mcp-guard"
+    assert response["result"]["serverInfo"]["name"] == "system1-mcp-guard"
     assert sentinel.call_count == 0
 
 

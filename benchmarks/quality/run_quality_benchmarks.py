@@ -558,7 +558,7 @@ def main() -> None:
     selected = list(BENCHMARKS.keys()) if args.bench == "all" else [args.bench]
 
     print("#" * 80)
-    print("  REFLEX DECISION ENGINE — QUALITY BENCHMARK SUITE")
+    print("  SYSTEM 1: INSTINCT — QUALITY BENCHMARK SUITE")
     print(f"  Timestamp: {datetime.now(timezone.utc).isoformat()}")
     print("#" * 80)
 

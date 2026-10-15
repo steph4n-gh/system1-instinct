@@ -14,14 +14,13 @@ def main(directory):
     assert source.stat().st_size < 25 * 1024**2, 'Source archive unexpectedly exceeds 25 MiB'
     with zipfile.ZipFile(wheel) as archive:
         wheel_names = set(archive.namelist())
-    assert {'system1/compiler.py', 'system1/teaching.py', 'system1/proto/system1.proto',
-            'reflex/__init__.py', 'reflex/teaching.py', 'reflex/proto/system1.proto'} <= wheel_names
-    assert not any(name.startswith(('benchmarks/', 'examples/')) for name in wheel_names)
+    assert {'system1/compiler.py', 'system1/teaching.py', 'system1/proto/system1.proto'} <= wheel_names
+    assert all(name.startswith(('system1/', 'system1_instinct-')) for name in wheel_names)
     with tarfile.open(source, 'r:gz') as archive:
         source_names = {member.name.split('/', 1)[1] for member in archive.getmembers() if '/' in member.name}
     assert {'src/system1/compiler.py', 'examples/teaching_by_doing/app.py',
             'examples/teaching_by_doing/index.html', 'examples/teaching_by_doing/documents.json',
-            'src/system1/teaching.py', 'src/reflex/teaching.py',
+            'src/system1/teaching.py',
             'docs/guides/correcting_skills.md',
             'benchmarks/quality/instinct_gauntlet_report.md',
             'benchmarks/quality/drop_in_and_adaptation_report.md',
@@ -32,6 +31,7 @@ def main(directory):
             'benchmarks/quality/document_workflow/results/evidence.zip',
             'benchmarks/quality/datasets/public_splits/official-test.json',
             'benchmarks/quality/datasets/public_splits/boundary-teaching-requests.json'} <= source_names
+    assert all(not name.startswith('src/') or (name + '/').startswith(('src/system1/', 'src/system1_instinct.egg-info/')) for name in source_names)
     print(f'Checked wheel ({wheel.stat().st_size:,} bytes) and source archive ({source.stat().st_size:,} bytes).')
 
 

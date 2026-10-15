@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from reflex import (
+from system1 import (
     ActionLedger,
     ActionProposal,
     DecisionOutcome,
@@ -33,7 +33,7 @@ from reflex import (
     create_decision_receipt,
     verify_decision_witness_receipt,
 )
-from reflex.receipt import public_key_bytes
+from system1.receipt import public_key_bytes
 
 
 # ---------------------------------------------------------------------------

@@ -14,8 +14,8 @@ import socket
 from pathlib import Path
 import pytest
 
-import reflex
-from reflex import (
+import system1
+from system1 import (
     ActionLedger,
     ActionProposal,
     Choice,
@@ -65,7 +65,7 @@ def test_zero_network_guard_hook_evaluation(enforce_zero_network, temp_ledger):
 
 def test_zero_network_action_ledger_operations(enforce_zero_network, temp_ledger):
     """Verify ActionLedger append, chaining, and verification operate with zero network calls."""
-    res = reflex.decide("Sample decision for ledger testing", schema=DefaultGuardDecisionSchema)
+    res = system1.decide("Sample decision for ledger testing", schema=DefaultGuardDecisionSchema)
     entry_hash = temp_ledger.record_decision_receipt(res.receipt)
     assert len(entry_hash) == 64
     assert temp_ledger.verify_integrity() is True

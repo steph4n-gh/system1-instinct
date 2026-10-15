@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package reflex.v1;
+package system1.v1;
 
 // SystemOneService exposes the System 1 decision engine over gRPC for polyglot
 // agent stacks (TypeScript, Go, Rust, etc.).

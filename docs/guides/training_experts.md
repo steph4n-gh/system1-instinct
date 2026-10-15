@@ -120,7 +120,7 @@ Because `TfidfProjector` freezes its vocabulary and IDF weights inside the `.s1m
 To fit `ChoiceField` heads with cross-entropy optimization instead of the default ridge solver, install the `teaching` extra and pass `choice_solver="logistic"`:
 
 ```bash
-python -m pip install 'system1[teaching]>=1.0.0'
+python -m pip install 'system1-instinct[teaching]>=1.0.0'
 ```
 
 In Python, pass `choice_solver="logistic"` and `regularization` to `SystemOneCompiler`:

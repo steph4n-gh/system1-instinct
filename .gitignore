@@ -88,7 +88,7 @@ roms/
 scratch/
 
 # Audit bundle and memos
-REFLEX_AUDIT_CODEBASE.txt
+SYSTEM1_AUDIT_CODEBASE.txt
 audit/
 
 # Agent run logs and data

@@ -244,6 +244,9 @@ The [`examples/drop_in/`](examples/drop_in/) and [`docs/drop_in/`](docs/drop_in/
 ## Quickstart
 
 ```bash
+python -m pip install system1-instinct
+
+# Or from a source checkout:
 git clone https://github.com/steph4n-gh/system1-instinct.git
 cd system1-instinct
 python3 -m venv .venv

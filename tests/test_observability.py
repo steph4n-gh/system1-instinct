@@ -558,7 +558,7 @@ class TestSystemOneOTelInstrumentor:
 
     def test_instrument_with_custom_tracer_name(self):
         Cls = self._import_instrumentor()
-        instrumentor = Cls(tracer_name="custom.reflex")
+        instrumentor = Cls(tracer_name="custom.system1")
         assert instrumentor is not None
 
     def test_span_attributes_recorded(self):
@@ -618,8 +618,8 @@ class TestSystemOneOTelInstrumentor:
             assert len(spans) == 1
             span = spans[0]
             attrs = dict(span.attributes)
-            assert attrs["reflex.schema"] == "SpanTestSchema"
-            assert attrs["reflex.latency_ms"] == 1.5
-            assert abs(attrs["reflex.latency_seconds"] - 0.0015) < 1e-9
-            assert attrs["reflex.cache_hit"] is True
-            assert attrs["reflex.outcome"] == "execute"
+            assert attrs["system1.schema"] == "SpanTestSchema"
+            assert attrs["system1.latency_ms"] == 1.5
+            assert abs(attrs["system1.latency_seconds"] - 0.0015) < 1e-9
+            assert attrs["system1.cache_hit"] is True
+            assert attrs["system1.outcome"] == "execute"

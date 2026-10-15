@@ -5,10 +5,10 @@ Optional Prometheus metrics and OpenTelemetry spans describe local decisions and
 ## Installation
 
 ```bash
-python -m pip install 'system1[observability,otel]'
+python -m pip install 'system1-instinct[observability,otel]'
 ```
 
-Install `system1[observability]` or `system1[otel]` individually when you need only one integration. The base package does not require either dependency.
+Install `system1-instinct[observability]` or `system1-instinct[otel]` individually when you need only one integration. The base package does not require either dependency.
 
 ## Prometheus metrics (`SystemOneMetricsExporter`)
 
@@ -83,12 +83,12 @@ engine.decide("Please correct my invoice")
 provider.shutdown()
 ```
 
-For compatibility, spans preserve the `reflex.*` attribute names: `reflex.schema`, `reflex.latency_ms`, `reflex.latency_seconds`, `reflex.outcome`, `reflex.cache_hit`, `reflex.is_ambiguous`, and `reflex.conformal_set_size_max`. The span name is `reflex.decide.<schema>`. An ambiguity flag represents a review request, not an external service call.
+Spans record the `system1.*` attribute names: `system1.schema`, `system1.latency_ms`, `system1.latency_seconds`, `system1.outcome`, `system1.cache_hit`, `system1.is_ambiguous`, and `system1.conformal_set_size_max`. The span name is `system1.decide.<schema>`. An ambiguity flag represents a review request, not an external service call.
 
-Remote OTLP export requires a separate exporter package such as `opentelemetry-exporter-otlp-proto-grpc`, which is not part of `system1[otel]`. Configure its collector, transport, and access controls in your application. Both `SystemOneMetricsExporter` and `SystemOneOTelInstrumentor` can wrap the same engine when you attach each exporter once.
+Remote OTLP export requires a separate exporter package such as `opentelemetry-exporter-otlp-proto-grpc`, which is not part of `system1-instinct[otel]`. Configure its collector, transport, and access controls in your application. Both `SystemOneMetricsExporter` and `SystemOneOTelInstrumentor` can wrap the same engine when you attach each exporter once.
 
 ## Grafana dashboard
 
-[grafana-dashboard.json](grafana-dashboard.json) defines panels for latency quantiles, decisions per second, review-signal rates, cumulative cache hit ratio, conformal-set buckets, and ledger depth. It preserves the `reflex-decision-engine` UID so importing the file updates existing dashboards.
+[grafana-dashboard.json](grafana-dashboard.json) defines panels for latency quantiles, decisions per second, review-signal rates, cumulative cache hit ratio, conformal-set buckets, and ledger depth. It uses the `system1-decision-engine` UID so importing the file updates existing dashboards.
 
 [Metrics implementation](../../src/system1/integrations/observability.py) · [Tracing implementation](../../src/system1/integrations/otel.py) · [Deployment boundaries](../deployment.md).

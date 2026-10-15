@@ -14,8 +14,8 @@ import concurrent.futures
 from pathlib import Path
 import pytest
 
-import reflex
-from reflex import (
+import system1
+from system1 import (
     ActionLedger,
     DefaultGuardDecisionSchema,
     IntegrityError,
@@ -31,7 +31,7 @@ def test_genesis_state_and_sequential_hash_chain(temp_ledger):
     assert temp_ledger.verify_integrity() is True
 
     # Record first decision
-    res1 = reflex.decide("First audit transaction", schema=DefaultGuardDecisionSchema)
+    res1 = system1.decide("First audit transaction", schema=DefaultGuardDecisionSchema)
     hash1 = temp_ledger.record_decision_receipt(res1.receipt)
     seq1, head1 = temp_ledger.audit_head()
     assert seq1 == 1
@@ -39,7 +39,7 @@ def test_genesis_state_and_sequential_hash_chain(temp_ledger):
     assert len(hash1) == 64
 
     # Record second decision
-    res2 = reflex.decide("Second audit transaction", schema=DefaultGuardDecisionSchema)
+    res2 = system1.decide("Second audit transaction", schema=DefaultGuardDecisionSchema)
     hash2 = temp_ledger.record_decision_receipt(res2.receipt)
     seq2, head2 = temp_ledger.audit_head()
     assert seq2 == 2
@@ -52,7 +52,7 @@ def test_genesis_state_and_sequential_hash_chain(temp_ledger):
 def test_tamper_detection_mutated_payload(temp_ledger):
     """Verify direct SQLite update to payload_json triggers integrity violation."""
     for i in range(3):
-        res = reflex.decide(f"Transaction step {i}", schema=DefaultGuardDecisionSchema)
+        res = system1.decide(f"Transaction step {i}", schema=DefaultGuardDecisionSchema)
         temp_ledger.record_decision_receipt(res.receipt)
 
     assert temp_ledger.verify_integrity() is True
@@ -69,7 +69,7 @@ def test_tamper_detection_mutated_payload(temp_ledger):
 def test_tamper_detection_broken_chain_link(temp_ledger):
     """Verify modifying previous_hash pointer breaks chain verification."""
     for i in range(3):
-        res = reflex.decide(f"Transaction step {i}", schema=DefaultGuardDecisionSchema)
+        res = system1.decide(f"Transaction step {i}", schema=DefaultGuardDecisionSchema)
         temp_ledger.record_decision_receipt(res.receipt)
 
     # Corrupt chain linkage at sequence 2
@@ -84,7 +84,7 @@ def test_tamper_detection_broken_chain_link(temp_ledger):
 def test_tamper_detection_deleted_entry(temp_ledger):
     """Verify deleting a ledger row causes chain discontinuity."""
     for i in range(4):
-        res = reflex.decide(f"Audit log item {i}", schema=DefaultGuardDecisionSchema)
+        res = system1.decide(f"Audit log item {i}", schema=DefaultGuardDecisionSchema)
         temp_ledger.record_decision_receipt(res.receipt)
 
     # Delete intermediate record
@@ -101,7 +101,7 @@ def test_read_only_mode_and_querying(tmp_path: Path):
     # 1. Populate durable ledger
     with ActionLedger(db_file) as ledger:
         for i in range(3):
-            res = reflex.decide(f"Durable step {i}", schema=DefaultGuardDecisionSchema)
+            res = system1.decide(f"Durable step {i}", schema=DefaultGuardDecisionSchema)
             ledger.record_decision_receipt(res.receipt)
         assert ledger.verify_integrity() is True
 
@@ -111,7 +111,7 @@ def test_read_only_mode_and_querying(tmp_path: Path):
         assert ro_ledger.verify_integrity() is True
         
         # Verify write rejection
-        dummy_res = reflex.decide("Attempt write on read-only", schema=DefaultGuardDecisionSchema)
+        dummy_res = system1.decide("Attempt write on read-only", schema=DefaultGuardDecisionSchema)
         with pytest.raises(LedgerError, match="read-only"):
             ro_ledger.record_decision_receipt(dummy_res.receipt)
 
@@ -123,7 +123,7 @@ def test_concurrent_multithread_ledger_appending(temp_ledger):
 
     def worker(worker_id: int):
         for i in range(items_per_thread):
-            res = reflex.decide(f"Worker {worker_id} item {i}", schema=DefaultGuardDecisionSchema)
+            res = system1.decide(f"Worker {worker_id} item {i}", schema=DefaultGuardDecisionSchema)
             temp_ledger.record_decision_receipt(res.receipt)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:

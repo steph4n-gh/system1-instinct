@@ -213,7 +213,7 @@ def main() -> None:
     try:
         import uvicorn
     except ImportError:
-        parser.error("Install the optional server: pip install 'system1[http]'")
+        parser.error("Install the optional server: pip install 'system1-instinct[http]'")
     token = os.environ.get("SYSTEM1_CLASSIFIER_TOKEN", "")
     app = InboxZeroApp(InboxZeroClassifier(args.model, enable_actions=args.enable_actions), token)
     uvicorn.run(app, host=args.host, port=args.port, access_log=False, limit_concurrency=32,

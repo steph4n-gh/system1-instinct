@@ -3,23 +3,23 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: reflex-grpc
+  name: system1-grpc
   labels:
-    app: reflex-grpc
+    app: system1-grpc
     component: decision-engine
 spec:
   replicas: 2
   selector:
     matchLabels:
-      app: reflex-grpc
+      app: system1-grpc
   template:
     metadata:
       labels:
-        app: reflex-grpc
+        app: system1-grpc
         component: decision-engine
     spec:
       containers:
-        - name: reflex-grpc
+        - name: system1-grpc
           image: system1-grpc:local
           ports:
             - containerPort: 50051

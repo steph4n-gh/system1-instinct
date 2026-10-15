@@ -1,7 +1,7 @@
 """Tier 1.2: E2E Requirement Tests for CLI Commands.
 
 Authoritative Invariants:
-1. CLI entrypoint supports both reflex.cli and system1.cli.
+1. CLI entrypoint supports system1.cli.
 2. `decide` command evaluates schemas, emits structured JSON with latencies, confidence, receipts.
 3. `bench` command produces reproducible empirical latency reports beating Jev bounds.
 4. `calibrate` command fits temperature scaling and outputs valid ECE and Brier scores.
@@ -15,14 +15,13 @@ import json
 from pathlib import Path
 import pytest
 
-import reflex
-import reflex.cli as r_cli
+import system1
 import system1.cli as s1_cli
 
 
 def test_cli_decide_json_and_schema_options(capsys):
     """Verify 'decide' command evaluates input and outputs valid JSON."""
-    code = r_cli.main(["decide", "Inspect local file", "--schema", "guard", "--json"])
+    code = s1_cli.main(["decide", "Inspect local file", "--schema", "guard", "--json"])
     assert code == 0
 
     captured = capsys.readouterr()
@@ -38,7 +37,7 @@ def test_cli_decide_json_and_schema_options(capsys):
 def test_cli_decide_signed_receipt_generation(tmp_path: Path, capsys):
     """Verify 'decide --sign' produces Ed25519 digital signature and creates identity files."""
     id_dir = tmp_path / "ident"
-    code = r_cli.main([
+    code = s1_cli.main([
         "decide", "Wipe partition and drop all databases",
         "--schema", "guard",
         "--sign",
@@ -62,7 +61,7 @@ def test_cli_decide_signed_receipt_generation(tmp_path: Path, capsys):
 
 def test_cli_bench_execution(capsys):
     """Verify 'bench' command measures latency and reports Jev-beating performance."""
-    code = r_cli.main(["bench", "--schema", "guard", "--iterations", "15", "--warmup", "2", "--json"])
+    code = s1_cli.main(["bench", "--schema", "guard", "--iterations", "15", "--warmup", "2", "--json"])
     assert code == 0
 
     captured = capsys.readouterr()
@@ -84,7 +83,7 @@ def test_cli_calibrate_execution(tmp_path: Path, capsys):
     ] * 5
     dataset_file.write_text(json.dumps(dataset), encoding="utf-8")
 
-    code = r_cli.main([
+    code = s1_cli.main([
         "calibrate",
         "--schema", "guard",
         "--dataset", str(dataset_file),
@@ -108,7 +107,7 @@ def test_cli_verify_receipt_valid_and_tampered(tmp_path: Path, capsys):
     id_dir.mkdir(parents=True)
     
     # 1. Generate authentic signed decision
-    code = r_cli.main([
+    code = s1_cli.main([
         "decide", "Check system status",
         "--schema", "guard",
         "--sign",
@@ -124,7 +123,7 @@ def test_cli_verify_receipt_valid_and_tampered(tmp_path: Path, capsys):
     pub_key_file = id_dir / "identity.pub"
 
     # 2. Verify authentic receipt
-    code_verify = r_cli.main([
+    code_verify = s1_cli.main([
         "verify-receipt",
         "--receipt", str(receipt_file),
         "--public-key", str(pub_key_file),
@@ -141,7 +140,7 @@ def test_cli_verify_receipt_valid_and_tampered(tmp_path: Path, capsys):
     tampered_file = tmp_path / "tampered_receipt.json"
     tampered_file.write_text(json.dumps(tampered_data), encoding="utf-8")
 
-    code_tampered = r_cli.main([
+    code_tampered = s1_cli.main([
         "verify-receipt",
         "--receipt", str(tampered_file),
         "--public-key", str(pub_key_file),
@@ -155,7 +154,7 @@ def test_cli_verify_receipt_valid_and_tampered(tmp_path: Path, capsys):
 def test_cli_compile_execution(tmp_path: Path, capsys):
     """Verify 'compile' command generates .s1m binary model."""
     output_model = tmp_path / "test_model.s1m"
-    code = r_cli.main([
+    code = s1_cli.main([
         "compile",
         "--schema", "guard",
         "--output", str(output_model),
@@ -172,11 +171,8 @@ def test_cli_compile_execution(tmp_path: Path, capsys):
     assert summary["schema_name"] == "DefaultGuardDecisionSchema"
 
 
-def test_cli_entrypoint_parity():
-    """Verify reflex.cli and system1.cli main functions behave symmetrically."""
-    parser_r = r_cli.build_parser()
+def test_cli_entrypoint_subcommands():
+    """Verify system1.cli parser registers expected subcommands."""
     parser_s = s1_cli.build_parser()
-    
-    assert set(parser_r._subparsers._group_actions[0].choices.keys()) == set(
-        parser_s._subparsers._group_actions[0].choices.keys()
-    )
+    subcommands = set(parser_s._subparsers._group_actions[0].choices.keys())
+    assert {"decide", "bench", "calibrate", "verify-receipt", "compile"}.issubset(subcommands)

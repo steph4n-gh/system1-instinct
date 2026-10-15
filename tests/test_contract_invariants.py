@@ -14,7 +14,7 @@ Covers:
   6. Harmless Sentinel Execution (0 invocations on all rejections and ledger failures).
 
 - Gate B: Authenticated Final Authorization & Durability (P0)
-  1. Explicit EnforcementProfile (reflex.witness.enforcement.v1 / strict_attested_durable_v1).
+  1. Explicit EnforcementProfile (system1.witness.enforcement.v1 / strict_attested_durable_v1).
   2. Comprehensive Authorization Receipt Binding (PolicyDecision, arguments, principal, tenant, scope, risk, epoch).
   3. Fail-Closed Ledger Durability (reject :memory:, verify_integrity with trusted_public_key).
   4. Complete Two-Phase Outcome Chaining & Structured INDETERMINATE across MCP and LangChain adapters.
@@ -780,7 +780,7 @@ Covers:
   3. Mandatory Statistical Acceptance (default require_statistical_bound=True, Wilson lower bound,
      strict 0.0% false-allow ceiling on critical security classes).
   4. Disjoint Lineage & Manifest Binding (CutoverPartition.assert_disjoint, promotion manifest hashes).
-  5. Twin-Namespace Parity (system1 and reflex namespaces).
+  5. Top-level and Submodule Export Parity (system1 namespace).
 """
 
 import concurrent.futures
@@ -793,17 +793,12 @@ import numpy as np
 import pytest
 from typing import Any, Dict, List
 
-# Twin-namespace imports
+import system1
 import system1.cache as s1_cache
-import reflex.cache as rx_cache
 import system1.calibration as s1_calib
-import reflex.calibration as rx_calib
 import system1.compiler as s1_comp
-import reflex.compiler as rx_comp
 import system1.engine as s1_eng
-import reflex.engine as rx_eng
 import system1.compat.typesafe as s1_typesafe
-import reflex.compat.typesafe as rx_typesafe
 
 from system1.core.schema import (
     BooleanField,
@@ -1486,30 +1481,32 @@ class TestDisjointLineageAndManifestBinding:
 
 
 # ============================================================================
-# Gate D: 5. Twin-Namespace Parity (system1 vs reflex)
+# Gate D: 5. Namespace Export Parity (system1 vs submodules)
 # ============================================================================
 
-class TestTwinNamespaceParity:
-    """Verifies that all classes and methods in system1 and reflex are identical and aligned."""
+class TestNamespaceExportParity:
+    """Verifies that all classes and methods in system1 and its submodules are identical and aligned."""
 
     def test_cache_namespace_parity(self):
-        assert rx_cache.SemanticSystemOneCache is s1_cache.SemanticSystemOneCache
-        assert rx_cache.CacheEntry is s1_cache.CacheEntry
-        assert rx_cache.validate_cache_inputs is s1_cache.validate_cache_inputs
+        assert system1.SemanticSystemOneCache is s1_cache.SemanticSystemOneCache
+        assert system1.CacheEntry is s1_cache.CacheEntry
+        assert callable(s1_cache.validate_cache_inputs)
 
     def test_engine_namespace_parity(self):
-        assert rx_eng.SystemOneEngine is s1_eng.SystemOneEngine
-        assert rx_eng.DecisionResult is s1_eng.DecisionResult
+        assert system1.SystemOneEngine is s1_eng.SystemOneEngine
+        assert system1.ReflexEngine is s1_eng.SystemOneEngine
+        assert system1.DecisionResult is s1_eng.DecisionResult
 
     def test_calibration_namespace_parity(self):
-        assert rx_calib.ConformalPredictor is s1_calib.ConformalPredictor
-        assert rx_calib.RegressionConformalPredictor is s1_calib.RegressionConformalPredictor
+        assert system1.ConformalPredictor is s1_calib.ConformalPredictor
+        assert system1.RegressionConformalPredictor is s1_calib.RegressionConformalPredictor
 
     def test_typesafe_namespace_parity(self):
-        assert rx_typesafe.CutoverPartition is s1_typesafe.CutoverPartition
-        assert rx_typesafe.PromotionPolicy is s1_typesafe.PromotionPolicy
-        assert rx_typesafe.evaluate_promotion_eligibility is s1_typesafe.evaluate_promotion_eligibility
-        assert rx_typesafe.compute_wilson_score_lower is s1_typesafe.compute_wilson_score_lower
+        assert system1.TypeSafeClient is s1_typesafe.TypeSafeClient
+        assert system1.SystemOneResponse is s1_typesafe.SystemOneResponse
+        assert system1.ZeroEgressViolationError is s1_typesafe.ZeroEgressViolationError
+        assert callable(s1_typesafe.evaluate_promotion_eligibility)
+        assert callable(s1_typesafe.compute_wilson_score_lower)
 
 
 # === Merged from tests/test_round2_gates_e_f.py ===
@@ -1524,7 +1521,7 @@ Validates:
   - Structured egress audit logging with host, port, payload bytes, operation.
   - Zero socket connection attempts verified via socket patching.
 - Gate F:
-  - Twin namespace parity between system1 and reflex for ZeroEgressViolationError and egress logs.
+  - Namespace export parity between system1 and system1.compat.typesafe for ZeroEgressViolationError and egress logs.
   - pyproject.toml bounds: protobuf>=5.26.1, grpcio>=1.62.0, grpcio-tools>=1.62.0.
   - grpc_server.serve() default loopback host="127.0.0.1".
   - CLI serve subcommand --host flag support.
@@ -1675,18 +1672,16 @@ class TestZeroEgressGatekeeper:
 # ============================================================================
 
 class TestPackagingAndProtobufAlignment:
-    """Features F22–F25: Namespace twin parity, pyproject bounds, loopback server, and Guard evaluation."""
+    """Features F22–F25: Namespace export parity, pyproject bounds, loopback server, and Guard evaluation."""
 
-    def test_twin_namespace_parity(self):
-        """Feature F22: system1 and reflex namespaces export identical Gate E classes and functions."""
-        import reflex
-        import reflex.compat.typesafe as system1_typesafe
+    def test_namespace_parity(self):
+        """Feature F22: system1 and system1.compat.typesafe export identical Gate E classes and functions."""
         import system1
+        import system1.compat.typesafe as system1_typesafe
 
         # ZeroEgressViolationError
         assert system1.ZeroEgressViolationError is s1_typesafe.ZeroEgressViolationError
-        assert reflex.ZeroEgressViolationError is system1_typesafe.ZeroEgressViolationError
-        assert system1.ZeroEgressViolationError is reflex.ZeroEgressViolationError
+        assert system1.ZeroEgressViolationError is system1_typesafe.ZeroEgressViolationError
 
         # Egress audit log helpers
         assert s1_typesafe.get_egress_audit_log is system1_typesafe.get_egress_audit_log

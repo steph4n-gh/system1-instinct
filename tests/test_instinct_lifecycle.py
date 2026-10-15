@@ -10,7 +10,6 @@ import shutil
 
 import pytest
 
-import reflex
 import system1
 from system1 import ChoiceField, DecisionSchema, TeachingSession
 
@@ -66,7 +65,7 @@ def test_legacy_version_one_session_opens_without_rewriting(tmp_path):
     assert reopened.snapshot()["settings"]["choice_solver"] == "ridge"
     assert path.read_bytes() == before
     assert reopened.history == []
-    assert reflex.TeachingSession is system1.TeachingSession
+    assert TeachingSession is system1.TeachingSession
 
 
 def test_approved_revisions_rollback_and_reopen_keep_exact_artifacts(session):
@@ -592,7 +591,7 @@ from pathlib import Path
 
 import pytest
 
-from reflex.fallback import BoundedReviewFallback as ReflexBoundedReviewFallback
+from system1.fallback import BoundedReviewFallback as FallbackBoundedReviewFallback
 from system1 import (
     BooleanField,
     BoundedReviewFallback,
@@ -1064,7 +1063,7 @@ def test_track4_async_background_compile_and_export(tmp_path):
 
 
 def test_track5_live_s1m_hot_reload_and_bounded_fallback(tmp_path):
-    assert BoundedReviewFallback is ReflexBoundedReviewFallback
+    assert BoundedReviewFallback is FallbackBoundedReviewFallback
 
     class RouteSchema(DecisionSchema):
         route = ChoiceField(["billing", "tech"])
@@ -1396,8 +1395,8 @@ import math
 import numpy as np
 import pytest
 
-import reflex
 import system1
+import system1.fallback
 from system1 import (
     BooleanField,
     BoundedReviewFallback,
@@ -1422,10 +1421,10 @@ from system1.core.text import _terms
 
 
 def test_v1_4_namespace_symmetry():
-    assert system1.StaticEmbeddingTable is reflex.StaticEmbeddingTable
+    assert system1.StaticEmbeddingTable is StaticEmbeddingTable
     assert system1.StaticEmbeddingTable is SubwordSemanticEmbeddings
-    assert system1.ReviewFallbackDecision is reflex.ReviewFallbackDecision
-    assert system1.BoundedReviewFallback is reflex.BoundedReviewFallback
+    assert system1.ReviewFallbackDecision is system1.fallback.ReviewFallbackDecision
+    assert system1.BoundedReviewFallback is system1.fallback.BoundedReviewFallback
 
 
 # ---------------------------------------------------------------------------

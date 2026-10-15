@@ -24,14 +24,14 @@ The image includes the license and installs the existing `grpc` extra.
 ## Kubernetes examples
 
 [deployment.yaml](kubernetes/deployment.yaml) and [service.yaml](kubernetes/service.yaml)
-use the legacy `reflex-grpc` resource labels consistently. Load your locally built
+use the `system1-grpc` resource labels consistently. Load your locally built
 `system1-grpc:local` image into the cluster or replace the image reference with
 your own. The standalone service listens on the pod interface and is reachable
 by other cluster clients; an authenticated boundary is not supplied.
 
 [sidecar-example.yaml](kubernetes/sidecar-example.yaml) instead keeps the runtime
 on loopback within the shared pod namespace. Its exec probes check loopback too.
-Replace `your-agent-image:latest` with your own agent image. `REFLEX_GRPC_ENDPOINT`
+Replace `your-agent-image:latest` with your own agent image. `SYSTEM1_GRPC_ENDPOINT`
 is an example application variable, not a runtime configuration option.
 
 These templates do not provision a production service, authenticated identity,

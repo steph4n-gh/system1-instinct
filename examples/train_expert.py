@@ -30,15 +30,15 @@ if str(SRC_DIR) not in sys.path:
 
 import numpy as np
 
-import reflex
-from reflex import (
+import system1
+from system1 import (
     BooleanField,
     ChoiceField,
     DecisionSchema,
     SystemOneEngine,
     ScoreField,
 )
-from reflex.compiler import (
+from system1.compiler import (
     CompiledSystemOneModel,
     SystemOneCompiler,
 )
@@ -108,8 +108,8 @@ class MoERouterSchema(DecisionSchema):
 
 def main() -> None:
     print("=" * 80)
-    print("  REFLEX DOMAIN EXPERT: TRAINING, DISTILLATION & DEPLOYMENT GUIDE")
-    print(f"  System 1 Version: {reflex.__version__} | Experimental synthetic teaching and composition")
+    print("  SYSTEM 1 DOMAIN EXPERT: TRAINING, DISTILLATION & DEPLOYMENT GUIDE")
+    print(f"  System 1 Version: {system1.__version__} | Experimental synthetic teaching and composition")
     print("=" * 80)
 
     with tempfile.TemporaryDirectory() as tmp_dir:

@@ -3,14 +3,14 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: reflex-grpc
+  name: system1-grpc
   labels:
-    app: reflex-grpc
+    app: system1-grpc
     component: decision-engine
 spec:
   type: ClusterIP
   selector:
-    app: reflex-grpc
+    app: system1-grpc
   ports:
     - name: grpc
       port: 50051

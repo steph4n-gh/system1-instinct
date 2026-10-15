@@ -100,7 +100,7 @@ async def test_gateway_and_mcp_publish_receipt_digest():
     )
     await middleware(dict(SCOPE), receive, send)
     digest = decision.receipt.compute_digest()
-    assert dict(sent[0]["headers"])[b"x-reflex-receipt-digest"] == digest.encode()
+    assert dict(sent[0]["headers"])[b"x-system1-receipt-digest"] == digest.encode()
     assert digest != decision.schema_digest
 
     error = SystemOneMCPBlockedError(GuardInterceptionResult(

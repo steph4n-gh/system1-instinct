@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-OUTPUT_FILE = REPO_ROOT / "REFLEX_AUDIT_CODEBASE.txt"
+OUTPUT_FILE = REPO_ROOT / "SYSTEM1_AUDIT_CODEBASE.txt"
 
 # Directories to ignore
 IGNORE_DIRS = {
@@ -50,7 +50,7 @@ EXPLICIT_INCLUDE_FILES = {
 
 EXCLUDE_PATTERNS = {
     "uv.lock",
-    "REFLEX_AUDIT_CODEBASE.txt",
+    "SYSTEM1_AUDIT_CODEBASE.txt",
     "test_eval.py",
     "test_monitor.py",
     "test_playwright.py",
@@ -69,7 +69,7 @@ def categorize_file(rel_path: str) -> Tuple[int, str]:
     elif rel_path.startswith("docs/") or rel_path in ("DOCUMENT_REVIEW_REPORT.md", "TEST_INFRA.md", "TEST_READY.md", "ORIGINAL_REQUEST.md"):
         return (2, "2. SPECIFICATIONS, ARCHITECTURE & PAPERS")
     elif rel_path.startswith("src/"):
-        return (3, "3. CORE SOURCE CODE (system1 & reflex)")
+        return (3, "3. CORE SOURCE CODE (system1)")
     elif rel_path.startswith("benchmarks/"):
         return (4, "4. BENCHMARKS & EVALUATION SUITE")
     elif rel_path.startswith("examples/"):
@@ -154,7 +154,7 @@ def build_bundle():
     def render_bundle(file_start_offsets: Optional[Dict[str, int]] = None) -> str:
         buf = []
         buf.append("=" * 80 + "\n")
-        buf.append("REFLEX / SYSTEM 1 — UNIFIED CODEBASE & DOCUMENTATION AUDIT BUNDLE\n")
+        buf.append("SYSTEM 1: INSTINCT — UNIFIED CODEBASE & DOCUMENTATION AUDIT BUNDLE\n")
         buf.append("=" * 80 + "\n")
         buf.append(f"Generated Date (UTC): {now_iso}\n")
         buf.append(f"Repository Root:      {REPO_ROOT}\n")

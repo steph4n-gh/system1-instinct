@@ -8,7 +8,7 @@ When a skill makes a mistake or encounters a new edge case, you can update it in
 To install System 1 1.0.0 or newer, run:
 
 ```bash
-python -m pip install 'system1>=1.0.0'
+python -m pip install 'system1-instinct>=1.0.0'
 ```
 
 `TeachingSession` supports single-field and multi-field schemas (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`) when at least one field enables ambiguity escalation (the schema default). The session rejects schemas that disable escalation on all fields. By default, `TeachingSession` fits a `TfidfProjector` with up to 1,024 features, ridge regularization `0.1`, and strict decisions at `alpha=0.05`. You can also configure `selection="chi2"`, `char_ngrams`, `mondrian=True`, `familiarity_alpha`, `prototype_alpha`, `hierarchical` routing, and `split="auto"` stratified routing.
@@ -214,7 +214,7 @@ system1 teach .system1/support-session --predict "Please refund my payment" --js
 session = TeachingSession(".system1/logistic-session", SupportRoute, choice_solver="logistic")
 ```
 
-To use `choice_solver="logistic"`, install `python -m pip install 'system1[teaching]'`, which adds SciPy for fitting. Saved `.s1m` artifacts run inference with NumPy alone and do not require SciPy at decision time.
+To use `choice_solver="logistic"`, install `python -m pip install 'system1-instinct[teaching]'`, which adds SciPy for fitting. Saved `.s1m` artifacts run inference with NumPy alone and do not require SciPy at decision time.
 
 ## Evaluate and recalibrate a compiled skill
 

@@ -9,7 +9,7 @@ Scope:
 1. src/system1/crypto/ (Ed25519 signatures, ActionLedger SHA-256 hash chains, tamper detection)
 2. src/system1/compat/typesafe.py (TypeSafe drop-in, monkey-patching, async routing, error fallbacks)
 3. src/system1/cli.py (dual syntax verify-receipt [path] and --receipt [path], invalid commands)
-4. Dual-import parity (import reflex vs import system1, cross-operations)
+4. Top-level and submodule export parity (import system1 vs system1 submodules)
 """
 
 import asyncio
@@ -25,13 +25,9 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
-import reflex
-import reflex.cli as r_cli
-import reflex.compat as r_compat
-import reflex.ledger as r_ledger
-import reflex.receipt as r_receipt
 import system1
 import system1.cli as s1_cli
+import system1.compat as s1_compat
 import system1.compat.typesafe as s1_typesafe
 import system1.ledger as s1_ledger
 import system1.receipt as s1_receipt
@@ -543,18 +539,18 @@ def test_adversarial_cli_invalid_commands_and_subprocesses():
 
 
 # ============================================================================
-# 5. Dual-Import Parity & Cross-Namespace Operations
+# 5. Top-Level and Submodule Export Parity & Operations
 # ============================================================================
 
-def test_adversarial_cross_namespace_receipt_and_ledger_interop(tmp_path):
-    """Verify cross-namespace interoperability between reflex and system1 packages."""
+def test_adversarial_cross_module_receipt_and_ledger_interop(tmp_path):
+    """Verify interoperability between system1 top-level exports and system1.receipt/system1.ledger."""
     signing_key = Ed25519PrivateKey.generate()
 
     # Create receipt using system1.receipt
     s1_rec = s1_receipt.create_decision_receipt(
-        schema_name="CrossNamespaceSchema",
+        schema_name="CrossModuleSchema",
         schema_digest="a" * 64,
-        prompt="Cross-namespace verification test",
+        prompt="Cross-module verification test",
         values={"route": "test"},
         confidences={"route": 0.95},
         conformal_sets={"route": ["test"]},
@@ -564,15 +560,15 @@ def test_adversarial_cross_namespace_receipt_and_ledger_interop(tmp_path):
         signing_key=signing_key,
     )
 
-    # Verify receipt using reflex.receipt
-    assert r_receipt.verify_decision_witness_receipt(s1_rec.to_dict(), public_key=signing_key.public_key()) is True
+    # Verify receipt using system1 top-level export
+    assert system1.verify_decision_witness_receipt(s1_rec.to_dict(), public_key=signing_key.public_key()) is True
 
-    # Record action in reflex.ledger.ActionLedger
+    # Record action in system1.ActionLedger
     db_file = tmp_path / "cross_ledger.db"
-    r_led = r_ledger.ActionLedger(db_file)
-    r_led.record_decision_receipt(s1_rec)
-    r_led.record_action("cross_action", {"origin": "reflex"})
-    r_led.close()
+    top_led = system1.ActionLedger(db_file)
+    top_led.record_decision_receipt(s1_rec)
+    top_led.record_action("cross_action", {"origin": "top"})
+    top_led.close()
 
     # Verify and append using system1.ledger.ActionLedger
     s1_led = s1_ledger.ActionLedger(db_file)
@@ -585,26 +581,26 @@ def test_adversarial_cross_namespace_receipt_and_ledger_interop(tmp_path):
     s1_led.close()
 
 
-def test_adversarial_twin_namespace_dynamic_submodules_parity():
-    """Verify dynamic resolution across all 15 submodules for both reflex and system1."""
+def test_adversarial_namespace_dynamic_submodules_parity():
+    """Verify dynamic resolution across all 15 submodules on system1."""
+    import importlib
+
     submodules = [
         "cache", "calibration", "cli", "compat", "compiler",
         "core", "embeddings", "engine", "guard", "ledger",
         "model", "neural", "receipt", "schema", "telemetry",
     ]
     for sub in submodules:
-        assert hasattr(reflex, sub), f"reflex missing {sub}"
         assert hasattr(system1, sub), f"system1 missing {sub}"
-        r_mod = getattr(reflex, sub)
         s_mod = getattr(system1, sub)
-        assert r_mod is not None
+        i_mod = importlib.import_module(f"system1.{sub}")
         assert s_mod is not None
-        assert set(r_mod.__all__) == set(s_mod.__all__)
+        assert s_mod is i_mod
+        assert hasattr(s_mod, "__all__")
 
-    # Top-level __all__ symmetry and object identity
-    assert set(reflex.__all__) == set(system1.__all__)
-    for sym in reflex.__all__:
-        assert getattr(reflex, sym) is getattr(system1, sym)
+    # Top-level __all__ completeness
+    for sym in system1.__all__:
+        assert getattr(system1, sym) is not None
 
 
 def test_adversarial_verify_receipt_invalid_explicit_public_key_raises():
@@ -633,26 +629,20 @@ def test_adversarial_verify_receipt_invalid_explicit_public_key_raises():
             verify_decision_witness_receipt(rec_dict, public_key=bad_key)
 
 
-def test_adversarial_system1_cli_module_execution_parity():
-    """Verify python3 -m reflex.cli execution matches python3 -m system1.cli."""
-    # 1. --help output parity
-    res_system1_help = subprocess.run(
-        [sys.executable, "-m", "reflex.cli", "--help"],
-        capture_output=True,
-        text=True,
-    )
+def test_adversarial_system1_cli_module_execution():
+    """Verify python3 -m system1.cli execution."""
+    # 1. --help output
     res_system1_help = subprocess.run(
         [sys.executable, "-m", "system1.cli", "--help"],
         capture_output=True,
         text=True,
     )
     assert res_system1_help.returncode == 0
-    assert res_system1_help.returncode == 0
-    assert res_system1_help.stdout == res_system1_help.stdout
+    assert "system1" in res_system1_help.stdout
 
-    # 2. decide command execution via reflex.cli
+    # 2. decide command execution via system1.cli
     res_decide = subprocess.run(
-        [sys.executable, "-m", "reflex.cli", "decide", "Test triage via reflex.cli", "--json"],
+        [sys.executable, "-m", "system1.cli", "decide", "Test triage via system1.cli", "--json"],
         capture_output=True,
         text=True,
     )
@@ -664,18 +654,15 @@ def test_adversarial_system1_cli_module_execution_parity():
 
 
 def test_adversarial_system1_compat_typesafe_identity():
-    """Verify reflex.compat.typesafe maintains object identity with system1.compat.typesafe."""
-    import reflex.compat.typesafe as r_ts
+    """Verify system1.compat.typesafe maintains object identity across import styles."""
     import system1.compat.typesafe as s1_ts
-    assert r_ts is s1_ts
-    assert reflex.compat.typesafe is system1.compat.typesafe
+    assert s1_compat.typesafe is s1_ts
+    assert system1.compat.typesafe is s1_ts
 
     # Verify via fresh subprocess execution
     sub_code = (
-        "import reflex.compat.typesafe\n"
         "import system1.compat.typesafe\n"
-        "assert reflex.compat.typesafe is system1.compat.typesafe\n"
-        "from reflex.compat import typesafe\n"
+        "from system1.compat import typesafe\n"
         "assert typesafe is system1.compat.typesafe\n"
     )
     res = subprocess.run([sys.executable, "-c", sub_code], capture_output=True, text=True)
@@ -1780,8 +1767,8 @@ Empirical Challenger verification covering:
      * SystemOneGuardCallbackHandler (on_tool_error with exec_error preservation)
    - Ensure complete structured reconciliation evidence (status=INDETERMINATE, action_id, receipt_digest, raw_result, underlying_error).
 
-6. Twin Namespace Parity:
-   - Verify object identity and functionality under both 'import reflex' and 'import system1'.
+6. Top-Level and Submodule Export Parity:
+   - Verify object identity and functionality across 'system1' and its submodules.
 """
 
 import asyncio
@@ -1795,12 +1782,6 @@ from unittest.mock import MagicMock
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-import reflex
-import reflex.guard as r_guard
-import reflex.integrations.langchain as r_lc
-import reflex.integrations.mcp as r_mcp
-import reflex.ledger as r_ledger
-import reflex.receipt as r_receipt
 import system1
 import system1.guard as s1_guard
 import system1.integrations.langchain as s1_lc
@@ -1964,7 +1945,7 @@ class TestUnauthenticatedAndDowngradeAttacks:
         downgraded = copy.deepcopy(receipt_dict)
         downgraded["envelope"]["signature"] = None
         downgraded["envelope"]["profile"] = "diagnostic_local"
-        downgraded["envelope"]["schema"] = "reflex.witness.diagnostic_local.v1"
+        downgraded["envelope"]["schema"] = "system1.witness.diagnostic_local.v1"
         # Recompute envelope digests so envelope internal check might pass
         env_obj = RunWitnessEnvelope.from_dict(downgraded["envelope"])
         computed_env_digest = env_obj.compute_witness_digest()
@@ -2700,32 +2681,31 @@ class TestTwoPhaseOutcomeInterception:
 
 
 class TestNamespaceParityGateB:
-    """Verify deep parity between 'reflex' and 'system1' for Gate B classes and functions."""
+    """Verify deep parity between 'system1' top-level and submodules for Gate B classes and functions."""
 
     def test_gate_b_symbol_and_object_identity(self):
-        """All Gate B symbols exported by system1 and reflex must have 100% object identity."""
-        assert r_receipt.EnforcementProfile is s1_receipt.EnforcementProfile
-        assert r_receipt.DecisionWitnessReceipt is s1_receipt.DecisionWitnessReceipt
-        assert r_receipt.RunWitnessEnvelope is s1_receipt.RunWitnessEnvelope
-        assert r_receipt.create_decision_receipt is s1_receipt.create_decision_receipt
-        assert r_receipt.verify_decision_witness_receipt is s1_receipt.verify_decision_witness_receipt
-        assert r_receipt.compute_receipt_digest is s1_receipt.compute_receipt_digest
+        """All Gate B symbols exported by system1 and its submodules must have 100% object identity."""
+        assert s1_receipt.EnforcementProfile is s1_guard.EnforcementProfile
+        assert system1.DecisionWitnessReceipt is s1_receipt.DecisionWitnessReceipt
+        assert system1.RunWitnessEnvelope is s1_receipt.RunWitnessEnvelope
+        assert system1.create_decision_receipt is s1_receipt.create_decision_receipt
+        assert system1.verify_decision_witness_receipt is s1_receipt.verify_decision_witness_receipt
+        assert system1.compute_receipt_digest is s1_receipt.compute_receipt_digest
 
-        assert r_ledger.ActionLedger is s1_ledger.ActionLedger
-        assert r_ledger.LedgerError is s1_ledger.LedgerError
-        assert r_ledger.LedgerWriteError is s1_ledger.LedgerWriteError
-        assert r_ledger.IntegrityError is s1_ledger.IntegrityError
+        assert system1.ActionLedger is s1_ledger.ActionLedger
+        assert issubclass(s1_ledger.LedgerWriteError, s1_ledger.LedgerError)
+        assert issubclass(s1_ledger.IntegrityError, s1_ledger.LedgerError)
 
-        assert r_guard.SystemOneGuardHook is s1_guard.SystemOneGuardHook
-        assert r_guard.EnforcementProfile is s1_guard.EnforcementProfile
-        assert r_guard.ENFORCEMENT_PROFILE_V1 == s1_guard.ENFORCEMENT_PROFILE_V1
+        assert system1.SystemOneGuardHook is s1_guard.SystemOneGuardHook
+        assert system1.ReflexGuard is s1_guard.SystemOneGuardHook
+        assert s1_receipt.ENFORCEMENT_PROFILE_V1 == "system1.witness.enforcement.v1"
 
-        assert r_mcp.SystemOneMCPProxy is s1_mcp.SystemOneMCPProxy
-        assert r_mcp.wrap_mcp_tool is s1_mcp.wrap_mcp_tool
+        assert system1.integrations.SystemOneMCPProxy is s1_mcp.SystemOneMCPProxy
+        assert callable(s1_mcp.wrap_mcp_tool)
 
-        assert r_lc.SystemOneIndeterminateExecutionError is s1_lc.SystemOneIndeterminateExecutionError
-        assert r_lc.SystemOneToolInterceptor is s1_lc.SystemOneToolInterceptor
-        assert r_lc.SystemOneGuardCallbackHandler is s1_lc.SystemOneGuardCallbackHandler
+        assert s1_mcp.SystemOneIndeterminateExecutionError is s1_lc.SystemOneIndeterminateExecutionError
+        assert system1.integrations.SystemOneToolInterceptor is s1_lc.SystemOneToolInterceptor
+        assert system1.integrations.SystemOneGuardCallbackHandler is s1_lc.SystemOneGuardCallbackHandler
 
 
 # === Merged from tests/test_adversarial_gate_c.py ===
@@ -2782,8 +2762,8 @@ Attacks Covered:
    - Invariant 7: Order statistic exceeding calibration sample count returns conservative q_hat=1.0.
    - Decoupled 50/50 partition for temperature scaling and conformal quantile fitting.
 
-8. Twin Namespace Parity:
-   - Verify exact parity across system1 and reflex namespaces for cache, calibration, compiler, and engine.
+8. Top-Level and Submodule Export Parity:
+   - Verify exact parity across system1 and its submodules for cache, calibration, compiler, and engine.
 """
 
 import concurrent.futures
@@ -2799,11 +2779,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pytest
 
-# Twin namespace imports
-import reflex.cache as rx_cache
-import reflex.calibration as rx_calib
-import reflex.compiler as rx_comp
-import reflex.engine as rx_eng
 import system1.cache as s1_cache
 import system1.calibration as s1_calib
 import system1.compiler as s1_comp
@@ -3441,31 +3416,32 @@ class TestAttack7DecoupledCalibrationAndInvariants:
 
 
 # ============================================================================
-# Attack 8: Twin Namespace Parity
+# Attack 8: Top-Level and Submodule Export Parity
 # ============================================================================
 
-class TestAttack8TwinNamespaceParity:
-    """Verifies 100% functional and structural parity across system1 and reflex namespaces."""
+class TestAttack8NamespaceExportParity:
+    """Verifies 100% functional and structural parity across system1 and its submodules."""
 
     def test_cache_namespace_parity(self):
-        assert s1_cache.SemanticSystemOneCache is rx_cache.SemanticSystemOneCache
-        assert s1_cache.CacheEntry is rx_cache.CacheEntry
-        assert s1_cache.validate_cache_inputs is rx_cache.validate_cache_inputs
+        assert s1_cache.SemanticSystemOneCache is system1.SemanticSystemOneCache
+        assert s1_cache.CacheEntry is system1.CacheEntry
+        assert callable(s1_cache.validate_cache_inputs)
 
     def test_calibration_namespace_parity(self):
-        assert s1_calib.ConformalPredictor is rx_calib.ConformalPredictor
-        assert s1_calib.RegressionConformalPredictor is rx_calib.RegressionConformalPredictor
-        assert s1_calib.DecisionCalibrator is rx_calib.DecisionCalibrator
-        assert s1_calib.ConformalPredictionSet is rx_calib.ConformalPredictionSet
-        assert s1_calib.RegressionConformalInterval is rx_calib.RegressionConformalInterval
+        assert s1_calib.ConformalPredictor is system1.ConformalPredictor
+        assert s1_calib.RegressionConformalPredictor is system1.RegressionConformalPredictor
+        assert s1_calib.DecisionCalibrator is system1.DecisionCalibrator
+        assert s1_calib.ConformalPredictionSet is system1.ConformalPredictionSet
+        assert s1_calib.RegressionConformalInterval is system1.RegressionConformalInterval
 
     def test_compiler_namespace_parity(self):
-        assert s1_comp.SystemOneCompiler is rx_comp.SystemOneCompiler
-        assert s1_comp.CompiledSystemOneModel is rx_comp.CompiledSystemOneModel
+        assert s1_comp.SystemOneCompiler is system1.SystemOneCompiler
+        assert s1_comp.CompiledSystemOneModel is system1.CompiledSystemOneModel
 
     def test_engine_namespace_parity(self):
-        assert s1_eng.SystemOneEngine is rx_eng.SystemOneEngine
-        assert s1_eng.DecisionResult is rx_eng.DecisionResult
+        assert s1_eng.SystemOneEngine is system1.SystemOneEngine
+        assert s1_eng.SystemOneEngine is system1.ReflexEngine
+        assert s1_eng.DecisionResult is system1.DecisionResult
 
 
 # === Merged from tests/test_adversarial_gate_d.py ===
@@ -4216,8 +4192,8 @@ Tests 6 specific adversarial attack vectors:
 5. High-Concurrency & Async Race Condition Stress Harness:
    Spawns multi-threaded and async workers hammering client evaluation and blocked egress
    under concurrent load, proving zero race-condition egress leaks.
-6. Twin Namespace & Patch Boundary Verification:
-   Ensures reflex and system1 namespaces, as well as patch_typesafe, enforce identical
+6. Namespace Export & Patch Boundary Verification:
+   Ensures system1 and system1.compat.typesafe, as well as patch_typesafe, enforce identical
    zero-egress contracts and fail-closed behaviors.
 """
 
@@ -4236,8 +4212,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import pytest
 
-import reflex
-import reflex.compat.typesafe as system1_typesafe
 import system1
 import system1.compat.typesafe as s1_typesafe
 from system1.compat.typesafe import (
@@ -4504,18 +4478,18 @@ class TestAttack1SocketInterception:
 
         assert len(network_trap) == 0
 
-    def test_twin_namespace_system1_zero_egress(self, network_trap):
-        """Verify reflex namespace exports enforce identical zero-egress guarantees."""
+    def test_namespace_system1_zero_egress(self, network_trap):
+        """Verify system1 top-level namespace exports enforce identical zero-egress guarantees."""
         questions = {"action": Choice("Action", {"allow": "Allow", "deny": "Deny"})}
 
-        with pytest.raises(reflex.ZeroEgressViolationError, match="zero_egress=True"):
-            system1_typesafe.call_real_typesafe_api("System 1 call", questions, zero_egress=True)
+        with pytest.raises(system1.ZeroEgressViolationError, match="zero_egress=True"):
+            s1_typesafe.call_real_typesafe_api("System 1 call", questions, zero_egress=True)
 
-        client = reflex.TypeSafeClient(mode="local", zero_egress=True)
+        client = system1.TypeSafeClient(mode="local", zero_egress=True)
         resp = client.systemone("System 1 client call", questions)
         assert resp.egress_bytes == 0
 
-        with pytest.raises(reflex.ZeroEgressViolationError, match="zero_egress=True"):
+        with pytest.raises(system1.ZeroEgressViolationError, match="zero_egress=True"):
             client.compare("System 1 compare", questions)
 
         assert len(network_trap) == 0
@@ -4958,17 +4932,15 @@ class TestAttack5ConcurrencyStressHarness:
 
 
 # ============================================================================
-# Attack 6: Twin Namespace & Patch Boundary Stress Tests
+# Attack 6: Namespace Export & Patch Boundary Stress Tests
 # ============================================================================
 
 class TestAttack6NamespaceAndPatchBoundary:
-    """Stress tests verifying identical zero-egress semantics across twin namespaces and patching."""
+    """Stress tests verifying identical zero-egress semantics across system1 and patching."""
 
-    def test_reflex_and_system1_class_identity_and_contracts(self):
-        """Verify exact type equivalence between system1 and reflex modules."""
-        assert system1.ZeroEgressViolationError is reflex.ZeroEgressViolationError
+    def test_system1_class_identity_and_contracts(self):
+        """Verify exact type equivalence between system1 and system1.compat.typesafe."""
         assert system1.ZeroEgressViolationError is s1_typesafe.ZeroEgressViolationError
-        assert reflex.ZeroEgressViolationError is system1_typesafe.ZeroEgressViolationError
         assert issubclass(ZeroEgressViolationError, RuntimeError)
 
     def test_patch_typesafe_unpatching_lifecycle_and_nesting(self, network_trap):
@@ -5021,10 +4993,10 @@ Tests 4 specific adversarial attack dimensions:
    - Resiliency against corrupted, malformed, non-JSON, or truncated VerifyReceipt payloads.
 4. Documentation Rigor & Packaging Parity Check:
    - Verification of pyproject.toml dependency bounds (protobuf>=5.26.1, grpcio>=1.62.0, grpcio-tools>=1.62.0).
-   - Packaging metadata: name is system1, scripts include system1 and reflex, packages include both.
-   - Verification of README.md install guidance: pip install system1 (not bare pip install reflex).
+   - Packaging metadata: name is system1-instinct, script is system1, packages include system1.
+   - Verification of README.md install guidance: pip install system1-instinct.
    - Reconciled documentation claims: conformal retention qualification, software Ed25519 vs hardware enclaves, empirical zero-wipe qualification.
-   - 1:1 twin namespace parity between system1 and reflex.
+   - 1:1 export parity between system1 top-level and submodules.
 """
 
 import importlib.util
@@ -5663,18 +5635,18 @@ class TestAttack4DocumentationRigorAndPackagingParity:
         assert "grpcio-tools>=1.80.0" in content, "pyproject.toml must enforce grpcio-tools>=1.80.0"
 
         # Project name and script entry points
-        assert 'name = "system1"' in content, "PyPI package name must be 'system1'"
+        assert 'name = "system1-instinct"' in content, "PyPI package name must be 'system1-instinct'"
         assert 'system1 = "system1.cli:main"' in content, "system1 CLI script must be defined"
 
-        # Packages include both system1 and reflex
-        assert 'include = ["system1*", "reflex*"]' in content or 'include = ["reflex*", "system1*"]' in content
+        # Packages include system1
+        assert 'include = ["system1*"]' in content
 
     def test_readme_installation_instructions_use_system1(self):
         """Ensure README.md and docs/README.md document installation clearly."""
         readme_path = Path(__file__).resolve().parent.parent / "README.md"
         assert readme_path.exists()
         readme_text = readme_path.read_text()
-        assert "pip install" in readme_text
+        assert "pip install system1-instinct" in readme_text
 
     def test_documentation_claims_qualify_retention_and_enclave_details(self):
         """Ensure claims regarding retention bounds and cryptographic signing are strictly qualified."""
@@ -5692,27 +5664,23 @@ class TestAttack4DocumentationRigorAndPackagingParity:
         assert "not an OS" in techspec_text
         assert "sandbox or hardware execution proof" in techspec_text
 
-    def test_twin_namespace_parity_gate_f_exports(self):
-        """Ensure reflex and system1 export identical symbols across all Gate E and Gate F interfaces."""
-        import reflex
-        import reflex.compat.typesafe as r_ts
-        import reflex.grpc_server as r_grpc
+    def test_namespace_parity_gate_f_exports(self):
+        """Ensure system1 top-level and submodules export identical symbols across Gate E and Gate F interfaces."""
         import system1
         import system1.compat.typesafe as s_ts
         import system1.grpc_server as s_grpc
 
         # Exception parity
-        assert reflex.ZeroEgressViolationError is system1.ZeroEgressViolationError
-        assert r_ts.ZeroEgressViolationError is s_ts.ZeroEgressViolationError
+        assert system1.ZeroEgressViolationError is s_ts.ZeroEgressViolationError
 
-        # gRPC exports parity
-        assert r_grpc.serve is s_grpc.serve
-        assert r_grpc.SystemOneServiceServicer is s_grpc.SystemOneServiceServicer
-        assert r_grpc.grpc_available is s_grpc.grpc_available
+        # gRPC exports
+        assert callable(s_grpc.serve)
+        assert s_grpc.SystemOneServiceServicer is not None
+        assert isinstance(s_grpc.grpc_available(), bool)
 
-        # Egress audit log parity
-        assert r_ts.get_egress_audit_log is s_ts.get_egress_audit_log
-        assert r_ts.clear_egress_audit_log is s_ts.clear_egress_audit_log
+        # Egress audit log helpers
+        assert callable(s_ts.get_egress_audit_log)
+        assert callable(s_ts.clear_egress_audit_log)
 
 
 # === Merged from tests/test_adversarial_invariants_6_to_10.py ===
@@ -5742,7 +5710,6 @@ from typing import Any, Dict, List, Mapping, Optional, Set
 import numpy as np
 import pytest
 
-import reflex
 import system1
 from system1 import (
     BooleanField,
@@ -6449,7 +6416,7 @@ from unittest.mock import MagicMock
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from reflex import (
+from system1 import (
     ActionLedger,
     ActionProposal,
     DecisionOutcome,
@@ -6469,7 +6436,7 @@ from reflex import (
     verify_decision_witness_receipt,
     wrap_mcp_tool,
 )
-from reflex.receipt import public_key_bytes
+from system1.receipt import public_key_bytes
 
 
 class SentinelExecutor:
@@ -6653,7 +6620,7 @@ def test_invariant_2_deeply_nested_structures_preserved():
     interceptor = SystemOneToolInterceptor(tool=process_config, guard=hook, tool_name="process_config")
     res = interceptor(nested_dict)
 
-    from reflex.receipt import thaw
+    from system1.receipt import thaw
 
     assert len(captured_proposals) == 1
     proposal = captured_proposals[0]
@@ -7107,14 +7074,14 @@ def test_invariant_1_mcp_malformed_arguments_type_zero_executions():
 
 
 # === Merged from tests/test_adversarial_m1_parity.py ===
-"""Adversarial stress test suite for Milestone 1 (Package Integrity & Namespace Parity).
+"""Adversarial stress test suite for Milestone 1 (Package Integrity & Namespace Exports).
 
 Tests empirical requirements:
-1. Twin namespace parity across all 15 submodules (static & dynamic imports, __all__ symmetry, symbol identity).
-2. Subprocess-isolated dynamic attribute access (hasattr/getattr) on system1 and reflex.
+1. Submodule export integrity across all 16 submodules (static & dynamic imports, __all__ completeness).
+2. Subprocess-isolated dynamic attribute access (hasattr/getattr) on system1.
 3. GuardInterceptionResult.allowed property across all DecisionOutcome variants, extended/adversarial variants, and immutability.
 4. Dynamic attribute access edge cases (non-existent attributes, empty strings, dunders).
-5. Mutation invariance between twin namespaces.
+5. Class alias identity (ReflexEngine, ReflexGuard, System1Engine, System1Guard).
 """
 
 import importlib
@@ -7127,7 +7094,7 @@ from system1.guard import (
     ActionProposal,
     DecisionOutcome,
     GuardInterceptionResult,
-    SystemOneGuardHook,
+    ReflexGuard,
     SystemOneGuardHook,
 )
 
@@ -7152,55 +7119,41 @@ ALL_16_SUBMODULES = [
 
 
 def test_static_and_dynamic_submodule_imports():
-    """Verify static and dynamic importability of all 16 submodules in reflex and system1."""
+    """Verify static and dynamic importability of all 16 submodules in system1."""
+    import system1
+
     for sub in ALL_16_SUBMODULES:
-        # Dynamic import
-        r_mod = importlib.import_module(f"reflex.{sub}")
         s_mod = importlib.import_module(f"system1.{sub}")
-
-        assert r_mod is not None, f"Dynamic import failed for reflex.{sub}"
         assert s_mod is not None, f"Dynamic import failed for system1.{sub}"
+        assert getattr(system1, sub) is s_mod
 
-        # __all__ completeness and parity
-        assert hasattr(r_mod, "__all__"), f"reflex.{sub} missing __all__"
         assert hasattr(s_mod, "__all__"), f"system1.{sub} missing __all__"
-        assert set(r_mod.__all__) == set(s_mod.__all__), (
-            f"__all__ mismatch in {sub}: {set(r_mod.__all__) ^ set(s_mod.__all__)}"
-        )
-
-        # Symbol object identity
         for sym in s_mod.__all__:
-            assert hasattr(r_mod, sym), f"reflex.{sub} missing symbol {sym}"
             assert hasattr(s_mod, sym), f"system1.{sub} missing symbol {sym}"
-            r_val = getattr(r_mod, sym)
-            s_val = getattr(s_mod, sym)
-            assert r_val is s_val, f"Symbol {sym} in {sub} is not identical object"
+            assert getattr(s_mod, sym) is not None
 
 
 def test_toplevel_symbols_identity_across_all():
-    """Verify all 92 symbols exported in system1.__all__ match reflex.__all__ with identical object references."""
-    import reflex
+    """Verify all symbols exported in system1.__all__ resolve to non-None objects and class aliases match."""
     import system1
 
-    assert set(reflex.__all__) == set(system1.__all__), (
-        f"Top-level __all__ mismatch: {set(reflex.__all__) ^ set(system1.__all__)}"
-    )
-
     for sym in system1.__all__:
-        r_val = getattr(reflex, sym)
         s_val = getattr(system1, sym)
-        assert r_val is s_val, f"Top-level symbol {sym} object reference differs ({r_val} is not {s_val})"
+        assert s_val is not None, f"Top-level symbol {sym} is None"
+
+    assert system1.ReflexEngine is system1.SystemOneEngine
+    assert system1.ReflexGuard is system1.SystemOneGuardHook
 
 
 def test_system1_dynamic_submodule_getattr_and_hasattr():
-    """Verify hasattr(reflex, submod) and getattr(reflex, submod) for all 16 submodules."""
-    import reflex
+    """Verify hasattr(system1, submod) and getattr(system1, submod) for all 16 submodules."""
+    import system1
 
     for sub in ALL_16_SUBMODULES:
-        assert hasattr(reflex, sub), f"hasattr(reflex, {sub!r}) is False"
-        mod = getattr(reflex, sub)
-        expected = importlib.import_module(f"reflex.{sub}")
-        assert mod is expected, f"getattr(reflex, {sub!r}) returned {mod}, expected {expected}"
+        assert hasattr(system1, sub), f"hasattr(system1, {sub!r}) is False"
+        mod = getattr(system1, sub)
+        expected = importlib.import_module(f"system1.{sub}")
+        assert mod is expected, f"getattr(system1, {sub!r}) returned {mod}, expected {expected}"
 
 
 def test_system1_dynamic_submodule_getattr_and_hasattr_isolated():
@@ -7281,7 +7234,7 @@ def test_guard_interception_result_allowed_property_stress():
 
 
 def test_guard_hooks_twin_allowed_behavior(read_policy):
-    """Verify both SystemOneGuardHook and SystemOneGuardHook produce identical .allowed verdicts."""
+    """Verify both SystemOneGuardHook and ReflexGuard produce identical .allowed verdicts."""
     proposal_safe = ActionProposal.create(
         tenant_id="t1",
         principal_id="p1",
@@ -7299,7 +7252,7 @@ def test_guard_hooks_twin_allowed_behavior(read_policy):
         purpose="Wipe disk",
     )
 
-    for hook_cls in (SystemOneGuardHook, SystemOneGuardHook):
+    for hook_cls in (SystemOneGuardHook, ReflexGuard):
         hook = hook_cls(min_confidence=0.50, alpha=0.10, policy=read_policy)
         res_safe = hook.evaluate_proposal(proposal_safe, context_prompt="Inspect read-only project documentation in README.md")
         assert res_safe.outcome == DecisionOutcome.ALLOW
@@ -7312,32 +7265,19 @@ def test_guard_hooks_twin_allowed_behavior(read_policy):
 
 def test_dynamic_attribute_access_nonexistent():
     """Verify dynamic attribute access for non-existent attributes raises AttributeError."""
-    import reflex
     import system1
 
-    for mod in (reflex, system1):
-        for bad_name in ["_non_existent", "missing_symbol", "custom_foo_bar", ""]:
-            assert not hasattr(mod, bad_name), f"{mod.__name__} should not have {bad_name!r}"
-            with pytest.raises(AttributeError) as exc_info:
-                getattr(mod, bad_name)
-            assert f"module {mod.__name__!r} has no attribute {bad_name!r}" in str(exc_info.value)
+    for bad_name in ["_non_existent", "missing_symbol", "custom_foo_bar", ""]:
+        assert not hasattr(system1, bad_name), f"{system1.__name__} should not have {bad_name!r}"
+        with pytest.raises(AttributeError) as exc_info:
+            getattr(system1, bad_name)
+        assert f"module {system1.__name__!r} has no attribute {bad_name!r}" in str(exc_info.value)
 
 
-def test_mutation_invariance():
-    """Verify mutations to reflex do not pollute system1 or its module collections."""
-    import reflex
-    import system1
-
-    # Independent __all__ copies
-    assert reflex.__all__ is not system1.__all__, "reflex.__all__ must be a distinct list copy"
-    orig_s1_len = len(system1.__all__)
-    reflex.__all__.append("__adversarial_canary__")
-    assert len(system1.__all__) == orig_s1_len
-    assert "__adversarial_canary__" not in system1.__all__
-
-    # Attribute mutation isolation
-    reflex.__adversarial_attr__ = "canary"
-    assert not hasattr(system1, "__adversarial_attr__")
+def test_legacy_reflex_package_is_removed():
+    """Verify that importing the removed legacy top-level reflex package raises ModuleNotFoundError."""
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("reflex")
 
 
 # === Merged from tests/test_adversarial_tier5_engine.py ===

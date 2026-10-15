@@ -1,13 +1,13 @@
-"""Tests for Polyglot gRPC / Protobuf Packaging, Wire Serialization, and Twin-Namespace Symmetry.
+"""Tests for Polyglot gRPC / Protobuf Packaging, Wire Serialization, and Submodule Exports.
 
 Verifies:
 1. Live gRPC server communication with compiled SystemOneServiceStub over binary wire.
 2. All 4 gRPC RPCs: Decide, Guard, VerifyReceipt, HealthCheck.
 3. Binary protobuf serialization/deserialization fidelity (SerializeToString / ParseFromString).
-4. Twin-namespace packaging symmetry:
-   - reflex.integrations.observability and reflex.integrations.otel mirror system1.integrations
-   - reflex.proto and system1.proto package assets (.proto files exist and match)
-   - reflex.promotion and system1.promotion exports
+4. Package exports:
+   - system1.integrations.observability and system1.integrations.otel exports
+   - system1.proto package assets (.proto files exist and use system1.v1)
+   - system1.promotion and system1.compat.typesafe exports
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from system1 import __version__
 try:
     import grpc
     from system1.proto import system1_pb2, system1_pb2_grpc, system1_proto_path as s1_proto_path
-    from reflex.proto import system1_pb2 as r_pb2, system1_pb2_grpc as r_pb2_grpc, system1_proto_path as system1_proto_path
     _GRPC_AVAILABLE = True
 except ImportError:
     _GRPC_AVAILABLE = False
@@ -177,8 +176,8 @@ def test_protobuf_binary_serialization_round_trip():
     assert dict(parsed_req.telemetry) == dict(original_req.telemetry)
 
 
-def test_twin_namespace_observability_mirrors():
-    """Verify reflex.integrations exports observability and otel without ModuleNotFoundError."""
+def test_namespace_observability_exports():
+    """Verify system1.integrations exports observability and otel without ModuleNotFoundError."""
     import sys
     orig_prom = sys.modules.get("prometheus_client")
     orig_otel = sys.modules.get("opentelemetry")
@@ -248,30 +247,25 @@ def test_twin_namespace_observability_mirrors():
             sys.modules["opentelemetry"] = otel
             sys.modules["opentelemetry.trace"] = otel_trace
 
-        import reflex.integrations.observability as r_obs
-        import reflex.integrations.otel as r_otel
+        import system1.integrations as s_int
         import system1.integrations.observability as s_obs
         import system1.integrations.otel as s_otel
 
-        assert hasattr(r_obs, "SystemOneMetricsExporter")
         assert hasattr(s_obs, "SystemOneMetricsExporter")
-        assert r_obs.SystemOneMetricsExporter is s_obs.SystemOneMetricsExporter
+        assert s_int.SystemOneMetricsExporter is s_obs.SystemOneMetricsExporter
 
-        assert hasattr(r_otel, "SystemOneOTelInstrumentor")
         assert hasattr(s_otel, "SystemOneOTelInstrumentor")
-        assert r_otel.SystemOneOTelInstrumentor is s_otel.SystemOneOTelInstrumentor
+        assert s_int.SystemOneOTelInstrumentor is s_otel.SystemOneOTelInstrumentor
     finally:
         # Restore sys.modules so downstream test files are not contaminated
         if orig_prom is None:
             sys.modules.pop("prometheus_client", None)
             sys.modules.pop("system1.integrations.observability", None)
-            sys.modules.pop("reflex.integrations.observability", None)
         else:
             sys.modules["prometheus_client"] = orig_prom
         if orig_otel is None:
             sys.modules.pop("opentelemetry", None)
             sys.modules.pop("system1.integrations.otel", None)
-            sys.modules.pop("reflex.integrations.otel", None)
         else:
             sys.modules["opentelemetry"] = orig_otel
         if orig_otel_trace is None:
@@ -280,27 +274,23 @@ def test_twin_namespace_observability_mirrors():
             sys.modules["opentelemetry.trace"] = orig_otel_trace
 
 
-def test_twin_namespace_proto_assets():
-    """Verify that .proto files exist in both namespaces and are identical."""
+def test_proto_package_assets():
+    """Verify that .proto file exists in system1.proto and uses system1.v1."""
     s1_path = Path(s1_proto_path())
-    r_path = Path(s1_path.parent.parent.parent / "reflex" / "proto" / "system1.proto")
 
     assert s1_path.is_file(), f"Proto file missing at {s1_path}"
-    assert r_path.is_file(), f"Proto file missing at {r_path}"
 
     s1_content = s1_path.read_text(encoding="utf-8")
-    r_content = r_path.read_text(encoding="utf-8")
 
-    assert s1_content == r_content
     assert 'syntax = "proto3";' in s1_content
+    assert "package system1.v1;" in s1_content
     assert "service SystemOneService" in s1_content
-    # Confirm deprecated option is removed
     assert "python_generic_services" not in s1_content
 
 
-def test_twin_namespace_promotion_symmetry():
-    """Verify promotion symbols match across reflex and system1 namespaces."""
-    import reflex.compat.typesafe as r_compat
+def test_promotion_exports_symmetry():
+    """Verify promotion symbols on system1.compat.typesafe and system1 top-level."""
+    import system1
     import system1.compat.typesafe as s_compat
 
     promotion_symbols = [
@@ -313,6 +303,7 @@ def test_twin_namespace_promotion_symmetry():
         "compute_wilson_score_lower",
     ]
     for symbol in promotion_symbols:
-        assert hasattr(r_compat, symbol), f"reflex.compat.typesafe missing export: {symbol}"
         assert hasattr(s_compat, symbol), f"system1.compat.typesafe missing export: {symbol}"
-        assert getattr(r_compat, symbol) is getattr(s_compat, symbol)
+    assert system1.TypeSafeClient is s_compat.TypeSafeClient
+    assert system1.SystemOneResponse is s_compat.SystemOneResponse
+    assert system1.ZeroEgressViolationError is s_compat.ZeroEgressViolationError

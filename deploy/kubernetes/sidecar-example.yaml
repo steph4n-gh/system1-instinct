@@ -7,10 +7,10 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: agent-with-reflex-sidecar
+  name: agent-with-system1-sidecar
   labels:
     app: agent
-    sidecar: reflex-grpc
+    sidecar: system1-grpc
 spec:
   containers:
     # ── Primary agent container ──────────────────────────────────────────
@@ -21,7 +21,7 @@ spec:
           name: http
       env:
         # The agent connects to the System 1 sidecar on localhost.
-        - name: REFLEX_GRPC_ENDPOINT
+        - name: SYSTEM1_GRPC_ENDPOINT
           value: "localhost:50051"
       resources:
         requests:
@@ -32,7 +32,7 @@ spec:
           memory: "1Gi"
 
     # ── System 1 gRPC sidecar ──────────────────────────────────────────────
-    - name: reflex-sidecar
+    - name: system1-sidecar
       image: system1-grpc:local
       command: ["system1", "serve", "--grpc", "--port", "50051", "--schema", "guard"]
       ports:

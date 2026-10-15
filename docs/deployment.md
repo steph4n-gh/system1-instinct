@@ -38,7 +38,7 @@ To verify signed receipts and maintain an intact `ActionLedger` chain:
 When you attach `SystemOneGatewayMiddleware` (via `add_system1_gateway`):
 
 1. **Enforce authentication and request-size limits in outer middleware.** Because `SystemOneGatewayMiddleware` returns local HTTP responses before FastAPI route dependencies run, place authentication, rate limiting, and body-size caps in your reverse proxy or outer ASGI middleware.
-2. **Scope `route_paths` to classification endpoints.** `SystemOneGatewayMiddleware` matches path prefixes and any `POST` carrying `x-reflex-route: true`. Use it only on classification endpoints. If you pass a custom `is_fastpath_fn`, verify its acceptance criteria on held-out traffic.
+2. **Scope `route_paths` to classification endpoints.** `SystemOneGatewayMiddleware` matches path prefixes and any `POST` carrying `x-system1-route: true`. Use it only on classification endpoints. If you pass a custom `is_fastpath_fn`, verify its acceptance criteria on held-out traffic.
 
 ## Bind principal identity in LangChain and MCP adapters
 
@@ -50,7 +50,7 @@ When you attach `SystemOneGuardCallbackHandler` or `System1MCPProxy`:
 <a id="grpc"></a>
 ## Secure the gRPC service boundary
 
-When you deploy the gRPC server (`system1[grpc]`):
+When you deploy the gRPC server (`system1-instinct[grpc]`):
 
 1. **Do not expose the CLI diagnostic server to untrusted networks.** `system1 serve --grpc` binds to `127.0.0.1` over plaintext gRPC without TLS, caller authentication, a persistent signing key, or a durable `ActionLedger`.
 2. **Configure production servers through `system1.grpc_server.serve(...)`.** Register explicit schema objects with `serve(schemas={"support": schema})`, attach a configured `SystemOneGuard`, and terminate TLS and caller authentication at your service proxy.
@@ -78,4 +78,4 @@ The loader disables Python `pickle`, verifies NPY header shapes and `float32` or
 
 ## Measure end-to-end latency on target hardware
 
-Reported sub-millisecond latencies (`0.1 to 0.4 ms`) measure median in-memory `engine.decide(...)` calls on CPU. They do not include SQLite disk syncs in `ActionLedger`, network hops in gRPC or HTTP, or downstream tool execution. Benchmark your full request path on your target hardware, and monitor `ActionLedger` write latency as the SQLite hash chain grows. Avoid installing the unrelated `reflex` web framework in the same virtual environment as `system1`, because `system1` provides the legacy `reflex` compatibility namespace.
+Reported sub-millisecond latencies (`0.1 to 0.4 ms`) measure median in-memory `engine.decide(...)` calls on CPU. They do not include SQLite disk syncs in `ActionLedger`, network hops in gRPC or HTTP, or downstream tool execution. Benchmark your full request path on your target hardware, and monitor `ActionLedger` write latency as the SQLite hash chain grows.

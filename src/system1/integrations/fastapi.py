@@ -77,10 +77,10 @@ class SystemOneGatewayMiddleware:
         """Constructs an OpenAI-compatible / System 1 response payload."""
         first_choice = next(iter(decision.values.values()), None) if decision.values else None
         return {
-            "id": f"reflex_{int(time.time() * 1000)}",
+            "id": f"system1_{int(time.time() * 1000)}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": "reflex-system1-metal",
+            "model": "system1-instinct",
             "choices": [
                 {
                     "index": 0,
@@ -96,7 +96,7 @@ class SystemOneGatewayMiddleware:
                 "completion_tokens": 0,
                 "total_tokens": 0,
             },
-            "reflex": {
+            "system1": {
                 "decision": decision.values,
                 "confidences": decision.confidences,
                 "latency_ms": decision.latency_ms,
@@ -116,7 +116,7 @@ class SystemOneGatewayMiddleware:
 
         # Fast-path evaluation applies only to POST requests matching route_paths or explicit header
         headers = dict(scope.get("headers", []))
-        explicit_route = headers.get(b"x-reflex-route", b"").lower() == b"true"
+        explicit_route = headers.get(b"x-system1-route", b"").lower() == b"true"
         matches_path = any(path.startswith(rp) for rp in self.route_paths)
 
         if method != "POST" or (not matches_path and not explicit_route):
@@ -196,12 +196,12 @@ class SystemOneGatewayMiddleware:
 
             res_headers = [
                 (b"content-type", b"application/json"),
-                (b"x-reflex-status", b"fastpath"),
-                (b"x-reflex-latency-ms", f"{latency_ms:.3f}".encode("utf-8")),
+                (b"x-system1-status", b"fastpath"),
+                (b"x-system1-latency-ms", f"{latency_ms:.3f}".encode("utf-8")),
             ]
             if decision.receipt is not None:
                 res_headers.append((
-                    b"x-reflex-receipt-digest",
+                    b"x-system1-receipt-digest",
                     decision.receipt.compute_digest().encode("utf-8"),
                 ))
 
@@ -230,8 +230,8 @@ class SystemOneGatewayMiddleware:
         async def send_with_escalation_header(message: Dict[str, Any]) -> None:
             if message["type"] == "http.response.start":
                 hdr = list(message.get("headers", []))
-                hdr.append((b"x-reflex-status", b"escalated"))
-                hdr.append((b"x-reflex-latency-ms", f"{latency_ms:.3f}".encode("utf-8")))
+                hdr.append((b"x-system1-status", b"escalated"))
+                hdr.append((b"x-system1-latency-ms", f"{latency_ms:.3f}".encode("utf-8")))
                 message["headers"] = hdr
             await send(message)
 

@@ -1034,9 +1034,14 @@ class SystemOneEngine:
                             compiled.class_calibration_scores = {
                                 str(k): tuple(float(v) for v in vals) for k, vals in c_scores.items()
                             }
-                    k = int(math.ceil((len(scores) + 1) * 0.95))
+                    k = int(math.ceil((len(scores) + 1) * (1.0 - self.default_alpha)))
                     upper = definition.max_value - definition.min_value if isinstance(definition, ScoreField) else 1.0
                     compiled.conformal_quantile = float(scores[k - 1]) if k <= len(scores) else upper
+            self.model_version = max(self.model_version, int(getattr(self.model, "model_version", 1))) + 1
+            if hasattr(self.model, "model_version"):
+                self.model.model_version = self.model_version
+            if getattr(self.model, "cache", None) is not None:
+                self.model.cache.clear()
             if self.cache is not None:
                 self.cache.clear()
             return metrics
@@ -2449,6 +2454,8 @@ class SystemOneEngine:
     ) -> Union[DecisionResult, EvaluationReport]:
         """Evaluates prompt against schema or evaluates a labeled dataset when given rows."""
         if not isinstance(prompt, str) and isinstance(prompt, (Path, Sequence, Mapping)):
+            return self.evaluate_dataset(prompt, alpha=alpha, strict_mode=strict)
+        if isinstance(prompt, str) and prompt.lower().endswith((".jsonl", ".json")) and Path(prompt).is_file():
             return self.evaluate_dataset(prompt, alpha=alpha, strict_mode=strict)
         if not isinstance(prompt, str):
             raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")

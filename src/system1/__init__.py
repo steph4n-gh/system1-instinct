@@ -1,8 +1,7 @@
 """System 1: teach bounded decision skills, validate them and reuse them locally.
 
 Fixed local features and small decision heads support structured outputs,
-uncertainty, optional teacher observation, explicit permissions and audit evidence.
-Available as both import system1 and the legacy import reflex."""
+uncertainty, optional teacher observation, explicit permissions and audit evidence."""
 
 from __future__ import annotations
 

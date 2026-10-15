@@ -175,12 +175,12 @@
     }
   ],
   "schemaVersion": 39,
-  "tags": ["reflex", "system1", "observability", "decision-engine"],
+  "tags": ["system1", "observability", "decision-engine"],
   "templating": { "list": [] },
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
   "title": "System 1 Decision Engine",
-  "uid": "reflex-decision-engine",
+  "uid": "system1-decision-engine",
   "version": 1
 }

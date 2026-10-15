@@ -4,13 +4,11 @@ import ast
 import tomllib
 from pathlib import Path
 
-import reflex
-import reflex.cli
 import system1
 import system1.cli
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIRS = (REPO_ROOT / "src" / "system1", REPO_ROOT / "src" / "reflex")
+SRC_DIRS = (REPO_ROOT / "src" / "system1",)
 
 
 def _iter_source_files() -> list[Path]:
@@ -93,17 +91,16 @@ def test_pyproject_metadata_and_entrypoints_contract() -> None:
     data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
 
     project = data["project"]
-    assert project["name"] == "system1"
+    assert project["name"] == "system1-instinct"
     assert project["requires-python"] == ">=3.11"
 
     scripts = project["scripts"]
-    assert scripts["system1"] == "system1.cli:main"
-    assert scripts["reflex"] == "reflex.cli:main"
+    assert scripts == {"system1": "system1.cli:main"}
 
-    packages_find = data["tool"]["setuptools"]["packages"]["find"]
-    assert packages_find["where"] == ["src"]
-    assert "system1*" in packages_find["include"]
-    assert "reflex*" in packages_find["include"]
+    find_cfg = data["tool"]["setuptools"]["packages"]["find"]
+    assert find_cfg["where"] == ["src"]
+    assert find_cfg.get("include") == ["system1*"]
+    assert (REPO_ROOT / "src" / "reflex").exists() is False
 
     deps_joined = " ".join(project["dependencies"]).lower()
     for required_dep in ("numpy", "cryptography"):
@@ -114,9 +111,23 @@ def test_pyproject_metadata_and_entrypoints_contract() -> None:
     for expected_extra in ("teaching", "neural", "dev", "grpc"):
         assert expected_extra in optional_deps
 
+    uv_lock_path = REPO_ROOT / "uv.lock"
+    uv_lock_data = tomllib.loads(uv_lock_path.read_text(encoding="utf-8"))
+    editable_pkgs = [
+        pkg for pkg in uv_lock_data.get("package", [])
+        if pkg.get("source") == {"editable": "."}
+    ]
+    assert len(editable_pkgs) == 1
+    assert editable_pkgs[0]["name"] == "system1-instinct"
+
+    for py_file in _iter_source_files():
+        rel = py_file.relative_to(REPO_ROOT)
+        text = py_file.read_text(encoding="utf-8")
+        assert "pip install 'system1[" not in text, f"Stale extra install hint in {rel}"
+        assert 'pip install "system1[' not in text, f"Stale extra install hint in {rel}"
 
 
-def test_cli_subcommand_inventory_and_reflex_parity() -> None:
+def test_cli_subcommand_inventory() -> None:
     expected_subcommands = {
         "decide",
         "bench",
@@ -128,14 +139,14 @@ def test_cli_subcommand_inventory_and_reflex_parity() -> None:
         "serve",
     }
 
-    for parser in (system1.cli.build_parser(), reflex.cli.build_parser()):
-        subparsers_actions = [
-            action
-            for action in parser._actions
-            if getattr(action, "choices", None) and isinstance(action.choices, dict)
-        ]
-        assert len(subparsers_actions) == 1
-        assert set(subparsers_actions[0].choices.keys()) == expected_subcommands
+    parser = system1.cli.build_parser()
+    subparsers_actions = [
+        action
+        for action in parser._actions
+        if getattr(action, "choices", None) and isinstance(action.choices, dict)
+    ]
+    assert len(subparsers_actions) == 1
+    assert set(subparsers_actions[0].choices.keys()) == expected_subcommands
 
     for sym in (
         "evaluate",
@@ -144,4 +155,4 @@ def test_cli_subcommand_inventory_and_reflex_parity() -> None:
         "RecalibrationMetrics",
         "RecalibrationReport",
     ):
-        assert getattr(system1, sym) is getattr(reflex, sym)
+        assert getattr(system1, sym) is not None

@@ -84,10 +84,10 @@ class BlockOptional(importlib.abc.MetaPathFinder):
             raise ModuleNotFoundError(fullname)
 sys.meta_path.insert(0, BlockOptional())
 from importlib.resources import files
-import reflex.proto, system1.proto
+from pathlib import Path
+import system1.proto
 assert files('system1.proto').joinpath('system1.proto').is_file()
-assert files('reflex.proto').joinpath('system1.proto').is_file()
-assert reflex.proto.system1_proto_path is system1.proto.system1_proto_path
+assert Path(system1.proto.system1_proto_path()).is_file()
 '''
     result = subprocess.run([sys.executable, '-c', script], cwd=tmp_path,
                             capture_output=True, text=True, timeout=30)

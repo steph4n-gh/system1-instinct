@@ -117,10 +117,8 @@ claim of workload quality or a change to automatic-observation defaults.
 
 ## Local decisions and uncertainty
 
-`System1Engine` is an alias of `SystemOneEngine`. Both `system1` and legacy
-`reflex` imports expose the same implementation. Install the `system1`
-distribution and use the `system1` CLI; the unrelated Reflex web framework is a
-different distribution.
+`System1Engine` and `ReflexEngine` are aliases of `SystemOneEngine`. Install the
+`system1-instinct` distribution (`import system1`) and use the `system1` CLI.
 
 Direct Python engines default to `strict_mode=False` for compatibility. For a
 taught skill, use `strict_mode=True`; saved-model CLI decisions and normal

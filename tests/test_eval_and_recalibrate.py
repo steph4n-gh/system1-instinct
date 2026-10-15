@@ -7,9 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import reflex
 import system1
-from reflex.cli import main as reflex_cli_main
 from system1 import (
     BooleanField,
     ChoiceField,
@@ -85,7 +83,7 @@ def test_evaluate_multi_field_and_input_formats(tmp_path: Path) -> None:
     engine = SystemOneEngine.load(model_path)
     rep_compiled = system1.evaluate(compiled, eval_tuples, alpha=0.10)
     rep_engine = system1.evaluate(engine, eval_dicts, alpha=0.10)
-    rep_path = reflex.evaluate(model_path, jsonl_path, alpha=0.10)
+    rep_path = system1.evaluate(model_path, jsonl_path, alpha=0.10)
 
     assert isinstance(rep_compiled, EvaluationReport)
     assert rep_compiled.total_examples == 10
@@ -301,7 +299,7 @@ def test_standalone_engine_recalibrate_and_evaluate() -> None:
     assert eval_rep.accuracy >= 0.90
 
 
-def test_cli_eval_subcommand_and_reflex_parity(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_cli_eval_subcommand(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     schema = DecisionSchema(
         fields={"intent": ChoiceField(options=["billing", "tech"])}
     )
@@ -341,16 +339,6 @@ def test_cli_eval_subcommand_and_reflex_parity(tmp_path: Path, capsys: pytest.Ca
         payload_s1["coverage"] + payload_s1["abstain_rate"] + payload_s1["unfamiliar_rate"],
         1.0,
         abs_tol=1e-9,
-    )
-
-    rc_reflex = reflex_cli_main(
-        ["eval", "--model", str(model_path), "--data", str(data_path), "--alpha", "0.05", "--json"]
-    )
-    assert rc_reflex == 0
-    payload_rx = json.loads(capsys.readouterr().out)
-    assert payload_rx["accuracy"] == pytest.approx(payload_s1["accuracy"])
-    assert payload_rx["field_metrics"]["intent"]["ece"] == pytest.approx(
-        payload_s1["field_metrics"]["intent"]["ece"]
     )
 
     calib_path = tmp_path / "cli_calib.jsonl"

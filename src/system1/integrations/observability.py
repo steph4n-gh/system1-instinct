@@ -6,7 +6,7 @@ rates, cache-hit ratios, conformal-set sizes, and ledger depth.
 
 Requires the optional ``prometheus_client`` package::
 
-    python -m pip install 'system1[observability]'
+    python -m pip install 'system1-instinct[observability]'
 """
 
 from __future__ import annotations
@@ -230,6 +230,10 @@ class SystemOneMetricsExporter:
     @staticmethod
     def _classify_escalation_reason(result: "DecisionResult") -> str:
         """Heuristically classify why a decision was escalated."""
+        abstention_reasons = getattr(result, "abstention_reasons", None) or {}
+        metadata = getattr(result, "metadata", None) or {}
+        if abstention_reasons or metadata.get("familiarity_triggered") or metadata.get("prototype_triggered"):
+            return "ood"
         if result.is_ambiguous:
             # Check if it's a margin-based escalation
             for _field, active in result.margin_gate_active.items():

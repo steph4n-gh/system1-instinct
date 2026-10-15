@@ -26,13 +26,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
-DECISION_WITNESS_PROFILE = "reflex.witness.decision.v1"
-ENFORCEMENT_PROFILE_V1 = "reflex.witness.enforcement.v1"
+DECISION_WITNESS_PROFILE = "system1.witness.decision.v1"
+ENFORCEMENT_PROFILE_V1 = "system1.witness.enforcement.v1"
 WITNESS_PROFILES = {
-    "diagnostic_local": "reflex.witness.diagnostic_local.v1",
-    "product_signed_v1": "reflex.witness.product_signed.v1",
-    "enforcement_v1": "reflex.witness.enforcement.v1",
-    "strict_attested_durable_v1": "reflex.witness.enforcement.v1",
+    "diagnostic_local": "system1.witness.diagnostic_local.v1",
+    "product_signed_v1": "system1.witness.product_signed.v1",
+    "enforcement_v1": "system1.witness.enforcement.v1",
+    "strict_attested_durable_v1": "system1.witness.enforcement.v1",
 }
 
 
@@ -40,7 +40,7 @@ WITNESS_PROFILES = {
 class EnforcementProfile:
     """Explicit enforcement configuration profile ensuring authentic, durable attestation."""
 
-    profile_id: str = "reflex.witness.enforcement.v1"
+    profile_id: str = "system1.witness.enforcement.v1"
     require_signer: bool = True
     require_durable_ledger: bool = True
     require_pre_execution_record: bool = True
@@ -245,7 +245,7 @@ def verify_payload(
 class RunWitnessEnvelope:
     """Cryptographic evidence envelope binding mutation intent, observations, and signatures."""
 
-    schema: str = "reflex.witness.product_signed.v1"
+    schema: str = "system1.witness.product_signed.v1"
     mutation_intent: Dict[str, Any] = field(default_factory=dict)
     guard_receipt: Dict[str, Any] = field(default_factory=dict)
     effect_observation: Dict[str, Any] = field(default_factory=dict)
@@ -323,7 +323,7 @@ def create_run_witness_envelope(
             json.dumps(readback_observation, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
 
-    schema = WITNESS_PROFILES.get(profile, "reflex.witness.product_signed.v1")
+    schema = WITNESS_PROFILES.get(profile, "system1.witness.product_signed.v1")
     envelope = RunWitnessEnvelope(
         schema=schema,
         profile=profile,

@@ -553,7 +553,7 @@ def handle_serve_command(args: argparse.Namespace) -> int:
     except ImportError:
         print(
             "[SYSTEM1 ERROR] grpcio is required for the serve command.  "
-            "Install with: pip install 'system1[grpc]'",
+            "Install with: pip install 'system1-instinct[grpc]'",
             file=sys.stderr,
         )
         return 1
@@ -561,7 +561,7 @@ def handle_serve_command(args: argparse.Namespace) -> int:
     if not grpc_available():
         print(
             "[SYSTEM1 ERROR] grpcio is not installed.  "
-            "Install with: pip install 'system1[grpc]'",
+            "Install with: pip install 'system1-instinct[grpc]'",
             file=sys.stderr,
         )
         return 1

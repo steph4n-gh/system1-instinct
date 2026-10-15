@@ -1778,7 +1778,7 @@ class SystemOneCompiler:
         try:
             from scipy.optimize import minimize
         except ImportError as exc:
-            raise ImportError("Logistic teaching requires pip install 'system1[teaching]'") from exc
+            raise ImportError("Logistic teaching requires pip install 'system1-instinct[teaching]'") from exc
 
         X = np.asarray(X, dtype=np.float64)
         Y = np.asarray(Y, dtype=np.float64)

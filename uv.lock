@@ -1478,7 +1478,7 @@ wheels = [
 ]
 
 [[package]]
-name = "system1"
+name = "system1-instinct"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [

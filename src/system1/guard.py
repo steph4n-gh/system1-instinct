@@ -816,13 +816,40 @@ class SystemOneGuardHook:
                 )
         return None
 
+    def evaluate(
+        self,
+        prompt: str,
+        *,
+        telemetry: Optional[Mapping[str, Any]] = None,
+        alpha: Optional[float] = None,
+        tool: str = "guard",
+    ) -> GuardInterceptionResult:
+        """Evaluate a prompt through the guard reference monitor without mutating self.alpha."""
+        proposal = ActionProposal.create(
+            tenant_id="default",
+            principal_id="grpc_client",
+            scope="execution",
+            tool=tool,
+            arguments={"prompt": prompt},
+            purpose=prompt or f"Evaluate proposal for {tool}",
+        )
+        return self.evaluate_proposal(
+            proposal,
+            context_prompt=prompt,
+            alpha=alpha,
+            telemetry=telemetry,
+        )
+
     def evaluate_proposal(
         self,
         proposal: ActionProposal,
         *,
         context_prompt: Optional[str] = None,
+        alpha: Optional[float] = None,
+        telemetry: Optional[Mapping[str, Any]] = None,
     ) -> GuardInterceptionResult:
         """Evaluates an ActionProposal through System 1 fail-closed gates."""
+        eff_alpha = self.alpha if alpha is None else float(alpha)
         # 0. Deterministic policy evaluation BEFORE model inference and caching
         pol_eval = None
         if self.policy is not None:
@@ -851,7 +878,8 @@ class SystemOneGuardHook:
                     pol_decision=pol_dec,
                     decision=None,
                     context_prompt=context_prompt,
-                    rule_id=p_rule_id
+                    rule_id=p_rule_id,
+                    effective_alpha=eff_alpha,
                 )
         else:
             # No matching rule found
@@ -871,7 +899,8 @@ class SystemOneGuardHook:
         try:
             decision = self.engine.decide(
                 prompt,
-                alpha=self.alpha,
+                alpha=eff_alpha,
+                telemetry=telemetry,
                 record_receipt=True,
                 ledger=self.ledger,
                 fail_closed_ledger=self.fail_closed_ledger,
@@ -930,7 +959,7 @@ class SystemOneGuardHook:
             if isinstance(f_def, (ChoiceField, BooleanField)) and len(cset) > 1:
                 outcome = DecisionOutcome.REQUIRE_APPROVAL
                 reason = (
-                    f"System 1 conformal ambiguity for {field_name!r}: set {cset} has {len(cset)} candidates at 1-alpha={1.0 - self.alpha:.2f}"
+                    f"System 1 conformal ambiguity for {field_name!r}: set {cset} has {len(cset)} candidates at 1-alpha={1.0 - eff_alpha:.2f}"
                 )
                 pol_decision = self._build_policy_decision(
                     proposal, outcome, RiskLevel.EXTERNAL, "system1_conformal_ambiguity", reason
@@ -973,7 +1002,8 @@ class SystemOneGuardHook:
             reason=reason,
             pol_decision=pol_decision,
             decision=decision,
-            context_prompt=prompt
+            context_prompt=prompt,
+            effective_alpha=eff_alpha,
         )
 
     def _finalize_authorization(
@@ -985,7 +1015,9 @@ class SystemOneGuardHook:
         decision: Optional[DecisionResult] = None,
         context_prompt: Optional[str] = None,
         rule_id: Optional[str] = None,
+        effective_alpha: Optional[float] = None,
     ) -> GuardInterceptionResult:
+        eff_alpha = self.alpha if effective_alpha is None else float(effective_alpha)
         p_prompt = context_prompt or (
             f"Tool: {proposal.tool}. Target: {proposal.canonical_target}. "
             f"Args: {dict(proposal.arguments)}. Purpose: {proposal.purpose}"
@@ -1033,7 +1065,7 @@ class SystemOneGuardHook:
             signing_key=self.engine.signing_key,
             policy_decision=pol_decision,
             action_proposal=proposal,
-            effective_alpha=self.alpha,
+            effective_alpha=eff_alpha,
             profile=chosen_profile,
             ledger_record_id=ledger_record_id,
         )
@@ -1087,7 +1119,7 @@ class SystemOneGuardHook:
                 probabilities=final_receipt.probabilities,
                 is_ambiguous=False,
                 latency_ms=final_receipt.latency_ms,
-                alpha=self.alpha,
+                alpha=eff_alpha,
                 receipt=final_receipt,
             )
 

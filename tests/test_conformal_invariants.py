@@ -10,8 +10,8 @@ Authoritative Invariants Tested:
    Round-trip .s1m serialization preserves {name}_calib_scores, conformal bounds, and empirical coverage.
 4. Prediction Set Cardinality vs Escalation Policy:
    Empty sets (|C(x)| == 0) and multi-label sets (|C(x)| > 1) escalate; strict=True suppresses margin override.
-5. Twin-namespace parity:
-   Identical behavior when imported via `system1` or `reflex`.
+5. Top-level and submodule export parity:
+   Identical behavior when imported via `system1` or `system1.calibration`.
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-import reflex
 import system1
+import system1.calibration
 from system1 import (
     BooleanField,
     ChoiceField,
@@ -261,11 +261,11 @@ def test_engine_strict_mode_cardinality_escalation():
         assert "severity" in res_strict.ambiguous_fields
 
 
-def test_twin_namespace_parity_for_conformal_components():
-    """Verify that system1 and reflex export identical conformal calibration classes."""
-    assert system1.ConformalPredictor is reflex.ConformalPredictor
-    assert system1.ConformalPredictionSet is reflex.ConformalPredictionSet
-    assert system1.RegressionConformalPredictor is reflex.RegressionConformalPredictor
-    assert system1.RegressionConformalInterval is reflex.RegressionConformalInterval
-    assert system1.DecisionCalibrator is reflex.DecisionCalibrator
-    assert system1.SystemOneEngine is reflex.SystemOneEngine
+def test_namespace_parity_for_conformal_components():
+    """Verify that system1 and system1.calibration export identical conformal calibration classes."""
+    assert system1.ConformalPredictor is system1.calibration.ConformalPredictor
+    assert system1.ConformalPredictionSet is system1.calibration.ConformalPredictionSet
+    assert system1.RegressionConformalPredictor is system1.calibration.RegressionConformalPredictor
+    assert system1.RegressionConformalInterval is system1.calibration.RegressionConformalInterval
+    assert system1.DecisionCalibrator is system1.calibration.DecisionCalibrator
+    assert system1.SystemOneEngine is system1.ReflexEngine

@@ -37,22 +37,22 @@ class SystemOneServiceStub:
             channel: A grpc.Channel.
         """
         self.Decide = channel.unary_unary(
-                '/reflex.v1.SystemOneService/Decide',
+                '/system1.v1.SystemOneService/Decide',
                 request_serializer=system1__pb2.DecideRequest.SerializeToString,
                 response_deserializer=system1__pb2.DecideResponse.FromString,
                 _registered_method=True)
         self.Guard = channel.unary_unary(
-                '/reflex.v1.SystemOneService/Guard',
+                '/system1.v1.SystemOneService/Guard',
                 request_serializer=system1__pb2.GuardRequest.SerializeToString,
                 response_deserializer=system1__pb2.GuardResponse.FromString,
                 _registered_method=True)
         self.VerifyReceipt = channel.unary_unary(
-                '/reflex.v1.SystemOneService/VerifyReceipt',
+                '/system1.v1.SystemOneService/VerifyReceipt',
                 request_serializer=system1__pb2.VerifyReceiptRequest.SerializeToString,
                 response_deserializer=system1__pb2.VerifyReceiptResponse.FromString,
                 _registered_method=True)
         self.HealthCheck = channel.unary_unary(
-                '/reflex.v1.SystemOneService/HealthCheck',
+                '/system1.v1.SystemOneService/HealthCheck',
                 request_serializer=system1__pb2.HealthCheckRequest.SerializeToString,
                 response_deserializer=system1__pb2.HealthCheckResponse.FromString,
                 _registered_method=True)
@@ -116,9 +116,9 @@ def add_SystemOneServiceServicer_to_server(servicer, server):
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'reflex.v1.SystemOneService', rpc_method_handlers)
+            'system1.v1.SystemOneService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('reflex.v1.SystemOneService', rpc_method_handlers)
+    server.add_registered_method_handlers('system1.v1.SystemOneService', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
@@ -141,7 +141,7 @@ class SystemOneService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/reflex.v1.SystemOneService/Decide',
+            '/system1.v1.SystemOneService/Decide',
             system1__pb2.DecideRequest.SerializeToString,
             system1__pb2.DecideResponse.FromString,
             options,
@@ -168,7 +168,7 @@ class SystemOneService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/reflex.v1.SystemOneService/Guard',
+            '/system1.v1.SystemOneService/Guard',
             system1__pb2.GuardRequest.SerializeToString,
             system1__pb2.GuardResponse.FromString,
             options,
@@ -195,7 +195,7 @@ class SystemOneService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/reflex.v1.SystemOneService/VerifyReceipt',
+            '/system1.v1.SystemOneService/VerifyReceipt',
             system1__pb2.VerifyReceiptRequest.SerializeToString,
             system1__pb2.VerifyReceiptResponse.FromString,
             options,
@@ -222,7 +222,7 @@ class SystemOneService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/reflex.v1.SystemOneService/HealthCheck',
+            '/system1.v1.SystemOneService/HealthCheck',
             system1__pb2.HealthCheckRequest.SerializeToString,
             system1__pb2.HealthCheckResponse.FromString,
             options,

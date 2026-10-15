@@ -5,7 +5,7 @@ latency, outcome, schema name, and cache-hit status as span attributes.
 
 Requires the optional ``opentelemetry-api`` and ``opentelemetry-sdk`` packages::
 
-    python -m pip install 'system1[otel]'
+    python -m pip install 'system1-instinct[otel]'
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from system1.engine import DecisionResult, SystemOneEngine
 
 
-_TRACER_NAME = "reflex.decision_engine"
+_TRACER_NAME = "system1.decision_engine"
 
 
 class SystemOneOTelInstrumentor:
@@ -62,27 +62,27 @@ class SystemOneOTelInstrumentor:
         def _traced_decide(*args: Any, **kwargs: Any) -> "DecisionResult":
             schema_name = engine.schema.schema_name
             with tracer.start_as_current_span(
-                f"reflex.decide.{schema_name}",
+                f"system1.decide.{schema_name}",
                 kind=trace.SpanKind.INTERNAL,
             ) as span:
-                span.set_attribute("reflex.schema", schema_name)
+                span.set_attribute("system1.schema", schema_name)
 
                 result = original_decide(*args, **kwargs)
 
                 # Record result attributes
                 span.set_attribute(
-                    "reflex.latency_ms", result.latency_ms
+                    "system1.latency_ms", result.latency_ms
                 )
                 span.set_attribute(
-                    "reflex.latency_seconds", result.latency_ms / 1000.0
+                    "system1.latency_seconds", result.latency_ms / 1000.0
                 )
-                span.set_attribute("reflex.cache_hit", result.is_cache_hit)
-                span.set_attribute("reflex.is_ambiguous", result.is_ambiguous)
+                span.set_attribute("system1.cache_hit", result.is_cache_hit)
+                span.set_attribute("system1.is_ambiguous", result.is_ambiguous)
 
                 # Outcome — first value in the decision result
                 if result.values:
                     first_value = next(iter(result.values.values()), "")
-                    span.set_attribute("reflex.outcome", str(first_value))
+                    span.set_attribute("system1.outcome", str(first_value))
 
                 # Conformal set sizes
                 if result.conformal_sets:
@@ -90,7 +90,7 @@ class SystemOneOTelInstrumentor:
                         len(v) for v in result.conformal_sets.values()
                     )
                     span.set_attribute(
-                        "reflex.conformal_set_size_max", max_set_size
+                        "system1.conformal_set_size_max", max_set_size
                     )
 
                 if result.is_ambiguous:

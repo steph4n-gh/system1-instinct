@@ -3,7 +3,7 @@ requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "system1"
+name = "system1-instinct"
 version = "1.0.0"
 description = "System 1: Instinct — Sub-millisecond non-autoregressive decision runtime and zero-shot adaptive skills."
 readme = "README.md"
@@ -11,7 +11,6 @@ license = "Apache-2.0"
 authors = [{name = "System 1: Instinct Authors"}]
 requires-python = ">=3.11"
 keywords = [
-    "reflex",
     "system1",
     "decision-runtime",
     "sub-millisecond",
@@ -89,16 +88,14 @@ http = [
 
 [project.scripts]
 system1 = "system1.cli:main"
-reflex = "reflex.cli:main"
 
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["system1*", "reflex*"]
+include = ["system1*"]
 
 [tool.setuptools.package-data]
 "system1" = ["proto/*.proto", "proto/*.py"]
-"reflex" = ["proto/*.proto", "proto/*.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

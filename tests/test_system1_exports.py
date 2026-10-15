@@ -250,67 +250,33 @@ def test_system1_cli_main_entrypoint(capsys):
     assert data["schema_name"] == "DefaultTriageSchema"
 
 
-def test_system1_package_parity():
-    """Verify reflex package exports and provides 100% interoperability with system1."""
-    import reflex
-    assert reflex.__version__ == system1.__version__
-    assert reflex.SystemOneEngine is system1.SystemOneEngine
-    assert reflex.SystemOneCompiler is system1.SystemOneCompiler
-    assert reflex.TeachingSession is system1.TeachingSession
-    assert reflex.DecisionSchema is system1.DecisionSchema
-    assert reflex.ChoiceField is system1.ChoiceField
-    assert reflex.BooleanField is system1.BooleanField
-    assert reflex.MultiChoiceField is system1.MultiChoiceField
-    assert reflex.ScoreField is system1.ScoreField
-    assert reflex.ActionLedger is system1.ActionLedger
+def test_system1_package_aliases():
+    """Verify system1 package exports and class aliases (System1Engine, ReflexEngine, System1Guard, ReflexGuard)."""
+    assert system1.System1Engine is system1.SystemOneEngine
+    assert system1.ReflexEngine is system1.SystemOneEngine
+    assert system1.System1Guard is system1.SystemOneGuardHook
+    assert system1.ReflexGuard is system1.SystemOneGuardHook
 
-    class ParitySchema(reflex.DecisionSchema):
-        choice = reflex.ChoiceField(options=["a", "b"])
+    class ParitySchema(system1.DecisionSchema):
+        choice = system1.ChoiceField(options=["a", "b"])
 
-    res = reflex.decide("Option a test", schema=ParitySchema)
+    res = system1.decide("Option a test", schema=ParitySchema)
     assert res.choice in ("a", "b")
 
 
-def test_system1_all_submodules_import_and_parity():
-    """Verify public submodules import through reflex with identical exports."""
+def test_system1_all_submodules_import():
+    """Verify public submodules import through system1 with explicit __all__."""
     import importlib
     import pkgutil
-    import system1
-    import reflex
 
     discovered = sorted([m.name for m in pkgutil.iter_modules(system1.__path__)])
     assert discovered == ALL_SUBMODULES, f"Expected submodules {ALL_SUBMODULES}, discovered {discovered}"
 
     for sub in ALL_SUBMODULES:
         s_mod = importlib.import_module(f"system1.{sub}")
-        r_mod = importlib.import_module(f"reflex.{sub}")
-
         assert hasattr(s_mod, "__all__"), f"system1.{sub} missing explicit __all__"
-        assert hasattr(r_mod, "__all__"), f"reflex.{sub} missing explicit __all__"
-        assert set(r_mod.__all__) == set(s_mod.__all__), (
-            f"Submodule {sub} __all__ mismatch: {set(r_mod.__all__) ^ set(s_mod.__all__)}"
-        )
-        assert len(r_mod.__all__) == len(s_mod.__all__)
-
         for symbol in s_mod.__all__:
-            assert hasattr(r_mod, symbol), f"reflex.{sub} missing symbol {symbol}"
-            r_val = getattr(r_mod, symbol)
-            s_val = getattr(s_mod, symbol)
-            assert r_val is s_val, f"Symbol {symbol} in {sub} is not identical object ({r_val} vs {s_val})"
-
-
-def test_reflex_dynamic_submodule_getattr():
-    """Verify reflex resolves every public submodule and includes it in dir()."""
-    import importlib
-    import reflex
-
-    system1_dir = dir(reflex)
-    for sub in ALL_SUBMODULES:
-        mod = getattr(reflex, sub)
-        assert mod is not None, f"getattr(reflex, {sub!r}) returned None"
-        expected_mod = importlib.import_module(f"reflex.{sub}")
-        assert mod is expected_mod, f"getattr(reflex, {sub!r}) returned {mod}, expected {expected_mod}"
-        assert sub in system1_dir, f"Submodule {sub} missing from dir(reflex)"
+            assert hasattr(s_mod, symbol), f"system1.{sub} missing symbol {symbol}"
 
 
 def test_guard_interception_result_allowed_property(read_policy):
@@ -365,31 +331,19 @@ def test_guard_interception_result_allowed_property(read_policy):
     assert res_hook_deny.allowed is False
 
 
-def test_system1_core_submodules_parity():
-    """Verify all reflex.core submodules match system1.core."""
+def test_system1_core_submodules():
+    """Verify all system1.core submodules expose explicit __all__."""
     import importlib
-    import reflex.core
     import system1.core
 
     core_subs = ["embeddings", "model", "neural", "schema", "telemetry"]
     for sub in core_subs:
         s_mod = importlib.import_module(f"system1.core.{sub}")
-        r_mod = importlib.import_module(f"reflex.core.{sub}")
         assert hasattr(s_mod, "__all__")
-        assert hasattr(r_mod, "__all__")
-        assert set(r_mod.__all__) == set(s_mod.__all__)
         for symbol in s_mod.__all__:
-            assert getattr(r_mod, symbol) is getattr(s_mod, symbol)
-
-
-def test_reflex_cli_main_entrypoint(capsys):
-    """Verify reflex.cli.main executes correctly."""
-    import reflex.cli as r_cli
-    ret = r_cli.main(["decide", "Safe read check", "--json"])
-    assert ret == 0
-    captured = capsys.readouterr()
-    data = json.loads(captured.out)
-    assert data["schema_name"] == "DefaultTriageSchema"
+            assert hasattr(s_mod, symbol)
+            if hasattr(system1.core, symbol):
+                assert getattr(s_mod, symbol) is getattr(system1.core, symbol)
 
 
 def test_system1_dynamic_submodule_getattr():
@@ -409,7 +363,7 @@ def test_system1_dynamic_submodule_getattr():
 def test_system1_isolated_subprocess_attribute_resolution():
     """Verify every public system1 submodule resolves in an isolated subprocess.
     
-    Prevents pre-import contamination (from reflex or engine) from masking lazy-loading defects.
+    Prevents pre-import contamination from masking lazy-loading defects.
     """
     import os
     import subprocess
@@ -454,89 +408,43 @@ sys.exit(0)
     )
 
 
-def test_twin_namespaces_isolated_subprocess_parity():
-    """Verify that both system1 and reflex provide identical dynamic submodule resolution in independent isolated subprocesses."""
-    import os
-    import subprocess
-    import sys
-
-    for pkg in ("system1", "reflex"):
-        code = f"""
-import sys
-import types
-import {pkg}
-
-ALL_SUBMODULES = {ALL_SUBMODULES!r}
-
-for sub in ALL_SUBMODULES:
-    assert hasattr({pkg}, sub), f"hasattr({pkg}, {{sub!r}}) is False"
-    val = getattr({pkg}, sub)
-    assert val is not None, f"getattr({pkg}, {{sub!r}}) is None"
-    assert isinstance(val, types.ModuleType), f"getattr({pkg}, {{sub!r}}) is not ModuleType"
-    assert val.__name__ == f"{pkg}.{{sub}}", f"Module name mismatch: {{val.__name__}}"
-"""
-        env = dict(os.environ)
-        env["PYTHONPATH"] = "src"
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        assert proc.returncode == 0, f"Isolated {pkg} dynamic submodule test failed:\n{proc.stdout}\n{proc.stderr}"
-
-
-def test_system1_and_reflex_negative_attribute_resolution():
-    """Verify that non-existent attributes raise AttributeError and hasattr is False on both namespaces."""
-    import reflex
-
-    for pkg, name in [(system1, "system1"), (reflex, "reflex")]:
-        for bad_attr in ["non_existent_module", "random_field_123", "", "_internal_unknown"]:
-            assert not hasattr(pkg, bad_attr), f"hasattr({name}, {bad_attr!r}) should be False"
-            with pytest.raises(AttributeError, match=f"module {name!r} has no attribute {bad_attr!r}"):
-                getattr(pkg, bad_attr)
+def test_system1_negative_attribute_resolution():
+    """Verify that non-existent attributes raise AttributeError and hasattr is False."""
+    for bad_attr in ["non_existent_module", "random_field_123", "", "_internal_unknown"]:
+        assert not hasattr(system1, bad_attr), f"hasattr(system1, {bad_attr!r}) should be False"
+        with pytest.raises(AttributeError, match=f"module 'system1' has no attribute {bad_attr!r}"):
+            getattr(system1, bad_attr)
 
 
 def test_submodule_inventory_and_module_map_completeness():
-    """Verify disk packages, module maps, and dir() agree across both namespaces."""
+    """Verify disk packages, module maps, and dir() agree."""
     import pkgutil
-    import reflex
 
     s1_disk = set(m.name for m in pkgutil.iter_modules(system1.__path__))
-    r_disk = set(m.name for m in pkgutil.iter_modules(reflex.__path__))
     expected = set(ALL_SUBMODULES)
 
     assert s1_disk == expected, f"system1 disk submodules mismatch: {s1_disk ^ expected}"
-    assert r_disk == expected, f"reflex disk submodules mismatch: {r_disk ^ expected}"
 
     # Verify every public submodule appears in dir().
     assert expected.issubset(set(dir(system1))), f"Missing from dir(system1): {expected - set(dir(system1))}"
-    assert expected.issubset(set(dir(reflex))), f"Missing from dir(reflex): {expected - set(dir(reflex))}"
 
 
 def test_spec_harmonization_aliases():
     """Verify spec harmonization aliases for exceptions, TypeSafeClient, and engine learning methods."""
-    import reflex
-    import system1
     from system1.integrations.langchain import SystemOneSecurityException, SystemOneGuardBlockedException
-    from reflex.integrations.langchain import SystemOneSecurityException as SystemOneSecurityExceptionReflex
 
     # 1. Exception alias parity
     assert SystemOneSecurityException is SystemOneGuardBlockedException
-    assert SystemOneSecurityExceptionReflex is SystemOneSecurityException
 
     # 2. TypeSafeClient agreement_threshold alias
     client = system1.compat.typesafe.TypeSafeClient(agreement_threshold=0.95)
     assert client.min_agreement_threshold == 0.95
-    client_r = reflex.compat.typesafe.TypeSafeClient(agreement_threshold=0.92)
-    assert client_r.min_agreement_threshold == 0.92
 
     # 3. Engine and Model System 2 / Tier 3 learning aliases & friendly learn / learn_from_outcome
     import inspect
 
     assert system1.SystemOneEngine.learn_from_system2 is system1.SystemOneEngine.learn_from_tier2
     assert system1.SystemOneEngine.learn_from_tier3 is system1.SystemOneEngine.learn_from_tier2
-    assert reflex.SystemOneEngine.learn_from_system2 is reflex.SystemOneEngine.learn_from_tier2
 
     assert system1.compiler.CompiledSystemOneModel.learn_from_system2 is system1.compiler.CompiledSystemOneModel.learn_from_tier2
     assert system1.core.SystemOneModel.learn_from_system2 is system1.core.SystemOneModel.learn_from_tier2
@@ -559,7 +467,7 @@ def test_spec_harmonization_aliases():
         assert "outcome" in sig_outcome.parameters
         assert "reward" in sig_outcome.parameters
 
-    # 4. Drop-in ecosystem replacement exports in system1, reflex, system1.integrations, reflex.integrations
+    # 4. Drop-in ecosystem replacement exports in system1 and system1.integrations
     drop_in_symbols = (
         "SemanticRoute",
         "RouteMatchResult",
@@ -578,8 +486,6 @@ def test_spec_harmonization_aliases():
     )
     for sym in drop_in_symbols:
         assert getattr(system1, sym) is getattr(system1.integrations, sym)
-        assert getattr(reflex, sym) is getattr(system1, sym)
-        assert getattr(reflex.integrations, sym) is getattr(system1.integrations, sym)
     assert system1.SystemOneRouteLayer is system1.InstinctRouteLayer
 
 

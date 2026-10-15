@@ -20,10 +20,11 @@ import logging
 import os
 from concurrent import futures
 from pathlib import Path
+import threading
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
-logger = logging.getLogger("reflex.grpc")
+logger = logging.getLogger("system1.grpc")
 
 # ---------------------------------------------------------------------------
 # Lazy gRPC imports — the module stays importable even without grpcio.
@@ -107,6 +108,7 @@ class SystemOneServiceServicer(_BaseServicer):
         self._signing_key = signing_key
         self._ledger = ledger
         self._policy_engine = policy_engine
+        self._lock = threading.Lock()
         self._engines: Dict[str, SystemOneEngine] = {}
         self._guard_hooks: Dict[str, SystemOneGuardHook] = {}
 
@@ -126,30 +128,51 @@ class SystemOneServiceServicer(_BaseServicer):
         from system1.engine import SystemOneEngine
 
         key = self._schema_key(schema_name, "triage")
-        if key not in self._engines:
-            schema = _load_schema_by_name(key, self._custom_schemas)
-            self._engines[key] = SystemOneEngine(
-                schema,
-                signing_key=self._signing_key,
-                ledger=self._ledger,
-                model_path=self._model_paths.get(key),
-                auto_reload=self._auto_reload,
-            )
-        return self._engines[key]
+        with self._lock:
+            if key not in self._engines:
+                schema = _load_schema_by_name(key, self._custom_schemas)
+                self._engines[key] = SystemOneEngine(
+                    schema,
+                    signing_key=self._signing_key,
+                    ledger=self._ledger,
+                    model_path=self._model_paths.get(key),
+                    auto_reload=self._auto_reload,
+                )
+            return self._engines[key]
 
     def _get_guard_hook(self, schema_name: str):
+        from system1.engine import SystemOneEngine
         from system1.guard import SystemOneGuardHook
 
         key = self._schema_key(schema_name, "guard")
-        if key not in self._guard_hooks:
-            engine = self._get_engine(key)
-            self._guard_hooks[key] = SystemOneGuardHook(
-                engine=engine,
-                signing_key=self._signing_key,
-                ledger=self._ledger,
-                policy=self._policy_engine,
-            )
-        return self._guard_hooks[key]
+        with self._lock:
+            if key not in self._guard_hooks:
+                if key == "guard" and key not in self._engines and key not in self._model_paths:
+                    hook = SystemOneGuardHook(
+                        engine=None,
+                        signing_key=self._signing_key,
+                        ledger=self._ledger,
+                        policy=self._policy_engine,
+                    )
+                    self._engines[key] = hook.engine
+                else:
+                    if key not in self._engines:
+                        schema = _load_schema_by_name(key, self._custom_schemas)
+                        self._engines[key] = SystemOneEngine(
+                            schema,
+                            signing_key=self._signing_key,
+                            ledger=self._ledger,
+                            model_path=self._model_paths.get(key),
+                            auto_reload=self._auto_reload,
+                        )
+                    hook = SystemOneGuardHook(
+                        engine=self._engines[key],
+                        signing_key=self._signing_key,
+                        ledger=self._ledger,
+                        policy=self._policy_engine,
+                    )
+                self._guard_hooks[key] = hook
+            return self._guard_hooks[key]
 
     def _schema_key(self, name: str, default: str) -> str:
         """Keep remote names within the finite startup registry, including aliases."""
@@ -201,6 +224,7 @@ class SystemOneServiceServicer(_BaseServicer):
             prompt = request.prompt if hasattr(request, "prompt") else request.get("prompt", "")
             schema_name = (request.schema_name if hasattr(request, "schema_name") else request.get("schema_name", "")) or "guard"
             alpha = (request.alpha if hasattr(request, "alpha") else request.get("alpha", 0.0)) or 0.05
+            telemetry_raw = request.telemetry if hasattr(request, "telemetry") else request.get("telemetry", {})
 
             if not prompt:
                 context.set_code(StatusCode.INVALID_ARGUMENT)
@@ -208,19 +232,10 @@ class SystemOneServiceServicer(_BaseServicer):
                 return _empty_guard_response(as_protobuf=is_proto)
 
             guard = self._get_guard_hook(schema_name)
-            guard.alpha = alpha
-            from system1.guard import ActionProposal, DecisionOutcome
+            telemetry = dict(telemetry_raw) if telemetry_raw else None
+            from system1.guard import DecisionOutcome
 
-            proposal = ActionProposal.create(
-                tenant_id="default",
-                principal_id="grpc_client",
-                scope="execution",
-                tool=schema_name,
-                arguments={"prompt": prompt},
-                purpose=prompt or f"Evaluate proposal for {schema_name}",
-            )
-
-            res = guard.evaluate_proposal(proposal, context_prompt=prompt)
+            res = guard.evaluate(prompt, telemetry=telemetry, alpha=alpha, tool=schema_name)
 
             if res.outcome == DecisionOutcome.ALLOW:
                 outcome_str = _GUARD_OUTCOME_ALLOW
@@ -733,7 +748,7 @@ def serve(
     if not _GRPC_AVAILABLE:
         raise ImportError(
             "grpcio is required for the gRPC server.  Install with: "
-            "pip install 'system1[grpc]'"
+            "pip install 'system1-instinct[grpc]'"
         )
 
     servicer = SystemOneServiceServicer(

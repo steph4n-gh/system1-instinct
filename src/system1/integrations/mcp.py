@@ -260,7 +260,7 @@ class SystemOneMCPProxy:
             elif method == "initialize":
                 result = {
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "reflex-mcp-guard", "version": "0.2.2"},
+                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.0.0"},
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":
@@ -374,7 +374,7 @@ class SystemOneMCPProxy:
         # Inject cryptographic witness metadata
         if interception and interception.decision_result:
             meta = result_payload.setdefault("_meta", {})
-            meta["reflex"] = {
+            meta["system1"] = {
                 "status": interception.outcome.value,
                 "latency_ms": interception.decision_result.latency_ms,
                 "digest": receipt_digest,
@@ -419,7 +419,7 @@ class SystemOneMCPProxy:
             elif method == "initialize":
                 result = {
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "reflex-mcp-guard", "version": "0.2.2"},
+                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.0.0"},
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":
@@ -500,7 +500,7 @@ class SystemOneMCPProxy:
 
         if interception and interception.decision_result:
             meta = result_payload.setdefault("_meta", {})
-            meta["reflex"] = {
+            meta["system1"] = {
                 "status": interception.outcome.value,
                 "latency_ms": interception.decision_result.latency_ms,
                 "digest": receipt_digest,

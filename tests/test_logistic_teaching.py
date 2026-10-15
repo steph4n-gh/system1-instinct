@@ -53,7 +53,7 @@ def test_logistic_saved_skill_needs_no_scipy_and_preserves_review(monkeypatch):
         assert actual.conformal_sets == expected.conformal_sets
         assert actual.is_ambiguous == expected.is_ambiguous
     assert before[-1].is_ambiguous
-    with pytest.raises(ImportError, match=r"system1\[teaching\]"):
+    with pytest.raises(ImportError, match=r"system1-instinct\[teaching\]"):
         compiler.compile({"intent": fit}, augment=False, calibration_exemplars={"intent": checks})
 
 

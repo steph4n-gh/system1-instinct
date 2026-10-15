@@ -160,9 +160,8 @@ def test_cli_verify_receipt_positional_and_syntax_alignment(tmp_path, capsys):
     assert "[SYSTEM1 ERROR] Receipt file not found" in missing_err
 
 
-def test_cli_verify_receipt_entrypoints_system1_and_reflex(tmp_path, capsys):
-    """Verifies verify-receipt across both system1 and reflex entrypoints with positional and flag syntax."""
-    import reflex.cli
+def test_cli_verify_receipt_entrypoint(tmp_path, capsys):
+    """Verifies verify-receipt on system1 entrypoint with positional and flag syntax."""
     import system1.cli
 
     # Create signed receipt
@@ -174,28 +173,27 @@ def test_cli_verify_receipt_entrypoints_system1_and_reflex(tmp_path, capsys):
     receipt_file = tmp_path / "entrypoint_receipt.json"
     receipt_file.write_text(json.dumps(receipt_data))
 
-    # Test both entrypoints
-    for entrypoint in [system1.cli.main, reflex.cli.main]:
-        # Positional syntax: <cli> verify-receipt <file> --json
-        assert entrypoint(["verify-receipt", str(receipt_file), "--public-key", str(tmp_path / "identity.pub"), "--json"]) == 0
-        res = json.loads(capsys.readouterr().out)
-        assert res["verified"] is True
-        assert res["decision_id"] == receipt_data["decision_id"]
+    entrypoint = system1.cli.main
+    # Positional syntax: <cli> verify-receipt <file> --json
+    assert entrypoint(["verify-receipt", str(receipt_file), "--public-key", str(tmp_path / "identity.pub"), "--json"]) == 0
+    res = json.loads(capsys.readouterr().out)
+    assert res["verified"] is True
+    assert res["decision_id"] == receipt_data["decision_id"]
 
-        # Positional syntax human readable: <cli> verify-receipt <file>
-        assert entrypoint(["verify-receipt", str(receipt_file), "--public-key", str(tmp_path / "identity.pub")]) == 0
-        human_out = capsys.readouterr().out
-        assert "[SYSTEM1 RECEIPT VERIFICATION] SUCCESS" in human_out
+    # Positional syntax human readable: <cli> verify-receipt <file>
+    assert entrypoint(["verify-receipt", str(receipt_file), "--public-key", str(tmp_path / "identity.pub")]) == 0
+    human_out = capsys.readouterr().out
+    assert "[SYSTEM1 RECEIPT VERIFICATION] SUCCESS" in human_out
 
-        # Flag syntax: <cli> verify-receipt --receipt <file> --json
-        assert entrypoint(["verify-receipt", "--receipt", str(receipt_file), "--public-key", str(tmp_path / "identity.pub"), "--json"]) == 0
-        res_flag = json.loads(capsys.readouterr().out)
-        assert res_flag["verified"] is True
+    # Flag syntax: <cli> verify-receipt --receipt <file> --json
+    assert entrypoint(["verify-receipt", "--receipt", str(receipt_file), "--public-key", str(tmp_path / "identity.pub"), "--json"]) == 0
+    res_flag = json.loads(capsys.readouterr().out)
+    assert res_flag["verified"] is True
 
-        # Flag syntax human readable: <cli> verify-receipt --receipt <file>
-        assert entrypoint(["verify-receipt", "--receipt", str(receipt_file), "--public-key", str(tmp_path / "identity.pub")]) == 0
-        human_flag_out = capsys.readouterr().out
-        assert "[SYSTEM1 RECEIPT VERIFICATION] SUCCESS" in human_flag_out
+    # Flag syntax human readable: <cli> verify-receipt --receipt <file>
+    assert entrypoint(["verify-receipt", "--receipt", str(receipt_file), "--public-key", str(tmp_path / "identity.pub")]) == 0
+    human_flag_out = capsys.readouterr().out
+    assert "[SYSTEM1 RECEIPT VERIFICATION] SUCCESS" in human_flag_out
 
 
 def test_cli_main_entrypoint(capsys):
