@@ -139,6 +139,12 @@ You can also run:
   # Or pull fresh live issues on demand via GitHub CLI (`gh api`):
   python examples/dogfood/live_github_triage.py --live --repo astral-sh/uv
   ```
+- **Live US FDA Enforcement Recall Triage Dogfood (`openFDA` + `astral-sh/uv` OOS)** ([`examples/dogfood/live_fda_recall_triage.py`](examples/dogfood/live_fda_recall_triage.py), snapshot in [`examples/dogfood/fda_live_recalls_snapshot.json`](examples/dogfood/fda_live_recalls_snapshot.json)): replays `297` real chronologically ordered US FDA enforcement recall reports (`20121212 -> 20261007`, `33/cell` across `food`, `drug`, `device` $\times$ `Class I`, `Class II`, `Class III`, zero synthetic strings, zero temporal leakage) across a **3-field multi-head schema** (`regulatory_center`, `hazard_class`, `urgent_class_i_escalation`) plus `25` real `astral-sh/uv` out-of-scope software issues from **`0` examples (`0.0%` offload, `100%` escalated)** $\to$ **online warm-up (`10.0%` offload at `100.0%` precision)** $\to$ **compiled `.s1m` (`45.8%` at `12/cell` $\to$ `55.6%` at `18/cell` $\to$ `70.8%` local offload at `25/cell` in `0.38 ms` with `98.0%` joint 3-field precision, `100.0%` center precision, `100.0%` OOS abstention, and `100%` `.s1m` reload parity)**:
+  ```bash
+  python examples/dogfood/live_fda_recall_triage.py
+  # Or pull fresh live enforcement recall reports on demand from api.fda.gov:
+  python examples/dogfood/live_fda_recall_triage.py --live
+  ```
 - **3-Wave Teacher Auto-Cutover Demo** ([`examples/drop_in/llm_cutover_dropin.py`](examples/drop_in/llm_cutover_dropin.py)).
 
 ### How Many Examples Does It Actually Take?

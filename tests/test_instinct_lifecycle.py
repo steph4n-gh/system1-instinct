@@ -2618,3 +2618,97 @@ def test_live_github_triage_dogfood_lifecycle(tmp_path, monkeypatch):
         mod._gh_api_get("repos/astral-sh/uv/issues")
 
 
+def test_live_fda_recall_triage_dogfood_lifecycle(tmp_path, monkeypatch):
+    import importlib.util
+    import urllib.error
+    import urllib.request
+    from pathlib import Path
+
+    script_path = Path(__file__).resolve().parents[1] / "examples" / "dogfood" / "live_fda_recall_triage.py"
+    spec = importlib.util.spec_from_file_location("live_fda_recall_triage", script_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    report = mod.run_live_fda_recall_triage(quiet=True)
+
+    # 1. Dataset & strict chronological split integrity (zero temporal leakage)
+    assert report["primary_source"] == "openFDA Enforcement API (food, drug, device)"
+    assert report["oos_source"] == "astral-sh/uv"
+    assert report["total_primary_recalls"] == 297
+    assert report["total_oos_issues"] == 25
+    t_lo, t_hi = report["train_chronological_range"]
+    h_lo, h_hi = report["heldout_chronological_range"]
+    assert t_lo < t_hi < h_lo < h_hi
+
+    # 2. Stage 1: Cold Start (0 examples, first 10 recalls) safely abstains 100%
+    s1 = report["stage1_cold_start"]
+    assert s1["local_offload_count"] == 0
+    assert s1["local_offload_rate"] == 0.0
+    assert s1["escalated_count"] == 10
+    assert s1["end_to_end_accuracy"] == 1.0
+
+    # 3. Stage 2: Online Warm-Up (Recalls 11-50) begins offloading repeat patterns locally
+    s2 = report["stage2_online_warmup"]
+    assert s2["local_offload_count"] >= 3
+    assert s2["local_precision"] >= 0.75
+    assert s2["end_to_end_accuracy"] >= 0.95
+
+    # 4. Stage 3 & Stage 4: Auto-Cutover Checkpoints (12/cell -> 18/cell -> 25/cell) + OOS Gate
+    c12, c18, c25 = report["stage3_checkpoints"]
+    assert c12["local_offload_rate"] < c18["local_offload_rate"] < c25["local_offload_rate"]
+    assert c12["local_offload_rate"] >= 0.40
+    assert c25["local_offload_rate"] >= 0.65
+    assert c18["local_precision"] >= 0.95
+    assert c25["local_precision"] >= 0.95
+    assert c25["center_local_precision"] == 1.0
+    for ckpt in (c12, c18, c25):
+        assert ckpt["observed_examples"] + ckpt["evaluated_recalls"] <= report["total_primary_recalls"]
+        assert ckpt["local_precision"] >= 0.90
+        assert ckpt["end_to_end_accuracy"] >= 0.95
+        assert ckpt["oos_abstention_rate"] >= 0.96
+        assert ckpt["p50_latency_ms"] < 2.0
+
+    # 5. Stage 5: .s1m Save & Reload Parity
+    s5 = report["stage5_reload_parity"]
+    assert s5["parity_matches"] == 72
+    assert s5["parity_rate"] == 1.0
+    assert 30.0 <= s5["artifact_size_kb"] <= 250.0
+
+    # 6. Regression test: smaller (<297 recall) snapshot dynamically scales checkpoints with zero train/test overlap
+    full_snap = json.loads(mod.DEFAULT_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    sub_recalls = list(full_snap["recalls"][:180])
+    sub_snap_path = tmp_path / "sub_fda_snapshot_180.json"
+    sub_snap_path.write_text(
+        json.dumps({**full_snap, "recalls": sub_recalls}),
+        encoding="utf-8",
+    )
+    sub_report = mod.run_live_fda_recall_triage(snapshot_path=sub_snap_path, quiet=True)
+    assert sub_report["total_primary_recalls"] == 180
+    st_lo, st_hi = sub_report["train_chronological_range"]
+    sh_lo, sh_hi = sub_report["heldout_chronological_range"]
+    assert st_lo <= st_hi <= sh_lo <= sh_hi
+    for ckpt in sub_report["stage3_checkpoints"]:
+        assert ckpt["observed_examples"] + ckpt["evaluated_recalls"] <= 180
+    assert (
+        sub_report["stage3_checkpoints"][-1]["observed_examples"]
+        + sub_report["stage3_checkpoints"][-1]["evaluated_recalls"]
+        == 180
+    )
+    assert sub_report["stage5_reload_parity"]["parity_rate"] == 1.0
+
+    # 7. Error handling when openFDA API returns HTTP 500
+    def _raise_http_500(*args, **kwargs):
+        raise urllib.error.HTTPError(
+            url="https://api.fda.gov/food/enforcement.json",
+            code=500,
+            msg="Internal Server Error",
+            hdrs=None,
+            fp=None,
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _raise_http_500)
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        mod._query_openfda_window("food", "Class I", "20240101", "20241231")
+
+
