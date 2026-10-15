@@ -3581,152 +3581,177 @@
     {
       "number": 491,
       "title": "Nest cache directories to avoid too large directories",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Instead of e.g. placing all pypi metadata in a directory, we should consider adding subdirectory levels to avoid large directories with multiple thousand entries that slow down fs operations. cache and git e.g. do this by using the first to letter of",
+      "source": "astral-sh/uv",
+      "body_snippet": "Instead of e.g. placing all pypi metadata in a directory, we should consider adding subdirectory levels to avoid large directories with multiple thousand entries that slow down fs operations. cache and git e.g. do this by using the first to letter of"
     },
     {
       "number": 537,
       "title": "Invalid unpack operation when building source distribution",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Running `cargo run -p puffin-cli -- pip-sync ../ruff-lsp/requirements-dev.txt` is giving me: ```text error: Failed to download distributions Caused by: Failed to build: ujson==5.7.0 Caused by: Failed to install requirements from build-system.requires",
+      "source": "astral-sh/uv",
+      "body_snippet": "Running `cargo run -p puffin-cli -- pip-sync ../ruff-lsp/requirements-dev.txt` is giving me: ```text error: Failed to download distributions Caused by: Failed to build: ujson==5.7.0 Caused by: Failed to install requirements from build-system.requires"
     },
     {
       "number": 554,
       "title": "Repeatedly building local source distribution fails",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "I'm getting, e.g.: ```text error: Failed to download distributions Caused by: Failed to build: service @ file:///Users/crmarsh/workspace/path/service Caused by: failed to rename file from /Users/crmarsh/Library/Caches/puffin/built-wheels-v0/c61d38458",
+      "source": "astral-sh/uv",
+      "body_snippet": "I'm getting, e.g.: ```text error: Failed to download distributions Caused by: Failed to build: service @ file:///Users/crmarsh/workspace/path/service Caused by: failed to rename file from /Users/crmarsh/Library/Caches/puffin/built-wheels-v0/c61d38458"
     },
     {
       "number": 721,
       "title": "Add support for relative URLs in simple metadata responses",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "## Summary This PR adds support for relative URLs in the simple JSON responses. We already support relative URLs for HTML responses, but the handling has been consolidated between the two. Similar to index URLs, we now store the base alongside the me",
+      "source": "astral-sh/uv",
+      "body_snippet": "## Summary This PR adds support for relative URLs in the simple JSON responses. We already support relative URLs for HTML responses, but the handling has been consolidated between the two. Similar to index URLs, we now store the base alongside the me"
     },
     {
       "number": 817,
       "title": "Improve contributing documentation",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "- Add a link to the README - Add some basic guidelines to CONTRIBUTING - Describe the architecture of the project - Ensure `scripts` projects have README files - Link to relevant scripts in CONTRIBUTING",
+      "source": "astral-sh/uv",
+      "body_snippet": "- Add a link to the README - Add some basic guidelines to CONTRIBUTING - Describe the architecture of the project - Ensure `scripts` projects have README files - Link to relevant scripts in CONTRIBUTING"
     },
     {
       "number": 856,
       "title": "Unzip while downloading",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Results: ``` torch==1.12.1: 1.13 ± 0.03 times faster trio.txt: 1.10 ± 0.11 times faster flyte.txt: 1.07 ± 0.02 times faster boto3.txt: 1.09 ± 0.11 times faster black.txt: 1.05 ± 0.24 times faster boto3==1.34.14: 1.04 ± 0.16 times faster pdm2193.txt: ",
+      "source": "astral-sh/uv",
+      "body_snippet": "Results: ``` torch==1.12.1: 1.13 ± 0.03 times faster trio.txt: 1.10 ± 0.11 times faster flyte.txt: 1.07 ± 0.02 times faster boto3.txt: 1.09 ± 0.11 times faster black.txt: 1.05 ± 0.24 times faster boto3==1.34.14: 1.04 ± 0.16 times faster pdm2193.txt: "
     },
     {
       "number": 1053,
       "title": "Run tests in CI on macOS",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Currently we only run CI tests on Linux. We could include tests for macOS, but it's expensive. Regardless, the project fails to compile https://github.com/astral-sh/puffin/actions/runs/7618370740/job/20749516326",
+      "source": "astral-sh/uv",
+      "body_snippet": "Currently we only run CI tests on Linux. We could include tests for macOS, but it's expensive. Regardless, the project fails to compile https://github.com/astral-sh/puffin/actions/runs/7618370740/job/20749516326"
     },
     {
       "number": 1063,
       "title": "Improve retry of pip install scenario tests",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Follow-up to #996 with retries of the full `pip_install_scenario` module since there are a few tests that flake and tracking down the non-determinism is proving to be quite complicated. Adds a profile that can be used to disable retries, e.g. `--prof",
+      "source": "astral-sh/uv",
+      "body_snippet": "Follow-up to #996 with retries of the full `pip_install_scenario` module since there are a few tests that flake and tracking down the non-determinism is proving to be quite complicated. Adds a profile that can be used to disable retries, e.g. `--prof"
     },
     {
       "number": 1234,
       "title": "Document profiling and tracing-durations-export",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Profiling is already extensively documented in ruff, so we can just link to that guide. I added `tracing-durations-export` to the guide because i found it a useful tool for optimizing.",
+      "source": "astral-sh/uv",
+      "body_snippet": "Profiling is already extensively documented in ruff, so we can just link to that guide. I added `tracing-durations-export` to the guide because i found it a useful tool for optimizing."
     },
     {
       "number": 1339,
       "title": "`pip install --trusted-host` support",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "`pip install` has the `trusted-host` flag: ``` --trusted-host <hostname> Mark this host or host:port pair as trusted, even though it does not have valid or any HTTPS. ``` Seems like a nice-to-have for `uv pip install` to also support this flag.",
+      "source": "astral-sh/uv",
+      "body_snippet": "`pip install` has the `trusted-host` flag: ``` --trusted-host <hostname> Mark this host or host:port pair as trusted, even though it does not have valid or any HTTPS. ``` Seems like a nice-to-have for `uv pip install` to also support this flag."
     },
     {
       "number": 1411,
       "title": "Update README.md to include venv activate",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "This is just a small readme change to include venv activation. In case someone just follows the docs as-is, they will end up installing packages outside of the desired virtual env.",
+      "source": "astral-sh/uv",
+      "body_snippet": "This is just a small readme change to include venv activation. In case someone just follows the docs as-is, they will end up installing packages outside of the desired virtual env."
     },
     {
       "number": 1431,
       "title": "Docs: `contributing.md` Python section anchor does not exist",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "> See the [Python](#python) section for instructions on installing the Python versions. `#python` does not currently exist in this file. https://github.com/JacobCoffee/uv/blob/2586f655bbf650a9797c8f88b6d9066eefe7a3dc/CONTRIBUTING.md#L30",
+      "source": "astral-sh/uv",
+      "body_snippet": "> See the [Python](#python) section for instructions on installing the Python versions. `#python` does not currently exist in this file. https://github.com/JacobCoffee/uv/blob/2586f655bbf650a9797c8f88b6d9066eefe7a3dc/CONTRIBUTING.md#L30"
     },
     {
       "number": 1434,
       "title": "fix(docs): adjust link",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "## What Fixes a missing link in `contributing.md` to the Python installation section by rearranging the section and adding a 3rd-level heading for #Python ## Closes Closes #1431",
+      "source": "astral-sh/uv",
+      "body_snippet": "## What Fixes a missing link in `contributing.md` to the Python installation section by rearranging the section and adding a 3rd-level heading for #Python ## Closes Closes #1431"
     },
     {
       "number": 1442,
       "title": "Implement `--report` for `uv pip install`",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "From the `pip` docs: > The `--report` option of the pip install command produces a detailed JSON report of what it did install (or what it would have installed, if used with the `--dry-run` option). This produces a nice JSON report that's essentially",
+      "source": "astral-sh/uv",
+      "body_snippet": "From the `pip` docs: > The `--report` option of the pip install command produces a detailed JSON report of what it did install (or what it would have installed, if used with the `--dry-run` option). This produces a nice JSON report that's essentially"
     },
     {
       "number": 1455,
       "title": "`uv` fails to install `pyyaml==5.4.1`",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "`uv pip install \"pyyaml<6\"` ``` Resolved 1 package in 0ms error: Failed to download distributions Caused by: Failed to fetch wheel: pyyaml==5.4.1 Caused by: Failed to build: pyyaml==5.4.1 Caused by: Build backend failed to determine extra requires wi",
+      "source": "astral-sh/uv",
+      "body_snippet": "`uv pip install \"pyyaml<6\"` ``` Resolved 1 package in 0ms error: Failed to download distributions Caused by: Failed to fetch wheel: pyyaml==5.4.1 Caused by: Failed to build: pyyaml==5.4.1 Caused by: Build backend failed to determine extra requires wi"
     },
     {
       "number": 1491,
       "title": "uv pip install inconsistent failure on Windows",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "- Windows 22H2 - Using PowerShell env (in either Windows Terminal or powershell.exe, non-elevated) When using `uv pip install -r requirements.txt`, I will frequently get the following error: ``` error: Failed to download distributions Caused by: Fail",
+      "source": "astral-sh/uv",
+      "body_snippet": "- Windows 22H2 - Using PowerShell env (in either Windows Terminal or powershell.exe, non-elevated) When using `uv pip install -r requirements.txt`, I will frequently get the following error: ``` error: Failed to download distributions Caused by: Fail"
     },
     {
       "number": 1514,
       "title": "Private git dependency URLs with credentials do not resolve",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Working with private git repos that require a username and token to resolve seems to fail in `uv`: ``` uv pip install '{packagename} @ git+https://{username}@github.com/{organization}/{packagename}.git' Updating https://{username}/ (github.com/{organ",
+      "source": "astral-sh/uv",
+      "body_snippet": "Working with private git repos that require a username and token to resolve seems to fail in `uv`: ``` uv pip install '{packagename} @ git+https://{username}@github.com/{organization}/{packagename}.git' Updating https://{username}/ (github.com/{organ"
     },
     {
       "number": 1516,
       "title": "Feature request: add a way to install only build dependencies",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "ref: https://github.com/pypa/pip/issues/11440#issuecomment-1615211774 In our CI, we often need to install build-dependencies for a project, without installing the project itself. At the moment, there is no easy way of telling pip to do that. We've re",
+      "source": "astral-sh/uv",
+      "body_snippet": "ref: https://github.com/pypa/pip/issues/11440#issuecomment-1615211774 In our CI, we often need to install build-dependencies for a project, without installing the project itself. At the moment, there is no easy way of telling pip to do that. We've re"
     },
     {
       "number": 1517,
       "title": "Add `-t/--target` flag for `uv pip install`",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "This option is used a lot for vendoring and for custom build systems. From `pip install --help`: ```sh -t, --target <dir> Install packages into <dir>. By default this will not replace existing files/folders in <dir>. Use --upgrade to replace existing",
+      "source": "astral-sh/uv",
+      "body_snippet": "This option is used a lot for vendoring and for custom build systems. From `pip install --help`: ```sh -t, --target <dir> Install packages into <dir>. By default this will not replace existing files/folders in <dir>. Use --upgrade to replace existing"
     },
     {
       "number": 1520,
       "title": "No keyring support for authentication",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "It appears `uv` does not have support for keyring like pip does. https://pip.pypa.io/en/stable/topics/authentication/#keyring-support",
+      "source": "astral-sh/uv",
+      "body_snippet": "It appears `uv` does not have support for keyring like pip does. https://pip.pypa.io/en/stable/topics/authentication/#keyring-support"
     },
     {
       "number": 1525,
       "title": "Uninstalling then reinstalling a package produces METADATA error",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Steps to reproduce: * Installing some package, let's say `pandas` ``` uv venv env1 -p 3.10 source env1/bin/activate uv pip install pandas ``` * Uninstalling it and installing it again: ``` uv pip uninstall pandas uv pip install pandas ``` * Produces ",
+      "source": "astral-sh/uv",
+      "body_snippet": "Steps to reproduce: * Installing some package, let's say `pandas` ``` uv venv env1 -p 3.10 source env1/bin/activate uv pip install pandas ``` * Uninstalling it and installing it again: ``` uv pip uninstall pandas uv pip install pandas ``` * Produces "
     },
     {
       "number": 1656,
       "title": "Virtualenv creation is failing on Python embedded versions",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Hi, When I try to create a virtualenv from a Python Embedded version on Windows I get the following error: ```cmd Using Python 3.7.9 interpreter at C:\\Users\\alex\\Documents\\Python\\python-3.7.9-embed-amd64\\python.exe Creating virtualenv at: .venv uv::v",
+      "source": "astral-sh/uv",
+      "body_snippet": "Hi, When I try to create a virtualenv from a Python Embedded version on Windows I get the following error: ```cmd Using Python 3.7.9 interpreter at C:\\Users\\alex\\Documents\\Python\\python-3.7.9-embed-amd64\\python.exe Creating virtualenv at: .venv uv::v"
     },
     {
       "number": 1668,
       "title": "fix: use --override rather than -o to specify overrides in README.md",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "## Summary Fix documentation (Readme.md): `-o` is the short for `--output-file`, so using `-o overrides.txt` would store the output in `overrides.txt` rather than using that as overrides. ## Test Plan no tests for docs (yet?)",
+      "source": "astral-sh/uv",
+      "body_snippet": "## Summary Fix documentation (Readme.md): `-o` is the short for `--output-file`, so using `-o overrides.txt` would store the output in `overrides.txt` rather than using that as overrides. ## Test Plan no tests for docs (yet?)"
     },
     {
       "number": 1737,
       "title": "Performance with large git repos",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "Hi, I found a situation where uv is significantly slower than pip: installing from a large git repo. Reproducer: `uv -v pip install \"odoo @ git+https://github.com/odoo/odoo@17.0\"` (warning: this requires ~6GB disk space and a ~4GB download). After th",
+      "source": "astral-sh/uv",
+      "body_snippet": "Hi, I found a situation where uv is significantly slower than pip: installing from a large git repo. Reproducer: `uv -v pip install \"odoo @ git+https://github.com/odoo/odoo@17.0\"` (warning: this requires ~6GB disk space and a ~4GB download). After th"
     },
     {
       "number": 1753,
       "title": "Tracking Issue: Make test suite pass on alpine",
-      "body": "",
-      "source": "astral-sh/uv"
+      "body": "For better musl support, we should add alpine to CI. The first step to that is making the test suite pass on alpine. We are currently at 8 failures. Each test failure needs to be triaged and either fixed or the test ignored. Afterwards, we need a scr",
+      "source": "astral-sh/uv",
+      "body_snippet": "For better musl support, we should add alpine to CI. The first step to that is making the test suite pass on alpine. We are currently at 8 failures. Each test failure needs to be triaged and either fixed or the test ignored. Afterwards, we need a scr"
     }
   ]
 }

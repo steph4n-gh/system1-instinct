@@ -41,7 +41,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -661,13 +663,19 @@ def format_recall_prompt(item: Mapping[str, Any]) -> str:
     prod = " ".join(str(item.get("product_description", "")).split())[:160]
     reason = " ".join(str(item.get("reason_for_recall", "")).split())[:320]
     code = " ".join(str(item.get("code_info", "")).split())[:80]
+    dist = " ".join(str(item.get("distribution_pattern", "")).split())[:80]
+    if dist and not code:
+        code = dist
+    elif dist:
+        code = f"{code} | Dist: {dist}"[:100]
     return f"Reason for Recall: {reason}\nProduct: {prod}\nCode Info: {code}"
 
 
 def format_oos_issue_prompt(issue: Mapping[str, Any]) -> str:
     """Format an out-of-scope software engineering issue prompt."""
     title = " ".join(str(issue.get("title", "")).split())
-    body = " ".join(str(issue.get("body", "")).split())[:420]
+    raw_body = issue.get("body_snippet") or issue.get("body") or ""
+    body = " ".join(str(raw_body).split())[:420]
     return f"Title: {title}\nBody: {body}" if body else f"Title: {title}"
 
 
@@ -760,6 +768,28 @@ def fetch_live_fda_recalls(
     oos_count: int = 25,
 ) -> Dict[str, Any]:
     """Fetch 297 real FDA enforcement reports across 6 chronological windows from openFDA."""
+    query_tasks: List[Tuple[int, str, str, str, str]] = [
+        (w_idx, center, hazard, date_lo, date_hi)
+        for center, hazard in CELLS
+        for w_idx, (date_lo, date_hi, _quota) in enumerate(CHRONOLOGICAL_WINDOWS)
+    ]
+
+    def _run_task(
+        task: Tuple[int, str, str, str, str],
+    ) -> Tuple[Tuple[int, str, str], List[Dict[str, Any]]]:
+        w_idx, center, hazard, date_lo, date_hi = task
+        rows = _query_openfda_window(
+            center=center,
+            hazard_class=hazard,
+            date_lo=date_lo,
+            date_hi=date_hi,
+            limit=300,
+        )
+        return (w_idx, center, hazard), rows
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        raw_by_cell_window = dict(pool.map(_run_task, query_tasks))
+
     seen_recall_numbers: set[str] = set()
     seen_events: set[str] = set()
     seen_reasons: set[str] = set()
@@ -767,13 +797,7 @@ def fetch_live_fda_recalls(
 
     for center, hazard in CELLS:
         for w_idx, (date_lo, date_hi, _quota) in enumerate(CHRONOLOGICAL_WINDOWS):
-            raw_rows = _query_openfda_window(
-                center=center,
-                hazard_class=hazard,
-                date_lo=date_lo,
-                date_hi=date_hi,
-                limit=300,
-            )
+            raw_rows = raw_by_cell_window[(w_idx, center, hazard)]
             candidates: List[Dict[str, Any]] = []
             for row in raw_rows:
                 recall_num = str(row.get("recall_number", "")).strip()
@@ -842,18 +866,25 @@ def fetch_live_fda_recalls(
 
     selected_recalls.sort(key=lambda x: (x["report_date"], x["recall_number"]))
 
+    if not oos_uv_snapshot_path.is_file():
+        raise FileNotFoundError(
+            f"OOS snapshot file not found: {oos_uv_snapshot_path}"
+        )
     oos_issues: List[Dict[str, Any]] = []
-    if oos_uv_snapshot_path.exists():
-        uv_data = json.loads(oos_uv_snapshot_path.read_text(encoding="utf-8"))
-        for raw_iss in list(uv_data.get("issues", []))[:oos_count]:
-            oos_issues.append(
-                {
-                    "number": int(raw_iss["number"]),
-                    "title": str(raw_iss["title"]),
-                    "body": str(raw_iss.get("body", ""))[:420],
-                    "source": "astral-sh/uv",
-                }
-            )
+    uv_data = json.loads(oos_uv_snapshot_path.read_text(encoding="utf-8"))
+    for raw_iss in list(uv_data.get("issues", []))[:oos_count]:
+        body_text = str(
+            raw_iss.get("body_snippet") or raw_iss.get("body") or ""
+        )[:420]
+        oos_issues.append(
+            {
+                "number": int(raw_iss["number"]),
+                "title": str(raw_iss["title"]),
+                "body": body_text,
+                "body_snippet": body_text,
+                "source": "astral-sh/uv",
+            }
+        )
 
     return {
         "primary_source": "openFDA Enforcement API (food, drug, device)",
@@ -872,16 +903,18 @@ def load_or_fetch_snapshot(
     save_snapshot: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Load cached openFDA recall snapshot or fetch fresh from `api.fda.gov`."""
-    if live or not snapshot_path.exists():
+    if live:
         snapshot = fetch_live_fda_recalls()
-        target_out = save_snapshot or (snapshot_path if not snapshot_path.exists() else None)
-        if target_out is not None:
-            target_out.parent.mkdir(parents=True, exist_ok=True)
-            target_out.write_text(
+        if save_snapshot is not None:
+            save_snapshot.parent.mkdir(parents=True, exist_ok=True)
+            save_snapshot.write_text(
                 json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
         return snapshot
+
+    if not snapshot_path.is_file():
+        raise FileNotFoundError(f"Snapshot file not found: {snapshot_path}")
 
     snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
     if save_snapshot is not None:
@@ -916,8 +949,8 @@ def _compile_checkpoint_engine(
         [text for text, _ in ex_joint],
         labels=[label for _, label in ex_joint],
         selection="chi2",
-        char_ngrams=(3, 5),
-        max_features=2048,
+        char_ngrams=(4, 5),
+        max_features=1792,
     )
     compiler = SystemOneCompiler(
         FdaRecallTriageSchema,
@@ -966,6 +999,17 @@ def run_live_fda_recall_triage(
     quiet: bool = False,
 ) -> Dict[str, Any]:
     """Execute all 5 production lifecycle stages on real openFDA enforcement recalls."""
+    if (
+        isinstance(conformal_alpha, bool)
+        or not isinstance(conformal_alpha, (int, float))
+        or not math.isfinite(conformal_alpha)
+        or not (0.0 < float(conformal_alpha) < 1.0)
+    ):
+        raise ValueError(
+            f"conformal_alpha must be finite and in (0.0, 1.0), got {conformal_alpha!r}."
+        )
+    conformal_alpha = float(conformal_alpha)
+
     t_start = time.perf_counter()
     snapshot = load_or_fetch_snapshot(
         snapshot_path=snapshot_path,
@@ -978,9 +1022,14 @@ def run_live_fda_recall_triage(
     # Verify strict chronological ordering (`oldest -> newest` by (report_date, recall_number))
     sort_keys = [(str(it["report_date"]), str(it["recall_number"])) for it in recalls]
     recall_nums = [str(it["recall_number"]) for it in recalls]
-    if sort_keys != sorted(sort_keys) or len(set(recall_nums)) != len(recall_nums):
+    if (
+        sort_keys != sorted(sort_keys)
+        or len(set(recall_nums)) != len(recall_nums)
+        or any(not re.fullmatch(r"\d{8}", d) or not rn.strip() for d, rn in sort_keys)
+    ):
         raise ValueError(
-            "Recalls must be unique and in strict ascending chronological order by (report_date, recall_number)."
+            "Recalls must have 8-digit YYYYMMDD report_date, unique recall_number, "
+            "and strict ascending chronological order by (report_date, recall_number)."
         )
 
     n_cells = len(CELLS)
@@ -1202,6 +1251,7 @@ def run_live_fda_recall_triage(
                     "truth": truth,
                     "predicted": pred,
                     "is_ambiguous": bool(dec.is_ambiguous),
+                    "ambiguous_fields": list(dec.ambiguous_fields),
                     "latency_ms": dt_ms,
                 }
             )
@@ -1223,6 +1273,7 @@ def run_live_fda_recall_triage(
                     "number": int(oos_it["number"]),
                     "title": str(oos_it["title"]),
                     "is_ambiguous": bool(oos_dec.is_ambiguous),
+                    "ambiguous_fields": list(oos_dec.ambiguous_fields),
                     "latency_ms": dt_ms,
                 }
             )
@@ -1286,6 +1337,7 @@ def run_live_fda_recall_triage(
             if (
                 orig_res.values == load_res.values
                 and orig_res.is_ambiguous == load_res.is_ambiguous
+                and orig_res.ambiguous_fields == load_res.ambiguous_fields
                 and orig_res.conformal_sets == load_res.conformal_sets
                 and orig_res.confidences == load_res.confidences
             ):
@@ -1425,23 +1477,25 @@ def _print_report(report: Mapping[str, Any]) -> None:
     escalated_samples = [s for s in samples if s["is_ambiguous"]][:3]
 
     for s in local_samples + escalated_samples:
-        reason_short = s["reason_for_recall"][:50] + (
-            "..." if len(s["reason_for_recall"]) > 50 else ""
+        reason_short = s["reason_for_recall"][:42] + (
+            "..." if len(s["reason_for_recall"]) > 42 else ""
         )
         t_c = s["truth"]["regulatory_center"]
         t_h = s["truth"]["hazard_class"]
+        t_u = s["truth"]["urgent_class_i_escalation"]
         if not s["is_ambiguous"]:
             p_c = s["predicted"]["regulatory_center"]
             p_h = s["predicted"]["hazard_class"]
             p_u = s["predicted"]["urgent_class_i_escalation"]
             mark = "✓" if s["predicted"] == s["truth"] else "✗"
             status = f"[LOCAL {s['latency_ms']:.2f}ms {mark}]"
-            route = f"-> {p_c}/{p_h} (urgent={p_u})"
+            route = f"-> {p_c} | {p_h} | urgent={p_u}"
         else:
-            status = "[ESCALATE -> REVIEW]"
-            route = f"(truth: {t_c}/{t_h})"
+            amb = ",".join(s.get("ambiguous_fields", []))
+            status = f"[ESCALATE {s['latency_ms']:.2f}ms]"
+            route = f"({t_c} | {t_h} | urgent={t_u}; amb={amb})"
         print(
-            f"  {status:<21} {s['recall_number']:<12} {route:<31} | {reason_short}"
+            f"  {status:<20} {s['recall_number']:<12} ({s['report_date']}) {route:<38} | {reason_short}"
         )
 
     print(

@@ -2641,6 +2641,21 @@ def test_live_fda_recall_triage_dogfood_lifecycle(tmp_path, monkeypatch):
     h_lo, h_hi = report["heldout_chronological_range"]
     assert t_lo < t_hi < h_lo < h_hi
 
+    full_snap = json.loads(mod.DEFAULT_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    for oos_item in full_snap["oos_issues"]:
+        assert len(str(oos_item.get("body", "")).strip()) >= 15
+        assert "\nBody: " in mod.format_oos_issue_prompt(oos_item)
+
+    dist_prompt = mod.format_recall_prompt(
+        {
+            "product_description": "Sterile Saline 0.9%",
+            "reason_for_recall": "Lack of sterility assurance",
+            "code_info": "Lot 1234",
+            "distribution_pattern": "Nationwide hospital pharmacies",
+        }
+    )
+    assert "Dist: Nationwide hospital pharmacies" in dist_prompt
+
     # 2. Stage 1: Cold Start (0 examples, first 10 recalls) safely abstains 100%
     s1 = report["stage1_cold_start"]
     assert s1["local_offload_count"] == 0
@@ -2657,17 +2672,22 @@ def test_live_fda_recall_triage_dogfood_lifecycle(tmp_path, monkeypatch):
     # 4. Stage 3 & Stage 4: Auto-Cutover Checkpoints (12/cell -> 18/cell -> 25/cell) + OOS Gate
     c12, c18, c25 = report["stage3_checkpoints"]
     assert c12["local_offload_rate"] < c18["local_offload_rate"] < c25["local_offload_rate"]
-    assert c12["local_offload_rate"] >= 0.40
+    assert c12["local_offload_rate"] >= 0.45
     assert c25["local_offload_rate"] >= 0.65
+    assert c12["local_precision"] >= 0.93
     assert c18["local_precision"] >= 0.95
     assert c25["local_precision"] >= 0.95
     assert c25["center_local_precision"] == 1.0
     for ckpt in (c12, c18, c25):
         assert ckpt["observed_examples"] + ckpt["evaluated_recalls"] <= report["total_primary_recalls"]
-        assert ckpt["local_precision"] >= 0.90
+        assert ckpt["local_precision"] >= 0.93
         assert ckpt["end_to_end_accuracy"] >= 0.95
         assert ckpt["oos_abstention_rate"] >= 0.96
-        assert ckpt["p50_latency_ms"] < 2.0
+        assert ckpt["p50_latency_ms"] < 1.0
+
+    for s in report["sample_decisions"]:
+        assert "ambiguous_fields" in s
+        assert bool(s["ambiguous_fields"]) == bool(s["is_ambiguous"])
 
     # 5. Stage 5: .s1m Save & Reload Parity
     s5 = report["stage5_reload_parity"]
@@ -2676,7 +2696,6 @@ def test_live_fda_recall_triage_dogfood_lifecycle(tmp_path, monkeypatch):
     assert 30.0 <= s5["artifact_size_kb"] <= 250.0
 
     # 6. Regression test: smaller (<297 recall) snapshot dynamically scales checkpoints with zero train/test overlap
-    full_snap = json.loads(mod.DEFAULT_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     sub_recalls = list(full_snap["recalls"][:180])
     sub_snap_path = tmp_path / "sub_fda_snapshot_180.json"
     sub_snap_path.write_text(
@@ -2697,7 +2716,48 @@ def test_live_fda_recall_triage_dogfood_lifecycle(tmp_path, monkeypatch):
     )
     assert sub_report["stage5_reload_parity"]["parity_rate"] == 1.0
 
-    # 7. Error handling when openFDA API returns HTTP 500
+    # 7. Custom conformal_alpha sensitivity & boundary validation
+    strict_report = mod.run_live_fda_recall_triage(conformal_alpha=0.05, quiet=True)
+    assert (
+        strict_report["stage3_checkpoints"][-1]["local_offload_rate"]
+        <= report["stage3_checkpoints"][-1]["local_offload_rate"]
+    )
+    assert strict_report["stage3_checkpoints"][-1]["local_precision"] >= 0.97
+    for bad_alpha in (0.0, 1.0, -0.1, float("nan"), True):
+        with pytest.raises(ValueError, match="conformal_alpha"):
+            mod.run_live_fda_recall_triage(conformal_alpha=bad_alpha, quiet=True)
+
+    # 8. Missing snapshot in offline mode raises FileNotFoundError without network calls
+    with pytest.raises(FileNotFoundError, match="Snapshot file not found"):
+        mod.run_live_fda_recall_triage(
+            snapshot_path=tmp_path / "does_not_exist.json",
+            live=False,
+            quiet=True,
+        )
+
+    # 9. Out-of-order report_date or duplicate recall_number raises ValueError
+    unordered_recalls = list(full_snap["recalls"][:60])
+    unordered_recalls[5], unordered_recalls[6] = unordered_recalls[6], unordered_recalls[5]
+    unordered_path = tmp_path / "unordered_fda.json"
+    unordered_path.write_text(
+        json.dumps({**full_snap, "recalls": unordered_recalls}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="strict ascending chronological order"):
+        mod.run_live_fda_recall_triage(snapshot_path=unordered_path, quiet=True)
+
+    dup_recalls = [dict(r) for r in full_snap["recalls"][:60]]
+    dup_recalls[1]["recall_number"] = dup_recalls[0]["recall_number"]
+    dup_recalls[1]["report_date"] = dup_recalls[0]["report_date"]
+    dup_path = tmp_path / "dup_fda.json"
+    dup_path.write_text(
+        json.dumps({**full_snap, "recalls": dup_recalls}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unique recall_number"):
+        mod.run_live_fda_recall_triage(snapshot_path=dup_path, quiet=True)
+
+    # 10. Error handling when openFDA API returns HTTP 500
     def _raise_http_500(*args, **kwargs):
         raise urllib.error.HTTPError(
             url="https://api.fda.gov/food/enforcement.json",
@@ -2710,5 +2770,6 @@ def test_live_fda_recall_triage_dogfood_lifecycle(tmp_path, monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _raise_http_500)
     with pytest.raises(RuntimeError, match="HTTP 500"):
         mod._query_openfda_window("food", "Class I", "20240101", "20241231")
+
 
 
