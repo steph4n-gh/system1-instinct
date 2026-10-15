@@ -719,9 +719,24 @@ def test_model_evaluate_cache_isolates_recency_weighted():
     res_uniform = model.evaluate(prompt, recency_weighted=False)
     assert res_uniform.fields["route"].selected_value == "password"
 
+    batch_uniform = model.forward_batch([prompt], recency_weighted=False)
+    assert batch_uniform[0].fields["route"].selected_value == "password"
+    batch_recent = model.forward_batch([prompt], recency_weighted=True)
+    assert batch_recent[0].fields["route"].selected_value == "refund"
+
     model.use_cache = False
     uncached_uniform = model.evaluate(prompt, recency_weighted=False)
     assert res_uniform.fields["route"].selected_value == uncached_uniform.fields["route"].selected_value
+
+    model.use_cache = True
+    model.learn(prompt, {"route": "refund"}, recency_weighted=True)
+    cached_after_learn = model.evaluate(prompt, recency_weighted=True)
+    uncached_after_learn = model.forward_single(prompt, recency_weighted=True, use_cache=False)
+    assert cached_after_learn.fields["route"].selected_value == uncached_after_learn.fields["route"].selected_value
+    assert np.allclose(
+        cached_after_learn.fields["route"].raw_probabilities,
+        uncached_after_learn.fields["route"].raw_probabilities,
+    )
 
 
 def test_compiler_auto_regularization_and_noise_robust_under_teacher_label_noise():
@@ -803,6 +818,65 @@ def test_compiler_auto_regularization_and_noise_robust_under_teacher_label_noise
     assert robust_acc >= fragile_acc + 0.05
     assert robust_acc >= 0.85
 
+    # Also verify auto-split calibration hygiene when calibration_exemplars is omitted
+    autosplit_robust = SystemOneCompiler(
+        schema,
+        projector=projector,
+        regularization=0.05,
+        auto_regularization=True,
+        noise_robust=True,
+    ).compile(fit_exemplars, augment=False, calibration_split=0.25)
+    autosplit_fragile = SystemOneCompiler(
+        schema,
+        projector=projector,
+        regularization=0.05,
+        auto_regularization=False,
+        noise_robust=False,
+    ).compile(fit_exemplars, augment=False, calibration_split=0.25)
+    assert max(autosplit_robust.heads["intent"].calibration_scores) < 0.10
+    assert max(autosplit_robust.heads["intent"].calibration_scores) < max(autosplit_fragile.heads["intent"].calibration_scores)
+    assert autosplit_robust.heads["intent"].margin_threshold < autosplit_fragile.heads["intent"].margin_threshold
+
+
+def test_compiler_noise_robust_extreme_class_imbalance():
+    from system1.compiler import SystemOneCompiler
+
+    rng = np.random.default_rng(42)
+    maj_words = ["invoice", "payment", "charge", "statement", "fee", "receipt", "billing", "credit", "card", "balance"]
+    texts, labels = [], []
+    for i in range(200):
+        w = rng.choice(maj_words, size=3, replace=False)
+        texts.append(f"request {w[0]} {w[1]} {w[2]} common")
+        labels.append("billing")
+    # 2 clean minority examples with distinct vocabulary — must NOT be falsely downweighted
+    texts.append("request breach firewall phishing common")
+    labels.append("security")
+    texts.append("request malware ransomware exploit common")
+    labels.append("security")
+
+    proj = TfidfProjector.from_texts(texts, max_features=256)
+    schema = DecisionSchema(fields={"intent": ChoiceField(options=["billing", "security"])})
+    comp = SystemOneCompiler(schema, projector=proj, regularization=0.1)
+    X = np.stack([proj.project(t) for t in texts])
+    Y = np.zeros((len(texts), 2), dtype=np.float32)
+    for i, l in enumerate(labels):
+        Y[i, 0 if l == "billing" else 1] = 1.0
+    _, sw_clean = comp._compute_loo_ridge_and_sample_weights(X, Y)
+    assert sw_clean is None or np.allclose(sw_clean[-2:], 1.0)
+
+    # Now add 1 corrupted billing example into a 3-example minority class
+    texts_noisy = list(texts[:-1]) + ["request breach firewall malware common", "request invoice payment charge common"]
+    labels_noisy = list(labels[:-1]) + ["security", "security"]
+    proj_noisy = TfidfProjector.from_texts(texts_noisy, max_features=256)
+    X_n = np.stack([proj_noisy.project(t) for t in texts_noisy])
+    Y_n = np.zeros((len(texts_noisy), 2), dtype=np.float32)
+    for i, l in enumerate(labels_noisy):
+        Y_n[i, 0 if l == "billing" else 1] = 1.0
+    _, sw_noisy = comp._compute_loo_ridge_and_sample_weights(X_n, Y_n)
+    assert sw_noisy is not None
+    assert sw_noisy[-3] >= 0.85 and sw_noisy[-2] >= 0.85
+    assert sw_noisy[-1] == pytest.approx(0.20, abs=1e-5)
+
 
 def test_teaching_session_noise_robust_and_compile_under_teacher_corruption(tmp_path):
     from system1.teaching import TeachingSession
@@ -822,7 +896,17 @@ def test_teaching_session_noise_robust_and_compile_under_teacher_corruption(tmp_
         regularization=0.02,
         max_features=128,
         selection="chi2",
+        auto_regularization=True,
+        noise_robust=True,
     )
+    assert session.auto_regularization is True
+    assert session.noise_robust is True
+    snap_settings = session.snapshot()["settings"]
+    assert snap_settings["auto_regularization"] is True
+    assert snap_settings["noise_robust"] is True
+
+    with pytest.raises(ValueError, match="auto_regularization must be a boolean"):
+        TeachingSession(tmp_path / "noisy_session", auto_regularization=1)
 
     for c_idx, cls in enumerate(classes):
         words = core_vocab[cls]
@@ -842,5 +926,6 @@ def test_teaching_session_noise_robust_and_compile_under_teacher_corruption(tmp_
     assert isinstance(compiled, CompiledSystemOneModel)
     report = session.assess(min_accuracy=0.80, min_coverage=0.50, max_accepted_errors=2)
     assert report["candidate"]["raw_accuracy"] >= 0.85
+
 
 

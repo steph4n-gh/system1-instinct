@@ -152,6 +152,13 @@ class TeachingSession:
                 "auto_regularization": auto_regularization,
                 "noise_robust": eff_noise_robust,
             }
+            for b_name, b_val in (
+                ("mondrian", mondrian),
+                ("auto_regularization", auto_regularization),
+                ("noise_robust", eff_noise_robust),
+            ):
+                if b_val is not None and type(b_val) is not bool:
+                    raise ValueError(f"{b_name} must be a boolean")
             for name, value in supplied_opts.items():
                 if value is not None and value != state.get(name, defaults[name]):
                     raise ValueError(f"{name} differs from this teaching session")
@@ -372,6 +379,14 @@ class TeachingSession:
     @property
     def hierarchical(self) -> Any:
         return self._read_state().get("hierarchical", "auto")
+
+    @property
+    def auto_regularization(self) -> bool:
+        return bool(self._read_state().get("auto_regularization", True))
+
+    @property
+    def noise_robust(self) -> bool:
+        return bool(self._read_state().get("noise_robust", True))
 
     def record(self, text, label, *, split="teach", source="human", group=None):
         """Add an explicit label, or replace a same-split correction in place."""
@@ -678,6 +693,10 @@ class TeachingSession:
             settings["prototype_alpha"] = state["prototype_alpha"]
         if "hierarchical" in state:
             settings["hierarchical"] = state["hierarchical"]
+        if "auto_regularization" in state:
+            settings["auto_regularization"] = state["auto_regularization"]
+        if "noise_robust" in state:
+            settings["noise_robust"] = state["noise_robust"]
         return {"records": state["records"], "counts": self._counts(state),
                 "current": identity["current"], "report": report, "adopted": adopted,
                 "candidate_stale": stale, "settings": settings,

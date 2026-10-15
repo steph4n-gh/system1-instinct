@@ -917,10 +917,14 @@ class CompiledSystemOneModel:
             total_ms = (time.perf_counter() - t0) * 1000.0
 
             # Evaluate model to get fresh result and store in Tier 0 cache
-            override_map = self._learned_prompt_overrides.get(norm_key) if (is_zero_emb and norm_key is not None) else None
+            override_map = self._learned_prompt_overrides.get(norm_key) if norm_key is not None else None
             evals: Dict[str, RawFieldEvaluation] = {}
             for name, head in self._field_heads.items():
-                if override_map is not None and name in override_map:
+                if (
+                    override_map is not None
+                    and name in override_map
+                    and (is_zero_emb or (head._exemplar_bank is None and not is_cold_skill))
+                ):
                     evals[name] = self._build_override_eval(head, override_map[name])
                 else:
                     evals[name] = head.forward(emb, prompt=prompt_for_eval)
@@ -2169,11 +2173,12 @@ class SystemOneCompiler:
         h_diag_loo = (1.0 / N) + U_sq @ f_loo
         denom_loo = np.maximum(1e-4, 1.0 - h_diag_loo)[:, None]
         Y_hat_loo = mu_Y + U @ (f_loo[:, None] * UT_Yc)
-        Y_loo = (Y_hat_loo - h_diag_loo[:, None] * Y64) / denom_loo
+        Y_loo = Y64 + (Y_hat_loo - Y64) / denom_loo
 
         true_cls = np.argmax(Y64, axis=1)
         s_true = Y_loo[np.arange(N), true_cls]
-        s_other = np.max(np.where(Y64 > 0.5, -1e9, Y_loo), axis=1)
+        rival_mask = (Y64 <= 0.5) & (Y_loo > mu_Y[None, :])
+        s_other = np.max(np.where(rival_mask, Y_loo, -1e9), axis=1)
         deficit = s_other - s_true
 
         if not np.any(deficit > 0.18):
@@ -2191,8 +2196,8 @@ class SystemOneCompiler:
             cls_idx = np.where(true_cls == k)[0]
             if len(cls_idx) > 0:
                 best_in_cls = int(cls_idx[int(np.argmin(deficit[cls_idx]))])
-                if sw[best_in_cls] < 0.75:
-                    sw[best_in_cls] = 0.75
+                if sw[best_in_cls] < 0.85:
+                    sw[best_in_cls] = 0.85
                 cls_sum = float(np.sum(sw[cls_idx]))
                 if cls_sum < 1.0:
                     sw[cls_idx] = np.clip(sw[cls_idx] * (1.0 / max(1e-6, cls_sum)), 0.20, 1.0)
@@ -2645,7 +2650,16 @@ class SystemOneCompiler:
                         proj_cache[p] = (emb_base, rn_val)
                     emb = emb_base
                 else:
-                    raw_emb = self.projector.project(p)
+                    if hasattr(self.projector, "project"):
+                        if self.recency_weighted and not isinstance(self.projector, TfidfProjector):
+                            try:
+                                raw_emb = self.projector.project(p, recency_weighted=self.recency_weighted)
+                            except TypeError:
+                                raw_emb = self.projector.project(p)
+                        else:
+                            raw_emb = self.projector.project(p)
+                    else:
+                        raw_emb = self.projector(p)
                     rn_val = float(self.projector.raw_norm(p)) if want_raw else None
                     norm = float(np.linalg.norm(raw_emb))
                     emb_base = (
@@ -2765,7 +2779,30 @@ class SystemOneCompiler:
 
                 # Calibrate temperature and conformal bounds on independent held-out folds
                 logits_calib = raw_logits_calib / 0.25
-                calib_labels = np.argmax(Y_calib, axis=1)
+                calib_labels = np.argmax(Y_calib, axis=1).copy()
+
+                if (
+                    calibration_data is None
+                    and not augment
+                    and eff_noise_robust
+                    and sw_choice is not None
+                    and len(calib_labels) >= 8
+                ):
+                    raw_top_cal = np.max(raw_logits_calib, axis=1)
+                    raw_true_cal = raw_logits_calib[np.arange(len(calib_labels)), calib_labels]
+                    raw_def_cal = raw_top_cal - raw_true_cal
+                    suspect_cal = (
+                        (raw_top_cal >= 0.55)
+                        & (raw_def_cal >= 0.45)
+                        & (raw_true_cal < (1.0 / max(2, K)))
+                    )
+                    if np.any(suspect_cal):
+                        max_fix = max(1, int(0.20 * len(calib_labels)))
+                        suspect_idx = np.where(suspect_cal)[0]
+                        if len(suspect_idx) > max_fix:
+                            order = np.argsort(-raw_def_cal[suspect_idx])
+                            suspect_idx = suspect_idx[order[:max_fix]]
+                        calib_labels[suspect_idx] = np.argmax(raw_logits_calib[suspect_idx], axis=1)
 
                 logits_temp, labels_temp = logits_calib[:num_temperature], calib_labels[:num_temperature]
                 logits_conf, labels_conf = logits_calib[num_temperature:], calib_labels[num_temperature:]
@@ -2890,6 +2927,25 @@ class SystemOneCompiler:
                 logits_calib = (X_calib @ weights.T + biases).flatten()
                 probs_calib = _stable_sigmoid(logits_calib, temperature=0.25)
                 calib_bools = [bool(lab) for lab in (raw_labels[num_train:])]
+                if (
+                    calibration_data is None
+                    and not augment
+                    and eff_noise_robust
+                    and sw_noise is not None
+                    and len(calib_bools) >= 8
+                ):
+                    signed_margin = np.array(
+                        [logits_calib[i] * (1.0 if calib_bools[i] else -1.0) for i in range(len(calib_bools))],
+                        dtype=np.float64,
+                    )
+                    suspect_b = signed_margin < -0.55
+                    if np.any(suspect_b):
+                        max_fix_b = max(1, int(0.20 * len(calib_bools)))
+                        sus_b_idx = np.where(suspect_b)[0]
+                        if len(sus_b_idx) > max_fix_b:
+                            sus_b_idx = sus_b_idx[np.argsort(signed_margin[sus_b_idx])[:max_fix_b]]
+                        for idx_b in sus_b_idx:
+                            calib_bools[int(idx_b)] = bool(logits_calib[int(idx_b)] >= 0.0)
                 nonconf_scores = []
                 error_margins_bool = []
                 per_class_bool: Dict[str, List[float]] = {"False": [], "True": []}
