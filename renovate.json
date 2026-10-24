@@ -1,0 +1,24 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "enabledManagers": [
+    "pep621"
+  ],
+  "prCreation": "immediate",
+  "prConcurrentLimit": 2,
+  "prHourlyLimit": 2,
+  "automerge": false,
+  "vulnerabilityAlerts": {
+    "automerge": false
+  },
+  "packageRules": [
+    {
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
