@@ -2,16 +2,19 @@
 """System 1: Instinct — The "Break-Me & Teach-Me" Live Gateway Showcase.
 
 Demonstrates both:
-1. EASE OF USE: 3 lines of Python to wrap an LLM, learn from ~5 examples/option,
-   compile a ~60 KiB `.s1m` skill, and cut over to 0.2 ms local execution.
+1. EASE OF USE: wrap a teacher callable, learn from a handful of examples per option,
+   compile a small `.s1m` skill, and serve later traffic locally. File size and
+   per-call time depend on the host; see the README honest-limits table.
 2. OBVIOUS BENEFIT: Side-by-side comparison against a real 67.2 MB neural vector
    router (`BAAI/bge-small-en-v1.5` via `semantic-router` / `fastembed`) across:
-   - Routine production traffic (100% local offload in ~0.2 ms, $0 LLM cost)
+   - Routine production traffic (local offload, $0 LLM cost). Printed milliseconds
+     are from the machine that runs the script.
    - Trap 1: Negation flips ("do NOT cancel my plan, upgrade me")
    - Trap 2: Out-of-Scope garbage ("Write a poem about sourdough bread")
    - Trap 3: Mobile character typos ("chagred twcie on my vsia crad")
    - Live 1-Shot Teaching: Watching a brand-new company codeword ("Valkyrie sync")
-     go from safe abstention -> 1-line `learn_from_tier2` (0.3 ms) -> instant local hit.
+     go from safe abstention -> one `learn_from_tier2` call -> a later local hit.
+     That update is local; its duration is host-specific.
 
 Run automated showcase:
     python examples/showcase_break_and_teach.py

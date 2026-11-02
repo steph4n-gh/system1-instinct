@@ -1,8 +1,8 @@
 """System 1 Framework Integrations.
 
-Native, drop-in adapters and middleware for production AI stacks:
-- mcp: Fail-closed Model Context Protocol (MCP) JSON-RPC safety proxy (< 1ms).
-- fastapi: ASGI gateway middleware for sub-millisecond local routing & frontier escalation.
+Native, drop-in adapters and middleware for application stacks:
+- mcp: In-process Model Context Protocol (MCP) JSON-RPC guard. Not a runnable MCP server.
+- fastapi: ASGI gateway middleware for local routing and escalation to the downstream app.
 - langchain: Agent tool interceptor and callback handler with Ed25519 witness receipts.
 - observability: Prometheus-compatible /metrics exporter for decision engine telemetry.
 - otel: OpenTelemetry tracing integration for decision spans.
