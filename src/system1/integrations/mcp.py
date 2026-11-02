@@ -1,7 +1,8 @@
-"""System 1 MCP (Model Context Protocol) Safety Proxy.
+"""In-process MCP (Model Context Protocol) guard.
 
-Intercepts MCP JSON-RPC tool calls on local metal in < 1ms with fail-closed
-conformal gating and Ed25519 digital witness receipts.
+`SystemOneMCPProxy` evaluates MCP JSON-RPC requests inside the caller process.
+It is not a runnable MCP server: it does not open a socket or speak stdio
+transport. Pass `handle_call(request, executor)` the tool function yourself.
 """
 
 from __future__ import annotations
@@ -59,10 +60,11 @@ class SystemOneMCPBlockedError(PermissionError):
 
 
 class SystemOneMCPProxy:
-    """Fail-closed Reference Monitor for Model Context Protocol (MCP) tool execution.
-    
-    Evaluates MCP `tools/call` JSON-RPC requests on local metal in < 1ms.
-    Enforces conformal coverage bounds, semantic safety, and creates Ed25519 digital receipts.
+    """In-process reference monitor for Model Context Protocol (MCP) tool calls.
+
+    Evaluates MCP `tools/call` JSON-RPC requests in the caller process.
+    This is not a runnable MCP server. Enforces conformal coverage bounds,
+    semantic safety, and creates Ed25519 digital receipts when a guard is configured.
     """
 
     def __init__(

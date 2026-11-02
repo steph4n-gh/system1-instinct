@@ -42,7 +42,7 @@ When you attach `SystemOneGatewayMiddleware` (via `add_system1_gateway`):
 
 ## Bind principal identity in LangChain and MCP adapters
 
-When you attach `SystemOneGuardCallbackHandler` or `System1MCPProxy`:
+When you attach `SystemOneGuardCallbackHandler` or the in-process `SystemOneMCPProxy` (not a standalone MCP server):
 
 1. **Assign one `principal_id` per authenticated user or service.** Do not use per-request LangChain `run_id` values as `principal_id`.
 2. **Attach callbacks directly to tool objects and keep `raise_error=True`.** Allow `SystemOneGuardBlockedException` to propagate so blocked tool calls cannot execute.
@@ -78,4 +78,4 @@ The loader disables Python `pickle`, verifies NPY header shapes and `float32` or
 
 ## Measure end-to-end latency on target hardware
 
-Reported sub-millisecond latencies (`0.1 to 0.4 ms`) measure median in-memory `engine.decide(...)` calls on CPU. They do not include SQLite disk syncs in `ActionLedger`, network hops in gRPC or HTTP, or downstream tool execution. Benchmark your full request path on your target hardware, and monitor `ActionLedger` write latency as the SQLite hash chain grows.
+Decision latency depends on the skill and the host. On a shared 4-vCPU Intel Xeon KVM guest, the README example measured about 3.1 ms median (`use_cache=False`), compiled replay skills about 0.42 ms and 0.64 ms median, and online warm-up about 5.4 ms and 9.5 ms median on locally answered items. See the [README honest limits](../README.md#honest-limits). Those figures are in-memory `engine.decide(...)` calls or the replay script's local-decision timer. They do not include SQLite disk syncs in `ActionLedger`, network hops in gRPC or HTTP, or downstream tool execution. Benchmark your full request path on your target hardware, and monitor `ActionLedger` write latency as the SQLite hash chain grows.

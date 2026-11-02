@@ -76,7 +76,7 @@ def main():
     version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
     labels = {
         "README.md": r"\*\*Version ([\d.]+):",
-        "docs/README.md": r"stable runtime: \*\*([\d.]+)\*\*",
+        "docs/README.md": r"package version: \*\*([\d.]+)\*\*",
         "docs/deployment.md": r"System 1(?:: Instinct)? ([\d.]+)",
         "docs/architecture/technical_specification.md": r"System 1(?:: Instinct)? ([\d.]+)",
         "docs/paper/system1_whitepaper.md": r"System 1(?:: Instinct)? ([\d.]+)",

@@ -1,8 +1,8 @@
 # System 1: Instinct documentation
 
-Current stable runtime: **1.0.0**.
+Current package version: **1.0.0** (`Development Status :: 4 - Beta`).
 
-**System 1: Instinct** is a sub-millisecond non-autoregressive decision runtime. Each skill defines a `DecisionSchema` (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`). A skill runs zero-shot from option descriptions or fits weights from labeled examples, updates online via `adapt_zero_shot` and `BoundedReviewFallback`, and serializes to a `.s1m` artifact.
+**System 1: Instinct** is a local decision runtime. It is not an LLM, and it ships no pretrained weights by default. Each skill defines a `DecisionSchema` (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`). A skill runs from option descriptions or fits weights from labeled examples, updates online via `adapt_zero_shot` and `BoundedReviewFallback`, and serializes to a `.s1m` artifact. Latency and file size depend on the host and the vocabulary; see the [README honest limits](../README.md#honest-limits).
 
 ---
 
@@ -30,7 +30,7 @@ The index in [`docs/drop_in/README.md`](drop_in/README.md) covers drop-in integr
 | [Correct, compare, and adopt a skill](guides/correcting_skills.md) | `TeachingSession` lifecycle, candidate assessment, qualification, and rollback |
 | [Teach and compile a decision skill](guides/training_experts.md) | Label formats, `SystemOneCompiler`, `TfidfProjector`, and online updates |
 | [Teacher observation (`TypeSafeClient`)](typesafe.md) | Reference for `system1.compat.typesafe.Client`, promotion policies, and `.s1m` export |
-| [Application integrations](integrations.md) | Reference for LangChain, MCP, FastAPI, ASGI, and gRPC adapters |
+| [Application integrations](integrations.md) | Reference for LangChain, the in-process MCP guard, FastAPI, ASGI, and gRPC adapters |
 | [Add an explicit tool policy](guides/policy_guard.md) | How to configure `SystemOneGuard`, `PolicyEngine`, Ed25519 receipts, and `ActionLedger` |
 | [Deployment boundaries](deployment.md) | Security boundaries, `.s1m` loader limits, and production checklists |
 | [Observability](observability/README.md) | Prometheus metrics and OpenTelemetry tracing |

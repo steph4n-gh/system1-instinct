@@ -1,7 +1,7 @@
 """System 1 FastAPI / Starlette Gateway Middleware.
 
-Sub-millisecond on-device ASGI middleware for local fast-path routing
-and fail-closed conformal escalation to frontier governors (Astra, Fable, Gemini, Grok).
+On-device ASGI middleware for local fast-path routing and fail-closed
+conformal escalation to the downstream application. Per-request time is host-specific.
 """
 
 from __future__ import annotations
@@ -16,9 +16,10 @@ from system1.receipt import DecisionWitnessReceipt, create_decision_receipt
 
 
 class SystemOneGatewayMiddleware:
-    """ASGI Middleware providing sub-millisecond local routing and frontier escalation.
-    
+    """ASGI middleware for local routing and escalation to the downstream app.
+
     Compatible with FastAPI, Starlette, Litestar, and any ASGI 3.0 compliant framework.
+    Per-request time is host-specific.
     """
 
     def __init__(

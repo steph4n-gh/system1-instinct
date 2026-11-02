@@ -13,7 +13,8 @@ stress gate:
       `engine.learn_from_outcome(...)`.
   - Stage 2: Online Warm-Up (Issues 11-50)
       Online updates (`engine.learn_from_outcome` / `BoundedReviewFallback(auto_online_update=True)`)
-      begin offloading clear repeat patterns locally in ~0.2 ms while escalating uncertain items.
+      begin offloading clear repeat patterns locally while escalating uncertain items.
+      Per-call time is host-specific; the README honest-limits table records one shared-VM pass.
   - Stage 3: Auto-Cutover Checkpoints (15/class, 25/class, 40/class observed outcomes)
       Compiles a calibrated `.s1m` skill with `SystemOneCompiler(auto_regularization=True, noise_robust=True)`
       and evaluates on the strictly held-out newest chronological issues (#20817..#22577).

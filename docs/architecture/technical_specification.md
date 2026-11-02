@@ -278,8 +278,8 @@ envelope binds the committed ledger record ID while the core receipt digest stay
 stable. Guards check exact stored receipt inclusion; write transactions reverify
 the complete chain. See [deployment boundaries](../deployment.md).
 
-LangChain, MCP, ASGI, gRPC, Prometheus and OpenTelemetry are adapters around these
-contracts. gRPC's diagnostic CLI has insecure transport and defaults to loopback.
+LangChain, the in-process MCP guard, ASGI, gRPC, Prometheus and OpenTelemetry are adapters around these
+contracts. `SystemOneMCPProxy` evaluates a JSON-RPC request inside the caller process. It is not a runnable MCP server. gRPC's diagnostic CLI has insecure transport and defaults to loopback.
 Remote schema selection is restricted to built-ins and exact startup registrations;
 file/import/inline-JSON loading belongs to the trusted local CLI path.
 Experimental container templates exist but no published image or authenticated

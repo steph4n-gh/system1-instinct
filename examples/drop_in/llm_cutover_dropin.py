@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Drop-In Procedure 5: Wrap Any LLM Call -> Observe -> Auto-Cutover to Local .s1m.
+"""Drop-In Procedure 5: Wrap a teacher callable -> Observe -> Auto-Cutover to Local .s1m.
 
-Demonstrates the complete real procedure for replacing a recurring LLM API call
-(e.g. OpenAI / Anthropic / Gemini ticket classifier) with System 1: Instinct:
-  Step 1: Start with a 0-shot schema and wrap your LLM function with BoundedReviewFallback.
-  Step 2: Stream traffic through the wrapper. Uncertain queries call the LLM fallback
-          and update System 1 online in <1 ms via Sherman-Morrison RLS.
-  Step 3: As System 1 learns the boundary, LLM calls drop to 0% and 100% of traffic
-          is served locally in ~0.3 ms.
+Shows the procedure for replacing a recurring classification call with System 1: Instinct.
+The teacher in this file (`upstream_llm_teacher`) is a keyword stub, not a live
+OpenAI, Anthropic, or Gemini client. Live-LLM-teacher evaluation is planned.
+  Step 1: Start with a 0-shot schema and wrap the callable with BoundedReviewFallback.
+  Step 2: Stream traffic through the wrapper. Uncertain queries call the stub
+          and update System 1 online via Sherman-Morrison RLS. Update time is host-specific.
+  Step 3: As System 1 learns the boundary, stub calls can drop and later traffic
+          is served locally. Per-call time is host-specific.
   Step 4: Save the learned skill to a portable `.s1m` file for zero-dependency deployment.
 """
 

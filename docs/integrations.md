@@ -20,9 +20,9 @@ result = your_tool.invoke(tool_arguments, config={"callbacks": [handler]})
 - **Failure behavior.** When `guard.evaluate_proposal(...)` returns `DecisionOutcome.DENY` or `DecisionOutcome.REQUIRE_APPROVAL`, the callback raises `SystemOneGuardBlockedException`.
 - **Direct callable wrapper.** `wrap_langchain_tool` wraps a Python callable with the same `SystemOneGuard` check.
 
-## Model Context Protocol (`System1MCPProxy`)
+## Model Context Protocol (`SystemOneMCPProxy`)
 
-`System1MCPProxy` intercepts JSON-RPC tool calls before dispatch. The proxy takes a configured `SystemOneGuard` and an authenticated caller identity, and exposes `handle_call(request, executor)` and `async_handle_call(request, executor)`. [`tests/test_integrations.py`](https://github.com/steph4n-gh/system1-instinct/blob/main/tests/test_integrations.py) defines the request and response schema. Diagnostic guard mode (`enforcement_profile=False`) does not produce signed enforcement receipts.
+`SystemOneMCPProxy` (also exported as `System1MCPProxy`) is an in-process guard in [`src/system1/integrations/mcp.py`](https://github.com/steph4n-gh/system1-instinct/blob/main/src/system1/integrations/mcp.py). It is not a runnable MCP server. There is no stdio transport, no listening socket, and no `system1 serve` mode for MCP. Call `handle_call(request, executor)` or `async_handle_call(request, executor)` from your process and pass the tool function yourself. `initialize` returns a JSON-RPC result whose `serverInfo.name` is `system1-mcp-guard`; that payload is a handshake dict, not a process you can launch. [`tests/test_integrations.py`](https://github.com/steph4n-gh/system1-instinct/blob/main/tests/test_integrations.py) defines the request and response schema. Diagnostic guard mode (`enforcement_profile=False`) does not produce signed enforcement receipts.
 
 ## FastAPI and ASGI (`add_system1_gateway`)
 

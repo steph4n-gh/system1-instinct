@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "system1-instinct"
 version = "1.0.0"
-description = "System 1: Instinct — Sub-millisecond non-autoregressive decision runtime and zero-shot adaptive skills."
+description = "System 1: Instinct — local decision runtime for structured skills, with no pretrained weights by default."
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{name = "System 1: Instinct Authors"}]
@@ -13,7 +13,6 @@ requires-python = ">=3.11"
 keywords = [
     "system1",
     "decision-runtime",
-    "sub-millisecond",
     "apple-silicon",
     "mlx",
     "conformal-prediction",
@@ -23,7 +22,7 @@ keywords = [
     "audit-receipts",
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
