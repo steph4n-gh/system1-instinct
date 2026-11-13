@@ -20,6 +20,7 @@ from system1.core import (
     TfidfProjector,
     HybridProjector,
     HybridSemanticProjector,
+    UnifiedHybridProjector,
     LocalNeuralProjector,
     ModelInferenceResult,
     MultiChoiceField,
@@ -33,6 +34,7 @@ from system1.core import (
 
 # Calibration & Conformal Prediction primitives (pure NumPy, zero crypto, zero SQLite)
 from system1.calibration import (
+    AdaptiveConformalTracker,
     BrierDecomposition,
     CalibrationMetrics,
     ConformalPredictionSet,
@@ -42,6 +44,9 @@ from system1.calibration import (
     RecalibrationReport,
     RegressionConformalInterval,
     RegressionConformalPredictor,
+    SelectiveRiskCalibrator,
+    SelectiveRiskCertificate,
+    clopper_pearson_upper,
 )
 
 # Eager lightweight submodules
@@ -429,6 +434,8 @@ _MODULE_MAP = {
     "SystemOneCompiler": "system1.compiler",
     "CompiledSystemOneModel": "system1.compiler",
     # integrations
+    "MCPStdioProxy": "system1.integrations",
+    "MCPStdioProxyConfig": "system1.integrations",
     "SystemOneMCPProxy": "system1.integrations",
     "SystemOneMCPBlockedError": "system1.integrations",
     "wrap_mcp_tool": "system1.integrations",
@@ -498,6 +505,7 @@ __all__ = [
     "ScoreField",
     "SchemaMeta",
     # Calibration & Conformal Prediction
+    "AdaptiveConformalTracker",
     "DecisionCalibrator",
     "CalibrationMetrics",
     "RecalibrationMetrics",
@@ -507,6 +515,9 @@ __all__ = [
     "ConformalPredictionSet",
     "RegressionConformalPredictor",
     "RegressionConformalInterval",
+    "SelectiveRiskCalibrator",
+    "SelectiveRiskCertificate",
+    "clopper_pearson_upper",
     # Proof-Carrying Evidence Receipts & Crypto
     "DecisionWitnessReceipt",
     "create_decision_receipt",
@@ -560,6 +571,7 @@ __all__ = [
     "LocalNeuralProjector",
     "HybridProjector",
     "HybridSemanticProjector",
+    "UnifiedHybridProjector",
     "StaticEmbeddingTable",
     "SubwordSemanticEmbeddings",
     "ModelInferenceResult",
@@ -596,6 +608,8 @@ __all__ = [
     "TelemetryProjector",
     "evaluate",
     # Framework Integrations (MCP, FastAPI, LangChain)
+    "MCPStdioProxy",
+    "MCPStdioProxyConfig",
     "SystemOneMCPProxy",
     "SystemOneMCPBlockedError",
     "wrap_mcp_tool",

@@ -10,6 +10,7 @@ from system1.core.embeddings import (
     HybridSemanticProjector,
     StaticEmbeddingTable,
     SubwordSemanticEmbeddings,
+    UnifiedHybridProjector,
 )
 from system1.core.embeddings import *
 from system1.core.embeddings import __all__ as _embeddings_all

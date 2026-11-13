@@ -1539,6 +1539,7 @@ class CompiledSystemOneModel:
                         or sparse + dense != dimension):
                     raise ValueError("Saved hybrid projector dimensions do not match the skill")
                 runtime_bytes += 16 * 25000 * dense
+                runtime_bytes += 64 * len(projector_config.get("tfidf_terms", ()))
                 runtime_bytes += 16 * len(projector_config.get("spectral_terms", ())) * dense
                 runtime_bytes += 8 * sum(len(row) for key in ("spectral_vectors", "subspace_components")
                                          for row in (projector_config.get(key) or ()))

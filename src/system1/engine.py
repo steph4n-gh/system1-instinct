@@ -319,6 +319,18 @@ class EvaluationReport:
         )
 
 
+def _parse_jsonl_rows(raw_text: str, *, source: str = "input") -> List[Any]:
+    rows: List[Any] = []
+    for line_no, line in enumerate(raw_text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as ex:
+            raise ValueError(f"Invalid JSON in {source} line {line_no}: {ex.msg}") from ex
+    return rows
+
+
 def _normalize_eval_rows(
     rows: Any,
     schema: DecisionSchema,
@@ -331,18 +343,14 @@ def _normalize_eval_rows(
         if not raw_text:
             raise ValueError(f"Dataset file is empty: {path}")
         if path.suffix.lower() == ".jsonl":
-            parsed_rows: Any = [
-                json.loads(line)
-                for line in raw_text.splitlines()
-                if line.strip()
-            ]
+            parsed_rows: Any = _parse_jsonl_rows(raw_text, source=str(path))
         else:
             try:
                 parsed_rows = json.loads(raw_text)
             except json.JSONDecodeError:
                 lines = [line for line in raw_text.splitlines() if line.strip()]
                 if len(lines) > 1:
-                    parsed_rows = [json.loads(line) for line in lines]
+                    parsed_rows = _parse_jsonl_rows(raw_text, source=str(path))
                 else:
                     raise
         rows = parsed_rows
@@ -595,6 +603,9 @@ class SystemOneEngine:
         compiled_model: Optional[Any] = None,
         min_calibration_lessons: int = 0,
         min_override_corroborations: int = 1,
+        max_calibration_window: int = 512,
+        selective_calibrators: Optional[Mapping[str, Any]] = None,
+        aci_tracker: Optional[Any] = None,
     ) -> None:
         if model is None and compiled_model is not None:
             model = compiled_model
@@ -633,8 +644,13 @@ class SystemOneEngine:
             raise ValueError(f"min_calibration_lessons must be >= 0, got {min_calibration_lessons}")
         if int(min_override_corroborations) < 1:
             raise ValueError(f"min_override_corroborations must be >= 1, got {min_override_corroborations}")
+        if int(max_calibration_window) < 1:
+            raise ValueError(f"max_calibration_window must be >= 1, got {max_calibration_window}")
         self.min_calibration_lessons: int = int(min_calibration_lessons)
         self.min_override_corroborations: int = int(min_override_corroborations)
+        self.max_calibration_window: int = int(max_calibration_window)
+        self.selective_calibrators: Dict[str, Any] = dict(selective_calibrators or {})
+        self.aci_tracker: Optional[Any] = aci_tracker
         self._online_lesson_count: int = 0
         self._override_counts: Dict[str, Dict[str, Tuple[Any, int]]] = {}
         self.policy_scope = str(policy_scope)
@@ -1809,7 +1825,7 @@ class SystemOneEngine:
                         if name in self.regression_conformal_predictors:
                             self.regression_conformal_predictors[name].is_calibrated = False
             if alpha is None:
-                alpha = self.default_alpha
+                alpha = self.aci_tracker.alpha_t if self.aci_tracker is not None else self.default_alpha
             if not isinstance(prompt, str):
                 raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
             if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not (0.0 < alpha < 1.0) or math.isnan(alpha) or math.isinf(alpha):
@@ -2332,6 +2348,41 @@ class SystemOneEngine:
                     prototype_triggered = True
                 elif abstention_reasons.get(name) == "low_feature_familiarity":
                     familiarity_triggered = True
+
+            if is_strict:
+                for name, definition in self.schema.fields.items():
+                    if name in learned_overrides:
+                        continue
+                    sel_cal = self.selective_calibrators.get(name) if hasattr(self, "selective_calibrators") else None
+                    if sel_cal is not None:
+                        score_kind = getattr(sel_cal, "score_name", "margin")
+                        if score_kind in ("p1", "top_prob"):
+                            sel_val = float(confidences.get(name, 0.0))
+                        else:
+                            sel_val = float(margins.get(name, 0.0))
+                        if not sel_cal.should_accept(sel_val):
+                            conformal_sets[name] = []
+                            abstention_reasons.setdefault(name, "selective_risk_gate")
+                            if name not in ambiguous_fields:
+                                ambiguous_fields.append(name)
+                            if getattr(definition, "escalate_on_ambiguity", True):
+                                is_ambiguous = True
+                                if name not in escalated_fields:
+                                    escalated_fields.append(name)
+                    if (
+                        getattr(self, "aci_tracker", None) is not None
+                        and getattr(self.aci_tracker, "margin_floor", None) is not None
+                        and name in margins
+                        and not self.aci_tracker.should_accept_margin(margins[name])
+                    ):
+                        conformal_sets[name] = []
+                        abstention_reasons.setdefault(name, "aci_margin_floor")
+                        if name not in ambiguous_fields:
+                            ambiguous_fields.append(name)
+                        if getattr(definition, "escalate_on_ambiguity", True):
+                            is_ambiguous = True
+                            if name not in escalated_fields:
+                                escalated_fields.append(name)
 
             validated_values = self.schema.validate_decision(values)
             total_latency_ms = (time.perf_counter() - t_start) * 1000.0

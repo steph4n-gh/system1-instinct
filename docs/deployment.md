@@ -37,12 +37,12 @@ To verify signed receipts and maintain an intact `ActionLedger` chain:
 
 When you attach `SystemOneGatewayMiddleware` (via `add_system1_gateway`):
 
-1. **Enforce authentication and request-size limits in outer middleware.** Because `SystemOneGatewayMiddleware` returns local HTTP responses before FastAPI route dependencies run, place authentication, rate limiting, and body-size caps in your reverse proxy or outer ASGI middleware.
-2. **Scope `route_paths` to classification endpoints.** `SystemOneGatewayMiddleware` matches path prefixes and any `POST` carrying `x-system1-route: true`. Use it only on classification endpoints. If you pass a custom `is_fastpath_fn`, verify its acceptance criteria on held-out traffic.
+1. **Enforce authentication and request-size limits in outer middleware.** Because `SystemOneGatewayMiddleware` returns local HTTP responses before FastAPI route dependencies run, place authentication and rate limiting in your reverse proxy or outer ASGI middleware. The middleware also enforces a built-in `max_body_bytes=1_048_576` (1 MiB) cap returning HTTP `413`.
+2. **Scope `route_paths` to classification endpoints.** `SystemOneGatewayMiddleware` matches `route_paths` prefixes by default. Header routing via `x-system1-route: true` is disabled unless `allow_route_header=True` is set, and when enabled should pair with `route_header_token` (`x-system1-route-token`). Use it only on classification endpoints. If you pass a custom `is_fastpath_fn`, verify its acceptance criteria on held-out traffic.
 
 ## Bind principal identity in LangChain and MCP adapters
 
-When you attach `SystemOneGuardCallbackHandler` or the in-process `SystemOneMCPProxy` (not a standalone MCP server):
+When you attach `SystemOneGuardCallbackHandler`, the in-process `SystemOneMCPProxy`, or the stdio `MCPStdioProxy` (`--principal-id` and `--tenant-id`):
 
 1. **Assign one `principal_id` per authenticated user or service.** Do not use per-request LangChain `run_id` values as `principal_id`.
 2. **Attach callbacks directly to tool objects and keep `raise_error=True`.** Allow `SystemOneGuardBlockedException` to propagate so blocked tool calls cannot execute.

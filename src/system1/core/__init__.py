@@ -50,6 +50,7 @@ from system1.core.embeddings import (
     HybridSemanticProjector,
     StaticEmbeddingTable,
     SubwordSemanticEmbeddings,
+    UnifiedHybridProjector,
 )
 
 # Core submodules
@@ -78,6 +79,7 @@ __all__ = [
     "LocalNeuralProjector",
     "HybridProjector",
     "HybridSemanticProjector",
+    "UnifiedHybridProjector",
     "SubwordSemanticEmbeddings",
     "StaticEmbeddingTable",
     "SystemOneModel",

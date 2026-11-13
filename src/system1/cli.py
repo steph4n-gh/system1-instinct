@@ -547,7 +547,12 @@ def handle_compile_command(args: argparse.Namespace) -> int:
 
 
 def handle_serve_command(args: argparse.Namespace) -> int:
-    """CLI handler for 'system1 serve' — starts the gRPC sidecar server."""
+    """CLI handler for 'system1 serve' — starts the gRPC sidecar or MCP stdio proxy server."""
+    transport = str(getattr(args, "transport", "grpc"))
+    if transport == "mcp-stdio":
+        from system1.integrations.mcp_stdio import run_mcp_stdio_from_args
+
+        return run_mcp_stdio_from_args(args, error_fn=_cli_error)
     try:
         from system1.grpc_server import serve as grpc_serve, grpc_available
     except ImportError:
@@ -607,6 +612,49 @@ def handle_serve_command(args: argparse.Namespace) -> int:
         block=True,
     )
     return 0
+
+
+def _cli_error(message: str) -> None:
+    print(f"[SYSTEM1 ERROR] {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def handle_mcp_proxy_command(args: argparse.Namespace) -> int:
+    """CLI handler for 'system1 mcp-proxy' — runs the MCP JSON-RPC 2.0 stdio proxy/guard."""
+    from system1.integrations.mcp_stdio import run_mcp_stdio_from_args
+
+    return run_mcp_stdio_from_args(args, error_fn=_cli_error)
+
+
+def _load_json_or_jsonl(path_str: str) -> Any:
+    """Load JSON or newline-delimited JSONL with line-numbered parse errors."""
+    path = Path(path_str)
+    raw = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".jsonl":
+        rows: List[Any] = []
+        for line_no, line in enumerate(raw.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as ex:
+                raise ValueError(f"Invalid JSON in {path} line {line_no}: {ex.msg}") from ex
+        return rows
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as ex:
+        non_empty = [line for line in raw.splitlines() if line.strip()]
+        if len(non_empty) > 1:
+            rows = []
+            for line_no, line in enumerate(raw.splitlines(), start=1):
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as line_ex:
+                    raise ValueError(f"Invalid JSON in {path} line {line_no}: {line_ex.msg}") from line_ex
+            return rows
+        raise ValueError(f"Invalid JSON in {path} line {ex.lineno}: {ex.msg}") from ex
 
 
 def _parse_char_ngrams(raw: Optional[str]) -> Optional[List[int]]:
@@ -684,8 +732,7 @@ def handle_teach_command(args: argparse.Namespace) -> int:
             hierarchical=hierarchical,
         )
         if args.dataset:
-            with open(args.dataset, encoding="utf-8") as stream:
-                data = json.load(stream)
+            data = _load_json_or_jsonl(args.dataset)
             if not isinstance(data, dict) or not data or set(data) - {"teach", "calibrate", "evaluate"}:
                 raise ValueError("Dataset must map teach, calibrate and/or evaluate to lists of [text, label]")
             rows = []
@@ -715,8 +762,7 @@ def handle_teach_command(args: argparse.Namespace) -> int:
         elif args.adopt:
             result = session.adopt()
         elif args.qualification:
-            with open(args.qualification, encoding="utf-8") as stream:
-                rows = json.load(stream)
+            rows = _load_json_or_jsonl(args.qualification)
             if not isinstance(rows, list):
                 raise ValueError("Qualification JSON must be a list of labeled examples")
             rows = [{"input": row[0], "label": row[1]} if isinstance(row, list) and len(row) == 2 else row
@@ -928,12 +974,24 @@ def build_parser() -> argparse.ArgumentParser:
     teach_parser.set_defaults(func=handle_teach_command)
 
     # Command: serve
-    serve_parser = subparsers.add_parser("serve", help="Start the System 1 gRPC sidecar server")
+    serve_parser = subparsers.add_parser("serve", help="Start the System 1 gRPC sidecar or MCP stdio proxy server")
+    serve_parser.add_argument("--transport", choices=("grpc", "mcp-stdio"), default="grpc", help="Server transport: 'grpc' (default) or 'mcp-stdio'")
     serve_parser.add_argument("--grpc", action="store_true", default=True, help="Use gRPC transport (default)")
     serve_parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address to bind to (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=50051, help="Port to listen on (default: 50051)")
     serve_parser.add_argument("--schema", action="append", help="Schema to load: 'guard', 'triage', or 'name:path/to/file.s1m'. Can be repeated.")
+    from system1.integrations.mcp_stdio import add_mcp_proxy_arguments
+
+    add_mcp_proxy_arguments(serve_parser)
     serve_parser.set_defaults(func=handle_serve_command)
+
+    # Command: mcp-proxy
+    mcp_proxy_parser = subparsers.add_parser(
+        "mcp-proxy",
+        help="Run the System 1 MCP JSON-RPC 2.0 stdio proxy/guard in front of an upstream MCP server",
+    )
+    add_mcp_proxy_arguments(mcp_proxy_parser)
+    mcp_proxy_parser.set_defaults(func=handle_mcp_proxy_command)
 
     eval_parser = subparsers.add_parser("eval", help="Evaluate a compiled .s1m skill or schema on a labeled dataset")
     eval_parser.add_argument("target_pos", nargs="?", default=None, metavar="target", help="Skill .s1m path, session directory, or schema preset ('triage', 'guard')")
@@ -1103,8 +1161,13 @@ def handle_eval_command(args: argparse.Namespace) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI entrypoint."""
+    eff_argv = list(sys.argv[1:] if argv is None else argv)
+    if eff_argv and eff_argv[0] == "mcp-proxy" and "-h" not in eff_argv[1:2] and "--help" not in eff_argv[1:2]:
+        from system1.integrations.mcp_stdio import run_mcp_stdio_cli
+
+        return run_mcp_stdio_cli(eff_argv[1:])
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(eff_argv)
     if not hasattr(args, "func"):
         parser.print_help()
         return 0
@@ -1121,6 +1184,7 @@ __all__ = [
     "handle_compile_command",
     "handle_teach_command",
     "handle_serve_command",
+    "handle_mcp_proxy_command",
     "handle_eval_command",
     "DefaultTriageSchema",
 ]

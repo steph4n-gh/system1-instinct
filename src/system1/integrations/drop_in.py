@@ -11,7 +11,7 @@ structured extraction, and prompt-injection scanning wrappers:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 from system1.compiler import CompiledSystemOneModel, SystemOneCompiler
@@ -399,6 +399,8 @@ class StructuredExtractionResult:
     values: Dict[str, Any]
     confidence: float
     latency_ms: float
+    is_ambiguous: bool = False
+    conformal_sets: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
 
 
 class SystemOneInstructorClient:
@@ -456,6 +458,8 @@ class SystemOneInstructorClient:
             values=dict(decision.values),
             confidence=round(conf, 4),
             latency_ms=round(latency_ms, 3),
+            is_ambiguous=bool(decision.is_ambiguous),
+            conformal_sets={k: tuple(v) for k, v in decision.conformal_sets.items()},
         )
 
     def adapt_unlabeled(

@@ -125,6 +125,7 @@ class BoundedReviewFallback:
         auto_online_update: bool = False,
         lesson_split: str = "train",
         lesson_source: str = "fallback_review",
+        aci_tracker: Optional[Any] = None,
     ) -> None:
         if network is None:
             network = engine if engine is not None else teaching_session
@@ -215,6 +216,7 @@ class BoundedReviewFallback:
         self.lesson_source = str(lesson_source)
         self.lessons_recorded = 0
         self.online_updates_applied = 0
+        self.aci_tracker = aci_tracker if aci_tracker is not None else getattr(network, "aci_tracker", None)
         self._busy = False
         self._halted = False
         self._pending: Optional[asyncio.Task[Any]] = None
@@ -451,11 +453,20 @@ class BoundedReviewFallback:
 
         if self.auto_online_update:
             updated_any = False
+            reward_scale_kw: Dict[str, Any] = {}
+            if self.aci_tracker is not None:
+                reward_scale_kw["reward_scale"] = getattr(self.aci_tracker, "escalation_learning_rate_scale", 0.25)
+                local_vals = decision.get("values") if isinstance(decision.get("values"), Mapping) else {}
+                margins_map = decision.get("margins") if isinstance(decision.get("margins"), Mapping) else {}
+                pred_wrong = any(local_vals.get(k) != v for k, v in resolved_values.items()) if local_vals else False
+                min_margin = min((float(m) for m in margins_map.values()), default=None) if margins_map else None
+                self.aci_tracker.record_escalation(predicted_wrong=pred_wrong, margin=min_margin)
             if hasattr(self.network, "learn_from_tier2"):
                 self.network.learn_from_tier2(
                     prompt_text,
                     resolved_values,
                     preserve_calibration=True,
+                    **reward_scale_kw,
                 )
                 updated_any = True
             if (

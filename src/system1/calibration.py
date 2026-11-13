@@ -13,8 +13,60 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
+
+
+def _binom_cdf(k: int, n: int, p: float) -> float:
+    """Exact Binomial(n, p) CDF P(X <= k) computed in log space (no scipy required)."""
+    if n <= 0 or k >= n or p <= 0.0:
+        return 1.0 if k >= 0 else 0.0
+    if k < 0 or p >= 1.0:
+        return 0.0
+    log_p = math.log(p)
+    log_q = math.log1p(-p)
+    if k <= n // 2:
+        cur = n * log_q
+        terms = [cur]
+        log_odds = log_p - log_q
+        for j in range(1, k + 1):
+            cur += math.log(n - j + 1) - math.log(j) + log_odds
+            terms.append(cur)
+        max_lp = max(terms)
+        if max_lp < -745.0:
+            return 0.0
+        return float(min(1.0, math.exp(max_lp) * sum(math.exp(t - max_lp) for t in terms)))
+    cur = n * log_p
+    terms = [cur]
+    log_inv_odds = log_q - log_p
+    for j in range(n - 1, k, -1):
+        cur += math.log(j + 1) - math.log(n - j) + log_inv_odds
+        terms.append(cur)
+    max_lp = max(terms)
+    if max_lp < -745.0:
+        return 1.0
+    upper = min(1.0, math.exp(max_lp) * sum(math.exp(t - max_lp) for t in terms))
+    return float(max(0.0, 1.0 - upper))
+
+
+def clopper_pearson_upper(errors: int, n: int, delta: float = 0.05) -> float:
+    """Exact one-sided (1 - delta) Clopper-Pearson upper confidence bound."""
+    if isinstance(delta, bool) or not isinstance(delta, (int, float)) or not (0.0 < float(delta) < 1.0):
+        raise ValueError(f"delta must be in (0, 1), got {delta}")
+    delta_f = float(delta)
+    if n <= 0 or errors >= n:
+        return 1.0
+    if errors <= 0:
+        return float(min(1.0, max(0.0, -math.expm1(math.log(delta_f) / float(n)))))
+    lo = 0.0
+    hi = 1.0
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        if _binom_cdf(errors, n, mid) > delta_f:
+            lo = mid
+        else:
+            hi = mid
+    return float(hi)
 
 
 @dataclass(frozen=True)
@@ -1249,7 +1301,350 @@ class RecalibrationReport:
         )
 
 
+@dataclass(frozen=True)
+class SelectiveRiskCertificate:
+    """Finite-sample LTT/RCPS selective acceptance certificate."""
+
+    threshold: Optional[float]
+    method: str
+    risk_type: str
+    alpha: float
+    delta: float
+    qualified: bool
+    n_qual: int
+    n_accepted_qual: int
+    errors_qual: int
+    upper_bound: Optional[float]
+    score_name: str = "margin"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+class SelectiveRiskCalibrator:
+    """Finite-sample selective-risk threshold calibrator (LTT-FST, LTT-Bonferroni, RCPS-Joint).
+
+    Controls either conditional selective risk Pr(err | g(X) >= lambda) <= alpha
+    via Learn Then Test (Angelopoulos et al.) or joint risk Pr(err and g(X) >= lambda) <= alpha
+    via Bates et al. RCPS with exact Clopper-Pearson bounds. Fail-closed until qualified.
+    """
+
+    VALID_METHODS = ("ltt_fst", "ltt_bonferroni", "rcps_joint")
+
+    def __init__(
+        self,
+        *,
+        score_name: str = "margin",
+        method: str = "ltt_fst",
+        alpha: float = 0.05,
+        delta: float = 0.05,
+        grid_size: int = 15,
+        max_frac: float = 0.55,
+    ) -> None:
+        if method not in self.VALID_METHODS:
+            raise ValueError(f"method must be one of {self.VALID_METHODS}, got {method!r}")
+        if not (0.0 < float(alpha) < 1.0):
+            raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+        if not (0.0 < float(delta) < 1.0):
+            raise ValueError(f"delta must be in (0, 1), got {delta}")
+        if int(grid_size) < 1:
+            raise ValueError(f"grid_size must be >= 1, got {grid_size}")
+        if not (0.0 < float(max_frac) <= 1.0):
+            raise ValueError(f"max_frac must be in (0, 1], got {max_frac}")
+        self.score_name = str(score_name)
+        self.method = str(method)
+        self.alpha = float(alpha)
+        self.delta = float(delta)
+        self.grid_size = int(grid_size)
+        self.max_frac = float(max_frac)
+        self.threshold: Optional[float] = None
+        self.certificate: Optional[SelectiveRiskCertificate] = None
+
+    def is_qualified(self) -> bool:
+        return (
+            self.certificate is not None
+            and self.certificate.qualified
+            and self.threshold is not None
+            and math.isfinite(self.threshold)
+        )
+
+    def should_accept(self, score: float) -> bool:
+        """Fail-closed selective gate: returns True only when qualified and score >= threshold."""
+        if not self.is_qualified():
+            return False
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+            return False
+        assert self.threshold is not None
+        return float(score) >= float(self.threshold)
+
+    def fit(
+        self,
+        scores: Sequence[float],
+        correct: Sequence[bool],
+        *,
+        alpha: Optional[float] = None,
+        delta: Optional[float] = None,
+        method: Optional[str] = None,
+    ) -> SelectiveRiskCertificate:
+        use_method = str(method or self.method)
+        if use_method not in self.VALID_METHODS:
+            raise ValueError(f"method must be one of {self.VALID_METHODS}, got {use_method!r}")
+        use_alpha = float(self.alpha if alpha is None else alpha)
+        use_delta = float(self.delta if delta is None else delta)
+        if not (0.0 < use_alpha < 1.0):
+            raise ValueError(f"alpha must be in (0, 1), got {use_alpha}")
+        if not (0.0 < use_delta < 1.0):
+            raise ValueError(f"delta must be in (0, 1), got {use_delta}")
+
+        s_arr = np.asarray(scores, dtype=np.float64).reshape(-1)
+        c_arr = np.asarray(correct, dtype=bool).reshape(-1)
+        if len(s_arr) != len(c_arr):
+            raise ValueError(f"scores and correct must have the same length ({len(s_arr)} vs {len(c_arr)})")
+        if len(s_arr) > 0 and not np.all(np.isfinite(s_arr)):
+            raise ValueError("scores must contain only finite values")
+
+        n = int(len(s_arr))
+        risk_type = "joint" if use_method == "rcps_joint" else "conditional"
+        best_lam: Optional[float] = None
+        best_ub: Optional[float] = None
+        best_m = 0
+        best_errs = 0
+
+        if n > 0:
+            s_desc = np.sort(s_arr)[::-1]
+            if use_method == "rcps_joint":
+                lo_m = max(1, min(10, n) if n < 100 else max(10, int(0.01 * n)))
+                hi_m = max(lo_m, int(0.80 * n)) if n >= 2 else n
+                count = min(self.grid_size, hi_m - lo_m + 1)
+                idxs = np.unique(np.round(np.geomspace(lo_m, hi_m, count)).astype(int) - 1)
+                thresholds = sorted({float(s_desc[i]) for i in idxs})
+                m_eff = max(1, len(thresholds))
+                for lam in reversed(thresholds):
+                    mask = s_arr >= lam
+                    errs = int(np.sum(~c_arr[mask]))
+                    ub = clopper_pearson_upper(errs, n, delta=use_delta / m_eff)
+                    if ub <= use_alpha:
+                        best_lam = lam
+                        best_ub = ub
+                        best_m = int(np.sum(mask))
+                        best_errs = errs
+                    else:
+                        break
+            elif use_method == "ltt_bonferroni":
+                min_m = max(1, math.ceil(math.log(use_delta / self.grid_size) / math.log(1.0 - use_alpha)))
+                if n >= min_m:
+                    max_m = max(min_m, int(round(self.max_frac * n)))
+                    hi_m = min(n, max_m)
+                    count = min(self.grid_size, hi_m - min_m + 1)
+                    idxs = np.unique(np.round(np.geomspace(min_m, hi_m, count)).astype(int) - 1)
+                    thresholds = sorted({float(s_desc[i]) for i in idxs})
+                    m_eff = max(1, len(thresholds))
+                    for lam in thresholds:
+                        mask = s_arr >= lam
+                        m = int(np.sum(mask))
+                        errs = int(np.sum(~c_arr[mask]))
+                        pval = _binom_cdf(errs, m, use_alpha)
+                        if pval <= use_delta / m_eff:
+                            best_lam = lam
+                            best_ub = clopper_pearson_upper(errs, m, delta=use_delta / m_eff)
+                            best_m = m
+                            best_errs = errs
+                            break
+            else:  # ltt_fst
+                min_m = max(1, math.ceil(math.log(use_delta) / math.log(1.0 - use_alpha)))
+                if n >= min_m:
+                    max_m = max(min_m, int(round(self.max_frac * n)))
+                    hi_m = min(n, max_m)
+                    count = min(self.grid_size, hi_m - min_m + 1)
+                    idxs = np.unique(np.round(np.geomspace(min_m, hi_m, count)).astype(int) - 1)
+                    thresholds = sorted({float(s_desc[i]) for i in idxs}, reverse=True)
+                    for lam in thresholds:
+                        mask = s_arr >= lam
+                        m = int(np.sum(mask))
+                        errs = int(np.sum(~c_arr[mask]))
+                        pval = _binom_cdf(errs, m, use_alpha)
+                        if pval <= use_delta:
+                            best_lam = lam
+                            best_ub = clopper_pearson_upper(errs, m, delta=use_delta)
+                            best_m = m
+                            best_errs = errs
+                        else:
+                            break
+
+        cert = SelectiveRiskCertificate(
+            threshold=best_lam,
+            method=use_method,
+            risk_type=risk_type,
+            alpha=use_alpha,
+            delta=use_delta,
+            qualified=best_lam is not None,
+            n_qual=n,
+            n_accepted_qual=best_m,
+            errors_qual=best_errs,
+            upper_bound=best_ub,
+            score_name=self.score_name,
+        )
+        self.threshold = best_lam
+        self.certificate = cert
+        return cert
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "score_name": self.score_name,
+            "method": self.method,
+            "alpha": self.alpha,
+            "delta": self.delta,
+            "grid_size": self.grid_size,
+            "max_frac": self.max_frac,
+            "threshold": self.threshold,
+            "certificate": self.certificate.to_dict() if self.certificate is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "SelectiveRiskCalibrator":
+        obj = cls(
+            score_name=str(data.get("score_name", "margin")),
+            method=str(data.get("method", "ltt_fst")),
+            alpha=float(data.get("alpha", 0.05)),
+            delta=float(data.get("delta", 0.05)),
+            grid_size=int(data.get("grid_size", 15)),
+            max_frac=float(data.get("max_frac", 0.55)),
+        )
+        cert_raw = data.get("certificate")
+        if isinstance(cert_raw, Mapping):
+            obj.certificate = SelectiveRiskCertificate(**dict(cert_raw))
+            obj.threshold = obj.certificate.threshold
+        else:
+            raw_t = data.get("threshold")
+            obj.threshold = float(raw_t) if raw_t is not None else None
+        return obj
+
+
+class AdaptiveConformalTracker:
+    """Online Adaptive Conformal Inference (ACI) tracker with bounded sliding window and margin ratchet."""
+
+    def __init__(
+        self,
+        *,
+        alpha_target: float = 0.05,
+        gamma: float = 0.02,
+        alpha_min: float = 0.01,
+        alpha_max: Optional[float] = None,
+        margin_floor: Optional[float] = None,
+        max_window: int = 512,
+        escalation_learning_rate_scale: float = 0.25,
+    ) -> None:
+        if not (0.0 < float(alpha_target) < 1.0):
+            raise ValueError(f"alpha_target must be in (0, 1), got {alpha_target}")
+        if float(gamma) < 0.0:
+            raise ValueError(f"gamma must be >= 0, got {gamma}")
+        if int(max_window) < 1:
+            raise ValueError(f"max_window must be >= 1, got {max_window}")
+        eff_max = float(alpha_target) if alpha_max is None else float(alpha_max)
+        eff_min = float(alpha_min)
+        if not (0.0 < eff_min <= eff_max < 1.0):
+            raise ValueError(f"Require 0 < alpha_min <= alpha_max < 1, got [{eff_min}, {eff_max}]")
+        self.alpha_target = float(alpha_target)
+        self.gamma = float(gamma)
+        self.alpha_min = eff_min
+        self.alpha_max = eff_max
+        self.alpha_t = float(alpha_target)
+        self.margin_floor: Optional[float] = float(margin_floor) if margin_floor is not None else None
+        self.max_window = int(max_window)
+        self.escalation_learning_rate_scale = float(escalation_learning_rate_scale)
+        self.steps = 0
+        self.accepted_steps = 0
+        self.accepted_errors = 0
+        self.escalation_steps = 0
+        self._scores: List[float] = []
+
+    def should_accept_margin(self, margin: float) -> bool:
+        if self.margin_floor is None:
+            return True
+        if not math.isfinite(float(margin)):
+            return False
+        return float(margin) >= float(self.margin_floor)
+
+    def update_accepted(self, error: bool, *, margin: Optional[float] = None) -> float:
+        """Update online ACI alpha_t after observing a locally accepted outcome."""
+        err_f = 1.0 if error else 0.0
+        self.steps += 1
+        self.accepted_steps += 1
+        self.accepted_errors += int(err_f)
+        self.alpha_t = float(
+            np.clip(
+                self.alpha_t + self.gamma * (self.alpha_target - err_f),
+                self.alpha_min,
+                self.alpha_max,
+            )
+        )
+        if error and margin is not None and math.isfinite(float(margin)):
+            floor = float(margin) + 1e-4
+            self.margin_floor = floor if self.margin_floor is None else max(self.margin_floor, floor)
+        return self.alpha_t
+
+    def record_escalation(self, *, predicted_wrong: bool = False, margin: Optional[float] = None) -> None:
+        self.steps += 1
+        self.escalation_steps += 1
+        if (
+            predicted_wrong
+            and margin is not None
+            and math.isfinite(float(margin))
+            and self.margin_floor is not None
+            and float(margin) >= self.margin_floor
+        ):
+            self.margin_floor = max(self.margin_floor, float(margin) + 1e-4)
+
+    def push_calibration_score(self, score: float) -> np.ndarray:
+        """Append a nonconformity score into the bounded sliding window and return sorted scores."""
+        self._scores.append(float(score))
+        if len(self._scores) > self.max_window:
+            self._scores = self._scores[-self.max_window :]
+        return np.sort(np.asarray(self._scores, dtype=np.float64))
+
+    def rescore_calibration_window(
+        self,
+        pairs: Sequence[Tuple[str, Any]],
+        predictor: Callable[[str, Any], Tuple[float, float, bool]],
+        *,
+        default_floor: float = 0.30,
+    ) -> Tuple[np.ndarray, float]:
+        """Re-score a bounded calibration window after online weight updates and ratchet margin_floor."""
+        window = list(pairs)[-self.max_window :]
+        scores: List[float] = []
+        err_margins: List[float] = []
+        for prompt_c, label_c in window:
+            nc_score, margin_c, is_correct = predictor(prompt_c, label_c)
+            scores.append(float(nc_score))
+            if not is_correct and math.isfinite(float(margin_c)):
+                err_margins.append(float(margin_c))
+        self._scores = list(scores)
+        new_floor = (max(err_margins) + 1e-4) if err_margins else float(default_floor)
+        if self.margin_floor is not None:
+            self.margin_floor = max(self.margin_floor, new_floor)
+        else:
+            self.margin_floor = new_floor
+        return np.sort(np.asarray(self._scores, dtype=np.float64)), float(self.margin_floor)
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "alpha_target": self.alpha_target,
+            "alpha_t": self.alpha_t,
+            "gamma": self.gamma,
+            "alpha_min": self.alpha_min,
+            "alpha_max": self.alpha_max,
+            "margin_floor": self.margin_floor,
+            "max_window": self.max_window,
+            "window_len": len(self._scores),
+            "steps": self.steps,
+            "accepted_steps": self.accepted_steps,
+            "accepted_errors": self.accepted_errors,
+            "escalation_steps": self.escalation_steps,
+        }
+
+
 __all__ = [
+    "AdaptiveConformalTracker",
     "BrierDecomposition",
     "CalibrationMetrics",
     "ConformalPredictionSet",
@@ -1259,6 +1654,9 @@ __all__ = [
     "RecalibrationReport",
     "RegressionConformalInterval",
     "RegressionConformalPredictor",
+    "SelectiveRiskCalibrator",
+    "SelectiveRiskCertificate",
+    "clopper_pearson_upper",
     "compute_brier_decomposition",
     "compute_ece_and_bins",
     "compute_nll",

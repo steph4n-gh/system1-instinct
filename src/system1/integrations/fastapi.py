@@ -6,6 +6,7 @@ conformal escalation to the downstream application. Per-request time is host-spe
 
 from __future__ import annotations
 
+import hmac
 import json
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
@@ -37,7 +38,12 @@ class SystemOneGatewayMiddleware:
         fastpath_response_fn: Optional[Callable[[DecisionResult, Dict[str, Any]], Dict[str, Any]]] = None,
         model_path: Optional[Any] = None,
         auto_reload: bool = False,
+        max_body_bytes: int = 1_048_576,
+        allow_route_header: bool = False,
+        route_header_token: Optional[str] = None,
     ):
+        if int(max_body_bytes) <= 0:
+            raise ValueError(f"max_body_bytes must be positive, got {max_body_bytes}")
         self.app = app
         self.schema = schema
         self.engine = engine or SystemOneEngine(schema, model_path=model_path, auto_reload=auto_reload)
@@ -48,6 +54,9 @@ class SystemOneGatewayMiddleware:
         self.is_fastpath_fn = is_fastpath_fn
         self.extract_prompt_fn = extract_prompt_fn or self._default_extract_prompt
         self.fastpath_response_fn = fastpath_response_fn or self._default_fastpath_response
+        self.max_body_bytes = int(max_body_bytes)
+        self.allow_route_header = bool(allow_route_header)
+        self.route_header_token = str(route_header_token) if route_header_token is not None else None
 
     @staticmethod
     def _default_extract_prompt(body_json: Dict[str, Any]) -> Optional[str]:
@@ -115,23 +124,55 @@ class SystemOneGatewayMiddleware:
         path = scope.get("path", "")
         method = scope.get("method", "GET")
 
-        # Fast-path evaluation applies only to POST requests matching route_paths or explicit header
-        headers = dict(scope.get("headers", []))
-        explicit_route = headers.get(b"x-system1-route", b"").lower() == b"true"
+        # Fast-path evaluation applies only to POST requests matching route_paths or authorized header
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        header_flag = headers.get(b"x-system1-route", b"").lower() == b"true"
+        if self.allow_route_header and header_flag:
+            if self.route_header_token is None:
+                explicit_route = True
+            else:
+                supplied = headers.get(b"x-system1-route-token", b"").decode("latin1")
+                explicit_route = hmac.compare_digest(supplied, self.route_header_token)
+        else:
+            explicit_route = False
         matches_path = any(path.startswith(rp) for rp in self.route_paths)
 
         if method != "POST" or (not matches_path and not explicit_route):
             await self.app(scope, receive, send)
             return
 
-        # Receive the request body
+        # Receive the request body up to max_body_bytes
         body_chunks = []
+        total_bytes = 0
         more_body = True
         while more_body:
             message = await receive()
             if message["type"] == "http.disconnect":
                 return
-            body_chunks.append(message.get("body", b""))
+            chunk = message.get("body", b"")
+            total_bytes += len(chunk)
+            if total_bytes > self.max_body_bytes:
+                err_bytes = json.dumps(
+                    {
+                        "error": "payload_too_large",
+                        "max_body_bytes": self.max_body_bytes,
+                    }
+                ).encode("utf-8")
+                await send({
+                    "type": "http.response.start",
+                    "status": 413,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"x-system1-status", b"rejected_oversize"),
+                    ],
+                })
+                await send({
+                    "type": "http.response.body",
+                    "body": err_bytes,
+                    "more_body": False,
+                })
+                return
+            body_chunks.append(chunk)
             more_body = message.get("more_body", False)
 
         body_bytes = b"".join(body_chunks)
