@@ -525,8 +525,10 @@ class TfidfProjector:
     def projector_digest(self) -> str:
         return self._digest
 
-    def to_config(self) -> dict:
-        cfg: dict[str, Any] = {"type": "tfidf", "terms": list(self._terms), "idf": list(self._idf)}
+    def to_config(self, *, include_arrays: bool = True) -> dict:
+        cfg: dict[str, Any] = {"type": "tfidf", "terms": list(self._terms)}
+        if include_arrays:
+            cfg["idf"] = list(self._idf)
         if self._char_ngrams is not None:
             cfg["char_ngrams"] = list(self._char_ngrams)
         if len(self._terms) > DEFAULT_MAX_FEATURES:
@@ -534,10 +536,16 @@ class TfidfProjector:
         return cfg
 
     @classmethod
-    def from_config(cls, config: dict) -> TfidfProjector:
+    def validate_header_config(
+        cls,
+        config: dict,
+        *,
+        allow_missing_idf: bool = False,
+    ) -> tuple[list[str], int]:
         if (
             not isinstance(config, dict)
-            or not {"type", "terms", "idf"} <= set(config)
+            or not {"type", "terms"} <= set(config)
+            or (not allow_missing_idf and "idf" not in config)
             or set(config) - {"type", "terms", "idf", "char_ngrams", "max_features"}
             or config["type"] != "tfidf"
         ):
@@ -551,7 +559,21 @@ class TfidfProjector:
         terms = config["terms"]
         if not isinstance(terms, (list, tuple)) or not 0 < len(terms) <= limit:
             raise ValueError(f"TF-IDF vocabulary must contain 1–{limit} terms")
-        return cls(terms, config["idf"], char_ngrams=config.get("char_ngrams"))
+        return list(terms), limit
+
+    @classmethod
+    def from_config(cls, config: dict, *, idf_array: Any = None) -> TfidfProjector:
+        terms, _ = cls.validate_header_config(config, allow_missing_idf=(idf_array is not None))
+        if "idf" in config:
+            idf_vals = config["idf"]
+        elif idf_array is not None:
+            arr = np.asarray(idf_array, dtype=np.float64)
+            if arr.ndim != 1 or len(arr) != len(terms):
+                raise ValueError("TF-IDF weights must match the vocabulary")
+            idf_vals = tuple(float(v) for v in arr.tolist())
+        else:
+            raise ValueError("Unsupported TF-IDF settings")
+        return cls(terms, idf_vals, char_ngrams=config.get("char_ngrams"))
 
     from_texts = fit
     to_dict = to_config

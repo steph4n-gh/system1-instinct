@@ -593,6 +593,8 @@ class SystemOneEngine:
         model_path: Optional[Union[str, Path]] = None,
         auto_reload: bool = False,
         compiled_model: Optional[Any] = None,
+        min_calibration_lessons: int = 0,
+        min_override_corroborations: int = 1,
     ) -> None:
         if model is None and compiled_model is not None:
             model = compiled_model
@@ -627,6 +629,14 @@ class SystemOneEngine:
         self.recency_weighted = bool(recency_weighted)
         self.strict_mode = bool(strict_mode)
         self.default_alpha: float = 0.05
+        if int(min_calibration_lessons) < 0:
+            raise ValueError(f"min_calibration_lessons must be >= 0, got {min_calibration_lessons}")
+        if int(min_override_corroborations) < 1:
+            raise ValueError(f"min_override_corroborations must be >= 1, got {min_override_corroborations}")
+        self.min_calibration_lessons: int = int(min_calibration_lessons)
+        self.min_override_corroborations: int = int(min_override_corroborations)
+        self._online_lesson_count: int = 0
+        self._override_counts: Dict[str, Dict[str, Tuple[Any, int]]] = {}
         self.policy_scope = str(policy_scope)
         self.policy_epoch: int = 0
         self.model_version: int = 1
@@ -721,6 +731,7 @@ class SystemOneEngine:
         # Lessons belong to the active skill; a replacement retires the old ones.
         self._learned_prompt_overrides = {}
         self._learned_prompt_override_recency: Dict[str, bool] = {}
+        self._override_counts = {}
         model_rec = getattr(model, "_learned_prompt_override_recency", {})
         if hasattr(model, "_learned_prompt_overrides") and isinstance(model._learned_prompt_overrides, Mapping):
             for p_key, f_map in model._learned_prompt_overrides.items():
@@ -2028,23 +2039,40 @@ class SystemOneEngine:
                 raw_eval = raw_result.fields[name]
                 calibrator = self.calibrators[name]
                 has_learned_override = name in learned_overrides
+                conformal = self.conformal_predictors.get(name)
+                head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
+                fam_thresh = max(
+                    float(getattr(head_obj, "familiarity_threshold", 0.0)) if head_obj is not None else 0.0,
+                    float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0,
+                )
+                proto_thresh = max(
+                    float(getattr(head_obj, "prototype_threshold", 0.0)) if head_obj is not None else 0.0,
+                    float(getattr(conformal, "prototype_threshold", 0.0)) if conformal is not None else 0.0,
+                )
+                is_zero_emb = not bool(np.any(raw_result.embedding))
+                enforce_calibrated_ood = (not is_zero_emb) and (fam_thresh > 0.0 or proto_thresh > 0.0)
 
                 proto_sim: Optional[float] = None
-                if not has_learned_override:
+                if (not has_learned_override) or enforce_calibrated_ood:
                     if hasattr(self.model, "compute_prototype_similarity") and callable(self.model.compute_prototype_similarity):
                         try:
                             proto_sim = self.model.compute_prototype_similarity(name, raw_result.embedding)
                         except Exception:
                             proto_sim = None
-                    if proto_sim is None:
-                        cp_for_proto = self.conformal_predictors.get(name)
-                        if cp_for_proto is not None and getattr(cp_for_proto, "prototypes", None) is not None:
-                            try:
-                                proto_sim = cp_for_proto.compute_prototype_similarity(raw_result.embedding)
-                            except Exception:
-                                proto_sim = None
+                    if proto_sim is None and conformal is not None and getattr(conformal, "prototypes", None) is not None:
+                        try:
+                            proto_sim = conformal.compute_prototype_similarity(raw_result.embedding)
+                        except Exception:
+                            proto_sim = None
                     if proto_sim is not None:
                         prototype_similarities[name] = float(proto_sim)
+
+                ood_blocked = False
+                if enforce_calibrated_ood:
+                    if fam_thresh > 0.0 and prompt_raw_norm is not None and prompt_raw_norm < fam_thresh - 1e-12:
+                        ood_blocked = True
+                    if proto_thresh > 0.0 and proto_sim is not None and proto_sim < proto_thresh - 1e-6:
+                        ood_blocked = True
 
                 if isinstance(f_def, ChoiceField):
                     calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
@@ -2057,10 +2085,10 @@ class SystemOneEngine:
                     confidences[name] = conf
                     probabilities[name] = prob_dict
 
-                    conformal = self.conformal_predictors.get(name)
-                    is_zero_emb = not bool(np.any(raw_result.embedding))
-                    override_matched = has_learned_override and (
-                        is_zero_emb or selected_choice == learned_overrides.get(name)
+                    override_matched = (
+                        has_learned_override
+                        and not ood_blocked
+                        and (is_zero_emb or selected_choice == learned_overrides.get(name))
                     )
                     if conformal is not None and not override_matched:
                         try:
@@ -2071,8 +2099,8 @@ class SystemOneEngine:
                                 relative_odds_ratio=eff_gamma if not is_strict else None,
                                 confidence_floor_tau0=eff_tau0 if not is_strict else None,
                                 strict=is_strict,
-                                familiarity_score=None if has_learned_override else prompt_raw_norm,
-                                prototype_similarity=None if has_learned_override else proto_sim,
+                                familiarity_score=(None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
+                                prototype_similarity=(None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
                             )
                         except TypeError:
                             cset = conformal.predict_set(calibrated_p, alpha=alpha)
@@ -2113,10 +2141,10 @@ class SystemOneEngine:
                     confidences[name] = conf
                     probabilities[name] = {"False": float(calibrated_p[0]), "True": prob_true}
 
-                    conformal = self.conformal_predictors.get(name)
-                    is_zero_emb = not bool(np.any(raw_result.embedding))
-                    override_matched = has_learned_override and (
-                        is_zero_emb or val == bool(learned_overrides.get(name))
+                    override_matched = (
+                        has_learned_override
+                        and not ood_blocked
+                        and (is_zero_emb or val == bool(learned_overrides.get(name)))
                     )
                     if conformal is not None and not override_matched:
                         try:
@@ -2127,8 +2155,8 @@ class SystemOneEngine:
                                 relative_odds_ratio=eff_gamma if not is_strict else None,
                                 confidence_floor_tau0=eff_tau0 if not is_strict else None,
                                 strict=is_strict,
-                                familiarity_score=None if has_learned_override else prompt_raw_norm,
-                                prototype_similarity=None if has_learned_override else proto_sim,
+                                familiarity_score=(None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
+                                prototype_similarity=(None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
                             )
                         except TypeError:
                             cset = conformal.predict_set(calibrated_p, alpha=alpha)
@@ -2262,14 +2290,14 @@ class SystemOneEngine:
                             escalated_fields.append(name)
             if prompt_raw_norm is not None:
                 for name, definition in self.schema.fields.items():
-                    if name in learned_overrides:
-                        continue
                     head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                     cp_obj = self.conformal_predictors.get(name)
                     fam_t = max(
                         float(getattr(head_obj, "familiarity_threshold", 0.0)) if head_obj is not None else 0.0,
                         float(getattr(cp_obj, "familiarity_threshold", 0.0)) if cp_obj is not None else 0.0,
                     )
+                    if name in learned_overrides and fam_t <= 0.0:
+                        continue
                     if fam_t > 0.0 and prompt_raw_norm < fam_t - 1e-12:
                         familiarity_triggered = True
                         conformal_sets[name] = []
@@ -2281,14 +2309,14 @@ class SystemOneEngine:
                             if name not in escalated_fields:
                                 escalated_fields.append(name)
             for name, definition in self.schema.fields.items():
-                if name in learned_overrides:
-                    continue
                 head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                 cp_obj = self.conformal_predictors.get(name)
                 proto_t = max(
                     float(getattr(head_obj, "prototype_threshold", 0.0)) if head_obj is not None else 0.0,
                     float(getattr(cp_obj, "prototype_threshold", 0.0)) if cp_obj is not None else 0.0,
                 )
+                if name in learned_overrides and proto_t <= 0.0:
+                    continue
                 p_sim = prototype_similarities.get(name)
                 if proto_t > 0.0 and p_sim is not None and p_sim < proto_t - 1e-6:
                     prototype_triggered = True
@@ -2501,10 +2529,40 @@ class SystemOneEngine:
             eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
             t0 = time.perf_counter()
 
+            c_emb: Optional[np.ndarray] = None
+            allow_prompt_for_head = (
+                embedding is None and isinstance(prompt, str) and bool(prompt.strip())
+            )
             if embedding is not None:
                 emb = np.asarray(embedding, dtype=np.float32).flatten()
             else:
-                emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
+                from system1.core.model import DeterministicSemanticProjector
+
+                heads_map = getattr(self.model, "heads", {})
+                needs_concept = any(
+                    f_name in heads_map
+                    and getattr(heads_map[f_name], "_exemplar_bank", None) is not None
+                    and not getattr(heads_map[f_name], "hierarchical", False)
+                    for f_name in target
+                )
+                if (
+                    needs_concept
+                    and telemetry is None
+                    and type(self.projector) is DeterministicSemanticProjector
+                    and isinstance(prompt, str)
+                    and prompt.strip()
+                ):
+                    emb_raw, c_emb = self.projector.project_both(
+                        prompt,
+                        recency_weighted=recency_weighted,
+                        need_base=True,
+                        need_concept=True,
+                    )
+                    assert emb_raw is not None
+                    norm = np.linalg.norm(emb_raw)
+                    emb = (emb_raw / norm).astype(np.float32) if norm > 0 else emb_raw
+                else:
+                    emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
             if len(emb) != self.dimension:
                 raise ValueError(f"Expected embedding of length {self.dimension}, got {len(emb)}")
             if not np.all(np.isfinite(emb)):
@@ -2513,8 +2571,8 @@ class SystemOneEngine:
 
             if hasattr(self.model, "learn_from_tier2"):
                 model_emb = (
-                    None
-                    if (embedding is None and getattr(self.model, "projector", None) is self.projector)
+                    emb
+                    if getattr(self.model, "projector", None) is self.projector
                     else emb
                 )
                 try:
@@ -2527,6 +2585,8 @@ class SystemOneEngine:
                         recency_weighted=recency_weighted,
                         preserve_calibration=preserve_calibration,
                         reward_scale=eff_reward_scale,
+                        concept_embedding=c_emb,
+                        allow_prompt_for_head=allow_prompt_for_head,
                     )
                 except TypeError:
                     try:
@@ -2534,10 +2594,11 @@ class SystemOneEngine:
                             prompt,
                             target,
                             telemetry=telemetry,
-                            embedding=model_emb,
+                            embedding=None if (embedding is None and getattr(self.model, "projector", None) is self.projector) else emb,
                             forgetting_factor=eff_forgetting,
                             recency_weighted=recency_weighted,
                             preserve_calibration=preserve_calibration,
+                            reward_scale=eff_reward_scale,
                         )
                     except TypeError:
                         try:
@@ -2548,16 +2609,27 @@ class SystemOneEngine:
                                 embedding=model_emb,
                                 forgetting_factor=eff_forgetting,
                                 recency_weighted=recency_weighted,
+                                preserve_calibration=preserve_calibration,
                             )
                         except TypeError:
                             try:
                                 res_dict = self.model.learn_from_tier2(
-                                    prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
+                                    prompt,
+                                    target,
+                                    telemetry=telemetry,
+                                    embedding=model_emb,
+                                    forgetting_factor=eff_forgetting,
+                                    recency_weighted=recency_weighted,
                                 )
                             except TypeError:
-                                res_dict = self.model.learn_from_tier2(
-                                    prompt, target, telemetry=telemetry, embedding=model_emb
-                                )
+                                try:
+                                    res_dict = self.model.learn_from_tier2(
+                                        prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
+                                    )
+                                except TypeError:
+                                    res_dict = self.model.learn_from_tier2(
+                                        prompt, target, telemetry=telemetry, embedding=model_emb
+                                    )
                 updated_fields = res_dict.get("updated_fields", [])
                 rank1_ms = res_dict.get("update_latency_ms", 0.0)
             else:
@@ -2609,8 +2681,12 @@ class SystemOneEngine:
 
             # Atomic version increment and cache invalidation AFTER weights are updated
             self.model_version += 1
+            self._online_lesson_count = getattr(self, "_online_lesson_count", 0) + 1
             if hasattr(self.model, "model_version"):
                 self.model.model_version = self.model_version
+
+            min_cal_lessons = getattr(self, "min_calibration_lessons", 0)
+            min_corrob = max(1, int(getattr(self, "min_override_corroborations", 1)))
 
             if not preserve_calibration:
                 norm_key_clear = (
@@ -2619,8 +2695,12 @@ class SystemOneEngine:
                     else None
                 )
                 for f_name in updated_fields:
-                    if norm_key_clear is not None and getattr(self, "_learned_prompt_overrides", None):
-                        if norm_key_clear in self._learned_prompt_overrides:
+                    if norm_key_clear is not None:
+                        if getattr(self, "_override_counts", None) and norm_key_clear in self._override_counts:
+                            self._override_counts[norm_key_clear].pop(f_name, None)
+                            if not self._override_counts[norm_key_clear]:
+                                self._override_counts.pop(norm_key_clear, None)
+                        if getattr(self, "_learned_prompt_overrides", None) and norm_key_clear in self._learned_prompt_overrides:
                             self._learned_prompt_overrides[norm_key_clear].pop(f_name, None)
                             if not self._learned_prompt_overrides[norm_key_clear]:
                                 self._learned_prompt_overrides.pop(norm_key_clear, None)
@@ -2652,18 +2732,34 @@ class SystemOneEngine:
                         and f_name in target_dict_for_override
                         and f_name in self.schema.fields
                     ):
+                        validated_val = self.schema.fields[f_name].validate_value(target_dict_for_override[f_name])
+                        if not hasattr(self, "_override_counts"):
+                            self._override_counts = {}
+                        field_counts = self._override_counts.setdefault(norm_key_override, {})
+                        prev_entry = field_counts.get(f_name)
+                        if prev_entry is not None and prev_entry[0] == validated_val:
+                            corrob_count = prev_entry[1] + 1
+                        else:
+                            corrob_count = 1
+                        field_counts[f_name] = (validated_val, corrob_count)
+
                         if not hasattr(self, "_learned_prompt_overrides"):
                             self._learned_prompt_overrides = {}
                         if not hasattr(self, "_learned_prompt_override_recency"):
                             self._learned_prompt_override_recency = {}
-                        while len(self._learned_prompt_overrides) >= 4096 and norm_key_override not in self._learned_prompt_overrides:
-                            oldest_k = next(iter(self._learned_prompt_overrides))
-                            del self._learned_prompt_overrides[oldest_k]
-                            self._learned_prompt_override_recency.pop(oldest_k, None)
-                        self._learned_prompt_overrides.setdefault(norm_key_override, {})[f_name] = (
-                            self.schema.fields[f_name].validate_value(target_dict_for_override[f_name])
-                        )
-                        self._learned_prompt_override_recency[norm_key_override] = bool(recency_weighted)
+                        if corrob_count >= min_corrob:
+                            while len(self._learned_prompt_overrides) >= 4096 and norm_key_override not in self._learned_prompt_overrides:
+                                oldest_k = next(iter(self._learned_prompt_overrides))
+                                del self._learned_prompt_overrides[oldest_k]
+                                self._learned_prompt_override_recency.pop(oldest_k, None)
+                                self._override_counts.pop(oldest_k, None)
+                            self._learned_prompt_overrides.setdefault(norm_key_override, {})[f_name] = validated_val
+                            self._learned_prompt_override_recency[norm_key_override] = bool(recency_weighted)
+                        elif norm_key_override in self._learned_prompt_overrides:
+                            self._learned_prompt_overrides[norm_key_override].pop(f_name, None)
+                            if not self._learned_prompt_overrides[norm_key_override]:
+                                self._learned_prompt_overrides.pop(norm_key_override, None)
+                                self._learned_prompt_override_recency.pop(norm_key_override, None)
                     ch = getattr(self.model, "heads", {}).get(f_name)
                     cp = self.conformal_predictors.get(f_name)
                     if cp is not None:
@@ -2693,7 +2789,7 @@ class SystemOneEngine:
                                     sim_after = float(np.max(cp.prototypes @ emb_u))
                                     if eff_reward_scale >= 0.5 and cp.prototype_threshold > 0.0 and sim_after < cp.prototype_threshold:
                                         cp.prototype_threshold = max(0.0, sim_after - 1e-4)
-                        if not cp.is_calibrated:
+                        if not cp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
                             k_opts = max(2, len(cp.options))
                             q_init = float((k_opts - 1.0) / (3.5 + k_opts))
                             cp.score_method = "lac"
@@ -2704,7 +2800,7 @@ class SystemOneEngine:
                         if ch is not None and getattr(ch, "calibration_scores", ()):
                             rcp.residuals = np.sort(np.asarray(ch.calibration_scores, dtype=np.float64))
                             rcp.is_calibrated = True
-                        elif not rcp.is_calibrated:
+                        elif not rcp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
                             f_def_s = self.schema.fields[f_name]
                             if isinstance(f_def_s, ScoreField):
                                 span = max(1e-6, float(f_def_s.max_value - f_def_s.min_value))
@@ -2722,43 +2818,44 @@ class SystemOneEngine:
                 if hasattr(self.model.cache, "invalidate_prior_versions"):
                     self.model.cache.invalidate_prior_versions(self.model_version)
 
-            # Re-evaluate with updated weights
-            res = self.decide(
-                prompt,
-                telemetry=telemetry,
-                embedding=embedding,
-                record_receipt=False,
-                recency_weighted=recency_weighted,
-                strict=self.strict_mode,
-                policy_scope=self.policy_scope,
-            )
-
-            if self.use_cache and (not res.is_ambiguous or not self.strict_mode):
-                eff_m_thresh = self.margin_threshold
-                m_dig = self._model_digest()
-                p_dig = self._projector_digest()
-                c_dig = self._calibration_digest()
-                self.cache.put(
+            # Re-evaluate and populate cache only when caching is active
+            if self.use_cache and self.cache is not None:
+                res = self.decide(
                     prompt,
-                    res,
-                    embedding=emb,
                     telemetry=telemetry,
-                    schema_digest=self.schema.schema_digest(),
-                    model_version=self.model_version,
-                    policy_scope=self.policy_scope,
-                    alpha=0.05,
-                    margin_threshold=eff_m_thresh if self.enable_margin_gating else 0.0,
-                    strict=self.strict_mode,
-                    relative_odds_ratio=self.relative_odds_ratio,
-                    confidence_floor_tau0=self.confidence_floor_tau0,
+                    embedding=embedding,
+                    record_receipt=False,
                     recency_weighted=recency_weighted,
-                    source="tier2",
-                    model_digest=m_dig,
-                    projector_digest=p_dig,
-                    calibration_digest=c_dig,
-                    policy_epoch=self.policy_epoch,
-                    explicit_embedding=(embedding is not None),
+                    strict=self.strict_mode,
+                    policy_scope=self.policy_scope,
                 )
+
+                if not res.is_ambiguous or not self.strict_mode:
+                    eff_m_thresh = self.margin_threshold
+                    m_dig = self._model_digest()
+                    p_dig = self._projector_digest()
+                    c_dig = self._calibration_digest()
+                    self.cache.put(
+                        prompt,
+                        res,
+                        embedding=emb,
+                        telemetry=telemetry,
+                        schema_digest=self.schema.schema_digest(),
+                        model_version=self.model_version,
+                        policy_scope=self.policy_scope,
+                        alpha=0.05,
+                        margin_threshold=eff_m_thresh if self.enable_margin_gating else 0.0,
+                        strict=self.strict_mode,
+                        relative_odds_ratio=self.relative_odds_ratio,
+                        confidence_floor_tau0=self.confidence_floor_tau0,
+                        recency_weighted=recency_weighted,
+                        source="tier2",
+                        model_digest=m_dig,
+                        projector_digest=p_dig,
+                        calibration_digest=c_dig,
+                        policy_epoch=self.policy_epoch,
+                        explicit_embedding=(embedding is not None),
+                    )
 
             total_ms = (time.perf_counter() - t0) * 1000.0
             return {
@@ -3082,13 +3179,19 @@ class SystemOneEngine:
                     compiled._learned_prompt_overrides[p_k] = dict(f_map)
             return compiled
 
-    def to_bytes(self, include_covariance: bool = False) -> bytes:
+    def to_bytes(self, include_covariance: bool = False, *, compact: Optional[bool] = None) -> bytes:
         """Serializes the engine's model and calibration state into compact .s1m binary bytes."""
-        return self.to_compiled_model().to_bytes(include_covariance=include_covariance)
+        return self.to_compiled_model().to_bytes(include_covariance=include_covariance, compact=compact)
 
-    def save(self, path: Union[str, Path], include_covariance: bool = False) -> None:
+    def save(
+        self,
+        path: Union[str, Path],
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+    ) -> None:
         """Saves the engine's model, calibration, and online state to a portable .s1m file."""
-        self.to_compiled_model().save(path, include_covariance=include_covariance)
+        self.to_compiled_model().save(path, include_covariance=include_covariance, compact=compact)
 
     @classmethod
     def from_bytes(

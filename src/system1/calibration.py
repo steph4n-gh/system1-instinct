@@ -327,30 +327,37 @@ class DecisionCalibrator:
 
     def calibrate_logits(self, logits: np.ndarray) -> np.ndarray:
         """Applies learned temperature to raw logits to yield calibrated probabilities."""
-        logits = np.asarray(logits, dtype=np.float64)
+        arr = np.asarray(logits, dtype=np.float64)
+        temp = self.temperature
         if self.is_binary:
-            if logits.ndim == 0:
-                logits = np.array([[-float(logits) / 2.0, float(logits) / 2.0]], dtype=np.float64)
-                scaled = logits / self.temperature
-                return _stable_softmax(scaled)[0]
-            elif logits.ndim == 1:
-                logits = np.column_stack([-logits / 2.0, logits / 2.0])
-                scaled = logits / self.temperature
-                return _stable_softmax(scaled)
+            if arr.ndim == 0:
+                half_z = float(arr) / (2.0 * temp)
+                s_max = half_z if half_z >= -half_z else -half_z
+                e0 = math.exp(-half_z - s_max)
+                e1 = math.exp(half_z - s_max)
+                inv = 1.0 / (e0 + e1)
+                return np.array([e0 * inv, e1 * inv], dtype=np.float64)
+            if arr.ndim == 1:
+                arr = np.column_stack([-arr / 2.0, arr / 2.0])
+                return _stable_softmax(arr / temp)
 
-        if logits.ndim == 1 and len(logits) == 1:
-            z = logits[0]
-            logits = np.array([-z / 2.0, z / 2.0], dtype=np.float64)
-        scaled = logits / self.temperature
-        if scaled.ndim == 1:
-            scaled = scaled.reshape(1, -1)
-            single = True
-        else:
-            single = False
+        if arr.ndim == 1:
+            if len(arr) == 1:
+                half_z = float(arr[0]) / (2.0 * temp)
+                s_max = half_z if half_z >= -half_z else -half_z
+                e0 = math.exp(-half_z - s_max)
+                e1 = math.exp(half_z - s_max)
+                inv = 1.0 / (e0 + e1)
+                return np.array([e0 * inv, e1 * inv], dtype=np.float64)
+            scaled = arr / temp
+            s = scaled - float(np.max(scaled))
+            exp = np.exp(s)
+            return exp / float(np.sum(exp))
+
+        scaled = arr / temp
         max_val = np.max(scaled, axis=-1, keepdims=True)
         exp = np.exp(scaled - max_val)
-        probs = exp / np.sum(exp, axis=-1, keepdims=True)
-        return probs[0] if single else probs
+        return exp / np.sum(exp, axis=-1, keepdims=True)
 
 
 class ConformalPredictor:
@@ -530,7 +537,8 @@ class ConformalPredictor:
             q_emp = c_lo + frac * (float(c_scores[hi]) - c_lo)
         shrink = max(1.0, self.mondrian_shrinkage)
         w = float(n_c) / (float(n_c) + shrink)
-        return float(w * q_emp + (1.0 - w) * q_global)
+        # Floor at q_global when k_c > n_c so tiny per-class cohorts never shrink below marginal coverage.
+        return float(max(q_global, w * q_emp + (1.0 - w) * q_global))
 
     def calibrate(
         self,
@@ -727,28 +735,28 @@ class ConformalPredictor:
             elif self.score_method == "lac":
                 if k > n:
                     prediction_set = list(self.options)
-                elif np.all(np.isfinite(probs)) and np.all(probs >= 0) and np.isclose(total_mass, 1.0):
+                elif np.all(np.isfinite(probs)) and np.all(probs >= 0) and abs(total_mass - 1.0) <= (1e-8 + 1e-5):
                     if self.mondrian and self.class_calibration_scores:
                         prediction_set = [
                             self.options[idx]
                             for idx in sorted_indices
-                            if 1.0 - float(probs[idx]) <= self.class_quantile(self.options[idx], alpha) + 1e-12
+                            if 1.0 - float(probs[idx]) <= self.class_quantile(self.options[idx], alpha) + 1e-7
                         ]
                     else:
                         prediction_set = [self.options[idx] for idx in sorted_indices
-                                          if 1.0 - float(probs[idx]) <= q_hat + 1e-12]
+                                          if 1.0 - float(probs[idx]) <= q_hat + 1e-7]
             elif strict:
                 # Invert the calibrated score s(x,y) = cumulative mass through y.
                 # Including the next label after crossing q_hat inflates every set.
                 # Empty sets request review; insufficient evidence includes all labels.
                 if k > n:
                     prediction_set = list(self.options)
-                elif np.all(np.isfinite(probs)) and np.all(probs >= 0) and np.isclose(total_mass, 1.0):
+                elif np.all(np.isfinite(probs)) and np.all(probs >= 0) and abs(total_mass - 1.0) <= (1e-8 + 1e-5):
                     for idx in sorted_indices:
                         cum_mass += float(probs[idx])
                         opt = self.options[idx]
                         thresh = self.class_quantile(opt, alpha) if (self.mondrian and self.class_calibration_scores) else q_hat
-                        if cum_mass <= thresh + 1e-12:
+                        if cum_mass <= thresh + 1e-7:
                             prediction_set.append(opt)
             elif total_mass >= q_hat - 1e-7 and total_mass >= 0.5:
                 for idx in sorted_indices:

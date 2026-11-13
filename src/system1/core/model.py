@@ -13,10 +13,11 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union
 import numpy as np
 
 from system1.core.embeddings import (
@@ -42,6 +43,11 @@ except ImportError:
     HAS_MLX = False
 
 
+_WORD_RE = re.compile(r"\b\w+\b")
+_UNPACK_6I = struct.Struct(">6I").unpack_from
+_SHA256 = hashlib.sha256
+
+
 class DeterministicSemanticProjector:
     """Deterministic normalized lexical features for local decisions.
 
@@ -49,11 +55,21 @@ class DeterministicSemanticProjector:
     Shared features can support generalization, but similarity does not guarantee
     semantic equivalence or distinguish all unrelated concepts."""
 
-    def __init__(self, dimension: int = 384, recency_weighted: bool = False):
+    def __init__(
+        self,
+        dimension: int = 384,
+        recency_weighted: bool = False,
+        *,
+        token_cache: bool = True,
+        max_token_cache: int = 65536,
+    ):
         if dimension <= 0:
             raise ValueError(f"dimension must be positive, got {dimension}")
         self.dimension = dimension
         self.recency_weighted = bool(recency_weighted)
+        self.token_cache_enabled = bool(token_cache)
+        self.max_token_cache = max(1, int(max_token_cache))
+        self._tok_hash_cache: Dict[str, Tuple[int, int, int, int, int, int, float, float, float, float, float, float]] = {}
         self._digest = hashlib.sha256(
             f'{{"dimension": {self.dimension}, "recency_weighted": {"true" if self.recency_weighted else "false"}, "type": "deterministic_hash"}}'.encode("utf-8")
         ).hexdigest()
@@ -61,16 +77,116 @@ class DeterministicSemanticProjector:
     def projector_digest(self) -> str:
         return self._digest
 
+    def clear_token_cache(self) -> None:
+        self._tok_hash_cache.clear()
+
+    def _hash_token(
+        self, token: str
+    ) -> Tuple[int, int, int, int, int, int, float, float, float, float, float, float]:
+        if self.token_cache_enabled:
+            cached = self._tok_hash_cache.get(token)
+            if cached is not None:
+                return cached
+        digest = _SHA256(token.encode("utf-8")).digest()
+        v0, v1, v2, v3, v4, v5 = _UNPACK_6I(digest)
+        dim = self.dimension
+        res = (
+            v0 % dim,
+            v1 % dim,
+            v2 % dim,
+            v3 % dim,
+            v4 % dim,
+            v5 % dim,
+            1.0 if ((v0 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v1 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v2 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v3 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v4 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v5 >> 16) & 1) == 0 else -1.0,
+        )
+        if self.token_cache_enabled:
+            if len(self._tok_hash_cache) >= self.max_token_cache:
+                self._tok_hash_cache.clear()
+            self._tok_hash_cache[token] = res
+        return res
+
     def _hash_to_sparse_vec(self, token: str, weight: float = 1.0) -> np.ndarray:
         """Map a token or n-gram deterministically to a sparse pseudo-random vector."""
         vec = np.zeros(self.dimension, dtype=np.float32)
-        h = hashlib.sha256(token.encode("utf-8")).digest()
-        for i in range(6):
-            chunk = h[i * 4 : (i + 1) * 4]
-            val = int.from_bytes(chunk, byteorder="big", signed=False)
-            idx = val % self.dimension
-            sign = 1.0 if ((val >> 16) & 1) == 0 else -1.0
-            vec[idx] += sign * weight
+        i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = self._hash_token(token)
+        vec[i0] += s0 * weight
+        vec[i1] += s1 * weight
+        vec[i2] += s2 * weight
+        vec[i3] += s3 * weight
+        vec[i4] += s4 * weight
+        vec[i5] += s5 * weight
+        return vec
+
+    def _accumulate_and_normalize(
+        self,
+        weights_map: Dict[str, float],
+        local_memo: Optional[Dict[str, Tuple[int, int, int, int, int, int, float, float, float, float, float, float]]] = None,
+    ) -> np.ndarray:
+        dim = self.dimension
+        if not weights_map:
+            out = np.zeros(dim, dtype=np.float32)
+            out[0] = 1.0
+            return out
+
+        vec_list = [0.0] * dim
+        tok_cache_on = self.token_cache_enabled
+        cache = self._tok_hash_cache if tok_cache_on else local_memo
+        max_cache = self.max_token_cache
+        cache_get = cache.get if cache is not None else None
+        sha256 = _SHA256
+        unpack_6i = _UNPACK_6I
+
+        for tok, w in weights_map.items():
+            if w == 0.0:
+                continue
+            res = cache_get(tok) if cache_get is not None else None
+            if res is None:
+                digest = sha256(tok.encode("utf-8")).digest()
+                v0, v1, v2, v3, v4, v5 = unpack_6i(digest)
+                res = (
+                    v0 % dim,
+                    v1 % dim,
+                    v2 % dim,
+                    v3 % dim,
+                    v4 % dim,
+                    v5 % dim,
+                    1.0 if ((v0 >> 16) & 1) == 0 else -1.0,
+                    1.0 if ((v1 >> 16) & 1) == 0 else -1.0,
+                    1.0 if ((v2 >> 16) & 1) == 0 else -1.0,
+                    1.0 if ((v3 >> 16) & 1) == 0 else -1.0,
+                    1.0 if ((v4 >> 16) & 1) == 0 else -1.0,
+                    1.0 if ((v5 >> 16) & 1) == 0 else -1.0,
+                )
+                if cache is not None:
+                    if tok_cache_on and len(cache) >= max_cache:
+                        cache.clear()
+                    cache[tok] = res
+            i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
+            vec_list[i0] += s0 * w
+            vec_list[i1] += s1 * w
+            vec_list[i2] += s2 * w
+            vec_list[i3] += s3 * w
+            vec_list[i4] += s4 * w
+            vec_list[i5] += s5 * w
+
+        vec = np.array(vec_list, dtype=np.float32)
+        max_abs = float(np.max(np.abs(vec))) if len(vec) > 0 else 0.0
+        if max_abs < 1e-12 or not math.isfinite(max_abs):
+            vec.fill(0.0)
+            vec[0] = 1.0
+            return vec
+        vec /= max_abs
+        norm = float(np.linalg.norm(vec))
+        if norm > 1e-12:
+            vec /= norm
+        else:
+            vec.fill(0.0)
+            vec[0] = 1.0
         return vec
 
     def project(self, text: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
@@ -95,116 +211,167 @@ class DeterministicSemanticProjector:
         clean_text = text.lower().strip()
         if len(clean_text) > 8192:
             clean_text = clean_text[:4096] + " " + clean_text[-4096:]
-        words = re.findall(r"\b\w+\b", clean_text)
+        words = _WORD_RE.findall(clean_text)
         n_words = len(words)
 
-        vec = np.zeros(self.dimension, dtype=np.float32)
+        wmap: Dict[str, float] = {}
+        wmap_get = wmap.get
+        log1p = math.log1p
+        sqrt = math.sqrt
 
         # 1. Whole word tokens with position decay and length weighting
         for pos, word in enumerate(words):
             dist = (n_words - 1 - pos) if use_recency else pos
-            word_weight = math.log1p(len(word)) / math.sqrt(1.0 + dist * 0.05)
-            vec += self._hash_to_sparse_vec(f"word:{word}", weight=word_weight * 2.0)
+            word_weight = log1p(len(word)) / sqrt(1.0 + dist * 0.05)
+            wk = f"word:{word}"
+            wmap[wk] = wmap_get(wk, 0.0) + word_weight * 2.0
 
-            # Subword 3-grams and 4-grams for morphological/synonym tolerance
-            if len(word) >= 3:
+            wlen = len(word)
+            if wlen >= 3:
                 for n in (3, 4):
-                    for j in range(len(word) - n + 1):
-                        ngram = word[j : j + n]
-                        vec += self._hash_to_sparse_vec(f"ng:{ngram}", weight=0.5)
+                    for j in range(wlen - n + 1):
+                        nk = f"ng:{word[j : j + n]}"
+                        wmap[nk] = wmap_get(nk, 0.0) + 0.5
 
         # 2. Word pairs / bigrams for local contextual semantics
-        for i in range(len(words) - 1):
-            bigram = f"{words[i]}_{words[i+1]}"
-            vec += self._hash_to_sparse_vec(f"bi:{bigram}", weight=1.5)
+        for i in range(n_words - 1):
+            bk = f"bi:{words[i]}_{words[i + 1]}"
+            wmap[bk] = wmap_get(bk, 0.0) + 1.5
 
         # 3. Global character 4-grams across word boundaries
         boundary_text = f" {clean_text} "
-        for j in range(max(0, len(boundary_text) - 4)):
-            c_ngram = boundary_text[j : j + 4]
-            vec += self._hash_to_sparse_vec(f"char4:{c_ngram}", weight=0.3)
+        limit = len(boundary_text) - 4
+        for j in range(max(0, limit)):
+            ck = f"char4:{boundary_text[j : j + 4]}"
+            wmap[ck] = wmap_get(ck, 0.0) + 0.3
 
-        # L2-normalization
-        max_abs = float(np.max(np.abs(vec))) if len(vec) > 0 else 0.0
-        if max_abs < 1e-12 or not np.isfinite(max_abs):
-            v = np.zeros(self.dimension, dtype=np.float32)
-            v[0] = 1.0
-            return v
-        scaled = vec / max_abs
-        norm = float(np.linalg.norm(scaled))
-        if norm < 1e-12:
-            vec_zero = np.zeros(self.dimension, dtype=np.float32)
-            vec_zero[0] = 1.0
-            return vec_zero
-        return (scaled / norm).astype(np.float32)
+        return self._accumulate_and_normalize(wmap)
 
     def _project_concept_aware(self, text: str) -> np.ndarray:
         """Project input text with morphological stems, stopword downweighting, and concept anchors for zero-shot exemplar banks."""
-        if not text or not text.strip():
-            v = np.zeros(self.dimension, dtype=np.float32)
-            v[0] = 1.0
-            return v
+        _, c_vec = self.project_both(text, need_base=False, need_concept=True)
+        assert c_vec is not None
+        return c_vec
 
+    def project_both(
+        self,
+        text: str,
+        *,
+        recency_weighted: Optional[bool] = None,
+        need_base: bool = True,
+        need_concept: bool = True,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Single-pass extraction sharing regex, ngrams, bigrams, and char4 slices."""
+        if not text or not text.strip():
+            v_b = None
+            v_c = None
+            if need_base:
+                v_b = np.zeros(self.dimension, dtype=np.float32)
+                v_b[0] = 1.0
+            if need_concept:
+                v_c = np.zeros(self.dimension, dtype=np.float32)
+                v_c[0] = 1.0
+            return v_b, v_c
+
+        use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         clean_text = text.lower().strip()
         if len(clean_text) > 8192:
             clean_text = clean_text[:4096] + " " + clean_text[-4096:]
-        words = re.findall(r"\b\w+\b", clean_text)
+
+        words = _WORD_RE.findall(clean_text)
         n_words = len(words)
-        vec = np.zeros(self.dimension, dtype=np.float32)
+        base_map: Optional[Dict[str, float]] = {} if need_base else None
+        conc_map: Optional[Dict[str, float]] = {} if need_concept else None
 
-        stems: List[str] = []
+        log1p = math.log1p
+        sqrt = math.sqrt
+        stems: List[str] = [""] * n_words if need_concept else []
+
         for pos, word in enumerate(words):
-            word_weight = math.log1p(len(word)) / math.sqrt(1.0 + pos * 0.05)
-            if word in _ANCHOR_STOPWORDS:
-                stems.append(word)
-                vec += self._hash_to_sparse_vec(f"word:{word}", weight=word_weight * 0.35)
-                continue
+            lw = log1p(len(word))
+            is_stop = word in _ANCHOR_STOPWORDS
+            if need_base:
+                assert base_map is not None
+                dist = (n_words - 1 - pos) if use_recency else pos
+                w_base = lw / sqrt(1.0 + dist * 0.05)
+                wk = f"word:{word}"
+                base_map[wk] = base_map.get(wk, 0.0) + w_base * 2.0
 
-            vec += self._hash_to_sparse_vec(f"word:{word}", weight=word_weight * 2.0)
-            stem = _stem_word(word)
-            stems.append(stem)
-            if len(stem) >= 3:
-                vec += self._hash_to_sparse_vec(f"stem:{stem}", weight=word_weight * 1.8)
-                if stem != word:
-                    vec += self._hash_to_sparse_vec(f"word:{stem}", weight=word_weight * 1.2)
+            if need_concept:
+                assert conc_map is not None
+                w_conc = lw / sqrt(1.0 + pos * 0.05)
+                wk = f"word:{word}"
+                if is_stop:
+                    conc_map[wk] = conc_map.get(wk, 0.0) + w_conc * 0.35
+                    stems[pos] = word
+                else:
+                    conc_map[wk] = conc_map.get(wk, 0.0) + w_conc * 2.0
+                    stem = _stem_word(word)
+                    stems[pos] = stem
+                    if len(stem) >= 3:
+                        sk = f"stem:{stem}"
+                        conc_map[sk] = conc_map.get(sk, 0.0) + w_conc * 1.8
+                        if stem != word:
+                            wsk = f"word:{stem}"
+                            conc_map[wsk] = conc_map.get(wsk, 0.0) + w_conc * 1.2
 
-            if len(word) >= 3:
+            wlen = len(word)
+            if wlen >= 3:
+                emit_conc_ng = need_concept
                 for n in (3, 4):
-                    for j in range(len(word) - n + 1):
-                        ngram = word[j : j + n]
-                        vec += self._hash_to_sparse_vec(f"ng:{ngram}", weight=0.4)
+                    for j in range(wlen - n + 1):
+                        nk = f"ng:{word[j : j + n]}"
+                        if need_base:
+                            assert base_map is not None
+                            base_map[nk] = base_map.get(nk, 0.0) + 0.5
+                        if emit_conc_ng:
+                            assert conc_map is not None
+                            conc_map[nk] = conc_map.get(nk, 0.0) + 0.4
 
-        for i in range(len(words) - 1):
-            bigram = f"{words[i]}_{words[i+1]}"
-            vec += self._hash_to_sparse_vec(f"bi:{bigram}", weight=1.5)
-            if stems[i] not in _ANCHOR_STOPWORDS or stems[i + 1] not in _ANCHOR_STOPWORDS:
-                s_bigram = f"{stems[i]}_{stems[i+1]}"
-                vec += self._hash_to_sparse_vec(f"sbi:{s_bigram}", weight=1.2)
+        for i in range(n_words - 1):
+            bk = f"bi:{words[i]}_{words[i + 1]}"
+            if need_base:
+                assert base_map is not None
+                base_map[bk] = base_map.get(bk, 0.0) + 1.5
+            if need_concept:
+                assert conc_map is not None
+                conc_map[bk] = conc_map.get(bk, 0.0) + 1.5
+                s0, s1 = stems[i], stems[i + 1]
+                if s0 not in _ANCHOR_STOPWORDS or s1 not in _ANCHOR_STOPWORDS:
+                    sbk = f"sbi:{s0}_{s1}"
+                    conc_map[sbk] = conc_map.get(sbk, 0.0) + 1.2
 
-        len_scale = math.sqrt(max(1.0, n_words / 4.0))
-        for c_name, c_score in match_semantic_concepts(clean_text).items():
-            vec += self._hash_to_sparse_vec(
-                f"concept:{c_name}",
-                weight=min(7.5, c_score * 2.1) * len_scale,
-            )
+        if need_concept and clean_text:
+            assert conc_map is not None
+            len_scale = sqrt(max(1.0, n_words / 4.0))
+            for c_name, c_score in match_semantic_concepts(clean_text).items():
+                ck = f"concept:{c_name}"
+                conc_map[ck] = conc_map.get(ck, 0.0) + min(7.5, c_score * 2.1) * len_scale
 
-        boundary_text = f" {clean_text} "
-        for j in range(max(0, len(boundary_text) - 4)):
-            c_ngram = boundary_text[j : j + 4]
-            vec += self._hash_to_sparse_vec(f"char4:{c_ngram}", weight=0.18)
+        if clean_text:
+            boundary_text = f" {clean_text} "
+            limit = len(boundary_text) - 4
+            for j in range(max(0, limit)):
+                ck = f"char4:{boundary_text[j : j + 4]}"
+                if need_base:
+                    assert base_map is not None
+                    base_map[ck] = base_map.get(ck, 0.0) + 0.3
+                if need_concept:
+                    assert conc_map is not None
+                    conc_map[ck] = conc_map.get(ck, 0.0) + 0.18
 
-        max_abs = float(np.max(np.abs(vec))) if len(vec) > 0 else 0.0
-        if max_abs < 1e-12 or not np.isfinite(max_abs):
-            v = np.zeros(self.dimension, dtype=np.float32)
-            v[0] = 1.0
-            return v
-        scaled = vec / max_abs
-        norm = float(np.linalg.norm(scaled))
-        if norm < 1e-12:
-            vec_zero = np.zeros(self.dimension, dtype=np.float32)
-            vec_zero[0] = 1.0
-            return vec_zero
-        return (scaled / norm).astype(np.float32)
+        local_memo = {} if (need_base and need_concept and not self.token_cache_enabled) else None
+        v_base = (
+            self._accumulate_and_normalize(base_map, local_memo=local_memo)
+            if need_base and base_map is not None
+            else None
+        )
+        v_conc = (
+            self._accumulate_and_normalize(conc_map, local_memo=local_memo)
+            if need_concept and conc_map is not None
+            else None
+        )
+        return v_base, v_conc
 
     encode = project
 
@@ -316,12 +483,32 @@ class DecisionFieldHead:
         self._initial_weights: Optional[np.ndarray] = None
         self._online_shots_p: Optional[List[List[np.ndarray]]] = None
         self._online_shots_c: Optional[List[List[np.ndarray]]] = None
+        self._p_tmp_buf: Optional[np.ndarray] = None
+        self._b_tmp_buf: Optional[np.ndarray] = None
+        self._known_stems_per_option: List[Set[str]] = []
         if initialize_weights:
             self._init_head()
         else:
             width = len(field_def.options) if isinstance(field_def, (ChoiceField, MultiChoiceField)) else 1
             self.weights = np.zeros((width, dimension), dtype=np.float32)
             self.biases = np.zeros(width, dtype=np.float32)
+        self._precompute_known_stems()
+
+    def _precompute_known_stems(self) -> None:
+        """Cache stemmed option descriptions once per head for fast online exemplar updates."""
+        stems_list: List[Set[str]] = []
+        if isinstance(self.field_def, ChoiceField):
+            for opt_name in self.field_def.options:
+                desc_k = self.field_def.descriptions.get(opt_name, "")
+                txts_k = desc_k if isinstance(desc_k, (list, tuple)) else [str(desc_k), opt_name.replace("_", " ")]
+                stems_list.append(
+                    {
+                        _stem_word(w)
+                        for t in txts_k
+                        for w in _WORD_RE.findall(str(t).lower())
+                    }
+                )
+        self._known_stems_per_option = stems_list
 
     def _build_concept_aware_exemplar_bank(self) -> None:
         """Constructs the concept-aware prototype and sub-prototype bank for a ChoiceField."""
@@ -734,6 +921,7 @@ class DecisionFieldHead:
         *,
         blend_rate: float = 0.28,
         attenuate_competitors: bool = True,
+        concept_embedding: Optional[np.ndarray] = None,
     ) -> None:
         """Updates the live multi-exemplar sub-prototype bank for ChoiceField class target_k."""
         if not isinstance(self.field_def, ChoiceField) or self.hierarchical:
@@ -744,39 +932,49 @@ class DecisionFieldHead:
             return
         if self._exemplar_bank is None:
             return
-        if prompt is not None and self._exemplar_projector is not None:
-            c_vec = self._exemplar_projector._project_concept_aware(prompt)
+        if (concept_embedding is not None or prompt is not None) and self._exemplar_projector is not None:
+            if concept_embedding is not None:
+                c_vec = concept_embedding
+            else:
+                assert prompt is not None
+                c_vec = self._exemplar_projector._project_concept_aware(prompt)
             if self._exemplar_mean is not None and len(self._exemplar_mean) == D:
                 c_vec = (c_vec - self._exemplar_mean).astype(np.float32)
             c_norm = float(np.linalg.norm(c_vec))
             if c_norm <= 1e-12:
                 return
             c_full = (c_vec / c_norm).astype(np.float32)
-            # Boost novel co-occurring vocabulary not already present in the initial description of target_k
-            opt_name = self.field_def.options[target_k]
-            desc_k = self.field_def.descriptions.get(opt_name, "")
-            txts_k = desc_k if isinstance(desc_k, (list, tuple)) else [str(desc_k), opt_name.replace("_", " ")]
-            known_stems_k = {
-                _stem_word(w)
-                for t in txts_k
-                for w in re.findall(r"\b\w+\b", str(t).lower())
-            }
-            words = re.findall(r"\b\w+\b", prompt.lower())
-            novel_words = [
-                w
-                for w in words
-                if w not in _ANCHOR_STOPWORDS and _stem_word(w) not in known_stems_k
-            ]
-            if novel_words and len(novel_words) < len(words):
-                c_nov_raw = self._exemplar_projector._project_concept_aware(" ".join(novel_words))
-                if self._exemplar_mean is not None and len(self._exemplar_mean) == D:
-                    c_nov_raw = (c_nov_raw - self._exemplar_mean).astype(np.float32)
-                cn_norm = float(np.linalg.norm(c_nov_raw))
-                if cn_norm > 1e-12:
-                    c_nov = (c_nov_raw / cn_norm).astype(np.float32)
-                    c_mix = 0.45 * c_full + 0.55 * c_nov
-                    cm_norm = float(np.linalg.norm(c_mix))
-                    c_unit = (c_mix / (cm_norm if cm_norm > 1e-12 else 1.0)).astype(np.float32)
+            if prompt is not None:
+                # Boost novel co-occurring vocabulary not already present in the initial description of target_k
+                if target_k < len(self._known_stems_per_option):
+                    known_stems_k = self._known_stems_per_option[target_k]
+                else:
+                    opt_name = self.field_def.options[target_k]
+                    desc_k = self.field_def.descriptions.get(opt_name, "")
+                    txts_k = desc_k if isinstance(desc_k, (list, tuple)) else [str(desc_k), opt_name.replace("_", " ")]
+                    known_stems_k = {
+                        _stem_word(w)
+                        for t in txts_k
+                        for w in _WORD_RE.findall(str(t).lower())
+                    }
+                words = _WORD_RE.findall(prompt.lower())
+                novel_words = [
+                    w
+                    for w in words
+                    if w not in _ANCHOR_STOPWORDS and _stem_word(w) not in known_stems_k
+                ]
+                if novel_words and len(novel_words) < len(words):
+                    c_nov_raw = self._exemplar_projector._project_concept_aware(" ".join(novel_words))
+                    if self._exemplar_mean is not None and len(self._exemplar_mean) == D:
+                        c_nov_raw = (c_nov_raw - self._exemplar_mean).astype(np.float32)
+                    cn_norm = float(np.linalg.norm(c_nov_raw))
+                    if cn_norm > 1e-12:
+                        c_nov = (c_nov_raw / cn_norm).astype(np.float32)
+                        c_mix = 0.45 * c_full + 0.55 * c_nov
+                        cm_norm = float(np.linalg.norm(c_mix))
+                        c_unit = (c_mix / (cm_norm if cm_norm > 1e-12 else 1.0)).astype(np.float32)
+                    else:
+                        c_unit = c_full
                 else:
                     c_unit = c_full
             else:
@@ -980,6 +1178,7 @@ class DecisionFieldHead:
         prompt: Optional[str] = None,
         preserve_calibration: bool = False,
         reward_scale: float = 1.0,
+        concept_embedding: Optional[np.ndarray] = None,
     ) -> float:
         r"""Closed-form rank-1 Sherman-Morrison update with exponential forgetting factor.
 
@@ -997,17 +1196,17 @@ class DecisionFieldHead:
         D = self.dimension
         K = self.weights.shape[0]
 
-        x = np.asarray(x_aug, dtype=np.float32).flatten()
+        x = np.asarray(x_aug, dtype=np.float32).ravel()
         if len(x) == D:
             # If prompt embedding without bias 1, augment
-            x = np.append(x, 1.0).astype(np.float32)
+            x = np.append(x, np.float32(1.0))
         elif len(x) != D + 1:
             raise ValueError(f"Expected x_aug of length {D} or {D+1}, got {len(x)}")
 
         if not np.all(np.isfinite(x)):
             raise ValueError("x_aug contains NaN or Inf non-finite values")
 
-        y = np.asarray(y_target, dtype=np.float32).flatten()
+        y = np.asarray(y_target, dtype=np.float32).ravel()
         if not np.all(np.isfinite(y)):
             raise ValueError("y_target contains NaN or Inf non-finite values")
         if len(y) != K:
@@ -1018,8 +1217,9 @@ class DecisionFieldHead:
 
         P = self.covariance_inv
         B = self.cross_covariance
+        assert P is not None and B is not None
 
-        eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
+        eff_reward_scale = float(min(1.0, max(0.0, reward_scale)))
         x_step = x
         y_step = y
         if not preserve_calibration and isinstance(self.field_def, ChoiceField) and K > 8:
@@ -1027,21 +1227,26 @@ class DecisionFieldHead:
             if pos_max > 0.0:
                 neg_balanced = -pos_max / float(max(1, K - 1))
                 y_step = np.where(y > 0.0, y, neg_balanced).astype(np.float32)
+
+        v: Optional[np.ndarray] = None
+        z_curr_dir: Optional[np.ndarray] = None
         if preserve_calibration and float(np.linalg.norm(x[:D])) > 1e-12:
-            x_step = np.append(x[:D], 0.0).astype(np.float32)
+            x_step = np.empty(D + 1, dtype=np.float32)
+            x_step[:D] = x[:D]
+            x_step[D] = 0.0
             v_dir = P @ x_step
             g = float(x_step @ v_dir)
             if g > 1e-12:
-                z0 = (self.weights @ x[:D] + self.biases).astype(np.float64)
+                v = v_dir
+                z0 = (self.weights @ x[:D]).astype(np.float64) + self.biases.astype(np.float64)
                 b0 = self.biases.astype(np.float64)
                 z_desired = z0.copy()
                 if isinstance(self.field_def, ChoiceField) and K >= 2:
                     t_idx = int(np.argmax(y))
-                    comp_max = float(np.max([z0[i] for i in range(K) if i != t_idx]))
                     for i in range(K):
                         if i != t_idx and z0[i] > 0.15:
                             z_desired[i] = 0.05
-                    comp_after = float(np.max([z_desired[i] for i in range(K) if i != t_idx]))
+                    comp_after = float(max(z_desired[i] for i in range(K) if i != t_idx))
                     z_desired[t_idx] = max(float(z0[t_idx]), comp_after + 1.45, 1.45)
                 elif isinstance(self.field_def, BooleanField):
                     sign = 1.0 if float(y[0]) >= 0.0 else -1.0
@@ -1058,36 +1263,69 @@ class DecisionFieldHead:
                 z_curr_dir = z0 - b0
                 y_step = (((lam_f + g) * y_des - lam_f * z_curr_dir) / g).astype(np.float32)
 
-        # v = P @ x_step (shape: D+1,)
-        v = P @ x_step
-        denom = float(lam_f + x_step @ v)
+        if v is None:
+            v = P @ x_step
+        denom = float(lam_f + float(x_step @ v))
         if denom <= 1e-12 or not math.isfinite(denom):
             # Degenerate input or numerical singularity: preserve internal state
             return (time.perf_counter() - t0) * 1000.0
 
-        # Rank-1 update with exponential forgetting factor:
-        # P_{t+1} = (1 / lam_f) * [ P_t - (v v^T) / denom ]
-        P_next = (1.0 / lam_f) * (P - (np.outer(v, v) / denom))
-        P_next = 0.5 * (P_next + P_next.T)
+        # In-place rank-1 P update using preallocated scratch buffer
+        if self._p_tmp_buf is None or self._p_tmp_buf.shape != P.shape or self._p_tmp_buf.dtype != P.dtype:
+            self._p_tmp_buf = np.empty_like(P)
+        buf = self._p_tmp_buf
+        np.multiply.outer(v, v, out=buf)
+        buf *= np.float32(1.0 / denom)
+        P -= buf
+        if lam_f != 1.0:
+            P *= np.float32(1.0 / lam_f)
 
-        # Cross-covariance update: B_{t+1} = lam_f * B_t + x y^T
-        B_next = (lam_f * B) + np.outer(x_step, y_step)
+        # In-place cross-covariance update: B_{t+1} = lam_f * B_t + x y^T
+        if lam_f != 1.0:
+            B *= np.float32(lam_f)
+        if self._b_tmp_buf is None or self._b_tmp_buf.shape != B.shape or self._b_tmp_buf.dtype != B.dtype:
+            self._b_tmp_buf = np.empty_like(B)
+        np.multiply.outer(x_step, y_step, out=self._b_tmp_buf)
+        B += self._b_tmp_buf
 
-        # Covariance bounding: prevent covariance windup along unexcited subspace directions
+        # Covariance bounding via diagonal view: prevent covariance windup along unexcited directions
+        p_diag = P.diagonal()
         p_max = float(50.0 / max(1e-4, self.regularization))
-        max_d = float(np.max(np.diag(P_next)))
-        if max_d > p_max and max_d > 0:
-            scale = p_max / max_d
-            P_next *= scale
-            B_next *= (1.0 / scale)
+        max_d = float(np.max(p_diag))
+        clamped = False
+        if max_d > p_max and max_d > 0.0:
+            scale = np.float32(p_max / max_d)
+            P *= scale
+            B *= np.float32(1.0 / scale)
+            clamped = True
 
         # Enforce strict positive-definiteness on diagonal against floating-point drift
-        np.fill_diagonal(P_next, np.maximum(np.diag(P_next), 1e-6))
+        if float(np.min(p_diag)) < 1e-6:
+            idx = np.arange(P.shape[0])
+            small = p_diag < 1e-6
+            P[idx[small], idx[small]] = np.float32(1e-6)
+            clamped = True
 
-        # Weight update: W_aug = (P_{t+1} @ B_{t+1})^T
-        W_aug = (P_next @ B_next).T
-        new_W = W_aug[:, :D].astype(np.float32)
-        new_b = W_aug[:, D].astype(np.float32)
+        # Exact O(D*K) Sherman-Morrison weight update when un-clamped
+        if not clamped:
+            if z_curr_dir is not None and x_step[D] == 0.0:
+                z_curr = z_curr_dir.astype(np.float32)
+            else:
+                z_curr = self.weights @ x_step[:D]
+                if x_step[D] != 0.0:
+                    z_curr = z_curr + self.biases * x_step[D]
+            gain = (v * np.float32(1.0 / denom)).astype(np.float32)
+            err = (y_step - z_curr).astype(np.float32)
+            new_W = self.weights + np.multiply.outer(err, gain[:D])
+            if gain[D] != 0.0:
+                new_b = self.biases + err * gain[D]
+            else:
+                new_b = self.biases
+        else:
+            P[:] = np.float32(0.5) * (P + P.T)
+            W_aug = (P @ B).T
+            new_W = W_aug[:, :D].astype(np.float32)
+            new_b = W_aug[:, D].astype(np.float32)
 
         # Update live cold-start exemplar bank if active
         if not self.hierarchical and isinstance(self.field_def, ChoiceField):
@@ -1101,6 +1339,7 @@ class DecisionFieldHead:
                             prompt=prompt,
                             blend_rate=(0.35 if preserve_calibration else 0.28) * eff_reward_scale,
                             attenuate_competitors=(eff_reward_scale >= 0.5),
+                            concept_embedding=concept_embedding,
                         )
                     elif eff_reward_scale >= 0.5 and isinstance(self.projector, DeterministicSemanticProjector):
                         if self._online_shots_p is None or getattr(self, "_online_shots_are_pseudo", False):
@@ -1111,8 +1350,12 @@ class DecisionFieldHead:
                         np_norm = float(np.linalg.norm(xp))
                         if np_norm > 1e-12:
                             self._online_shots_p[target_k].append((xp / np_norm).astype(np.float32))
-                        if prompt is not None and self._exemplar_projector is not None:
-                            xc = self._exemplar_projector._project_concept_aware(prompt)
+                        if (concept_embedding is not None or prompt is not None) and self._exemplar_projector is not None:
+                            xc = (
+                                concept_embedding
+                                if concept_embedding is not None
+                                else self._exemplar_projector._project_concept_aware(prompt or "")
+                            )
                             nc_norm = float(np.linalg.norm(xc))
                             if nc_norm > 1e-12:
                                 self._online_shots_c[target_k].append((xc / nc_norm).astype(np.float32))
@@ -1154,8 +1397,6 @@ class DecisionFieldHead:
                         self.fine_weights = (self.fine_weights + step * np.outer(err_f, x_feat)).astype(np.float32)
 
         # Atomic commit (preserve _exemplar_bank across online updates)
-        self.covariance_inv = P_next.astype(np.float32)
-        self.cross_covariance = B_next.astype(np.float32)
         self.set_weights(new_W, new_b, clear_exemplar_bank=False)
         return (time.perf_counter() - t0) * 1000.0
 
@@ -1233,6 +1474,8 @@ class DecisionFieldHead:
         self,
         embedding: np.ndarray,
         prompts: Optional[Union[str, Sequence[str]]] = None,
+        *,
+        concept_embedding: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Compute raw logits (including two-stage coarse-to-fine routing when active)."""
         emb = np.asarray(embedding, dtype=np.float32)
@@ -1256,7 +1499,11 @@ class DecisionFieldHead:
             logits = emb @ self.weights.T + self.biases
             if self._exemplar_bank is not None and not self.hierarchical:
                 w_cons, sub_banks = self._exemplar_bank
-                if prompts is not None and self._exemplar_projector is not None:
+                if concept_embedding is not None:
+                    c_emb = np.asarray(concept_embedding, dtype=np.float32)
+                    if c_emb.ndim == 1:
+                        c_emb = c_emb.reshape(1, -1)
+                elif prompts is not None and self._exemplar_projector is not None:
                     if isinstance(prompts, str):
                         c_emb = self._exemplar_projector._project_concept_aware(prompts).reshape(1, -1)
                     else:
@@ -1330,9 +1577,15 @@ class DecisionFieldHead:
 
         return logits.flatten() if single else logits
 
-    def forward(self, embedding: np.ndarray, prompt: Optional[str] = None) -> RawFieldEvaluation:
+    def forward(
+        self,
+        embedding: np.ndarray,
+        prompt: Optional[str] = None,
+        *,
+        concept_embedding: Optional[np.ndarray] = None,
+    ) -> RawFieldEvaluation:
         """Projects dense embedding into logits and raw probabilities."""
-        logits = self.compute_logits(embedding, prompts=prompt)
+        logits = self.compute_logits(embedding, prompts=prompt, concept_embedding=concept_embedding)
         return self.evaluate_logits(logits)
 
 
@@ -1482,20 +1735,39 @@ class SystemOneModel:
         telemetry: Optional[Any] = None,
         embedding: Optional[np.ndarray] = None,
         recency_weighted: Optional[bool] = None,
+        *,
+        concept_embedding: Optional[np.ndarray] = None,
     ) -> ModelInferenceResult:
         """Executes a single non-autoregressive forward pass over the schema."""
         start_t = time.perf_counter()
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         raw_norm: Optional[float] = None
+        c_emb: Optional[np.ndarray] = concept_embedding
         if embedding is not None:
             emb = np.asarray(embedding, dtype=np.float32).flatten()
+        elif (
+            telemetry is None
+            and type(self.projector) is DeterministicSemanticProjector
+            and any(h._exemplar_bank is not None and not h.hierarchical for h in self.heads.values())
+        ):
+            if not isinstance(prompt, str):
+                raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
+            emb_raw, c_emb = self.projector.project_both(
+                prompt,
+                recency_weighted=use_recency,
+                need_base=True,
+                need_concept=True,
+            )
+            assert emb_raw is not None
+            norm = np.linalg.norm(emb_raw)
+            emb = (emb_raw / norm).astype(np.float32) if norm > 0 else emb_raw
         else:
             emb, raw_norm = self._encode_with_norm(prompt, telemetry=telemetry, recency_weighted=use_recency)
 
         field_results: Dict[str, RawFieldEvaluation] = {}
         prompt_for_head = prompt if embedding is None else None
         for name, head in self.heads.items():
-            field_results[name] = head.forward(emb, prompt=prompt_for_head)
+            field_results[name] = head.forward(emb, prompt=prompt_for_head, concept_embedding=c_emb)
 
         elapsed_ms = (time.perf_counter() - start_t) * 1000.0
         return ModelInferenceResult(
@@ -1532,6 +1804,8 @@ class SystemOneModel:
         preserve_calibration: bool = False,
         *,
         reward_scale: float = 1.0,
+        concept_embedding: Optional[np.ndarray] = None,
+        allow_prompt_for_head: bool = False,
     ) -> Dict[str, Any]:
         """Closed-form rank-1 Sherman-Morrison online update on the metal (<0.1ms)."""
         with self._lock:
@@ -1540,8 +1814,32 @@ class SystemOneModel:
             if not math.isfinite(eff_ff) or not (0.0 < eff_ff <= 1.0):
                 raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_ff}")
             t0 = time.perf_counter()
+            c_emb = concept_embedding
+            needs_concept = any(
+                f_name in self.heads
+                and self.heads[f_name]._exemplar_bank is not None
+                and not self.heads[f_name].hierarchical
+                for f_name in target_dict
+            )
             if embedding is not None:
                 emb = np.asarray(embedding, dtype=np.float32).flatten()
+            elif (
+                needs_concept
+                and telemetry is None
+                and type(self.projector) is DeterministicSemanticProjector
+                and isinstance(prompt, str)
+                and prompt.strip()
+            ):
+                use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
+                emb_raw, c_emb = self.projector.project_both(
+                    prompt,
+                    recency_weighted=use_recency,
+                    need_base=True,
+                    need_concept=True,
+                )
+                assert emb_raw is not None
+                norm = np.linalg.norm(emb_raw)
+                emb = (emb_raw / norm).astype(np.float32) if norm > 0 else emb_raw
             else:
                 emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
             if len(emb) != self.dimension:
@@ -1553,7 +1851,9 @@ class SystemOneModel:
             updated_fields: List[str] = []
             update_durations_ms: List[float] = []
             prompt_for_head = (
-                prompt if (embedding is None and isinstance(prompt, str) and prompt.strip()) else None
+                prompt
+                if ((embedding is None or allow_prompt_for_head) and isinstance(prompt, str) and prompt.strip())
+                else None
             )
 
             for f_name, target_val in target_dict.items():
@@ -1567,6 +1867,7 @@ class SystemOneModel:
                         prompt=prompt_for_head,
                         preserve_calibration=preserve_calibration,
                         reward_scale=reward_scale,
+                        concept_embedding=c_emb,
                     )
                     update_durations_ms.append(dt)
                     updated_fields.append(f_name)

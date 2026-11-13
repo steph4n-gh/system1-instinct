@@ -414,6 +414,7 @@ class DecisionSchema(metaclass=SchemaMeta):
         self.schema_name: str = schema_name or self.__class__.__name__
         self.description: str = description
         self._fields: Dict[str, DecisionField] = dict(self._declared_fields)
+        self._cached_schema_digest: Optional[str] = None
         if fields:
             for k, f in fields.items():
                 f.bind_name(k)
@@ -486,7 +487,12 @@ class DecisionSchema(metaclass=SchemaMeta):
 
     def schema_digest(self) -> str:
         """Computes the canonical SHA-256 fingerprint of the schema."""
-        return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+        cached = getattr(self, "_cached_schema_digest", None)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
+        self._cached_schema_digest = digest
+        return digest
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> DecisionSchema:

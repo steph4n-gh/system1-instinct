@@ -57,6 +57,32 @@ MAX_SKILL_COMPRESSION_RATIO = 1024
 EXEMPLAR_ARRAYS = ("exemplar_centroids", "exemplar_vectors", "exemplar_mean", "initial_w", "shots_p", "shots_c")
 
 
+def _snap_f16(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Quantize a finite weight/matrix buffer through IEEE float16 so compiled predictions match .s1m reload bit-for-bit."""
+    if arr is None:
+        return None
+    a32 = np.asarray(arr, dtype=np.float32)
+    if a32.size == 0:
+        return a32
+    a16 = a32.astype(np.float16)
+    return a16.astype(np.float32) if np.all(np.isfinite(a16)) else a32
+
+
+def _roundtrip_unit_f16(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Snap a row-wise unit-norm matrix through float16 and re-normalize each non-zero row."""
+    if arr is None:
+        return None
+    a32 = np.asarray(arr, dtype=np.float32)
+    if a32.size == 0 or a32.ndim != 2:
+        return a32
+    a16 = a32.astype(np.float16)
+    if not np.all(np.isfinite(a16)):
+        return a32
+    rt = a16.astype(np.float32)
+    norms = np.linalg.norm(rt, axis=1, keepdims=True)
+    return (rt / np.where(norms < 1e-12, 1.0, norms)).astype(np.float32)
+
+
 def _read_skill_bytes(path: Union[str, Path]) -> bytes:
     with Path(path).open("rb") as stream:
         data = stream.read(MAX_SKILL_BYTES + 1)
@@ -74,7 +100,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
     _, disk, directory_disk, disk_count, count, directory_size, directory_offset, comment_size = struct.unpack(
         "<4s4H2LH", data[end:end + 22]
     )
-    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS))
+    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS)) + 4
             or directory_size > MAX_SKILL_HEADER_BYTES or directory_offset + directory_size != end
             or end + 22 + comment_size != len(data)):
         raise ValueError("Saved skill NPZ directory exceeds limits or is malformed")
@@ -97,8 +123,11 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
     } | {
         "_projector_spectral_vectors.npy",
         "_projector_subspace_components.npy",
+        "_projector_tfidf_idf.npy",
+        "_projector_hybrid_tfidf_idf.npy",
     }
     shapes: Dict[str, Tuple[int, ...]] = {}
+    effective_array_bytes = 0
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         members = archive.infolist()
         names = [info.filename for info in members]
@@ -118,13 +147,24 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
                     shape, _, dtype = np.lib.format.read_array_header_2_0(stream)
                 else:
                     raise ValueError("Unsupported saved skill array format")
-                if (dtype.kind != "f" or dtype.itemsize not in (4, 8) or len(shape) not in (1, 2)
+                if (dtype.kind != "f" or dtype.itemsize not in (2, 4, 8) or len(shape) not in (1, 2)
                         or any(type(n) is not int or n < 0 for n in shape)):
-                    raise ValueError("Saved skill arrays must be bounded float32/float64 vectors or matrices")
+                    raise ValueError("Saved skill arrays must be bounded float16/float32/float64 vectors or matrices")
                 byte_count = math.prod(shape) * dtype.itemsize
                 if byte_count > MAX_SKILL_ARRAY_BYTES or stream.tell() + byte_count != info.file_size:
                     raise ValueError("Saved skill array shape exceeds its declared size or budget")
+                effective_array_bytes += info.file_size + (byte_count if dtype.itemsize == 2 else 0)
                 shapes[info.filename[:-4]] = shape
+        if effective_array_bytes > MAX_SKILL_ARRAY_BYTES:
+            raise ValueError("Saved skill arrays exceed upcast array budget")
+        tfidf_idf_shape = shapes.get("_projector_tfidf_idf")
+        if tfidf_idf_shape is not None and tfidf_idf_shape != (dimension,):
+            raise ValueError("Saved TF-IDF idf array has invalid shape")
+        hyb_idf_shape = shapes.get("_projector_hybrid_tfidf_idf")
+        if hyb_idf_shape is not None and (
+            len(hyb_idf_shape) != 1 or not (1 <= hyb_idf_shape[0] <= dimension)
+        ):
+            raise ValueError("Saved hybrid TF-IDF idf array has invalid shape")
         spec_vec_shape = shapes.get("_projector_spectral_vectors")
         if spec_vec_shape is not None and (
             len(spec_vec_shape) != 2
@@ -198,7 +238,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
                     raise ValueError(f"Saved head {name!r} has incompatible exemplar dimensions")
                 if suffix in ("shots_p", "shots_c"):
                     runtime_bytes += 160 * shape[0]  # Retained per-row ndarray views and list slots.
-        runtime_bytes += 2 * sum(info.file_size for info in members)
+        runtime_bytes += 2 * effective_array_bytes
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
         # Every member has been checked, including optional covariance arrays.
@@ -214,8 +254,8 @@ def _projector_config(projector: Any, *, include_arrays: bool = True) -> Dict[st
         return {"type": "deterministic", "dimension": projector.dimension,
                 "recency_weighted": projector.recency_weighted}
     if type(projector) is TfidfProjector:
-        return projector.to_config()
-    if type(projector) is HybridProjector:
+        return projector.to_config(include_arrays=include_arrays)
+    if isinstance(projector, HybridProjector):
         return projector.to_config(include_arrays=include_arrays)
     config = {"type": "external", "class": f"{type(projector).__module__}.{type(projector).__qualname__}",
               "dimension": getattr(projector, "dimension", None)}
@@ -1240,7 +1280,7 @@ class CompiledSystemOneModel:
             use_cache=use_cache,
         )
 
-    def to_bytes(self, include_covariance: bool = False) -> bytes:
+    def to_bytes(self, include_covariance: bool = False, *, compact: Optional[bool] = None) -> bytes:
         """Serializes the compiled model into compact .s1m binary bytes.
 
         By default, excludes covariance matrices to keep the binary ultra-compact (<20 KB).
@@ -1309,9 +1349,20 @@ class CompiledSystemOneModel:
                     for p_k in self._learned_prompt_overrides
                 }
 
+            use_binary_tfidf_idf = (
+                type(self.projector) is TfidfProjector
+                and (compact is True or len(self.projector._terms) > 128)
+            )
             header_meta = {
                 "version": 2,
-                "projector": _projector_config(self.projector, include_arrays=False),
+                "projector": _projector_config(
+                    self.projector,
+                    include_arrays=(
+                        not use_binary_tfidf_idf
+                        if type(self.projector) is TfidfProjector
+                        else False
+                    ),
+                ),
                 "schema_name": self.schema.schema_name,
                 "schema_dict": self.schema.to_dict(),
                 "schema_digest": self.schema.schema_digest(),
@@ -1325,31 +1376,57 @@ class CompiledSystemOneModel:
             if header_len > MAX_SKILL_HEADER_BYTES:
                 raise ValueError("Saved skill header exceeds size limit")
 
+            def _pack_array(arr: np.ndarray) -> np.ndarray:
+                a32 = np.asarray(arr, dtype=np.float32)
+                if a32.ndim == 2 and a32.size > 0:
+                    a16 = a32.astype(np.float16)
+                    if np.all(np.isfinite(a16)) and (
+                        compact is True
+                        or (compact is None and np.array_equal(a32, a16.astype(np.float32)))
+                    ):
+                        return a16
+                return a32
+
             # Pack numpy weights into compressed zip buffer
             npz_buf = io.BytesIO()
             arrays_to_save: Dict[str, np.ndarray] = {}
             from system1.core.embeddings import HybridProjector
 
-            if type(self.projector) is HybridProjector and getattr(self.projector, "_fitted", False):
+            if use_binary_tfidf_idf:
+                arrays_to_save["_projector_tfidf_idf"] = np.asarray(self.projector._idf, dtype=np.float64)
+            if isinstance(self.projector, HybridProjector) and getattr(self.projector, "_fitted", False):
                 if getattr(self.projector, "_spectral_vectors", None) is not None:
-                    arrays_to_save["_projector_spectral_vectors"] = np.asarray(
-                        self.projector._spectral_vectors, dtype=np.float32
+                    arrays_to_save["_projector_spectral_vectors"] = _pack_array(
+                        self.projector._spectral_vectors
                     )
                 if getattr(self.projector, "_subspace_components", None) is not None:
-                    arrays_to_save["_projector_subspace_components"] = np.asarray(
-                        self.projector._subspace_components, dtype=np.float32
+                    arrays_to_save["_projector_subspace_components"] = _pack_array(
+                        self.projector._subspace_components
+                    )
+                hybrid_tfidf = getattr(self.projector, "_tfidf_projector", None)
+                if hybrid_tfidf is not None and getattr(hybrid_tfidf, "_idf", None) is not None:
+                    arrays_to_save["_projector_hybrid_tfidf_idf"] = np.asarray(
+                        hybrid_tfidf._idf, dtype=np.float64
                     )
             for name, ch in sorted(self.heads.items()):
-                arrays_to_save[f"{name}_w"] = ch.weights.astype(np.float32)
+                arrays_to_save[f"{name}_w"] = _pack_array(ch.weights)
                 arrays_to_save[f"{name}_b"] = ch.biases.astype(np.float32)
                 state = exemplar_states.get(name)
                 if state is not None:
                     for suffix, arr in state["arrays"].items():
-                        arrays_to_save[f"{name}_{suffix}"] = np.asarray(arr)
+                        arr_np = np.asarray(arr)
+                        arrays_to_save[f"{name}_{suffix}"] = (
+                            _pack_array(arr_np) if arr_np.ndim == 2 else arr_np
+                        )
                 if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
                     arrays_to_save[f"{name}_calib_scores"] = np.asarray(ch.calibration_scores, dtype=np.float64)
                 if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
-                    arrays_to_save[f"{name}_prototypes"] = np.asarray(ch.prototypes, dtype=np.float32)
+                    proto_32 = np.asarray(ch.prototypes, dtype=np.float32)
+                    proto_16 = proto_32.astype(np.float16)
+                    if compact is not False and np.all(np.isfinite(proto_16)):
+                        arrays_to_save[f"{name}_prototypes"] = proto_16
+                    else:
+                        arrays_to_save[f"{name}_prototypes"] = _pack_array(proto_32)
                 if getattr(ch, "prototype_scores", ()) and len(ch.prototype_scores) > 0:
                     arrays_to_save[f"{name}_proto_scores"] = np.asarray(ch.prototype_scores, dtype=np.float64)
                 if (
@@ -1357,16 +1434,16 @@ class CompiledSystemOneModel:
                     and ch.coarse_weights is not None
                     and ch.coarse_biases is not None
                 ):
-                    arrays_to_save[f"{name}_coarse_w"] = np.asarray(ch.coarse_weights, dtype=np.float32)
+                    arrays_to_save[f"{name}_coarse_w"] = _pack_array(ch.coarse_weights)
                     arrays_to_save[f"{name}_coarse_b"] = np.asarray(ch.coarse_biases, dtype=np.float32)
                     if ch.fine_weights is not None and ch.fine_biases is not None:
-                        arrays_to_save[f"{name}_fine_w"] = np.asarray(ch.fine_weights, dtype=np.float32)
+                        arrays_to_save[f"{name}_fine_w"] = _pack_array(ch.fine_weights)
                         arrays_to_save[f"{name}_fine_b"] = np.asarray(ch.fine_biases, dtype=np.float32)
                 if include_covariance:
                     if ch.P is not None:
-                        arrays_to_save[f"{name}_P"] = ch.P.astype(np.float32)
+                        arrays_to_save[f"{name}_P"] = _pack_array(ch.P)
                     if ch.B is not None:
-                        arrays_to_save[f"{name}_B"] = ch.B.astype(np.float32)
+                        arrays_to_save[f"{name}_B"] = _pack_array(ch.B)
             np.savez_compressed(npz_buf, **arrays_to_save)
             npz_bytes = npz_buf.getvalue()
 
@@ -1378,11 +1455,17 @@ class CompiledSystemOneModel:
             out.extend(npz_bytes)
             return bytes(out)
 
-    def save(self, path: Union[str, Path], include_covariance: bool = False) -> None:
+    def save(
+        self,
+        path: Union[str, Path],
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+    ) -> None:
         """Saves compiled model to a .s1m binary file on disk."""
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(self.to_bytes(include_covariance=include_covariance))
+        target.write_bytes(self.to_bytes(include_covariance=include_covariance, compact=compact))
 
     @classmethod
     def from_bytes(
@@ -1438,9 +1521,13 @@ class CompiledSystemOneModel:
         if projector_config is not None:
             kind = projector_config["type"]
             if kind == "tfidf":
-                saved_tfidf = TfidfProjector.from_config(projector_config)
-                if saved_tfidf.dimension != dimension:
+                tfidf_terms, _ = TfidfProjector.validate_header_config(
+                    projector_config, allow_missing_idf=True
+                )
+                if len(tfidf_terms) != dimension:
                     raise ValueError("Saved TF-IDF dimension does not match the skill")
+                if "idf" in projector_config:
+                    saved_tfidf = TfidfProjector.from_config(projector_config)
             if kind == "deterministic" and projector_config.get("dimension") != dimension:
                 raise ValueError("Saved projector dimension does not match the skill")
             if kind == "hybrid":
@@ -1460,23 +1547,53 @@ class CompiledSystemOneModel:
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
         npz_file = _read_skill_arrays(data[header_end:], schema, dimension, runtime_bytes)
+        if (projector_config is None or projector_config.get("type") != "tfidf") and (
+            "_projector_tfidf_idf" in npz_file
+        ):
+            raise ValueError("Saved skill contains unexpected TF-IDF idf array")
         if (projector_config is None or projector_config.get("type") != "hybrid") and (
-            "_projector_spectral_vectors" in npz_file or "_projector_subspace_components" in npz_file
+            "_projector_spectral_vectors" in npz_file
+            or "_projector_subspace_components" in npz_file
+            or "_projector_hybrid_tfidf_idf" in npz_file
         ):
             raise ValueError("Saved skill contains unexpected hybrid projector arrays")
-        if projector_config is not None and projector_config["type"] == "hybrid":
-            saved_hybrid = HybridProjector.from_config(
+
+        def _as_f32(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            if arr is None:
+                return None
+            return np.asarray(arr, dtype=np.float32) if arr.dtype == np.float16 else arr
+
+        if projector_config is not None and projector_config["type"] == "tfidf" and saved_tfidf is None:
+            saved_tfidf = TfidfProjector.from_config(
                 projector_config,
-                backend=backend,
-                spectral_vectors=npz_file.get("_projector_spectral_vectors"),
-                subspace_components=npz_file.get("_projector_subspace_components"),
+                idf_array=npz_file.get("_projector_tfidf_idf"),
             )
+        if projector_config is not None and projector_config["type"] == "hybrid":
+            hyb_kwargs: Dict[str, Any] = {
+                "backend": backend,
+                "spectral_vectors": _as_f32(npz_file.get("_projector_spectral_vectors")),
+                "subspace_components": _as_f32(npz_file.get("_projector_subspace_components")),
+            }
+            if "_projector_hybrid_tfidf_idf" in npz_file:
+                hyb_kwargs["tfidf_idf_array"] = npz_file["_projector_hybrid_tfidf_idf"]
+            try:
+                saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
+            except TypeError:
+                hyb_kwargs.pop("tfidf_idf_array", None)
+                saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
         if projector_config is not None:
             if projector is not None:
                 if projector_config["type"] == "hybrid" and saved_hybrid is not None:
                     if (
-                        type(projector) is not HybridProjector
+                        not isinstance(projector, HybridProjector)
                         or projector.projector_digest() != saved_hybrid.projector_digest()
+                    ):
+                        raise ValueError("Supplied projector does not match the saved skill's feature space")
+                elif projector_config["type"] == "tfidf" and saved_tfidf is not None:
+                    if (
+                        type(projector) is not TfidfProjector
+                        or _projector_config(projector, include_arrays=True)
+                        != _projector_config(saved_tfidf, include_arrays=True)
                     ):
                         raise ValueError("Supplied projector does not match the saved skill's feature space")
                 elif _projector_config(projector) != projector_config:
@@ -1504,7 +1621,8 @@ class CompiledSystemOneModel:
             if name not in schema.fields or h_info["field_type"] != schema.fields[name].field_type:
                 raise ValueError(f"Saved head {name!r} does not match the schema")
             definition = schema.fields[name]
-            w = npz_file[f"{name}_w"]
+            w = _as_f32(npz_file[f"{name}_w"])
+            assert w is not None
             b = npz_file[f"{name}_b"]
             widths = (1, 2) if isinstance(definition, BooleanField) else (len(definition.options),) if hasattr(definition, "options") else (1,)
             if w.ndim != 2 or w.shape[0] not in widths or w.shape[1] != dimension or b.shape != (w.shape[0],):
@@ -1518,8 +1636,8 @@ class CompiledSystemOneModel:
                 raise ValueError(f"Saved head {name!r} uses an unsupported conformal score")
             if isinstance(definition, (ChoiceField, MultiChoiceField)) and tuple(h_info.get("options", ())) != definition.options:
                 raise ValueError(f"Saved head {name!r} options do not match the schema")
-            p_mat = npz_file[f"{name}_P"] if f"{name}_P" in npz_file else None
-            b_mat = npz_file[f"{name}_B"] if f"{name}_B" in npz_file else None
+            p_mat = _as_f32(npz_file[f"{name}_P"]) if f"{name}_P" in npz_file else None
+            b_mat = _as_f32(npz_file[f"{name}_B"]) if f"{name}_B" in npz_file else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (p_mat, b_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite covariance")
             calib_scores_arr = npz_file[f"{name}_calib_scores"] if f"{name}_calib_scores" in npz_file else None
@@ -1558,9 +1676,13 @@ class CompiledSystemOneModel:
             proto_thresh = float(h_info.get("prototype_threshold", 0.0))
             if not math.isfinite(proto_thresh) or proto_thresh < 0:
                 raise ValueError(f"Saved head {name!r} has an invalid prototype_threshold")
-            proto_mat = npz_file[f"{name}_prototypes"] if f"{name}_prototypes" in npz_file else None
+            raw_proto_arr = npz_file[f"{name}_prototypes"] if f"{name}_prototypes" in npz_file else None
+            proto_mat = _as_f32(raw_proto_arr)
             if proto_mat is not None and not np.all(np.isfinite(proto_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite prototypes")
+            if raw_proto_arr is not None and raw_proto_arr.dtype == np.float16 and proto_mat is not None and proto_mat.ndim == 2:
+                proto_norms = np.linalg.norm(proto_mat, axis=1, keepdims=True)
+                proto_mat = (proto_mat / np.where(proto_norms < 1e-12, 1.0, proto_norms)).astype(np.float32)
             if (
                 proto_mat is None
                 and not is_cold_skill
@@ -1588,9 +1710,9 @@ class CompiledSystemOneModel:
             ):
                 raise ValueError(f"Saved head {name!r} has invalid cluster_assignments")
             cluster_assign = tuple(int(c) for c in raw_assign) if isinstance(raw_assign, (list, tuple)) else ()
-            coarse_w = npz_file[f"{name}_coarse_w"] if f"{name}_coarse_w" in npz_file else None
+            coarse_w = _as_f32(npz_file[f"{name}_coarse_w"]) if f"{name}_coarse_w" in npz_file else None
             coarse_b = npz_file[f"{name}_coarse_b"] if f"{name}_coarse_b" in npz_file else None
-            fine_w = npz_file[f"{name}_fine_w"] if f"{name}_fine_w" in npz_file else None
+            fine_w = _as_f32(npz_file[f"{name}_fine_w"]) if f"{name}_fine_w" in npz_file else None
             fine_b = npz_file[f"{name}_fine_b"] if f"{name}_fine_b" in npz_file else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (coarse_w, coarse_b, fine_w, fine_b)):
                 raise ValueError(f"Saved head {name!r} contains non-finite hierarchical weights")
@@ -1601,7 +1723,7 @@ class CompiledSystemOneModel:
                     raise ValueError(f"Saved head {name!r} has out-of-range cluster_assignments")
 
             exemplar_arrays = {
-                suffix: npz_file[f"{name}_{suffix}"]
+                suffix: (_as_f32(npz_file[f"{name}_{suffix}"]) if npz_file[f"{name}_{suffix}"].dtype == np.float16 else npz_file[f"{name}_{suffix}"])
                 for suffix in EXEMPLAR_ARRAYS
                 if f"{name}_{suffix}" in npz_file
             }
@@ -2257,7 +2379,9 @@ class SystemOneCompiler:
                     norm = float(np.linalg.norm(vec))
                     if norm > 1e-12:
                         protos[idx] = (vec / norm).astype(np.float32)
-            return protos
+            res = _roundtrip_unit_f16(protos)
+            assert res is not None
+            return res
 
         Y_mat = np.asarray(Y_train, dtype=np.float32)
         K = Y_mat.shape[1] if Y_mat.ndim > 1 else 1
@@ -2274,7 +2398,9 @@ class SystemOneCompiler:
                 norm = float(np.linalg.norm(vec))
                 if norm > 1e-12:
                     protos[k] = (vec / norm).astype(np.float32)
-        return protos
+        res = _roundtrip_unit_f16(protos)
+        assert res is not None
+        return res
 
     def _compute_loo_ridge_and_sample_weights(
         self,
@@ -2900,6 +3026,10 @@ class SystemOneCompiler:
                         regularize_bias=augment,
                         return_covariance=True,
                     )
+                weights = _snap_f16(weights)
+                assert weights is not None
+                P_mat = _snap_f16(P_mat)
+                B_mat = _snap_f16(B_mat)
 
                 use_hierarchical = False
                 if self.choice_solver == "ridge" and num_train >= K:
@@ -2929,6 +3059,8 @@ class SystemOneCompiler:
                         regularization=eff_reg,
                         sample_weights=sw_choice,
                     )
+                    coarse_weights = _snap_f16(coarse_weights)
+                    fine_weights = _snap_f16(fine_weights)
                     raw_logits_calib = self._compute_hierarchical_logits(
                         X_calib,
                         weights,
@@ -3064,6 +3196,10 @@ class SystemOneCompiler:
                 weights, biases, P_mat, B_mat = self._solve_ridge(
                     X_train, Y_train, eff_reg_bool, sample_weights=sw, regularize_bias=True, return_covariance=True
                 )
+                weights = _snap_f16(weights)
+                assert weights is not None
+                P_mat = _snap_f16(P_mat)
+                B_mat = _snap_f16(B_mat)
 
                 # Calibrate conformal bounds on X_calib
                 logits_calib = (X_calib @ weights.T + biases).flatten()
@@ -3180,6 +3316,10 @@ class SystemOneCompiler:
                     P_mat = np.linalg.pinv(A_mc).astype(np.float32)
                 w_aug = np.hstack([weights, biases.reshape(-1, 1)])
                 B_mat = (A_mc @ w_aug.T).astype(np.float32)
+                weights = _snap_f16(weights)
+                assert weights is not None
+                P_mat = _snap_f16(P_mat)
+                B_mat = _snap_f16(B_mat)
 
                 # Calibrate conformal bounds on X_calib
                 logits_calib = X_calib @ weights.T + biases
@@ -3230,6 +3370,10 @@ class SystemOneCompiler:
                 weights, biases, P_mat, B_mat = self._solve_ridge(
                     X_train, Z_train, self.regularization, regularize_bias=augment, return_covariance=True
                 )
+                weights = _snap_f16(weights)
+                assert weights is not None
+                P_mat = _snap_f16(P_mat)
+                B_mat = _snap_f16(B_mat)
 
                 # Calibrate residual bounds on X_calib
                 logits_calib = (X_calib @ weights.T + biases).flatten()
