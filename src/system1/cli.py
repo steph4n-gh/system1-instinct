@@ -547,12 +547,16 @@ def handle_compile_command(args: argparse.Namespace) -> int:
 
 
 def handle_serve_command(args: argparse.Namespace) -> int:
-    """CLI handler for 'system1 serve' — starts the gRPC sidecar or MCP stdio proxy server."""
+    """CLI handler for 'system1 serve' -- starts the gRPC sidecar or MCP stdio/HTTP proxy server."""
     transport = str(getattr(args, "transport", "grpc"))
     if transport == "mcp-stdio":
         from system1.integrations.mcp_stdio import run_mcp_stdio_from_args
 
         return run_mcp_stdio_from_args(args, error_fn=_cli_error)
+    if transport == "mcp-http":
+        from system1.integrations.mcp_http import run_mcp_http_from_args
+
+        return run_mcp_http_from_args(args, error_fn=_cli_error)
     try:
         from system1.grpc_server import serve as grpc_serve, grpc_available
     except ImportError:
@@ -974,8 +978,8 @@ def build_parser() -> argparse.ArgumentParser:
     teach_parser.set_defaults(func=handle_teach_command)
 
     # Command: serve
-    serve_parser = subparsers.add_parser("serve", help="Start the System 1 gRPC sidecar or MCP stdio proxy server")
-    serve_parser.add_argument("--transport", choices=("grpc", "mcp-stdio"), default="grpc", help="Server transport: 'grpc' (default) or 'mcp-stdio'")
+    serve_parser = subparsers.add_parser("serve", help="Start the System 1 gRPC sidecar or MCP stdio/HTTP proxy server")
+    serve_parser.add_argument("--transport", choices=("grpc", "mcp-stdio", "mcp-http"), default="grpc", help="Server transport: 'grpc' (default), 'mcp-stdio', or 'mcp-http'")
     serve_parser.add_argument("--grpc", action="store_true", default=True, help="Use gRPC transport (default)")
     serve_parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address to bind to (default: 127.0.0.1)")
     serve_parser.add_argument("--port", type=int, default=50051, help="Port to listen on (default: 50051)")
@@ -988,8 +992,16 @@ def build_parser() -> argparse.ArgumentParser:
     # Command: mcp-proxy
     mcp_proxy_parser = subparsers.add_parser(
         "mcp-proxy",
-        help="Run the System 1 MCP JSON-RPC 2.0 stdio proxy/guard in front of an upstream MCP server",
+        help="Run the System 1 MCP JSON-RPC 2.0 stdio or Streamable HTTP proxy/guard",
     )
+    mcp_proxy_parser.add_argument(
+        "--transport",
+        choices=("stdio", "http", "streamable-http"),
+        default="stdio",
+        help="MCP proxy transport: 'stdio' (default) or 'http'/'streamable-http'",
+    )
+    mcp_proxy_parser.add_argument("--host", type=str, default="127.0.0.1", help="HTTP bind host (default: 127.0.0.1)")
+    mcp_proxy_parser.add_argument("--port", type=int, default=8765, help="HTTP bind port (default: 8765)")
     add_mcp_proxy_arguments(mcp_proxy_parser)
     mcp_proxy_parser.set_defaults(func=handle_mcp_proxy_command)
 

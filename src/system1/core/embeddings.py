@@ -986,19 +986,17 @@ class SubwordSemanticEmbeddings:
         """Constructs the dense subword embedding table with calibrated semantic anchors."""
         return self._build_default_table()
 
-    def encode(
+    def _extract_bucket_weights(
         self,
         text: str,
         *,
         _pretokenized: Optional[Tuple[str, List[str], Dict[int, str]]] = None,
-    ) -> np.ndarray:
-        """Encodes text into a normalized dense subword vector with negation-scope binding."""
+    ) -> Tuple[List[int], List[float]]:
+        """Extracts weighted subword/phrase hash bucket indices for a single text."""
         if not isinstance(text, str):
             raise TypeError(f"Expected text to be a string, got {type(text).__name__}")
         if not text or not text.strip():
-            v = np.zeros(self.dimension, dtype=np.float32)
-            v[0] = 1.0
-            return v
+            return [], []
 
         if _pretokenized is not None:
             clean_text, words, negated_positions = _pretokenized
@@ -1008,8 +1006,8 @@ class SubwordSemanticEmbeddings:
 
         indices: List[int] = []
         weights: List[float] = []
+        hash_token = self._hash_token
 
-        # 1. Check for multi-word phrase & idiom anchors via space-adjacent 3-gram index
         if " " in clean_text:
             seen_k3: set[str] = set()
             pos_sp = clean_text.find(" ")
@@ -1038,42 +1036,49 @@ class SubwordSemanticEmbeddings:
                                     weights.append(3.5)
                 pos_sp = clean_text.find(" ", pos_sp + 1)
 
-        # 2. Extract words, negation-scope bindings, and subwords
         for pos, word in enumerate(words):
             word_weight = math.log1p(len(word)) / math.sqrt(1.0 + pos * 0.05)
             if pos in negated_positions:
                 cue = negated_positions[pos]
-                # Emit explicit bound negated features and invert positive unigram pull
-                indices.append(self._hash_token(f"neg:{word}"))
+                indices.append(hash_token(f"neg:{word}"))
                 weights.append(word_weight * 2.8)
-                indices.append(self._hash_token(f"neg:{cue}_{word}"))
+                indices.append(hash_token(f"neg:{cue}_{word}"))
                 weights.append(word_weight * 2.0)
-                indices.append(self._hash_token(word))
+                indices.append(hash_token(word))
                 weights.append(-word_weight * 0.9)
                 continue
 
             if word in _NEGATION_TOKENS:
-                indices.append(self._hash_token(word))
+                indices.append(hash_token(word))
                 weights.append(word_weight * 0.6)
                 continue
 
-            indices.append(self._hash_token(word))
+            indices.append(hash_token(word))
             weights.append(word_weight * 1.5)
 
-            # Character 3-grams and 4-grams
-            if len(word) >= 3:
+            wlen = len(word)
+            if wlen >= 3:
                 for n in (3, 4):
-                    for j in range(len(word) - n + 1):
+                    for j in range(wlen - n + 1):
                         sub = word[j : j + n]
-                        indices.append(self._hash_token(f"sub:{sub}"))
+                        indices.append(hash_token(f"sub:{sub}"))
                         weights.append(0.35)
 
-        # 3. Word bigrams
         for i in range(len(words) - 1):
             bigram = f"{words[i]}_{words[i+1]}"
-            indices.append(self._hash_token(f"bi:{bigram}"))
+            indices.append(hash_token(f"bi:{bigram}"))
             weights.append(1.2)
 
+        return indices, weights
+
+    def encode(
+        self,
+        text: str,
+        *,
+        _pretokenized: Optional[Tuple[str, List[str], Dict[int, str]]] = None,
+    ) -> np.ndarray:
+        """Encodes text into a normalized dense subword vector with negation-scope binding."""
+        indices, weights = self._extract_bucket_weights(text, _pretokenized=_pretokenized)
         if not indices:
             v = np.zeros(self.dimension, dtype=np.float32)
             v[0] = 1.0
@@ -1082,7 +1087,6 @@ class SubwordSemanticEmbeddings:
         idx_arr = np.array(indices, dtype=np.int32)
         w_arr = np.array(weights, dtype=np.float32)
 
-        # Fast BLAS 1D-by-2D dot product
         accum = w_arr @ self._table[idx_arr]
 
         norm = float(np.linalg.norm(accum))
@@ -1094,15 +1098,74 @@ class SubwordSemanticEmbeddings:
 
     project = encode
 
-    def encode_batch(self, texts: Sequence[str]) -> np.ndarray:
-        """Batched encoding of multiple text inputs."""
+    def encode_batch(
+        self,
+        texts: Sequence[str],
+        *,
+        _pretokenized_list: Optional[Sequence[Tuple[str, List[str], Dict[int, str]]]] = None,
+    ) -> np.ndarray:
+        """Batched encoding of multiple text inputs using chunked single-SGEMM unique-bucket lookup."""
         if texts is None:
             raise TypeError("texts must be a sequence of strings, got None")
         if not hasattr(texts, "__iter__"):
             raise TypeError(f"texts must be a sequence of strings, got {type(texts).__name__}")
-        if len(texts) == 0:
+        n_docs = len(texts)
+        if n_docs == 0:
             return np.empty((0, self.dimension), dtype=np.float32)
-        return np.stack([self.encode(t) for t in texts], axis=0).astype(np.float32)
+        if _pretokenized_list is not None and len(_pretokenized_list) != n_docs:
+            raise ValueError("_pretokenized_list length must match texts length")
+
+        out = np.empty((n_docs, self.dimension), dtype=np.float32)
+        chunk_size = 256
+        for start in range(0, n_docs, chunk_size):
+            end = min(start + chunk_size, n_docs)
+            c_len = end - start
+            unique_buckets: Dict[int, int] = {}
+            doc_maps: List[Dict[int, float]] = []
+            empty_rows: List[int] = []
+
+            for local_i, global_i in enumerate(range(start, end)):
+                pretok = _pretokenized_list[global_i] if _pretokenized_list is not None else None
+                idxs, wts = self._extract_bucket_weights(texts[global_i], _pretokenized=pretok)
+                if not idxs:
+                    doc_maps.append({})
+                    empty_rows.append(local_i)
+                    continue
+                bmap: Dict[int, float] = {}
+                for b_id, w in zip(idxs, wts):
+                    if b_id not in unique_buckets:
+                        unique_buckets[b_id] = len(unique_buckets)
+                    bmap[b_id] = bmap.get(b_id, 0.0) + w
+                doc_maps.append(bmap)
+
+            if not unique_buckets:
+                chunk = np.zeros((c_len, self.dimension), dtype=np.float32)
+                chunk[:, 0] = 1.0
+                out[start:end] = chunk
+                continue
+
+            bucket_ids = np.array(list(unique_buckets.keys()), dtype=np.int32)
+            weight_mat = np.zeros((c_len, len(bucket_ids)), dtype=np.float32)
+            for local_i, bmap in enumerate(doc_maps):
+                if bmap:
+                    cols = [unique_buckets[b_id] for b_id in bmap]
+                    vals = list(bmap.values())
+                    weight_mat[local_i, cols] = np.asarray(vals, dtype=np.float32)
+
+            accums = weight_mat @ self._table[bucket_ids]
+            norms = np.linalg.norm(accums, axis=1, keepdims=True)
+            valid = (norms[:, 0] >= 1e-12) & np.isfinite(norms[:, 0])
+            if empty_rows:
+                valid[empty_rows] = False
+
+            chunk = np.zeros_like(accums, dtype=np.float32)
+            if np.any(valid):
+                chunk[valid] = (accums[valid] / norms[valid]).astype(np.float32)
+            if np.any(~valid):
+                chunk[~valid, 0] = 1.0
+            out[start:end] = chunk
+
+        return out
 
     project_batch = encode_batch
 
@@ -1146,6 +1209,92 @@ def _extract_corpus_terms(text: str) -> List[str]:
     return terms
 
 
+def compute_strict_loo_weights(
+    X_train: np.ndarray,
+    Y_onehot: np.ndarray,
+    *,
+    hard_drop_thresh: float = 0.25,
+    reg_loo: float = 0.75,
+    min_samples: int = 40,
+    min_per_class: float = 4.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Pure-NumPy closed-form Leave-One-Out ridge margin weights and clean sample mask."""
+    n_samples, n_dim = X_train.shape
+    n_classes = Y_onehot.shape[1]
+    if n_samples < min_samples or n_classes < 2 or (n_samples / n_classes) < min_per_class:
+        return np.ones(n_samples, dtype=np.float32), np.ones(n_samples, dtype=bool)
+
+    x64 = np.asarray(X_train, dtype=np.float64)
+    y64 = np.asarray(Y_onehot, dtype=np.float64)
+    mu_y = np.mean(y64, axis=0)
+    yc = y64 - mu_y
+    eff_reg = max(1e-6, float(reg_loo))
+    mu_x = np.mean(x64, axis=0)
+    xc = x64 - mu_x
+
+    if n_samples <= n_dim:
+        gram = xc @ xc.T
+        gram.flat[:: n_samples + 1] += eff_reg
+        chol = np.linalg.cholesky(gram)
+        chol_inv = np.linalg.solve(chol, np.eye(n_samples, dtype=np.float64))
+        diag_kinv = np.sum(chol_inv * chol_inv, axis=0)
+        kinv_yc = np.linalg.solve(chol.T, chol_inv @ yc)
+        denom = np.maximum(1e-4, eff_reg * diag_kinv - (1.0 / n_samples))[:, None]
+        y_loo = y64 - (eff_reg * kinv_yc) / denom
+    else:
+        u_mat, s_vals, _ = np.linalg.svd(xc, full_matrices=False)
+        s2 = np.maximum(0.0, s_vals * s_vals)
+        filt = s2 / (s2 + eff_reg)
+        h_diag = (1.0 / n_samples) + (u_mat * u_mat) @ filt
+        denom = np.maximum(1e-4, 1.0 - h_diag)[:, None]
+        y_hat = mu_y + u_mat @ (filt[:, None] * (u_mat.T @ yc))
+        y_loo = y64 + (y_hat - y64) / denom
+
+    true_cls = np.argmax(y64, axis=1)
+    s_true = y_loo[np.arange(n_samples), true_cls]
+    rival_mask = (y64 <= 0.5) & (y_loo > mu_y[None, :])
+    s_other = np.max(np.where(rival_mask, y_loo, -1e9), axis=1)
+    deficit = s_other - s_true
+    sw = np.where(
+        deficit > 0.15,
+        np.clip(1.0 - 2.6 * (deficit - 0.15), 0.05, 1.0),
+        1.0,
+    ).astype(np.float32)
+    s_true_excess = s_true - mu_y[true_cls]
+    sw = np.where(s_true_excess > 0.105, np.maximum(sw, 0.75), sw).astype(np.float32)
+    for k in range(n_classes):
+        idx = np.where(true_cls == k)[0]
+        if len(idx) > 0:
+            best = int(idx[int(np.argmin(deficit[idx]))])
+            sw[best] = max(float(sw[best]), 0.85)
+    clean_mask = sw >= float(hard_drop_thresh)
+    return sw, clean_mask
+
+
+def extract_schema_anchor_texts(schema: Any) -> List[str]:
+    """Extracts human-readable semantic anchor phrases from a DecisionSchema-like object."""
+    fields = getattr(schema, "fields", None)
+    if not isinstance(fields, Mapping):
+        return []
+    anchors: List[str] = []
+    for field_name, field in fields.items():
+        options = getattr(field, "options", None)
+        descriptions = getattr(field, "descriptions", None) or {}
+        if options is not None:
+            for opt in options:
+                opt_str = str(opt)
+                desc = str(descriptions.get(opt_str, "")).strip()
+                phrase = f"{opt_str.replace('_', ' ')} {desc}".strip()
+                if phrase:
+                    anchors.append(phrase)
+        else:
+            desc = str(getattr(field, "description", "")).strip()
+            phrase = f"{str(field_name).replace('_', ' ')} {desc}".strip()
+            if phrase:
+                anchors.append(phrase)
+    return anchors
+
+
 class _HybridFitDescriptor:
     """Allows HybridProjector.fit(...) to be called as either a classmethod or an instance method."""
 
@@ -1185,7 +1334,21 @@ class HybridProjector:
         "svd_power",
         "spectral_blend",
         "use_subspace",
+        "direct_spectral",
+        "direct_spectral_dim",
+        "context_smooth",
+        "tfidf_use_stems",
+        "tfidf_stem_weight",
+        "tfidf_use_skip_bigrams",
+        "tfidf_skip_weight",
+        "tfidf_word_quota_frac",
+        "tfidf_char_weight",
+        "rbf_landmarks",
+        "rbf_gamma",
+        "rbf_weight",
     })
+
+    extract_schema_anchor_texts = staticmethod(extract_schema_anchor_texts)
 
     def __init__(
         self,
@@ -1239,12 +1402,27 @@ class HybridProjector:
         self._spectral_terms: Tuple[str, ...] = ()
         self._spectral_vocab: Dict[str, int] = {}
         self._spectral_weights: Tuple[float, ...] = ()
+        self._spectral_weights_arr: np.ndarray = np.empty(0, dtype=np.float32)
         self._spectral_vectors: Optional[np.ndarray] = None  # shape: (V, R_spec)
         self._spectral_basis: Optional[np.ndarray] = None    # shape: (R_spec, dense_dim)
-        self._subspace_components: Optional[np.ndarray] = None  # shape: (R_sub, dimension)
+        self._subspace_components: Optional[np.ndarray] = None  # shape: (R_sub, base_dim)
         self._subspace_weight: float = 0.0
         self._use_subspace: bool = False
+        self._direct_spectral: bool = False
+        self._direct_spectral_dim: int = 0
+        self._context_smooth: float = 1.0
+        self._rbf_landmarks: Optional[np.ndarray] = None
+        self._rbf_gamma: float = 3.0
+        self._rbf_weight: float = 0.0
         self._digest: Optional[str] = None
+
+    @property
+    def _base_dimension(self) -> int:
+        return self.sparse_dim + self.dense_dim + (self._direct_spectral_dim if self._direct_spectral else 0)
+
+    def _update_dimension(self) -> None:
+        rbf_k = int(self._rbf_landmarks.shape[0]) if self._rbf_landmarks is not None else 0
+        self.dimension = self._base_dimension + rbf_k
 
     @property
     def is_fitted(self) -> bool:
@@ -1256,8 +1434,10 @@ class HybridProjector:
 
     @property
     def spectral_proj(self) -> Optional[np.ndarray]:
-        if self._spectral_vectors is None or self._spectral_basis is None:
+        if self._spectral_vectors is None:
             return None
+        if self._spectral_basis is None:
+            return self._spectral_vectors.astype(np.float32)
         return (self._spectral_vectors @ self._spectral_basis).astype(np.float32)
 
     def _resolve_backend(self, backend: str) -> str:
@@ -1297,6 +1477,15 @@ class HybridProjector:
         svd_power: Optional[float] = None,
         spectral_blend: Optional[float] = None,
         use_subspace: bool = False,
+        direct_spectral: bool = False,
+        context_smooth: float = 1.0,
+        extra_texts: Sequence[str] = (),
+        tfidf_use_stems: bool = False,
+        tfidf_stem_weight: Optional[float] = None,
+        tfidf_use_skip_bigrams: bool = False,
+        tfidf_skip_weight: Optional[float] = None,
+        tfidf_word_quota_frac: Optional[float] = None,
+        tfidf_char_weight: Optional[float] = None,
         _auto_sparse_dim: bool = False,
         **kwargs: Any,
     ) -> HybridProjector:
@@ -1326,6 +1515,11 @@ class HybridProjector:
         if spectral_blend is not None:
             self.spectral_blend = float(spectral_blend)
         self._use_subspace = bool(use_subspace)
+        self._direct_spectral = bool(direct_spectral)
+        self._direct_spectral_dim = 0
+        self._context_smooth = float(context_smooth)
+        self._rbf_landmarks = None
+        self._rbf_weight = 0.0
 
         label_list: Optional[List[str]] = None
         if labels is not None:
@@ -1339,34 +1533,57 @@ class HybridProjector:
         self._digest = None
         self._fit_base_cache = {}
         self._tfidf_projector = None
-        if not text_list:
+        self._spectral_basis = None
+        if not text_list and not extra_texts:
             self._fitted = True
+            self._update_dimension()
             return self
 
         from system1.core.text import TfidfProjector
 
+        extra_list = [str(t) for t in extra_texts if isinstance(t, str) and t.strip()]
+        if extra_list and selection not in ("chi2", "mi"):
+            tfidf_corpus = text_list + list(dict.fromkeys(extra_list))
+            tfidf_labels = None
+        else:
+            tfidf_corpus = text_list
+            tfidf_labels = label_list if selection in ("chi2", "mi") else None
+
         try:
-            tfidf = TfidfProjector.fit(
-                text_list,
-                max_features=self.sparse_dim,
-                labels=label_list if selection in ("chi2", "mi") else None,
-                selection=selection,
-                char_ngrams=char_ngrams,
-            )
+            tfidf_kwargs: Dict[str, Any] = {
+                "max_features": self.sparse_dim,
+                "labels": tfidf_labels,
+                "selection": selection,
+                "char_ngrams": char_ngrams,
+            }
+            if tfidf_use_stems:
+                tfidf_kwargs["use_stems"] = True
+            if tfidf_stem_weight is not None:
+                tfidf_kwargs["stem_weight"] = float(tfidf_stem_weight)
+            if tfidf_use_skip_bigrams:
+                tfidf_kwargs["use_skip_bigrams"] = True
+            if tfidf_skip_weight is not None:
+                tfidf_kwargs["skip_weight"] = float(tfidf_skip_weight)
+            if tfidf_word_quota_frac is not None:
+                tfidf_kwargs["word_quota_frac"] = float(tfidf_word_quota_frac)
+            if tfidf_char_weight is not None:
+                tfidf_kwargs["char_weight"] = float(tfidf_char_weight)
+            tfidf = TfidfProjector.fit(tfidf_corpus, **tfidf_kwargs)
         except ValueError:
             tfidf = None
 
         self._tfidf_projector = tfidf
         if tfidf is not None and _auto_sparse_dim and tfidf.dimension < self.sparse_dim:
             self.sparse_dim = max(1, tfidf.dimension)
-            self.dimension = self.sparse_dim + self.dense_dim
+        self._update_dimension()
 
-        n_docs = len(text_list)
+        spectral_corpus = text_list + extra_list
+        n_docs = len(spectral_corpus)
         doc_terms: List[List[str]] = []
         df_counter: Counter[str] = Counter()
         tf_counter: Counter[str] = Counter()
 
-        for t in text_list:
+        for t in spectral_corpus:
             terms = _extract_corpus_terms(t)
             doc_terms.append(terms)
             tf_counter.update(terms)
@@ -1374,6 +1591,7 @@ class HybridProjector:
 
         if not tf_counter:
             self._fitted = True
+            self._update_dimension()
             return self
 
         eff_min_df = max(1, int(min_df))
@@ -1381,7 +1599,6 @@ class HybridProjector:
         if not candidate_terms:
             candidate_terms = list(df_counter.keys())
 
-        # Unsupervised corpus-weighted term scoring & IDF weights (keeps features stable under teacher label noise)
         term_scores: Dict[str, float] = {}
         term_weights_map: Dict[str, float] = {}
         for term in candidate_terms:
@@ -1391,35 +1608,44 @@ class HybridProjector:
             term_weights_map[term] = float(idf)
             term_scores[term] = float(math.log1p(tf_counter[term]) * idf * df_penalty)
 
-        v_limit = max(1, min(int(max_vocab), 1024))
+        vocab_cap = 2048 if self._direct_spectral else 1024
+        v_limit = max(1, min(int(max_vocab), vocab_cap))
         selected_vocab = sorted(
             sorted(term_scores.keys(), key=lambda tm: (-round(term_scores[tm], 9), -tf_counter[tm], tm))[:v_limit]
         )
         v_size = len(selected_vocab)
         vocab_idx = {tm: i for i, tm in enumerate(selected_vocab)}
 
-        # Build symmetric document co-occurrence matrix and transform to PPMI
         cooc = np.zeros((v_size, v_size), dtype=np.float64)
-        for terms in doc_terms:
-            present = sorted({vocab_idx[tm] for tm in terms if tm in vocab_idx})
-            for idx_a in present:
-                cooc[idx_a, idx_a] += 1.0
-                for idx_b in present:
-                    if idx_a != idx_b:
-                        cooc[idx_a, idx_b] += 1.0
+        chunk_docs = 1024
+        for start in range(0, n_docs, chunk_docs):
+            end = min(start + chunk_docs, n_docs)
+            indicator = np.zeros((end - start, v_size), dtype=np.float64)
+            for row_i, terms in enumerate(doc_terms[start:end]):
+                present = {vocab_idx[tm] for tm in terms if tm in vocab_idx}
+                if present:
+                    indicator[row_i, list(present)] = 1.0
+            cooc += indicator.T @ indicator
 
         total_cooc = float(np.sum(cooc))
         if total_cooc > 0.0:
             row_sums = np.sum(cooc, axis=1, keepdims=True)
             col_sums = np.sum(cooc, axis=0, keepdims=True)
+            if self._context_smooth != 1.0:
+                col_s_sm = np.power(np.maximum(col_sums, 1e-12), self._context_smooth)
+                sm_sum = float(np.sum(col_s_sm))
+                if sm_sum > 0.0:
+                    col_sums = col_s_sm * (float(np.sum(col_sums)) / sm_sum)
             denom = np.maximum(row_sums @ col_sums, 1e-12)
             ratio = (cooc * total_cooc) / denom
             ppmi = np.maximum(0.0, np.log(np.maximum(ratio, 1e-12)))
         else:
             ppmi = np.eye(v_size, dtype=np.float64)
 
-        # Truncated SVD on PPMI matrix for distributional spectral representations
-        r_spec = max(1, min(int(spectral_dim), v_size, self.dense_dim))
+        if self._direct_spectral:
+            r_spec = max(1, min(int(spectral_dim), v_size))
+        else:
+            r_spec = max(1, min(int(spectral_dim), v_size, self.dense_dim))
         u_mat, s_vals, _ = np.linalg.svd(ppmi, full_matrices=False)
         spec_vecs = (u_mat[:, :r_spec] * np.power(np.maximum(s_vals[:r_spec], 1e-12), self.svd_power)).astype(np.float32)
         spec_norms = np.linalg.norm(spec_vecs, axis=1, keepdims=True)
@@ -1432,22 +1658,28 @@ class HybridProjector:
         self._spectral_terms = tuple(selected_vocab)
         self._spectral_vocab = vocab_idx
         self._spectral_weights = tuple(term_weights_map[tm] for tm in selected_vocab)
+        self._spectral_weights_arr = np.asarray(self._spectral_weights, dtype=np.float32)
         self._spectral_vectors = spec_vecs
-        # Align spectral basis with the semantic dense space of the vocabulary terms
-        vocab_dense = np.stack([self._dense_engine.encode(tm) for tm in selected_vocab], axis=0).astype(np.float32)
-        aligned_basis = (spec_vecs.T @ vocab_dense).astype(np.float32)
-        b_norms = np.linalg.norm(aligned_basis, axis=1, keepdims=True)
-        if np.all(b_norms.flatten() > 1e-6):
-            self._spectral_basis = (aligned_basis / b_norms).astype(np.float32)
+
+        if self._direct_spectral:
+            self._direct_spectral_dim = r_spec
+            self._spectral_basis = None
         else:
-            self._spectral_basis = self._build_spectral_basis(r_spec)
+            vocab_dense = self._dense_engine.encode_batch(selected_vocab).astype(np.float32)
+            aligned_basis = (spec_vecs.T @ vocab_dense).astype(np.float32)
+            b_norms = np.linalg.norm(aligned_basis, axis=1, keepdims=True)
+            if np.all(b_norms.flatten() > 1e-6):
+                self._spectral_basis = (aligned_basis / b_norms).astype(np.float32)
+            else:
+                self._spectral_basis = self._build_spectral_basis(r_spec)
+
+        self._update_dimension()
         self._subspace_components = None
         self._subspace_weight = float(subspace_weight) if self._use_subspace else 0.0
         self._fitted = True
 
-        # Step 2: Optional low-rank subspace (disabled by default to avoid noisy centroid projection)
-        if self._use_subspace and n_docs >= 2:
-            base_embs = np.stack([self._project_base(t) for t in text_list], axis=0).astype(np.float64)
+        if self._use_subspace and len(text_list) >= 2:
+            base_embs = self._project_base_batch(text_list).astype(np.float64)
             if len(text_list) <= 4096:
                 self._fit_base_cache = {
                     t: base_embs[i].astype(np.float32) for i, t in enumerate(text_list)
@@ -1466,7 +1698,7 @@ class HybridProjector:
                     proto_mat = np.stack(centroids, axis=0)
                     centered_protos = proto_mat - np.mean(proto_mat, axis=0, keepdims=True)
                     _, s_p, vt_p = np.linalg.svd(centered_protos, full_matrices=False)
-                    r_sub = max(1, min(int(subspace_dim), vt_p.shape[0], self.dimension))
+                    r_sub = max(1, min(int(subspace_dim), vt_p.shape[0], self._base_dimension))
                     valid = s_p[:r_sub] > 1e-6
                     if np.any(valid):
                         sub_arr = vt_p[:r_sub][valid].astype(np.float32)
@@ -1475,7 +1707,7 @@ class HybridProjector:
             else:
                 centered = base_embs - np.mean(base_embs, axis=0, keepdims=True)
                 _, s_u, vt_u = np.linalg.svd(centered, full_matrices=False)
-                r_sub = max(1, min(int(subspace_dim), vt_u.shape[0], self.dimension))
+                r_sub = max(1, min(int(subspace_dim), vt_u.shape[0], self._base_dimension))
                 valid = s_u[:r_sub] > 1e-6
                 if np.any(valid):
                     sub_arr = vt_u[:r_sub][valid].astype(np.float32)
@@ -1509,6 +1741,15 @@ class HybridProjector:
         svd_power: float = 0.5,
         spectral_blend: float = 0.35,
         use_subspace: bool = False,
+        direct_spectral: bool = False,
+        context_smooth: float = 1.0,
+        extra_texts: Sequence[str] = (),
+        tfidf_use_stems: bool = False,
+        tfidf_stem_weight: Optional[float] = None,
+        tfidf_use_skip_bigrams: bool = False,
+        tfidf_skip_weight: Optional[float] = None,
+        tfidf_word_quota_frac: Optional[float] = None,
+        tfidf_char_weight: Optional[float] = None,
         **kwargs: Any,
     ) -> HybridProjector:
         auto_sparse_dim = dimension is None and sparse_dim is None and max_features is None
@@ -1543,9 +1784,165 @@ class HybridProjector:
             svd_power=svd_power,
             spectral_blend=spectral_blend,
             use_subspace=use_subspace,
+            direct_spectral=direct_spectral,
+            context_smooth=context_smooth,
+            extra_texts=extra_texts,
+            tfidf_use_stems=tfidf_use_stems,
+            tfidf_stem_weight=tfidf_stem_weight,
+            tfidf_use_skip_bigrams=tfidf_use_skip_bigrams,
+            tfidf_skip_weight=tfidf_skip_weight,
+            tfidf_word_quota_frac=tfidf_word_quota_frac,
+            tfidf_char_weight=tfidf_char_weight,
             _auto_sparse_dim=auto_sparse_dim,
             **kwargs,
         )
+
+    @classmethod
+    def fit_v1_2(
+        cls,
+        texts: Iterable[str],
+        labels: Optional[Sequence[Any]] = None,
+        *,
+        schema: Optional[Any] = None,
+        schema_repeat: int = 4,
+        dimension: Optional[int] = None,
+        sparse_dim: Optional[int] = None,
+        max_features: Optional[int] = None,
+        dense_dim: int = 192,
+        alpha: float = 0.88,
+        seed: int = 42,
+        backend: str = "auto",
+        max_vocab: int = 2048,
+        spectral_dim: int = 128,
+        spectral_blend: float = 0.55,
+        svd_power: float = 0.5,
+        context_smooth: float = 0.75,
+        char_ngrams: Optional[Tuple[int, int]] = (2, 5),
+        tfidf_use_stems: bool = True,
+        tfidf_stem_weight: float = 0.90,
+        tfidf_use_skip_bigrams: bool = True,
+        tfidf_skip_weight: float = 0.75,
+        tfidf_word_quota_frac: float = 0.58,
+        tfidf_char_weight: float = 0.42,
+        direct_spectral: bool = True,
+        rbf_gamma: float = 3.0,
+        rbf_weight: float = 0.14,
+        attach_rbf: bool = False,
+        **kwargs: Any,
+    ) -> HybridProjector:
+        """Fit the v1.2 unified hybrid projector (rich lexical + schema-distributional spectral + optional RBF landmarks)."""
+        text_list = list(texts)
+        extra_texts: List[str] = []
+        if schema is not None:
+            anchors = extract_schema_anchor_texts(schema)
+            if anchors and schema_repeat > 0:
+                extra_texts = anchors * int(schema_repeat)
+        proj = cls._fit_class(
+            text_list,
+            labels=labels,
+            dimension=dimension,
+            sparse_dim=sparse_dim,
+            max_features=max_features,
+            dense_dim=dense_dim,
+            alpha=alpha,
+            seed=seed,
+            backend=backend,
+            max_vocab=max_vocab,
+            spectral_dim=spectral_dim,
+            spectral_blend=spectral_blend,
+            svd_power=svd_power,
+            char_ngrams=char_ngrams,
+            direct_spectral=direct_spectral,
+            context_smooth=context_smooth,
+            extra_texts=extra_texts,
+            tfidf_use_stems=tfidf_use_stems,
+            tfidf_stem_weight=tfidf_stem_weight,
+            tfidf_use_skip_bigrams=tfidf_use_skip_bigrams,
+            tfidf_skip_weight=tfidf_skip_weight,
+            tfidf_word_quota_frac=tfidf_word_quota_frac,
+            tfidf_char_weight=tfidf_char_weight,
+            **kwargs,
+        )
+        if attach_rbf and labels is not None and len(text_list) >= 2:
+            proj.attach_rbf_landmarks(
+                text_list,
+                labels,
+                rbf_gamma=rbf_gamma,
+                rbf_weight=rbf_weight,
+            )
+        return proj
+
+    def attach_rbf_landmarks(
+        self,
+        texts: Sequence[str],
+        labels: Sequence[Any],
+        *,
+        rbf_gamma: float = 3.0,
+        rbf_weight: float = 0.14,
+        hard_drop_thresh: float = 0.35,
+        reg_loo: float = 0.75,
+    ) -> HybridProjector:
+        """Attach LOO-filtered class-centroid RBF-Cosine similarity landmarks on base features."""
+        text_list = list(texts)
+        label_list = [str(lbl) for lbl in labels]
+        if len(text_list) != len(label_list):
+            raise ValueError("labels must match texts length")
+        if not text_list:
+            raise ValueError("texts must be non-empty to attach RBF landmarks")
+
+        eff_gamma = float(rbf_gamma)
+        eff_weight = float(rbf_weight)
+        if eff_gamma <= 0.0 or not math.isfinite(eff_gamma):
+            raise ValueError(f"rbf_gamma must be positive and finite, got {rbf_gamma}")
+        if not (0.0 < eff_weight < 1.0) or not math.isfinite(eff_weight):
+            raise ValueError(f"rbf_weight must be in (0, 1), got {rbf_weight}")
+
+        self._rbf_landmarks = None
+        self._rbf_weight = 0.0
+        self._update_dimension()
+
+        base_x = self.project_batch(text_list).astype(np.float64)
+        classes = sorted(set(label_list))
+        if len(classes) < 2:
+            return self
+        c_map = {c: i for i, c in enumerate(classes)}
+        n_samples = len(text_list)
+        y_mat = np.zeros((n_samples, len(classes)), dtype=np.float64)
+        for i, lbl in enumerate(label_list):
+            y_mat[i, c_map[lbl]] = 1.0
+
+        sw, clean_mask = compute_strict_loo_weights(
+            base_x,
+            y_mat,
+            hard_drop_thresh=hard_drop_thresh,
+            reg_loo=reg_loo,
+        )
+        if int(np.sum(clean_mask)) >= len(classes):
+            xc = base_x[clean_mask]
+            yc = y_mat[clean_mask]
+            swc = sw[clean_mask]
+        else:
+            xc, yc, swc = base_x, y_mat, sw
+
+        landmarks: List[np.ndarray] = []
+        for k in range(len(classes)):
+            mask = yc[:, k] > 0.5
+            if np.any(mask):
+                w_k = swc[mask][:, None]
+                m_k = np.sum(xc[mask] * w_k, axis=0) / max(1e-8, float(np.sum(w_k)))
+                mn = float(np.linalg.norm(m_k))
+                landmarks.append((m_k / (mn if mn > 1e-12 else 1.0)).astype(np.float32))
+        if landmarks:
+            lm_arr = np.stack(landmarks, axis=0).astype(np.float32)
+            lm_f16 = lm_arr.astype(np.float16)
+            if np.all(np.isfinite(lm_f16)):
+                lm_arr = lm_f16.astype(np.float32)
+            self._rbf_landmarks = lm_arr
+            self._rbf_gamma = eff_gamma
+            self._rbf_weight = eff_weight
+            self._update_dimension()
+            self._digest = None
+        return self
 
     fit = _HybridFitDescriptor()
 
@@ -1653,22 +2050,20 @@ class HybridProjector:
             return v
         return (vec / norm).astype(np.float32)
 
-    def _encode_spectral_dense(self, text: str, base_dense: np.ndarray) -> np.ndarray:
-        """Blends corpus-learned PPMI/SVD spectral co-occurrence vector into dense channel."""
+    def _extract_spectral_unit(self, text: str) -> Tuple[Optional[np.ndarray], bool]:
+        """Compute unit-normalized spectral vector for a single document, or (None, False)."""
         if (
             not self._fitted
             or self._spectral_vectors is None
-            or self._spectral_basis is None
             or not self._spectral_vocab
-            or self.spectral_blend <= 0.0
         ):
-            return base_dense
+            return None, False
         terms = _extract_corpus_terms(text)
         if not terms:
-            return base_dense
+            return None, False
         counts = Counter(t for t in terms if t in self._spectral_vocab)
         if not counts:
-            return base_dense
+            return None, False
         r_spec = self._spectral_vectors.shape[1]
         spec_accum = np.zeros(r_spec, dtype=np.float32)
         for tm, cnt in counts.items():
@@ -1677,8 +2072,70 @@ class HybridProjector:
             spec_accum += w * self._spectral_vectors[idx]
         s_norm = float(np.linalg.norm(spec_accum))
         if s_norm < 1e-12:
+            return None, False
+        return (spec_accum / s_norm).astype(np.float32), True
+
+    def _extract_spectral_unit_batch(self, texts: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
+        """Batched unit-normalized raw spectral vectors and validity mask via chunked SGEMM."""
+        n_docs = len(texts)
+        if (
+            not self._fitted
+            or self._spectral_vectors is None
+            or not self._spectral_vocab
+        ):
+            r_spec = self._spectral_vectors.shape[1] if self._spectral_vectors is not None else max(0, self._direct_spectral_dim)
+            return np.zeros((n_docs, r_spec), dtype=np.float32), np.zeros(n_docs, dtype=bool)
+
+        v_size, r_spec = self._spectral_vectors.shape
+        sw_arr = self._spectral_weights_arr
+        if len(sw_arr) != v_size:
+            sw_arr = np.asarray(self._spectral_weights, dtype=np.float32)
+            self._spectral_weights_arr = sw_arr
+        sv = self._spectral_vocab
+
+        out = np.zeros((n_docs, r_spec), dtype=np.float32)
+        has_spec = np.zeros(n_docs, dtype=bool)
+        chunk_size = 256
+        for start in range(0, n_docs, chunk_size):
+            end = min(start + chunk_size, n_docs)
+            c_len = end - start
+            counts_mat = np.zeros((c_len, v_size), dtype=np.float32)
+            non_empty_rows: List[int] = []
+            for local_i, t in enumerate(texts[start:end]):
+                terms = _extract_corpus_terms(t)
+                if not terms:
+                    continue
+                cnts: Dict[int, int] = {}
+                for tm in terms:
+                    idx = sv.get(tm)
+                    if idx is not None:
+                        cnts[idx] = cnts.get(idx, 0) + 1
+                if cnts:
+                    cols = list(cnts.keys())
+                    vals = [
+                        float(sw_arr[idx]) if c == 1 else (1.0 + math.log(c)) * float(sw_arr[idx])
+                        for idx, c in cnts.items()
+                    ]
+                    counts_mat[local_i, cols] = np.asarray(vals, dtype=np.float32)
+                    non_empty_rows.append(local_i)
+            if not non_empty_rows:
+                continue
+            accums = counts_mat @ self._spectral_vectors
+            norms = np.linalg.norm(accums, axis=1, keepdims=True)
+            valid = (norms[:, 0] >= 1e-12) & np.isfinite(norms[:, 0])
+            if np.any(valid):
+                accums[valid] /= norms[valid]
+                out[start:end][valid] = accums[valid].astype(np.float32)
+                has_spec[start:end] = valid
+        return out, has_spec
+
+    def _encode_spectral_dense(self, text: str, base_dense: np.ndarray) -> np.ndarray:
+        """Blends corpus-learned PPMI/SVD spectral co-occurrence vector into dense channel."""
+        if self._spectral_basis is None or self.spectral_blend <= 0.0:
             return base_dense
-        spec_unit = spec_accum / s_norm
+        spec_unit, ok = self._extract_spectral_unit(text)
+        if not ok or spec_unit is None:
+            return base_dense
         spec_dense = spec_unit @ self._spectral_basis
         sd_norm = float(np.linalg.norm(spec_dense))
         if sd_norm > 1e-12:
@@ -1711,6 +2168,35 @@ class HybridProjector:
         else:
             v_sparse = self._hash_to_sparse_vec(text, _pretokenized=pretok)
         v_dense = self._dense_engine.encode(text, _pretokenized=pretok)
+
+        if self._direct_spectral:
+            sd = self.sparse_dim
+            dd = self.dense_dim
+            spd = self._direct_spectral_dim
+            base_dim = sd + dd + spd
+            w_sparse = math.sqrt(self.alpha)
+            if spd > 0:
+                w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
+                w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
+            else:
+                w_dense = math.sqrt(1.0 - self.alpha)
+                w_spec = 0.0
+            v_out = np.empty(base_dim, dtype=np.float32)
+            np.multiply(v_sparse, w_sparse, out=v_out[:sd])
+            np.multiply(v_dense, w_dense, out=v_out[sd : sd + dd])
+            if spd > 0:
+                spec_unit, ok = self._extract_spectral_unit(text)
+                if ok and spec_unit is not None and spec_unit.shape[0] == spd:
+                    np.multiply(spec_unit, w_spec, out=v_out[sd + dd :])
+                else:
+                    v_out[sd + dd :] = 0.0
+            norm = float(np.linalg.norm(v_out))
+            if norm > 1e-12 and np.isfinite(norm):
+                return (v_out / norm).astype(np.float32)
+            v_fallback = np.zeros(base_dim, dtype=np.float32)
+            v_fallback[0] = 1.0
+            return v_fallback
+
         if self._fitted:
             v_dense = self._encode_spectral_dense(text, v_dense)
 
@@ -1721,9 +2207,123 @@ class HybridProjector:
         norm = float(np.linalg.norm(v_hybrid))
         if norm > 1e-12:
             return (v_hybrid / norm).astype(np.float32)
-        v_fallback = np.zeros(self.dimension, dtype=np.float32)
+        v_fallback = np.zeros(self._base_dimension, dtype=np.float32)
         v_fallback[0] = 1.0
         return v_fallback
+
+    def _project_base_batch(
+        self,
+        texts: Sequence[str],
+        *,
+        return_norms: bool = False,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """Batched projection into base feature space prior to subspace/RBF stages."""
+        n_docs = len(texts)
+        base_dim = self._base_dimension
+        if n_docs == 0:
+            empty_x = np.empty((0, base_dim), dtype=np.float32)
+            if return_norms:
+                return empty_x, np.empty(0, dtype=np.float32)
+            return empty_x
+
+        if self._tfidf_projector is not None:
+            pretok_list = None
+            if return_norms:
+                tf_vecs, raw_norms = self._tfidf_projector.project_batch(texts, return_norms=True)
+            else:
+                tf_vecs = self._tfidf_projector.project_batch(texts, return_norms=False)
+                raw_norms = None
+            if tf_vecs.shape[1] == self.sparse_dim:
+                v_sparse_mat = tf_vecs
+            else:
+                v_sparse_mat = np.zeros((n_docs, self.sparse_dim), dtype=np.float32)
+                n_copy = min(self.sparse_dim, tf_vecs.shape[1])
+                v_sparse_mat[:, :n_copy] = tf_vecs[:, :n_copy]
+        else:
+            pretok_list = [
+                (ct, *_tokenize_with_negation_scope(ct)) if (t and t.strip() and (ct := _normalize_text(t))) else ("", [], {})
+                for t in texts
+            ]
+            v_sparse_mat = np.stack(
+                [self._hash_to_sparse_vec(t, _pretokenized=pt if t and t.strip() else None) for t, pt in zip(texts, pretok_list)],
+                axis=0,
+            ).astype(np.float32)
+            if return_norms:
+                raw_norms = np.array([1.0 if t.strip() else 0.0 for t in texts], dtype=np.float32)
+            else:
+                raw_norms = None
+
+        v_dense_mat = self._dense_engine.encode_batch(
+            texts,
+            _pretokenized_list=[
+                pt if (t and t.strip()) else None for t, pt in zip(texts, pretok_list)
+            ] if pretok_list is not None else None,
+        )
+
+        if self._direct_spectral:
+            sd = self.sparse_dim
+            dd = self.dense_dim
+            spd = self._direct_spectral_dim
+            w_sparse = math.sqrt(self.alpha)
+            if spd > 0:
+                w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
+                w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
+            else:
+                w_dense = math.sqrt(1.0 - self.alpha)
+                w_spec = 0.0
+
+            base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
+            np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, :sd])
+            np.multiply(v_dense_mat, w_dense, out=base_mat[:, sd : sd + dd])
+            if spd > 0:
+                spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
+                if spec_mat.shape[1] == spd:
+                    np.multiply(spec_mat, w_spec, out=base_mat[:, sd + dd :])
+                    if np.any(~has_spec):
+                        base_mat[~has_spec, sd + dd :] = 0.0
+                else:
+                    base_mat[:, sd + dd :] = 0.0
+        else:
+            if (
+                self._fitted
+                and self._spectral_vectors is not None
+                and self._spectral_basis is not None
+                and self._spectral_vocab
+                and self.spectral_blend > 0.0
+            ):
+                spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
+                if np.any(has_spec):
+                    spec_dense = spec_mat[has_spec] @ self._spectral_basis
+                    sd_norms = np.linalg.norm(spec_dense, axis=1, keepdims=True)
+                    good_sd = sd_norms[:, 0] > 1e-12
+                    if np.any(good_sd):
+                        spec_dense[good_sd] = spec_dense[good_sd] / sd_norms[good_sd]
+                    blend = min(1.0, max(0.0, float(self.spectral_blend)))
+                    blended = (1.0 - blend) * v_dense_mat[has_spec] + blend * spec_dense
+                    b_norms = np.linalg.norm(blended, axis=1, keepdims=True)
+                    good_b = b_norms[:, 0] > 1e-12
+                    has_idx = np.flatnonzero(has_spec)
+                    if np.any(good_b):
+                        v_dense_mat[has_idx[good_b]] = (blended[good_b] / b_norms[good_b]).astype(np.float32)
+
+            w_sparse = math.sqrt(self.alpha)
+            w_dense = math.sqrt(1.0 - self.alpha)
+            base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
+            np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, : self.sparse_dim])
+            np.multiply(v_dense_mat, w_dense, out=base_mat[:, self.sparse_dim :])
+
+        norms = np.linalg.norm(base_mat, axis=1, keepdims=True)
+        valid = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
+        if np.any(valid):
+            base_mat[valid] = (base_mat[valid] / norms[valid]).astype(np.float32)
+        if np.any(~valid):
+            base_mat[~valid] = 0.0
+            base_mat[~valid, 0] = 1.0
+
+        if return_norms:
+            assert raw_norms is not None
+            return base_mat, raw_norms
+        return base_mat
 
     def raw_norm(self, text: str) -> float:
         """Returns pre-normalization lexical magnitude (TF-IDF L2 norm when fitted with TF-IDF)."""
@@ -1738,37 +2338,114 @@ class HybridProjector:
         if not isinstance(text, str):
             raise TypeError(f"Expected text to be a string, got {type(text).__name__}")
 
-        v_hybrid = self._project_base(text)
+        v_base = self._project_base(text)
         if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
-            # Project onto learned spectral / class-prototype subspace and blend
-            coords = self._subspace_components @ v_hybrid
+            coords = self._subspace_components @ v_base
             v_sub = self._subspace_components.T @ coords
-            v_hybrid = v_hybrid + float(self._subspace_weight) * v_sub
-            norm = float(np.linalg.norm(v_hybrid))
+            v_base = v_base + float(self._subspace_weight) * v_sub
+            norm = float(np.linalg.norm(v_base))
             if norm > 1e-12 and np.isfinite(norm):
-                v_hybrid = (v_hybrid / norm).astype(np.float32)
+                v_base = (v_base / norm).astype(np.float32)
             else:
-                v_hybrid = np.zeros(self.dimension, dtype=np.float32)
-                v_hybrid[0] = 1.0
-        return v_hybrid
+                v_base = np.zeros(self._base_dimension, dtype=np.float32)
+                v_base[0] = 1.0
+
+        if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
+            sims = self._rbf_landmarks @ v_base
+            phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
+            pnorm = float(np.linalg.norm(phi))
+            wb = math.sqrt(1.0 - self._rbf_weight)
+            wr = math.sqrt(self._rbf_weight)
+            d_b = len(v_base)
+            v_out = np.empty(self.dimension, dtype=np.float32)
+            np.multiply(v_base, wb, out=v_out[:d_b])
+            if pnorm > 1e-12:
+                np.multiply(phi, wr / pnorm, out=v_out[d_b:])
+                if not np.any(v_base):
+                    on = float(np.linalg.norm(v_out))
+                    if on > 1e-12:
+                        v_out /= on
+            else:
+                v_out[d_b:] = 0.0
+                on = float(np.linalg.norm(v_out))
+                if on > 1e-12:
+                    v_out /= on
+            return v_out
+
+        return v_base
 
     encode = project
 
     def __call__(self, text: str) -> np.ndarray:
         return self.project(text)
 
-    def project_batch(self, texts: Sequence[str], recency_weighted: Optional[bool] = None) -> np.ndarray:
-        """Batched projection of multiple text inputs."""
+    def project_batch(
+        self,
+        texts: Sequence[str],
+        recency_weighted: Optional[bool] = None,
+        *,
+        return_norms: bool = False,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """Batched projection of multiple text inputs using vectorized sparse, dense, and spectral stages."""
+        _ = recency_weighted
         if texts is None:
             raise TypeError("texts must be a sequence of strings, got None")
         if not hasattr(texts, "__iter__"):
             raise TypeError(f"texts must be a sequence of strings, got {type(texts).__name__}")
-        if len(texts) == 0:
-            return np.empty((0, self.dimension), dtype=np.float32)
-        for idx, t in enumerate(texts):
+        text_list = list(texts) if not isinstance(texts, (list, tuple)) else texts
+        if len(text_list) == 0:
+            empty_x = np.empty((0, self.dimension), dtype=np.float32)
+            if return_norms:
+                return empty_x, np.empty(0, dtype=np.float32)
+            return empty_x
+        for idx, t in enumerate(text_list):
             if not isinstance(t, str):
                 raise TypeError(f"All elements in texts must be strings, got {type(t).__name__} at index {idx}")
-        return np.stack([self.project(t) for t in texts], axis=0).astype(np.float32)
+
+        if return_norms:
+            v_base_mat, raw_norms = self._project_base_batch(text_list, return_norms=True)
+        else:
+            v_base_mat = self._project_base_batch(text_list, return_norms=False)
+            raw_norms = None
+
+        if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
+            coords = v_base_mat @ self._subspace_components.T
+            v_sub = coords @ self._subspace_components
+            v_base_mat = (v_base_mat + float(self._subspace_weight) * v_sub).astype(np.float32)
+            s_norms = np.linalg.norm(v_base_mat, axis=1, keepdims=True)
+            valid = (s_norms[:, 0] > 1e-12) & np.isfinite(s_norms[:, 0])
+            if np.any(valid):
+                v_base_mat[valid] = (v_base_mat[valid] / s_norms[valid]).astype(np.float32)
+            if np.any(~valid):
+                v_base_mat[~valid] = 0.0
+                v_base_mat[~valid, 0] = 1.0
+
+        if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
+            sims = v_base_mat @ self._rbf_landmarks.T
+            phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
+            p_norms = np.linalg.norm(phi, axis=1, keepdims=True)
+            phi_unit = np.where(p_norms > 1e-12, phi / np.maximum(p_norms, 1e-12), 0.0).astype(np.float32)
+            wb = math.sqrt(1.0 - self._rbf_weight)
+            wr = math.sqrt(self._rbf_weight)
+            d_b = v_base_mat.shape[1]
+            v_out = np.empty((len(text_list), self.dimension), dtype=np.float32)
+            np.multiply(v_base_mat, wb, out=v_out[:, :d_b])
+            np.multiply(phi_unit, wr, out=v_out[:, d_b:])
+            row_norms = np.linalg.norm(v_out, axis=1, keepdims=True)
+            valid_out = (row_norms[:, 0] > 1e-12) & np.isfinite(row_norms[:, 0])
+            if np.any(valid_out):
+                v_out[valid_out] = (v_out[valid_out] / row_norms[valid_out]).astype(np.float32)
+            if np.any(~valid_out):
+                v_out[~valid_out] = 0.0
+                v_out[~valid_out, 0] = 1.0
+            res = v_out
+        else:
+            res = v_base_mat
+
+        if return_norms:
+            assert raw_norms is not None
+            return res, raw_norms
+        return res
 
     encode_batch = project_batch
 
@@ -1792,14 +2469,37 @@ class HybridProjector:
             cfg["spectral_blend"] = round(float(self.spectral_blend), 6)
             cfg["spectral_terms"] = list(self._spectral_terms)
             cfg["spectral_weights"] = [round(float(w), 6) for w in self._spectral_weights]
+            if self._direct_spectral:
+                cfg["direct_spectral"] = True
+                cfg["direct_spectral_dim"] = int(self._direct_spectral_dim)
+            if abs(self._context_smooth - 1.0) > 1e-9:
+                cfg["context_smooth"] = round(float(self._context_smooth), 6)
             if self._tfidf_projector is not None:
-                cfg["tfidf_terms"] = list(self._tfidf_projector._terms)
-                if self._tfidf_projector._char_ngrams is not None:
-                    cfg["tfidf_char_ngrams"] = list(self._tfidf_projector._char_ngrams)
-                if include_arrays:
-                    cfg["tfidf_idf"] = [float(v) for v in self._tfidf_projector._idf]
+                tp_cfg = self._tfidf_projector.to_config(include_arrays=include_arrays)
+                cfg["tfidf_terms"] = tp_cfg["terms"]
+                if "char_ngrams" in tp_cfg and tp_cfg["char_ngrams"] is not None:
+                    cfg["tfidf_char_ngrams"] = tp_cfg["char_ngrams"]
+                for src_k, dst_k in (
+                    ("use_stems", "tfidf_use_stems"),
+                    ("stem_weight", "tfidf_stem_weight"),
+                    ("use_skip_bigrams", "tfidf_use_skip_bigrams"),
+                    ("skip_weight", "tfidf_skip_weight"),
+                    ("word_quota_frac", "tfidf_word_quota_frac"),
+                    ("char_weight", "tfidf_char_weight"),
+                ):
+                    if src_k in tp_cfg:
+                        cfg[dst_k] = tp_cfg[src_k]
+                if include_arrays and "idf" in tp_cfg:
+                    cfg["tfidf_idf"] = tp_cfg["idf"]
             if self._use_subspace:
                 cfg["use_subspace"] = True
+            if self._rbf_landmarks is not None:
+                cfg["rbf_gamma"] = round(float(self._rbf_gamma), 6)
+                cfg["rbf_weight"] = round(float(self._rbf_weight), 6)
+                if include_arrays:
+                    cfg["rbf_landmarks"] = [
+                        [round(float(x), 6) for x in row] for row in self._rbf_landmarks
+                    ]
             if include_arrays:
                 if self._spectral_vectors is not None:
                     cfg["spectral_vectors"] = [
@@ -1821,6 +2521,7 @@ class HybridProjector:
         spectral_vectors: Optional[np.ndarray] = None,
         subspace_components: Optional[np.ndarray] = None,
         tfidf_idf_array: Optional[np.ndarray] = None,
+        rbf_landmarks: Optional[np.ndarray] = None,
     ) -> HybridProjector:
         if not isinstance(config, Mapping) or config.get("type") != "hybrid":
             raise ValueError("Unsupported hybrid projector settings")
@@ -1847,6 +2548,10 @@ class HybridProjector:
             spectral_blend=spectral_blend,
         )
         proj._use_subspace = bool(config.get("use_subspace", False))
+        proj._direct_spectral = bool(config.get("direct_spectral", False))
+        proj._direct_spectral_dim = int(config.get("direct_spectral_dim", 0)) if proj._direct_spectral else 0
+        proj._context_smooth = float(config.get("context_smooth", 1.0))
+
         if config.get("fitted"):
             if "tfidf_terms" in config:
                 from system1.core.text import DEFAULT_MAX_FEATURES, TfidfProjector
@@ -1857,6 +2562,16 @@ class HybridProjector:
                 tf_cfg: Dict[str, Any] = {"type": "tfidf", "terms": list(tf_terms)}
                 if "tfidf_char_ngrams" in config and config["tfidf_char_ngrams"] is not None:
                     tf_cfg["char_ngrams"] = config["tfidf_char_ngrams"]
+                for src_k, dst_k in (
+                    ("tfidf_use_stems", "use_stems"),
+                    ("tfidf_stem_weight", "stem_weight"),
+                    ("tfidf_use_skip_bigrams", "use_skip_bigrams"),
+                    ("tfidf_skip_weight", "skip_weight"),
+                    ("tfidf_word_quota_frac", "word_quota_frac"),
+                    ("tfidf_char_weight", "char_weight"),
+                ):
+                    if src_k in config:
+                        tf_cfg[dst_k] = config[src_k]
                 if len(tf_terms) > DEFAULT_MAX_FEATURES:
                     tf_cfg["max_features"] = len(tf_terms)
                 if tfidf_idf_array is None and "tfidf_idf" in config:
@@ -1871,31 +2586,50 @@ class HybridProjector:
             proj._spectral_terms = terms
             proj._spectral_vocab = {tm: i for i, tm in enumerate(terms)}
             proj._spectral_weights = weights
+            proj._spectral_weights_arr = np.asarray(weights, dtype=np.float32)
+
             raw_spec = spectral_vectors if spectral_vectors is not None else config.get("spectral_vectors")
             if raw_spec is not None and len(raw_spec) > 0:
                 spec_arr = np.asarray(raw_spec, dtype=np.float32)
-                if (
-                    spec_arr.ndim != 2
-                    or spec_arr.shape[0] != len(terms)
-                    or not (1 <= spec_arr.shape[1] <= dense)
-                    or not np.all(np.isfinite(spec_arr))
-                ):
-                    raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
-                proj._spectral_vectors = spec_arr
-                vocab_dense = np.stack([proj._dense_engine.encode(tm) for tm in terms], axis=0).astype(np.float32)
-                aligned_basis = (spec_arr.T @ vocab_dense).astype(np.float32)
-                b_norms = np.linalg.norm(aligned_basis, axis=1, keepdims=True)
-                if np.all(b_norms.flatten() > 1e-6):
-                    proj._spectral_basis = (aligned_basis / b_norms).astype(np.float32)
+                if proj._direct_spectral:
+                    max_r = proj._direct_spectral_dim if proj._direct_spectral_dim > 0 else spec_arr.shape[1]
+                    if (
+                        spec_arr.ndim != 2
+                        or spec_arr.shape[0] != len(terms)
+                        or not (1 <= spec_arr.shape[1] <= 1024)
+                        or (proj._direct_spectral_dim > 0 and spec_arr.shape[1] != max_r)
+                        or not np.all(np.isfinite(spec_arr))
+                    ):
+                        raise ValueError("Saved hybrid projector direct spectral_vectors have invalid shape")
+                    proj._direct_spectral_dim = int(spec_arr.shape[1])
+                    proj._spectral_vectors = spec_arr
+                    proj._spectral_basis = None
                 else:
-                    proj._spectral_basis = proj._build_spectral_basis(spec_arr.shape[1])
+                    if (
+                        spec_arr.ndim != 2
+                        or spec_arr.shape[0] != len(terms)
+                        or not (1 <= spec_arr.shape[1] <= dense)
+                        or not np.all(np.isfinite(spec_arr))
+                    ):
+                        raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
+                    proj._spectral_vectors = spec_arr
+                    vocab_dense = proj._dense_engine.encode_batch(list(terms)).astype(np.float32)
+                    aligned_basis = (spec_arr.T @ vocab_dense).astype(np.float32)
+                    b_norms = np.linalg.norm(aligned_basis, axis=1, keepdims=True)
+                    if np.all(b_norms.flatten() > 1e-6):
+                        proj._spectral_basis = (aligned_basis / b_norms).astype(np.float32)
+                    else:
+                        proj._spectral_basis = proj._build_spectral_basis(spec_arr.shape[1])
+
+            proj._update_dimension()
             raw_sub = subspace_components if subspace_components is not None else config.get("subspace_components")
             if raw_sub is not None and len(raw_sub) > 0:
                 sub_arr = np.asarray(raw_sub, dtype=np.float32)
+                base_dim = proj._base_dimension
                 if (
                     sub_arr.ndim != 2
-                    or not (1 <= sub_arr.shape[0] <= proj.dimension)
-                    or sub_arr.shape[1] != proj.dimension
+                    or not (1 <= sub_arr.shape[0] <= base_dim)
+                    or sub_arr.shape[1] != base_dim
                     or not np.all(np.isfinite(sub_arr))
                 ):
                     raise ValueError("Saved hybrid projector subspace_components have invalid shape")
@@ -1904,6 +2638,18 @@ class HybridProjector:
             if not math.isfinite(sub_w):
                 raise ValueError("Saved hybrid projector subspace_weight must be finite")
             proj._subspace_weight = sub_w
+
+            raw_rbf = rbf_landmarks if rbf_landmarks is not None else config.get("rbf_landmarks")
+            if raw_rbf is not None and len(raw_rbf) > 0:
+                rbf_arr = np.asarray(raw_rbf, dtype=np.float32)
+                base_dim = proj._base_dimension
+                if rbf_arr.ndim != 2 or rbf_arr.shape[0] < 1 or rbf_arr.shape[1] != base_dim or not np.all(np.isfinite(rbf_arr)):
+                    raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
+                proj._rbf_landmarks = rbf_arr
+                proj._rbf_gamma = float(config.get("rbf_gamma", 3.0))
+                proj._rbf_weight = float(config.get("rbf_weight", 0.14))
+
+            proj._update_dimension()
             proj._fitted = True
         proj._digest = None
         return proj
@@ -1931,4 +2677,6 @@ __all__ = [
     "_stem_word",
     "_ANCHOR_STOPWORDS",
     "match_semantic_concepts",
+    "compute_strict_loo_weights",
+    "extract_schema_anchor_texts",
 ]

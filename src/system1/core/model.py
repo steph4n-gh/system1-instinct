@@ -189,24 +189,10 @@ class DeterministicSemanticProjector:
             vec[0] = 1.0
         return vec
 
-    def project(self, text: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
-        """Project input text into a deterministic dense vector.
-
-        Supports recency weighting for multi-turn agent traces / command histories.
-        When recency_weighted=True, trailing tokens receive full weight 1.0 and historical
-        context decays backwards from the end:
-            weight(i) = log(1 + len(w_i)) / sqrt(1.0 + 0.05 * (N - 1 - i))
-        When recency_weighted=False (default), standard forward position decay applies:
-            weight(i) = log(1 + len(w_i)) / sqrt(1.0 + 0.05 * i)
-        """
-        if not isinstance(text, str):
-            raise TypeError(f"Expected text to be a string, got {type(text).__name__}")
+    def _extract_token_weights(self, text: str, use_recency: bool) -> Dict[str, float]:
+        """Extracts weighted word, n-gram, bigram, and character features for base projection."""
         if not text or not text.strip():
-            v = np.zeros(self.dimension, dtype=np.float32)
-            v[0] = 1.0
-            return v
-
-        use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
+            return {}
 
         clean_text = text.lower().strip()
         if len(clean_text) > 8192:
@@ -219,7 +205,6 @@ class DeterministicSemanticProjector:
         log1p = math.log1p
         sqrt = math.sqrt
 
-        # 1. Whole word tokens with position decay and length weighting
         for pos, word in enumerate(words):
             dist = (n_words - 1 - pos) if use_recency else pos
             word_weight = log1p(len(word)) / sqrt(1.0 + dist * 0.05)
@@ -233,18 +218,32 @@ class DeterministicSemanticProjector:
                         nk = f"ng:{word[j : j + n]}"
                         wmap[nk] = wmap_get(nk, 0.0) + 0.5
 
-        # 2. Word pairs / bigrams for local contextual semantics
         for i in range(n_words - 1):
             bk = f"bi:{words[i]}_{words[i + 1]}"
             wmap[bk] = wmap_get(bk, 0.0) + 1.5
 
-        # 3. Global character 4-grams across word boundaries
         boundary_text = f" {clean_text} "
         limit = len(boundary_text) - 4
         for j in range(max(0, limit)):
             ck = f"char4:{boundary_text[j : j + 4]}"
             wmap[ck] = wmap_get(ck, 0.0) + 0.3
 
+        return wmap
+
+    def project(self, text: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
+        """Project input text into a deterministic dense vector.
+
+        Supports recency weighting for multi-turn agent traces / command histories.
+        When recency_weighted=True, trailing tokens receive full weight 1.0 and historical
+        context decays backwards from the end:
+            weight(i) = log(1 + len(w_i)) / sqrt(1.0 + 0.05 * (N - 1 - i))
+        When recency_weighted=False (default), standard forward position decay applies:
+            weight(i) = log(1 + len(w_i)) / sqrt(1.0 + 0.05 * i)
+        """
+        if not isinstance(text, str):
+            raise TypeError(f"Expected text to be a string, got {type(text).__name__}")
+        use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
+        wmap = self._extract_token_weights(text, use_recency)
         return self._accumulate_and_normalize(wmap)
 
     def _project_concept_aware(self, text: str) -> np.ndarray:
@@ -376,17 +375,133 @@ class DeterministicSemanticProjector:
     encode = project
 
     def project_batch(self, texts: Sequence[str], recency_weighted: Optional[bool] = None) -> np.ndarray:
-        """Batched projection of multiple text inputs."""
+        """Batched projection of multiple text inputs using shared token hashing and BLAS."""
         if texts is None:
             raise TypeError("texts must be a sequence of strings, got None")
         if not hasattr(texts, "__iter__"):
             raise TypeError(f"texts must be a sequence of strings, got {type(texts).__name__}")
-        if len(texts) == 0:
+        n_docs = len(texts)
+        if n_docs == 0:
             return np.empty((0, self.dimension), dtype=np.float32)
         for idx, t in enumerate(texts):
             if not isinstance(t, str):
                 raise TypeError(f"All elements in texts must be strings, got {type(t).__name__} at index {idx}")
-        return np.stack([self.project(t, recency_weighted=recency_weighted) for t in texts], axis=0).astype(np.float32)
+
+        use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
+        if n_docs <= 4:
+            return np.stack([self._accumulate_and_normalize(self._extract_token_weights(t, use_recency)) for t in texts], axis=0).astype(np.float32)
+
+        dim = self.dimension
+        tok_cache_on = self.token_cache_enabled
+        cache = self._tok_hash_cache if tok_cache_on else {}
+        max_cache = self.max_token_cache
+        cache_get = cache.get
+        sha256 = _SHA256
+        unpack_6i = _UNPACK_6I
+
+        avg_len = sum(len(t) for t in texts) / n_docs
+        chunk_size = 256 if avg_len <= 512 else (64 if avg_len <= 2048 else 32)
+        out = np.empty((n_docs, dim), dtype=np.float32)
+
+        for start in range(0, n_docs, chunk_size):
+            end = min(start + chunk_size, n_docs)
+            c_len = end - start
+            unique_tokens: Dict[str, int] = {}
+            doc_maps: List[Dict[str, float]] = []
+            empty_rows: List[int] = []
+
+            for local_i, global_i in enumerate(range(start, end)):
+                wmap = self._extract_token_weights(texts[global_i], use_recency)
+                if not wmap:
+                    doc_maps.append({})
+                    empty_rows.append(local_i)
+                    continue
+                for tok, w in wmap.items():
+                    if w != 0.0 and tok not in unique_tokens:
+                        unique_tokens[tok] = len(unique_tokens)
+                doc_maps.append(wmap)
+
+            n_uniq = len(unique_tokens)
+            if n_uniq == 0:
+                chunk = np.zeros((c_len, dim), dtype=np.float32)
+                chunk[:, 0] = 1.0
+                out[start:end] = chunk
+                continue
+
+            i_mat = np.empty((n_uniq, 6), dtype=np.int32)
+            s_mat = np.empty((n_uniq, 6), dtype=np.float64)
+            for tok, u_idx in unique_tokens.items():
+                res = cache_get(tok)
+                if res is None:
+                    digest = sha256(tok.encode("utf-8")).digest()
+                    v0, v1, v2, v3, v4, v5 = unpack_6i(digest)
+                    res = (
+                        v0 % dim,
+                        v1 % dim,
+                        v2 % dim,
+                        v3 % dim,
+                        v4 % dim,
+                        v5 % dim,
+                        1.0 if ((v0 >> 16) & 1) == 0 else -1.0,
+                        1.0 if ((v1 >> 16) & 1) == 0 else -1.0,
+                        1.0 if ((v2 >> 16) & 1) == 0 else -1.0,
+                        1.0 if ((v3 >> 16) & 1) == 0 else -1.0,
+                        1.0 if ((v4 >> 16) & 1) == 0 else -1.0,
+                        1.0 if ((v5 >> 16) & 1) == 0 else -1.0,
+                    )
+                    if tok_cache_on and len(cache) >= max_cache:
+                        cache.clear()
+                    cache[tok] = res
+                i_mat[u_idx, 0] = res[0]
+                i_mat[u_idx, 1] = res[1]
+                i_mat[u_idx, 2] = res[2]
+                i_mat[u_idx, 3] = res[3]
+                i_mat[u_idx, 4] = res[4]
+                i_mat[u_idx, 5] = res[5]
+                s_mat[u_idx, 0] = res[6]
+                s_mat[u_idx, 1] = res[7]
+                s_mat[u_idx, 2] = res[8]
+                s_mat[u_idx, 3] = res[9]
+                s_mat[u_idx, 4] = res[10]
+                s_mat[u_idx, 5] = res[11]
+
+            proj_mat = np.zeros((n_uniq, dim), dtype=np.float64)
+            u_arange = np.arange(n_uniq, dtype=np.int32)
+            for col in range(6):
+                np.add.at(proj_mat, (u_arange, i_mat[:, col]), s_mat[:, col])
+
+            w_mat = np.zeros((c_len, n_uniq), dtype=np.float64)
+            for local_i, wmap in enumerate(doc_maps):
+                if wmap:
+                    cols = [unique_tokens[tok] for tok, w in wmap.items() if w != 0.0]
+                    vals = [w for w in wmap.values() if w != 0.0]
+                    if cols:
+                        w_mat[local_i, cols] = np.asarray(vals, dtype=np.float64)
+
+            vecs = (w_mat @ proj_mat).astype(np.float32)
+            max_abs = np.max(np.abs(vecs), axis=1, keepdims=True)
+            valid = (max_abs[:, 0] >= 1e-12) & np.isfinite(max_abs[:, 0])
+            if empty_rows:
+                valid[empty_rows] = False
+
+            if np.any(valid):
+                vecs[valid] /= max_abs[valid]
+                norms = np.linalg.norm(vecs[valid], axis=1, keepdims=True)
+                good_norm = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
+                valid_indices = np.flatnonzero(valid)
+                if np.any(good_norm):
+                    good_rows = valid_indices[good_norm]
+                    vecs[good_rows] /= norms[good_norm]
+                if np.any(~good_norm):
+                    bad_rows = valid_indices[~good_norm]
+                    vecs[bad_rows] = 0.0
+                    vecs[bad_rows, 0] = 1.0
+            if np.any(~valid):
+                vecs[~valid] = 0.0
+                vecs[~valid, 0] = 1.0
+            out[start:end] = vecs
+
+        return out
 
     def similarity(self, text_a: str, text_b: str, recency_weighted: Optional[bool] = None) -> float:
         """Computes cosine similarity between two text strings."""

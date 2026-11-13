@@ -756,6 +756,24 @@ def add_mcp_proxy_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--max-line-bytes", type=int, default=DEFAULT_MAX_LINE_BYTES, help="Maximum NDJSON frame size in bytes")
     parser.add_argument("--upstream-timeout", type=float, default=30.0, help="Upstream request timeout in seconds")
     parser.add_argument("--shutdown-timeout", type=float, default=3.0, help="Upstream graceful shutdown timeout in seconds")
+    parser.add_argument("--bearer-token", help="Bearer token required on Streamable HTTP /mcp requests")
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        dest="allowed_origins",
+        help="Allowed browser Origin for Streamable HTTP requests (repeatable)",
+    )
+    parser.add_argument(
+        "--require-origin",
+        action="store_true",
+        help="Reject Streamable HTTP requests missing an Origin header",
+    )
+    parser.add_argument(
+        "--durability-mode",
+        choices=("process_wal", "strict_sync", "group_commit", "high_throughput_normal"),
+        default="process_wal",
+        help="SQLite ActionLedger durability mode (default: process_wal)",
+    )
     parser.add_argument("upstream_cmd", nargs=argparse.REMAINDER, help="Upstream MCP command after '--'")
     return parser
 
@@ -763,8 +781,16 @@ def add_mcp_proxy_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
 def build_mcp_proxy_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="system1 mcp-proxy",
-        description="Run the System 1 MCP JSON-RPC 2.0 stdio proxy/guard in front of an upstream MCP server",
+        description="Run the System 1 MCP JSON-RPC 2.0 stdio or Streamable HTTP proxy/guard",
     )
+    parser.add_argument(
+        "--transport",
+        choices=("stdio", "http", "streamable-http"),
+        default="stdio",
+        help="MCP proxy transport: 'stdio' (default) or 'http'/'streamable-http'",
+    )
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="HTTP bind host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8765, help="HTTP bind port (default: 8765)")
     return add_mcp_proxy_arguments(parser)
 
 
@@ -773,7 +799,13 @@ def run_mcp_stdio_from_args(
     *,
     error_fn: Callable[[str], Any],
 ) -> int:
-    """Construct an MCPStdioProxy from parsed CLI arguments and execute the stdio loop."""
+    """Construct an MCPStdioProxy or MCPStreamableHTTPServer from parsed CLI arguments and execute."""
+    transport = str(getattr(args, "transport", "stdio"))
+    if transport in ("http", "streamable-http", "mcp-http"):
+        from system1.integrations.mcp_http import run_mcp_http_from_args
+
+        return run_mcp_http_from_args(args, error_fn=error_fn)
+
     cmd = list(getattr(args, "upstream_cmd", []) or [])
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]

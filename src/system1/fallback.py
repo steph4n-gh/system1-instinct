@@ -126,6 +126,9 @@ class BoundedReviewFallback:
         lesson_split: str = "train",
         lesson_source: str = "fallback_review",
         aci_tracker: Optional[Any] = None,
+        auto_compile: bool = False,
+        auto_compile_config: Optional[Any] = None,
+        auto_compile_lifecycle: Optional[Any] = None,
     ) -> None:
         if network is None:
             network = engine if engine is not None else teaching_session
@@ -137,6 +140,8 @@ class BoundedReviewFallback:
             or teaching_session is not None
             or bool(auto_record_lessons)
             or bool(auto_online_update)
+            or bool(auto_compile)
+            or auto_compile_lifecycle is not None
         )
 
         if expert is _UNSET:
@@ -217,6 +222,21 @@ class BoundedReviewFallback:
         self.lessons_recorded = 0
         self.online_updates_applied = 0
         self.aci_tracker = aci_tracker if aci_tracker is not None else getattr(network, "aci_tracker", None)
+        self.auto_compile = bool(auto_compile)
+        if auto_compile_lifecycle is not None:
+            self.cutover_lifecycle: Optional[Any] = auto_compile_lifecycle
+        elif self.auto_compile:
+            if self.schema is None:
+                raise ValueError("BoundedReviewFallback auto_compile=True requires a DecisionSchema")
+            from system1.cutover import AutoCutoverLifecycle
+
+            self.cutover_lifecycle = AutoCutoverLifecycle(
+                self.schema,
+                teacher=None,
+                config=auto_compile_config,
+            )
+        else:
+            self.cutover_lifecycle = None
         self._busy = False
         self._halted = False
         self._pending: Optional[asyncio.Task[Any]] = None
@@ -261,6 +281,23 @@ class BoundedReviewFallback:
 
     def _run_local(self, context: Any) -> Dict[str, Any]:
         prompt = _checked_value(self.prompt_extractor, context) if self.prompt_extractor is not None else context
+        if self.cutover_lifecycle is not None and isinstance(prompt, str):
+            local_vals = self.cutover_lifecycle.decide_local(prompt)
+            if local_vals is not None:
+                if self.action_key in local_vals:
+                    action_val: Any = local_vals[self.action_key]
+                elif len(local_vals) == 1:
+                    action_val = next(iter(local_vals.values()))
+                else:
+                    action_val = dict(local_vals)
+                return {
+                    self.action_key: action_val,
+                    "values": dict(local_vals),
+                    "review": False,
+                    "calls": 1,
+                    "auto_compiled": True,
+                    "cutover_state": self.cutover_lifecycle.state,
+                }
         # Support TeachingSession.decision_details
         if hasattr(self.network, "decision_details") and isinstance(prompt, str):
             details = dict(self.network.decision_details(prompt))
@@ -497,6 +534,10 @@ class BoundedReviewFallback:
                 step_online_updated = True
                 self._reviewed = None
 
+        if self.cutover_lifecycle is not None:
+            self.cutover_lifecycle.observe_teacher(prompt_text, resolved_values)
+            self._reviewed = None
+
         if isinstance(answer, Mapping):
             if self.action_key in answer:
                 action_val = answer[self.action_key]
@@ -522,6 +563,8 @@ class BoundedReviewFallback:
             "lesson_recorded": step_lesson_recorded,
             "online_update_applied": step_online_updated,
         }
+        if self.cutover_lifecycle is not None:
+            out["cutover_state"] = self.cutover_lifecycle.state
         for k, v in resolved_values.items():
             if k not in out:
                 out[k] = v

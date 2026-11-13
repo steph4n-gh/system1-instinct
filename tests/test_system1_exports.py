@@ -15,6 +15,7 @@ ALL_SUBMODULES = [
     "compat",
     "compiler",
     "core",
+    "cutover",
     "embeddings",
     "engine",
     "fallback",

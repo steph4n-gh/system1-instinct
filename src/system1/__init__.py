@@ -40,12 +40,16 @@ from system1.calibration import (
     ConformalPredictionSet,
     ConformalPredictor,
     DecisionCalibrator,
+    JointSchemaCalibrator,
+    JointSelectiveCertificate,
     RecalibrationMetrics,
     RecalibrationReport,
     RegressionConformalInterval,
     RegressionConformalPredictor,
     SelectiveRiskCalibrator,
     SelectiveRiskCertificate,
+    SequentialMonitorStep,
+    SequentialRiskMonitor,
     clopper_pearson_upper,
 )
 
@@ -307,6 +311,7 @@ _SUBMODULE_NAMES = {
     "compat",
     "compiler",
     "core",
+    "cutover",
     "embeddings",
     "engine",
     "fallback",
@@ -332,6 +337,7 @@ _MODULE_MAP = {
     "compat": "system1.compat",
     "compiler": "system1.compiler",
     "core": "system1.core",
+    "cutover": "system1.cutover",
     "embeddings": "system1.embeddings",
     "engine": "system1.engine",
     "fallback": "system1.fallback",
@@ -433,9 +439,19 @@ _MODULE_MAP = {
     # compiler
     "SystemOneCompiler": "system1.compiler",
     "CompiledSystemOneModel": "system1.compiler",
+    "compute_strict_loo_weights": "system1.core.embeddings",
+    # cutover
+    "AutoCutoverLifecycle": "system1.cutover",
+    "CutoverConfig": "system1.cutover",
+    "CutoverState": "system1.cutover",
+    "CutoverStepResult": "system1.cutover",
     # integrations
     "MCPStdioProxy": "system1.integrations",
     "MCPStdioProxyConfig": "system1.integrations",
+    "MCPGuardRuntime": "system1.integrations",
+    "MCPStreamableHTTPConfig": "system1.integrations",
+    "MCPStreamableHTTPServer": "system1.integrations",
+    "MCP_PROTOCOL_VERSION": "system1.integrations",
     "SystemOneMCPProxy": "system1.integrations",
     "SystemOneMCPBlockedError": "system1.integrations",
     "wrap_mcp_tool": "system1.integrations",
@@ -507,6 +523,8 @@ __all__ = [
     # Calibration & Conformal Prediction
     "AdaptiveConformalTracker",
     "DecisionCalibrator",
+    "JointSchemaCalibrator",
+    "JointSelectiveCertificate",
     "CalibrationMetrics",
     "RecalibrationMetrics",
     "RecalibrationReport",
@@ -517,6 +535,8 @@ __all__ = [
     "RegressionConformalInterval",
     "SelectiveRiskCalibrator",
     "SelectiveRiskCertificate",
+    "SequentialMonitorStep",
+    "SequentialRiskMonitor",
     "clopper_pearson_upper",
     # Proof-Carrying Evidence Receipts & Crypto
     "DecisionWitnessReceipt",
@@ -602,6 +622,12 @@ __all__ = [
     # Compiler
     "SystemOneCompiler",
     "CompiledSystemOneModel",
+    "compute_strict_loo_weights",
+    # Auto-Cutover Lifecycle
+    "AutoCutoverLifecycle",
+    "CutoverConfig",
+    "CutoverState",
+    "CutoverStepResult",
     # 4 Levers (Cache, Telemetry, Online Update, Margin Gating)
     "SemanticSystemOneCache",
     "CacheEntry",
@@ -610,6 +636,10 @@ __all__ = [
     # Framework Integrations (MCP, FastAPI, LangChain)
     "MCPStdioProxy",
     "MCPStdioProxyConfig",
+    "MCPGuardRuntime",
+    "MCPStreamableHTTPConfig",
+    "MCPStreamableHTTPServer",
+    "MCP_PROTOCOL_VERSION",
     "SystemOneMCPProxy",
     "SystemOneMCPBlockedError",
     "wrap_mcp_tool",

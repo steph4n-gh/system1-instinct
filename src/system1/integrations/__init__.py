@@ -3,6 +3,7 @@
 Native, drop-in adapters and middleware for application stacks:
 - mcp: In-process Model Context Protocol (MCP) JSON-RPC guard.
 - mcp_stdio: Runnable Model Context Protocol (MCP) JSON-RPC 2.0 stdio proxy/guard.
+- mcp_http: Runnable Model Context Protocol (MCP) Streamable HTTP (2025-03-26) guard server.
 - fastapi: ASGI gateway middleware for local routing and escalation to the downstream app.
 - langchain: Agent tool interceptor and callback handler with Ed25519 witness receipts.
 - observability: Prometheus-compatible /metrics exporter for decision engine telemetry.
@@ -15,6 +16,12 @@ from system1.integrations.mcp import (
     SystemOneMCPBlockedError,
     SystemOneMCPProxy,
     wrap_mcp_tool,
+)
+from system1.integrations.mcp_http import (
+    MCPGuardRuntime,
+    MCPStreamableHTTPConfig,
+    MCPStreamableHTTPServer,
+    MCP_PROTOCOL_VERSION,
 )
 from system1.integrations.mcp_stdio import (
     MCPStdioProxy,
@@ -52,6 +59,10 @@ System1MCPProxy = SystemOneMCPProxy
 
 __all__ = [
     # MCP
+    "MCPGuardRuntime",
+    "MCPStreamableHTTPConfig",
+    "MCPStreamableHTTPServer",
+    "MCP_PROTOCOL_VERSION",
     "MCPStdioProxy",
     "MCPStdioProxyConfig",
     "SystemOneMCPBlockedError",

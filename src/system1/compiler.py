@@ -38,6 +38,7 @@ from system1.core.schema import (
     ScoreField,
 )
 from system1.calibration import ConformalPredictor, DecisionCalibrator
+from system1.core.embeddings import compute_strict_loo_weights
 from system1.core.telemetry import TelemetryProjector
 from system1.core.text import TfidfProjector
 from system1.cache import SemanticSystemOneCache
@@ -55,6 +56,7 @@ MAX_SKILL_OPTIONS = 1024
 MAX_SKILL_CALIBRATION_SCORES = 1_000_000
 MAX_SKILL_COMPRESSION_RATIO = 1024
 EXEMPLAR_ARRAYS = ("exemplar_centroids", "exemplar_vectors", "exemplar_mean", "initial_w", "shots_p", "shots_c")
+VALID_SEMANTIC_MODES = ("default", "v1_1", "v1_2_fisher", "v1_2_rbf")
 
 
 def _snap_f16(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -100,7 +102,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
     _, disk, directory_disk, disk_count, count, directory_size, directory_offset, comment_size = struct.unpack(
         "<4s4H2LH", data[end:end + 22]
     )
-    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS)) + 4
+    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS)) + 5
             or directory_size > MAX_SKILL_HEADER_BYTES or directory_offset + directory_size != end
             or end + 22 + comment_size != len(data)):
         raise ValueError("Saved skill NPZ directory exceeds limits or is malformed")
@@ -123,6 +125,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
     } | {
         "_projector_spectral_vectors.npy",
         "_projector_subspace_components.npy",
+        "_projector_rbf_landmarks.npy",
         "_projector_tfidf_idf.npy",
         "_projector_hybrid_tfidf_idf.npy",
     }
@@ -168,7 +171,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
         spec_vec_shape = shapes.get("_projector_spectral_vectors")
         if spec_vec_shape is not None and (
             len(spec_vec_shape) != 2
-            or not (1 <= spec_vec_shape[0] <= 1024)
+            or not (1 <= spec_vec_shape[0] <= 2048)
             or not (1 <= spec_vec_shape[1] <= dimension)
         ):
             raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
@@ -176,9 +179,17 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
         if sub_comp_shape is not None and (
             len(sub_comp_shape) != 2
             or not (1 <= sub_comp_shape[0] <= dimension)
-            or sub_comp_shape[1] != dimension
+            or not (1 <= sub_comp_shape[1] <= dimension)
         ):
             raise ValueError("Saved hybrid projector subspace_components have invalid shape")
+        rbf_shape = shapes.get("_projector_rbf_landmarks")
+        if rbf_shape is not None and (
+            len(rbf_shape) != 2
+            or not (1 <= rbf_shape[0] <= MAX_SKILL_OPTIONS)
+            or not (1 <= rbf_shape[1] <= dimension)
+            or rbf_shape[0] + rbf_shape[1] != dimension
+        ):
+            raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
         for name, definition in schema.fields.items():
             widths = (1, 2) if isinstance(definition, BooleanField) else (len(definition.options),) if hasattr(definition, "options") else (1,)
             weight_shape = shapes.get(f"{name}_w", ())
@@ -1403,6 +1414,10 @@ class CompiledSystemOneModel:
                     arrays_to_save["_projector_subspace_components"] = _pack_array(
                         self.projector._subspace_components
                     )
+                if getattr(self.projector, "_rbf_landmarks", None) is not None:
+                    arrays_to_save["_projector_rbf_landmarks"] = _pack_array(
+                        self.projector._rbf_landmarks
+                    )
                 hybrid_tfidf = getattr(self.projector, "_tfidf_projector", None)
                 if hybrid_tfidf is not None and getattr(hybrid_tfidf, "_idf", None) is not None:
                     arrays_to_save["_projector_hybrid_tfidf_idf"] = np.asarray(
@@ -1535,14 +1550,30 @@ class CompiledSystemOneModel:
                 if set(projector_config) - HybridProjector.CONFIG_KEYS:
                     raise ValueError("Saved hybrid projector contains unsupported settings")
                 sparse, dense = projector_config.get("sparse_dim"), projector_config.get("dense_dim")
-                if (type(sparse) is not int or type(dense) is not int or sparse <= 0 or dense <= 0
-                        or sparse + dense != dimension):
+                direct_spec = (
+                    projector_config.get("direct_spectral_dim", 0)
+                    if projector_config.get("direct_spectral")
+                    else 0
+                )
+                inline_rbf_rows = len(projector_config.get("rbf_landmarks") or ())
+                if (
+                    type(sparse) is not int
+                    or type(dense) is not int
+                    or sparse <= 0
+                    or dense <= 0
+                    or type(direct_spec) is not int
+                    or direct_spec < 0
+                    or sparse + dense + direct_spec + inline_rbf_rows > dimension
+                ):
                     raise ValueError("Saved hybrid projector dimensions do not match the skill")
                 runtime_bytes += 16 * 25000 * dense
                 runtime_bytes += 64 * len(projector_config.get("tfidf_terms", ()))
                 runtime_bytes += 16 * len(projector_config.get("spectral_terms", ())) * dense
-                runtime_bytes += 8 * sum(len(row) for key in ("spectral_vectors", "subspace_components")
-                                         for row in (projector_config.get(key) or ()))
+                runtime_bytes += 8 * sum(
+                    len(row)
+                    for key in ("spectral_vectors", "subspace_components", "rbf_landmarks")
+                    for row in (projector_config.get(key) or ())
+                )
                 if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
                     raise ValueError("Saved skill runtime allocation exceeds memory budget")
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
@@ -1555,6 +1586,7 @@ class CompiledSystemOneModel:
         if (projector_config is None or projector_config.get("type") != "hybrid") and (
             "_projector_spectral_vectors" in npz_file
             or "_projector_subspace_components" in npz_file
+            or "_projector_rbf_landmarks" in npz_file
             or "_projector_hybrid_tfidf_idf" in npz_file
         ):
             raise ValueError("Saved skill contains unexpected hybrid projector arrays")
@@ -1570,6 +1602,22 @@ class CompiledSystemOneModel:
                 idf_array=npz_file.get("_projector_tfidf_idf"),
             )
         if projector_config is not None and projector_config["type"] == "hybrid":
+            rbf_arr = npz_file.get("_projector_rbf_landmarks")
+            rbf_rows = (
+                int(rbf_arr.shape[0])
+                if rbf_arr is not None
+                else len(projector_config.get("rbf_landmarks") or ())
+            )
+            direct_spec = (
+                projector_config.get("direct_spectral_dim", 0)
+                if projector_config.get("direct_spectral")
+                else 0
+            )
+            if (
+                projector_config["sparse_dim"] + projector_config["dense_dim"] + direct_spec + rbf_rows
+                != dimension
+            ):
+                raise ValueError("Saved hybrid projector dimensions do not match the skill")
             hyb_kwargs: Dict[str, Any] = {
                 "backend": backend,
                 "spectral_vectors": _as_f32(npz_file.get("_projector_spectral_vectors")),
@@ -1577,10 +1625,13 @@ class CompiledSystemOneModel:
             }
             if "_projector_hybrid_tfidf_idf" in npz_file:
                 hyb_kwargs["tfidf_idf_array"] = npz_file["_projector_hybrid_tfidf_idf"]
+            if "_projector_rbf_landmarks" in npz_file:
+                hyb_kwargs["rbf_landmarks"] = _as_f32(npz_file["_projector_rbf_landmarks"])
             try:
                 saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
             except TypeError:
                 hyb_kwargs.pop("tfidf_idf_array", None)
+                hyb_kwargs.pop("rbf_landmarks", None)
                 saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
         if projector_config is not None:
             if projector is not None:
@@ -1834,6 +1885,9 @@ class SystemOneCompiler:
         auto_regularization: bool = True,
         noise_robust: bool = True,
         label_noise_robust: Optional[bool] = None,
+        semantic_mode: str = "default",
+        proto_blend: Optional[float] = None,
+        fisher_reg: Optional[float] = None,
     ) -> None:
         if isinstance(schema, type) and issubclass(schema, DecisionSchema):
             self.schema = schema()
@@ -1874,6 +1928,26 @@ class SystemOneCompiler:
         self.relative_odds_ratio = float(relative_odds_ratio)
         self.confidence_floor_tau0 = float(confidence_floor_tau0)
         self.recency_weighted = bool(recency_weighted)
+        if not isinstance(semantic_mode, str) or semantic_mode not in VALID_SEMANTIC_MODES:
+            raise ValueError(
+                f"Unsupported semantic_mode {semantic_mode!r}; expected one of {VALID_SEMANTIC_MODES}"
+            )
+        self.semantic_mode = semantic_mode
+        if proto_blend is not None:
+            pb = float(proto_blend)
+            if not math.isfinite(pb) or not (0.0 <= pb <= 1.0):
+                raise ValueError("proto_blend must be finite and in [0, 1]")
+            self.proto_blend: Optional[float] = pb
+        else:
+            self.proto_blend = None
+        if fisher_reg is not None:
+            fr = float(fisher_reg)
+            if not math.isfinite(fr) or fr <= 0.0:
+                raise ValueError("fisher_reg must be finite and positive")
+            self.fisher_reg: Optional[float] = fr
+        else:
+            self.fisher_reg = None
+        self._explicit_projector = projector is not None
         if projector is not None:
             self.projector = projector
             if hasattr(projector, "dimension"):
@@ -2720,6 +2794,9 @@ class SystemOneCompiler:
         auto_regularization: Optional[bool] = None,
         noise_robust: Optional[bool] = None,
         label_noise_robust: Optional[bool] = None,
+        semantic_mode: Optional[str] = None,
+        proto_blend: Optional[float] = None,
+        fisher_reg: Optional[float] = None,
     ) -> CompiledSystemOneModel:
         """Compile a local model, optionally using supplied examples only.
 
@@ -2751,6 +2828,25 @@ class SystemOneCompiler:
         if req_noise is not None and not isinstance(req_noise, bool):
             raise ValueError("noise_robust must be a boolean")
         eff_noise_robust = self.noise_robust if req_noise is None else req_noise
+        eff_semantic_mode = self.semantic_mode if semantic_mode is None else semantic_mode
+        if not isinstance(eff_semantic_mode, str) or eff_semantic_mode not in VALID_SEMANTIC_MODES:
+            raise ValueError(
+                f"Unsupported semantic_mode {eff_semantic_mode!r}; expected one of {VALID_SEMANTIC_MODES}"
+            )
+        raw_pb = self.proto_blend if proto_blend is None else float(proto_blend)
+        if raw_pb is None:
+            eff_proto_blend = 0.22 if eff_semantic_mode in ("v1_2_fisher", "v1_2_rbf") else 0.0
+        else:
+            if not math.isfinite(raw_pb) or not (0.0 <= raw_pb <= 1.0):
+                raise ValueError("proto_blend must be finite and in [0, 1]")
+            eff_proto_blend = float(raw_pb)
+        raw_fr = self.fisher_reg if fisher_reg is None else float(fisher_reg)
+        if raw_fr is not None:
+            if not math.isfinite(raw_fr) or raw_fr <= 0.0:
+                raise ValueError("fisher_reg must be finite and positive")
+            eff_fisher_reg: Optional[float] = float(raw_fr)
+        else:
+            eff_fisher_reg = None
         if not math.isfinite(calibration_split) or not 0.0 <= calibration_split < 1.0:
             raise ValueError("calibration_split must be finite and in [0, 1)")
         if not augment and exemplars is None:
@@ -2778,27 +2874,18 @@ class SystemOneCompiler:
 
         compiled_heads: Dict[str, CompiledHeadWeights] = {}
         sample_counts: Dict[str, Dict[str, int]] = {}
+        partitioned_fields: Dict[str, Optional[Dict[str, Any]]] = {}
+        all_train_texts: List[str] = []
+        discrete_texts: List[str] = []
+        discrete_labels: List[str] = []
+        multi_field_schema = len(self.schema.fields) > 1
 
         for field_name, f_def in self.schema.fields.items():
             samples = list(dataset.get(field_name, []))
             if not samples:
                 if not augment:
                     raise ValueError(f"Teaching requires examples for field {field_name!r}")
-                # Fall back to default initialized head weights
-                head = DecisionFieldHead(f_def, dimension=self.dimension, projector=self.projector)
-                compiled_heads[field_name] = CompiledHeadWeights(
-                    field_name=field_name,
-                    field_type=f_def.field_type,
-                    weights=head.weights,
-                    biases=head.biases,
-                    temperature=1.0,
-                    conformal_quantile=0.0,
-                    options=getattr(f_def, "options", ()),
-                    forgetting_factor=self.forgetting_factor,
-                    relative_odds_ratio=self.relative_odds_ratio,
-                    confidence_floor_tau0=self.confidence_floor_tau0,
-                    escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
-                )
+                partitioned_fields[field_name] = None
                 continue
 
             # Teaching from examples keeps repeated inputs in one partition.
@@ -2883,7 +2970,6 @@ class SystemOneCompiler:
                         for idx in range(target_c - len(high_real)):
                             samples.append(high_synth[idx % len(high_synth)])
 
-
                 # Synthetic templates must not duplicate held-out inputs either.
                 held_out = {self._sample_key(row) for row in calibration_samples}
                 samples = [row for row in samples if self._sample_key(row) not in held_out]
@@ -2915,7 +3001,105 @@ class SystemOneCompiler:
                 "temperature": num_temperature,
                 "generated": generated_count,
             }
-            samples = samples + calibration_samples
+            for row in samples:
+                p_txt = row[0]
+                if isinstance(p_txt, str):
+                    all_train_texts.append(p_txt)
+                    if isinstance(f_def, (ChoiceField, BooleanField)):
+                        discrete_texts.append(p_txt)
+                        lbl_str = str(row[1])
+                        discrete_labels.append(f"{field_name}:{lbl_str}" if multi_field_schema else lbl_str)
+            partitioned_fields[field_name] = {
+                "samples": samples + calibration_samples,
+                "num_train": num_train,
+                "num_calib": num_calib,
+                "num_temperature": num_temperature,
+                "generated_count": generated_count,
+            }
+
+        if eff_semantic_mode in ("v1_1", "v1_2_fisher", "v1_2_rbf") and all_train_texts:
+            from system1.core.embeddings import HybridProjector
+
+            should_fit_proj = not self._explicit_projector or (
+                isinstance(self.projector, HybridProjector)
+                and not getattr(self.projector, "_fitted", False)
+            )
+            has_all_discrete = (
+                len(discrete_labels) == len(all_train_texts)
+                and len(set(discrete_labels)) >= 2
+            )
+            has_some_discrete = len(set(discrete_labels)) >= 2
+            fit_labels = discrete_labels if has_all_discrete else None
+
+            if should_fit_proj:
+                extra_fit_kw: Dict[str, Any] = {}
+                if isinstance(self.projector, HybridProjector):
+                    extra_fit_kw["sparse_dim"] = self.projector.sparse_dim
+                    extra_fit_kw["dense_dim"] = self.projector.dense_dim
+                    extra_fit_kw["alpha"] = self.projector.alpha
+                    extra_fit_kw["seed"] = self.projector.seed
+
+                if eff_semantic_mode == "v1_1":
+                    fitted_proj = HybridProjector.fit(
+                        all_train_texts,
+                        labels=fit_labels,
+                        backend=self.backend,
+                        **extra_fit_kw,
+                    )
+                else:
+                    fitted_proj = HybridProjector.fit_v1_2(
+                        all_train_texts,
+                        labels=fit_labels,
+                        schema=self.schema,
+                        backend=self.backend,
+                        attach_rbf=bool(eff_semantic_mode == "v1_2_rbf" and has_all_discrete),
+                        **extra_fit_kw,
+                    )
+                    if eff_semantic_mode == "v1_2_rbf" and not has_all_discrete and has_some_discrete:
+                        fitted_proj.attach_rbf_landmarks(discrete_texts, discrete_labels)
+                self.projector = fitted_proj
+                self.dimension = int(fitted_proj.dimension)
+                self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
+            elif (
+                eff_semantic_mode == "v1_2_rbf"
+                and isinstance(self.projector, HybridProjector)
+                and getattr(self.projector, "_rbf_landmarks", None) is None
+                and has_some_discrete
+            ):
+                cloned_proj = HybridProjector.from_config(
+                    self.projector.to_config(),
+                    backend=self.backend,
+                )
+                cloned_proj.attach_rbf_landmarks(discrete_texts, discrete_labels)
+                self.projector = cloned_proj
+                self.dimension = int(cloned_proj.dimension)
+                self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
+
+        for field_name, f_def in self.schema.fields.items():
+            part = partitioned_fields[field_name]
+            if part is None:
+                # Fall back to default initialized head weights
+                head = DecisionFieldHead(f_def, dimension=self.dimension, projector=self.projector)
+                compiled_heads[field_name] = CompiledHeadWeights(
+                    field_name=field_name,
+                    field_type=f_def.field_type,
+                    weights=head.weights,
+                    biases=head.biases,
+                    temperature=1.0,
+                    conformal_quantile=0.0,
+                    options=getattr(f_def, "options", ()),
+                    forgetting_factor=self.forgetting_factor,
+                    relative_odds_ratio=self.relative_odds_ratio,
+                    confidence_floor_tau0=self.confidence_floor_tau0,
+                    escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
+                )
+                continue
+
+            samples = part["samples"]
+            num_train = part["num_train"]
+            num_calib = part["num_calib"]
+            num_temperature = part["num_temperature"]
+            generated_count = part["generated_count"]
 
             # Prompts and labels
             prompts = [s[0] for s in samples]
@@ -2930,6 +3114,69 @@ class SystemOneCompiler:
             X_list = []
             fam_vals: List[float] = []
             proj_cache: Dict[str, Tuple[np.ndarray, Optional[float]]] = {}
+            unique_prompts: List[str] = []
+            need_norm_set: set[str] = set()
+            seen_prompts: set[str] = set()
+            for idx_s, s in enumerate(samples):
+                p = s[0]
+                if isinstance(p, str):
+                    if p not in seen_prompts:
+                        seen_prompts.add(p)
+                        unique_prompts.append(p)
+                    if need_fam and idx_s >= conf_start_idx:
+                        need_norm_set.add(p)
+
+            if unique_prompts and hasattr(self.projector, "project_batch"):
+                use_rw = self.recency_weighted and not isinstance(self.projector, TfidfProjector)
+                want_any_norm = bool(need_norm_set)
+                raw_norms_batch: Optional[np.ndarray] = None
+                try:
+                    if want_any_norm:
+                        if use_rw:
+                            raw_mat, raw_norms_batch = self.projector.project_batch(
+                                unique_prompts,
+                                recency_weighted=self.recency_weighted,
+                                return_norms=True,
+                            )
+                        else:
+                            raw_mat, raw_norms_batch = self.projector.project_batch(
+                                unique_prompts,
+                                return_norms=True,
+                            )
+                    elif use_rw:
+                        raw_mat = self.projector.project_batch(
+                            unique_prompts,
+                            recency_weighted=self.recency_weighted,
+                        )
+                    else:
+                        raw_mat = self.projector.project_batch(unique_prompts)
+                except TypeError:
+                    if use_rw:
+                        try:
+                            raw_mat = self.projector.project_batch(
+                                unique_prompts,
+                                recency_weighted=self.recency_weighted,
+                            )
+                        except TypeError:
+                            raw_mat = self.projector.project_batch(unique_prompts)
+                    else:
+                        raw_mat = self.projector.project_batch(unique_prompts)
+                raw_mat_arr = np.asarray(raw_mat, dtype=np.float32)
+                row_norms = np.linalg.norm(raw_mat_arr, axis=1, keepdims=True)
+                normed_mat = np.where(
+                    row_norms > 1e-12,
+                    raw_mat_arr / np.maximum(row_norms, 1e-12),
+                    raw_mat_arr,
+                ).astype(np.float32)
+                for u_idx, p in enumerate(unique_prompts):
+                    if raw_norms_batch is not None and p in need_norm_set:
+                        rn_val_b: Optional[float] = float(raw_norms_batch[u_idx])
+                    elif p in need_norm_set:
+                        rn_val_b = float(self.projector.raw_norm(p))
+                    else:
+                        rn_val_b = None
+                    proj_cache[p] = (normed_mat[u_idx], rn_val_b)
+
             for idx_s, s in enumerate(samples):
                 p = s[0]
                 t = s[2] if len(s) > 2 else None
@@ -3027,6 +3274,43 @@ class SystemOneCompiler:
                         regularize_bias=augment,
                         return_covariance=True,
                     )
+                    if eff_proto_blend > 0.0 and K >= 2 and X_train.shape[0] >= K:
+                        sw_strict, clean_mask = compute_strict_loo_weights(X_train, Y_train)
+                        if sw_choice is not None:
+                            sw_strict = np.minimum(sw_choice, sw_strict)
+                        use_clean = int(np.sum(clean_mask)) >= K
+                        X_c = X_train[clean_mask] if use_clean else X_train
+                        Y_c = Y_train[clean_mask] if use_clean else Y_train
+                        sw_c = sw_strict[clean_mask] if use_clean else sw_strict
+                        cls_c = np.maximum(1.0, np.sum(Y_c, axis=0))
+                        Y_bal = (Y_c / cls_c[None, :]) * float(len(X_c) / K)
+                        f_reg = (
+                            float(eff_fisher_reg)
+                            if eff_fisher_reg is not None
+                            else max(0.25, float(eff_reg))
+                        )
+                        w_bal, b_bal = self._solve_ridge(
+                            X_c,
+                            Y_bal,
+                            f_reg,
+                            sample_weights=sw_c,
+                            regularize_bias=augment,
+                            return_covariance=False,
+                        )
+                        wn = np.linalg.norm(w_bal, axis=1, keepdims=True)
+                        wu = w_bal / np.where(wn < 1e-12, 1.0, wn)
+                        rn = np.linalg.norm(weights, axis=1, keepdims=True)
+                        ru = weights / np.where(rn < 1e-12, 1.0, rn)
+                        mean_rn = float(np.mean(rn))
+                        w_comb = (1.0 - eff_proto_blend) * ru + eff_proto_blend * wu
+                        cn = np.linalg.norm(w_comb, axis=1, keepdims=True)
+                        weights = ((w_comb / np.where(cn < 1e-12, 1.0, cn)) * mean_rn).astype(
+                            np.float32
+                        )
+                        biases = (
+                            (1.0 - eff_proto_blend) * biases
+                            + eff_proto_blend * (b_bal - np.mean(b_bal))
+                        ).astype(np.float32)
                 weights = _snap_f16(weights)
                 assert weights is not None
                 P_mat = _snap_f16(P_mat)
@@ -3424,6 +3708,9 @@ class SystemOneCompiler:
                 "familiarity_alpha": eff_familiarity_alpha,
                 "prototype_alpha": eff_prototype_alpha,
                 "hierarchical": eff_hierarchical,
+                "semantic_mode": eff_semantic_mode,
+                "proto_blend": eff_proto_blend,
+                "fisher_reg": eff_fisher_reg,
                 "teacher": teacher if augment else None,
                 "teaching_mode": "schema_augmented" if augment else "examples",
                 "sample_counts": sample_counts,
@@ -3448,6 +3735,9 @@ class SystemOneCompiler:
         auto_regularization: Optional[bool] = None,
         noise_robust: Optional[bool] = None,
         label_noise_robust: Optional[bool] = None,
+        semantic_mode: Optional[str] = None,
+        proto_blend: Optional[float] = None,
+        fisher_reg: Optional[float] = None,
     ) -> CompiledSystemOneModel:
         """Compiles model and writes directly to target .s1m binary file."""
         model = self.compile(
@@ -3464,6 +3754,9 @@ class SystemOneCompiler:
             auto_regularization=auto_regularization,
             noise_robust=noise_robust,
             label_noise_robust=label_noise_robust,
+            semantic_mode=semantic_mode,
+            proto_blend=proto_blend,
+            fisher_reg=fisher_reg,
         )
         model.save(output_path)
         return model
@@ -3484,4 +3777,6 @@ __all__ = [
     "CompiledSystemOneModel",
     "CompiledHeadWeights",
     "MAGIC_HEADER",
+    "VALID_SEMANTIC_MODES",
+    "compute_strict_loo_weights",
 ]
