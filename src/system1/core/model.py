@@ -1333,6 +1333,12 @@ class DecisionFieldHead:
         P = self.covariance_inv
         B = self.cross_covariance
         assert P is not None and B is not None
+        if not P.flags.writeable:
+            P = P.copy()
+            self.covariance_inv = P
+        if not B.flags.writeable:
+            B = B.copy()
+            self.cross_covariance = B
 
         eff_reward_scale = float(min(1.0, max(0.0, reward_scale)))
         x_step = x
@@ -2180,12 +2186,1059 @@ class SystemOneModel:
         return results
 
 
+def _fast_deterministic_project(
+    proj: DeterministicSemanticProjector,
+    text: str,
+    recency_weighted: Optional[bool] = None,
+) -> np.ndarray:
+    """Bit-equivalent single-pass projection for DeterministicSemanticProjector."""
+    if not isinstance(text, str):
+        raise TypeError(f"Expected text to be a string, got {type(text).__name__}")
+    dim = proj.dimension
+    clean_text = text.lower().strip()
+    if not clean_text:
+        out = np.zeros(dim, dtype=np.float32)
+        out[0] = 1.0
+        return out
+    if len(clean_text) > 8192:
+        clean_text = clean_text[:4096] + " " + clean_text[-4096:]
+
+    words = _WORD_RE.findall(clean_text)
+    n_words = len(words)
+    use_recency = proj.recency_weighted if recency_weighted is None else bool(recency_weighted)
+    cache = proj._tok_hash_cache
+    tok_cache_on = proj.token_cache_enabled
+    max_cache = proj.max_token_cache
+    cache_get = cache.get if tok_cache_on else None
+    sha256 = _SHA256
+    unpack_6i = _UNPACK_6I
+    sqrt = math.sqrt
+    log1p = math.log1p
+
+    def _populate_tok(
+        key: str,
+    ) -> Tuple[int, int, int, int, int, int, float, float, float, float, float, float]:
+        v0, v1, v2, v3, v4, v5 = unpack_6i(sha256(key.encode("utf-8")).digest())
+        entry = (
+            v0 % dim,
+            v1 % dim,
+            v2 % dim,
+            v3 % dim,
+            v4 % dim,
+            v5 % dim,
+            1.0 if ((v0 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v1 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v2 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v3 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v4 >> 16) & 1) == 0 else -1.0,
+            1.0 if ((v5 >> 16) & 1) == 0 else -1.0,
+        )
+        if tok_cache_on:
+            if len(cache) >= max_cache:
+                cache.clear()
+            cache[key] = entry
+        return entry
+
+    vec_list = [0.0] * dim
+
+    for pos, word in enumerate(words):
+        dist = (n_words - 1 - pos) if use_recency else pos
+        ww = (log1p(len(word)) / sqrt(1.0 + dist * 0.05)) * 2.0
+        wk = "word:" + word
+        res = cache_get(wk) if cache_get is not None else None
+        if res is None:
+            res = _populate_tok(wk)
+        i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
+        vec_list[i0] += s0 * ww
+        vec_list[i1] += s1 * ww
+        vec_list[i2] += s2 * ww
+        vec_list[i3] += s3 * ww
+        vec_list[i4] += s4 * ww
+        vec_list[i5] += s5 * ww
+
+        wlen = len(word)
+        if wlen >= 3:
+            for j in range(wlen - 2):
+                nk = "ng:" + word[j : j + 3]
+                res = cache_get(nk) if cache_get is not None else None
+                if res is None:
+                    res = _populate_tok(nk)
+                i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
+                vec_list[i0] += s0 * 0.5
+                vec_list[i1] += s1 * 0.5
+                vec_list[i2] += s2 * 0.5
+                vec_list[i3] += s3 * 0.5
+                vec_list[i4] += s4 * 0.5
+                vec_list[i5] += s5 * 0.5
+            if wlen >= 4:
+                for j in range(wlen - 3):
+                    nk = "ng:" + word[j : j + 4]
+                    res = cache_get(nk) if cache_get is not None else None
+                    if res is None:
+                        res = _populate_tok(nk)
+                    i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
+                    vec_list[i0] += s0 * 0.5
+                    vec_list[i1] += s1 * 0.5
+                    vec_list[i2] += s2 * 0.5
+                    vec_list[i3] += s3 * 0.5
+                    vec_list[i4] += s4 * 0.5
+                    vec_list[i5] += s5 * 0.5
+
+    for i in range(n_words - 1):
+        bk = "bi:" + words[i] + "_" + words[i + 1]
+        res = cache_get(bk) if cache_get is not None else None
+        if res is None:
+            res = _populate_tok(bk)
+        i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
+        vec_list[i0] += s0 * 1.5
+        vec_list[i1] += s1 * 1.5
+        vec_list[i2] += s2 * 1.5
+        vec_list[i3] += s3 * 1.5
+        vec_list[i4] += s4 * 1.5
+        vec_list[i5] += s5 * 1.5
+
+    btext = " " + clean_text + " "
+    blimit = max(0, len(btext) - 4)
+    for j in range(blimit):
+        ck = "char4:" + btext[j : j + 4]
+        res = cache_get(ck) if cache_get is not None else None
+        if res is None:
+            res = _populate_tok(ck)
+        i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
+        vec_list[i0] += s0 * 0.3
+        vec_list[i1] += s1 * 0.3
+        vec_list[i2] += s2 * 0.3
+        vec_list[i3] += s3 * 0.3
+        vec_list[i4] += s4 * 0.3
+        vec_list[i5] += s5 * 0.3
+
+    vec = np.array(vec_list, dtype=np.float32)
+    max_abs = float(np.max(np.abs(vec))) if len(vec) > 0 else 0.0
+    if max_abs < 1e-12 or not math.isfinite(max_abs):
+        vec.fill(0.0)
+        vec[0] = 1.0
+        return vec
+    vec /= max_abs
+    norm = float(np.linalg.norm(vec))
+    if norm > 1e-12:
+        vec /= norm
+    else:
+        vec.fill(0.0)
+        vec[0] = 1.0
+    return vec
+
+
+_VALID_PACKED_STORAGE_MODES = ("float32", "float16", "float16_upcast")
+
+
+class PackedMultiQuestionKernel:
+    """Contiguous multi-head kernel packing Choice, Boolean, and Score heads into one GEMM/GEMV."""
+
+    def __init__(
+        self,
+        *,
+        projector: Any,
+        dimension: int,
+        strict_mode: bool,
+        alpha: float,
+        enable_margin_gating: bool,
+        margin_threshold: Optional[float],
+        recency_weighted: bool,
+        W_packed: np.ndarray,
+        b_packed: np.ndarray,
+        choice_names: Tuple[str, ...],
+        c_options: Tuple[Tuple[str, ...], ...],
+        c_K: np.ndarray,
+        c_offsets: np.ndarray,
+        c_seg_idx: np.ndarray,
+        c_qhat: np.ndarray,
+        c_is_cal: np.ndarray,
+        c_is_lac: np.ndarray,
+        c_eff_m: np.ndarray,
+        c_gamma: np.ndarray,
+        c_tau0: np.ndarray,
+        bool_names: Tuple[str, ...],
+        b_thresh: np.ndarray,
+        b_qhat: np.ndarray,
+        b_is_cal: np.ndarray,
+        b_is_lac: np.ndarray,
+        b_eff_m: np.ndarray,
+        b_gamma: np.ndarray,
+        b_tau0: np.ndarray,
+        score_names: Tuple[str, ...],
+        s_min: np.ndarray,
+        s_range: np.ndarray,
+        s_norm_margin: np.ndarray,
+        s_raw_scale: np.ndarray,
+        s_is_cal: np.ndarray,
+        storage_mode: str = "float32",
+    ) -> None:
+        self.projector = projector
+        self.dimension = dimension
+        self.strict = strict_mode
+        self.alpha = alpha
+        self.enable_margin_gating = enable_margin_gating
+        self.margin_threshold = margin_threshold
+        self.recency_weighted = recency_weighted
+        self.storage_mode = storage_mode
+
+        self.W_packed = W_packed
+        self.b_packed = b_packed
+        self.M_total = int(W_packed.shape[1])
+
+        self.choice_names = choice_names
+        self.c_options = c_options
+        self.c_K = c_K
+        self.Q_c = len(choice_names)
+        self.M_c = int(np.sum(c_K)) if self.Q_c else 0
+        self.c_offsets = c_offsets
+        self.c_seg_idx = c_seg_idx
+        self.c_qhat = c_qhat
+        self.c_is_cal = c_is_cal
+        self.c_is_lac = c_is_lac
+        self.c_eff_m = c_eff_m
+        self.c_gamma = c_gamma
+        self.c_tau0 = c_tau0
+        self.c_all_lac = bool(self.Q_c and np.all(c_is_lac) and np.all(c_is_cal))
+        self.c_all_aps_cal = bool(self.Q_c and np.all(~c_is_lac) and np.all(c_is_cal))
+        self.K_max = int(self.c_K.max()) if self.Q_c else 0
+        self.c_pad_rows = (
+            np.repeat(np.arange(self.Q_c, dtype=np.int32), self.c_K)
+            if self.Q_c
+            else np.empty(0, dtype=np.int32)
+        )
+        self.c_pad_cols = (
+            np.concatenate([np.arange(int(k), dtype=np.int32) for k in self.c_K])
+            if self.Q_c
+            else np.empty(0, dtype=np.int32)
+        )
+        self.c_conf_floor = (
+            (1.0 / np.maximum(1.0, self.c_K)) + self.c_tau0
+            if self.Q_c
+            else np.empty(0, dtype=np.float64)
+        )
+
+        self.bool_names = bool_names
+        self.Q_b = len(bool_names)
+        self.b_thresh = b_thresh
+        self.b_qhat = b_qhat
+        self.b_is_cal = b_is_cal
+        self.b_is_lac = b_is_lac
+        self.b_eff_m = b_eff_m
+        self.b_gamma = b_gamma
+        self.b_tau0 = b_tau0
+        self.b_all_lac = bool(self.Q_b and np.all(b_is_lac) and np.all(b_is_cal))
+        self.b_all_aps_cal = bool(self.Q_b and np.all(~b_is_lac) and np.all(b_is_cal))
+        self.b_conf_floor = 0.5 + self.b_tau0 if self.Q_b else np.empty(0, dtype=np.float64)
+
+        self.score_names = score_names
+        self.Q_s = len(score_names)
+        self.s_min = s_min
+        self.s_range = s_range
+        self.s_norm_margin = s_norm_margin
+        self.s_raw_scale = s_raw_scale
+        self.s_is_cal = s_is_cal
+        self.eff_score_thresh = (
+            float(margin_threshold)
+            if (enable_margin_gating and margin_threshold is not None)
+            else 0.5
+        )
+        self.Q_total = self.Q_c + self.Q_b + self.Q_s
+
+    @classmethod
+    def from_engine(
+        cls,
+        eng: Any,
+        *,
+        storage_mode: str = "float32",
+        alpha: Optional[float] = None,
+        strict: Optional[bool] = None,
+        margin_threshold: Optional[float] = None,
+        relative_odds_ratio: Optional[float] = None,
+        confidence_floor_tau0: Optional[float] = None,
+        recency_weighted: Optional[bool] = None,
+    ) -> "PackedMultiQuestionKernel":
+        if storage_mode not in _VALID_PACKED_STORAGE_MODES:
+            raise ValueError(
+                f"storage_mode must be one of {_VALID_PACKED_STORAGE_MODES}, got {storage_mode!r}"
+            )
+        fields = eng.schema.fields
+        if not fields:
+            raise ValueError("PackedMultiQuestionKernel requires a non-empty schema")
+        model = eng.model
+        heads = model.heads
+        field_heads = getattr(model, "_field_heads", {})
+        eff_alpha = float(eng.default_alpha if alpha is None else alpha)
+        strict_mode = bool(eng.strict_mode if strict is None else strict)
+        enable_margin_gating = bool(getattr(eng, "enable_margin_gating", False))
+        eng_margin_threshold = eng.margin_threshold if margin_threshold is None else margin_threshold
+        eng_rel_odds = getattr(eng, "relative_odds_ratio", None) if relative_odds_ratio is None else relative_odds_ratio
+        eng_tau0 = getattr(eng, "confidence_floor_tau0", None) if confidence_floor_tau0 is None else confidence_floor_tau0
+        eff_recency = bool(getattr(eng, "recency_weighted", False) if recency_weighted is None else recency_weighted)
+
+        def _resolve_gate_params(cp_obj: Any) -> Tuple[float, float, float]:
+            if strict_mode or not enable_margin_gating:
+                eff_m = 0.0
+            elif eng_margin_threshold is not None:
+                eff_m = float(eng_margin_threshold)
+            elif getattr(cp_obj, "margin_threshold", None) is not None:
+                eff_m = float(cp_obj.margin_threshold)
+            else:
+                eff_m = float(getattr(cp_obj, "calibrated_margin_threshold", 0.0))
+
+            eff_gamma = (
+                float(eng_rel_odds)
+                if eng_rel_odds is not None
+                else float(getattr(cp_obj, "relative_odds_ratio", 1.5))
+            )
+            eff_tau0 = (
+                float(eng_tau0)
+                if eng_tau0 is not None
+                else float(getattr(cp_obj, "confidence_floor_tau0", 0.15))
+            )
+            return eff_m, eff_gamma, eff_tau0
+
+        W_cols: List[np.ndarray] = []
+        b_cols: List[np.ndarray] = []
+
+        choice_names: List[str] = []
+        c_options: List[Tuple[str, ...]] = []
+        c_K: List[int] = []
+        c_offsets: List[int] = []
+        c_seg_idx: List[int] = []
+        c_qhat: List[float] = []
+        c_is_cal: List[bool] = []
+        c_is_lac: List[bool] = []
+        c_eff_m: List[float] = []
+        c_gamma: List[float] = []
+        c_tau0: List[float] = []
+
+        bool_names: List[str] = []
+        b_thresh: List[float] = []
+        b_qhat: List[float] = []
+        b_is_cal: List[bool] = []
+        b_is_lac: List[bool] = []
+        b_eff_m: List[float] = []
+        b_gamma: List[float] = []
+        b_tau0: List[float] = []
+
+        score_names: List[str] = []
+        s_min: List[float] = []
+        s_range: List[float] = []
+        s_norm_margin: List[float] = []
+        s_raw_scale: List[float] = []
+        s_is_cal: List[bool] = []
+
+        def _validate_head(fname: str) -> Any:
+            h = heads[fname]
+            live_h = field_heads.get(fname)
+            if getattr(h, "hierarchical", False) and getattr(h, "coarse_weights", None) is not None:
+                raise ValueError(f"PackedMultiQuestionKernel does not support hierarchical head {fname!r}")
+            if getattr(h, "_exemplar_bank", None) is not None or (
+                live_h is not None and getattr(live_h, "_exemplar_bank", None) is not None
+            ):
+                raise ValueError(f"PackedMultiQuestionKernel does not support exemplar bank on {fname!r}")
+            return h
+
+        def _validate_cp(fname: str) -> Any:
+            cp = eng.conformal_predictors[fname]
+            if getattr(cp, "mondrian", False) and getattr(cp, "class_calibration_scores", None):
+                raise ValueError(f"PackedMultiQuestionKernel does not support Mondrian predictor on {fname!r}")
+            if float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0:
+                raise ValueError(f"PackedMultiQuestionKernel does not support familiarity_threshold on {fname!r}")
+            if float(getattr(cp, "prototype_threshold", 0.0)) > 0.0:
+                raise ValueError(f"PackedMultiQuestionKernel does not support prototype_threshold on {fname!r}")
+            return cp
+
+        for fname, f_def in fields.items():
+            if not isinstance(f_def, (ChoiceField, BooleanField, ScoreField)):
+                raise ValueError(
+                    f"PackedMultiQuestionKernel does not support field {fname!r} of type {type(f_def).__name__}"
+                )
+
+        cursor = 0
+        for fname, f_def in fields.items():
+            if isinstance(f_def, ChoiceField):
+                head = _validate_head(fname)
+                cp = _validate_cp(fname)
+                ci = len(choice_names)
+                choice_names.append(fname)
+                c_options.append(tuple(f_def.options))
+                K = len(f_def.options)
+                c_K.append(K)
+                cal = eng.calibrators[fname]
+                temp = max(1e-4, float(cal.temperature))
+                W = np.asarray(head.weights, dtype=np.float64) / (0.25 * temp)
+                b = np.asarray(head.biases, dtype=np.float64).reshape(-1) / (0.25 * temp)
+                if getattr(cal, "logit_adjustments", None) is not None:
+                    b = b + np.asarray(cal.logit_adjustments, dtype=np.float64) / temp
+                W_cols.append(W.T)
+                b_cols.append(b)
+                c_offsets.append(cursor)
+                c_seg_idx.extend([ci] * K)
+                cursor += K
+
+                n_cal = len(cp.calibration_scores)
+                cal_ok = bool(cp.is_calibrated and n_cal > 0)
+                c_is_cal.append(cal_ok)
+                c_is_lac.append(cp.score_method == "lac")
+                if cal_ok:
+                    k_idx = math.ceil((n_cal + 1) * (1.0 - eff_alpha))
+                    c_qhat.append(1.0 if k_idx > n_cal else float(cp.calibration_scores[k_idx - 1]))
+                else:
+                    c_qhat.append(1.0 - eff_alpha)
+                gm, gg, gt = _resolve_gate_params(cp)
+                c_eff_m.append(gm)
+                c_gamma.append(gg)
+                c_tau0.append(gt)
+
+        for fname, f_def in fields.items():
+            if isinstance(f_def, BooleanField):
+                head = _validate_head(fname)
+                cp = _validate_cp(fname)
+                bool_names.append(fname)
+                cal = eng.calibrators[fname]
+                temp = max(1e-4, float(cal.temperature))
+                W = np.asarray(head.weights, dtype=np.float64)[:1] / (0.25 * temp)
+                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)[:1] / (0.25 * temp)
+                adj = getattr(cal, "logit_adjustments", None)
+                if adj is not None and len(adj) == 2:
+                    b = b + (float(adj[1]) - float(adj[0])) / temp
+                W_cols.append(W.T)
+                b_cols.append(b)
+                b_thresh.append(float(f_def.threshold))
+
+                n_cal = len(cp.calibration_scores)
+                cal_ok = bool(cp.is_calibrated and n_cal > 0)
+                b_is_cal.append(cal_ok)
+                b_is_lac.append(cp.score_method == "lac")
+                if cal_ok:
+                    k_idx = math.ceil((n_cal + 1) * (1.0 - eff_alpha))
+                    b_qhat.append(1.0 if k_idx > n_cal else float(cp.calibration_scores[k_idx - 1]))
+                else:
+                    b_qhat.append(1.0 - eff_alpha)
+                gm, gg, gt = _resolve_gate_params(cp)
+                b_eff_m.append(gm)
+                b_gamma.append(gg)
+                b_tau0.append(gt)
+
+        for fname, f_def in fields.items():
+            if isinstance(f_def, ScoreField):
+                head = _validate_head(fname)
+                score_names.append(fname)
+                cal = eng.calibrators[fname]
+                temp = max(1e-4, float(cal.temperature))
+                W = np.asarray(head.weights, dtype=np.float64)[:1] / (0.25 * temp)
+                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)[:1] / (0.25 * temp)
+                W_cols.append(W.T)
+                b_cols.append(b)
+                s_raw_scale.append(temp)
+                rng_val = float(f_def.max_value - f_def.min_value)
+                s_min.append(float(f_def.min_value))
+                s_range.append(rng_val)
+                rcp = eng.regression_conformal_predictors[fname]
+                n_res = len(rcp.residuals)
+                cal_ok = bool(rcp.is_calibrated and n_res > 0)
+                s_is_cal.append(cal_ok)
+                if cal_ok:
+                    k_idx = math.ceil((n_res + 1) * (1.0 - eff_alpha))
+                    m = rng_val if k_idx > n_res else float(rcp.residuals[k_idx - 1])
+                else:
+                    m = rng_val if strict_mode else rng_val * ((1.0 - eff_alpha) / 2.0)
+                s_norm_margin.append(m / max(1e-6, rng_val))
+
+        arr_dtype = np.float32 if storage_mode == "float32" else np.float16
+        W_packed = np.ascontiguousarray(np.hstack(W_cols), dtype=arr_dtype)
+        b_packed = np.ascontiguousarray(np.concatenate(b_cols), dtype=arr_dtype)
+
+        return cls(
+            projector=getattr(model, "projector", eng.projector),
+            dimension=int(eng.dimension),
+            strict_mode=strict_mode,
+            alpha=eff_alpha,
+            enable_margin_gating=enable_margin_gating,
+            margin_threshold=eng_margin_threshold,
+            recency_weighted=eff_recency,
+            W_packed=W_packed,
+            b_packed=b_packed,
+            choice_names=tuple(choice_names),
+            c_options=tuple(c_options),
+            c_K=np.asarray(c_K, dtype=np.int32),
+            c_offsets=np.asarray(c_offsets, dtype=np.int32),
+            c_seg_idx=np.asarray(c_seg_idx, dtype=np.int32),
+            c_qhat=np.asarray(c_qhat, dtype=np.float64),
+            c_is_cal=np.asarray(c_is_cal, dtype=bool),
+            c_is_lac=np.asarray(c_is_lac, dtype=bool),
+            c_eff_m=np.asarray(c_eff_m, dtype=np.float64),
+            c_gamma=np.asarray(c_gamma, dtype=np.float64),
+            c_tau0=np.asarray(c_tau0, dtype=np.float64),
+            bool_names=tuple(bool_names),
+            b_thresh=np.asarray(b_thresh, dtype=np.float64),
+            b_qhat=np.asarray(b_qhat, dtype=np.float64),
+            b_is_cal=np.asarray(b_is_cal, dtype=bool),
+            b_is_lac=np.asarray(b_is_lac, dtype=bool),
+            b_eff_m=np.asarray(b_eff_m, dtype=np.float64),
+            b_gamma=np.asarray(b_gamma, dtype=np.float64),
+            b_tau0=np.asarray(b_tau0, dtype=np.float64),
+            score_names=tuple(score_names),
+            s_min=np.asarray(s_min, dtype=np.float64),
+            s_range=np.asarray(s_range, dtype=np.float64),
+            s_norm_margin=np.asarray(s_norm_margin, dtype=np.float64),
+            s_raw_scale=np.asarray(s_raw_scale, dtype=np.float64),
+            s_is_cal=np.asarray(s_is_cal, dtype=bool),
+            storage_mode=storage_mode,
+        )
+
+    def forward_embeddings(self, X: np.ndarray) -> Dict[str, Any]:
+        """Single contiguous BLAS GEMV (B=1) / GEMM (B>1) + vectorized postprocessing."""
+        is_1d = X.ndim == 1
+        B_in = 1 if is_1d else int(X.shape[0])
+        if B_in == 0:
+            return {
+                "p_c": np.empty((0, self.M_c), dtype=np.float64),
+                "best_idx": np.empty((0, self.Q_c), dtype=np.int32),
+                "c_conf": np.empty((0, self.Q_c), dtype=np.float64),
+                "in_c": np.empty((0, self.Q_c), dtype=np.int32),
+                "p_true": np.empty((0, self.Q_b), dtype=np.float64),
+                "b_val": np.empty((0, self.Q_b), dtype=bool),
+                "b_conf": np.empty((0, self.Q_b), dtype=np.float64),
+                "in_b": np.empty((0, self.Q_b), dtype=np.int32),
+                "s_val": np.empty((0, self.Q_s), dtype=np.float64),
+                "p_s": np.empty((0, self.Q_s), dtype=np.float64),
+                "s_conf": np.empty((0, self.Q_s), dtype=np.float64),
+                "is_ambiguous": np.empty((0,), dtype=bool),
+            }
+
+        if self.storage_mode == "float32":
+            Xm = X if X.dtype == np.float32 else X.astype(np.float32, copy=False)
+            logits = Xm @ self.W_packed + self.b_packed
+        elif self.storage_mode == "float16":
+            Xm = X if X.dtype == np.float16 else X.astype(np.float16, copy=False)
+            logits = Xm @ self.W_packed + self.b_packed
+        else:
+            Xm = X if X.dtype == np.float32 else X.astype(np.float32, copy=False)
+            logits = Xm @ self.W_packed.astype(np.float32) + self.b_packed.astype(np.float32)
+
+        if logits.dtype != np.float64:
+            logits = logits.astype(np.float64)
+        if is_1d:
+            logits = logits[None, :]
+        B = logits.shape[0]
+
+        zc = logits[:, : self.M_c]
+        zb = logits[:, self.M_c : self.M_c + self.Q_b]
+        zs = logits[:, self.M_c + self.Q_b :]
+
+        if self.Q_c > 0:
+            seg_max = np.maximum.reduceat(zc, self.c_offsets, axis=1)
+            exp_z = np.exp(zc - seg_max[:, self.c_seg_idx])
+            seg_sum = np.add.reduceat(exp_z, self.c_offsets, axis=1)
+            p_c = exp_z / seg_sum[:, self.c_seg_idx]
+
+            p_pad = np.full((B, self.Q_c, self.K_max), -1.0, dtype=np.float64)
+            p_pad[:, self.c_pad_rows, self.c_pad_cols] = p_c
+            best_idx = np.argmax(p_pad, axis=2)
+            p_sorted = -np.sort(-p_pad, axis=2)
+            c_conf = p_sorted[:, :, 0]
+
+            if self.c_all_lac:
+                in_c = np.sum(
+                    (p_pad >= 0.0) & ((1.0 - p_pad) <= self.c_qhat[None, :, None] + 1e-7),
+                    axis=2,
+                )
+            elif self.c_all_aps_cal:
+                csum = np.cumsum(np.maximum(p_sorted, 0.0), axis=2)
+                if self.strict:
+                    in_c = np.sum(
+                        (p_sorted >= 0.0) & (csum <= self.c_qhat[None, :, None] + 1e-7),
+                        axis=2,
+                    )
+                else:
+                    prev_csum = np.concatenate(
+                        [np.zeros((B, self.Q_c, 1), dtype=np.float64), csum[:, :, :-1]],
+                        axis=2,
+                    )
+                    in_c = np.maximum(
+                        1,
+                        np.sum(
+                            (p_sorted >= 0.0) & (prev_csum < self.c_qhat[None, :, None] - 1e-7),
+                            axis=2,
+                        ),
+                    )
+            else:
+                csum = np.cumsum(np.maximum(p_sorted, 0.0), axis=2)
+                prev_csum = np.concatenate(
+                    [np.zeros((B, self.Q_c, 1), dtype=np.float64), csum[:, :, :-1]],
+                    axis=2,
+                )
+                in_lac = np.sum(
+                    (p_pad >= 0.0) & ((1.0 - p_pad) <= self.c_qhat[None, :, None] + 1e-7),
+                    axis=2,
+                )
+                if self.strict:
+                    in_aps = np.sum(
+                        (p_sorted >= 0.0) & (csum <= self.c_qhat[None, :, None] + 1e-7),
+                        axis=2,
+                    )
+                    in_uncal = np.broadcast_to(self.c_K[None, :], (B, self.Q_c))
+                else:
+                    in_aps = np.maximum(
+                        1,
+                        np.sum(
+                            (p_sorted >= 0.0) & (prev_csum < self.c_qhat[None, :, None] - 1e-7),
+                            axis=2,
+                        ),
+                    )
+                    in_uncal = np.maximum(
+                        1,
+                        np.sum(
+                            (p_sorted >= 0.0) & (prev_csum < (1.0 - self.alpha - 1e-7)),
+                            axis=2,
+                        ),
+                    )
+                in_c = np.where(
+                    self.c_is_cal[None, :],
+                    np.where(self.c_is_lac[None, :], in_lac, in_aps),
+                    in_uncal,
+                )
+
+            if self.strict:
+                c_ambig = (in_c != 1) | (~self.c_is_cal[None, :])
+            else:
+                runner_up = (
+                    np.maximum(0.0, p_sorted[:, :, 1]) if self.K_max >= 2 else np.zeros((B, self.Q_c))
+                )
+                margin = c_conf - runner_up
+                odds = c_conf / np.maximum(1e-6, runner_up)
+                mg = (
+                    (in_c > 1)
+                    & (self.c_eff_m[None, :] > 0.0)
+                    & (margin >= self.c_eff_m[None, :])
+                    & (c_conf >= self.c_conf_floor[None, :])
+                    & (odds >= self.c_gamma[None, :])
+                )
+                c_ambig = (in_c == 0) | ((in_c > 1) & (~mg))
+        else:
+            p_c = np.empty((B, 0), dtype=np.float64)
+            best_idx = in_c = np.empty((B, 0), dtype=np.int32)
+            c_conf = np.empty((B, 0), dtype=np.float64)
+            c_ambig = np.empty((B, 0), dtype=bool)
+
+        if self.Q_b > 0:
+            p_true = 1.0 / (1.0 + np.exp(-np.clip(zb, -50.0, 50.0)))
+            p_false = 1.0 - p_true
+            b_val = p_true >= self.b_thresh[None, :]
+            b_conf = np.where(b_val, p_true, p_false)
+            b_top = np.maximum(p_true, p_false)
+
+            if self.b_all_lac:
+                in_b = ((1.0 - p_true) <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
+                    (1.0 - p_false) <= self.b_qhat[None, :] + 1e-7
+                ).astype(np.int32)
+            elif self.b_all_aps_cal:
+                if self.strict:
+                    in_b = (b_top <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
+                        1.0 <= self.b_qhat[None, :] + 1e-7
+                    ).astype(np.int32)
+                else:
+                    in_b = 1 + (b_top < self.b_qhat[None, :] - 1e-7).astype(np.int32)
+            else:
+                in_lac_b = ((1.0 - p_true) <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
+                    (1.0 - p_false) <= self.b_qhat[None, :] + 1e-7
+                ).astype(np.int32)
+                if self.strict:
+                    in_aps_b = (b_top <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
+                        1.0 <= self.b_qhat[None, :] + 1e-7
+                    ).astype(np.int32)
+                    in_uncal_b = np.full((B, self.Q_b), 2, dtype=np.int32)
+                else:
+                    in_aps_b = 1 + (b_top < self.b_qhat[None, :] - 1e-7).astype(np.int32)
+                    in_uncal_b = 1 + (b_top < (1.0 - self.alpha - 1e-7)).astype(np.int32)
+                in_b = np.where(
+                    self.b_is_cal[None, :],
+                    np.where(self.b_is_lac[None, :], in_lac_b, in_aps_b),
+                    in_uncal_b,
+                )
+
+            if self.strict:
+                b_ambig = (in_b != 1) | (~self.b_is_cal[None, :])
+            else:
+                b_bot = 1.0 - b_top
+                margin_b = b_top - b_bot
+                odds_b = b_top / np.maximum(1e-6, b_bot)
+                mg_b = (
+                    (in_b > 1)
+                    & (self.b_eff_m[None, :] > 0.0)
+                    & (margin_b >= self.b_eff_m[None, :])
+                    & (b_top >= self.b_conf_floor[None, :])
+                    & (odds_b >= self.b_gamma[None, :])
+                )
+                b_ambig = (in_b == 0) | ((in_b > 1) & (~mg_b))
+        else:
+            p_true = b_conf = np.empty((B, 0), dtype=np.float64)
+            b_val = b_ambig = np.empty((B, 0), dtype=bool)
+            in_b = np.empty((B, 0), dtype=np.int32)
+
+        if self.Q_s > 0:
+            p_s = 1.0 / (1.0 + np.exp(-np.clip(zs, -50.0, 50.0)))
+            s_val = self.s_min[None, :] + self.s_range[None, :] * p_s
+            p_s_raw = 1.0 / (1.0 + np.exp(-np.clip(zs * self.s_raw_scale[None, :], -50.0, 50.0)))
+            s_conf = np.maximum(p_s_raw, 1.0 - p_s_raw)
+            if self.strict:
+                s_ambig = np.broadcast_to(
+                    (~self.s_is_cal) | (self.s_norm_margin > self.eff_score_thresh),
+                    (B, self.Q_s),
+                )
+            else:
+                s_ambig = np.zeros((B, self.Q_s), dtype=bool)
+        else:
+            p_s = s_val = s_conf = np.empty((B, 0), dtype=np.float64)
+            s_ambig = np.empty((B, 0), dtype=bool)
+
+        row_ambig = (
+            (np.any(c_ambig, axis=1) if self.Q_c else np.zeros(B, dtype=bool))
+            | (np.any(b_ambig, axis=1) if self.Q_b else np.zeros(B, dtype=bool))
+            | (np.any(s_ambig, axis=1) if self.Q_s else np.zeros(B, dtype=bool))
+        )
+
+        return {
+            "p_c": p_c,
+            "best_idx": best_idx,
+            "c_conf": c_conf,
+            "in_c": in_c,
+            "p_true": p_true,
+            "b_val": b_val,
+            "b_conf": b_conf,
+            "in_b": in_b,
+            "s_val": s_val,
+            "p_s": p_s,
+            "s_conf": s_conf,
+            "is_ambiguous": row_ambig,
+        }
+
+    def encode_one(self, prompt: str) -> np.ndarray:
+        if type(self.projector) is DeterministicSemanticProjector:
+            return _fast_deterministic_project(
+                self.projector, prompt, recency_weighted=self.recency_weighted
+            )
+        if not isinstance(prompt, str):
+            raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
+        try:
+            raw = self.projector.project(prompt, recency_weighted=self.recency_weighted)
+        except TypeError:
+            raw = self.projector.project(prompt)
+        vec = np.asarray(raw, dtype=np.float32).ravel()
+        norm = float(np.linalg.norm(vec))
+        if norm > 1e-12:
+            return (vec / norm).astype(np.float32)
+        out = np.zeros(self.dimension, dtype=np.float32)
+        if type(self.projector).__name__ not in ("TfidfProjector", "PragmaticCompositeProjector"):
+            out[0] = 1.0
+        return out
+
+    def encode_batch(self, prompts: Sequence[str]) -> np.ndarray:
+        if len(prompts) == 0:
+            return np.zeros((0, self.dimension), dtype=np.float32)
+        if hasattr(self.projector, "project_batch") and type(self.projector) is not DeterministicSemanticProjector:
+            try:
+                raw_mat = self.projector.project_batch(
+                    list(prompts), recency_weighted=self.recency_weighted
+                )
+            except TypeError:
+                raw_mat = self.projector.project_batch(list(prompts))
+            arr = np.asarray(raw_mat, dtype=np.float32)
+            norms = np.linalg.norm(arr, axis=1, keepdims=True)
+            good = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
+            out = np.zeros((len(prompts), self.dimension), dtype=np.float32)
+            if np.any(good):
+                out[good] = (arr[good] / norms[good]).astype(np.float32)
+            if (
+                np.any(~good)
+                and type(self.projector).__name__ not in ("TfidfProjector", "PragmaticCompositeProjector")
+            ):
+                out[~good, 0] = 1.0
+            return out
+        return np.stack([self.encode_one(p) for p in prompts], axis=0)
+
+    def decide_prompt(self, prompt: str) -> Dict[str, Any]:
+        return self.forward_embeddings(self.encode_one(prompt))
+
+    def decide_batch(self, prompts: Sequence[str]) -> Dict[str, Any]:
+        return self.forward_embeddings(self.encode_batch(prompts))
+
+
+class FastDecisionOutput:
+    """Slotted decision output avoiding per-call Pydantic/receipt overhead on hot paths."""
+
+    __slots__ = ("values", "confidences", "is_ambiguous")
+
+    def __init__(
+        self,
+        values: Dict[str, Any],
+        confidences: Dict[str, float],
+        is_ambiguous: bool,
+    ) -> None:
+        self.values = values
+        self.confidences = confidences
+        self.is_ambiguous = is_ambiguous
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "values": self.values,
+            "confidences": self.confidences,
+            "is_ambiguous": self.is_ambiguous,
+        }
+
+
+class FastDecisionCallable:
+    """Pre-bound callable compiled from a SystemOneEngine (zero lock/validation/receipt overhead)."""
+
+    def __init__(self, eng: Any, *, storage_mode: str = "float32") -> None:
+        if hasattr(eng, "compile_packed_kernel"):
+            self.kernel = eng.compile_packed_kernel(storage_mode=storage_mode)
+        else:
+            self.kernel = PackedMultiQuestionKernel.from_engine(eng, storage_mode=storage_mode)
+        self.projector = self.kernel.projector
+        self.recency_weighted = self.kernel.recency_weighted
+        self.is_det_proj = type(self.projector) is DeterministicSemanticProjector
+        self.small_q = self.kernel.Q_total <= 8 and storage_mode == "float32"
+
+        self.W_t = np.ascontiguousarray(self.kernel.W_packed, dtype=np.float32)
+        self.b = np.ascontiguousarray(self.kernel.b_packed, dtype=np.float32)
+        self.strict = self.kernel.strict
+        self.alpha = self.kernel.alpha
+        self.Q_c = self.kernel.Q_c
+        self.Q_b = self.kernel.Q_b
+        self.Q_s = self.kernel.Q_s
+        self.c_options = self.kernel.c_options
+        self.c_names = self.kernel.choice_names
+        self.c_K_list = [int(x) for x in self.kernel.c_K]
+        self.c_starts = [int(x) for x in self.kernel.c_offsets]
+        self.c_qhats = [float(x) for x in self.kernel.c_qhat]
+        self.c_cals = [bool(x) for x in self.kernel.c_is_cal]
+        self.c_lacs = [bool(x) for x in self.kernel.c_is_lac]
+        self.c_eff_m = [float(x) for x in self.kernel.c_eff_m]
+        self.c_gamma = [float(x) for x in self.kernel.c_gamma]
+        self.c_conf_floor = [float(x) for x in self.kernel.c_conf_floor]
+
+        self.b_names = self.kernel.bool_names
+        self.b_thresh = [float(x) for x in self.kernel.b_thresh]
+        self.b_qhats = [float(x) for x in self.kernel.b_qhat]
+        self.b_cals = [bool(x) for x in self.kernel.b_is_cal]
+        self.b_lacs = [bool(x) for x in self.kernel.b_is_lac]
+        self.b_eff_m = [float(x) for x in self.kernel.b_eff_m]
+        self.b_gamma = [float(x) for x in self.kernel.b_gamma]
+        self.b_conf_floor = [float(x) for x in self.kernel.b_conf_floor]
+        self.b_offset = self.kernel.M_c
+
+        self.s_names = self.kernel.score_names
+        self.s_min = [float(x) for x in self.kernel.s_min]
+        self.s_range = [float(x) for x in self.kernel.s_range]
+        self.s_norm_margin = [float(x) for x in self.kernel.s_norm_margin]
+        self.s_raw_scale = [float(x) for x in self.kernel.s_raw_scale]
+        self.s_cals = [bool(x) for x in self.kernel.s_is_cal]
+        self.s_eff_thresh = float(self.kernel.eff_score_thresh)
+        self.s_offset = self.kernel.M_c + self.Q_b
+
+    def __call__(
+        self, prompt: Optional[str] = None, *, embedding: Optional[np.ndarray] = None
+    ) -> FastDecisionOutput:
+        if embedding is None:
+            if prompt is None:
+                raise ValueError("Either prompt or embedding must be provided")
+            emb = self.kernel.encode_one(prompt)
+        else:
+            emb = (
+                embedding
+                if isinstance(embedding, np.ndarray) and embedding.dtype == np.float32
+                else np.asarray(embedding, dtype=np.float32)
+            )
+            if emb.ndim != 1:
+                emb = emb.ravel()
+            if emb.shape[0] != self.kernel.dimension:
+                raise ValueError(
+                    f"embedding dimension mismatch: expected {self.kernel.dimension}, got {emb.shape[0]}"
+                )
+
+        if not self.small_q:
+            out = self.kernel.forward_embeddings(emb)
+            vals: Dict[str, Any] = {}
+            confs: Dict[str, float] = {}
+            for ci, fn in enumerate(self.c_names):
+                vals[fn] = self.c_options[ci][int(out["best_idx"][0, ci])]
+                confs[fn] = float(out["c_conf"][0, ci])
+            for bi, fn in enumerate(self.b_names):
+                vals[fn] = bool(out["b_val"][0, bi])
+                confs[fn] = float(out["b_conf"][0, bi])
+            for si, fn in enumerate(self.s_names):
+                vals[fn] = float(out["s_val"][0, si])
+                confs[fn] = float(out["s_conf"][0, si])
+            return FastDecisionOutput(vals, confs, bool(out["is_ambiguous"][0]))
+
+        z_list: List[float] = (emb @ self.W_t + self.b).tolist()
+        vals = {}
+        confs = {}
+        ambig = False
+        exp = math.exp
+        strict = self.strict
+
+        for ci in range(self.Q_c):
+            fn = self.c_names[ci]
+            K = self.c_K_list[ci]
+            s0 = self.c_starts[ci]
+            z_slice = z_list[s0 : s0 + K]
+            m = max(z_slice)
+            exps = [exp(v - m) for v in z_slice]
+            inv_sum = 1.0 / sum(exps)
+            probs = [e * inv_sum for e in exps]
+            best_i = 0
+            best_p = probs[0]
+            for j in range(1, K):
+                if probs[j] > best_p:
+                    best_p = probs[j]
+                    best_i = j
+            vals[fn] = self.c_options[ci][best_i]
+            confs[fn] = best_p
+
+            ps: Optional[List[float]] = None
+            if not self.c_cals[ci]:
+                if strict:
+                    cnt = K
+                else:
+                    ps = sorted(probs, reverse=True)
+                    cs = 0.0
+                    cnt = 0
+                    thr = 1.0 - self.alpha - 1e-7
+                    for pv in ps:
+                        cs += pv
+                        cnt += 1
+                        if cs >= thr:
+                            break
+            else:
+                qh = self.c_qhats[ci]
+                if self.c_lacs[ci]:
+                    cnt = sum(1 for pv in probs if (1.0 - pv) <= qh + 1e-7)
+                elif strict:
+                    ps = sorted(probs, reverse=True)
+                    cs = 0.0
+                    cnt = 0
+                    for pv in ps:
+                        cs += pv
+                        if cs <= qh + 1e-7:
+                            cnt += 1
+                        else:
+                            break
+                else:
+                    ps = sorted(probs, reverse=True)
+                    cs = 0.0
+                    cnt = 0
+                    for pv in ps:
+                        cs += pv
+                        cnt += 1
+                        if cs >= qh - 1e-7:
+                            break
+
+            if strict:
+                if (not self.c_cals[ci]) or (cnt != 1):
+                    ambig = True
+            else:
+                if cnt == 0:
+                    ambig = True
+                elif cnt > 1:
+                    eff_m = self.c_eff_m[ci]
+                    if eff_m > 0.0:
+                        if ps is None:
+                            ps = sorted(probs, reverse=True)
+                        top_p = ps[0]
+                        run_p = ps[1] if K > 1 else 0.0
+                        marg = (top_p - run_p) if K > 1 else 1.0
+                        odds = top_p / (run_p if run_p > 1e-6 else 1e-6)
+                        if not (
+                            (marg >= eff_m)
+                            and (top_p >= self.c_conf_floor[ci])
+                            and (odds >= self.c_gamma[ci])
+                        ):
+                            ambig = True
+                    else:
+                        ambig = True
+
+        for bi in range(self.Q_b):
+            fn = self.b_names[bi]
+            zv = z_list[self.b_offset + bi]
+            if zv > 50.0:
+                zv = 50.0
+            elif zv < -50.0:
+                zv = -50.0
+            pt = 1.0 / (1.0 + exp(-zv))
+            pf = 1.0 - pt
+            bv = pt >= self.b_thresh[bi]
+            vals[fn] = bv
+            confs[fn] = pt if bv else pf
+
+            top = pt if pt >= pf else pf
+            if not self.b_cals[bi]:
+                if strict:
+                    cnt = 2
+                else:
+                    cnt = 1 if top >= (1.0 - self.alpha - 1e-7) else 2
+            else:
+                qh = self.b_qhats[bi]
+                if self.b_lacs[bi]:
+                    cnt = (1 if (1.0 - pt) <= qh + 1e-7 else 0) + (
+                        1 if (1.0 - pf) <= qh + 1e-7 else 0
+                    )
+                elif strict:
+                    cnt = (1 if top <= qh + 1e-7 else 0) + (1 if 1.0 <= qh + 1e-7 else 0)
+                else:
+                    cnt = 1 if top >= qh - 1e-7 else 2
+
+            if strict:
+                if (not self.b_cals[bi]) or (cnt != 1):
+                    ambig = True
+            else:
+                if cnt == 0:
+                    ambig = True
+                elif cnt > 1:
+                    eff_m = self.b_eff_m[bi]
+                    if eff_m > 0.0:
+                        bot = 1.0 - top
+                        marg = top - bot
+                        odds = top / (bot if bot > 1e-6 else 1e-6)
+                        if not (
+                            (marg >= eff_m)
+                            and (top >= self.b_conf_floor[bi])
+                            and (odds >= self.b_gamma[bi])
+                        ):
+                            ambig = True
+                    else:
+                        ambig = True
+
+        for si in range(self.Q_s):
+            fn = self.s_names[si]
+            zv = z_list[self.s_offset + si]
+            zv_c = 50.0 if zv > 50.0 else (-50.0 if zv < -50.0 else zv)
+            ps = 1.0 / (1.0 + exp(-zv_c))
+            vals[fn] = self.s_min[si] + self.s_range[si] * ps
+            z_raw = zv * self.s_raw_scale[si]
+            z_rc = 50.0 if z_raw > 50.0 else (-50.0 if z_raw < -50.0 else z_raw)
+            ps_raw = 1.0 / (1.0 + exp(-z_rc))
+            confs[fn] = ps_raw if ps_raw >= 0.5 else (1.0 - ps_raw)
+            if strict and ((not self.s_cals[si]) or (self.s_norm_margin[si] > self.s_eff_thresh)):
+                ambig = True
+
+        return FastDecisionOutput(vals, confs, ambig)
+
+
 __all__ = [
     "DeterministicSemanticProjector",
+    "_fast_deterministic_project",
     "DecisionFieldHead",
     "RawFieldEvaluation",
     "ModelInferenceResult",
     "SystemOneModel",
+    "PackedMultiQuestionKernel",
+    "FastDecisionOutput",
+    "FastDecisionCallable",
     "HAS_MLX",
     "_stable_softmax",
     "_stable_sigmoid",

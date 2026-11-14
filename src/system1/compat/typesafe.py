@@ -55,6 +55,7 @@ from system1.core import (
     MultiChoiceField,
     ScoreField,
 )
+from system1.core.model import FastDecisionCallable
 
 logger = logging.getLogger("system1.compat.typesafe")
 
@@ -1676,14 +1677,30 @@ class TypeSafeClient:
         with self._engine_lock:
             return self._last_promotion_report
 
-    def export_model(self, path: Union[str, Path]) -> bool:
+    def export_model(
+        self,
+        path: Union[str, Path],
+        *,
+        format_version: int = 2,
+        embed_vocab: bool = False,
+    ) -> bool:
         """Compiles and exports the validated System 1 model to disk."""
         cm = self.compiled_model
         if cm is None:
             return False
-            
-        cm.save(path)
+
+        cm.save(path, format_version=format_version, embed_vocab=embed_vocab)
         return True
+
+    def compile_callable(
+        self,
+        questions: Mapping[str, Any],
+        *,
+        storage_mode: str = "float32",
+    ) -> FastDecisionCallable:
+        """Compiles a low-overhead fast decision callable for a TypeSafe question map."""
+        eng = self._get_engine(questions)
+        return eng.compile_callable(storage_mode=storage_mode)
 
     def export_teaching_session(
         self,
@@ -3193,6 +3210,7 @@ def _apply_patch(mode: str = "local") -> _Unpatcher:
             "evaluate": evaluate,
             "batch_system_one": batch_system_one,
             "batch_systemone": batch_systemone,
+            "compile_typesafe_callable": compile_typesafe_callable,
             "patch_typesafe": patch_typesafe,
             "DotDict": DotDict,
             "call_real_typesafe_api": call_real_typesafe_api,
@@ -3228,6 +3246,7 @@ def _apply_patch(mode: str = "local") -> _Unpatcher:
             "evaluate",
             "batch_system_one",
             "batch_systemone",
+            "compile_typesafe_callable",
             "patch_typesafe",
             "DotDict",
             "call_real_typesafe_api",
@@ -3357,6 +3376,16 @@ def patch_typesafe(func: Optional[Callable[..., Any]] = None, *, mode: str = "lo
     return _apply_patch(mode=mode)
 
 
+def compile_typesafe_callable(
+    client: TypeSafeClient,
+    questions: Mapping[str, Any],
+    *,
+    storage_mode: str = "float32",
+) -> FastDecisionCallable:
+    """Compiles a low-overhead fast decision callable for a TypeSafeClient and question map."""
+    return client.compile_callable(questions, storage_mode=storage_mode)
+
+
 __all__ = [
     "Choice",
     "MultiChoice",
@@ -3379,6 +3408,7 @@ __all__ = [
     "evaluate",
     "batch_system_one",
     "batch_systemone",
+    "compile_typesafe_callable",
     "patch_typesafe",
     "DotDict",
     "call_real_typesafe_api",

@@ -6,9 +6,11 @@ Schema-derived synthetic examples remain available for bootstrapping demos.
 
 from __future__ import annotations
 
+import gc
 import io
 import json
 import math
+import mmap
 import os
 import struct
 import threading
@@ -44,6 +46,15 @@ from system1.core.text import MAX_PRAG_FEATURES, PragmaticCompositeProjector, Tf
 from system1.cache import SemanticSystemOneCache
 
 MAGIC_HEADER = b"S1M\x02"
+MAGIC_HEADER_V3 = b"S1M\x03\x00\x00\x00\x00"
+_V3_HDR_STRUCT = struct.Struct("<8sQ")
+S1M_V3_PAGE_SIZE = 16384
+MAX_SKILL_FIELDS_V3 = 512
+MAX_SKILL_BYTES_V3 = 256 * 1024 * 1024
+MAX_SKILL_HEADER_BYTES_V3 = 16 * 1024 * 1024
+MAX_SKILL_ARRAY_BYTES_V3 = 256 * 1024 * 1024
+MAX_SKILL_RUNTIME_BYTES_V3 = 512 * 1024 * 1024
+_ALLOWED_V3_DTYPES = frozenset(("float16", "float32", "float64"))
 
 # Fixed budgets for portable, bounded skills. Check before decoding/allocating.
 MAX_SKILL_BYTES = 64 * 1024 * 1024
@@ -554,6 +565,8 @@ class CompiledSystemOneModel:
         self.model_version: int = 1
         self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
         self._lock = threading.RLock()
+        self._mmap_obj: Optional[mmap.mmap] = None
+        self._mmap_fh: Optional[Any] = None
         self._learned_prompt_overrides: Dict[str, Dict[str, Any]] = {}
         self._learned_prompt_override_recency: Dict[str, bool] = {}
         raw_overrides = self.metadata.get("learned_prompt_overrides")
@@ -607,6 +620,61 @@ class CompiledSystemOneModel:
                 if ch.P is not None or ch.B is not None:
                     head.init_covariance(P=ch.P, B=ch.B)
             self._field_heads[name] = head
+
+    @staticmethod
+    def _close_mmap_handle(mm: Optional[mmap.mmap], fh: Optional[Any]) -> None:
+        """Closes file handle immediately and unmaps mmap when no NumPy views remain."""
+        try:
+            if mm is not None:
+                try:
+                    mm.close()
+                except BufferError:
+                    gc.collect()
+                    try:
+                        mm.close()
+                    except BufferError:
+                        # External read-only NumPy views still reference mm; GC will unmap it safely.
+                        pass
+        finally:
+            if fh is not None:
+                fh.close()
+
+    def close(self) -> None:
+        """Releases any memory-mapped buffers held by this compiled model."""
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            mm = getattr(self, "_mmap_obj", None)
+            fh = getattr(self, "_mmap_fh", None)
+            if mm is None and fh is None:
+                return
+            self._mmap_obj = None
+            self._mmap_fh = None
+            if hasattr(self, "_field_heads") and self._field_heads:
+                self._field_heads.clear()
+            if hasattr(self, "heads") and self.heads:
+                self.heads.clear()
+            if hasattr(self, "_online_prototype_bank"):
+                self._online_prototype_bank.clear()
+            self.projector = None
+            cache = getattr(self, "cache", None)
+            if cache is not None and hasattr(cache, "clear"):
+                cache.clear()
+            gc.collect()
+            self._close_mmap_handle(mm, fh)
+
+    def __enter__(self) -> CompiledSystemOneModel:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _build_override_eval(head: DecisionFieldHead, override_val: Any) -> RawFieldEvaluation:
@@ -1487,193 +1555,366 @@ class CompiledSystemOneModel:
             use_cache=use_cache,
         )
 
-    def to_bytes(self, include_covariance: bool = False, *, compact: Optional[bool] = None) -> bytes:
-        """Serializes the compiled model into compact .s1m binary bytes.
+    def _build_export_header_and_arrays(
+        self,
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
+    ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+        """Builds metadata dictionary and contiguous array payload for .s1m serialization."""
+        if format_version not in (2, 3):
+            raise ValueError(f"Unsupported .s1m format_version {format_version!r}; expected 2 or 3")
+        if format_version == 3 and not 0 < len(self.schema.fields) <= MAX_SKILL_FIELDS_V3:
+            raise ValueError(
+                f"Skill field count {len(self.schema.fields)} exceeds v3 limit {MAX_SKILL_FIELDS_V3}"
+            )
 
-        By default, excludes covariance matrices to keep the binary ultra-compact (<20 KB).
-        Covariance is automatically initialized on-demand if online learning is invoked.
+        heads_meta: Dict[str, Any] = {}
+        exemplar_states = {name: head.export_exemplar_state() for name, head in self._field_heads.items()}
+        for name, ch in sorted(self.heads.items()):
+            h_entry: Dict[str, Any] = {
+                "field_type": ch.field_type,
+                "temperature": float(ch.temperature),
+                "conformal_quantile": float(ch.conformal_quantile),
+                "score_method": ch.score_method,
+                "margin_threshold": float(getattr(ch, "margin_threshold", 0.20)),
+                "forgetting_factor": float(getattr(ch, "forgetting_factor", 0.995)),
+                "relative_odds_ratio": float(getattr(ch, "relative_odds_ratio", 1.5)),
+                "confidence_floor_tau0": float(getattr(ch, "confidence_floor_tau0", 0.15)),
+                "escalate_on_ambiguity": bool(getattr(ch, "escalate_on_ambiguity", True)),
+                "options": list(ch.options),
+                "weights_shape": list(ch.weights.shape),
+                "biases_shape": list(ch.biases.shape),
+            }
+            if getattr(ch, "mondrian", False):
+                h_entry["mondrian"] = True
+            class_scores = getattr(ch, "class_calibration_scores", None)
+            if class_scores and (
+                getattr(ch, "mondrian", False)
+                or sum(len(v) for v in class_scores.values()) <= 2048
+            ):
+                h_entry["class_calibration_scores"] = {
+                    str(k): [float(v) for v in vals] for k, vals in sorted(class_scores.items())
+                }
+            fam_thresh = float(getattr(ch, "familiarity_threshold", 0.0))
+            if fam_thresh > 0.0:
+                h_entry["familiarity_threshold"] = fam_thresh
+            proto_thresh = float(getattr(ch, "prototype_threshold", 0.0))
+            if proto_thresh > 0.0:
+                h_entry["prototype_threshold"] = proto_thresh
+            if getattr(ch, "hierarchical", False) and getattr(ch, "cluster_assignments", ()):
+                h_entry["hierarchical"] = True
+                h_entry["cluster_assignments"] = [int(c) for c in ch.cluster_assignments]
+            state = exemplar_states.get(name)
+            if state is not None:
+                h_entry["exemplar_state"] = {key: value for key, value in state.items() if key != "arrays"}
+            heads_meta[name] = h_entry
+
+        serialized_meta: Dict[str, Any] = {
+            **self.metadata,
+            "forgetting_factor": self.forgetting_factor,
+            "recency_weighted": self.recency_weighted,
+        }
+        # Loaded metadata may describe lessons that have since been cleared.
+        serialized_meta.pop("learned_prompt_overrides", None)
+        serialized_meta.pop("learned_prompt_override_recency", None)
+        if self._learned_prompt_overrides:
+            serialized_meta["learned_prompt_overrides"] = {
+                p_k: {
+                    f_k: (list(f_v) if isinstance(f_v, tuple) else f_v)
+                    for f_k, f_v in f_map.items()
+                }
+                for p_k, f_map in self._learned_prompt_overrides.items()
+            }
+            serialized_meta["learned_prompt_override_recency"] = {
+                p_k: bool(self._learned_prompt_override_recency.get(p_k, self.recency_weighted))
+                for p_k in self._learned_prompt_overrides
+            }
+
+        use_binary_tfidf_idf = (
+            type(self.projector) is TfidfProjector
+            and (compact is True or len(self.projector._terms) > 128)
+        )
+        use_binary_prag_tfidf = (
+            isinstance(self.projector, PragmaticCompositeProjector)
+            and (
+                compact is True
+                or (len(self.projector.base_tfidf._terms) + len(self.projector._prag_terms)) > 128
+            )
+        )
+        header_meta: Dict[str, Any] = {
+            "version": int(format_version),
+            "projector": _projector_config(
+                self.projector,
+                include_arrays=(
+                    not use_binary_tfidf_idf
+                    if type(self.projector) is TfidfProjector
+                    else (
+                        not use_binary_prag_tfidf
+                        if isinstance(self.projector, PragmaticCompositeProjector)
+                        else False
+                    )
+                ),
+            ),
+            "schema_name": self.schema.schema_name,
+            "schema_dict": self.schema.to_dict(),
+            "schema_digest": self.schema.schema_digest(),
+            "dimension": self.dimension,
+            "created_at": getattr(self, "created_at", 0.0),
+            "metadata": serialized_meta,
+            "heads": heads_meta,
+        }
+        if format_version == 3:
+            header_meta["embed_vocab"] = bool(embed_vocab)
+
+        def _pack_array(arr: np.ndarray) -> np.ndarray:
+            a32 = np.asarray(arr, dtype=np.float32)
+            if a32.ndim == 2 and a32.size > 0:
+                if format_version == 3:
+                    if compact is True:
+                        a16 = a32.astype(np.float16)
+                        if np.all(np.isfinite(a16)):
+                            return np.ascontiguousarray(a16)
+                    return np.ascontiguousarray(a32)
+                a16 = a32.astype(np.float16)
+                if np.all(np.isfinite(a16)) and (
+                    compact is True
+                    or (compact is None and np.array_equal(a32, a16.astype(np.float32)))
+                ):
+                    return a16
+            return np.ascontiguousarray(a32) if format_version == 3 else a32
+
+        arrays_to_save: Dict[str, np.ndarray] = {}
+        from system1.core.embeddings import HybridProjector
+
+        if use_binary_tfidf_idf:
+            arrays_to_save["_projector_tfidf_idf"] = np.asarray(self.projector._idf, dtype=np.float64)
+        if use_binary_prag_tfidf:
+            arrays_to_save["_projector_prag_base_idf"] = np.asarray(
+                self.projector.base_tfidf._idf, dtype=np.float64
+            )
+            if self.projector.prag_dim > 0:
+                arrays_to_save["_projector_prag_idf"] = np.asarray(
+                    self.projector.prag_idf, dtype=np.float64
+                )
+        if isinstance(self.projector, HybridProjector) and getattr(self.projector, "_fitted", False):
+            if getattr(self.projector, "_spectral_vectors", None) is not None:
+                arrays_to_save["_projector_spectral_vectors"] = _pack_array(
+                    self.projector._spectral_vectors
+                )
+            if getattr(self.projector, "_subspace_components", None) is not None:
+                arrays_to_save["_projector_subspace_components"] = _pack_array(
+                    self.projector._subspace_components
+                )
+            if getattr(self.projector, "_rbf_landmarks", None) is not None:
+                arrays_to_save["_projector_rbf_landmarks"] = _pack_array(
+                    self.projector._rbf_landmarks
+                )
+            hybrid_tfidf = getattr(self.projector, "_tfidf_projector", None)
+            if hybrid_tfidf is not None and getattr(hybrid_tfidf, "_idf", None) is not None:
+                arrays_to_save["_projector_hybrid_tfidf_idf"] = np.asarray(
+                    hybrid_tfidf._idf, dtype=np.float64
+                )
+
+        if format_version == 3 and embed_vocab and isinstance(self.projector, HybridProjector):
+            dense_eng = self.projector._dense_engine
+            arrays_to_save["_projector_dense_table"] = np.ascontiguousarray(
+                dense_eng._table, dtype=np.float32
+            )
+            if getattr(self.projector, "_spectral_basis", None) is not None:
+                arrays_to_save["_projector_spectral_basis"] = _pack_array(
+                    self.projector._spectral_basis
+                )
+            header_meta["dense_embed_vocab"] = {
+                "vocab_size": int(dense_eng.vocab_size),
+                "seed": int(dense_eng.seed),
+                "explicit_alpha": bool(getattr(self.projector, "_explicit_alpha", True)),
+                "multiword_by_space3": {
+                    str(k): [[str(e[0]), bool(e[1]), int(e[2])] for e in entries]
+                    for k, entries in dense_eng._multiword_by_space3.items()
+                },
+                "sparse": (
+                    self.projector._tfidf_projector.to_config(include_arrays=False)
+                    if self.projector._tfidf_projector is not None
+                    else None
+                ),
+            }
+
+        for name, ch in sorted(self.heads.items()):
+            arrays_to_save[f"{name}_w"] = _pack_array(ch.weights)
+            arrays_to_save[f"{name}_b"] = np.asarray(ch.biases, dtype=np.float32)
+            state = exemplar_states.get(name)
+            if state is not None:
+                for suffix, arr in state["arrays"].items():
+                    arr_np = np.asarray(arr)
+                    arrays_to_save[f"{name}_{suffix}"] = (
+                        _pack_array(arr_np) if arr_np.ndim == 2 else arr_np
+                    )
+            if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
+                arrays_to_save[f"{name}_calib_scores"] = np.asarray(ch.calibration_scores, dtype=np.float64)
+            if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
+                proto_32 = np.asarray(ch.prototypes, dtype=np.float32)
+                proto_16 = proto_32.astype(np.float16)
+                if (
+                    compact is not False
+                    and (format_version == 2 or compact is True)
+                    and np.all(np.isfinite(proto_16))
+                ):
+                    arrays_to_save[f"{name}_prototypes"] = proto_16
+                else:
+                    arrays_to_save[f"{name}_prototypes"] = _pack_array(proto_32)
+            if getattr(ch, "prototype_scores", ()) and len(ch.prototype_scores) > 0:
+                arrays_to_save[f"{name}_proto_scores"] = np.asarray(ch.prototype_scores, dtype=np.float64)
+            if (
+                getattr(ch, "hierarchical", False)
+                and ch.coarse_weights is not None
+                and ch.coarse_biases is not None
+            ):
+                arrays_to_save[f"{name}_coarse_w"] = _pack_array(ch.coarse_weights)
+                arrays_to_save[f"{name}_coarse_b"] = np.asarray(ch.coarse_biases, dtype=np.float32)
+                if ch.fine_weights is not None and ch.fine_biases is not None:
+                    arrays_to_save[f"{name}_fine_w"] = _pack_array(ch.fine_weights)
+                    arrays_to_save[f"{name}_fine_b"] = np.asarray(ch.fine_biases, dtype=np.float32)
+            if include_covariance:
+                if ch.P is not None:
+                    arrays_to_save[f"{name}_P"] = _pack_array(ch.P)
+                if ch.B is not None:
+                    arrays_to_save[f"{name}_B"] = _pack_array(ch.B)
+
+        if format_version == 3:
+            for tname, arr in list(arrays_to_save.items()):
+                arr_c = np.ascontiguousarray(arr)
+                if arr_c.dtype.name not in _ALLOWED_V3_DTYPES:
+                    arr_c = np.ascontiguousarray(arr_c, dtype=np.float32)
+                arrays_to_save[tname] = arr_c
+
+        return header_meta, arrays_to_save
+
+    def _to_bytes_v3(
+        self,
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+        embed_vocab: bool = False,
+    ) -> bytes:
+        header_meta, arrays_to_save = self._build_export_header_and_arrays(
+            include_covariance=include_covariance,
+            compact=compact,
+            format_version=3,
+            embed_vocab=embed_vocab,
+        )
+        arrays_ordered = sorted(arrays_to_save.items(), key=lambda kv: kv[0])
+        manifest: Dict[str, Dict[str, Any]] = {
+            tname: {
+                "dtype": arr.dtype.name,
+                "shape": [int(d) for d in arr.shape],
+                "offset": 0,
+                "nbytes": int(arr.nbytes),
+            }
+            for tname, arr in arrays_ordered
+        }
+        header_meta["tensors"] = manifest
+        header_bytes = json.dumps(header_meta, sort_keys=True, allow_nan=False).encode("utf-8")
+        if len(header_bytes) > MAX_SKILL_HEADER_BYTES_V3:
+            raise ValueError("Saved v3 skill header exceeds size limit")
+
+        cursor = 0
+        for _ in range(8):
+            cursor = (
+                (16 + len(header_bytes) + S1M_V3_PAGE_SIZE - 1) // S1M_V3_PAGE_SIZE
+            ) * S1M_V3_PAGE_SIZE
+            next_manifest: Dict[str, Dict[str, Any]] = {}
+            for idx, (tname, arr) in enumerate(arrays_ordered):
+                align = (
+                    S1M_V3_PAGE_SIZE
+                    if (idx == 0 or arr.nbytes >= 65536 or tname == "_projector_dense_table")
+                    else 64
+                )
+                cursor = ((cursor + align - 1) // align) * align
+                next_manifest[tname] = {
+                    "dtype": arr.dtype.name,
+                    "shape": [int(d) for d in arr.shape],
+                    "offset": int(cursor),
+                    "nbytes": int(arr.nbytes),
+                }
+                cursor += int(arr.nbytes)
+            header_meta["tensors"] = next_manifest
+            next_header_bytes = json.dumps(header_meta, sort_keys=True, allow_nan=False).encode("utf-8")
+            if len(next_header_bytes) > MAX_SKILL_HEADER_BYTES_V3:
+                raise ValueError("Saved v3 skill header exceeds size limit")
+            if next_manifest == manifest and next_header_bytes == header_bytes:
+                header_bytes = next_header_bytes
+                manifest = next_manifest
+                break
+            header_bytes = next_header_bytes
+            manifest = next_manifest
+        else:
+            # Final pass to guarantee offsets remain consistent with settled header_len.
+            cursor = (
+                (16 + len(header_bytes) + S1M_V3_PAGE_SIZE - 1) // S1M_V3_PAGE_SIZE
+            ) * S1M_V3_PAGE_SIZE
+            for idx, (tname, arr) in enumerate(arrays_ordered):
+                align = (
+                    S1M_V3_PAGE_SIZE
+                    if (idx == 0 or arr.nbytes >= 65536 or tname == "_projector_dense_table")
+                    else 64
+                )
+                cursor = ((cursor + align - 1) // align) * align
+                manifest[tname]["offset"] = int(cursor)
+                cursor += int(arr.nbytes)
+            header_meta["tensors"] = manifest
+            header_bytes = json.dumps(header_meta, sort_keys=True, allow_nan=False).encode("utf-8")
+
+        total_len = ((cursor + S1M_V3_PAGE_SIZE - 1) // S1M_V3_PAGE_SIZE) * S1M_V3_PAGE_SIZE
+        if total_len > MAX_SKILL_BYTES_V3:
+            raise ValueError("Saved v3 skill file exceeds size limit")
+
+        out = bytearray(total_len)
+        _V3_HDR_STRUCT.pack_into(out, 0, MAGIC_HEADER_V3, len(header_bytes))
+        out[16 : 16 + len(header_bytes)] = header_bytes
+        for tname, arr in arrays_ordered:
+            spec = manifest[tname]
+            nbytes = int(spec["nbytes"])
+            if nbytes > 0:
+                offset = int(spec["offset"])
+                out[offset : offset + nbytes] = np.ascontiguousarray(arr).tobytes()
+        return bytes(out)
+
+    def to_bytes(
+        self,
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
+    ) -> bytes:
+        """Serializes the compiled model into .s1m binary bytes (v2 compact zip or v3 page-aligned mmap).
+
+        By default (format_version=2), excludes covariance matrices and emits S1M\\x02
+        bytes (<20 KB for typical skills). Set format_version=3 for S1M\\x03 page-aligned
+        zero-copy mmap storage supporting up to 512 fields and optional embed_vocab.
         """
         with self._lock:
-            heads_meta: Dict[str, Any] = {}
-            exemplar_states = {name: head.export_exemplar_state() for name, head in self._field_heads.items()}
-            for name, ch in sorted(self.heads.items()):
-                h_entry: Dict[str, Any] = {
-                    "field_type": ch.field_type,
-                    "temperature": float(ch.temperature),
-                    "conformal_quantile": float(ch.conformal_quantile),
-                    "score_method": ch.score_method,
-                    "margin_threshold": float(getattr(ch, "margin_threshold", 0.20)),
-                    "forgetting_factor": float(getattr(ch, "forgetting_factor", 0.995)),
-                    "relative_odds_ratio": float(getattr(ch, "relative_odds_ratio", 1.5)),
-                    "confidence_floor_tau0": float(getattr(ch, "confidence_floor_tau0", 0.15)),
-                    "escalate_on_ambiguity": bool(getattr(ch, "escalate_on_ambiguity", True)),
-                    "options": list(ch.options),
-                    "weights_shape": list(ch.weights.shape),
-                    "biases_shape": list(ch.biases.shape),
-                }
-                if getattr(ch, "mondrian", False):
-                    h_entry["mondrian"] = True
-                class_scores = getattr(ch, "class_calibration_scores", None)
-                if class_scores and (
-                    getattr(ch, "mondrian", False)
-                    or sum(len(v) for v in class_scores.values()) <= 2048
-                ):
-                    h_entry["class_calibration_scores"] = {
-                        str(k): [float(v) for v in vals] for k, vals in sorted(class_scores.items())
-                    }
-                fam_thresh = float(getattr(ch, "familiarity_threshold", 0.0))
-                if fam_thresh > 0.0:
-                    h_entry["familiarity_threshold"] = fam_thresh
-                proto_thresh = float(getattr(ch, "prototype_threshold", 0.0))
-                if proto_thresh > 0.0:
-                    h_entry["prototype_threshold"] = proto_thresh
-                if getattr(ch, "hierarchical", False) and getattr(ch, "cluster_assignments", ()):
-                    h_entry["hierarchical"] = True
-                    h_entry["cluster_assignments"] = [int(c) for c in ch.cluster_assignments]
-                state = exemplar_states.get(name)
-                if state is not None:
-                    h_entry["exemplar_state"] = {key: value for key, value in state.items() if key != "arrays"}
-                heads_meta[name] = h_entry
-
-            serialized_meta: Dict[str, Any] = {
-                **self.metadata,
-                "forgetting_factor": self.forgetting_factor,
-                "recency_weighted": self.recency_weighted,
-            }
-            # Loaded metadata may describe lessons that have since been cleared.
-            serialized_meta.pop("learned_prompt_overrides", None)
-            serialized_meta.pop("learned_prompt_override_recency", None)
-            if self._learned_prompt_overrides:
-                serialized_meta["learned_prompt_overrides"] = {
-                    p_k: {
-                        f_k: (list(f_v) if isinstance(f_v, tuple) else f_v)
-                        for f_k, f_v in f_map.items()
-                    }
-                    for p_k, f_map in self._learned_prompt_overrides.items()
-                }
-                serialized_meta["learned_prompt_override_recency"] = {
-                    p_k: bool(self._learned_prompt_override_recency.get(p_k, self.recency_weighted))
-                    for p_k in self._learned_prompt_overrides
-                }
-
-            use_binary_tfidf_idf = (
-                type(self.projector) is TfidfProjector
-                and (compact is True or len(self.projector._terms) > 128)
-            )
-            use_binary_prag_tfidf = (
-                isinstance(self.projector, PragmaticCompositeProjector)
-                and (
-                    compact is True
-                    or (len(self.projector.base_tfidf._terms) + len(self.projector._prag_terms)) > 128
+            if format_version == 3:
+                return self._to_bytes_v3(
+                    include_covariance=include_covariance,
+                    compact=compact,
+                    embed_vocab=embed_vocab,
                 )
+            header_meta, arrays_to_save = self._build_export_header_and_arrays(
+                include_covariance=include_covariance,
+                compact=compact,
+                format_version=format_version,
+                embed_vocab=False,
             )
-            header_meta = {
-                "version": 2,
-                "projector": _projector_config(
-                    self.projector,
-                    include_arrays=(
-                        not use_binary_tfidf_idf
-                        if type(self.projector) is TfidfProjector
-                        else (
-                            not use_binary_prag_tfidf
-                            if isinstance(self.projector, PragmaticCompositeProjector)
-                            else False
-                        )
-                    ),
-                ),
-                "schema_name": self.schema.schema_name,
-                "schema_dict": self.schema.to_dict(),
-                "schema_digest": self.schema.schema_digest(),
-                "dimension": self.dimension,
-                "created_at": getattr(self, "created_at", 0.0),
-                "metadata": serialized_meta,
-                "heads": heads_meta,
-            }
             header_bytes = json.dumps(header_meta, sort_keys=True).encode("utf-8")
             header_len = len(header_bytes)
             if header_len > MAX_SKILL_HEADER_BYTES:
                 raise ValueError("Saved skill header exceeds size limit")
 
-            def _pack_array(arr: np.ndarray) -> np.ndarray:
-                a32 = np.asarray(arr, dtype=np.float32)
-                if a32.ndim == 2 and a32.size > 0:
-                    a16 = a32.astype(np.float16)
-                    if np.all(np.isfinite(a16)) and (
-                        compact is True
-                        or (compact is None and np.array_equal(a32, a16.astype(np.float32)))
-                    ):
-                        return a16
-                return a32
-
-            # Pack numpy weights into compressed zip buffer
             npz_buf = io.BytesIO()
-            arrays_to_save: Dict[str, np.ndarray] = {}
-            from system1.core.embeddings import HybridProjector
-
-            if use_binary_tfidf_idf:
-                arrays_to_save["_projector_tfidf_idf"] = np.asarray(self.projector._idf, dtype=np.float64)
-            if use_binary_prag_tfidf:
-                arrays_to_save["_projector_prag_base_idf"] = np.asarray(
-                    self.projector.base_tfidf._idf, dtype=np.float64
-                )
-                if self.projector.prag_dim > 0:
-                    arrays_to_save["_projector_prag_idf"] = np.asarray(
-                        self.projector.prag_idf, dtype=np.float64
-                    )
-            if isinstance(self.projector, HybridProjector) and getattr(self.projector, "_fitted", False):
-                if getattr(self.projector, "_spectral_vectors", None) is not None:
-                    arrays_to_save["_projector_spectral_vectors"] = _pack_array(
-                        self.projector._spectral_vectors
-                    )
-                if getattr(self.projector, "_subspace_components", None) is not None:
-                    arrays_to_save["_projector_subspace_components"] = _pack_array(
-                        self.projector._subspace_components
-                    )
-                if getattr(self.projector, "_rbf_landmarks", None) is not None:
-                    arrays_to_save["_projector_rbf_landmarks"] = _pack_array(
-                        self.projector._rbf_landmarks
-                    )
-                hybrid_tfidf = getattr(self.projector, "_tfidf_projector", None)
-                if hybrid_tfidf is not None and getattr(hybrid_tfidf, "_idf", None) is not None:
-                    arrays_to_save["_projector_hybrid_tfidf_idf"] = np.asarray(
-                        hybrid_tfidf._idf, dtype=np.float64
-                    )
-            for name, ch in sorted(self.heads.items()):
-                arrays_to_save[f"{name}_w"] = _pack_array(ch.weights)
-                arrays_to_save[f"{name}_b"] = ch.biases.astype(np.float32)
-                state = exemplar_states.get(name)
-                if state is not None:
-                    for suffix, arr in state["arrays"].items():
-                        arr_np = np.asarray(arr)
-                        arrays_to_save[f"{name}_{suffix}"] = (
-                            _pack_array(arr_np) if arr_np.ndim == 2 else arr_np
-                        )
-                if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
-                    arrays_to_save[f"{name}_calib_scores"] = np.asarray(ch.calibration_scores, dtype=np.float64)
-                if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
-                    proto_32 = np.asarray(ch.prototypes, dtype=np.float32)
-                    proto_16 = proto_32.astype(np.float16)
-                    if compact is not False and np.all(np.isfinite(proto_16)):
-                        arrays_to_save[f"{name}_prototypes"] = proto_16
-                    else:
-                        arrays_to_save[f"{name}_prototypes"] = _pack_array(proto_32)
-                if getattr(ch, "prototype_scores", ()) and len(ch.prototype_scores) > 0:
-                    arrays_to_save[f"{name}_proto_scores"] = np.asarray(ch.prototype_scores, dtype=np.float64)
-                if (
-                    getattr(ch, "hierarchical", False)
-                    and ch.coarse_weights is not None
-                    and ch.coarse_biases is not None
-                ):
-                    arrays_to_save[f"{name}_coarse_w"] = _pack_array(ch.coarse_weights)
-                    arrays_to_save[f"{name}_coarse_b"] = np.asarray(ch.coarse_biases, dtype=np.float32)
-                    if ch.fine_weights is not None and ch.fine_biases is not None:
-                        arrays_to_save[f"{name}_fine_w"] = _pack_array(ch.fine_weights)
-                        arrays_to_save[f"{name}_fine_b"] = np.asarray(ch.fine_biases, dtype=np.float32)
-                if include_covariance:
-                    if ch.P is not None:
-                        arrays_to_save[f"{name}_P"] = _pack_array(ch.P)
-                    if ch.B is not None:
-                        arrays_to_save[f"{name}_B"] = _pack_array(ch.B)
             np.savez_compressed(npz_buf, **arrays_to_save)
             npz_bytes = npz_buf.getvalue()
 
@@ -1691,154 +1932,97 @@ class CompiledSystemOneModel:
         include_covariance: bool = False,
         *,
         compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
     ) -> None:
         """Saves compiled model to a .s1m binary file on disk."""
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(self.to_bytes(include_covariance=include_covariance, compact=compact))
+        target.write_bytes(
+            self.to_bytes(
+                include_covariance=include_covariance,
+                compact=compact,
+                format_version=format_version,
+                embed_vocab=embed_vocab,
+            )
+        )
 
     @classmethod
-    def from_bytes(
+    def _reconstruct_model_from_parts(
         cls,
-        data: bytes,
-        projector: Optional[Any] = None,
-        backend: str = "numpy",
+        meta: Mapping[str, Any],
+        array_map: Mapping[str, np.ndarray],
+        *,
+        projector: Optional[Any],
+        backend: str,
+        schema: DecisionSchema,
+        dimension: int,
+        projector_config: Optional[Mapping[str, Any]],
+        saved_tfidf: Optional[Any],
+        saved_prag: Optional[Any],
+        format_version: int,
     ) -> CompiledSystemOneModel:
-        """Deserializes a CompiledSystemOneModel from binary bytes."""
-        if len(data) > MAX_SKILL_BYTES:
-            raise ValueError("Saved skill file exceeds size limit")
-        if len(data) < 8 or data[:4] not in (b"S1M\x01", MAGIC_HEADER):
-            raise ValueError("Invalid System 1 Model binary: missing or invalid magic header")
-
-        header_len = struct.unpack(">I", data[4:8])[0]
-        if header_len > MAX_SKILL_HEADER_BYTES:
-            raise ValueError("Saved skill header exceeds size limit")
-        header_end = 8 + header_len
-        if len(data) < header_end:
-            raise ValueError("Corrupted System 1 Model binary: truncated header")
-
-        header_json = data[8:header_end].decode("utf-8")
-        meta = json.loads(header_json)
-        if meta.get("version") not in (1, 2) or meta["version"] != data[3]:
-            raise ValueError("Unsupported or inconsistent saved skill format version")
-
-        # Reconstruct schema
-        fields_data = meta["schema_dict"]["fields"]
-        if not isinstance(fields_data, dict) or not 0 < len(fields_data) <= MAX_SKILL_FIELDS:
-            raise ValueError("Saved skill field count exceeds limits")
-        for definition in fields_data.values():
-            if len(definition.get("options", ())) > MAX_SKILL_OPTIONS:
-                raise ValueError("Saved skill option count exceeds limits")
-        schema = DecisionSchema.from_dict(meta["schema_dict"])
-        if meta.get("schema_digest") != schema.schema_digest():
-            raise ValueError("Saved skill schema digest does not match its definition")
-        dimension = meta["dimension"]
-        if type(dimension) is not int or not 0 < dimension <= MAX_SKILL_DIMENSION:
-            raise ValueError("Saved skill dimension must be a positive integer within limits")
-        if set(meta["heads"]) != set(schema.fields):
-            raise ValueError("Saved skill heads must exactly match its schema")
-        # Includes constructor/NumPy temporaries and covariance defaults when applicable.
-        widths = sum(max(2, len(getattr(f, "options", ()))) for f in schema.fields.values())
-        projector_config = meta.get("projector")
-        cov_fields = (
-            len(schema.fields)
-            if (projector_config is None or projector_config.get("type") == "deterministic")
-            else 0
-        )
-        runtime_bytes = 16 * cov_fields * (dimension + 1) ** 2 + 16 * widths * (dimension + 1)
-        saved_tfidf = None
-        saved_prag = None
-        saved_hybrid = None
-        if projector_config is not None:
-            kind = projector_config["type"]
-            if kind == "tfidf":
-                tfidf_terms, _ = TfidfProjector.validate_header_config(
-                    projector_config, allow_missing_idf=True
-                )
-                if len(tfidf_terms) != dimension:
-                    raise ValueError("Saved TF-IDF dimension does not match the skill")
-                if "idf" in projector_config:
-                    saved_tfidf = TfidfProjector.from_config(projector_config)
-            if kind == "pragmatic_tfidf":
-                _, _, prag_total_dim = PragmaticCompositeProjector.validate_header_config(
-                    projector_config, allow_missing_idf=True
-                )
-                if prag_total_dim != dimension:
-                    raise ValueError("Saved pragmatic TF-IDF dimension does not match the skill")
-                runtime_bytes += 64 * prag_total_dim
-                base_cfg = projector_config.get("base_tfidf", {})
-                if "prag_idf" in projector_config and isinstance(base_cfg, dict) and "idf" in base_cfg:
-                    saved_prag = PragmaticCompositeProjector.from_config(projector_config)
-            if kind == "deterministic" and projector_config.get("dimension") != dimension:
-                raise ValueError("Saved projector dimension does not match the skill")
-            if kind == "hybrid":
-                from system1.core.embeddings import HybridProjector
-                if set(projector_config) - HybridProjector.CONFIG_KEYS:
-                    raise ValueError("Saved hybrid projector contains unsupported settings")
-                sparse, dense = projector_config.get("sparse_dim"), projector_config.get("dense_dim")
-                direct_spec = (
-                    projector_config.get("direct_spectral_dim", 0)
-                    if projector_config.get("direct_spectral")
-                    else 0
-                )
-                inline_rbf_rows = len(projector_config.get("rbf_landmarks") or ())
-                if (
-                    type(sparse) is not int
-                    or type(dense) is not int
-                    or sparse <= 0
-                    or dense <= 0
-                    or type(direct_spec) is not int
-                    or direct_spec < 0
-                    or sparse + dense + direct_spec + inline_rbf_rows > dimension
-                ):
-                    raise ValueError("Saved hybrid projector dimensions do not match the skill")
-                runtime_bytes += 16 * 25000 * dense
-                runtime_bytes += 64 * len(projector_config.get("tfidf_terms", ()))
-                runtime_bytes += 16 * len(projector_config.get("spectral_terms", ())) * dense
-                runtime_bytes += 8 * sum(
-                    len(row)
-                    for key in ("spectral_vectors", "subspace_components", "rbf_landmarks")
-                    for row in (projector_config.get(key) or ())
-                )
-                if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
-                    raise ValueError("Saved skill runtime allocation exceeds memory budget")
-        if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
-            raise ValueError("Saved skill runtime allocation exceeds memory budget")
-        npz_file = _read_skill_arrays(data[header_end:], schema, dimension, runtime_bytes)
-        if (projector_config is None or projector_config.get("type") != "tfidf") and (
-            "_projector_tfidf_idf" in npz_file
-        ):
-            raise ValueError("Saved skill contains unexpected TF-IDF idf array")
-        if (projector_config is None or projector_config.get("type") != "pragmatic_tfidf") and (
-            "_projector_prag_base_idf" in npz_file or "_projector_prag_idf" in npz_file
-        ):
-            raise ValueError("Saved skill contains unexpected pragmatic TF-IDF idf array")
-        if (projector_config is None or projector_config.get("type") != "hybrid") and (
-            "_projector_spectral_vectors" in npz_file
-            or "_projector_subspace_components" in npz_file
-            or "_projector_rbf_landmarks" in npz_file
-            or "_projector_hybrid_tfidf_idf" in npz_file
-        ):
-            raise ValueError("Saved skill contains unexpected hybrid projector arrays")
+        from system1.core.embeddings import HybridProjector, SubwordSemanticEmbeddings
 
         def _as_f32(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
             if arr is None:
                 return None
             return np.asarray(arr, dtype=np.float32) if arr.dtype == np.float16 else arr
 
+        is_v3 = format_version == 3
+        embed_vocab_flag = bool(meta.get("embed_vocab", False)) if is_v3 else False
+
+        if (projector_config is None or projector_config.get("type") != "tfidf") and (
+            "_projector_tfidf_idf" in array_map
+        ):
+            raise ValueError("Saved skill contains unexpected TF-IDF idf array")
+        if (projector_config is None or projector_config.get("type") != "pragmatic_tfidf") and (
+            "_projector_prag_base_idf" in array_map or "_projector_prag_idf" in array_map
+        ):
+            raise ValueError("Saved skill contains unexpected pragmatic TF-IDF idf array")
+        if (projector_config is None or projector_config.get("type") != "hybrid") and (
+            "_projector_spectral_vectors" in array_map
+            or "_projector_spectral_basis" in array_map
+            or "_projector_subspace_components" in array_map
+            or "_projector_rbf_landmarks" in array_map
+            or "_projector_hybrid_tfidf_idf" in array_map
+            or "_projector_dense_table" in array_map
+        ):
+            raise ValueError("Saved skill contains unexpected hybrid projector arrays")
+        if (not is_v3 or not embed_vocab_flag) and (
+            "_projector_dense_table" in array_map or "_projector_spectral_basis" in array_map
+        ):
+            raise ValueError("Saved skill contains unexpected dense vocab projector arrays")
+
+        for proj_arr_key in (
+            "_projector_tfidf_idf",
+            "_projector_prag_base_idf",
+            "_projector_prag_idf",
+            "_projector_spectral_vectors",
+            "_projector_spectral_basis",
+            "_projector_subspace_components",
+            "_projector_rbf_landmarks",
+            "_projector_hybrid_tfidf_idf",
+            "_projector_dense_table",
+        ):
+            if proj_arr_key in array_map and not np.all(np.isfinite(array_map[proj_arr_key])):
+                raise ValueError(f"Saved projector array {proj_arr_key!r} contains non-finite values")
+
         if projector_config is not None and projector_config["type"] == "tfidf" and saved_tfidf is None:
             saved_tfidf = TfidfProjector.from_config(
                 projector_config,
-                idf_array=npz_file.get("_projector_tfidf_idf"),
+                idf_array=array_map.get("_projector_tfidf_idf"),
             )
         if projector_config is not None and projector_config["type"] == "pragmatic_tfidf" and saved_prag is None:
             saved_prag = PragmaticCompositeProjector.from_config(
                 projector_config,
-                tfidf_idf_array=npz_file.get("_projector_prag_base_idf"),
-                prag_idf_array=npz_file.get("_projector_prag_idf"),
+                tfidf_idf_array=array_map.get("_projector_prag_base_idf"),
+                prag_idf_array=array_map.get("_projector_prag_idf"),
             )
+
+        saved_hybrid = None
         if projector_config is not None and projector_config["type"] == "hybrid":
-            rbf_arr = npz_file.get("_projector_rbf_landmarks")
+            rbf_arr = array_map.get("_projector_rbf_landmarks")
             rbf_rows = (
                 int(rbf_arr.shape[0])
                 if rbf_arr is not None
@@ -1854,21 +2038,117 @@ class CompiledSystemOneModel:
                 != dimension
             ):
                 raise ValueError("Saved hybrid projector dimensions do not match the skill")
-            hyb_kwargs: Dict[str, Any] = {
-                "backend": backend,
-                "spectral_vectors": _as_f32(npz_file.get("_projector_spectral_vectors")),
-                "subspace_components": _as_f32(npz_file.get("_projector_subspace_components")),
-            }
-            if "_projector_hybrid_tfidf_idf" in npz_file:
-                hyb_kwargs["tfidf_idf_array"] = npz_file["_projector_hybrid_tfidf_idf"]
-            if "_projector_rbf_landmarks" in npz_file:
-                hyb_kwargs["rbf_landmarks"] = _as_f32(npz_file["_projector_rbf_landmarks"])
-            try:
-                saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
-            except TypeError:
-                hyb_kwargs.pop("tfidf_idf_array", None)
-                hyb_kwargs.pop("rbf_landmarks", None)
-                saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
+
+            if is_v3 and embed_vocab_flag and "_projector_dense_table" in array_map:
+                vocab_meta = meta.get("dense_embed_vocab")
+                if not isinstance(vocab_meta, Mapping):
+                    raise ValueError("Saved v3 skill missing dense_embed_vocab metadata")
+                vocab_size = vocab_meta.get("vocab_size")
+                if type(vocab_size) is not int or not 1 <= vocab_size <= 250_000:
+                    raise ValueError("Saved v3 skill dense_embed_vocab vocab_size is invalid")
+                dense_dim = int(projector_config["dense_dim"])
+                dense_table = array_map["_projector_dense_table"]
+                if dense_table.ndim != 2 or dense_table.shape != (vocab_size, dense_dim):
+                    raise ValueError("Saved v3 skill _projector_dense_table shape mismatch")
+                if dense_table.dtype == np.float16:
+                    dense_table = np.asarray(dense_table, dtype=np.float32)
+
+                raw_mw = vocab_meta.get("multiword_by_space3", {})
+                if not isinstance(raw_mw, Mapping):
+                    raise ValueError("Saved v3 skill multiword_by_space3 must be a mapping")
+                mw_map: Dict[str, Tuple[Tuple[str, bool, int], ...]] = {}
+                for k_str, entries in raw_mw.items():
+                    if not isinstance(k_str, str) or not isinstance(entries, (list, tuple)):
+                        raise ValueError("Saved v3 skill multiword_by_space3 entry is invalid")
+                    parsed_entries: List[Tuple[str, bool, int]] = []
+                    for entry in entries:
+                        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+                            raise ValueError("Saved v3 skill multiword_by_space3 tuple is invalid")
+                        term_s, neg_f, tok_idx = entry
+                        if (
+                            not isinstance(term_s, str)
+                            or type(neg_f) is not bool
+                            or type(tok_idx) is not int
+                            or not 0 <= tok_idx < vocab_size
+                        ):
+                            raise ValueError("Saved v3 skill multiword_by_space3 item out of bounds")
+                        parsed_entries.append((term_s, neg_f, tok_idx))
+                    mw_map[k_str] = tuple(parsed_entries)
+
+                sparse_cfg = vocab_meta.get("sparse")
+                tfidf_proj: Optional[Any] = None
+                if sparse_cfg is not None:
+                    if not isinstance(sparse_cfg, Mapping):
+                        raise ValueError("Saved v3 skill sparse projector config is invalid")
+                    TfidfProjector.validate_header_config(sparse_cfg, allow_missing_idf=True)
+                    tfidf_proj = TfidfProjector.from_config(
+                        sparse_cfg,
+                        idf_array=array_map.get("_projector_hybrid_tfidf_idf"),
+                    )
+
+                dense_engine = object.__new__(SubwordSemanticEmbeddings)
+                dense_engine.dimension = dense_dim
+                dense_engine.vocab_size = vocab_size
+                dense_engine.seed = int(vocab_meta.get("seed", projector_config.get("seed", 42)))
+                dense_engine._table = dense_table
+                dense_engine._multiword_by_space3 = mw_map
+
+                hp = object.__new__(HybridProjector)
+                hp.sparse_dim = int(projector_config["sparse_dim"])
+                hp.dense_dim = dense_dim
+                hp.dimension = int(dimension)
+                hp.alpha = float(projector_config.get("alpha", 0.5))
+                hp._explicit_alpha = bool(vocab_meta.get("explicit_alpha", True))
+                hp.seed = int(projector_config.get("seed", 42))
+                hp.svd_power = float(projector_config.get("svd_power", 0.5))
+                hp.spectral_blend = float(projector_config.get("spectral_blend", 0.35))
+                hp.backend = "numpy"
+                hp._dense_engine = dense_engine
+                hp._fitted = bool(projector_config.get("fitted", False))
+                hp._tfidf_projector = tfidf_proj
+                spec_terms = tuple(str(t) for t in projector_config.get("spectral_terms", ()))
+                spec_weights = tuple(float(w) for w in projector_config.get("spectral_weights", ()))
+                hp._spectral_terms = spec_terms
+                hp._spectral_vocab = {t: idx for idx, t in enumerate(spec_terms)}
+                hp._spectral_weights = spec_weights
+                hp._spectral_weights_arr = (
+                    np.asarray(spec_weights, dtype=np.float32)
+                    if spec_weights
+                    else np.empty(0, dtype=np.float32)
+                )
+                hp._spectral_vectors = _as_f32(array_map.get("_projector_spectral_vectors"))
+                hp._spectral_basis = _as_f32(array_map.get("_projector_spectral_basis"))
+                hp._subspace_components = _as_f32(array_map.get("_projector_subspace_components"))
+                hp._subspace_weight = float(projector_config.get("subspace_weight", 0.0))
+                hp._use_subspace = bool(
+                    projector_config.get("use_subspace", hp._subspace_components is not None)
+                )
+                hp._direct_spectral = bool(projector_config.get("direct_spectral", False))
+                hp._direct_spectral_dim = int(projector_config.get("direct_spectral_dim", 0))
+                hp._context_smooth = float(projector_config.get("context_smooth", 1.0))
+                hp._rbf_landmarks = _as_f32(rbf_arr)
+                hp._rbf_gamma = float(projector_config.get("rbf_gamma", 2.5))
+                hp._rbf_weight = float(projector_config.get("rbf_weight", 0.0))
+                hp._digest = None
+                hp._fit_base_cache = {}
+                saved_hybrid = hp
+            else:
+                hyb_kwargs: Dict[str, Any] = {
+                    "backend": backend,
+                    "spectral_vectors": _as_f32(array_map.get("_projector_spectral_vectors")),
+                    "subspace_components": _as_f32(array_map.get("_projector_subspace_components")),
+                }
+                if "_projector_hybrid_tfidf_idf" in array_map:
+                    hyb_kwargs["tfidf_idf_array"] = array_map["_projector_hybrid_tfidf_idf"]
+                if "_projector_rbf_landmarks" in array_map:
+                    hyb_kwargs["rbf_landmarks"] = _as_f32(array_map["_projector_rbf_landmarks"])
+                try:
+                    saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
+                except TypeError:
+                    hyb_kwargs.pop("tfidf_idf_array", None)
+                    hyb_kwargs.pop("rbf_landmarks", None)
+                    saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
+
         if projector_config is not None:
             if projector is not None:
                 if projector_config["type"] == "hybrid" and saved_hybrid is not None:
@@ -1911,16 +2191,24 @@ class CompiledSystemOneModel:
             raise ValueError("Saved skill metadata must be a mapping")
         is_cold_skill = bool(saved_meta.get("cold_start", False))
 
-        # Reconstruct head weights
         heads: Dict[str, CompiledHeadWeights] = {}
         for name, h_info in meta["heads"].items():
             if name not in schema.fields or h_info["field_type"] != schema.fields[name].field_type:
                 raise ValueError(f"Saved head {name!r} does not match the schema")
             definition = schema.fields[name]
-            w = _as_f32(npz_file[f"{name}_w"])
+            if f"{name}_w" not in array_map or f"{name}_b" not in array_map:
+                raise ValueError(f"Saved head {name!r} is missing required weights")
+            w = _as_f32(array_map[f"{name}_w"])
             assert w is not None
-            b = npz_file[f"{name}_b"]
-            widths = (1, 2) if isinstance(definition, BooleanField) else (len(definition.options),) if hasattr(definition, "options") else (1,)
+            b_raw = array_map[f"{name}_b"]
+            b = np.asarray(b_raw, dtype=np.float32) if b_raw.dtype == np.float16 else b_raw
+            widths = (
+                (1, 2)
+                if isinstance(definition, BooleanField)
+                else (len(definition.options),)
+                if hasattr(definition, "options")
+                else (1,)
+            )
             if w.ndim != 2 or w.shape[0] not in widths or w.shape[1] != dimension or b.shape != (w.shape[0],):
                 raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
             if not np.all(np.isfinite(w)) or not np.all(np.isfinite(b)):
@@ -1932,11 +2220,11 @@ class CompiledSystemOneModel:
                 raise ValueError(f"Saved head {name!r} uses an unsupported conformal score")
             if isinstance(definition, (ChoiceField, MultiChoiceField)) and tuple(h_info.get("options", ())) != definition.options:
                 raise ValueError(f"Saved head {name!r} options do not match the schema")
-            p_mat = _as_f32(npz_file[f"{name}_P"]) if f"{name}_P" in npz_file else None
-            b_mat = _as_f32(npz_file[f"{name}_B"]) if f"{name}_B" in npz_file else None
+            p_mat = _as_f32(array_map[f"{name}_P"]) if f"{name}_P" in array_map else None
+            b_mat = _as_f32(array_map[f"{name}_B"]) if f"{name}_B" in array_map else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (p_mat, b_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite covariance")
-            calib_scores_arr = npz_file[f"{name}_calib_scores"] if f"{name}_calib_scores" in npz_file else None
+            calib_scores_arr = array_map[f"{name}_calib_scores"] if f"{name}_calib_scores" in array_map else None
             calib_scores = tuple(float(s) for s in calib_scores_arr) if calib_scores_arr is not None else ()
             if any(not math.isfinite(score) or score < 0 for score in calib_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid calibration scores")
@@ -1972,7 +2260,7 @@ class CompiledSystemOneModel:
             proto_thresh = float(h_info.get("prototype_threshold", 0.0))
             if not math.isfinite(proto_thresh) or proto_thresh < 0:
                 raise ValueError(f"Saved head {name!r} has an invalid prototype_threshold")
-            raw_proto_arr = npz_file[f"{name}_prototypes"] if f"{name}_prototypes" in npz_file else None
+            raw_proto_arr = array_map[f"{name}_prototypes"] if f"{name}_prototypes" in array_map else None
             proto_mat = _as_f32(raw_proto_arr)
             if proto_mat is not None and not np.all(np.isfinite(proto_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite prototypes")
@@ -1994,7 +2282,7 @@ class CompiledSystemOneModel:
                     w_norm = max(1e-12, float(np.linalg.norm(w[0])))
                     w_u = (w[0] / w_norm).astype(np.float32)
                     proto_mat = np.vstack([-w_u, w_u]).astype(np.float32)
-            proto_scores_arr = npz_file[f"{name}_proto_scores"] if f"{name}_proto_scores" in npz_file else None
+            proto_scores_arr = array_map[f"{name}_proto_scores"] if f"{name}_proto_scores" in array_map else None
             proto_scores = tuple(float(s) for s in proto_scores_arr) if proto_scores_arr is not None else ()
             if any(not math.isfinite(score) or score < 0 for score in proto_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid prototype calibration scores")
@@ -2006,10 +2294,10 @@ class CompiledSystemOneModel:
             ):
                 raise ValueError(f"Saved head {name!r} has invalid cluster_assignments")
             cluster_assign = tuple(int(c) for c in raw_assign) if isinstance(raw_assign, (list, tuple)) else ()
-            coarse_w = _as_f32(npz_file[f"{name}_coarse_w"]) if f"{name}_coarse_w" in npz_file else None
-            coarse_b = npz_file[f"{name}_coarse_b"] if f"{name}_coarse_b" in npz_file else None
-            fine_w = _as_f32(npz_file[f"{name}_fine_w"]) if f"{name}_fine_w" in npz_file else None
-            fine_b = npz_file[f"{name}_fine_b"] if f"{name}_fine_b" in npz_file else None
+            coarse_w = _as_f32(array_map[f"{name}_coarse_w"]) if f"{name}_coarse_w" in array_map else None
+            coarse_b = _as_f32(array_map[f"{name}_coarse_b"]) if f"{name}_coarse_b" in array_map else None
+            fine_w = _as_f32(array_map[f"{name}_fine_w"]) if f"{name}_fine_w" in array_map else None
+            fine_b = _as_f32(array_map[f"{name}_fine_b"]) if f"{name}_fine_b" in array_map else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (coarse_w, coarse_b, fine_w, fine_b)):
                 raise ValueError(f"Saved head {name!r} contains non-finite hierarchical weights")
             if is_hier:
@@ -2019,10 +2307,17 @@ class CompiledSystemOneModel:
                     raise ValueError(f"Saved head {name!r} has out-of-range cluster_assignments")
 
             exemplar_arrays = {
-                suffix: (_as_f32(npz_file[f"{name}_{suffix}"]) if npz_file[f"{name}_{suffix}"].dtype == np.float16 else npz_file[f"{name}_{suffix}"])
+                suffix: (
+                    _as_f32(array_map[f"{name}_{suffix}"])
+                    if array_map[f"{name}_{suffix}"].dtype == np.float16
+                    else array_map[f"{name}_{suffix}"]
+                )
                 for suffix in EXEMPLAR_ARRAYS
-                if f"{name}_{suffix}" in npz_file
+                if f"{name}_{suffix}" in array_map
             }
+            for ex_arr in exemplar_arrays.values():
+                if not np.all(np.isfinite(ex_arr)):
+                    raise ValueError(f"Saved head {name!r} contains non-finite exemplar arrays")
             if "exemplar_state" in h_info:
                 exemplar_meta = h_info["exemplar_state"]
                 if not isinstance(exemplar_meta, Mapping) or (
@@ -2043,7 +2338,7 @@ class CompiledSystemOneModel:
                 field_type=h_info["field_type"],
                 weights=w,
                 biases=b,
-                temperature=float(h_info.get("temperature", 1.0)),
+                temperature=temperature,
                 conformal_quantile=float(h_info.get("conformal_quantile", 0.0)),
                 score_method=h_info.get("score_method", "aps"),
                 options=tuple(h_info.get("options", [])),
@@ -2076,9 +2371,327 @@ class CompiledSystemOneModel:
             dimension=dimension,
             projector=projector,
             backend=backend,
-            metadata=saved_meta,
+            metadata=dict(saved_meta),
             forgetting_factor=float(saved_meta.get("forgetting_factor", 0.995)),
             recency_weighted=bool(saved_meta.get("recency_weighted", False)),
+        )
+
+    @staticmethod
+    def _validate_projector_and_budget(
+        schema: DecisionSchema,
+        dimension: int,
+        projector_config: Optional[Mapping[str, Any]],
+        *,
+        cov_fields: int,
+        max_runtime_bytes: int,
+    ) -> Tuple[Optional[Any], Optional[Any], int]:
+        """Validates projector configuration and estimates bounded runtime memory allocation."""
+        widths = sum(max(2, len(getattr(f, "options", ()))) for f in schema.fields.values())
+        runtime_bytes = 16 * cov_fields * (dimension + 1) ** 2 + 16 * widths * (dimension + 1)
+        saved_tfidf = None
+        saved_prag = None
+        if projector_config is not None:
+            kind = projector_config["type"]
+            if kind == "tfidf":
+                tfidf_terms, _ = TfidfProjector.validate_header_config(
+                    projector_config, allow_missing_idf=True
+                )
+                if len(tfidf_terms) != dimension:
+                    raise ValueError("Saved TF-IDF dimension does not match the skill")
+                if "idf" in projector_config:
+                    saved_tfidf = TfidfProjector.from_config(projector_config)
+            if kind == "pragmatic_tfidf":
+                _, _, prag_total_dim = PragmaticCompositeProjector.validate_header_config(
+                    projector_config, allow_missing_idf=True
+                )
+                if prag_total_dim != dimension:
+                    raise ValueError("Saved pragmatic TF-IDF dimension does not match the skill")
+                runtime_bytes += 64 * prag_total_dim
+                base_cfg = projector_config.get("base_tfidf", {})
+                if "prag_idf" in projector_config and isinstance(base_cfg, dict) and "idf" in base_cfg:
+                    saved_prag = PragmaticCompositeProjector.from_config(projector_config)
+            if kind == "deterministic" and projector_config.get("dimension") != dimension:
+                raise ValueError("Saved projector dimension does not match the skill")
+            if kind == "hybrid":
+                from system1.core.embeddings import HybridProjector
+
+                if set(projector_config) - HybridProjector.CONFIG_KEYS:
+                    raise ValueError("Saved hybrid projector contains unsupported settings")
+                sparse, dense = projector_config.get("sparse_dim"), projector_config.get("dense_dim")
+                direct_spec = (
+                    projector_config.get("direct_spectral_dim", 0)
+                    if projector_config.get("direct_spectral")
+                    else 0
+                )
+                inline_rbf_rows = len(projector_config.get("rbf_landmarks") or ())
+                if (
+                    type(sparse) is not int
+                    or type(dense) is not int
+                    or sparse <= 0
+                    or dense <= 0
+                    or type(direct_spec) is not int
+                    or direct_spec < 0
+                    or sparse + dense + direct_spec + inline_rbf_rows > dimension
+                ):
+                    raise ValueError("Saved hybrid projector dimensions do not match the skill")
+                runtime_bytes += 16 * 25000 * dense
+                runtime_bytes += 64 * len(projector_config.get("tfidf_terms", ()))
+                runtime_bytes += 16 * len(projector_config.get("spectral_terms", ())) * dense
+                runtime_bytes += 8 * sum(
+                    len(row)
+                    for key in ("spectral_vectors", "subspace_components", "rbf_landmarks")
+                    for row in (projector_config.get(key) or ())
+                )
+        if runtime_bytes > max_runtime_bytes:
+            raise ValueError("Saved skill runtime allocation exceeds memory budget")
+        return saved_tfidf, saved_prag, runtime_bytes
+
+    @classmethod
+    def _from_v3_buffer(
+        cls,
+        buf: Union[bytes, bytearray, memoryview, mmap.mmap],
+        buf_len: int,
+        projector: Optional[Any] = None,
+        backend: str = "numpy",
+    ) -> CompiledSystemOneModel:
+        """Preflight-validates and constructs a zero-copy CompiledSystemOneModel over a v3 buffer."""
+        if buf_len < 16 or buf_len > MAX_SKILL_BYTES_V3:
+            raise ValueError("Saved v3 skill file size is out of bounds")
+        magic, hdr_len = _V3_HDR_STRUCT.unpack_from(buf, 0)
+        if magic != MAGIC_HEADER_V3:
+            raise ValueError("Invalid System 1 v3 Model binary: missing or invalid magic header")
+        if hdr_len == 0 or hdr_len > MAX_SKILL_HEADER_BYTES_V3:
+            raise ValueError("Saved v3 skill header exceeds size limit")
+        header_end = 16 + hdr_len
+        if buf_len < header_end:
+            raise ValueError("Corrupted System 1 v3 Model binary: truncated header")
+
+        try:
+            header_json = bytes(buf[16:header_end]).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Corrupted System 1 v3 header encoding: {exc}") from exc
+
+        def _reject_nonfinite(tok: str) -> Any:
+            raise ValueError(f"Saved v3 skill header contains non-finite constant: {tok!r}")
+
+        meta = json.loads(header_json, parse_constant=_reject_nonfinite)
+        if not isinstance(meta, dict) or meta.get("version") != 3:
+            raise ValueError("Unsupported or inconsistent saved v3 skill format version")
+        if "embed_vocab" in meta and type(meta["embed_vocab"]) is not bool:
+            raise ValueError("Saved v3 skill embed_vocab flag must be a boolean")
+
+        fields_data = meta["schema_dict"]["fields"]
+        if not isinstance(fields_data, dict) or not 0 < len(fields_data) <= MAX_SKILL_FIELDS_V3:
+            raise ValueError("Saved v3 skill field count exceeds limits")
+        for definition in fields_data.values():
+            if len(definition.get("options", ())) > MAX_SKILL_OPTIONS:
+                raise ValueError("Saved v3 skill option count exceeds limits")
+        schema = DecisionSchema.from_dict(meta["schema_dict"])
+        if meta.get("schema_digest") != schema.schema_digest():
+            raise ValueError("Saved skill schema digest does not match its definition")
+        dimension = meta.get("dimension")
+        if type(dimension) is not int or not 0 < dimension <= MAX_SKILL_DIMENSION:
+            raise ValueError("Saved skill dimension must be a positive integer within limits")
+        if set(meta.get("heads", ())) != set(schema.fields):
+            raise ValueError("Saved skill heads must exactly match its schema")
+
+        raw_tensors = meta.get("tensors")
+        if not isinstance(raw_tensors, dict) or len(raw_tensors) > 16 * MAX_SKILL_FIELDS_V3 + 32:
+            raise ValueError("Saved v3 skill tensor manifest is invalid or exceeds limit")
+
+        allowed_names = {
+            "_projector_tfidf_idf",
+            "_projector_prag_base_idf",
+            "_projector_prag_idf",
+            "_projector_spectral_vectors",
+            "_projector_spectral_basis",
+            "_projector_subspace_components",
+            "_projector_rbf_landmarks",
+            "_projector_hybrid_tfidf_idf",
+            "_projector_dense_table",
+        }
+        head_suffixes = (
+            "w",
+            "b",
+            "P",
+            "B",
+            "calib_scores",
+            "prototypes",
+            "proto_scores",
+            "coarse_w",
+            "coarse_b",
+            "fine_w",
+            "fine_b",
+            *EXEMPLAR_ARRAYS,
+        )
+        for fname in schema.fields:
+            for suf in head_suffixes:
+                allowed_names.add(f"{fname}_{suf}")
+
+        max_dim_bound = max(MAX_SKILL_CALIBRATION_SCORES, 250_000)
+        total_array_bytes = 0
+        intervals: List[Tuple[int, int, str]] = []
+        for tname, spec in raw_tensors.items():
+            if not isinstance(tname, str) or tname not in allowed_names:
+                raise ValueError(f"Saved v3 skill contains unexpected tensor: {tname!r}")
+            if not isinstance(spec, Mapping):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} spec must be a mapping")
+            dt_name = spec.get("dtype")
+            if not isinstance(dt_name, str) or dt_name not in _ALLOWED_V3_DTYPES:
+                raise ValueError(f"Saved v3 skill tensor {tname!r} has unsupported dtype {dt_name!r}")
+            dt = np.dtype(dt_name)
+            shape = spec.get("shape")
+            if (
+                not isinstance(shape, list)
+                or len(shape) > 3
+                or any(type(d) is not int or d < 0 or d > max_dim_bound for d in shape)
+            ):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} has invalid shape {shape!r}")
+            count = 1
+            for d in shape:
+                count *= d
+            expected_nbytes = count * dt.itemsize
+            nbytes = spec.get("nbytes")
+            if (
+                type(nbytes) is not int
+                or nbytes != expected_nbytes
+                or nbytes < 0
+                or nbytes > MAX_SKILL_ARRAY_BYTES_V3
+            ):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} nbytes mismatch")
+            offset = spec.get("offset")
+            if (
+                type(offset) is not int
+                or offset < header_end
+                or (offset % 64) != 0
+                or offset + nbytes > buf_len
+            ):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} offset is misaligned or out of bounds")
+            if (nbytes >= 65536 or tname == "_projector_dense_table") and (offset % S1M_V3_PAGE_SIZE) != 0:
+                raise ValueError(f"Saved v3 skill tensor {tname!r} is not {S1M_V3_PAGE_SIZE}-byte page aligned")
+            total_array_bytes += nbytes
+            if total_array_bytes > MAX_SKILL_ARRAY_BYTES_V3:
+                raise ValueError("Saved v3 skill array payload exceeds memory budget")
+            if nbytes > 0:
+                intervals.append((offset, offset + nbytes, tname))
+
+        intervals.sort()
+        prev_end = header_end
+        for start, end, tname in intervals:
+            if start < prev_end:
+                raise ValueError(f"Saved v3 skill tensor {tname!r} overlaps another tensor region")
+            prev_end = end
+
+        cov_fields = sum(
+            1
+            for fname in schema.fields
+            if f"{fname}_P" in raw_tensors or f"{fname}_B" in raw_tensors
+        )
+        projector_config = meta.get("projector")
+        saved_tfidf, saved_prag, _ = cls._validate_projector_and_budget(
+            schema,
+            dimension,
+            projector_config,
+            cov_fields=cov_fields,
+            max_runtime_bytes=MAX_SKILL_RUNTIME_BYTES_V3,
+        )
+
+        views: Dict[str, np.ndarray] = {}
+        try:
+            for tname, spec in raw_tensors.items():
+                shape = tuple(spec["shape"])
+                dt = np.dtype(spec["dtype"])
+                count = int(math.prod(shape)) if shape else 1
+                if count == 0:
+                    arr = np.empty(shape, dtype=dt)
+                else:
+                    arr = np.frombuffer(buf, dtype=dt, count=count, offset=spec["offset"]).reshape(shape)
+                arr.setflags(write=False)
+                views[tname] = arr
+
+            return cls._reconstruct_model_from_parts(
+                meta,
+                views,
+                projector=projector,
+                backend=backend,
+                schema=schema,
+                dimension=dimension,
+                projector_config=projector_config,
+                saved_tfidf=saved_tfidf,
+                saved_prag=saved_prag,
+                format_version=3,
+            )
+        except Exception:
+            views.clear()
+            raise
+
+    @classmethod
+    def from_bytes(
+        cls,
+        data: bytes,
+        projector: Optional[Any] = None,
+        backend: str = "numpy",
+    ) -> CompiledSystemOneModel:
+        """Deserializes a CompiledSystemOneModel from .s1m binary bytes (v1, v2, or v3)."""
+        if len(data) >= 8 and data[:8] == MAGIC_HEADER_V3:
+            return cls._from_v3_buffer(memoryview(data), len(data), projector=projector, backend=backend)
+
+        if len(data) > MAX_SKILL_BYTES:
+            raise ValueError("Saved skill file exceeds size limit")
+        if len(data) < 8 or data[:4] not in (b"S1M\x01", MAGIC_HEADER):
+            raise ValueError("Invalid System 1 Model binary: missing or invalid magic header")
+
+        header_len = struct.unpack(">I", data[4:8])[0]
+        if header_len > MAX_SKILL_HEADER_BYTES:
+            raise ValueError("Saved skill header exceeds size limit")
+        header_end = 8 + header_len
+        if len(data) < header_end:
+            raise ValueError("Corrupted System 1 Model binary: truncated header")
+
+        header_json = data[8:header_end].decode("utf-8")
+        meta = json.loads(header_json)
+        if meta.get("version") not in (1, 2) or meta["version"] != data[3]:
+            raise ValueError("Unsupported or inconsistent saved skill format version")
+
+        fields_data = meta["schema_dict"]["fields"]
+        if not isinstance(fields_data, dict) or not 0 < len(fields_data) <= MAX_SKILL_FIELDS:
+            raise ValueError("Saved skill field count exceeds limits")
+        for definition in fields_data.values():
+            if len(definition.get("options", ())) > MAX_SKILL_OPTIONS:
+                raise ValueError("Saved skill option count exceeds limits")
+        schema = DecisionSchema.from_dict(meta["schema_dict"])
+        if meta.get("schema_digest") != schema.schema_digest():
+            raise ValueError("Saved skill schema digest does not match its definition")
+        dimension = meta["dimension"]
+        if type(dimension) is not int or not 0 < dimension <= MAX_SKILL_DIMENSION:
+            raise ValueError("Saved skill dimension must be a positive integer within limits")
+        if set(meta["heads"]) != set(schema.fields):
+            raise ValueError("Saved skill heads must exactly match its schema")
+        projector_config = meta.get("projector")
+        cov_fields = (
+            len(schema.fields)
+            if (projector_config is None or projector_config.get("type") == "deterministic")
+            else 0
+        )
+        saved_tfidf, saved_prag, runtime_bytes = cls._validate_projector_and_budget(
+            schema,
+            dimension,
+            projector_config,
+            cov_fields=cov_fields,
+            max_runtime_bytes=MAX_SKILL_RUNTIME_BYTES,
+        )
+        npz_file = _read_skill_arrays(data[header_end:], schema, dimension, runtime_bytes)
+        return cls._reconstruct_model_from_parts(
+            meta,
+            npz_file,
+            projector=projector,
+            backend=backend,
+            schema=schema,
+            dimension=dimension,
+            projector_config=projector_config,
+            saved_tfidf=saved_tfidf,
+            saved_prag=saved_prag,
+            format_version=int(meta["version"]),
         )
 
     @classmethod
@@ -2087,11 +2700,32 @@ class CompiledSystemOneModel:
         path: Union[str, Path],
         projector: Optional[Any] = None,
         backend: str = "numpy",
+        *,
+        mmap_mode: bool = True,
     ) -> CompiledSystemOneModel:
-        """Loads a CompiledSystemOneModel from a .s1m file."""
+        """Loads a CompiledSystemOneModel from a .s1m file (using zero-copy mmap for S1M\\x03)."""
         target = Path(path)
         if not target.is_file():
             raise FileNotFoundError(f"Model file not found: {target}")
+        file_size = target.stat().st_size
+        with open(target, "rb") as _hdr_fh:
+            magic8 = _hdr_fh.read(8)
+        if magic8 == MAGIC_HEADER_V3:
+            if file_size > MAX_SKILL_BYTES_V3:
+                raise ValueError("Saved v3 skill file exceeds size limit")
+            if mmap_mode:
+                fh = open(target, "rb")
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                try:
+                    model = cls._from_v3_buffer(mm, len(mm), projector=projector, backend=backend)
+                except Exception:
+                    cls._close_mmap_handle(mm, fh)
+                    raise
+                model._mmap_obj = mm
+                model._mmap_fh = fh
+                return model
+            return cls.from_bytes(target.read_bytes(), projector=projector, backend=backend)
+
         data = _read_skill_bytes(target)
         return cls.from_bytes(data, projector=projector, backend=backend)
 
@@ -4609,6 +5243,8 @@ class SystemOneCompiler:
         proto_blend: Optional[float] = None,
         fisher_reg: Optional[float] = None,
         soft_targets: Optional[Mapping[str, Sequence[Sequence[float]]]] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
     ) -> CompiledSystemOneModel:
         """Compiles model and writes directly to target .s1m binary file."""
         model = self.compile(
@@ -4630,7 +5266,11 @@ class SystemOneCompiler:
             fisher_reg=fisher_reg,
             soft_targets=soft_targets,
         )
-        model.save(output_path)
+        model.save(
+            output_path,
+            format_version=format_version,
+            embed_vocab=embed_vocab,
+        )
         return model
 
     @classmethod
@@ -4639,9 +5279,16 @@ class SystemOneCompiler:
         path: Union[str, Path],
         projector: Optional[Any] = None,
         backend: str = "numpy",
+        *,
+        mmap_mode: bool = True,
     ) -> CompiledSystemOneModel:
         """Loads a compiled model from a .s1m file."""
-        return CompiledSystemOneModel.load(path, projector=projector, backend=backend)
+        return CompiledSystemOneModel.load(
+            path,
+            projector=projector,
+            backend=backend,
+            mmap_mode=mmap_mode,
+        )
 
 
 __all__ = [
@@ -4649,6 +5296,9 @@ __all__ = [
     "CompiledSystemOneModel",
     "CompiledHeadWeights",
     "MAGIC_HEADER",
+    "MAGIC_HEADER_V3",
+    "S1M_V3_PAGE_SIZE",
+    "MAX_SKILL_FIELDS_V3",
     "VALID_SEMANTIC_MODES",
     "compute_strict_loo_weights",
 ]

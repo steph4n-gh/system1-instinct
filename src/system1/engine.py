@@ -52,7 +52,7 @@ from system1.core import (
     ScoreField,
     SystemOneModel,
 )
-from system1.core.model import _stable_sigmoid
+from system1.core.model import FastDecisionCallable, PackedMultiQuestionKernel, _stable_sigmoid
 from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
 from system1.core.telemetry import TelemetryProjector
 from system1.ledger import ActionLedger, LedgerWriteError
@@ -664,6 +664,7 @@ class SystemOneEngine:
         self.model_path: Optional[Path] = Path(model_path).resolve() if model_path is not None else None
         self.auto_reload: bool = bool(auto_reload)
         self._model_stat: Optional[Tuple[int, int, str]] = None
+        self._packed_kernel_cache: Optional[Tuple[Tuple[Any, ...], Any]] = None
 
         if model is None and self.model_path is not None and self.model_path.exists():
             from system1.compiler import CompiledSystemOneModel, _read_skill_bytes
@@ -738,6 +739,7 @@ class SystemOneEngine:
     def _sync_from_model(self, model: Any) -> None:
         self.model = model
         self.model_version = max(getattr(self, "model_version", 1), int(getattr(model, "model_version", 1)))
+        self._packed_kernel_cache = None
         self.dimension = getattr(model, "dimension", self.dimension)
         self.backend = getattr(model, "backend", self.backend)
         self.projector = getattr(model, "projector", self.projector)
@@ -1080,6 +1082,7 @@ class SystemOneEngine:
             self.model_version = max(self.model_version, int(getattr(self.model, "model_version", 1))) + 1
             if hasattr(self.model, "model_version"):
                 self.model.model_version = self.model_version
+            self._packed_kernel_cache = None
             if getattr(self.model, "cache", None) is not None:
                 self.model.cache.clear()
             if self.cache is not None:
@@ -1427,6 +1430,7 @@ class SystemOneEngine:
             self.model_version = max(self.model_version, int(getattr(self.model, "model_version", 1))) + 1
             if hasattr(self.model, "model_version"):
                 self.model.model_version = self.model_version
+            self._packed_kernel_cache = None
             if self.cache is not None:
                 self.cache.clear()
             if hasattr(self.model, "cache") and getattr(self.model, "cache", None) is not None:
@@ -1512,6 +1516,7 @@ class SystemOneEngine:
                         )
                 cert = jcal.calibrate(calib_probs, [lbl for _, lbl in calibration_examples])
                 self.joint_calibrator = jcal
+                self._packed_kernel_cache = None
                 if self.cache is not None:
                     self.cache.clear()
                 if hasattr(self.model, "cache") and getattr(self.model, "cache", None) is not None:
@@ -3003,6 +3008,7 @@ class SystemOneEngine:
                                 rcp.residuals = np.full(20, 0.05 * span, dtype=np.float64)
                                 rcp.is_calibrated = True
 
+            self._packed_kernel_cache = None
             if self.use_cache and self.cache is not None:
                 if embedding is None:
                     self.cache.evict_prompt(prompt)
@@ -3090,6 +3096,7 @@ class SystemOneEngine:
 
             if int(res_info.get("adapted_samples", 0)) > 0:
                 self.model_version += 1
+                self._packed_kernel_cache = None
                 if hasattr(self.model, "model_version"):
                     self.model.model_version = self.model_version
                 if self.use_cache and self.cache is not None:
@@ -3375,9 +3382,100 @@ class SystemOneEngine:
                     compiled._learned_prompt_overrides[p_k] = dict(f_map)
             return compiled
 
-    def to_bytes(self, include_covariance: bool = False, *, compact: Optional[bool] = None) -> bytes:
+    def _packed_kernel_cache_key(self, storage_mode: str) -> Tuple[Any, ...]:
+        cal_sig = tuple(
+            (
+                name,
+                float(getattr(cal, "temperature", 1.0)),
+                tuple(
+                    np.asarray(getattr(cal, "logit_adjustments", ()), dtype=np.float64)
+                    .ravel()
+                    .tolist()
+                )
+                if getattr(cal, "logit_adjustments", None) is not None
+                else (),
+            )
+            for name, cal in sorted(self.calibrators.items())
+        )
+        cp_sig = tuple(
+            (
+                name,
+                float(getattr(cp, "q_hat", 0.0)),
+                int(len(getattr(cp, "calibration_scores", ()))),
+                str(getattr(cp, "score_method", "")),
+                float(getattr(cp, "calibrated_margin_threshold", 0.0)),
+            )
+            for name, cp in sorted(self.conformal_predictors.items())
+        )
+        rcp_sig = tuple(
+            (
+                name,
+                float(getattr(rcp, "q_hat", 0.0)),
+                int(len(getattr(rcp, "residuals", ()))),
+            )
+            for name, rcp in sorted(getattr(self, "regression_conformal_predictors", {}).items())
+        )
+        return (
+            str(storage_mode),
+            int(getattr(self, "model_version", 1)),
+            int(getattr(self, "policy_epoch", 0)),
+            float(self.default_alpha),
+            bool(self.strict_mode),
+            bool(getattr(self, "enable_margin_gating", False)),
+            self.margin_threshold,
+            getattr(self, "relative_odds_ratio", None),
+            getattr(self, "confidence_floor_tau0", None),
+            bool(getattr(self, "recency_weighted", False)),
+            cal_sig,
+            cp_sig,
+            rcp_sig,
+        )
+
+    def compile_packed_kernel(self, *, storage_mode: str = "float32") -> PackedMultiQuestionKernel:
+        """Compiles and caches a fused multi-question inference kernel for this engine."""
+        with self._lock:
+            cache_key = self._packed_kernel_cache_key(storage_mode)
+            cached = getattr(self, "_packed_kernel_cache", None)
+            if cached is not None and cached[0] == cache_key:
+                return cached[1]
+            kernel = PackedMultiQuestionKernel.from_engine(self, storage_mode=storage_mode)
+            self._packed_kernel_cache = (cache_key, kernel)
+            return kernel
+
+    def compile_callable(self, *, storage_mode: str = "float32") -> FastDecisionCallable:
+        """Returns a zero-overhead decision callable backed by a packed multi-question kernel."""
+        return FastDecisionCallable(self, storage_mode=storage_mode)
+
+    def close(self) -> None:
+        """Releases any memory-mapped resources held by the underlying model."""
+        with self._lock:
+            self._packed_kernel_cache = None
+            model = getattr(self, "model", None)
+            close_fn = getattr(model, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+    def __enter__(self) -> SystemOneEngine:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def to_bytes(
+        self,
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
+    ) -> bytes:
         """Serializes the engine's model and calibration state into compact .s1m binary bytes."""
-        return self.to_compiled_model().to_bytes(include_covariance=include_covariance, compact=compact)
+        return self.to_compiled_model().to_bytes(
+            include_covariance=include_covariance,
+            compact=compact,
+            format_version=format_version,
+            embed_vocab=embed_vocab,
+        )
 
     def save(
         self,
@@ -3385,9 +3483,17 @@ class SystemOneEngine:
         include_covariance: bool = False,
         *,
         compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
     ) -> None:
         """Saves the engine's model, calibration, and online state to a portable .s1m file."""
-        self.to_compiled_model().save(path, include_covariance=include_covariance, compact=compact)
+        self.to_compiled_model().save(
+            path,
+            include_covariance=include_covariance,
+            compact=compact,
+            format_version=format_version,
+            embed_vocab=embed_vocab,
+        )
 
     @classmethod
     def from_bytes(
@@ -3433,6 +3539,7 @@ class SystemOneEngine:
         schema: Optional[Union[DecisionSchema, Type[DecisionSchema]]] = None,
         projector: Optional[Any] = None,
         backend: str = "auto",
+        mmap_mode: bool = True,
         **kwargs: Any,
     ) -> SystemOneEngine:
         """Loads a SystemOneEngine directly from a saved .s1m file."""
@@ -3442,6 +3549,7 @@ class SystemOneEngine:
             path,
             projector=projector,
             backend="numpy" if backend == "auto" else backend,
+            mmap_mode=mmap_mode,
         )
         if "strict_mode" not in kwargs:
             kwargs["strict_mode"] = (
@@ -4339,6 +4447,15 @@ class SystemOneEngine:
         )
 
 
+def compile_engine_callable(
+    engine: SystemOneEngine,
+    *,
+    storage_mode: str = "float32",
+) -> FastDecisionCallable:
+    """Compiles a low-overhead fast decision callable for a SystemOneEngine."""
+    return engine.compile_callable(storage_mode=storage_mode)
+
+
 # Compatibility aliases
 ReflexEngine = SystemOneEngine
 System1Engine = SystemOneEngine
@@ -4347,6 +4464,7 @@ __all__ = [
     "SystemOneEngine",
     "System1Engine",
     "ReflexEngine",
+    "compile_engine_callable",
     "DecisionResult",
     "BenchmarkReport",
     "FieldEvaluationMetrics",

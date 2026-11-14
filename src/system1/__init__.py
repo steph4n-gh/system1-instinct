@@ -34,6 +34,9 @@ from system1.core import (
     StaticEmbeddingTable,
     SubwordSemanticEmbeddings,
     SystemOneModel,
+    PackedMultiQuestionKernel,
+    FastDecisionOutput,
+    FastDecisionCallable,
     SchemaMeta,
     clear_embedding_caches,
     set_embedding_cache_maxsize,
@@ -372,6 +375,7 @@ _MODULE_MAP = {
     "SystemOneEngine": "system1.engine",
     "System1Engine": "system1.engine",
     "ReflexEngine": "system1.engine",
+    "compile_engine_callable": "system1.engine",
     "DecisionResult": "system1.engine",
     "BenchmarkReport": "system1.engine",
     "FieldEvaluationMetrics": "system1.engine",
@@ -441,12 +445,14 @@ _MODULE_MAP = {
     "systemone": "system1.compat.typesafe",
     "batch_system_one": "system1.compat.typesafe",
     "batch_systemone": "system1.compat.typesafe",
+    "compile_typesafe_callable": "system1.compat.typesafe",
     "patch_typesafe": "system1.compat.typesafe",
     "DotDict": "system1.compat.typesafe",
     "ZeroEgressViolationError": "system1.compat.typesafe",
     # compiler
     "SystemOneCompiler": "system1.compiler",
     "CompiledSystemOneModel": "system1.compiler",
+    "MAGIC_HEADER_V3": "system1.compiler",
     "compute_strict_loo_weights": "system1.core.embeddings",
     # cutover
     "AutoCutoverLifecycle": "system1.cutover",
@@ -514,6 +520,7 @@ __all__ = [
     "SystemOneEngine",
     "System1Engine",
     "ReflexEngine",
+    "compile_engine_callable",
     "DecisionResult",
     "BenchmarkReport",
     "FieldEvaluationMetrics",
@@ -612,6 +619,9 @@ __all__ = [
     "set_embedding_cache_maxsize",
     "ModelInferenceResult",
     "RawFieldEvaluation",
+    "PackedMultiQuestionKernel",
+    "FastDecisionOutput",
+    "FastDecisionCallable",
     # TypeSafe Compatibility
     "TypeSafeClient",
     "Client",
@@ -638,6 +648,7 @@ __all__ = [
     # Compiler
     "SystemOneCompiler",
     "CompiledSystemOneModel",
+    "MAGIC_HEADER_V3",
     "compute_strict_loo_weights",
     # Auto-Cutover Lifecycle
     "AutoCutoverLifecycle",
