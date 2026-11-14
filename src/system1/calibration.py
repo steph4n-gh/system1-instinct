@@ -2480,12 +2480,756 @@ class SequentialRiskMonitor:
         return out
 
 
+# ---------------------------------------------------------------------------
+# Wave 3: Pure-NumPy Decision Utility, Ordinal Calibration & Platt/Beta Head
+# ---------------------------------------------------------------------------
+
+
+def _expit_np(x: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+    """Numerically bounded pure-NumPy logistic sigmoid."""
+    arr = np.asarray(x, dtype=np.float64)
+    clipped = np.clip(arr, -60.0, 60.0)
+    out = 1.0 / (1.0 + np.exp(-clipped))
+    if np.ndim(x) == 0:
+        return float(out)
+    return out
+
+
+def _softmax_np(logits: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically stable pure-NumPy softmax."""
+    arr = np.asarray(logits, dtype=np.float64)
+    shifted = arr - np.max(arr, axis=axis, keepdims=True)
+    exps = np.exp(np.clip(shifted, -60.0, 60.0))
+    denom = np.maximum(np.sum(exps, axis=axis, keepdims=True), 1e-12)
+    return exps / denom
+
+
+def _minimize_lbfgs_np(
+    fun: Callable[[np.ndarray], Tuple[float, np.ndarray]],
+    x0: np.ndarray,
+    *,
+    bounds: Optional[Sequence[Tuple[Optional[float], Optional[float]]]] = None,
+    maxiter: int = 250,
+    gtol: float = 1e-6,
+    ftol: float = 1e-12,
+    m: int = 10,
+) -> Tuple[np.ndarray, float, int]:
+    """Pure-NumPy box-projected L-BFGS optimizer with Armijo backtracking line search."""
+    x = np.asarray(x0, dtype=np.float64).copy().ravel()
+    n = x.size
+    if bounds is not None:
+        if len(bounds) != n:
+            raise ValueError(f"Expected {n} bounds entries, got {len(bounds)}")
+        lb = np.array([-np.inf if lo is None else float(lo) for lo, _ in bounds], dtype=np.float64)
+        ub = np.array([np.inf if hi is None else float(hi) for _, hi in bounds], dtype=np.float64)
+    else:
+        lb = np.full(n, -np.inf, dtype=np.float64)
+        ub = np.full(n, np.inf, dtype=np.float64)
+
+    x = np.clip(x, lb, ub)
+    f_raw, g_raw = fun(x)
+    f = float(f_raw)
+    g = np.asarray(g_raw, dtype=np.float64).ravel()
+
+    def _project_grad(xv: np.ndarray, gv: np.ndarray) -> np.ndarray:
+        pg = gv.copy()
+        pg[(xv <= lb + 1e-12) & (gv > 0.0)] = 0.0
+        pg[(xv >= ub - 1e-12) & (gv < 0.0)] = 0.0
+        return pg
+
+    history: List[Tuple[np.ndarray, np.ndarray, float]] = []
+    iters = 0
+    for iters in range(1, max(1, int(maxiter)) + 1):
+        pg = _project_grad(x, g)
+        if pg.size == 0 or float(np.max(np.abs(pg))) <= gtol:
+            break
+
+        # Two-loop L-BFGS search direction on projected gradient.
+        q = pg.copy()
+        alphas = [0.0] * len(history)
+        for idx in range(len(history) - 1, -1, -1):
+            s_i, y_i, rho_i = history[idx]
+            alpha_i = rho_i * float(np.dot(s_i, q))
+            alphas[idx] = alpha_i
+            q = q - alpha_i * y_i
+
+        if history:
+            s_last, y_last, _ = history[-1]
+            yy = float(np.dot(y_last, y_last))
+            gamma = float(np.dot(s_last, y_last)) / max(yy, 1e-12)
+            gamma = max(min(gamma, 1e6), 1e-6)
+        else:
+            gamma = 1.0
+
+        r = gamma * q
+        for idx, (s_i, y_i, rho_i) in enumerate(history):
+            beta_i = rho_i * float(np.dot(y_i, r))
+            r = r + s_i * (alphas[idx] - beta_i)
+
+        d = -r
+        d[(x <= lb + 1e-12) & (d < 0.0)] = 0.0
+        d[(x >= ub - 1e-12) & (d > 0.0)] = 0.0
+        if float(np.dot(g, d)) >= -1e-14 * max(1.0, float(np.linalg.norm(g))):
+            d = -pg
+            history.clear()
+
+        step = 1.0
+        accepted = False
+        x_next = x
+        f_next = f
+        g_next = g
+        for _ in range(36):
+            cand = np.clip(x + step * d, lb, ub)
+            delta_x = cand - x
+            slope = float(np.dot(g, delta_x))
+            if slope >= 0.0:
+                step *= 0.5
+                continue
+            cand_f, cand_g = fun(cand)
+            cand_f_f = float(cand_f)
+            if math.isfinite(cand_f_f) and cand_f_f <= f + 1e-4 * slope:
+                x_next = cand
+                f_next = cand_f_f
+                g_next = np.asarray(cand_g, dtype=np.float64).ravel()
+                accepted = True
+                break
+            step *= 0.5
+
+        if not accepted:
+            if history:
+                history.clear()
+                continue
+            break
+
+        s_vec = x_next - x
+        y_vec = g_next - g
+        rel_f = abs(f - f_next) / max(1.0, abs(f))
+        x, f, g = x_next, f_next, g_next
+        if rel_f <= ftol and float(np.max(np.abs(s_vec))) <= 1e-11:
+            break
+
+        sy = float(np.dot(s_vec, y_vec))
+        ss = float(np.dot(s_vec, s_vec))
+        if sy > 1e-10 * max(ss, 1e-12):
+            history.append((s_vec, y_vec, 1.0 / sy))
+            if len(history) > m:
+                history.pop(0)
+
+    return x, f, iters
+
+
+def should_use_soft_ordinal(n_classes: int) -> bool:
+    """Return True when soft ordinal heads apply (small ordinal schemas 2 <= K <= 5)."""
+    return 2 <= int(n_classes) <= 5
+
+
+class UtilityCalibrator:
+    """Bayes expected-cost decision rule + Conformal Risk Control (CRC) gating.
+
+    Uses pure-NumPy temperature scaling and finite-sample CRC calibration over an
+    ``(A, K)`` cost matrix ``C[action, true_class]``. When finite-sample data
+    cannot certify non-vacuous excess-risk control, ``lam_crc`` is set to
+    ``-1.0``, ``is_vacuous`` is True, and ``predict`` falls back to ``safe_action``.
+    """
+
+    def __init__(
+        self,
+        cost_matrix: Any,
+        *,
+        safe_action: Optional[int] = None,
+        alpha: float = 0.05,
+        loss_mode: str = "normalized_excess",
+        fit_temperature: bool = False,
+        temperature: float = 1.0,
+        ladder_mode: bool = False,
+    ) -> None:
+        matrix = np.asarray(cost_matrix, dtype=np.float64)
+        if matrix.ndim != 2 or matrix.shape[0] < 1 or matrix.shape[1] < 2:
+            raise ValueError(
+                f"cost_matrix must be 2D (n_actions >= 1, n_classes >= 2), got shape {matrix.shape}"
+            )
+        if not (0.0 < float(alpha) < 1.0):
+            raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+        if loss_mode not in {"normalized_excess", "indicator"}:
+            raise ValueError(f"Unsupported loss_mode {loss_mode!r}")
+
+        self.cost_matrix = matrix
+        self.n_actions, self.n_classes = matrix.shape
+        if safe_action is None:
+            self.safe_action = int(np.argmin(np.max(matrix, axis=1)))
+        else:
+            if not (0 <= int(safe_action) < self.n_actions):
+                raise ValueError(f"safe_action {safe_action} out of range [0, {self.n_actions})")
+            self.safe_action = int(safe_action)
+        self.alpha = float(alpha)
+        self.loss_mode = loss_mode
+        self.fit_temperature = bool(fit_temperature)
+        self.temperature = max(1e-3, float(temperature))
+        self.ladder_mode = bool(ladder_mode)
+
+        self.c_esc = float(np.max(self.cost_matrix[self.safe_action]))
+        self.B = float(np.max(self.cost_matrix))
+        self.denom = max(1e-9, self.B - self.c_esc)
+        self.L = np.maximum(0.0, self.cost_matrix - self.c_esc) / self.denom
+
+        self.lam_crc: float = -1.0
+        self._is_fitted: bool = False
+
+    @property
+    def is_vacuous(self) -> bool:
+        """True when CRC has no certified non-safe threshold (lam_crc < 0)."""
+        return (not self._is_fitted) or (self.lam_crc < 0.0)
+
+    def _fit_temperature(self, probs: np.ndarray, y: np.ndarray) -> float:
+        logits = np.log(np.clip(probs, 1e-12, 1.0))
+        n = logits.shape[0]
+        rows = np.arange(n)
+        y_onehot = np.zeros_like(logits)
+        y_onehot[rows, y] = 1.0
+
+        def _obj(params: np.ndarray) -> Tuple[float, np.ndarray]:
+            beta = float(params[0])
+            inv_t = math.exp(beta)
+            scaled = inv_t * logits
+            shifted = scaled - np.max(scaled, axis=1, keepdims=True)
+            exps = np.exp(np.clip(shifted, -60.0, 60.0))
+            denom = np.sum(exps, axis=1, keepdims=True)
+            log_p = shifted - np.log(np.maximum(denom, 1e-12))
+            p = exps / np.maximum(denom, 1e-12)
+            nll = -float(np.mean(log_p[rows, y])) + 0.5 * 1e-4 * (beta ** 2)
+            d_inv_t = float(np.mean(np.sum((p - y_onehot) * logits, axis=1)))
+            grad_beta = inv_t * d_inv_t + 1e-4 * beta
+            return nll, np.array([grad_beta], dtype=np.float64)
+
+        opt, _, _ = _minimize_lbfgs_np(
+            _obj,
+            np.array([0.0], dtype=np.float64),
+            bounds=[(math.log(0.1), math.log(10.0))],
+            maxiter=80,
+        )
+        return float(1.0 / math.exp(float(opt[0])))
+
+    def transform_probs(self, probs: np.ndarray) -> np.ndarray:
+        """Apply learned temperature scaling when ``temperature != 1.0``."""
+        p = np.asarray(probs, dtype=np.float64)
+        single = p.ndim == 1
+        p2 = p.reshape(1, -1) if single else p
+        if p2.shape[1] != self.n_classes:
+            raise ValueError(f"Expected {self.n_classes} classes, got {p2.shape[1]}")
+        if abs(self.temperature - 1.0) <= 1e-12:
+            scaled = p2
+        else:
+            logits = np.log(np.clip(p2, 1e-12, 1.0))
+            scaled = _softmax_np(logits / max(self.temperature, 1e-3), axis=1)
+        return scaled[0] if single else scaled
+
+    def expected_costs(self, probs: np.ndarray, *, apply_temperature: bool = True) -> np.ndarray:
+        """Return expected cost matrix product ``probs @ C.T`` of shape ``(..., A)``."""
+        p = self.transform_probs(probs) if apply_temperature else np.asarray(probs, dtype=np.float64)
+        single = p.ndim == 1
+        p2 = p.reshape(1, -1) if single else p
+        costs = p2 @ self.cost_matrix.T
+        return costs[0] if single else costs
+
+    def _apply_policy(self, probs_2d: np.ndarray, lam: float) -> np.ndarray:
+        n = probs_2d.shape[0]
+        if lam < 0.0:
+            return np.full(n, self.safe_action, dtype=np.int64)
+        a_bayes = np.argmin(probs_2d @ self.cost_matrix.T, axis=1).astype(np.int64)
+        eh_all = probs_2d @ self.L.T
+        if self.ladder_mode:
+            acts = np.full(n, self.safe_action, dtype=np.int64)
+            for i in range(n):
+                ab = int(a_bayes[i])
+                if ab <= self.safe_action:
+                    chosen = self.safe_action
+                    for cand in range(ab, self.safe_action + 1):
+                        if cand == self.safe_action or float(eh_all[i, cand]) <= lam + 1e-12:
+                            chosen = cand
+                            break
+                    acts[i] = chosen
+                else:
+                    acts[i] = ab if float(eh_all[i, ab]) <= lam + 1e-12 else self.safe_action
+            return acts
+        eh_best = eh_all[np.arange(n), a_bayes]
+        return np.where(eh_best <= lam + 1e-12, a_bayes, self.safe_action).astype(np.int64)
+
+    def fit_crc(
+        self,
+        probs_cal: np.ndarray,
+        y_cal: np.ndarray,
+        alpha: Optional[float] = None,
+    ) -> float:
+        """Select largest threshold ``lam`` in ``[0, 1]`` satisfying CRC bound ``<= alpha``."""
+        eff_alpha = self.alpha if alpha is None else float(alpha)
+        if not (0.0 < eff_alpha < 1.0):
+            raise ValueError(f"alpha must lie in (0, 1), got {eff_alpha!r}")
+        p_cal = self.transform_probs(np.asarray(probs_cal, dtype=np.float64))
+        y_arr = np.asarray(y_cal, dtype=np.int64).ravel()
+        if p_cal.ndim != 2 or p_cal.shape[1] != self.n_classes:
+            raise ValueError(f"probs_cal must have shape (N, {self.n_classes}), got {p_cal.shape}")
+        n = y_arr.shape[0]
+        if p_cal.shape[0] != n or n == 0 or (1.0 / float(n + 1) > eff_alpha + 1e-12):
+            self.lam_crc = -1.0
+            self._is_fitted = True
+            return -1.0
+
+        lam_best = -1.0
+        for lam in np.linspace(0.0, 1.0, 501):
+            lam_f = float(lam)
+            acts = self._apply_policy(p_cal, lam_f)
+            if self.loss_mode == "indicator":
+                losses = (self.cost_matrix[acts, y_arr] > self.c_esc + 1e-12).astype(np.float64)
+            else:
+                losses = self.L[acts, y_arr]
+            crc_ub = (float(np.sum(losses)) + 1.0) / float(n + 1)
+            if crc_ub <= eff_alpha + 1e-12:
+                lam_best = lam_f
+
+        self.lam_crc = lam_best
+        self._is_fitted = True
+        return lam_best
+
+    def fit(
+        self,
+        probs: np.ndarray,
+        y_true: np.ndarray,
+        *,
+        cal_probs: Optional[np.ndarray] = None,
+        cal_y: Optional[np.ndarray] = None,
+    ) -> "UtilityCalibrator":
+        """Fit optional temperature scaling and finite-sample CRC risk threshold."""
+        p_train = np.asarray(probs, dtype=np.float64)
+        y_train = np.asarray(y_true, dtype=np.int64).ravel()
+        if p_train.ndim != 2 or p_train.shape[1] != self.n_classes:
+            raise ValueError(f"probs must have shape (N, {self.n_classes}), got {p_train.shape}")
+        if p_train.shape[0] != y_train.shape[0] or y_train.size == 0:
+            raise ValueError("probs and y_true must be non-empty and match in length")
+
+        if self.fit_temperature and y_train.size >= 8:
+            self.temperature = self._fit_temperature(p_train, y_train)
+
+        p_crc = p_train if cal_probs is None else np.asarray(cal_probs, dtype=np.float64)
+        y_crc = y_train if cal_y is None else np.asarray(cal_y, dtype=np.int64).ravel()
+        if p_crc.shape[0] != y_crc.shape[0] or y_crc.size == 0:
+            self.lam_crc = -1.0
+            self._is_fitted = True
+            return self
+        self.fit_crc(p_crc, y_crc, alpha=self.alpha)
+        return self
+
+    def calibrate(
+        self,
+        probs: np.ndarray,
+        y_true: np.ndarray,
+    ) -> "UtilityCalibrator":
+        """Alias for ``fit`` matching calibrator conventions."""
+        return self.fit(probs, y_true)
+
+    def predict(
+        self,
+        probs: np.ndarray,
+        *,
+        use_crc: bool = True,
+    ) -> np.ndarray:
+        """Select risk-calibrated actions of shape ``(N,)``."""
+        p = np.asarray(probs, dtype=np.float64)
+        single = p.ndim == 1
+        p2 = self.transform_probs(p.reshape(1, -1) if single else p)
+        if not use_crc:
+            out = np.argmin(p2 @ self.cost_matrix.T, axis=1).astype(np.int64)
+            return out[:1] if single else out
+        lam = -1.0 if self.is_vacuous else self.lam_crc
+        out = self._apply_policy(p2, lam)
+        return out[:1] if single else out
+
+
+class CumulativeLogitOrdinalHead:
+    """Proportional-odds cumulative logit model trained with pure-NumPy L-BFGS."""
+
+    def __init__(
+        self,
+        n_classes: Optional[int] = None,
+        *,
+        l2: float = 1e-2,
+        max_iter: int = 300,
+    ) -> None:
+        self.n_classes = int(n_classes) if n_classes is not None else None
+        self.l2 = max(0.0, float(l2))
+        self.max_iter = max(10, int(max_iter))
+        self.weights_: Optional[np.ndarray] = None
+        self.thresholds_: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _unpack_thresholds(delta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        k_minus_1 = delta.size
+        thetas = np.empty(k_minus_1, dtype=np.float64)
+        slopes = np.ones(k_minus_1, dtype=np.float64)
+        thetas[0] = delta[0]
+        for j in range(1, k_minus_1):
+            g = float(np.clip(delta[j], -30.0, 30.0))
+            step = math.log1p(math.exp(g)) if g < 20.0 else g
+            thetas[j] = thetas[j - 1] + step + 1e-4
+            slopes[j] = float(_expit_np(g))
+        return thetas, slopes
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "CumulativeLogitOrdinalHead":
+        X_arr = np.asarray(X, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.int64).ravel()
+        if X_arr.ndim != 2 or X_arr.shape[0] != y_arr.shape[0] or y_arr.size == 0:
+            raise ValueError("X must be 2D and match non-empty 1D y")
+        n, d = X_arr.shape
+        k = int(self.n_classes) if self.n_classes is not None else int(np.max(y_arr)) + 1
+        if k < 2:
+            raise ValueError(f"Ordinal head requires at least 2 classes, got {k}")
+        if int(np.min(y_arr)) < 0 or int(np.max(y_arr)) >= k:
+            raise ValueError(f"Labels must lie in [0, {k - 1}]")
+        self.n_classes = k
+
+        y_le_idx = y_arr.copy()
+        delta0 = np.zeros(k - 1, dtype=np.float64)
+        delta0[0] = -0.5 * float(k - 2) if k > 2 else 0.0
+        for j in range(1, k - 1):
+            delta0[j] = 0.0
+        x0 = np.concatenate([np.zeros(d, dtype=np.float64), delta0])
+
+        def _obj(params: np.ndarray) -> Tuple[float, np.ndarray]:
+            w = params[:d]
+            delta = params[d:]
+            thetas, slopes = self._unpack_thresholds(delta)
+            eta = X_arr @ w
+
+            f_hi = np.ones(n, dtype=np.float64)
+            mask_hi = y_le_idx < (k - 1)
+            if np.any(mask_hi):
+                f_hi[mask_hi] = _expit_np(thetas[y_le_idx[mask_hi]] - eta[mask_hi])
+
+            f_lo = np.zeros(n, dtype=np.float64)
+            mask_lo = y_le_idx > 0
+            if np.any(mask_lo):
+                f_lo[mask_lo] = _expit_np(thetas[y_le_idx[mask_lo] - 1] - eta[mask_lo])
+
+            probs = np.maximum(f_hi - f_lo, 1e-12)
+            loss = -float(np.mean(np.log(probs))) + 0.5 * self.l2 * float(np.sum(w * w))
+
+            s_hi = np.where(mask_hi, f_hi * (1.0 - f_hi), 0.0)
+            s_lo = np.where(mask_lo, f_lo * (1.0 - f_lo), 0.0)
+            inv_pn = 1.0 / (probs * float(n))
+
+            d_eta = (s_hi - s_lo) * inv_pn
+            grad_w = X_arr.T @ d_eta + self.l2 * w
+
+            grad_theta = np.zeros(k - 1, dtype=np.float64)
+            if np.any(mask_hi):
+                np.add.at(grad_theta, y_le_idx[mask_hi], -s_hi[mask_hi] * inv_pn[mask_hi])
+            if np.any(mask_lo):
+                np.add.at(grad_theta, y_le_idx[mask_lo] - 1, s_lo[mask_lo] * inv_pn[mask_lo])
+
+            suffix_sum = np.cumsum(grad_theta[::-1])[::-1]
+            grad_delta = suffix_sum.copy()
+            grad_delta[1:] = suffix_sum[1:] * slopes[1:]
+            return loss, np.concatenate([grad_w, grad_delta])
+
+        opt, _, _ = _minimize_lbfgs_np(_obj, x0, maxiter=self.max_iter)
+        self.weights_ = opt[:d].copy()
+        self.thresholds_, _ = self._unpack_thresholds(opt[d:])
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.weights_ is None or self.thresholds_ is None or self.n_classes is None:
+            raise RuntimeError("CumulativeLogitOrdinalHead must be fit before calling predict_proba")
+        X_arr = np.asarray(X, dtype=np.float64)
+        single = X_arr.ndim == 1
+        X2 = X_arr.reshape(1, -1) if single else X_arr
+        eta = X2 @ self.weights_
+        n = X2.shape[0]
+        k = self.n_classes
+        cum = np.ones((n, k), dtype=np.float64)
+        cum[:, : k - 1] = _expit_np(self.thresholds_[None, :] - eta[:, None])
+        probs = np.empty((n, k), dtype=np.float64)
+        probs[:, 0] = cum[:, 0]
+        if k > 1:
+            probs[:, 1:] = cum[:, 1:] - cum[:, :-1]
+        probs = np.clip(probs, 1e-12, 1.0)
+        probs /= np.sum(probs, axis=1, keepdims=True)
+        return probs[0] if single else probs
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        proba = self.predict_proba(X)
+        if proba.ndim == 1:
+            return np.array([int(np.argmax(proba))], dtype=np.int64)
+        return np.argmax(proba, axis=1).astype(np.int64)
+
+    def expected_value(self, X: np.ndarray) -> np.ndarray:
+        proba = self.predict_proba(X)
+        classes = np.arange(self.n_classes or proba.shape[-1], dtype=np.float64)
+        return proba @ classes
+
+
+class SoftOrdinalHead:
+    """Gaussian/Laplace soft-target linear softmax ordinal head in pure NumPy."""
+
+    def __init__(
+        self,
+        n_classes: Optional[int] = None,
+        *,
+        sigma: float = 0.5,
+        l2: float = 1e-2,
+        max_iter: int = 300,
+    ) -> None:
+        self.n_classes = int(n_classes) if n_classes is not None else None
+        self.sigma = max(0.0, float(sigma))
+        self.l2 = max(0.0, float(l2))
+        self.max_iter = max(10, int(max_iter))
+        self.weights_: Optional[np.ndarray] = None
+        self.bias_: Optional[np.ndarray] = None
+
+    @staticmethod
+    def build_soft_targets(y: np.ndarray, n_classes: int, sigma: float) -> np.ndarray:
+        n = y.shape[0]
+        if sigma <= 0.0:
+            q = np.zeros((n, n_classes), dtype=np.float64)
+            q[np.arange(n), y] = 1.0
+            return q
+        ks = np.arange(n_classes, dtype=np.float64)[None, :]
+        dist2 = (ks - y[:, None].astype(np.float64)) ** 2
+        logits = -0.5 * dist2 / (sigma ** 2)
+        return _softmax_np(logits, axis=1)
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "SoftOrdinalHead":
+        X_arr = np.asarray(X, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.int64).ravel()
+        if X_arr.ndim != 2 or X_arr.shape[0] != y_arr.shape[0] or y_arr.size == 0:
+            raise ValueError("X must be 2D and match non-empty 1D y")
+        n, d = X_arr.shape
+        k = int(self.n_classes) if self.n_classes is not None else int(np.max(y_arr)) + 1
+        if k < 2:
+            raise ValueError(f"SoftOrdinalHead requires at least 2 classes, got {k}")
+        if int(np.min(y_arr)) < 0 or int(np.max(y_arr)) >= k:
+            raise ValueError(f"Labels must lie in [0, {k - 1}]")
+        self.n_classes = k
+
+        q = self.build_soft_targets(y_arr, k, self.sigma)
+        w_len = d * k
+        x0 = np.zeros(w_len + k, dtype=np.float64)
+
+        def _obj(params: np.ndarray) -> Tuple[float, np.ndarray]:
+            w = params[:w_len].reshape(d, k)
+            b = params[w_len:]
+            logits = X_arr @ w + b
+            shifted = logits - np.max(logits, axis=1, keepdims=True)
+            exps = np.exp(np.clip(shifted, -60.0, 60.0))
+            denom = np.maximum(np.sum(exps, axis=1, keepdims=True), 1e-12)
+            log_p = shifted - np.log(denom)
+            p = exps / denom
+            loss = -float(np.mean(np.sum(q * log_p, axis=1))) + 0.5 * self.l2 * float(np.sum(w * w))
+            dz = (p - q) / float(n)
+            gw = (X_arr.T @ dz) + self.l2 * w
+            gb = np.sum(dz, axis=0)
+            return loss, np.concatenate([gw.ravel(), gb])
+
+        opt, _, _ = _minimize_lbfgs_np(_obj, x0, maxiter=self.max_iter)
+        self.weights_ = opt[:w_len].reshape(d, k).copy()
+        self.bias_ = opt[w_len:].copy()
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.weights_ is None or self.bias_ is None:
+            raise RuntimeError("SoftOrdinalHead must be fit before calling predict_proba")
+        X_arr = np.asarray(X, dtype=np.float64)
+        single = X_arr.ndim == 1
+        X2 = X_arr.reshape(1, -1) if single else X_arr
+        probs = _softmax_np(X2 @ self.weights_ + self.bias_, axis=1)
+        return probs[0] if single else probs
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        proba = self.predict_proba(X)
+        if proba.ndim == 1:
+            return np.array([int(np.argmax(proba))], dtype=np.int64)
+        return np.argmax(proba, axis=1).astype(np.int64)
+
+    def expected_value(self, X: np.ndarray) -> np.ndarray:
+        proba = self.predict_proba(X)
+        classes = np.arange(self.n_classes or proba.shape[-1], dtype=np.float64)
+        return proba @ classes
+
+
+def _cdf_ordinal_quantiles(probs: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    cdf = np.cumsum(np.asarray(probs, dtype=np.float64), axis=1)
+    lo = np.argmax(cdf >= (0.5 * alpha) - 1e-12, axis=1).astype(np.int64)
+    hi = np.argmax(cdf >= (1.0 - 0.5 * alpha) - 1e-12, axis=1).astype(np.int64)
+    hi = np.maximum(hi, lo)
+    return lo, hi
+
+
+def cqr_ordinal_intervals(
+    cal_probs: np.ndarray,
+    cal_y: np.ndarray,
+    test_probs: np.ndarray,
+    *,
+    alpha: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Finite-sample Conformalized Quantile Regression intervals for ordinal labels.
+
+    Returns integer arrays ``(lower, upper)`` with guaranteed finite-sample marginal
+    coverage ``>= 1 - alpha`` under exchangeability.
+    """
+    p_cal = np.asarray(cal_probs, dtype=np.float64)
+    y_cal = np.asarray(cal_y, dtype=np.int64).ravel()
+    p_test = np.asarray(test_probs, dtype=np.float64)
+    if p_cal.ndim != 2 or p_test.ndim != 2 or p_cal.shape[1] != p_test.shape[1]:
+        raise ValueError("cal_probs and test_probs must be 2D arrays with matching n_classes")
+    if p_cal.shape[0] != y_cal.shape[0] or y_cal.size == 0:
+        raise ValueError("cal_probs and cal_y must be non-empty and match in length")
+    if not (0.0 < float(alpha) < 1.0):
+        raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+
+    k = p_cal.shape[1]
+    n = y_cal.shape[0]
+    cal_lo, cal_hi = _cdf_ordinal_quantiles(p_cal, float(alpha))
+    scores = np.maximum(cal_lo - y_cal, y_cal - cal_hi).astype(np.float64)
+
+    level = math.ceil((n + 1) * (1.0 - float(alpha))) / float(n)
+    if level > 1.0:
+        lo_out = np.zeros(p_test.shape[0], dtype=np.int64)
+        hi_out = np.full(p_test.shape[0], k - 1, dtype=np.int64)
+        return lo_out, hi_out
+
+    q_idx = min(n, max(1, int(math.ceil((n + 1) * (1.0 - float(alpha)))))) - 1
+    q_hat = int(round(float(np.sort(scores)[q_idx])))
+
+    test_lo, test_hi = _cdf_ordinal_quantiles(p_test, float(alpha))
+    lo_out = np.clip(test_lo - q_hat, 0, k - 1).astype(np.int64)
+    hi_out = np.clip(test_hi + q_hat, 0, k - 1).astype(np.int64)
+    mid = np.clip(np.round(0.5 * (test_lo + test_hi)).astype(np.int64), 0, k - 1)
+    empty = lo_out > hi_out
+    if np.any(empty):
+        lo_out = np.where(empty, mid, lo_out)
+        hi_out = np.where(empty, mid, hi_out)
+    return lo_out, hi_out
+
+
+class BinaryPlattBetaCalibrator:
+    """Adaptive Platt / Beta binary probability calibrator in pure NumPy.
+
+    Selects 2-parameter Platt scaling when ``n_cal < min_beta_samples`` (default 74)
+    to avoid small-sample overfitting, and 3-parameter Beta calibration when
+    ``n_cal >= min_beta_samples``.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_beta_samples: int = 74,
+        reg: float = 1e-3,
+        max_iter: int = 200,
+    ) -> None:
+        self.min_beta_samples = max(1, int(min_beta_samples))
+        self.reg = max(0.0, float(reg))
+        self.max_iter = max(10, int(max_iter))
+        self.mode: str = "unfitted"
+        self.n_cal: int = 0
+        self.params_: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _extract_positive_probs(probs: np.ndarray) -> np.ndarray:
+        arr = np.asarray(probs, dtype=np.float64)
+        if arr.ndim == 2:
+            if arr.shape[1] != 2:
+                raise ValueError(f"Expected binary (N, 2) probabilities, got {arr.shape}")
+            p1 = arr[:, 1]
+        elif arr.ndim == 1:
+            p1 = arr
+        else:
+            raise ValueError(f"Expected 1D or 2D probabilities, got ndim={arr.ndim}")
+        return np.clip(p1, 1e-6, 1.0 - 1e-6)
+
+    def fit(self, probs: np.ndarray, y_true: np.ndarray) -> "BinaryPlattBetaCalibrator":
+        p1 = self._extract_positive_probs(probs)
+        y = np.asarray(y_true, dtype=np.float64).ravel()
+        if p1.shape[0] != y.shape[0] or y.size == 0:
+            raise ValueError("probs and y_true must be non-empty and match in length")
+        if np.any((y != 0.0) & (y != 1.0)):
+            raise ValueError("BinaryPlattBetaCalibrator requires binary {0, 1} labels")
+
+        n = y.shape[0]
+        self.n_cal = int(n)
+        if n < self.min_beta_samples:
+            self.mode = "platt"
+            z = np.log(p1 / (1.0 - p1))
+
+            def _obj_platt(params: np.ndarray) -> Tuple[float, np.ndarray]:
+                w, c = float(params[0]), float(params[1])
+                eta = np.clip(w * z + c, -60.0, 60.0)
+                q = _expit_np(eta)
+                bce = float(np.mean(np.logaddexp(0.0, eta) - y * eta))
+                loss = bce + 0.5 * self.reg * ((w - 1.0) ** 2 + c ** 2)
+                diff = (q - y) / float(n)
+                dw = float(np.dot(diff, z)) + self.reg * (w - 1.0)
+                dc = float(np.sum(diff)) + self.reg * c
+                return loss, np.array([dw, dc], dtype=np.float64)
+
+            opt, _, _ = _minimize_lbfgs_np(
+                _obj_platt,
+                np.array([1.0, 0.0], dtype=np.float64),
+                bounds=[(0.0, 20.0), (-20.0, 20.0)],
+                maxiter=self.max_iter,
+            )
+            self.params_ = opt.copy()
+        else:
+            self.mode = "beta"
+            x_pos = np.log(p1)
+            x_neg = -np.log(1.0 - p1)
+
+            def _obj_beta(params: np.ndarray) -> Tuple[float, np.ndarray]:
+                a, b, c = float(params[0]), float(params[1]), float(params[2])
+                eta = np.clip(a * x_pos + b * x_neg + c, -60.0, 60.0)
+                q = _expit_np(eta)
+                bce = float(np.mean(np.logaddexp(0.0, eta) - y * eta))
+                loss = bce + 0.5 * self.reg * ((a - 1.0) ** 2 + (b - 1.0) ** 2 + c ** 2)
+                diff = (q - y) / float(n)
+                da = float(np.dot(diff, x_pos)) + self.reg * (a - 1.0)
+                db = float(np.dot(diff, x_neg)) + self.reg * (b - 1.0)
+                dc = float(np.sum(diff)) + self.reg * c
+                return loss, np.array([da, db, dc], dtype=np.float64)
+
+            opt, _, _ = _minimize_lbfgs_np(
+                _obj_beta,
+                np.array([1.0, 1.0, 0.0], dtype=np.float64),
+                bounds=[(0.0, 20.0), (0.0, 20.0), (-20.0, 20.0)],
+                maxiter=self.max_iter,
+            )
+            self.params_ = opt.copy()
+        return self
+
+    def transform(self, probs: np.ndarray) -> np.ndarray:
+        """Return calibrated positive-class probability vector of shape ``(N,)``."""
+        if self.params_ is None or self.mode == "unfitted":
+            raise RuntimeError("BinaryPlattBetaCalibrator must be fit before transforming")
+        p1 = self._extract_positive_probs(probs)
+        if self.mode == "platt":
+            w, c = float(self.params_[0]), float(self.params_[1])
+            z = np.log(p1 / (1.0 - p1))
+            out = _expit_np(w * z + c)
+        else:
+            a, b, c = float(self.params_[0]), float(self.params_[1]), float(self.params_[2])
+            out = _expit_np(a * np.log(p1) - b * np.log(1.0 - p1) + c)
+        return np.clip(np.asarray(out, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+
+    def predict_proba(self, probs: np.ndarray) -> np.ndarray:
+        """Return calibrated two-column probability matrix ``[1 - p, p]``."""
+        p_cal = self.transform(probs)
+        return np.stack([1.0 - p_cal, p_cal], axis=1)
+
+
 __all__ = [
     "AdaptiveConformalTracker",
+    "BinaryPlattBetaCalibrator",
     "BrierDecomposition",
     "CalibrationMetrics",
     "ConformalPredictionSet",
     "ConformalPredictor",
+    "CumulativeLogitOrdinalHead",
     "DecisionCalibrator",
     "JointSchemaCalibrator",
     "JointSelectiveCertificate",
@@ -2498,9 +3242,13 @@ __all__ = [
     "SelectiveRiskCertificate",
     "SequentialMonitorStep",
     "SequentialRiskMonitor",
+    "SoftOrdinalHead",
+    "UtilityCalibrator",
     "VALID_MONITOR_MODES",
     "clopper_pearson_upper",
     "compute_brier_decomposition",
     "compute_ece_and_bins",
     "compute_nll",
+    "cqr_ordinal_intervals",
+    "should_use_soft_ordinal",
 ]

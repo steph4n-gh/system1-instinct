@@ -1,5 +1,5 @@
 """System 1 Compatibility Modules."""
-from system1.compat import typesafe
+from system1.compat import typesafe, universal
 from system1.compat.typesafe import (
     AsyncClient,
     AsyncTypeSafeClient,
@@ -27,9 +27,31 @@ from system1.compat.typesafe import (
     create_typesafe_baseline_response,
     compare,
 )
+from system1.compat.universal import (
+    AuthError,
+    CompiledContractSchema,
+    ForbiddenOriginError,
+    InteropError,
+    PayloadTooLargeError,
+    QuestionContract,
+    SchemaValidationError,
+    SoftDistillingLifecycle,
+    UniversalDecisionASGIApp,
+    UniversalDecisionClient,
+    UniversalDecisionHTTPServer,
+    UniversalDecisionService,
+    UniversalDecisionsClient,
+    UniversalDecisionsHTTPServer,
+    UnsupportedMediaError,
+    add_universal_decisions_gateway,
+    compile_questions_contract,
+    detect_wire_format,
+    diff_schemas,
+)
 
 __all__ = [
     "typesafe",
+    "universal",
     "TypeSafeClient",
     "Client",
     "AsyncTypeSafeClient",
@@ -55,5 +77,24 @@ __all__ = [
     "call_real_typesafe_api",
     "create_typesafe_baseline_response",
     "compare",
+    "AuthError",
+    "CompiledContractSchema",
+    "ForbiddenOriginError",
+    "InteropError",
+    "PayloadTooLargeError",
+    "QuestionContract",
+    "SchemaValidationError",
+    "SoftDistillingLifecycle",
+    "UniversalDecisionASGIApp",
+    "UniversalDecisionClient",
+    "UniversalDecisionHTTPServer",
+    "UniversalDecisionService",
+    "UniversalDecisionsClient",
+    "UniversalDecisionsHTTPServer",
+    "UnsupportedMediaError",
+    "add_universal_decisions_gateway",
+    "compile_questions_contract",
+    "detect_wire_format",
+    "diff_schemas",
 ]
 

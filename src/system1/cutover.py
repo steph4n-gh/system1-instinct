@@ -16,7 +16,7 @@ import math
 import re
 import threading
 import time
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union
+from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union
 
 import numpy as np
 
@@ -36,6 +36,7 @@ from system1.core.schema import (
     ChoiceField,
     DecisionField,
     DecisionSchema,
+    ScoreField,
 )
 from system1.engine import SystemOneEngine
 
@@ -93,6 +94,7 @@ class CutoverConfig:
     enable_quarantine: bool = True
     semantic_mode: str = "default"
     drift_delta: float = 0.05
+    score_tolerance: float = 0.15
 
     def __post_init__(self) -> None:
         if not self.milestones or any(int(m) < 2 for m in self.milestones):
@@ -113,6 +115,8 @@ class CutoverConfig:
             )
         if not (0.0 < float(self.drift_delta) < 1.0):
             raise ValueError(f"drift_delta must be in (0, 1), got {self.drift_delta}")
+        if not (0.0 < float(self.score_tolerance) <= 1.0):
+            raise ValueError(f"score_tolerance must be in (0, 1], got {self.score_tolerance}")
 
 
 @dataclass(frozen=True)
@@ -183,6 +187,8 @@ class AutoCutoverLifecycle:
 
         if isinstance(primary_field, ChoiceField):
             self.total_schema_classes = max(2, len(primary_field.options))
+        elif isinstance(primary_field, ScoreField):
+            self.total_schema_classes = 4
         elif isinstance(primary_field, BooleanField):
             self.total_schema_classes = 2
         else:
@@ -271,11 +277,81 @@ class AutoCutoverLifecycle:
 
     def _primary_label_key(self, values: Mapping[str, Any]) -> str:
         val = values[self.primary_field_name]
+        if isinstance(self.primary_field, ScoreField):
+            lo = float(self.primary_field.min_value)
+            hi = float(self.primary_field.max_value)
+            norm = min(1.0, max(0.0, (float(val) - lo) / max(1e-9, hi - lo)))
+            return f"bin_{min(3, int(norm * 4.0))}"
         if isinstance(self.primary_field, BooleanField):
             return "True" if bool(val) else "False"
         if isinstance(val, (tuple, list)):
             return "|".join(str(v) for v in val)
         return str(val)
+
+    def _values_match(
+        self,
+        pred_values: Mapping[str, Any],
+        target_values: Mapping[str, Any],
+        schema: Optional[DecisionSchema] = None,
+    ) -> bool:
+        """Compare predicted and target values across fields using tolerance for ScoreField."""
+        target_schema = schema or self.schema
+        for fname, f_def in target_schema.fields.items():
+            if fname not in pred_values or fname not in target_values:
+                return False
+            p_val = pred_values[fname]
+            t_val = target_values[fname]
+            if isinstance(f_def, ScoreField):
+                try:
+                    p_f = float(p_val)
+                    t_f = float(t_val)
+                except (TypeError, ValueError):
+                    return False
+                if not (math.isfinite(p_f) and math.isfinite(t_f)):
+                    return False
+                span = max(1e-9, float(f_def.max_value) - float(f_def.min_value))
+                if abs(p_f - t_f) > float(self.config.score_tolerance) * span:
+                    return False
+            elif isinstance(f_def, BooleanField):
+                if bool(p_val) != bool(t_val):
+                    return False
+            else:
+                if p_val != t_val:
+                    return False
+        return True
+
+    def _decision_min_margin(
+        self,
+        res: Any,
+        engine: Optional[SystemOneEngine],
+        field_names: Iterable[str],
+    ) -> float:
+        """Return minimum field confidence/margin across fields, supporting ScoreField intervals."""
+        margins: List[float] = []
+        reg_preds = getattr(engine, "regression_conformal_predictors", {}) if engine is not None else {}
+        for fname in field_names:
+            if fname in res.margins:
+                margins.append(float(res.margins[fname]))
+                continue
+            f_def = self.schema.fields.get(fname)
+            if isinstance(f_def, ScoreField):
+                span = max(1e-9, float(f_def.max_value) - float(f_def.min_value))
+                conf = float(res.confidences.get(fname, 0.0))
+                rcp = reg_preds.get(fname)
+                alpha_eff = max(1e-6, float(getattr(res, "alpha", self.config.alpha_target)))
+                if (
+                    rcp is not None
+                    and getattr(rcp, "is_calibrated", False)
+                    and len(getattr(rcp, "residuals", ())) >= math.ceil(1.0 / alpha_eff) - 1
+                ):
+                    iv = rcp.predict_interval(float(res.values[fname]), alpha=alpha_eff)
+                    half_w_margin = max(0.0, 1.0 - 0.5 * float(iv.margin) / span)
+                    margins.append(min(conf, half_w_margin) if iv.margin < span else conf)
+                else:
+                    margins.append(conf)
+            else:
+                margins.append(float(res.margins.get(fname, 0.0)))
+        return min(margins) if margins else 0.0
 
     def _admit_record_locked(
         self,
@@ -636,11 +712,8 @@ class AutoCutoverLifecycle:
         for (p_c, vals_c), d_c in zip(cal_pairs, cal_decs):
             if d_c.abstention_reason in ("low_feature_familiarity", "low_semantic_familiarity"):
                 continue
-            field_margins = [
-                float(d_c.margins.get(fname, 0.0)) for fname in active_schema.fields
-            ]
-            min_margin = min(field_margins) if field_margins else 0.0
-            is_ok = all(d_c.values.get(fname) == vals_c.get(fname) for fname in active_schema.fields)
+            min_margin = self._decision_min_margin(d_c, sub_eng, active_schema.fields)
+            is_ok = self._values_match(d_c.values, vals_c, schema=active_schema)
             margins_cal.append(min_margin)
             correct_cal.append(is_ok)
             if d_c.abstention_reason is None and is_ok and min_margin >= 0.85:
@@ -743,7 +816,7 @@ class AutoCutoverLifecycle:
         from_cache: bool,
     ) -> None:
         self.canary_checks += 1
-        is_err = pred_values != y_teacher_values
+        is_err = not self._values_match(pred_values, y_teacher_values)
         self.canary_window.append(1 if is_err else 0)
         self.aci.update_accepted(is_err, margin=(None if from_cache else margin))
         mon_step = self.drift_monitor.update(is_err, step=self.step_count)
@@ -788,8 +861,7 @@ class AutoCutoverLifecycle:
         res = self.engine.decide(prompt, strict=False, record_receipt=False, use_cache=False)
         vals = dict(res.values)
         pred_key = self._primary_label_key(vals)
-        field_margins = [float(res.margins.get(fname, 0.0)) for fname in res.values]
-        margin = min(field_margins) if field_margins else 0.0
+        margin = self._decision_min_margin(res, self.engine, res.values)
 
         if (
             res.abstention_reason is None

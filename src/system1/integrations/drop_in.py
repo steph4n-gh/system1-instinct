@@ -14,6 +14,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
+import numpy as np
+
+from system1.calibration import (
+    BinaryPlattBetaCalibrator,
+    SoftOrdinalHead,
+    UtilityCalibrator,
+    should_use_soft_ordinal,
+)
+
 from system1.compiler import CompiledSystemOneModel, SystemOneCompiler
 from system1.core import HybridProjector, TfidfProjector
 from system1.core.schema import (
@@ -338,6 +347,250 @@ class SystemOneRouteController:
         )
 
     learn_feedback = record_feedback
+
+
+CASCADE_TIERS: Tuple[str, str, str] = (
+    "system1_local",
+    "fast_small_model",
+    "frontier_reasoning_model",
+)
+
+
+@dataclass(frozen=True)
+class CascadeRouteDecision:
+    """Cost-aware calibrated routing decision returned by UtilityCascadeRouter."""
+
+    prompt: str
+    selected_tier: str
+    selected_model: str
+    action_index: int
+    requires_deep_reasoning: bool
+    confidence: float
+    expected_costs: Dict[str, float]
+    probabilities: Dict[str, float]
+    used_crc_fallback: bool
+    is_vacuous: bool
+    latency_ms: float
+
+
+class UtilityCascadeRouter:
+    """Bayes expected-cost + CRC ladder router for local/weak/strong LLM cascades."""
+
+    def __init__(
+        self,
+        strong_model: str = "gpt-5-reasoning",
+        weak_model: str = "gpt-4o-mini",
+        local_model: str = "system1-instinct-local",
+        *,
+        error_multiplier: float = 25.0,
+        cost_matrix: Optional[Any] = None,
+        safe_action: int = 2,
+        alpha: float = 0.05,
+        ladder_mode: bool = True,
+        min_beta_samples: int = 74,
+        soft_ordinal_sigma: float = 0.5,
+    ) -> None:
+        self.strong_model = strong_model
+        self.weak_model = weak_model
+        self.local_model = local_model
+        self.error_multiplier = float(error_multiplier)
+        if cost_matrix is None:
+            m = self.error_multiplier
+            self.cost_matrix = np.array(
+                [
+                    [0.0, 0.4 * m, m],
+                    [0.15, 0.15, 0.6 * m],
+                    [5.0, 5.0, 5.0],
+                ],
+                dtype=np.float64,
+            )
+        else:
+            self.cost_matrix = np.asarray(cost_matrix, dtype=np.float64)
+        self.safe_action = int(safe_action)
+        self.alpha = float(alpha)
+        self.ladder_mode = bool(ladder_mode)
+        self.min_beta_samples = int(min_beta_samples)
+        self.soft_ordinal_sigma = float(soft_ordinal_sigma)
+
+        self.engine = SystemOneEngine(RouteLLMCascadeSchema, strict_mode=False, use_cache=True)
+        self._tier_to_model = {
+            "system1_local": self.local_model,
+            "fast_small_model": self.weak_model,
+            "frontier_reasoning_model": self.strong_model,
+        }
+        self._tier_to_index = {name: idx for idx, name in enumerate(CASCADE_TIERS)}
+        self.ordinal_head: Optional[SoftOrdinalHead] = None
+        self.utility_calibrator = UtilityCalibrator(
+            self.cost_matrix,
+            safe_action=self.safe_action,
+            alpha=self.alpha,
+            ladder_mode=self.ladder_mode,
+        )
+        self.binary_calibrator = BinaryPlattBetaCalibrator(
+            min_beta_samples=self.min_beta_samples
+        )
+        self._is_calibrated = False
+
+    def _encode_prompts(self, prompts: Sequence[str]) -> np.ndarray:
+        if not prompts:
+            raise ValueError("prompts must be non-empty")
+        return np.vstack([self.engine.encode(str(p)) for p in prompts]).astype(np.float64)
+
+    def _parse_tiers(self, tiers: Sequence[Union[int, str]]) -> np.ndarray:
+        indices: List[int] = []
+        for item in tiers:
+            if isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+                idx = int(item)
+                if not (0 <= idx < len(CASCADE_TIERS)):
+                    raise ValueError(f"Tier index out of range [0, 2]: {idx}")
+                indices.append(idx)
+            else:
+                key = str(item)
+                if key not in self._tier_to_index:
+                    raise ValueError(f"Unknown cascade tier {item!r}")
+                indices.append(self._tier_to_index[key])
+        return np.asarray(indices, dtype=np.int64)
+
+    def _raw_probs(self, prompt: str) -> np.ndarray:
+        decision = self.engine.decide(prompt, record_receipt=False)
+        engine_probs = np.array(
+            [float(decision.probabilities["target_tier"].get(t, 1e-6)) for t in CASCADE_TIERS],
+            dtype=np.float64,
+        )
+        engine_probs = engine_probs / max(float(np.sum(engine_probs)), 1e-12)
+        if self.ordinal_head is None:
+            return engine_probs
+        vec = self.engine.encode(prompt).astype(np.float64)
+        head_probs = np.asarray(self.ordinal_head.predict_proba(vec), dtype=np.float64)
+        blended = 0.65 * head_probs + 0.35 * engine_probs
+        return blended / max(float(np.sum(blended)), 1e-12)
+
+    def _batch_raw_probs(self, prompts: Sequence[str], features: Optional[np.ndarray] = None) -> np.ndarray:
+        x_arr = self._encode_prompts(prompts) if features is None else features
+        out = np.empty((len(prompts), len(CASCADE_TIERS)), dtype=np.float64)
+        head_probs_all = (
+            self.ordinal_head.predict_proba(x_arr)
+            if self.ordinal_head is not None
+            else None
+        )
+        for idx, prompt in enumerate(prompts):
+            decision = self.engine.decide(str(prompt), record_receipt=False)
+            ep = np.array(
+                [float(decision.probabilities["target_tier"].get(t, 1e-6)) for t in CASCADE_TIERS],
+                dtype=np.float64,
+            )
+            ep /= max(float(np.sum(ep)), 1e-12)
+            if head_probs_all is not None:
+                blended = 0.65 * head_probs_all[idx] + 0.35 * ep
+                out[idx] = blended / max(float(np.sum(blended)), 1e-12)
+            else:
+                out[idx] = ep
+        return out
+
+    def fit(
+        self,
+        prompts: Sequence[str],
+        true_tiers: Sequence[Union[int, str]],
+        *,
+        cal_prompts: Optional[Sequence[str]] = None,
+        cal_tiers: Optional[Sequence[Union[int, str]]] = None,
+        cal_fraction: float = 0.0,
+    ) -> "UtilityCascadeRouter":
+        """Train ordinal tier predictor and calibrate utility + escalation risk."""
+        if len(prompts) != len(true_tiers) or len(prompts) == 0:
+            raise ValueError("prompts and true_tiers must be non-empty and match in length")
+
+        if cal_prompts is None and cal_tiers is None and cal_fraction > 0.0 and len(prompts) >= 10:
+            split = max(1, min(len(prompts) - 1, int(round(len(prompts) * (1.0 - float(cal_fraction))))))
+            fit_prompts, cal_prompts_eff = list(prompts[:split]), list(prompts[split:])
+            fit_tiers, cal_tiers_eff = list(true_tiers[:split]), list(true_tiers[split:])
+        else:
+            fit_prompts = list(prompts)
+            fit_tiers = list(true_tiers)
+            cal_prompts_eff = list(cal_prompts) if cal_prompts is not None else None
+            cal_tiers_eff = list(cal_tiers) if cal_tiers is not None else None
+
+        y_fit = self._parse_tiers(fit_tiers)
+        for prompt, tier_idx in zip(fit_prompts, y_fit):
+            tier_name = CASCADE_TIERS[int(tier_idx)]
+            self.engine.learn(
+                str(prompt),
+                {
+                    "target_tier": tier_name,
+                    "requires_deep_reasoning": bool(int(tier_idx) == 2),
+                },
+            )
+
+        x_fit = self._encode_prompts(fit_prompts)
+        if should_use_soft_ordinal(len(CASCADE_TIERS)):
+            self.ordinal_head = SoftOrdinalHead(
+                n_classes=len(CASCADE_TIERS),
+                sigma=self.soft_ordinal_sigma,
+            ).fit(x_fit, y_fit)
+
+        if cal_prompts_eff is not None and cal_tiers_eff is not None:
+            return self.calibrate(cal_prompts_eff, cal_tiers_eff)
+        return self.calibrate(fit_prompts, fit_tiers, _features=x_fit, _y=y_fit)
+
+    def calibrate(
+        self,
+        prompts: Sequence[str],
+        true_tiers: Sequence[Union[int, str]],
+        *,
+        _features: Optional[np.ndarray] = None,
+        _y: Optional[np.ndarray] = None,
+    ) -> "UtilityCascadeRouter":
+        """Calibrate UtilityCalibrator CRC threshold and BinaryPlattBetaCalibrator."""
+        if len(prompts) != len(true_tiers) or len(prompts) == 0:
+            raise ValueError("prompts and true_tiers must be non-empty and match in length")
+        y_cal = self._parse_tiers(true_tiers) if _y is None else _y
+        probs = self._batch_raw_probs(prompts, features=_features)
+        self.utility_calibrator.fit(probs, y_cal)
+        p_escalate = np.clip(1.0 - probs[:, 0], 1e-6, 1.0 - 1e-6)
+        y_escalate = (y_cal > 0).astype(np.float64)
+        self.binary_calibrator.fit(p_escalate, y_escalate)
+        self._is_calibrated = True
+        return self
+
+    def route(self, prompt: str) -> CascadeRouteDecision:
+        """Route a prompt using expected utility and finite-sample CRC safety."""
+        t0 = time.perf_counter()
+        raw_p = self._raw_probs(str(prompt))
+        if self._is_calibrated:
+            cal_p = self.utility_calibrator.transform_probs(raw_p)
+            costs_vec = self.utility_calibrator.expected_costs(raw_p, apply_temperature=True)
+            action = int(self.utility_calibrator.predict(raw_p[None, :], use_crc=True)[0])
+            bayes_action = int(np.argmin(costs_vec))
+            used_crc_fallback = action != bayes_action
+            is_vacuous = self.utility_calibrator.is_vacuous
+        else:
+            cal_p = raw_p
+            costs_vec = self.utility_calibrator.expected_costs(raw_p, apply_temperature=False)
+            action = int(np.argmin(costs_vec))
+            used_crc_fallback = False
+            is_vacuous = False
+
+        tier = CASCADE_TIERS[action]
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return CascadeRouteDecision(
+            prompt=str(prompt),
+            selected_tier=tier,
+            selected_model=self._tier_to_model.get(tier, self.strong_model),
+            action_index=action,
+            requires_deep_reasoning=(action == 2),
+            confidence=round(float(cal_p[action]), 4),
+            expected_costs={
+                CASCADE_TIERS[i]: round(float(costs_vec[i]), 6)
+                for i in range(len(CASCADE_TIERS))
+            },
+            probabilities={
+                CASCADE_TIERS[i]: round(float(cal_p[i]), 6)
+                for i in range(len(CASCADE_TIERS))
+            },
+            used_crc_fallback=used_crc_fallback,
+            is_vacuous=is_vacuous,
+            latency_ms=round(latency_ms, 3),
+        )
 
 
 # ===========================================================================
@@ -714,7 +967,9 @@ __all__ = [
     "build_default_router",
     "RouteLLMCascadeSchema",
     "RouteDecision",
+    "CascadeRouteDecision",
     "SystemOneRouteController",
+    "UtilityCascadeRouter",
     "IncidentTriageModel",
     "StructuredExtractionResult",
     "SystemOneInstructorClient",

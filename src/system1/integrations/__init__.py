@@ -29,7 +29,12 @@ from system1.integrations.mcp_stdio import (
 )
 from system1.integrations.fastapi import (
     SystemOneGatewayMiddleware,
+    UniversalDecisionASGIApp,
+    UniversalDecisionService,
     add_system1_gateway,
+    add_universal_decisions_gateway,
+    create_universal_asgi_app,
+    mount_universal_gateway,
 )
 from system1.integrations.langchain import (
     SystemOneGuardBlockedException,
@@ -51,6 +56,8 @@ from system1.integrations.drop_in import (
     SystemOnePromptGuard,
     SystemOneRouteController,
     SystemOneRouteLayer,
+    UtilityCascadeRouter,
+    CascadeRouteDecision,
     build_default_router,
 )
 
@@ -71,7 +78,12 @@ __all__ = [
     "wrap_mcp_tool",
     # FastAPI / ASGI
     "SystemOneGatewayMiddleware",
+    "UniversalDecisionASGIApp",
+    "UniversalDecisionService",
     "add_system1_gateway",
+    "add_universal_decisions_gateway",
+    "create_universal_asgi_app",
+    "mount_universal_gateway",
     # LangChain / Agent
     "SystemOneGuardBlockedException",
     "SystemOneGuardCallbackHandler",
@@ -85,7 +97,9 @@ __all__ = [
     "build_default_router",
     "RouteLLMCascadeSchema",
     "RouteDecision",
+    "CascadeRouteDecision",
     "SystemOneRouteController",
+    "UtilityCascadeRouter",
     "IncidentTriageModel",
     "StructuredExtractionResult",
     "SystemOneInstructorClient",
