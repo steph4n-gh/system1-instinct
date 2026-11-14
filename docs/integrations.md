@@ -35,6 +35,12 @@ result = your_tool.invoke(tool_arguments, config={"callbacks": [handler]})
 - **Request-size and route-header bounds.** `max_body_bytes` defaults to `1_048_576` (1 MiB) and rejects oversize bodies with HTTP `413` (`x-system1-status: rejected_oversize`) before buffering the full payload. Header-triggered routing via `x-system1-route: true` is disabled by default (`allow_route_header=False`) and supports an optional shared secret (`route_header_token`, verified with `hmac.compare_digest` against `x-system1-route-token`).
 - **Security boundary.** `SystemOneGatewayMiddleware` runs before downstream route dependencies. Authentication and caller authorization still belong in outer middleware or a reverse proxy, as detailed in [Deployment boundaries](deployment.md#asgi-gateway).
 
+## Universal Decision Gateway (`compat.universal`)
+
+`system1.compat.universal` exposes `UniversalDecisionService`, `create_universal_asgi_app`, `mount_universal_gateway`, and `UniversalDecisionHTTPServer` for `/v1beta/decisions` wire interoperability with Laya and Jev decision payloads.
+
+- **Guard and Prompt-Guard opt-in shield.** `SystemOneGuardHook` and `SystemOnePromptGuard` default to `shield_mode="off"` and accept opt-in `shield_mode="sliding_window"` backed by `GuardShield` (`canonicalize_guard_text`, invisible-character stripping, encoded payload extraction, and sliding-window evaluation). See [Add an explicit tool policy](guides/policy_guard.md) and [Deployment boundaries](deployment.md).
+
 ## gRPC (`system1-instinct[grpc]`)
 
 The `system1-instinct[grpc]` extra provides the gRPC server and CLI entrypoint:

@@ -665,6 +665,7 @@ class SystemOneEngine:
         self.auto_reload: bool = bool(auto_reload)
         self._model_stat: Optional[Tuple[int, int, str]] = None
         self._packed_kernel_cache: Optional[Tuple[Tuple[Any, ...], Any]] = None
+        self._explainer_cache: Dict[str, Tuple[Tuple[Any, ...], Any]] = {}
 
         if model is None and self.model_path is not None and self.model_path.exists():
             from system1.compiler import CompiledSystemOneModel, _read_skill_bytes
@@ -740,6 +741,8 @@ class SystemOneEngine:
         self.model = model
         self.model_version = max(getattr(self, "model_version", 1), int(getattr(model, "model_version", 1)))
         self._packed_kernel_cache = None
+        if hasattr(self, "_explainer_cache"):
+            self._explainer_cache.clear()
         self.dimension = getattr(model, "dimension", self.dimension)
         self.backend = getattr(model, "backend", self.backend)
         self.projector = getattr(model, "projector", self.projector)
@@ -1083,6 +1086,8 @@ class SystemOneEngine:
             if hasattr(self.model, "model_version"):
                 self.model.model_version = self.model_version
             self._packed_kernel_cache = None
+            if hasattr(self, "_explainer_cache"):
+                self._explainer_cache.clear()
             if getattr(self.model, "cache", None) is not None:
                 self.model.cache.clear()
             if self.cache is not None:
@@ -1431,6 +1436,8 @@ class SystemOneEngine:
             if hasattr(self.model, "model_version"):
                 self.model.model_version = self.model_version
             self._packed_kernel_cache = None
+            if hasattr(self, "_explainer_cache"):
+                self._explainer_cache.clear()
             if self.cache is not None:
                 self.cache.clear()
             if hasattr(self.model, "cache") and getattr(self.model, "cache", None) is not None:
@@ -1517,6 +1524,8 @@ class SystemOneEngine:
                 cert = jcal.calibrate(calib_probs, [lbl for _, lbl in calibration_examples])
                 self.joint_calibrator = jcal
                 self._packed_kernel_cache = None
+                if hasattr(self, "_explainer_cache"):
+                    self._explainer_cache.clear()
                 if self.cache is not None:
                     self.cache.clear()
                 if hasattr(self.model, "cache") and getattr(self.model, "cache", None) is not None:
@@ -3009,6 +3018,8 @@ class SystemOneEngine:
                                 rcp.is_calibrated = True
 
             self._packed_kernel_cache = None
+            if hasattr(self, "_explainer_cache"):
+                self._explainer_cache.clear()
             if self.use_cache and self.cache is not None:
                 if embedding is None:
                     self.cache.evict_prompt(prompt)
@@ -3097,6 +3108,8 @@ class SystemOneEngine:
             if int(res_info.get("adapted_samples", 0)) > 0:
                 self.model_version += 1
                 self._packed_kernel_cache = None
+                if hasattr(self, "_explainer_cache"):
+                    self._explainer_cache.clear()
                 if hasattr(self.model, "model_version"):
                     self.model.model_version = self.model_version
                 if self.use_cache and self.cache is not None:
@@ -3446,10 +3459,62 @@ class SystemOneEngine:
         """Returns a zero-overhead decision callable backed by a packed multi-question kernel."""
         return FastDecisionCallable(self, storage_mode=storage_mode)
 
+    def explain(
+        self,
+        prompt: str,
+        field_name: Optional[str] = None,
+        *,
+        include_counterfactual: bool = True,
+        train_texts: Optional[Sequence[str]] = None,
+        train_labels: Optional[Sequence[Any]] = None,
+    ) -> Any:
+        """Returns additive token attributions, exemplar witnesses, and counterfactual flips."""
+        if not isinstance(prompt, str):
+            raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
+        from system1.explain import FastExplainer, _canonical_explain_field
+
+        resolved_field = _canonical_explain_field(self.schema, field_name)
+        if self.auto_reload and self.model_path is not None:
+            self.reload_if_changed()
+        with self._lock:
+            if train_texts is None and train_labels is None:
+                cache_key = self._packed_kernel_cache_key("float32")
+                cached = self._explainer_cache.get(resolved_field)
+                if cached is not None and cached[0] == cache_key:
+                    explainer = cached[1]
+                else:
+                    explainer = FastExplainer.from_engine(self, resolved_field)
+                    self._explainer_cache[resolved_field] = (cache_key, explainer)
+            else:
+                explainer = FastExplainer.from_engine(
+                    self,
+                    resolved_field,
+                    train_texts=train_texts,
+                    train_labels=train_labels,
+                )
+        return explainer.explain(prompt, include_counterfactual=include_counterfactual)
+
+    def explain_all(
+        self,
+        prompt: str,
+        *,
+        include_counterfactual: bool = True,
+    ) -> Dict[str, Any]:
+        """Explains every ChoiceField and BooleanField in the schema for one prompt."""
+        if not isinstance(prompt, str):
+            raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
+        return {
+            name: self.explain(prompt, name, include_counterfactual=include_counterfactual)
+            for name, f_def in self.schema.fields.items()
+            if isinstance(f_def, (ChoiceField, BooleanField))
+        }
+
     def close(self) -> None:
         """Releases any memory-mapped resources held by the underlying model."""
         with self._lock:
             self._packed_kernel_cache = None
+            if hasattr(self, "_explainer_cache"):
+                self._explainer_cache.clear()
             model = getattr(self, "model", None)
             close_fn = getattr(model, "close", None)
             if callable(close_fn):

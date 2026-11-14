@@ -277,6 +277,13 @@ These rows are the claims a reviewer can check against the code and against one 
 | **Release status** | `pyproject.toml` classifier: `Development Status :: 5 - Production/Stable`. |
 | **Replay test size** | uv held-out set: **60** issues (of 260), plus **25** OOS issues (**93.3%** / `56/60` local offload, **100.0%** precision, **96.0%** OOS abstention). FDA held-out set: **72** recalls (of 297), plus **25** OOS issues (**66.7%** / `48/72` local offload, **95.8%** joint 3-field precision, **100.0%** OOS abstention on this pass). |
 
+### v1.3 Capabilities (`feat/v1.3`)
+
+- **Smarts and soft distillation:** `PragmaticCompositeProjector`, `SmartsCrossZeroFewRouter`, pure-NumPy `compile_soft_distilled`, `AdaptiveConformalTracker`, and `OnlineMondrianConformal`.
+- **Fast compiled callables and `.s1m` v3:** `compile_engine_callable`, `compile_typesafe_callable`, `PackedMultiQuestionKernel`, and opt-in `S1M\x03` (`format_version=3`, `MAX_SKILL_FIELDS_V3=512`, `embed_vocab`, and 16 KiB `mmap` alignment).
+- **Universal gateway and calibrated utility routing:** `UniversalDecisionService` (`/v1beta/decisions`) with Laya and Jev adapters, `ScoreField` support in `AutoCutoverLifecycle`, `UtilityCalibrator` (CRC and vacuity fallback), `CumulativeLogitOrdinalHead`, `SoftOrdinalHead`, `BinaryPlattBetaCalibrator`, and `UtilityCascadeRouter`.
+- **Explainability, active teaching, prompt shield, and multi-tenant fleet:** `FastExplainer` (`engine.explain` / `engine.explain_all`) with signed compact witnesses, `ActiveTeacherSelector`, opt-in `GuardShield` (`shield_mode="off"` by default), and `MultiTenantSkillFleet`.
+
 ---
 
 ## Read the documentation

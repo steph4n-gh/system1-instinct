@@ -6,15 +6,22 @@ boundary. This in-process hook is not a hardware sandbox or security detector.""
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import math
 import os
 import re
 import sqlite3
+import time
+import unicodedata
+import urllib.parse
 from dataclasses import dataclass, replace
 from enum import IntEnum, StrEnum
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from system1.engine import DecisionResult, SystemOneEngine, SystemOneEngine
+import numpy as np
+
+from system1.engine import DecisionResult, SystemOneEngine
 from system1.ledger import ActionLedger, LedgerError, LedgerWriteError
 from system1.receipt import (
     DecisionWitnessReceipt,
@@ -35,6 +42,547 @@ from system1.core import (
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,254}$")
+
+VALID_SHIELD_MODES: Tuple[str, ...] = ("off", "canonicalize", "sliding_window")
+
+_INVISIBLE_CHARS = frozenset({
+    "\u00ad", "\u034f", "\u061c", "\u115f", "\u1160", "\u17b4", "\u17b5",
+    "\u180e", "\u200b", "\u200c", "\u200d", "\u200e", "\u200f", "\u202a",
+    "\u202b", "\u202c", "\u202d", "\u202e", "\u2060", "\u2061", "\u2062",
+    "\u2063", "\u2064", "\u206a", "\u206b", "\u206c", "\u206d", "\u206e",
+    "\u206f", "\u3164", "\ufeff", "\uffa0",
+})
+_INVISIBLE_TRANS = str.maketrans("", "", "".join(_INVISIBLE_CHARS))
+_URL_PCT_RUN_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_B64_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{12,1024}={0,2}(?![A-Za-z0-9+/_=-])")
+_WS_RE = re.compile(r"\s+")
+
+_CAL_FILLER_SENTENCES: Tuple[str, ...] = (
+    "Design committee notes reviewed typography spacing and table alignment across the handbook.",
+    "Product planning scheduled roadmap sync sessions for autumn localization updates.",
+    "Archival librarians verified catalog timestamps across historical quarterly newsletters.",
+    "Editorial guidelines prefer plain headings, concise captions, and numbered appendix references.",
+    "Operations summaries tracked hardware depreciation schedules across branch offices.",
+    "Workshop slides outlined seminar registration deadlines and room seating arrangements.",
+    "Procurement teams compared paper supplier invoices from regional printing vendors.",
+    "Training facilitators prepared welcome packets for incoming summer research interns.",
+    "Inventory coordinators reconciled barcode labels across warehouse shipping crates.",
+    "Advisory board minutes recorded budget votes and annual conference venue dates.",
+)
+
+
+def _make_cal_filler_words(target_words: int, seed: int) -> List[str]:
+    words: List[str] = []
+    idx = seed % len(_CAL_FILLER_SENTENCES)
+    while len(words) < target_words:
+        words.extend(_CAL_FILLER_SENTENCES[idx % len(_CAL_FILLER_SENTENCES)].split())
+        idx += 1
+    return words[:target_words]
+
+
+@dataclass(frozen=True, slots=True)
+class ShieldDecision:
+    """Prediction and diagnostic details for a guarded prompt evaluation."""
+
+    predicted_label: str
+    is_unsafe: bool
+    full_doc_unsafe_margin: float
+    max_window_unsafe_margin: float
+    max_window_unsafe_prob: float
+    num_windows: int
+    decoded_fragments: int
+    canonicalize_us: float
+    total_us: float
+    max_window_unsafe_sim: Optional[float] = None
+
+
+def strip_invisible_and_nfkc(text: str) -> str:
+    """Strip invisible format characters and apply Unicode NFKC canonicalization."""
+    cleaned = text.translate(_INVISIBLE_TRANS)
+    if any(unicodedata.category(ch) == "Cf" for ch in cleaned):
+        cleaned = "".join(ch for ch in cleaned if unicodedata.category(ch) != "Cf")
+    return unicodedata.normalize("NFKC", cleaned)
+
+
+def _is_meaningful_decoded_text(candidate: str) -> bool:
+    if len(candidate) < 4:
+        return False
+    printable = sum(1 for ch in candidate if 32 <= ord(ch) <= 126 or ch in "\n\r\t")
+    if printable / len(candidate) < 0.85:
+        return False
+    alpha_count = sum(1 for ch in candidate if ch.isalpha())
+    has_struct = any(ch in candidate for ch in (" ", "/", "-", "=", "_"))
+    return alpha_count >= 3 and has_struct
+
+
+def extract_decoded_tool_payloads(text: str) -> List[str]:
+    """Bounded, ReDoS-free URL percent and Base64 argument decoder."""
+    fragments: List[str] = []
+    seen: set[str] = set()
+
+    if "%" in text:
+        for tok in _WS_RE.split(text):
+            if _URL_PCT_RUN_RE.search(tok):
+                raw_tok = tok[:2048].strip("\"'(),;")
+                decoded = urllib.parse.unquote_plus(raw_tok)
+                if "%" in decoded:
+                    decoded = urllib.parse.unquote(decoded)
+                if "?" in decoded:
+                    decoded = decoded.split("?", 1)[1]
+                cleaned_parts: List[str] = []
+                for kv in decoded.split("&"):
+                    val = kv.split("=", 1)[1] if "=" in kv else kv
+                    val = val.strip("\"'(),;")
+                    if val:
+                        cleaned_parts.append(val)
+                norm_dec = " ".join(cleaned_parts).strip()
+                if norm_dec != tok and _is_meaningful_decoded_text(norm_dec) and norm_dec not in seen:
+                    seen.add(norm_dec)
+                    fragments.append(norm_dec)
+
+    for m in _B64_TOKEN_RE.finditer(text):
+        tok = m.group(0)
+        if len(tok) > 1024:
+            continue
+        tok_stripped = tok.rstrip("=")
+        if len(tok_stripped) % 4 == 1:
+            continue
+        padded = tok_stripped + ("=" * ((4 - len(tok_stripped) % 4) % 4))
+        for altchars in (None, b"-_"):
+            try:
+                raw = base64.b64decode(padded, altchars=altchars, validate=True)
+            except Exception:
+                continue
+            try:
+                dec = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if _is_meaningful_decoded_text(dec):
+                dec_clean = strip_invisible_and_nfkc(dec).strip()
+                if dec_clean and dec_clean not in seen:
+                    seen.add(dec_clean)
+                    fragments.append(dec_clean)
+                break
+
+    return fragments
+
+
+def canonicalize_guard_text(text: str) -> Tuple[str, List[str]]:
+    """Return `(canonical_text, decoded_arg_fragments)` in linear time."""
+    canon = strip_invisible_and_nfkc(text)
+    fragments = extract_decoded_tool_payloads(canon)
+    return canon, fragments
+
+
+def make_sliding_windows(
+    canon_text: str,
+    decoded_fragments: Sequence[str],
+    *,
+    window_words: int = 24,
+    stride_words: int = 12,
+) -> List[str]:
+    """Build overlapping word windows plus decoded payload views without middle truncation."""
+    words = _WS_RE.split(canon_text.strip()) if canon_text.strip() else []
+    windows: List[str] = []
+    if len(words) <= window_words:
+        if canon_text.strip():
+            windows.append(canon_text.strip())
+    else:
+        for start in range(0, len(words), stride_words):
+            chunk = " ".join(words[start : start + window_words])
+            if chunk:
+                windows.append(chunk)
+            if start + window_words >= len(words):
+                break
+    for frag in decoded_fragments:
+        fwords = _WS_RE.split(frag.strip()) if frag.strip() else []
+        if len(fwords) <= window_words:
+            if frag.strip():
+                windows.append(frag.strip())
+        else:
+            for start in range(0, len(fwords), stride_words):
+                chunk = " ".join(fwords[start : start + window_words])
+                if chunk:
+                    windows.append(chunk)
+                if start + window_words >= len(fwords):
+                    break
+    return windows if windows else [canon_text]
+
+
+def _l2_normalize_rows(X: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    return X / np.maximum(norms, 1e-12)
+
+
+def _normalize_unsafe_label_arg(
+    unsafe_label: Optional[Union[str, bool]],
+    unsafe_labels: Optional[Sequence[Union[str, bool]]],
+) -> Tuple[str, ...]:
+    raw = list(unsafe_labels) if unsafe_labels is not None else ([unsafe_label] if unsafe_label is not None else [])
+    if not raw:
+        raise ValueError("GuardShield requires unsafe_label or unsafe_labels")
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        lbl = "True" if item is True else ("False" if item is False else str(item))
+        if lbl not in seen:
+            seen.add(lbl)
+            out.append(lbl)
+    return tuple(out)
+
+
+class GuardShield:
+    """Canonicalizing prototype-similarity-gated sliding-window shield for System 1."""
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        field_name: str,
+        unsafe_label: Optional[Union[str, bool]] = None,
+        unsafe_labels: Optional[Sequence[Union[str, bool]]] = None,
+        window_words: int = 24,
+        stride_words: int = 12,
+        window_margin_threshold: float = 0.0,
+        canonicalize: bool = True,
+        use_windows: bool = True,
+        short_doc_passthrough: bool = True,
+        short_doc_words: int = 24,
+        unsafe_exemplars: Optional[Sequence[str]] = None,
+        sim_threshold: Optional[float] = None,
+    ) -> None:
+        resolved = getattr(model, "model", model)
+        self.model = resolved
+        self.field_name = str(field_name)
+        if self.field_name not in resolved.schema.fields:
+            raise ValueError(f"Unknown field {field_name!r} in model schema")
+        heads_map = getattr(resolved, "_field_heads", None)
+        if heads_map is None:
+            heads_map = getattr(resolved, "heads", {})
+        self.head = heads_map[self.field_name]
+        f_def = resolved.schema.fields[self.field_name]
+        raw_w = np.asarray(self.head.weights, dtype=np.float32)
+        raw_b = np.asarray(self.head.biases, dtype=np.float32).reshape(-1)
+        if isinstance(f_def, BooleanField) or raw_w.shape[0] == 1:
+            self.options: Tuple[str, ...] = ("False", "True")
+            t_clamped = min(max(float(getattr(f_def, "threshold", 0.5)), 1e-6), 1.0 - 1e-6)
+            b_adj = float(raw_b[0]) - 0.25 * math.log(t_clamped / (1.0 - t_clamped))
+            self.W = np.vstack([-0.5 * raw_w[0], 0.5 * raw_w[0]]).astype(np.float32)
+            self.b = np.array([-0.5 * b_adj, 0.5 * b_adj], dtype=np.float32)
+        else:
+            self.options = tuple(str(o) for o in f_def.options)
+            self.W = raw_w
+            self.b = raw_b
+
+        resolved_unsafe = _normalize_unsafe_label_arg(unsafe_label, unsafe_labels)
+        self.unsafe_idxs: List[int] = [self.options.index(lbl) for lbl in resolved_unsafe]
+        self._unsafe_idx_set = set(self.unsafe_idxs)
+        self.unsafe_idx = self.unsafe_idxs[0]
+        self.unsafe_label = self.options[self.unsafe_idx]
+        self.unsafe_labels = tuple(self.options[i] for i in self.unsafe_idxs)
+        self.safe_idxs = [i for i in range(len(self.options)) if i not in self._unsafe_idx_set]
+        if not self.safe_idxs:
+            raise ValueError("GuardShield requires at least one non-unsafe option")
+
+        self.window_words = int(window_words)
+        self.stride_words = int(stride_words)
+        self.window_margin_threshold = float(window_margin_threshold)
+        self.canonicalize = bool(canonicalize)
+        self.use_windows = bool(use_windows)
+        self.short_doc_passthrough = bool(short_doc_passthrough)
+        self.short_doc_words = int(short_doc_words)
+        self.sim_threshold = float(sim_threshold) if sim_threshold is not None else None
+        self.projector = resolved.projector
+
+        self.unsafe_bank: Optional[np.ndarray] = None
+        if unsafe_exemplars:
+            U = self._project_batch(unsafe_exemplars)
+            if len(U) > 0:
+                self.unsafe_bank = _l2_normalize_rows(U)
+
+    def _project_batch(self, texts: Sequence[str]) -> np.ndarray:
+        text_list = list(texts)
+        project_batch = getattr(self.projector, "project_batch", None)
+        if callable(project_batch):
+            out = project_batch(text_list)
+            if isinstance(out, tuple):
+                out = out[0]
+            return np.asarray(out, dtype=np.float32)
+        return np.vstack([np.asarray(self.projector.project(t), dtype=np.float32) for t in text_list])
+
+    def _batch_eval_logits_and_emb(self, texts: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
+        X = self._project_batch(texts)
+        return ((X @ self.W.T) + self.b) / 0.25, X
+
+    def _score_views(
+        self, text: str
+    ) -> Tuple[int, int, int, np.ndarray, np.ndarray, Optional[np.ndarray], float, float]:
+        t0 = time.perf_counter_ns()
+        if self.canonicalize:
+            canon, fragments = canonicalize_guard_text(text)
+        else:
+            canon, fragments = text, []
+        t1 = time.perf_counter_ns()
+
+        canon_stripped = canon.strip()
+        words = _WS_RE.split(canon_stripped) if canon_stripped else []
+        is_short_doc = len(words) <= self.short_doc_words
+
+        if not self.use_windows:
+            combined = canon_stripped if not fragments else (canon_stripped + " " + " ".join(fragments)).strip()
+            all_views = [combined if combined else canon]
+        elif self.short_doc_passthrough and is_short_doc:
+            if not fragments:
+                all_views = [canon_stripped if canon_stripped else canon]
+            else:
+                frag_views = make_sliding_windows(
+                    "",
+                    fragments,
+                    window_words=self.window_words,
+                    stride_words=self.stride_words,
+                )
+                frag_views = [v for v in frag_views if v]
+                all_views = [canon_stripped if canon_stripped else canon] + frag_views
+        else:
+            all_views = make_sliding_windows(
+                canon,
+                fragments,
+                window_words=self.window_words,
+                stride_words=self.stride_words,
+            )
+
+        scaled_logits, X_views = self._batch_eval_logits_and_emb(all_views)
+        shifted = scaled_logits - np.max(scaled_logits, axis=1, keepdims=True)
+        exps = np.exp(np.clip(shifted, -50.0, 50.0))
+        probs = exps / np.sum(exps, axis=1, keepdims=True)
+
+        sims: Optional[np.ndarray] = None
+        if self.unsafe_bank is not None and len(self.unsafe_bank) > 0:
+            X_norm = _l2_normalize_rows(X_views)
+            sims = np.max(X_norm @ self.unsafe_bank.T, axis=1)
+
+        elapsed_us = (time.perf_counter_ns() - t0) / 1000.0
+        canon_us = (t1 - t0) / 1000.0
+        return (
+            len(all_views),
+            len(fragments),
+            int(is_short_doc),
+            scaled_logits,
+            probs,
+            sims,
+            canon_us,
+            elapsed_us,
+        )
+
+    def _decision_from_views(
+        self,
+        *,
+        n_views: int,
+        n_frags: int,
+        is_short_doc: bool,
+        scaled_logits: np.ndarray,
+        probs: np.ndarray,
+        sims: Optional[np.ndarray],
+        canon_us: float,
+        base_elapsed_us: float,
+        short_doc_passthrough: bool,
+        window_margin_threshold: float,
+        sim_threshold: Optional[float],
+    ) -> ShieldDecision:
+        t_dec0 = time.perf_counter_ns()
+        unsafe_logits = np.max(scaled_logits[:, self.unsafe_idxs], axis=1)
+        max_other_logits = np.max(scaled_logits[:, self.safe_idxs], axis=1)
+        unsafe_margins = unsafe_logits - max_other_logits
+        unsafe_probs = np.sum(probs[:, self.unsafe_idxs], axis=1)
+
+        full_margin = float(unsafe_margins[0])
+        if (not self.use_windows) or (short_doc_passthrough and is_short_doc and n_frags == 0):
+            best_win = 0
+            max_margin = full_margin
+            max_prob = float(unsafe_probs[0])
+            max_sim = float(sims[0]) if sims is not None else None
+            is_unsafe = max_margin >= 0.0
+        elif short_doc_passthrough and is_short_doc and n_frags > 0:
+            base_hit = full_margin >= 0.0
+            frag_margins = unsafe_margins[1:]
+            if sim_threshold is not None and sims is not None and len(frag_margins) > 0:
+                frag_hits = (frag_margins >= window_margin_threshold) & (sims[1:] >= sim_threshold)
+                hit_any = base_hit or bool(np.any(frag_hits))
+            else:
+                frag_hits = frag_margins >= 0.0
+                hit_any = base_hit or bool(np.any(frag_hits))
+            best_win = int(np.argmax(unsafe_margins))
+            max_margin = float(unsafe_margins[best_win])
+            max_prob = float(unsafe_probs[best_win])
+            max_sim = float(np.max(sims)) if sims is not None else None
+            is_unsafe = hit_any
+        else:
+            if sim_threshold is not None and sims is not None:
+                win_hits = (unsafe_margins >= window_margin_threshold) & (sims >= sim_threshold)
+                is_unsafe = bool(np.any(win_hits))
+                if is_unsafe:
+                    best_win = int(np.argmax(np.where(win_hits, unsafe_margins, -1e9)))
+                else:
+                    best_win = int(np.argmax(unsafe_margins))
+                max_sim = float(sims[best_win])
+            else:
+                best_win = int(np.argmax(unsafe_margins))
+                is_unsafe = bool(unsafe_margins[best_win] >= window_margin_threshold)
+                max_sim = float(sims[best_win]) if sims is not None else None
+            max_margin = float(unsafe_margins[best_win])
+            max_prob = float(unsafe_probs[best_win])
+
+        if is_unsafe:
+            best_u = max(self.unsafe_idxs, key=lambda idx: float(scaled_logits[best_win, idx]))
+            pred = self.options[best_u]
+        else:
+            best_c = int(np.argmax(scaled_logits[0]))
+            if best_c in self._unsafe_idx_set:
+                best_safe = max(self.safe_idxs, key=lambda idx: float(scaled_logits[0, idx]))
+                pred = self.options[best_safe]
+            else:
+                pred = self.options[best_c]
+
+        dec_us = (time.perf_counter_ns() - t_dec0) / 1000.0
+        return ShieldDecision(
+            predicted_label=pred,
+            is_unsafe=is_unsafe,
+            full_doc_unsafe_margin=full_margin,
+            max_window_unsafe_margin=max_margin,
+            max_window_unsafe_prob=max_prob,
+            num_windows=n_views,
+            decoded_fragments=n_frags,
+            canonicalize_us=canon_us,
+            total_us=base_elapsed_us + dec_us,
+            max_window_unsafe_sim=max_sim,
+        )
+
+    def evaluate_single(self, text: str) -> ShieldDecision:
+        """Evaluate one prompt with canonicalization and optional prototype-gated windows."""
+        nv, nf, is_s, s_log, probs, sims, canon_us, base_us = self._score_views(text)
+        return self._decision_from_views(
+            n_views=nv,
+            n_frags=nf,
+            is_short_doc=bool(is_s),
+            scaled_logits=s_log,
+            probs=probs,
+            sims=sims,
+            canon_us=canon_us,
+            base_elapsed_us=base_us,
+            short_doc_passthrough=self.short_doc_passthrough,
+            window_margin_threshold=self.window_margin_threshold,
+            sim_threshold=self.sim_threshold,
+        )
+
+    def evaluate_with_naive_ablation(self, text: str) -> Tuple[ShieldDecision, ShieldDecision]:
+        """Return `(gated_decision, naive_maxwin_decision)` sharing one window projection pass."""
+        nv, nf, is_s, s_log, probs, sims, canon_us, base_us = self._score_views(text)
+        dec_gated = self._decision_from_views(
+            n_views=nv,
+            n_frags=nf,
+            is_short_doc=bool(is_s),
+            scaled_logits=s_log,
+            probs=probs,
+            sims=sims,
+            canon_us=canon_us,
+            base_elapsed_us=base_us,
+            short_doc_passthrough=self.short_doc_passthrough,
+            window_margin_threshold=self.window_margin_threshold,
+            sim_threshold=self.sim_threshold,
+        )
+        dec_naive = self._decision_from_views(
+            n_views=nv,
+            n_frags=nf,
+            is_short_doc=bool(is_s),
+            scaled_logits=s_log,
+            probs=probs,
+            sims=None,
+            canon_us=canon_us,
+            base_elapsed_us=base_us,
+            short_doc_passthrough=False,
+            window_margin_threshold=0.0,
+            sim_threshold=None,
+        )
+        return dec_gated, dec_naive
+
+    @classmethod
+    def calibrate_sim_threshold_from_benign(
+        cls,
+        model: Any,
+        *,
+        field_name: str,
+        unsafe_label: Optional[Union[str, bool]] = None,
+        unsafe_labels: Optional[Sequence[Union[str, bool]]] = None,
+        benign_texts: Sequence[str],
+        unsafe_exemplars: Sequence[str],
+        window_words: int = 24,
+        stride_words: int = 12,
+        target_fpr: float = 0.01,
+        safety_margin: float = 0.02,
+        seed: int = 77,
+    ) -> float:
+        """Calibrate `sim_threshold` strictly on clean and benign-padded calibration texts."""
+        if not benign_texts or not unsafe_exemplars:
+            return 0.0
+        probe = cls(
+            model,
+            field_name=field_name,
+            unsafe_label=unsafe_label,
+            unsafe_labels=unsafe_labels,
+            window_words=window_words,
+            stride_words=stride_words,
+            window_margin_threshold=0.0,
+            short_doc_passthrough=False,
+            unsafe_exemplars=unsafe_exemplars,
+            sim_threshold=None,
+        )
+        if probe.unsafe_bank is None or len(probe.unsafe_bank) == 0:
+            return 0.0
+        cal_docs: List[str] = []
+        for i, txt in enumerate(benign_texts):
+            filler = _make_cal_filler_words(240, seed + i * 13)
+            half = len(filler) // 2
+            cal_docs.append(" ".join(filler[:half]) + f" {txt} " + " ".join(filler[half:]))
+
+        max_sims: List[float] = []
+        for doc in cal_docs:
+            canon, frags = canonicalize_guard_text(doc)
+            wins = make_sliding_windows(canon, frags, window_words=window_words, stride_words=stride_words)
+            X_w = _l2_normalize_rows(probe._project_batch(wins))
+            sims = np.max(X_w @ probe.unsafe_bank.T, axis=1)
+            max_sims.append(float(np.max(sims)))
+        q = float(np.quantile(max_sims, min(1.0, max(0.0, 1.0 - target_fpr))))
+        return float(q + safety_margin)
+
+    @classmethod
+    def calibrate_threshold_from_benign(
+        cls,
+        model: Any,
+        *,
+        field_name: str,
+        unsafe_label: Optional[Union[str, bool]] = None,
+        unsafe_labels: Optional[Sequence[Union[str, bool]]] = None,
+        benign_texts: Sequence[str],
+        window_words: int = 24,
+        stride_words: int = 12,
+        target_fpr: float = 0.01,
+    ) -> float:
+        """Calibrate `window_margin_threshold` on benign texts strictly from calibration splits."""
+        if not benign_texts:
+            return 0.0
+        probe = cls(
+            model,
+            field_name=field_name,
+            unsafe_label=unsafe_label,
+            unsafe_labels=unsafe_labels,
+            window_words=window_words,
+            stride_words=stride_words,
+            window_margin_threshold=0.0,
+            short_doc_passthrough=False,
+        )
+        margins = [probe.evaluate_single(t).max_window_unsafe_margin for t in benign_texts]
+        q = float(np.quantile(margins, min(1.0, max(0.0, 1.0 - target_fpr))))
+        return max(0.0, q + 1e-4)
 
 
 def _required_identifier(name: str, value: str) -> str:
@@ -775,7 +1323,15 @@ class SystemOneGuardHook:
         fail_closed_ledger: bool = True,
         enforcement_profile: Optional[Union[str, EnforcementProfile, bool]] = None,
         signing_key: Optional[Any] = None,
+        shield_mode: str = "off",
+        shield: Optional[GuardShield] = None,
     ) -> None:
+        if shield_mode not in VALID_SHIELD_MODES:
+            raise ValueError(f"Unsupported shield_mode {shield_mode!r}; expected one of {VALID_SHIELD_MODES}")
+        self.shield_mode = shield_mode
+        self.shield = shield
+        self._lazy_shield: Optional[GuardShield] = None
+        self._lazy_shield_version: int = -1
         self.fail_closed_ledger = bool(fail_closed_ledger)
         if enforcement_profile is True:
             self.enforcement_profile: Optional[EnforcementProfile] = EnforcementProfile()
@@ -938,10 +1494,15 @@ class SystemOneGuardHook:
                 )
                 return GuardInterceptionResult(outcome, reason, decision_result=None, policy_decision=pol_decision, proposal=proposal)
 
-        prompt = context_prompt or (
+        raw_prompt = context_prompt or (
             f"Tool: {proposal.tool}. Target: {proposal.canonical_target}. "
             f"Args: {dict(proposal.arguments)}. Purpose: {proposal.purpose}"
         )
+        if self.shield_mode != "off":
+            canon_p, frags_p = canonicalize_guard_text(raw_prompt)
+            prompt = canon_p if not frags_p else f"{canon_p} {' '.join(frags_p)}".strip()
+        else:
+            prompt = raw_prompt
 
         native_engine = isinstance(self.engine, SystemOneEngine)
         try:
@@ -1026,6 +1587,30 @@ class SystemOneGuardHook:
                     effective_alpha=eff_alpha,
                 )
             return GuardInterceptionResult(final_outcome, final_reason, decision, pol_dec, proposal=proposal)
+
+        # 0. Check opt-in GuardShield window scanner when enabled
+        active_shield = self.shield
+        if active_shield is None and self.shield_mode == "sliding_window" and native_engine:
+            model_obj = getattr(self.engine, "model", None)
+            heads = (
+                (getattr(model_obj, "_field_heads", None) or getattr(model_obj, "heads", {}))
+                if model_obj is not None
+                else {}
+            )
+            if "is_safe" in self.engine.schema.fields and "is_safe" in heads:
+                cur_ver = int(getattr(self.engine, "model_version", 1))
+                if self._lazy_shield is None or self._lazy_shield_version != cur_ver:
+                    self._lazy_shield = GuardShield(self.engine, field_name="is_safe", unsafe_label="False")
+                    self._lazy_shield_version = cur_ver
+                active_shield = self._lazy_shield
+        if active_shield is not None:
+            shield_dec = active_shield.evaluate_single(raw_prompt)
+            if shield_dec.is_unsafe:
+                reason = (
+                    f"System 1 GuardShield blocked unsafe window "
+                    f"(margin: {shield_dec.max_window_unsafe_margin:.3f})"
+                )
+                return _finish(DecisionOutcome.DENY, RiskLevel.IRREVERSIBLE, "system1_shield_deny", reason)
 
         # 1. Check safety boolean if present
         if "is_safe" in decision.values and not decision.values["is_safe"]:
@@ -1223,13 +1808,20 @@ __all__ = [
     "EnforcementProfile",
     "EvidenceRef",
     "GuardInterceptionResult",
+    "GuardShield",
     "PolicyDecision",
     "PolicyEngine",
     "PolicyRule",
+    "ShieldDecision",
     "SystemOneGuard",
     "SystemOneGuardHook",
     "System1Guard",
     "ReflexGuard",
     "ResultStatus",
     "RiskLevel",
+    "VALID_SHIELD_MODES",
+    "canonicalize_guard_text",
+    "extract_decoded_tool_payloads",
+    "make_sliding_windows",
+    "strip_invisible_and_nfkc",
 ]

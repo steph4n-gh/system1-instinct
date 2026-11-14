@@ -6,6 +6,7 @@ import ast
 import asyncio
 import json
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any, Dict, List, Tuple
 
@@ -758,12 +759,25 @@ def test_utility_cascade_router_end_to_end() -> None:
 
 
 def test_pure_numpy_no_scipy_or_sklearn_in_wave3_modules() -> None:
-    assert "scipy" not in sys.modules
-    assert "sklearn" not in sys.modules
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys, system1.calibration, system1.compat.universal, "
+                "system1.integrations.drop_in, system1.explain, system1.fleet, "
+                "system1.guard, system1.teaching; "
+                "assert 'scipy' not in sys.modules; "
+                "assert 'sklearn' not in sys.modules; "
+                "assert 'orjson' not in sys.modules"
+            ),
+        ],
+        check=True,
+    )
 
     pkg_dir = Path(system1.__file__).resolve().parent
     forbidden = {"scipy", "sklearn", "orjson"}
-    for fname in ("calibration.py", "compat/universal.py", "integrations/drop_in.py"):
+    for fname in ("calibration.py", "compat/universal.py", "integrations/drop_in.py", "explain.py", "fleet.py"):
         source = (pkg_dir / fname).read_text(encoding="utf-8")
         tree = ast.parse(source)
         for node in ast.walk(tree):

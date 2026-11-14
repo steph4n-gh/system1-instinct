@@ -34,6 +34,12 @@ from system1.core.schema import (
 )
 from system1.engine import SystemOneEngine
 from system1.fallback import BoundedReviewFallback
+from system1.guard import (
+    GuardShield,
+    VALID_SHIELD_MODES,
+    canonicalize_guard_text,
+    make_sliding_windows,
+)
 
 
 # ===========================================================================
@@ -889,13 +895,49 @@ class SystemOnePromptGuard:
         ),
     )
 
-    def __init__(self, compiled: bool = True) -> None:
+    def __init__(self, compiled: bool = True, *, shield_mode: str = "off") -> None:
+        if shield_mode not in VALID_SHIELD_MODES:
+            raise ValueError(f"Unsupported shield_mode {shield_mode!r}; expected one of {VALID_SHIELD_MODES}")
+        self.shield_mode = shield_mode
+        self._compiled = bool(compiled)
+        self._shield: Optional[GuardShield] = None
         self.training_rows: List[Tuple[str, Dict[str, Any]]] = list(self._TRAINING_ROWS)
         self.calibration_rows: List[Tuple[str, Dict[str, Any]]] = list(self._CALIBRATION_ROWS)
         if compiled:
             self.engine = self._build_compiled_guard()
         else:
             self.engine = SystemOneEngine(PromptGuardSchema, strict_mode=False, use_cache=True)
+        if self.shield_mode != "off" and self._compiled:
+            self._rebuild_shield()
+
+    def _rebuild_shield(self) -> None:
+        rows = self.training_rows + self.calibration_rows
+        benign_texts = [t for t, r in rows if r["verdict"] == "benign"]
+        unsafe_texts = [t for t, r in rows if r["verdict"] != "benign"]
+        unsafe_labels = ("prompt_injection", "credential_exfiltration")
+        if self.shield_mode == "sliding_window":
+            sim_thr = GuardShield.calibrate_sim_threshold_from_benign(
+                self.engine.model,
+                field_name="verdict",
+                unsafe_labels=unsafe_labels,
+                benign_texts=benign_texts,
+                unsafe_exemplars=unsafe_texts,
+            )
+            self._shield = GuardShield(
+                self.engine.model,
+                field_name="verdict",
+                unsafe_labels=unsafe_labels,
+                use_windows=True,
+                unsafe_exemplars=unsafe_texts,
+                sim_threshold=sim_thr,
+            )
+        else:
+            self._shield = GuardShield(
+                self.engine.model,
+                field_name="verdict",
+                unsafe_labels=unsafe_labels,
+                use_windows=False,
+            )
 
     @classmethod
     def _build_compiled_guard(cls) -> SystemOneEngine:
@@ -933,30 +975,60 @@ class SystemOnePromptGuard:
     def scan(self, prompt: str) -> PromptGuardResult:
         """Scans an incoming prompt in sub-millisecond latency."""
         t0 = time.perf_counter()
-        decision = self.engine.decide(prompt, record_receipt=False)
-        latency_ms = (time.perf_counter() - t0) * 1000.0
+        if self.shield_mode == "off":
+            eff_prompt = prompt
+        else:
+            canon, frags = canonicalize_guard_text(prompt)
+            eff_prompt = canon if not frags else f"{canon} {' '.join(frags)}".strip()
+
+        decision = self.engine.decide(eff_prompt, record_receipt=False)
         verdict = str(decision.values["verdict"])
         blocked = bool(decision.values["block_request"]) or (verdict != "benign")
+        risk_score = float(decision.values["risk_score"])
         conf = float(min(decision.confidences.values())) if decision.confidences else 1.0
+
+        if self.shield_mode == "sliding_window":
+            if self._shield is not None:
+                s_dec = self._shield.evaluate_single(prompt)
+                if s_dec.is_unsafe:
+                    if verdict == "benign":
+                        verdict = s_dec.predicted_label
+                    blocked = True
+                    risk_score = max(risk_score, float(s_dec.max_window_unsafe_prob))
+                    conf = max(conf, float(s_dec.max_window_unsafe_prob))
+            else:
+                for win in make_sliding_windows(canon, frags):
+                    w_dec = self.engine.decide(win, record_receipt=False)
+                    w_verdict = str(w_dec.values["verdict"])
+                    if bool(w_dec.values["block_request"]) or (w_verdict != "benign"):
+                        if verdict == "benign":
+                            verdict = w_verdict
+                        blocked = True
+                        risk_score = max(risk_score, float(w_dec.values["risk_score"]))
+                        w_conf = float(min(w_dec.confidences.values())) if w_dec.confidences else conf
+                        conf = max(conf, w_conf)
+
+        latency_ms = (time.perf_counter() - t0) * 1000.0
         return PromptGuardResult(
             prompt=prompt,
             verdict=verdict,
             blocked=blocked,
-            risk_score=round(float(decision.values["risk_score"]), 4),
+            risk_score=round(risk_score, 4),
             confidence=round(conf, 4),
             latency_ms=round(latency_ms, 3),
         )
 
     def learn_feedback(self, prompt: str, verdict: str) -> None:
         """Online 1-shot update for new attack vectors or false-positive corrections."""
-        self.engine.learn(
-            prompt,
-            {
-                "verdict": verdict,
-                "block_request": (verdict != "benign"),
-                "risk_score": 0.05 if verdict == "benign" else 0.95,
-            },
-        )
+        row = {
+            "verdict": verdict,
+            "block_request": (verdict != "benign"),
+            "risk_score": 0.05 if verdict == "benign" else 0.95,
+        }
+        self.training_rows.append((prompt, row))
+        self.engine.learn(prompt, row)
+        if self.shield_mode != "off" and self._compiled:
+            self._rebuild_shield()
 
 
 __all__ = [
