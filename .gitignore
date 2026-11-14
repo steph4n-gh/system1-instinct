@@ -94,6 +94,7 @@ audit/
 # Agent run logs and data
 runs/
 *.jsonl
+!benchmarks/prequential/fixtures/*.jsonl
 
 # Quality benchmark results
 benchmarks/quality/results/quality_results_*.json
