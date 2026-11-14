@@ -60,3 +60,37 @@ with ActionLedger(".system1/demo-audit.sqlite", require_durable=True) as ledger:
 ## Enforce caller identity and argument limits
 
 Derive `tenant_id`, `principal_id`, and `scope` from your authenticated application session, restrict tool arguments and targets in `PolicyRule`, and prevent agent code from calling tools outside `SystemOneGuard`. Without `enforcement_profile=True`, `SystemOneGuard` runs in diagnostic mode and can allow actions through statistical classification. Before granting consequential tool permissions, review [Deployment boundaries](../deployment.md).
+
+## Configure ActionLedger WAL durability and coalesced READ_ONLY writes
+
+`ActionLedger` supports four `durability_mode` profiles:
+
+- `"process_wal"` (default): SQLite WAL mode with `synchronous=NORMAL`.
+- `"group_commit"`: Background writer thread batching concurrent commits over `group_commit_ms` (default `4.0 ms`).
+- `"strict_sync"`: `synchronous=FULL` with `fullfsync` on commit (used when per-commit hardware barriers are required).
+- `"high_throughput_normal"`: Non-strict throughput profile (rejected when `enforce_durability=True`).
+
+For enforced persistent ledgers and atomic `READ_ONLY` execution auditing:
+
+```python
+with ActionLedger(
+    ".system1/demo-audit.sqlite",
+    require_durable=True,
+    enforce_durability=True,
+    durability_mode="process_wal",
+) as ledger:
+    decision_hash, outcome_hash = ledger.record_coalesced_read_only_execution(
+        auth.receipt,
+        reversibility="READ_ONLY",
+        action_id=proposal.action_id,
+        receipt_digest=auth.receipt.compute_digest(),
+        status="SUCCEEDED",
+        result_payload={"value": "system1-demo"},
+        tenant_id=proposal.tenant_id,
+        principal_id=proposal.principal_id,
+        scope=proposal.scope,
+        trusted_public_key=signing_key.public_key(),
+    )
+```
+
+Mutating or destructive operations continue to require two separate commits (`append` / `record_decision_receipt` before execution, then `record_execution_outcome` after execution). On unmodified connections, `ActionLedger` uses an `O(1)` verification watermark (`PRAGMA data_version` and `total_changes()`) and reverifies the full hash chain whenever external SQLite writes or reopening occur.

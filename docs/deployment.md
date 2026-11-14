@@ -1,6 +1,6 @@
 # Configure deployment boundaries and runtime limits
 
-System 1: Instinct 1.0.0 provides NumPy-based compilation, conformal calibration, local `.s1m` inference, teacher observation, closed-loop review fallback (`BoundedReviewFallback`), and deterministic tool authorization (`SystemOneGuard`). See the [six-category benchmark report](../benchmarks/quality/instinct_gauntlet_report.md), [drop-in replacement guides](drop_in/README.md), [changelog](../CHANGELOG.md), and [benchmark suite index](../benchmarks/quality/README.md). Follow the procedures below to enforce security boundaries, statistical checks, and resource limits in production.
+System 1: Instinct 1.2.0 provides NumPy-based compilation, conformal calibration, local `.s1m` inference, teacher observation, closed-loop review fallback (`BoundedReviewFallback`), and deterministic tool authorization (`SystemOneGuard`). See the [six-category benchmark report](../benchmarks/quality/instinct_gauntlet_report.md), [drop-in replacement guides](drop_in/README.md), [changelog](../CHANGELOG.md), and [benchmark suite index](../benchmarks/quality/README.md). Follow the procedures below to enforce security boundaries, statistical checks, and resource limits in production.
 
 ## Enforce deterministic tool authorization
 
@@ -20,13 +20,14 @@ Follow these rules when deploying statistical decisions from `SystemOneEngine`:
 2. **Maintain exchangeability between calibration and live traffic.** Split-conformal prediction (`strict_mode=True`) guarantees marginal label coverage only when calibration examples and live inputs are exchangeable and you freeze the scoring head before calibration. It does not guarantee conditional correctness on every accepted singleton, joint coverage across all fields simultaneously, or adversarial robustness. An empty conformal set (`conformal_sets[field] == []`) signals abstention, not proof of distribution shift. See [Angelopoulos and Bates (2021)](https://arxiv.org/abs/2107.07511).
 3. **Keep teaching, calibration, and evaluation data disjoint.** Measure accuracy, coverage, and accepted-error rates on held-out traffic from your target environment. Setting `alpha` does not fix a constant escalation rate. `SystemOneEngine.decide()` returns structured values and `is_ambiguous` flags, leaving fallback execution to your application or `BoundedReviewFallback`.
 4. **Recalibrate when your workload requires strict coverage guarantees.** `engine.learn(...)` and `engine.learn_from_outcome(...)` default to `preserve_calibration=True`, which scales existing quantiles via Sherman-Morrison directional gain and synthesizes twenty initial scores when starting from zero examples. When you require formal split-conformal coverage after model updates, pass `preserve_calibration=False` and call `engine.calibrate(...)` on fresh held-out examples.
+5. **Control joint multi-field risk and sequential drift.** Call `engine.calibrate_joint(...)` (`JointSchemaCalibrator`) when coupled fields require joint selective risk control across predictions, and use `SequentialRiskMonitor(mode="capital_ons")` or `AutoCutoverLifecycle` for anytime-valid post-deployment drift monitoring.
 
 ## Verify audit receipts and protect ledger files
 
 To verify signed receipts and maintain an intact `ActionLedger` chain:
 
 1. **Supply an independently trusted public key.** Call `verify_decision_witness_receipt(receipt, public_key=trusted_key)` in Python or `system1 verify-receipt receipt.json --public-key trusted.pub` on the CLI. Calling `verify_decision_witness_receipt` without `public_key` returns `False`. Never trust a public key extracted from the receipt itself. For unsigned local integrity checks, use `check_decision_receipt_integrity(receipt)`.
-2. **Verify ledger inclusion against the SQLite chain.** `ActionLedger` stores a linear SHA-256 hash chain in SQLite and binds `ledger_record_id` inside the signed receipt envelope. Call `ledger.verify_receipt_record(receipt, trusted_public_key=trusted_key)` to verify both the stored record and the full hash chain. Because a linear SQLite chain is not a hardware enclave or external Merkle log, export periodic ledger-head digests to external append-only storage if you need truncation detection on a compromised host.
+2. **Verify ledger inclusion against the SQLite chain.** `ActionLedger` stores a linear SHA-256 hash chain in SQLite and binds `ledger_record_id` inside the signed receipt envelope. Configure SQLite WAL durability via `ActionLedger(..., durability_mode=...)` (`process_wal`, `strict_sync`, `group_commit`, or `high_throughput_normal`; `enforce_durability=True` rejects `:memory:` and `high_throughput_normal`), and use `record_coalesced_read_only_execution(...)` to commit decision and outcome together for strictly `READ_ONLY` actions. Call `ledger.verify_receipt_record(receipt, trusted_public_key=trusted_key)` to verify both the stored record and the full hash chain. Because a linear SQLite chain is not a hardware enclave or external Merkle log, export periodic ledger-head digests to external append-only storage if you need truncation detection on a compromised host.
 3. **Persist your Ed25519 keypair across restarts.** Generating a new signing key on every process start breaks single-key verification across ledger history. Store the private key with restricted filesystem permissions and back it up alongside the SQLite ledger.
 4. **Log policy denials separately if required.** Deterministic policy denials and approval requests do not always emit signed witness receipts. Record those events in your application logs if your audit policy requires a log of every rejected attempt.
 5. **Restrict access to ledger and receipt files.** Receipts and SQLite ledgers store prompts, tool arguments, and execution results in plaintext. Apply filesystem permissions and encryption at rest according to your data-handling policy.
@@ -37,12 +38,12 @@ To verify signed receipts and maintain an intact `ActionLedger` chain:
 
 When you attach `SystemOneGatewayMiddleware` (via `add_system1_gateway`):
 
-1. **Enforce authentication and request-size limits in outer middleware.** Because `SystemOneGatewayMiddleware` returns local HTTP responses before FastAPI route dependencies run, place authentication, rate limiting, and body-size caps in your reverse proxy or outer ASGI middleware.
-2. **Scope `route_paths` to classification endpoints.** `SystemOneGatewayMiddleware` matches path prefixes and any `POST` carrying `x-system1-route: true`. Use it only on classification endpoints. If you pass a custom `is_fastpath_fn`, verify its acceptance criteria on held-out traffic.
+1. **Enforce authentication and request-size limits in outer middleware.** Because `SystemOneGatewayMiddleware` returns local HTTP responses before FastAPI route dependencies run, place authentication and rate limiting in your reverse proxy or outer ASGI middleware. The middleware also enforces a built-in `max_body_bytes=1_048_576` (1 MiB) cap returning HTTP `413`.
+2. **Scope `route_paths` to classification endpoints.** `SystemOneGatewayMiddleware` matches `route_paths` prefixes by default. Header routing via `x-system1-route: true` is disabled unless `allow_route_header=True` is set, and when enabled should pair with `route_header_token` (`x-system1-route-token`). Use it only on classification endpoints. If you pass a custom `is_fastpath_fn`, verify its acceptance criteria on held-out traffic.
 
 ## Bind principal identity in LangChain and MCP adapters
 
-When you attach `SystemOneGuardCallbackHandler` or the in-process `SystemOneMCPProxy` (not a standalone MCP server):
+When you attach `SystemOneGuardCallbackHandler`, the in-process `SystemOneMCPProxy`, the stdio `MCPStdioProxy` (`--principal-id` and `--tenant-id`), or the HTTP `MCPStreamableHTTPServer` (`--bearer-token` and `--allowed-origin`):
 
 1. **Assign one `principal_id` per authenticated user or service.** Do not use per-request LangChain `run_id` values as `principal_id`.
 2. **Attach callbacks directly to tool objects and keep `raise_error=True`.** Allow `SystemOneGuardBlockedException` to propagate so blocked tool calls cannot execute.
@@ -74,7 +75,7 @@ When you deploy the gRPC server (`system1-instinct[grpc]`):
 | Per-member compression ratio | `1,024:1` |
 | Estimated model allocation budget | `256 MiB` |
 
-The loader disables Python `pickle`, verifies NPY header shapes and `float32` or `float64` dtypes before reading arrays, and raises `ValueError` on malformed or over-budget files. `HybridProjector` skills store their spectral and subspace matrices as binary `.npz` members (`_projector_spectral_vectors` and `_projector_subspace_components`). Both v1 (APS) and v2 (LAC) `.s1m` files remain readable in System 1: Instinct 1.0.0.
+The loader disables Python `pickle`, verifies NPY header shapes and `float32` or `float64` dtypes before reading arrays, and raises `ValueError` on malformed or over-budget files. `HybridProjector` skills store their spectral, subspace, landmark, and IDF arrays as binary `.npz` members (`_projector_spectral_vectors`, `_projector_subspace_components`, `_projector_rbf_landmarks`, `_projector_tfidf_idf`, and `_projector_hybrid_tfidf_idf`) for `v1_2_fisher` and `v1_2_rbf` compiled skills. Both v1 (APS) and v2 (LAC) `.s1m` files remain readable in System 1: Instinct 1.2.0.
 
 ## Measure end-to-end latency on target hardware
 

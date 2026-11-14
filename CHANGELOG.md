@@ -1,7 +1,24 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 - 2026-11-13
 
+**System 1: Instinct (`1.2.0`)** - Consolidates the internal `1.1` milestone and `1.2` runtime, calibration, cutover, and MCP server upgrades under `Development Status :: 5 - Production/Stable`.
+
+- **`ActionLedger` WAL Durability & `O(1)` Verification Watermarks**:
+  - Add configurable SQLite `durability_mode` (`"process_wal"` default, `"group_commit"`, `"strict_sync"`, `"high_throughput_normal"`) and `enforce_durability=True` (requiring persistent storage and rejecting `"high_throughput_normal"`).
+  - Add atomic single-commit `ActionLedger.record_coalesced_read_only_execution(...)` for `RiskLevel.READ_ONLY` actions and `O(1)` hash-chain verification watermarks invalidated on `PRAGMA data_version` or `total_changes()` drift.
+- **Vectorized Batch Inference**:
+  - Add `SystemOneEngine.decide_batch(prompts, ...)` with single-call numerical parity across `DeterministicSemanticProjector`, `TfidfProjector`, `HybridProjector`, and `CompiledSystemOneModel`.
+- **Discriminative Hybrid Representation (`v1_1`, `v1_2_fisher`, `v1_2_rbf`)**:
+  - Add `HybridProjector.fit(...)` (`semantic_mode="v1_1"`), `HybridProjector.fit_v1_2(...)` (stemmed/skip-bigram/char-ngram TF-IDF, schema-anchored spectral SVD, and optional LOO-filtered class-centroid RBF-Cosine landmarks via `attach_rbf_landmarks` in `"v1_2_rbf"`), `compute_strict_loo_weights` leave-one-out ridge margin filtering blended with class-balanced ridge weights (`proto_blend=0.22` in `"v1_2_fisher"` and `"v1_2_rbf"`), and pure-NumPy `DecisionCalibrator.fit_imbalance_aware(...)`.
+- **Selective, Factor-Graph Joint & Sequential Risk Control**:
+  - Add `SelectiveRiskCalibrator` (`"ltt_fst"`, `"ltt_bonferroni"`, `"rcps_joint"`), `AdaptiveConformalTracker`, `JointSchemaCalibrator` / `SystemOneEngine.calibrate_joint(train_examples, calibration_examples, ...)` (pairwise factor-graph exact MAP decoding + Joint LTT qualification), and `SequentialRiskMonitor` (`"capital_ons"`, `"ons_betting"`, `"capital_eb"`, `"fixed_mixture"` e-processes).
+- **Autonomous Cold-Start Cutover (`AutoCutoverLifecycle`)**:
+  - Add `AutoCutoverLifecycle` and `CutoverConfig` (`COLD_START_ABSTAIN` -> `MICRO_COMPILED_WARMUP` -> `SELECTIVE_HOT_SWAP` -> `DRIFT_RECALIBRATE`) with quarantine-filtered disjoint train/calibration reservoirs, wired into `BoundedReviewFallback(..., auto_compile=True)` and `TypeSafeClient(..., auto_cutover_lifecycle=...)`.
+- **Runnable MCP Stdio & Streamable HTTP Guard Servers**:
+  - Add `MCPStdioProxy` (`system1 mcp-proxy` / `system1 serve --transport mcp-stdio`) and `MCPStreamableHTTPServer` (`system1 serve --transport mcp-http` / `system1 mcp-proxy --transport http`, MCP `2025-03-26` Streamable HTTP with constant-time Bearer auth, `Origin` allowlists, `Mcp-Session-Id` lifecycle, `--durability-mode`, and `GET /healthz`).
+- **Offline Prequential Cassette Benchmark**:
+  - Add `benchmarks/prequential/` (`system1.cassette.v1` socket-blocked causal replay harness).
 - Add a frozen fresh HWU64/noisy-teacher comparison (`benchmarks/heldout_traffic/`) against an exact cache and a simple classifier at a matched 1% local error budget, with provenance receipts and independent verification (`verify.py` enforcing explicit `ValueError` checks even under `python -O`).
 - Serialize `HybridProjector` spectral and learned subspace matrices as binary `.npz` arrays inside `.s1m` artifacts instead of nested JSON lists in the header (reducing 64-class HWU64 hybrid headers from `1.27 MB` to `20.9 KB` and restoring `5/5` reloadability), while retaining backward-compatible loading for legacy JSON-inline projector fields.
 - Accelerate `SystemOneCompiler._solve_ridge` via an $O(N^3)$ dual/Woodbury solve when $N < D$, eliminate redundant `TfidfProjector` tokenization during compilation, and cache `HybridProjector` stem/hash tokens (cutting 64-class hybrid compile + calibration time from `4.68 s` to `1.74 s`).

@@ -380,6 +380,46 @@ class GuardInterceptionResult:
         return None
 
 
+_TARGET_ARG_KEYS = ("path", "target", "command", "input", "query", "url", "file", "uri")
+_MAX_TARGET_SCAN_BYTES = 1_048_576
+_TARGET_CHUNK_WINDOW = 65536
+_TARGET_CHUNK_STEP = 49152
+
+
+def _iter_target_chunks(raw: str) -> List[str]:
+    if len(raw) <= _TARGET_CHUNK_WINDOW:
+        return [raw]
+    capped = raw[:_MAX_TARGET_SCAN_BYTES]
+    chunks: List[str] = []
+    for start in range(0, len(capped), _TARGET_CHUNK_STEP):
+        chunks.append(capped[start : start + _TARGET_CHUNK_WINDOW])
+        if start + _TARGET_CHUNK_WINDOW >= len(capped):
+            break
+    return chunks
+
+
+def _extract_proposal_targets(proposal: ActionProposal, *, chunk_for_regex: bool = False) -> Tuple[str, ...]:
+    """Return canonical_target plus raw target-like arguments when hashed to sha256:."""
+    canonical = str(proposal.canonical_target)
+    if not canonical.startswith("sha256:") or not isinstance(proposal.arguments, Mapping):
+        return (canonical,)
+    candidates: List[str] = [canonical]
+    raw_values: List[str] = []
+    for key in _TARGET_ARG_KEYS:
+        val = proposal.arguments.get(key)
+        if isinstance(val, str) and val:
+            raw_values.append(val)
+    pos_args = proposal.arguments.get("_args")
+    if isinstance(pos_args, (list, tuple)) and pos_args and isinstance(pos_args[0], str) and pos_args[0]:
+        raw_values.append(pos_args[0])
+    for raw_val in raw_values:
+        if chunk_for_regex:
+            candidates.extend(_iter_target_chunks(raw_val))
+        else:
+            candidates.append(raw_val[:_MAX_TARGET_SCAN_BYTES])
+    return tuple(candidates)
+
+
 @dataclass(frozen=True)
 class PolicyRule:
     """Deterministic policy rule specifying conditions and strict action outcome."""
@@ -419,7 +459,10 @@ class PolicyRule:
             return False
         if self.action_pattern is not None and not re.search(self.action_pattern, proposal.tool):
             return False
-        if self.target_pattern is not None and not re.search(self.target_pattern, str(proposal.canonical_target)):
+        if self.target_pattern is not None and not any(
+            re.search(self.target_pattern, target_cand)
+            for target_cand in _extract_proposal_targets(proposal, chunk_for_regex=True)
+        ):
             return False
 
         if self.tenants is not None and proposal.tenant_id not in self.tenants:
@@ -485,9 +528,13 @@ class PolicyRule:
 
         # 5. Target constraints
         if self.denied_targets is not None:
-            target_str = str(proposal.canonical_target).lower()
+            candidate_targets = [
+                cand.lower()
+                for cand in _extract_proposal_targets(proposal, chunk_for_regex=False)
+            ]
             for pattern in self.denied_targets:
-                if str(pattern).lower() in target_str:
+                pat_lower = str(pattern).lower()
+                if any(pat_lower in target_str for target_str in candidate_targets):
                     return (
                         False,
                         self.reason or f"Deterministic policy violation: target {proposal.canonical_target!r} matches denied target pattern {pattern!r}",
@@ -896,15 +943,26 @@ class SystemOneGuardHook:
             f"Args: {dict(proposal.arguments)}. Purpose: {proposal.purpose}"
         )
 
+        native_engine = isinstance(self.engine, SystemOneEngine)
         try:
-            decision = self.engine.decide(
-                prompt,
-                alpha=eff_alpha,
-                telemetry=telemetry,
-                record_receipt=True,
-                ledger=self.ledger,
-                fail_closed_ledger=self.fail_closed_ledger,
-            )
+            if native_engine:
+                decision = self.engine.decide(
+                    prompt,
+                    alpha=eff_alpha,
+                    telemetry=telemetry,
+                    record_receipt=False,
+                    ledger=None,
+                    fail_closed_ledger=False,
+                )
+            else:
+                decision = self.engine.decide(
+                    prompt,
+                    alpha=eff_alpha,
+                    telemetry=telemetry,
+                    record_receipt=True,
+                    ledger=self.ledger,
+                    fail_closed_ledger=self.fail_closed_ledger,
+                )
         except (LedgerWriteError, LedgerError, sqlite3.Error) as ex:
             outcome = DecisionOutcome.DENY
             reason = f"Fail-closed Reference Monitor: ActionLedger write failed ({ex})"
@@ -920,11 +978,16 @@ class SystemOneGuardHook:
             )
             return GuardInterceptionResult(outcome, reason, decision_result=None, policy_decision=pol_decision, proposal=proposal)
 
-        # Fail-closed ledger check: if ledger is configured, durable recording MUST have succeeded
-        if self.ledger is not None and (decision.receipt is None or not decision.receipt.ledger_record_id or self.ledger.verify_receipt_record(
-            decision.receipt,
-            trusted_public_key=self.engine.signing_key.public_key() if self.engine.signing_key else None,
-        ) is not True):
+        # Fail-closed ledger check whenever the engine returned a receipt or handles its own recording
+        if self.ledger is not None and (not native_engine or decision.receipt is not None) and (
+            decision.receipt is None
+            or not decision.receipt.ledger_record_id
+            or self.ledger.verify_receipt_record(
+                decision.receipt,
+                trusted_public_key=self.engine.signing_key.public_key() if self.engine.signing_key else None,
+            )
+            is not True
+        ):
             outcome = DecisionOutcome.DENY
             reason = "Fail-closed Reference Monitor: ActionLedger failed to durably record decision receipt"
             pol_decision = self._build_policy_decision(
@@ -932,79 +995,78 @@ class SystemOneGuardHook:
             )
             return GuardInterceptionResult(outcome, reason, decision, pol_decision, proposal=proposal)
 
+        def _finish(
+            final_outcome: DecisionOutcome,
+            final_risk: RiskLevel,
+            final_rule_id: str,
+            final_reason: str,
+        ) -> GuardInterceptionResult:
+            pol_dec = self._build_policy_decision(
+                proposal, final_outcome, final_risk, final_rule_id, final_reason
+            )
+            if native_engine:
+                return self._finalize_authorization(
+                    proposal=proposal,
+                    outcome=final_outcome,
+                    reason=final_reason,
+                    pol_decision=pol_dec,
+                    decision=decision,
+                    context_prompt=prompt,
+                    rule_id=final_rule_id,
+                    effective_alpha=eff_alpha,
+                )
+            if final_outcome == DecisionOutcome.ALLOW:
+                return self._finalize_authorization(
+                    proposal=proposal,
+                    outcome=final_outcome,
+                    reason=final_reason,
+                    pol_decision=pol_dec,
+                    decision=decision,
+                    context_prompt=prompt,
+                    effective_alpha=eff_alpha,
+                )
+            return GuardInterceptionResult(final_outcome, final_reason, decision, pol_dec, proposal=proposal)
+
         # 1. Check safety boolean if present
         if "is_safe" in decision.values and not decision.values["is_safe"]:
-            outcome = DecisionOutcome.DENY
             reason = (
                 f"System 1 classified action as unsafe (confidence: {decision.confidences.get('is_safe', 0.0):.3f})"
             )
-            pol_decision = self._build_policy_decision(
-                proposal, outcome, RiskLevel.IRREVERSIBLE, "system1_safety_deny", reason
-            )
-            return GuardInterceptionResult(outcome, reason, decision, pol_decision, proposal=proposal)
+            return _finish(DecisionOutcome.DENY, RiskLevel.IRREVERSIBLE, "system1_safety_deny", reason)
         # 2. Check conformal ambiguity (|C(x)| > 1) or OOD (|C(x)| == 0)
         for field_name, cset in decision.conformal_sets.items():
             f_def = self.engine.schema.fields.get(field_name)
 
             # Out-of-distribution detection across all fields
             if len(cset) == 0:
-                outcome = DecisionOutcome.REQUIRE_APPROVAL
                 reason = f"System 1 detected out-of-distribution input for field {field_name!r} (empty conformal set)"
-                pol_decision = self._build_policy_decision(
-                    proposal, outcome, RiskLevel.EXTERNAL, "system1_conformal_ood", reason
-                )
-                return GuardInterceptionResult(outcome, reason, decision, pol_decision, proposal=proposal)
+                return _finish(DecisionOutcome.REQUIRE_APPROVAL, RiskLevel.EXTERNAL, "system1_conformal_ood", reason)
 
             # Categorical ambiguity (|C(x)| > 1) strictly applies to single-selection fields
             if isinstance(f_def, (ChoiceField, BooleanField)) and len(cset) > 1:
-                outcome = DecisionOutcome.REQUIRE_APPROVAL
                 reason = (
                     f"System 1 conformal ambiguity for {field_name!r}: set {cset} has {len(cset)} candidates at 1-alpha={1.0 - eff_alpha:.2f}"
                 )
-                pol_decision = self._build_policy_decision(
-                    proposal, outcome, RiskLevel.EXTERNAL, "system1_conformal_ambiguity", reason
-                )
-                return GuardInterceptionResult(outcome, reason, decision, pol_decision, proposal=proposal)
+                return _finish(DecisionOutcome.REQUIRE_APPROVAL, RiskLevel.EXTERNAL, "system1_conformal_ambiguity", reason)
 
         # 2.5 Check structured escalation state directly from the decision (catches regression/intervals)
         if getattr(decision, "is_ambiguous", False) or getattr(decision, "escalated_fields", None):
-            outcome = DecisionOutcome.REQUIRE_APPROVAL
             fields_str = ", ".join(getattr(decision, "escalated_fields", []) or [])
             reason = f"System 1 structured escalation required due to ambiguity/uncertainty (fields: {fields_str})"
-            pol_decision = self._build_policy_decision(
-                proposal, outcome, RiskLevel.EXTERNAL, "system1_structured_escalation", reason
-            )
-            return GuardInterceptionResult(outcome, reason, decision, pol_decision, proposal=proposal)
+            return _finish(DecisionOutcome.REQUIRE_APPROVAL, RiskLevel.EXTERNAL, "system1_structured_escalation", reason)
 
         # 3. Check minimum confidence threshold across all fields
         for field_name, conf in decision.confidences.items():
             if conf < self.min_confidence:
-                outcome = DecisionOutcome.REQUIRE_APPROVAL
                 reason = (
                     f"System 1 calibrated confidence {conf:.3f} for {field_name!r} below required threshold {self.min_confidence:.3f}"
                 )
-                pol_decision = self._build_policy_decision(
-                    proposal, outcome, RiskLevel.REVERSIBLE, "system1_low_confidence", reason
-                )
-                return GuardInterceptionResult(outcome, reason, decision, pol_decision, proposal=proposal)
+                return _finish(DecisionOutcome.REQUIRE_APPROVAL, RiskLevel.REVERSIBLE, "system1_low_confidence", reason)
 
         # 4. Safe and confident
-        outcome = DecisionOutcome.ALLOW
         lat_str = f"{decision.latency_ms:.2f}" if isinstance(decision.latency_ms, (int, float)) else str(decision.latency_ms)
         reason = f"System 1 verified action with full conformal confidence in {lat_str}ms"
-        pol_decision = self._build_policy_decision(
-            proposal, outcome, RiskLevel.READ_ONLY, "system1_verified_allow", reason
-        )
-
-        return self._finalize_authorization(
-            proposal=proposal,
-            outcome=outcome,
-            reason=reason,
-            pol_decision=pol_decision,
-            decision=decision,
-            context_prompt=prompt,
-            effective_alpha=eff_alpha,
-        )
+        return _finish(DecisionOutcome.ALLOW, RiskLevel.READ_ONLY, "system1_verified_allow", reason)
 
     def _finalize_authorization(
         self,
@@ -1051,6 +1113,20 @@ class SystemOneGuardHook:
             is_ambiguous = False
             ledger_record_id = None
 
+        truth_ledger_head = ""
+        if self.ledger is not None:
+            try:
+                truth_ledger_head = self.ledger.head_hash()
+            except Exception as ex:
+                if self.fail_closed_ledger:
+                    f_outcome = DecisionOutcome.DENY
+                    f_reason = f"Fail-closed Reference Monitor: ActionLedger write failed ({ex})"
+                    f_pol_decision = self._build_policy_decision(
+                        proposal, f_outcome, RiskLevel.IRREVERSIBLE, "system1_ledger_failure", f_reason
+                    )
+                    return GuardInterceptionResult(f_outcome, f_reason, decision_result=None, policy_decision=f_pol_decision, proposal=proposal)
+                truth_ledger_head = ""
+
         final_receipt = create_decision_receipt(
             schema_name=schema_name,
             schema_digest=schema_digest,
@@ -1061,7 +1137,7 @@ class SystemOneGuardHook:
             probabilities=probabilities,
             latency_ms=latency_ms,
             is_ambiguous=is_ambiguous,
-            truth_ledger_head=self.ledger.head_hash() if self.ledger else "",
+            truth_ledger_head=truth_ledger_head,
             signing_key=self.engine.signing_key,
             policy_decision=pol_decision,
             action_proposal=proposal,

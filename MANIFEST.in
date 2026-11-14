@@ -10,3 +10,4 @@ recursive-include deploy *.md *.yaml
 include examples/inbox_zero/upstream/LICENSE examples/inbox_zero/upstream/system1.patch
 recursive-include examples/teaching_by_doing/results *.zip
 recursive-include benchmarks/quality/document_workflow/results *.zip
+include benchmarks/prequential/fixtures/support_stream_v1.cassette.jsonl

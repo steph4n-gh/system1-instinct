@@ -137,6 +137,7 @@ def test_cli_subcommand_inventory() -> None:
         "compile",
         "teach",
         "serve",
+        "mcp-proxy",
     }
 
     parser = system1.cli.build_parser()

@@ -72,12 +72,13 @@ class SystemOneMCPProxy:
         guard: Optional[SystemOneGuardHook] = None,
         *,
         ledger: Optional[ActionLedger] = None,
-        alpha: float = 0.10,
+        alpha: float = 0.20,
         min_confidence: float = 0.50,
         tenant_id: str = "tenant_mcp_default",
         principal_id: str = "agent_mcp_client",
         model_path: Optional[Any] = None,
         auto_reload: bool = False,
+        tools: Optional[Sequence[Mapping[str, Any]]] = None,
     ):
         if guard is None:
             from system1.guard import DefaultGuardDecisionSchema
@@ -97,6 +98,7 @@ class SystemOneMCPProxy:
             self.guard = guard
         self.tenant_id = tenant_id
         self.principal_id = principal_id
+        self.tools: List[Dict[str, Any]] = [dict(t) for t in tools] if tools is not None else []
 
     def evaluate_mcp_call(
         self,
@@ -257,16 +259,18 @@ class SystemOneMCPProxy:
         # Invariant 1: Only dispatch to executor when method == "tools/call".
         # For non-tool methods (e.g. ping, initialize), return standard protocol response with 0 executor calls.
         if method != "tools/call":
+            if isinstance(data, dict) and "id" not in data:
+                return {}
             if method == "ping":
                 result = {}
             elif method == "initialize":
                 result = {
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.0.0"},
+                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.2.0"},
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":
-                result = {"tools": []}
+                result = {"tools": [dict(t) for t in self.tools]}
             else:
                 result = {}
             return {
@@ -416,16 +420,18 @@ class SystemOneMCPProxy:
         method = data.get("method")
 
         if method != "tools/call":
+            if isinstance(data, dict) and "id" not in data:
+                return {}
             if method == "ping":
                 result = {}
             elif method == "initialize":
                 result = {
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.0.0"},
+                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.2.0"},
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":
-                result = {"tools": []}
+                result = {"tools": [dict(t) for t in self.tools]}
             else:
                 result = {}
             return {"jsonrpc": "2.0", "id": req_id, "result": result}

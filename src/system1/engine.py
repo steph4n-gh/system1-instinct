@@ -32,6 +32,8 @@ from system1.calibration import (
     ConformalPredictionSet,
     ConformalPredictor,
     DecisionCalibrator,
+    JointSchemaCalibrator,
+    JointSelectiveCertificate,
     RecalibrationMetrics,
     RecalibrationReport,
     RegressionConformalInterval,
@@ -319,6 +321,18 @@ class EvaluationReport:
         )
 
 
+def _parse_jsonl_rows(raw_text: str, *, source: str = "input") -> List[Any]:
+    rows: List[Any] = []
+    for line_no, line in enumerate(raw_text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as ex:
+            raise ValueError(f"Invalid JSON in {source} line {line_no}: {ex.msg}") from ex
+    return rows
+
+
 def _normalize_eval_rows(
     rows: Any,
     schema: DecisionSchema,
@@ -331,18 +345,14 @@ def _normalize_eval_rows(
         if not raw_text:
             raise ValueError(f"Dataset file is empty: {path}")
         if path.suffix.lower() == ".jsonl":
-            parsed_rows: Any = [
-                json.loads(line)
-                for line in raw_text.splitlines()
-                if line.strip()
-            ]
+            parsed_rows: Any = _parse_jsonl_rows(raw_text, source=str(path))
         else:
             try:
                 parsed_rows = json.loads(raw_text)
             except json.JSONDecodeError:
                 lines = [line for line in raw_text.splitlines() if line.strip()]
                 if len(lines) > 1:
-                    parsed_rows = [json.loads(line) for line in lines]
+                    parsed_rows = _parse_jsonl_rows(raw_text, source=str(path))
                 else:
                     raise
         rows = parsed_rows
@@ -593,6 +603,12 @@ class SystemOneEngine:
         model_path: Optional[Union[str, Path]] = None,
         auto_reload: bool = False,
         compiled_model: Optional[Any] = None,
+        min_calibration_lessons: int = 0,
+        min_override_corroborations: int = 1,
+        max_calibration_window: int = 512,
+        selective_calibrators: Optional[Mapping[str, Any]] = None,
+        aci_tracker: Optional[Any] = None,
+        joint_calibrator: Optional[Any] = None,
     ) -> None:
         if model is None and compiled_model is not None:
             model = compiled_model
@@ -627,6 +643,20 @@ class SystemOneEngine:
         self.recency_weighted = bool(recency_weighted)
         self.strict_mode = bool(strict_mode)
         self.default_alpha: float = 0.05
+        if int(min_calibration_lessons) < 0:
+            raise ValueError(f"min_calibration_lessons must be >= 0, got {min_calibration_lessons}")
+        if int(min_override_corroborations) < 1:
+            raise ValueError(f"min_override_corroborations must be >= 1, got {min_override_corroborations}")
+        if int(max_calibration_window) < 1:
+            raise ValueError(f"max_calibration_window must be >= 1, got {max_calibration_window}")
+        self.min_calibration_lessons: int = int(min_calibration_lessons)
+        self.min_override_corroborations: int = int(min_override_corroborations)
+        self.max_calibration_window: int = int(max_calibration_window)
+        self.selective_calibrators: Dict[str, Any] = dict(selective_calibrators or {})
+        self.aci_tracker: Optional[Any] = aci_tracker
+        self.joint_calibrator: Optional[Any] = joint_calibrator
+        self._online_lesson_count: int = 0
+        self._override_counts: Dict[str, Dict[str, Tuple[Any, int]]] = {}
         self.policy_scope = str(policy_scope)
         self.policy_epoch: int = 0
         self.model_version: int = 1
@@ -721,6 +751,7 @@ class SystemOneEngine:
         # Lessons belong to the active skill; a replacement retires the old ones.
         self._learned_prompt_overrides = {}
         self._learned_prompt_override_recency: Dict[str, bool] = {}
+        self._override_counts = {}
         model_rec = getattr(model, "_learned_prompt_override_recency", {})
         if hasattr(model, "_learned_prompt_overrides") and isinstance(model._learned_prompt_overrides, Mapping):
             for p_key, f_map in model._learned_prompt_overrides.items():
@@ -859,6 +890,12 @@ class SystemOneEngine:
             calib = self.calibrators.get(fname)
             if calib is not None:
                 h.update(f"{fname}:temp:{calib.temperature:.6f}".encode("utf-8"))
+                adj = getattr(calib, "logit_adjustments", None)
+                if adj is not None:
+                    h.update(f"{fname}:adj:{np.asarray(adj, dtype=np.float64).tobytes()}".encode("utf-8"))
+                m_th = getattr(calib, "margin_threshold", None)
+                if m_th is not None:
+                    h.update(f"{fname}:mth:{float(m_th):.6f}".encode("utf-8"))
             cp = self.conformal_predictors.get(fname)
             if cp is not None and getattr(cp, "is_calibrated", False):
                 scores = getattr(cp, "calibration_scores", np.array([]))
@@ -874,6 +911,9 @@ class SystemOneEngine:
             if rcp is not None and getattr(rcp, "is_calibrated", False):
                 res = getattr(rcp, "residuals", np.array([]))
                 h.update(f"{fname}:rcp_res:{res.tobytes()}".encode("utf-8"))
+        jcal = getattr(self, "joint_calibrator", None)
+        if jcal is not None and hasattr(jcal, "digest"):
+            h.update(f"joint:{jcal.digest()}".encode("utf-8"))
         return h.hexdigest()
 
     def encode(
@@ -1411,6 +1451,76 @@ class SystemOneEngine:
                 brier_after=float(sum(m.brier_after for m in f_list)) / n_f_rep if f_list else 0.0,
             )
 
+    def calibrate_joint(
+        self,
+        train_examples: Sequence[Tuple[str, Mapping[str, Any]]],
+        calibration_examples: Sequence[Tuple[str, Mapping[str, Any]]],
+        *,
+        gamma: float = 1.0,
+        alpha: Optional[float] = None,
+        delta: float = 0.05,
+        score_kind: str = "margin",
+        grid_size: int = 25,
+        max_frac: float = 0.95,
+    ) -> Any:
+        """Fit pairwise factor-graph MAP structure on train_examples and Joint LTT on calibration_examples."""
+        if not train_examples:
+            raise ValueError("train_examples must be non-empty")
+        if not calibration_examples:
+            raise ValueError("calibration_examples must be non-empty")
+
+        eff_alpha = self.default_alpha if alpha is None else float(alpha)
+        jcal = JointSchemaCalibrator(
+            self.schema,
+            gamma=gamma,
+            alpha=eff_alpha,
+            delta=delta,
+            score_kind=score_kind,
+            grid_size=grid_size,
+            max_frac=max_frac,
+        )
+        jcal.fit_structure([lbl for _, lbl in train_examples])
+
+        with self._lock:
+            prev_jcal = self.joint_calibrator
+            self.joint_calibrator = None
+            try:
+                cal_prompts = [p for p, _ in calibration_examples]
+                decs = self.decide_batch(
+                    cal_prompts,
+                    alpha=eff_alpha,
+                    strict=False,
+                    record_receipt=False,
+                    use_cache=False,
+                )
+                calib_probs: Dict[str, np.ndarray] = {}
+                for jf in jcal.field_names:
+                    f_def = self.schema.fields[jf]
+                    if isinstance(f_def, BooleanField):
+                        calib_probs[jf] = np.array(
+                            [
+                                [d.probabilities[jf]["False"], d.probabilities[jf]["True"]]
+                                for d in decs
+                            ],
+                            dtype=np.float64,
+                        )
+                    else:
+                        opts = f_def.options
+                        calib_probs[jf] = np.array(
+                            [[d.probabilities[jf][o] for o in opts] for d in decs],
+                            dtype=np.float64,
+                        )
+                cert = jcal.calibrate(calib_probs, [lbl for _, lbl in calibration_examples])
+                self.joint_calibrator = jcal
+                if self.cache is not None:
+                    self.cache.clear()
+                if hasattr(self.model, "cache") and getattr(self.model, "cache", None) is not None:
+                    self.model.cache.clear()
+                return cert
+            except Exception:
+                self.joint_calibrator = prev_jcal
+                raise
+
     def evaluate_dataset(
         self,
         rows: Union[Sequence[Any], str, Path],
@@ -1434,18 +1544,28 @@ class SystemOneEngine:
 
         normalized_rows = _normalize_eval_rows(rows, self.schema)
         eff_strict = self.strict_mode if strict_mode is None else bool(strict_mode)
+        eff_use_cache = bool(use_cache)
 
-        decisions: List[DecisionResult] = [
-            self.decide(
-                prompt,
-                telemetry=telemetry,
+        if not eff_use_cache and all(telem is None for _, _, telem in normalized_rows):
+            decisions = self.decide_batch(
+                [prompt for prompt, _, _ in normalized_rows],
                 alpha=eff_alpha,
                 record_receipt=False,
                 strict=eff_strict,
-                use_cache=use_cache,
+                use_cache=False,
             )
-            for prompt, _, telemetry in normalized_rows
-        ]
+        else:
+            decisions = [
+                self.decide(
+                    prompt,
+                    telemetry=telemetry,
+                    alpha=eff_alpha,
+                    record_receipt=False,
+                    strict=eff_strict,
+                    use_cache=eff_use_cache,
+                )
+                for prompt, _, telemetry in normalized_rows
+            ]
 
         total_examples = len(normalized_rows)
         latencies = sorted(float(d.latency_ms) for d in decisions)
@@ -1798,7 +1918,7 @@ class SystemOneEngine:
                         if name in self.regression_conformal_predictors:
                             self.regression_conformal_predictors[name].is_calibrated = False
             if alpha is None:
-                alpha = self.default_alpha
+                alpha = self.aci_tracker.alpha_t if self.aci_tracker is not None else self.default_alpha
             if not isinstance(prompt, str):
                 raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
             if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not (0.0 < alpha < 1.0) or math.isnan(alpha) or math.isinf(alpha):
@@ -2028,23 +2148,40 @@ class SystemOneEngine:
                 raw_eval = raw_result.fields[name]
                 calibrator = self.calibrators[name]
                 has_learned_override = name in learned_overrides
+                conformal = self.conformal_predictors.get(name)
+                head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
+                fam_thresh = max(
+                    float(getattr(head_obj, "familiarity_threshold", 0.0)) if head_obj is not None else 0.0,
+                    float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0,
+                )
+                proto_thresh = max(
+                    float(getattr(head_obj, "prototype_threshold", 0.0)) if head_obj is not None else 0.0,
+                    float(getattr(conformal, "prototype_threshold", 0.0)) if conformal is not None else 0.0,
+                )
+                is_zero_emb = not bool(np.any(raw_result.embedding))
+                enforce_calibrated_ood = (not is_zero_emb) and (fam_thresh > 0.0 or proto_thresh > 0.0)
 
                 proto_sim: Optional[float] = None
-                if not has_learned_override:
+                if (not has_learned_override) or enforce_calibrated_ood:
                     if hasattr(self.model, "compute_prototype_similarity") and callable(self.model.compute_prototype_similarity):
                         try:
                             proto_sim = self.model.compute_prototype_similarity(name, raw_result.embedding)
                         except Exception:
                             proto_sim = None
-                    if proto_sim is None:
-                        cp_for_proto = self.conformal_predictors.get(name)
-                        if cp_for_proto is not None and getattr(cp_for_proto, "prototypes", None) is not None:
-                            try:
-                                proto_sim = cp_for_proto.compute_prototype_similarity(raw_result.embedding)
-                            except Exception:
-                                proto_sim = None
+                    if proto_sim is None and conformal is not None and getattr(conformal, "prototypes", None) is not None:
+                        try:
+                            proto_sim = conformal.compute_prototype_similarity(raw_result.embedding)
+                        except Exception:
+                            proto_sim = None
                     if proto_sim is not None:
                         prototype_similarities[name] = float(proto_sim)
+
+                ood_blocked = False
+                if enforce_calibrated_ood:
+                    if fam_thresh > 0.0 and prompt_raw_norm is not None and prompt_raw_norm < fam_thresh - 1e-12:
+                        ood_blocked = True
+                    if proto_thresh > 0.0 and proto_sim is not None and proto_sim < proto_thresh - 1e-6:
+                        ood_blocked = True
 
                 if isinstance(f_def, ChoiceField):
                     calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
@@ -2057,10 +2194,10 @@ class SystemOneEngine:
                     confidences[name] = conf
                     probabilities[name] = prob_dict
 
-                    conformal = self.conformal_predictors.get(name)
-                    is_zero_emb = not bool(np.any(raw_result.embedding))
-                    override_matched = has_learned_override and (
-                        is_zero_emb or selected_choice == learned_overrides.get(name)
+                    override_matched = (
+                        has_learned_override
+                        and not ood_blocked
+                        and (is_zero_emb or selected_choice == learned_overrides.get(name))
                     )
                     if conformal is not None and not override_matched:
                         try:
@@ -2071,8 +2208,8 @@ class SystemOneEngine:
                                 relative_odds_ratio=eff_gamma if not is_strict else None,
                                 confidence_floor_tau0=eff_tau0 if not is_strict else None,
                                 strict=is_strict,
-                                familiarity_score=None if has_learned_override else prompt_raw_norm,
-                                prototype_similarity=None if has_learned_override else proto_sim,
+                                familiarity_score=(None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
+                                prototype_similarity=(None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
                             )
                         except TypeError:
                             cset = conformal.predict_set(calibrated_p, alpha=alpha)
@@ -2113,10 +2250,10 @@ class SystemOneEngine:
                     confidences[name] = conf
                     probabilities[name] = {"False": float(calibrated_p[0]), "True": prob_true}
 
-                    conformal = self.conformal_predictors.get(name)
-                    is_zero_emb = not bool(np.any(raw_result.embedding))
-                    override_matched = has_learned_override and (
-                        is_zero_emb or val == bool(learned_overrides.get(name))
+                    override_matched = (
+                        has_learned_override
+                        and not ood_blocked
+                        and (is_zero_emb or val == bool(learned_overrides.get(name)))
                     )
                     if conformal is not None and not override_matched:
                         try:
@@ -2127,8 +2264,8 @@ class SystemOneEngine:
                                 relative_odds_ratio=eff_gamma if not is_strict else None,
                                 confidence_floor_tau0=eff_tau0 if not is_strict else None,
                                 strict=is_strict,
-                                familiarity_score=None if has_learned_override else prompt_raw_norm,
-                                prototype_similarity=None if has_learned_override else proto_sim,
+                                familiarity_score=(None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
+                                prototype_similarity=(None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
                             )
                         except TypeError:
                             cset = conformal.predict_set(calibrated_p, alpha=alpha)
@@ -2262,14 +2399,14 @@ class SystemOneEngine:
                             escalated_fields.append(name)
             if prompt_raw_norm is not None:
                 for name, definition in self.schema.fields.items():
-                    if name in learned_overrides:
-                        continue
                     head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                     cp_obj = self.conformal_predictors.get(name)
                     fam_t = max(
                         float(getattr(head_obj, "familiarity_threshold", 0.0)) if head_obj is not None else 0.0,
                         float(getattr(cp_obj, "familiarity_threshold", 0.0)) if cp_obj is not None else 0.0,
                     )
+                    if name in learned_overrides and fam_t <= 0.0:
+                        continue
                     if fam_t > 0.0 and prompt_raw_norm < fam_t - 1e-12:
                         familiarity_triggered = True
                         conformal_sets[name] = []
@@ -2281,14 +2418,14 @@ class SystemOneEngine:
                             if name not in escalated_fields:
                                 escalated_fields.append(name)
             for name, definition in self.schema.fields.items():
-                if name in learned_overrides:
-                    continue
                 head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                 cp_obj = self.conformal_predictors.get(name)
                 proto_t = max(
                     float(getattr(head_obj, "prototype_threshold", 0.0)) if head_obj is not None else 0.0,
                     float(getattr(cp_obj, "prototype_threshold", 0.0)) if cp_obj is not None else 0.0,
                 )
+                if name in learned_overrides and proto_t <= 0.0:
+                    continue
                 p_sim = prototype_similarities.get(name)
                 if proto_t > 0.0 and p_sim is not None and p_sim < proto_t - 1e-6:
                     prototype_triggered = True
@@ -2304,6 +2441,90 @@ class SystemOneEngine:
                     prototype_triggered = True
                 elif abstention_reasons.get(name) == "low_feature_familiarity":
                     familiarity_triggered = True
+
+            if is_strict:
+                for name, definition in self.schema.fields.items():
+                    if name in learned_overrides:
+                        continue
+                    sel_cal = self.selective_calibrators.get(name) if hasattr(self, "selective_calibrators") else None
+                    if sel_cal is not None:
+                        score_kind = getattr(sel_cal, "score_name", "margin")
+                        if score_kind in ("p1", "top_prob", "confidence"):
+                            sel_val = float(confidences.get(name, 0.0))
+                        else:
+                            sel_val = float(margins.get(name, 0.0))
+                        if not sel_cal.should_accept(sel_val):
+                            conformal_sets[name] = []
+                            abstention_reasons.setdefault(name, "selective_risk_gate")
+                            if name not in ambiguous_fields:
+                                ambiguous_fields.append(name)
+                            if getattr(definition, "escalate_on_ambiguity", True):
+                                is_ambiguous = True
+                                if name not in escalated_fields:
+                                    escalated_fields.append(name)
+                    if (
+                        getattr(self, "aci_tracker", None) is not None
+                        and getattr(self.aci_tracker, "margin_floor", None) is not None
+                        and name in margins
+                        and not self.aci_tracker.should_accept_margin(margins[name])
+                    ):
+                        conformal_sets[name] = []
+                        abstention_reasons.setdefault(name, "aci_margin_floor")
+                        if name not in ambiguous_fields:
+                            ambiguous_fields.append(name)
+                        if getattr(definition, "escalate_on_ambiguity", True):
+                            is_ambiguous = True
+                            if name not in escalated_fields:
+                                escalated_fields.append(name)
+
+            joint_extra_meta: Optional[Dict[str, Any]] = None
+            jcal = getattr(self, "joint_calibrator", None)
+            if (
+                jcal is not None
+                and hasattr(jcal, "decode_batch")
+                and not abstention_reasons
+                and not learned_overrides
+            ):
+                joint_fields = tuple(getattr(jcal, "field_names", ()))
+                if joint_fields and all(jf in probabilities for jf in joint_fields):
+                    probs_by_field_1: Dict[str, np.ndarray] = {}
+                    for jf in joint_fields:
+                        jf_def = self.schema.fields[jf]
+                        if isinstance(jf_def, BooleanField):
+                            probs_by_field_1[jf] = np.array(
+                                [[probabilities[jf]["False"], probabilities[jf]["True"]]],
+                                dtype=np.float64,
+                            )
+                        else:
+                            probs_by_field_1[jf] = np.array(
+                                [[probabilities[jf][o] for o in jf_def.options]],
+                                dtype=np.float64,
+                            )
+                    j_dicts, j_probs, j_margs, j_acc = jcal.decode_batch(probs_by_field_1)
+                    values.update(j_dicts[0])
+                    acc_0 = bool(j_acc[0])
+                    joint_extra_meta = {
+                        "joint_map_prob": float(j_probs[0]),
+                        "joint_map_margin": float(j_margs[0]),
+                        "joint_accepted": acc_0,
+                    }
+                    if is_strict:
+                        if acc_0:
+                            for jf in joint_fields:
+                                conformal_sets[jf] = [str(j_dicts[0][jf])]
+                            ambiguous_fields = [f for f in ambiguous_fields if f not in joint_fields]
+                            escalated_fields = [f for f in escalated_fields if f not in joint_fields]
+                            is_ambiguous = bool(escalated_fields)
+                        else:
+                            for jf in joint_fields:
+                                conformal_sets[jf] = []
+                                abstention_reasons.setdefault(jf, "joint_selective_risk_gate")
+                                if jf not in ambiguous_fields:
+                                    ambiguous_fields.append(jf)
+                                if getattr(self.schema.fields[jf], "escalate_on_ambiguity", True):
+                                    is_ambiguous = True
+                                    if jf not in escalated_fields:
+                                        escalated_fields.append(jf)
 
             validated_values = self.schema.validate_decision(values)
             total_latency_ms = (time.perf_counter() - t_start) * 1000.0
@@ -2377,6 +2598,16 @@ class SystemOneEngine:
                     pass
 
             primary_abstention_reason = next(iter(abstention_reasons.values()), None)
+            result_meta: Dict[str, Any] = {
+                "familiarity_score": prompt_raw_norm,
+                "familiarity_triggered": familiarity_triggered,
+                "prototype_similarities": prototype_similarities,
+                "prototype_triggered": prototype_triggered,
+                "abstention_reason": primary_abstention_reason,
+                "abstention_reasons": abstention_reasons,
+            }
+            if joint_extra_meta is not None:
+                result_meta.update(joint_extra_meta)
             result = DecisionResult(
                 schema_name=self.schema.schema_name,
                 schema_digest=self.schema.schema_digest(),
@@ -2401,14 +2632,7 @@ class SystemOneEngine:
                 is_cache_hit=False,
                 embedding=raw_result.embedding,
                 familiarity_score=prompt_raw_norm,
-                metadata={
-                    "familiarity_score": prompt_raw_norm,
-                    "familiarity_triggered": familiarity_triggered,
-                    "prototype_similarities": prototype_similarities,
-                    "prototype_triggered": prototype_triggered,
-                    "abstention_reason": primary_abstention_reason,
-                    "abstention_reasons": abstention_reasons,
-                },
+                metadata=result_meta,
             )
 
             if eff_use_cache and not is_ambiguous:
@@ -2501,10 +2725,40 @@ class SystemOneEngine:
             eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
             t0 = time.perf_counter()
 
+            c_emb: Optional[np.ndarray] = None
+            allow_prompt_for_head = (
+                embedding is None and isinstance(prompt, str) and bool(prompt.strip())
+            )
             if embedding is not None:
                 emb = np.asarray(embedding, dtype=np.float32).flatten()
             else:
-                emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
+                from system1.core.model import DeterministicSemanticProjector
+
+                heads_map = getattr(self.model, "heads", {})
+                needs_concept = any(
+                    f_name in heads_map
+                    and getattr(heads_map[f_name], "_exemplar_bank", None) is not None
+                    and not getattr(heads_map[f_name], "hierarchical", False)
+                    for f_name in target
+                )
+                if (
+                    needs_concept
+                    and telemetry is None
+                    and type(self.projector) is DeterministicSemanticProjector
+                    and isinstance(prompt, str)
+                    and prompt.strip()
+                ):
+                    emb_raw, c_emb = self.projector.project_both(
+                        prompt,
+                        recency_weighted=recency_weighted,
+                        need_base=True,
+                        need_concept=True,
+                    )
+                    assert emb_raw is not None
+                    norm = np.linalg.norm(emb_raw)
+                    emb = (emb_raw / norm).astype(np.float32) if norm > 0 else emb_raw
+                else:
+                    emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
             if len(emb) != self.dimension:
                 raise ValueError(f"Expected embedding of length {self.dimension}, got {len(emb)}")
             if not np.all(np.isfinite(emb)):
@@ -2513,8 +2767,8 @@ class SystemOneEngine:
 
             if hasattr(self.model, "learn_from_tier2"):
                 model_emb = (
-                    None
-                    if (embedding is None and getattr(self.model, "projector", None) is self.projector)
+                    emb
+                    if getattr(self.model, "projector", None) is self.projector
                     else emb
                 )
                 try:
@@ -2527,6 +2781,8 @@ class SystemOneEngine:
                         recency_weighted=recency_weighted,
                         preserve_calibration=preserve_calibration,
                         reward_scale=eff_reward_scale,
+                        concept_embedding=c_emb,
+                        allow_prompt_for_head=allow_prompt_for_head,
                     )
                 except TypeError:
                     try:
@@ -2534,10 +2790,11 @@ class SystemOneEngine:
                             prompt,
                             target,
                             telemetry=telemetry,
-                            embedding=model_emb,
+                            embedding=None if (embedding is None and getattr(self.model, "projector", None) is self.projector) else emb,
                             forgetting_factor=eff_forgetting,
                             recency_weighted=recency_weighted,
                             preserve_calibration=preserve_calibration,
+                            reward_scale=eff_reward_scale,
                         )
                     except TypeError:
                         try:
@@ -2548,16 +2805,27 @@ class SystemOneEngine:
                                 embedding=model_emb,
                                 forgetting_factor=eff_forgetting,
                                 recency_weighted=recency_weighted,
+                                preserve_calibration=preserve_calibration,
                             )
                         except TypeError:
                             try:
                                 res_dict = self.model.learn_from_tier2(
-                                    prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
+                                    prompt,
+                                    target,
+                                    telemetry=telemetry,
+                                    embedding=model_emb,
+                                    forgetting_factor=eff_forgetting,
+                                    recency_weighted=recency_weighted,
                                 )
                             except TypeError:
-                                res_dict = self.model.learn_from_tier2(
-                                    prompt, target, telemetry=telemetry, embedding=model_emb
-                                )
+                                try:
+                                    res_dict = self.model.learn_from_tier2(
+                                        prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
+                                    )
+                                except TypeError:
+                                    res_dict = self.model.learn_from_tier2(
+                                        prompt, target, telemetry=telemetry, embedding=model_emb
+                                    )
                 updated_fields = res_dict.get("updated_fields", [])
                 rank1_ms = res_dict.get("update_latency_ms", 0.0)
             else:
@@ -2609,8 +2877,12 @@ class SystemOneEngine:
 
             # Atomic version increment and cache invalidation AFTER weights are updated
             self.model_version += 1
+            self._online_lesson_count = getattr(self, "_online_lesson_count", 0) + 1
             if hasattr(self.model, "model_version"):
                 self.model.model_version = self.model_version
+
+            min_cal_lessons = getattr(self, "min_calibration_lessons", 0)
+            min_corrob = max(1, int(getattr(self, "min_override_corroborations", 1)))
 
             if not preserve_calibration:
                 norm_key_clear = (
@@ -2619,8 +2891,12 @@ class SystemOneEngine:
                     else None
                 )
                 for f_name in updated_fields:
-                    if norm_key_clear is not None and getattr(self, "_learned_prompt_overrides", None):
-                        if norm_key_clear in self._learned_prompt_overrides:
+                    if norm_key_clear is not None:
+                        if getattr(self, "_override_counts", None) and norm_key_clear in self._override_counts:
+                            self._override_counts[norm_key_clear].pop(f_name, None)
+                            if not self._override_counts[norm_key_clear]:
+                                self._override_counts.pop(norm_key_clear, None)
+                        if getattr(self, "_learned_prompt_overrides", None) and norm_key_clear in self._learned_prompt_overrides:
                             self._learned_prompt_overrides[norm_key_clear].pop(f_name, None)
                             if not self._learned_prompt_overrides[norm_key_clear]:
                                 self._learned_prompt_overrides.pop(norm_key_clear, None)
@@ -2652,18 +2928,34 @@ class SystemOneEngine:
                         and f_name in target_dict_for_override
                         and f_name in self.schema.fields
                     ):
+                        validated_val = self.schema.fields[f_name].validate_value(target_dict_for_override[f_name])
+                        if not hasattr(self, "_override_counts"):
+                            self._override_counts = {}
+                        field_counts = self._override_counts.setdefault(norm_key_override, {})
+                        prev_entry = field_counts.get(f_name)
+                        if prev_entry is not None and prev_entry[0] == validated_val:
+                            corrob_count = prev_entry[1] + 1
+                        else:
+                            corrob_count = 1
+                        field_counts[f_name] = (validated_val, corrob_count)
+
                         if not hasattr(self, "_learned_prompt_overrides"):
                             self._learned_prompt_overrides = {}
                         if not hasattr(self, "_learned_prompt_override_recency"):
                             self._learned_prompt_override_recency = {}
-                        while len(self._learned_prompt_overrides) >= 4096 and norm_key_override not in self._learned_prompt_overrides:
-                            oldest_k = next(iter(self._learned_prompt_overrides))
-                            del self._learned_prompt_overrides[oldest_k]
-                            self._learned_prompt_override_recency.pop(oldest_k, None)
-                        self._learned_prompt_overrides.setdefault(norm_key_override, {})[f_name] = (
-                            self.schema.fields[f_name].validate_value(target_dict_for_override[f_name])
-                        )
-                        self._learned_prompt_override_recency[norm_key_override] = bool(recency_weighted)
+                        if corrob_count >= min_corrob:
+                            while len(self._learned_prompt_overrides) >= 4096 and norm_key_override not in self._learned_prompt_overrides:
+                                oldest_k = next(iter(self._learned_prompt_overrides))
+                                del self._learned_prompt_overrides[oldest_k]
+                                self._learned_prompt_override_recency.pop(oldest_k, None)
+                                self._override_counts.pop(oldest_k, None)
+                            self._learned_prompt_overrides.setdefault(norm_key_override, {})[f_name] = validated_val
+                            self._learned_prompt_override_recency[norm_key_override] = bool(recency_weighted)
+                        elif norm_key_override in self._learned_prompt_overrides:
+                            self._learned_prompt_overrides[norm_key_override].pop(f_name, None)
+                            if not self._learned_prompt_overrides[norm_key_override]:
+                                self._learned_prompt_overrides.pop(norm_key_override, None)
+                                self._learned_prompt_override_recency.pop(norm_key_override, None)
                     ch = getattr(self.model, "heads", {}).get(f_name)
                     cp = self.conformal_predictors.get(f_name)
                     if cp is not None:
@@ -2693,7 +2985,7 @@ class SystemOneEngine:
                                     sim_after = float(np.max(cp.prototypes @ emb_u))
                                     if eff_reward_scale >= 0.5 and cp.prototype_threshold > 0.0 and sim_after < cp.prototype_threshold:
                                         cp.prototype_threshold = max(0.0, sim_after - 1e-4)
-                        if not cp.is_calibrated:
+                        if not cp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
                             k_opts = max(2, len(cp.options))
                             q_init = float((k_opts - 1.0) / (3.5 + k_opts))
                             cp.score_method = "lac"
@@ -2704,7 +2996,7 @@ class SystemOneEngine:
                         if ch is not None and getattr(ch, "calibration_scores", ()):
                             rcp.residuals = np.sort(np.asarray(ch.calibration_scores, dtype=np.float64))
                             rcp.is_calibrated = True
-                        elif not rcp.is_calibrated:
+                        elif not rcp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
                             f_def_s = self.schema.fields[f_name]
                             if isinstance(f_def_s, ScoreField):
                                 span = max(1e-6, float(f_def_s.max_value - f_def_s.min_value))
@@ -2722,43 +3014,44 @@ class SystemOneEngine:
                 if hasattr(self.model.cache, "invalidate_prior_versions"):
                     self.model.cache.invalidate_prior_versions(self.model_version)
 
-            # Re-evaluate with updated weights
-            res = self.decide(
-                prompt,
-                telemetry=telemetry,
-                embedding=embedding,
-                record_receipt=False,
-                recency_weighted=recency_weighted,
-                strict=self.strict_mode,
-                policy_scope=self.policy_scope,
-            )
-
-            if self.use_cache and (not res.is_ambiguous or not self.strict_mode):
-                eff_m_thresh = self.margin_threshold
-                m_dig = self._model_digest()
-                p_dig = self._projector_digest()
-                c_dig = self._calibration_digest()
-                self.cache.put(
+            # Re-evaluate and populate cache only when caching is active
+            if self.use_cache and self.cache is not None:
+                res = self.decide(
                     prompt,
-                    res,
-                    embedding=emb,
                     telemetry=telemetry,
-                    schema_digest=self.schema.schema_digest(),
-                    model_version=self.model_version,
-                    policy_scope=self.policy_scope,
-                    alpha=0.05,
-                    margin_threshold=eff_m_thresh if self.enable_margin_gating else 0.0,
-                    strict=self.strict_mode,
-                    relative_odds_ratio=self.relative_odds_ratio,
-                    confidence_floor_tau0=self.confidence_floor_tau0,
+                    embedding=embedding,
+                    record_receipt=False,
                     recency_weighted=recency_weighted,
-                    source="tier2",
-                    model_digest=m_dig,
-                    projector_digest=p_dig,
-                    calibration_digest=c_dig,
-                    policy_epoch=self.policy_epoch,
-                    explicit_embedding=(embedding is not None),
+                    strict=self.strict_mode,
+                    policy_scope=self.policy_scope,
                 )
+
+                if not res.is_ambiguous or not self.strict_mode:
+                    eff_m_thresh = self.margin_threshold
+                    m_dig = self._model_digest()
+                    p_dig = self._projector_digest()
+                    c_dig = self._calibration_digest()
+                    self.cache.put(
+                        prompt,
+                        res,
+                        embedding=emb,
+                        telemetry=telemetry,
+                        schema_digest=self.schema.schema_digest(),
+                        model_version=self.model_version,
+                        policy_scope=self.policy_scope,
+                        alpha=0.05,
+                        margin_threshold=eff_m_thresh if self.enable_margin_gating else 0.0,
+                        strict=self.strict_mode,
+                        relative_odds_ratio=self.relative_odds_ratio,
+                        confidence_floor_tau0=self.confidence_floor_tau0,
+                        recency_weighted=recency_weighted,
+                        source="tier2",
+                        model_digest=m_dig,
+                        projector_digest=p_dig,
+                        calibration_digest=c_dig,
+                        policy_epoch=self.policy_epoch,
+                        explicit_embedding=(embedding is not None),
+                    )
 
             total_ms = (time.perf_counter() - t0) * 1000.0
             return {
@@ -3082,13 +3375,19 @@ class SystemOneEngine:
                     compiled._learned_prompt_overrides[p_k] = dict(f_map)
             return compiled
 
-    def to_bytes(self, include_covariance: bool = False) -> bytes:
+    def to_bytes(self, include_covariance: bool = False, *, compact: Optional[bool] = None) -> bytes:
         """Serializes the engine's model and calibration state into compact .s1m binary bytes."""
-        return self.to_compiled_model().to_bytes(include_covariance=include_covariance)
+        return self.to_compiled_model().to_bytes(include_covariance=include_covariance, compact=compact)
 
-    def save(self, path: Union[str, Path], include_covariance: bool = False) -> None:
+    def save(
+        self,
+        path: Union[str, Path],
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+    ) -> None:
         """Saves the engine's model, calibration, and online state to a portable .s1m file."""
-        self.to_compiled_model().save(path, include_covariance=include_covariance)
+        self.to_compiled_model().save(path, include_covariance=include_covariance, compact=compact)
 
     @classmethod
     def from_bytes(
@@ -3162,6 +3461,729 @@ class SystemOneEngine:
             **kwargs,
         )
 
+    def _decide_batch_vectorized(
+        self,
+        prompts: Sequence[str],
+        *,
+        alpha: Optional[float] = None,
+        margin_threshold: Optional[float] = None,
+        relative_odds_ratio: Optional[float] = None,
+        confidence_floor_tau0: Optional[float] = None,
+        recency_weighted: Optional[bool] = None,
+        strict: Optional[bool] = None,
+    ) -> List[DecisionResult]:
+        """Vectorized chunked pure-NumPy batch inference path for ChoiceField/BooleanField schemas."""
+        from system1.core.text import TfidfProjector
+
+        n_total = len(prompts)
+        if n_total == 0:
+            return []
+
+        if self.auto_reload and self.model_path is not None:
+            self.reload_if_changed()
+
+        with self._lock, getattr(self.model, "_lock", nullcontext()):
+            recency_flag = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
+            version = getattr(self.model, "model_version", self.model_version)
+            if version != self.model_version:
+                if hasattr(self.model, "_field_heads"):
+                    self._sync_from_model(self.model)
+                self.model_version = version
+                for fname in self.schema.fields:
+                    head_obj = getattr(self.model, "heads", {}).get(fname)
+                    if not getattr(head_obj, "calibration_scores", ()):
+                        self.calibrators[fname] = DecisionCalibrator()
+                        if fname in self.conformal_predictors:
+                            cp_reset = self.conformal_predictors[fname]
+                            cp_reset.is_calibrated = False
+                            cp_reset.familiarity_threshold = 0.0
+                            cp_reset.prototype_threshold = 0.0
+                            cp_reset.familiarity_scores = np.array([], dtype=np.float64)
+                            cp_reset.prototype_scores = np.array([], dtype=np.float64)
+                            cp_reset.class_calibration_scores = {}
+                        if fname in self.regression_conformal_predictors:
+                            self.regression_conformal_predictors[fname].is_calibrated = False
+
+            eff_alpha = (
+                (self.aci_tracker.alpha_t if self.aci_tracker is not None else self.default_alpha)
+                if alpha is None
+                else alpha
+            )
+            if (
+                isinstance(eff_alpha, bool)
+                or not isinstance(eff_alpha, (int, float))
+                or not (0.0 < eff_alpha < 1.0)
+                or math.isnan(eff_alpha)
+                or math.isinf(eff_alpha)
+            ):
+                raise ValueError(f"alpha must be in (0, 1), got {eff_alpha}")
+            eff_alpha = float(eff_alpha)
+            if margin_threshold is not None and (
+                isinstance(margin_threshold, bool)
+                or not isinstance(margin_threshold, (int, float))
+                or margin_threshold < 0.0
+                or math.isnan(margin_threshold)
+                or math.isinf(margin_threshold)
+            ):
+                raise ValueError(f"margin_threshold must be non-negative, got {margin_threshold}")
+            if relative_odds_ratio is not None and (
+                isinstance(relative_odds_ratio, bool)
+                or not isinstance(relative_odds_ratio, (int, float))
+                or relative_odds_ratio <= 0.0
+                or math.isnan(relative_odds_ratio)
+                or math.isinf(relative_odds_ratio)
+            ):
+                raise ValueError(f"relative_odds_ratio must be strictly positive, got {relative_odds_ratio}")
+            if confidence_floor_tau0 is not None and (
+                isinstance(confidence_floor_tau0, bool)
+                or not isinstance(confidence_floor_tau0, (int, float))
+                or confidence_floor_tau0 < 0.0
+                or math.isnan(confidence_floor_tau0)
+                or math.isinf(confidence_floor_tau0)
+            ):
+                raise ValueError(f"confidence_floor_tau0 must be non-negative, got {confidence_floor_tau0}")
+
+            is_strict = self.strict_mode if strict is None else bool(strict)
+            eff_m_thresh = margin_threshold if margin_threshold is not None else self.margin_threshold
+            eff_gamma = relative_odds_ratio if relative_odds_ratio is not None else self.relative_odds_ratio
+            eff_tau0 = confidence_floor_tau0 if confidence_floor_tau0 is not None else self.confidence_floor_tau0
+
+            proj_obj = getattr(self.model, "projector", self.projector)
+            is_tfidf_proj = isinstance(proj_obj, TfidfProjector)
+            schema_name = self.schema.schema_name
+            schema_digest = self.schema.schema_digest()
+            custom_validate = type(self.schema).validate_decision is not DecisionSchema.validate_decision
+
+            online_bank_map = getattr(self.model, "_online_prototype_bank", {})
+            model_field_heads = getattr(self.model, "_field_heads", {})
+            needs_raw_norm = any(
+                float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
+                for cp in self.conformal_predictors.values()
+            ) or any(
+                float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                for ch in getattr(self.model, "heads", {}).values()
+            )
+            sel_cals = getattr(self, "selective_calibrators", {}) or {}
+            aci = getattr(self, "aci_tracker", None)
+            aci_has_floor = aci is not None and getattr(aci, "margin_floor", None) is not None
+            jcal = getattr(self, "joint_calibrator", None)
+
+            field_specs: List[Dict[str, Any]] = []
+            for fname, f_def in self.schema.fields.items():
+                head = self.model.heads[fname]
+                calibrator = self.calibrators[fname]
+                conformal = self.conformal_predictors.get(fname)
+                is_bool = isinstance(f_def, BooleanField)
+                options = ("False", "True") if is_bool else tuple(f_def.options)
+                k_opts = len(options)
+
+                w_mat = np.asarray(head.weights, dtype=np.float32)
+                b_vec = np.asarray(head.biases, dtype=np.float32).reshape(-1)
+
+                cluster_assign_raw = getattr(head, "cluster_assignments", ()) or ()
+                is_hier = bool(
+                    not is_bool
+                    and getattr(head, "hierarchical", False)
+                    and getattr(head, "coarse_weights", None) is not None
+                    and getattr(head, "coarse_biases", None) is not None
+                    and len(cluster_assign_raw) == w_mat.shape[0]
+                )
+                coarse_w = np.asarray(head.coarse_weights, dtype=np.float32) if is_hier else None
+                coarse_b = np.asarray(head.coarse_biases, dtype=np.float32).reshape(-1) if is_hier else None
+                fine_w = (
+                    np.asarray(head.fine_weights, dtype=np.float32)
+                    if is_hier and getattr(head, "fine_weights", None) is not None
+                    else None
+                )
+                fine_b = (
+                    np.asarray(head.fine_biases, dtype=np.float32).reshape(-1)
+                    if is_hier and getattr(head, "fine_biases", None) is not None
+                    else None
+                )
+                cluster_assign = np.asarray(cluster_assign_raw, dtype=np.int64) if is_hier else None
+
+                fam_t = max(
+                    float(getattr(head, "familiarity_threshold", 0.0)),
+                    float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0,
+                )
+                proto_t = max(
+                    float(getattr(head, "prototype_threshold", 0.0)),
+                    float(getattr(conformal, "prototype_threshold", 0.0)) if conformal is not None else 0.0,
+                )
+
+                proto_chunks: List[np.ndarray] = []
+                head_protos = getattr(head, "prototypes", None)
+                if head_protos is not None and np.ndim(head_protos) == 2 and head_protos.shape[1] == self.dimension:
+                    hp = np.asarray(head_protos, dtype=np.float32)
+                    hnorms = np.linalg.norm(hp, axis=1, keepdims=True)
+                    hvalid = (hnorms[:, 0] > 1e-12) & np.isfinite(hnorms[:, 0])
+                    if np.any(hvalid):
+                        proto_chunks.append((hp[hvalid] / hnorms[hvalid]).astype(np.float32))
+                if not proto_chunks and conformal is not None and getattr(conformal, "prototypes", None) is not None:
+                    cp_p = np.asarray(conformal.prototypes, dtype=np.float32)
+                    if cp_p.ndim == 2 and cp_p.shape[1] == self.dimension:
+                        cnorms = np.linalg.norm(cp_p, axis=1, keepdims=True)
+                        cvalid = (cnorms[:, 0] > 1e-12) & np.isfinite(cnorms[:, 0])
+                        if np.any(cvalid):
+                            proto_chunks.append((cp_p[cvalid] / cnorms[cvalid]).astype(np.float32))
+                if head_protos is not None and online_bank_map:
+                    bank = online_bank_map.get(fname)
+                    if bank:
+                        bank_arr = [
+                            np.asarray(s, dtype=np.float32).flatten()
+                            for s in bank
+                            if np.asarray(s).size == self.dimension
+                        ]
+                        if bank_arr:
+                            proto_chunks.append(np.stack(bank_arr, axis=0))
+                if head_protos is not None and model_field_heads:
+                    mfh = model_field_heads.get(fname)
+                    shots_p = getattr(mfh, "_online_shots_p", None) if mfh is not None else None
+                    if shots_p:
+                        shot_vecs: List[np.ndarray] = []
+                        for grp in shots_p:
+                            for s in grp:
+                                s_arr = np.asarray(s, dtype=np.float32).flatten()
+                                if s_arr.shape[0] == self.dimension:
+                                    sn = float(np.linalg.norm(s_arr))
+                                    if sn > 1e-12:
+                                        shot_vecs.append((s_arr / sn).astype(np.float32))
+                        if shot_vecs:
+                            proto_chunks.append(np.stack(shot_vecs, axis=0))
+                protos_unit = np.concatenate(proto_chunks, axis=0) if proto_chunks else None
+
+                cp_fam_t = float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0
+                cp_proto_t = float(getattr(conformal, "prototype_threshold", 0.0)) if conformal is not None else 0.0
+                if conformal is not None:
+                    eff_m = (
+                        float(eff_m_thresh)
+                        if (self.enable_margin_gating and not is_strict and eff_m_thresh is not None)
+                        else (
+                            (
+                                conformal.margin_threshold
+                                if conformal.margin_threshold is not None
+                                else conformal.calibrated_margin_threshold
+                            )
+                            if (self.enable_margin_gating and not is_strict)
+                            else 0.0
+                        )
+                    )
+                    eff_g = float(eff_gamma) if (not is_strict and eff_gamma is not None) else conformal.relative_odds_ratio
+                    eff_t0 = float(eff_tau0) if (not is_strict and eff_tau0 is not None) else conformal.confidence_floor_tau0
+                    conf_floor = float((1.0 / max(1, k_opts)) + eff_t0)
+                    n_cal = len(conformal.calibration_scores)
+                    if not conformal.is_calibrated or n_cal == 0:
+                        k_q = n_cal + 1
+                        q_hat = 1.0 if is_strict else (1.0 - eff_alpha)
+                    else:
+                        k_q = int(math.ceil((n_cal + 1) * (1.0 - eff_alpha)))
+                        q_hat = 1.0 if k_q > n_cal else float(conformal.calibration_scores[k_q - 1])
+                    if conformal.mondrian and conformal.class_calibration_scores and n_cal > 0:
+                        q_per_cls = np.array(
+                            [conformal.class_quantile(opt, eff_alpha) for opt in options],
+                            dtype=np.float64,
+                        )
+                    else:
+                        q_per_cls = None
+                else:
+                    eff_m = 0.0
+                    eff_g = 0.0
+                    conf_floor = 0.0
+                    n_cal = 0
+                    k_q = 1
+                    q_hat = 1.0
+                    q_per_cls = None
+
+                field_specs.append(
+                    {
+                        "name": fname,
+                        "f_def": f_def,
+                        "is_bool": is_bool,
+                        "bool_threshold": float(getattr(f_def, "threshold", 0.5)),
+                        "options": options,
+                        "k_opts": k_opts,
+                        "escalate": bool(getattr(f_def, "escalate_on_ambiguity", True)),
+                        "w": w_mat,
+                        "b": b_vec,
+                        "is_hier": is_hier,
+                        "coarse_w": coarse_w,
+                        "coarse_b": coarse_b,
+                        "fine_w": fine_w,
+                        "fine_b": fine_b,
+                        "cluster_assign": cluster_assign,
+                        "calibrator": calibrator,
+                        "conformal": conformal,
+                        "fam_t": fam_t,
+                        "proto_t": proto_t,
+                        "cp_fam_t": cp_fam_t,
+                        "cp_proto_t": cp_proto_t,
+                        "protos_unit": protos_unit,
+                        "eff_m": float(eff_m),
+                        "eff_g": float(eff_g),
+                        "conf_floor": float(conf_floor),
+                        "n_cal": n_cal,
+                        "k_q": k_q,
+                        "q_hat": float(q_hat),
+                        "q_per_cls": q_per_cls,
+                        "sel_cal": sel_cals.get(fname),
+                    }
+                )
+
+            results: List[DecisionResult] = []
+            chunk_size = 512
+            for start in range(0, n_total, chunk_size):
+                end = min(n_total, start + chunk_size)
+                chunk_prompts = prompts[start:end]
+                m_docs = len(chunk_prompts)
+                t_chunk_start = time.perf_counter()
+
+                raw_norms_arr: Optional[np.ndarray] = None
+                if needs_raw_norm:
+                    try:
+                        proj_ret = proj_obj.project_batch(
+                            chunk_prompts, recency_weighted=recency_flag, return_norms=True
+                        )
+                    except TypeError:
+                        proj_ret = proj_obj.project_batch(chunk_prompts, return_norms=True)
+                    if isinstance(proj_ret, tuple):
+                        X_raw, raw_norms_arr = proj_ret
+                        raw_norms_arr = np.asarray(raw_norms_arr, dtype=np.float64).reshape(-1)
+                    else:
+                        X_raw = proj_ret
+                        if hasattr(proj_obj, "raw_norm"):
+                            raw_norms_arr = np.array(
+                                [float(proj_obj.raw_norm(p)) for p in chunk_prompts], dtype=np.float64
+                            )
+                else:
+                    try:
+                        X_raw = proj_obj.project_batch(chunk_prompts, recency_weighted=recency_flag)
+                    except TypeError:
+                        X_raw = proj_obj.project_batch(chunk_prompts)
+
+                X_arr = np.asarray(X_raw, dtype=np.float32)
+                norms = np.linalg.norm(X_arr, axis=1, keepdims=True)
+                good = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
+                X = np.zeros((m_docs, self.dimension), dtype=np.float32)
+                if np.any(good):
+                    X[good] = (X_arr[good] / norms[good]).astype(np.float32)
+                if is_tfidf_proj:
+                    zero_emb_mask = ~good
+                else:
+                    if np.any(~good):
+                        X[~good, 0] = 1.0
+                    zero_emb_mask = np.zeros(m_docs, dtype=bool)
+
+                row_values: List[Dict[str, Any]] = [{} for _ in range(m_docs)]
+                row_confs: List[Dict[str, float]] = [{} for _ in range(m_docs)]
+                row_probs: List[Dict[str, Dict[str, float]]] = [{} for _ in range(m_docs)]
+                row_csets: List[Dict[str, List[str]]] = [{} for _ in range(m_docs)]
+                row_margins: List[Dict[str, float]] = [{} for _ in range(m_docs)]
+                row_mthresh: List[Dict[str, float]] = [{} for _ in range(m_docs)]
+                row_mgact: List[Dict[str, bool]] = [{} for _ in range(m_docs)]
+                row_odds: List[Dict[str, float]] = [{} for _ in range(m_docs)]
+                row_ror: List[Dict[str, float]] = [{} for _ in range(m_docs)]
+                row_cfloor: List[Dict[str, float]] = [{} for _ in range(m_docs)]
+                row_proto_sims: List[Dict[str, float]] = [{} for _ in range(m_docs)]
+                row_reasons: List[Dict[str, str]] = [{} for _ in range(m_docs)]
+                row_amb_fields: List[List[str]] = [[] for _ in range(m_docs)]
+                row_esc_fields: List[List[str]] = [[] for _ in range(m_docs)]
+                row_is_amb = np.zeros(m_docs, dtype=bool)
+                row_fam_trig = np.zeros(m_docs, dtype=bool)
+                row_proto_trig = np.zeros(m_docs, dtype=bool)
+                probs_by_field_arr: Dict[str, np.ndarray] = {}
+
+                for spec in field_specs:
+                    fname = spec["name"]
+                    options = spec["options"]
+                    k_opts = spec["k_opts"]
+                    calibrator = spec["calibrator"]
+                    conformal = spec["conformal"]
+
+                    logits = X @ spec["w"].T + spec["b"]
+                    if spec["is_hier"]:
+                        coarse_logits = X @ spec["coarse_w"].T + spec["coarse_b"]
+                        c_scaled = coarse_logits.astype(np.float64) / 0.25
+                        c_scaled -= np.max(c_scaled, axis=1, keepdims=True)
+                        c_exp = np.exp(c_scaled)
+                        coarse_probs = c_exp / np.sum(c_exp, axis=1, keepdims=True)
+                        assign = spec["cluster_assign"]
+                        mapped_coarse = coarse_logits[:, assign]
+                        if spec["fine_w"] is not None and spec["fine_b"] is not None:
+                            spec_logits = X @ spec["fine_w"].T + spec["fine_b"]
+                            mapped_probs = coarse_probs[:, assign]
+                            logits = (
+                                0.65 * logits
+                                + (0.20 + 0.30 * mapped_probs) * spec_logits
+                                + 0.20 * mapped_coarse
+                            ).astype(np.float32)
+                        else:
+                            logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
+
+                    if spec["is_bool"]:
+                        z_col = logits[:, 0].astype(np.float64) / 0.25
+                        two_logits = np.column_stack([-z_col / 2.0, z_col / 2.0])
+                        probs = calibrator.calibrate_logits(two_logits)
+                        if probs.ndim == 1:
+                            probs = probs.reshape(1, -1)
+                        p_true = probs[:, 1]
+                        b_vals = p_true >= spec["bool_threshold"]
+                        confs = np.where(b_vals, p_true, 1.0 - p_true)
+                        for i in range(m_docs):
+                            pt = float(p_true[i])
+                            row_values[i][fname] = bool(b_vals[i])
+                            row_confs[i][fname] = float(confs[i])
+                            row_probs[i][fname] = {"False": float(probs[i, 0]), "True": pt}
+                    else:
+                        probs = calibrator.calibrate_logits(logits.astype(np.float64) / 0.25)
+                        if probs.ndim == 1:
+                            probs = probs.reshape(1, -1)
+                        best_idx = np.argmax(probs, axis=1)
+                        confs = probs[np.arange(m_docs), best_idx]
+                        for i in range(m_docs):
+                            bi = int(best_idx[i])
+                            prow = probs[i]
+                            row_values[i][fname] = options[bi]
+                            row_confs[i][fname] = float(confs[i])
+                            row_probs[i][fname] = {opt: float(prow[j]) for j, opt in enumerate(options)}
+                    probs_by_field_arr[fname] = probs
+
+                    protos_unit = spec["protos_unit"]
+                    if protos_unit is not None:
+                        p_sims = np.max(X @ protos_unit.T, axis=1).astype(np.float64)
+                        if np.any(zero_emb_mask):
+                            p_sims = np.where(zero_emb_mask, 0.0, p_sims)
+                        for i in range(m_docs):
+                            row_proto_sims[i][fname] = float(p_sims[i])
+                    else:
+                        p_sims = None
+
+                    if conformal is None:
+                        for i in range(m_docs):
+                            if spec["is_bool"]:
+                                row_csets[i][fname] = ["True" if row_values[i][fname] else "False"]
+                            else:
+                                row_csets[i][fname] = [str(row_values[i][fname])]
+                            row_margins[i][fname] = 1.0
+                        continue
+
+                    cp_fam_t = spec["cp_fam_t"]
+                    cp_proto_t = spec["cp_proto_t"]
+                    low_fam = (
+                        ((raw_norms_arr < cp_fam_t - 1e-12) | ~np.isfinite(raw_norms_arr))
+                        if (raw_norms_arr is not None and cp_fam_t > 0.0)
+                        else np.zeros(m_docs, dtype=bool)
+                    )
+                    low_proto = (
+                        ((p_sims < cp_proto_t - 1e-6) | ~np.isfinite(p_sims))
+                        if (p_sims is not None and cp_proto_t > 0.0)
+                        else np.zeros(m_docs, dtype=bool)
+                    )
+                    oos_mask = low_fam | low_proto
+
+                    sorted_idx = np.argsort(-probs, axis=1, kind="mergesort")
+                    top_p = probs[np.arange(m_docs), sorted_idx[:, 0]] if k_opts > 0 else np.zeros(m_docs)
+                    if k_opts > 1:
+                        run_p = probs[np.arange(m_docs), sorted_idx[:, 1]]
+                        marg_arr = top_p - run_p
+                    else:
+                        run_p = np.zeros(m_docs, dtype=np.float64)
+                        marg_arr = np.ones(m_docs, dtype=np.float64)
+                    odds_arr = top_p / np.maximum(1e-6, run_p)
+
+                    n_cal = spec["n_cal"]
+                    k_q = spec["k_q"]
+                    q_hat = spec["q_hat"]
+                    q_per_cls = spec["q_per_cls"]
+                    eff_m = spec["eff_m"]
+                    eff_g = spec["eff_g"]
+                    conf_floor = spec["conf_floor"]
+
+                    if not conformal.is_calibrated or n_cal == 0:
+                        if is_strict:
+                            cset_rows = [[] if oos_mask[i] else list(options) for i in range(m_docs)]
+                        else:
+                            total_mass = np.sum(probs, axis=1)
+                            sorted_probs = np.take_along_axis(probs, sorted_idx, axis=1)
+                            cset_rows = []
+                            for i in range(m_docs):
+                                if oos_mask[i] or total_mass[i] < q_hat - 1e-7 or total_mass[i] < 0.5:
+                                    cset_rows.append([])
+                                else:
+                                    s_row: List[str] = []
+                                    cmass = 0.0
+                                    for j_pos in range(k_opts):
+                                        idx_o = int(sorted_idx[i, j_pos])
+                                        s_row.append(options[idx_o])
+                                        cmass += float(sorted_probs[i, j_pos])
+                                        if cmass >= q_hat - 1e-7:
+                                            break
+                                    cset_rows.append(s_row)
+                    else:
+                        total_mass = np.sum(probs, axis=1)
+                        valid_p = (
+                            np.all(np.isfinite(probs), axis=1)
+                            & np.all(probs >= 0.0, axis=1)
+                            & (np.abs(total_mass - 1.0) <= (1e-8 + 1e-5))
+                        )
+                        if conformal.score_method == "lac":
+                            if k_q > n_cal:
+                                cset_rows = [[] if oos_mask[i] else list(options) for i in range(m_docs)]
+                            else:
+                                sorted_probs = np.take_along_axis(probs, sorted_idx, axis=1)
+                                if q_per_cls is not None:
+                                    thr_sorted = q_per_cls[sorted_idx]
+                                    mask_sorted = (1.0 - sorted_probs) <= (thr_sorted + 1e-7)
+                                else:
+                                    mask_sorted = (1.0 - sorted_probs) <= (q_hat + 1e-7)
+                                mask_sorted &= valid_p[:, None]
+                                mask_sorted[oos_mask] = False
+                                cset_rows = [
+                                    [options[int(sorted_idx[i, j])] for j in np.flatnonzero(mask_sorted[i])]
+                                    if np.any(mask_sorted[i])
+                                    else []
+                                    for i in range(m_docs)
+                                ]
+                        elif is_strict:
+                            if k_q > n_cal:
+                                cset_rows = [[] if oos_mask[i] else list(options) for i in range(m_docs)]
+                            else:
+                                sorted_probs = np.take_along_axis(probs, sorted_idx, axis=1)
+                                cum_mass = np.cumsum(sorted_probs, axis=1)
+                                if q_per_cls is not None:
+                                    thr_sorted = q_per_cls[sorted_idx]
+                                    mask_sorted = cum_mass <= (thr_sorted + 1e-7)
+                                else:
+                                    mask_sorted = cum_mass <= (q_hat + 1e-7)
+                                mask_sorted &= valid_p[:, None]
+                                mask_sorted[oos_mask] = False
+                                cset_rows = [
+                                    [options[int(sorted_idx[i, j])] for j in np.flatnonzero(mask_sorted[i])]
+                                    if np.any(mask_sorted[i])
+                                    else []
+                                    for i in range(m_docs)
+                                ]
+                        else:
+                            sorted_probs = np.take_along_axis(probs, sorted_idx, axis=1)
+                            cset_rows = []
+                            for i in range(m_docs):
+                                if oos_mask[i] or total_mass[i] < q_hat - 1e-7 or total_mass[i] < 0.5:
+                                    cset_rows.append([])
+                                else:
+                                    s_row = []
+                                    cmass = 0.0
+                                    for j_pos in range(k_opts):
+                                        idx_o = int(sorted_idx[i, j_pos])
+                                        s_row.append(options[idx_o])
+                                        cmass += float(sorted_probs[i, j_pos])
+                                        if cmass >= q_hat - 1e-7:
+                                            break
+                                    cset_rows.append(s_row)
+
+                    uncal_or_empty = (not conformal.is_calibrated) or (n_cal == 0)
+                    for i in range(m_docs):
+                        cset_list = cset_rows[i]
+                        card = len(cset_list)
+                        raw_amb = card > 1
+                        is_empty_set = card == 0
+                        m_i = float(marg_arr[i])
+                        tp_i = float(top_p[i])
+                        odds_i = float(odds_arr[i])
+                        mg_act = bool(
+                            (not is_strict)
+                            and raw_amb
+                            and (eff_m > 0.0)
+                            and (m_i >= eff_m)
+                            and (tp_i >= conf_floor)
+                            and (odds_i >= eff_g)
+                        )
+                        if oos_mask[i] or (is_strict and uncal_or_empty):
+                            cset_amb = True
+                        else:
+                            cset_amb = raw_amb and not mg_act
+
+                        row_csets[i][fname] = cset_list
+                        row_margins[i][fname] = m_i
+                        row_mthresh[i][fname] = eff_m
+                        row_mgact[i][fname] = mg_act
+                        row_odds[i][fname] = odds_i
+                        row_ror[i][fname] = eff_g
+                        row_cfloor[i][fname] = conf_floor
+
+                        if low_fam[i]:
+                            row_reasons[i][fname] = "low_feature_familiarity"
+                        elif low_proto[i]:
+                            row_reasons[i][fname] = "low_semantic_familiarity"
+
+                        field_amb = (card != 1 or cset_amb or is_empty_set) if is_strict else (is_empty_set or cset_amb)
+                        if field_amb:
+                            row_amb_fields[i].append(fname)
+                            if spec["escalate"]:
+                                row_is_amb[i] = True
+                                row_esc_fields[i].append(fname)
+
+                if is_tfidf_proj and np.any(zero_emb_mask):
+                    for i in np.flatnonzero(zero_emb_mask):
+                        row_fam_trig[i] = True
+                        for spec in field_specs:
+                            fname = spec["name"]
+                            row_csets[i][fname] = []
+                            row_reasons[i].setdefault(fname, "low_feature_familiarity")
+                            if fname not in row_amb_fields[i]:
+                                row_amb_fields[i].append(fname)
+                            if spec["escalate"]:
+                                row_is_amb[i] = True
+                                if fname not in row_esc_fields[i]:
+                                    row_esc_fields[i].append(fname)
+
+                for spec in field_specs:
+                    fname = spec["name"]
+                    fam_t = spec["fam_t"]
+                    proto_t = spec["proto_t"]
+                    if raw_norms_arr is not None and fam_t > 0.0:
+                        low_f_idxs = np.flatnonzero(raw_norms_arr < (fam_t - 1e-12))
+                        for i in low_f_idxs:
+                            row_fam_trig[i] = True
+                            row_csets[i][fname] = []
+                            row_reasons[i].setdefault(fname, "low_feature_familiarity")
+                            if fname not in row_amb_fields[i]:
+                                row_amb_fields[i].append(fname)
+                            if spec["escalate"]:
+                                row_is_amb[i] = True
+                                if fname not in row_esc_fields[i]:
+                                    row_esc_fields[i].append(fname)
+                    if proto_t > 0.0 and spec["protos_unit"] is not None:
+                        for i in range(m_docs):
+                            p_sim = row_proto_sims[i].get(fname)
+                            if p_sim is not None and p_sim < (proto_t - 1e-6):
+                                row_proto_trig[i] = True
+                                row_csets[i][fname] = []
+                                row_reasons[i].setdefault(fname, "low_semantic_familiarity")
+                                if fname not in row_amb_fields[i]:
+                                    row_amb_fields[i].append(fname)
+                                if spec["escalate"]:
+                                    row_is_amb[i] = True
+                                    if fname not in row_esc_fields[i]:
+                                        row_esc_fields[i].append(fname)
+                            elif row_reasons[i].get(fname) == "low_semantic_familiarity":
+                                row_proto_trig[i] = True
+                            elif row_reasons[i].get(fname) == "low_feature_familiarity":
+                                row_fam_trig[i] = True
+                    else:
+                        for i in range(m_docs):
+                            rsn = row_reasons[i].get(fname)
+                            if rsn == "low_semantic_familiarity":
+                                row_proto_trig[i] = True
+                            elif rsn == "low_feature_familiarity":
+                                row_fam_trig[i] = True
+
+                if is_strict:
+                    for spec in field_specs:
+                        fname = spec["name"]
+                        sel_cal = spec["sel_cal"]
+                        if sel_cal is not None:
+                            score_kind = getattr(sel_cal, "score_name", "margin")
+                            use_conf = score_kind in ("p1", "top_prob", "confidence")
+                            for i in range(m_docs):
+                                s_val = float(row_confs[i][fname] if use_conf else row_margins[i].get(fname, 0.0))
+                                if not sel_cal.should_accept(s_val):
+                                    row_csets[i][fname] = []
+                                    row_reasons[i].setdefault(fname, "selective_risk_gate")
+                                    if fname not in row_amb_fields[i]:
+                                        row_amb_fields[i].append(fname)
+                                    if spec["escalate"]:
+                                        row_is_amb[i] = True
+                                        if fname not in row_esc_fields[i]:
+                                            row_esc_fields[i].append(fname)
+                        if aci_has_floor:
+                            for i in range(m_docs):
+                                if fname in row_margins[i] and not aci.should_accept_margin(row_margins[i][fname]):
+                                    row_csets[i][fname] = []
+                                    row_reasons[i].setdefault(fname, "aci_margin_floor")
+                                    if fname not in row_amb_fields[i]:
+                                        row_amb_fields[i].append(fname)
+                                    if spec["escalate"]:
+                                        row_is_amb[i] = True
+                                        if fname not in row_esc_fields[i]:
+                                            row_esc_fields[i].append(fname)
+
+                joint_extra_meta: Optional[List[Optional[Dict[str, Any]]]] = None
+                if jcal is not None and hasattr(jcal, "decode_batch"):
+                    j_dicts, j_probs, j_margs, j_acc = jcal.decode_batch(probs_by_field_arr)
+                    joint_fields = tuple(getattr(jcal, "field_names", ()))
+                    joint_extra_meta = [None] * m_docs
+                    for i in range(m_docs):
+                        if row_reasons[i]:
+                            continue
+                        row_values[i].update(j_dicts[i])
+                        acc_i = bool(j_acc[i])
+                        joint_extra_meta[i] = {
+                            "joint_map_prob": float(j_probs[i]),
+                            "joint_map_margin": float(j_margs[i]),
+                            "joint_accepted": acc_i,
+                        }
+                        if is_strict:
+                            if acc_i:
+                                for jf in joint_fields:
+                                    row_csets[i][jf] = [str(j_dicts[i][jf])]
+                                row_amb_fields[i] = [f for f in row_amb_fields[i] if f not in joint_fields]
+                                row_esc_fields[i] = [f for f in row_esc_fields[i] if f not in joint_fields]
+                                row_is_amb[i] = bool(row_esc_fields[i])
+                            else:
+                                for jf in joint_fields:
+                                    row_csets[i][jf] = []
+                                    row_reasons[i].setdefault(jf, "joint_selective_risk_gate")
+                                    if jf not in row_amb_fields[i]:
+                                        row_amb_fields[i].append(jf)
+                                    if getattr(self.schema.fields[jf], "escalate_on_ambiguity", True):
+                                        row_is_amb[i] = True
+                                        if jf not in row_esc_fields[i]:
+                                            row_esc_fields[i].append(jf)
+
+                per_item_ms = ((time.perf_counter() - t_chunk_start) * 1000.0) / m_docs
+                for i in range(m_docs):
+                    vals_i = self.schema.validate_decision(row_values[i]) if custom_validate else row_values[i]
+                    fam_score_i = float(raw_norms_arr[i]) if raw_norms_arr is not None else None
+                    reasons_i = row_reasons[i]
+                    meta_i: Dict[str, Any] = {
+                        "familiarity_score": fam_score_i,
+                        "familiarity_triggered": bool(row_fam_trig[i]),
+                        "prototype_similarities": row_proto_sims[i],
+                        "prototype_triggered": bool(row_proto_trig[i]),
+                        "abstention_reason": next(iter(reasons_i.values()), None),
+                        "abstention_reasons": reasons_i,
+                    }
+                    if joint_extra_meta is not None and joint_extra_meta[i] is not None:
+                        meta_i.update(joint_extra_meta[i])
+                    results.append(
+                        DecisionResult(
+                            schema_name=schema_name,
+                            schema_digest=schema_digest,
+                            prompt=chunk_prompts[i],
+                            values=vals_i,
+                            confidences=row_confs[i],
+                            conformal_sets=row_csets[i],
+                            probabilities=row_probs[i],
+                            is_ambiguous=bool(row_is_amb[i]),
+                            latency_ms=per_item_ms,
+                            alpha=eff_alpha,
+                            receipt=None,
+                            margins=row_margins[i],
+                            margin_thresholds=row_mthresh[i],
+                            margin_gate_active=row_mgact[i],
+                            odds_ratios=row_odds[i],
+                            relative_odds_ratio_thresholds=row_ror[i],
+                            confidence_floors=row_cfloor[i],
+                            ambiguous_fields=row_amb_fields[i],
+                            escalated_fields=row_esc_fields[i],
+                            telemetry=None,
+                            is_cache_hit=False,
+                            embedding=X[i],
+                            familiarity_score=fam_score_i,
+                            metadata=meta_i,
+                        )
+                    )
+            return results
+
     def decide_batch(
         self,
         prompts: Sequence[str],
@@ -3175,9 +4197,42 @@ class SystemOneEngine:
         recency_weighted: Optional[bool] = None,
         strict: Optional[bool] = None,
         policy_scope: Optional[str] = None,
+        use_cache: Optional[bool] = False,
     ) -> List[DecisionResult]:
         """Processes multiple inputs in batch with optional continuous telemetry."""
-        if telemetry is not None and len(telemetry) == len(prompts):
+        if len(prompts) == 0:
+            return []
+
+        eff_use_cache = self.use_cache if use_cache is None else bool(use_cache)
+        matching_telemetry = telemetry is not None and len(telemetry) == len(prompts)
+        any_telemetry = matching_telemetry and any(t is not None for t in telemetry)
+        proj_obj = getattr(self.model, "projector", self.projector)
+
+        can_vectorize = (
+            not record_receipt
+            and not eff_use_cache
+            and not any_telemetry
+            and all(isinstance(p, str) for p in prompts)
+            and type(self.model).__name__ in ("CompiledSystemOneModel", "SystemOneModel")
+            and hasattr(self.model, "heads")
+            and callable(getattr(proj_obj, "project_batch", None))
+            and not hasattr(proj_obj, "project_with_norm")
+            and all(isinstance(f, (ChoiceField, BooleanField)) for f in self.schema.fields.values())
+            and not getattr(self.model, "_learned_prompt_overrides", None)
+            and not getattr(self, "_learned_prompt_overrides", None)
+        )
+        if can_vectorize:
+            return self._decide_batch_vectorized(
+                prompts,
+                alpha=alpha,
+                margin_threshold=margin_threshold,
+                relative_odds_ratio=relative_odds_ratio,
+                confidence_floor_tau0=confidence_floor_tau0,
+                recency_weighted=recency_weighted,
+                strict=strict,
+            )
+
+        if matching_telemetry:
             return [
                 self.decide(
                     p,
@@ -3190,6 +4245,7 @@ class SystemOneEngine:
                     recency_weighted=recency_weighted,
                     strict=strict,
                     policy_scope=policy_scope,
+                    use_cache=eff_use_cache,
                 )
                 for i, p in enumerate(prompts)
             ]
@@ -3204,6 +4260,7 @@ class SystemOneEngine:
                 recency_weighted=recency_weighted,
                 strict=strict,
                 policy_scope=policy_scope,
+                use_cache=eff_use_cache,
             )
             for p in prompts
         ]

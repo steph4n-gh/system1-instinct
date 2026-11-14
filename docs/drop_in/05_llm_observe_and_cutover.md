@@ -32,6 +32,22 @@ Call `fallback.decide(prompt)` for each incoming request, or call `engine.learn(
 - **Wave 2: recurring traffic.** When those patterns recur, `SystemOneEngine` can resolve them locally with `0` calls to the stub.
 - **Wave 3: unseen phrasings.** New phrasings of those learned patterns, such as `"Redis cluster crash and Kafka consumer lag triggering 502 gateway timeouts"`, are scored locally. Each wave in the script is 6 requests. A 6/6 result on that toy set is not a published accuracy claim.
 
+### Autonomous milestone compilation (`auto_compile=True`)
+
+To combine cold-start teacher escalation with scheduled hybrid micro-compilations, quarantine-filtered disjoint train/calibration reservoirs, and e-process drift recalibration (`AutoCutoverLifecycle` / `CutoverConfig`), pass `auto_compile=True` (and optional `auto_compile_config=CutoverConfig(...)`) to `BoundedReviewFallback`:
+
+```python
+from system1 import BoundedReviewFallback, CutoverConfig, SystemOneEngine
+
+engine = SystemOneEngine(SupportTicketSchema, strict_mode=True)
+fallback = BoundedReviewFallback(
+    engine,
+    review_fn=upstream_llm_teacher,
+    auto_compile=True,
+    auto_compile_config=CutoverConfig(alpha_target=0.05, semantic_mode="v1_2_fisher"),
+)
+```
+
 ## 3. Save and reload the `.s1m` skill
 
 To persist the online-updated engine to disk and reload it in another process without an LLM client, call `engine.save(...)` and `SystemOneEngine.load(...)`:

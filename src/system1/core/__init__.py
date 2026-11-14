@@ -50,6 +50,7 @@ from system1.core.embeddings import (
     HybridSemanticProjector,
     StaticEmbeddingTable,
     SubwordSemanticEmbeddings,
+    UnifiedHybridProjector,
 )
 
 # Core submodules
@@ -60,7 +61,7 @@ from system1.core import (
     schema,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 __all__ = [
     # Schema primitives
@@ -78,6 +79,7 @@ __all__ = [
     "LocalNeuralProjector",
     "HybridProjector",
     "HybridSemanticProjector",
+    "UnifiedHybridProjector",
     "SubwordSemanticEmbeddings",
     "StaticEmbeddingTable",
     "SystemOneModel",

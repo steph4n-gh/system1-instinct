@@ -1506,6 +1506,7 @@ class TypeSafeClient:
         promotion_policy: Optional[PromotionPolicy] = None,
         drift_detector: Optional[DriftDetector] = None,
         background_compile: bool = False,
+        auto_cutover_lifecycle: Union[bool, Any] = False,
         **kwargs: Any,
     ) -> None:
         if api_key is None:
@@ -1525,6 +1526,8 @@ class TypeSafeClient:
         self.allow_cloud_fallback = bool(kwargs.get("allow_cloud_fallback", allow_cloud_fallback))
         self.fallback_baseline = bool(kwargs.get("fallback_baseline", fallback_baseline))
         self.background_compile = bool(kwargs.get("background_compile", background_compile))
+        self.auto_cutover_lifecycle = auto_cutover_lifecycle
+        self._cutover_lifecycles: Dict[str, Any] = {}
         self.promotion_policy = promotion_policy or kwargs.get("promotion_policy", None)
         self._drift_detector = drift_detector or kwargs.get("drift_detector", None) or DriftDetector()
         self._drift_detectors: Dict[str, DriftDetector] = {}
@@ -1842,23 +1845,20 @@ class TypeSafeClient:
                 self._engine_cache[digest] = self._new_engine(schema, model)
             return self._engine_cache[digest]
 
-    def _execute_local(
-        self,
-        state: str,
+    @staticmethod
+    def _build_answers_from_values(
         questions: Mapping[str, Any],
-        model: str = "jev-latest",
+        values: Mapping[str, Any],
         *,
-        alpha: float = 0.05,
-        record_receipt: bool = True,
-        **kwargs: Any,
-    ) -> TypeSafeResponse:
-        """Executes single-pass System 1 evaluation locally on the prompt state."""
-        engine = self._get_engine(questions)
-        t0 = time.perf_counter()
-        result = engine.decide(_content_text(state), alpha=alpha, record_receipt=record_receipt)
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-
+        confidences: Optional[Mapping[str, float]] = None,
+        conformal_sets: Optional[Mapping[str, Any]] = None,
+        probabilities: Optional[Mapping[str, Any]] = None,
+        schema: Optional[DecisionSchema] = None,
+    ) -> Dict[str, Any]:
         answers: Dict[str, Any] = {}
+        conf_map = confidences or {}
+        cset_map = conformal_sets or {}
+        prob_map = probabilities or {}
         for q_name, q_spec in questions.items():
             q_type = getattr(q_spec, "type", None)
             if q_type is None:
@@ -1868,12 +1868,19 @@ class TypeSafeClient:
             if isinstance(q_type, str):
                 q_type = q_type.lower().strip()
 
-            val = result.values.get(q_name)
-            conf = float(result.confidences.get(q_name, 1.0))
-            cset = result.conformal_sets.get(q_name, [])
+            val = values.get(q_name)
+            conf = float(conf_map.get(q_name, 1.0))
+            if q_name in cset_map:
+                cset = cset_map[q_name]
+            elif val is None:
+                cset = []
+            elif isinstance(val, (list, tuple)):
+                cset = list(val)
+            else:
+                cset = [val]
 
             if q_type == "choice":
-                probs = result.probabilities.get(q_name, {})
+                probs = prob_map.get(q_name, ({str(val): conf} if val is not None else {}))
                 answers[q_name] = ChoiceAnswer({
                     "type": "choice",
                     "choice": val,
@@ -1900,9 +1907,10 @@ class TypeSafeClient:
                     "confidence": conf,
                     "conformal_set": cset,
                 }
-                field = engine.schema.fields[q_name]
-                if field.metadata.get("typesafe_score_levels"):
-                    answer.update(_ordinal_answer(field, result.probabilities[q_name]))
+                if schema is not None and q_name in schema.fields:
+                    field = schema.fields[q_name]
+                    if field.metadata.get("typesafe_score_levels") and q_name in prob_map:
+                        answer.update(_ordinal_answer(field, prob_map[q_name]))
                 answers[q_name] = ScoreAnswer(answer)
             elif q_type in ("multi_choice", "multichoice"):
                 choices_list = list(val) if val is not None else []
@@ -1919,6 +1927,32 @@ class TypeSafeClient:
                     "confidence": conf,
                     "conformal_set": cset,
                 })
+        return answers
+
+    def _execute_local(
+        self,
+        state: str,
+        questions: Mapping[str, Any],
+        model: str = "jev-latest",
+        *,
+        alpha: float = 0.05,
+        record_receipt: bool = True,
+        **kwargs: Any,
+    ) -> TypeSafeResponse:
+        """Executes single-pass System 1 evaluation locally on the prompt state."""
+        engine = self._get_engine(questions)
+        t0 = time.perf_counter()
+        result = engine.decide(_content_text(state), alpha=alpha, record_receipt=record_receipt)
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        answers = self._build_answers_from_values(
+            questions,
+            result.values,
+            confidences=result.confidences,
+            conformal_sets=result.conformal_sets,
+            probabilities=result.probabilities,
+            schema=engine.schema,
+        )
 
         receipt_dict = None
         if result.receipt:
@@ -2273,6 +2307,94 @@ class TypeSafeClient:
             schema = _build_dynamic_schema(questions)
             digest = schema.schema_digest()
 
+            if self.auto_cutover_lifecycle:
+                from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+
+                with self._engine_lock:
+                    lc = self._cutover_lifecycles.get(digest)
+                    if lc is None:
+                        if hasattr(self.auto_cutover_lifecycle, "decide_local") and hasattr(
+                            self.auto_cutover_lifecycle, "observe_teacher"
+                        ):
+                            lc = self.auto_cutover_lifecycle
+                        else:
+                            lc_cfg = (
+                                self.auto_cutover_lifecycle
+                                if isinstance(self.auto_cutover_lifecycle, CutoverConfig)
+                                else None
+                            )
+                            lc = AutoCutoverLifecycle(schema, teacher=None, config=lc_cfg)
+                        self._cutover_lifecycles[digest] = lc
+
+                t_local = time.perf_counter()
+                local_vals = lc.decide_local(encoded_state)
+                if local_vals is not None:
+                    latency_ms = (time.perf_counter() - t_local) * 1000.0
+                    local_answers = self._build_answers_from_values(
+                        questions,
+                        local_vals,
+                        schema=schema,
+                    )
+                    with self._engine_lock:
+                        self._call_count[digest] += 1
+                    return SystemOneResponse({
+                        "model": model,
+                        "state": state,
+                        "answers": local_answers,
+                        "usage": Usage({
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 0,
+                        }),
+                        "latency_ms": round(latency_ms, 3),
+                        "local_execution": True,
+                        "egress_bytes": 0,
+                        "conformal_alpha": alpha,
+                        "receipt": None,
+                        "is_ambiguous": False,
+                        "auto_cutover_active": True,
+                        "is_cutover": True,
+                        "cutover_state": lc.state,
+                    })
+
+                if self.baseline_handler is not None:
+                    cloud_resp = TypeSafeResponse(self.baseline_handler(state, questions))
+                    egress_bytes = int(cloud_resp.get("egress_bytes", 0 if self.zero_egress else 800))
+                else:
+                    if self.zero_egress:
+                        raise ZeroEgressViolationError(
+                            "Incompatible configuration: mode='auto_cutover' with zero_egress=True "
+                            "requires a local baseline_handler to provide teacher exemplars without egress."
+                        )
+                    fb = kwargs.get("fallback_baseline", self.fallback_baseline)
+                    cloud_resp, _, egress_bytes = self.call_real_api(
+                        state=state,
+                        questions=questions,
+                        model=model,
+                        timeout=self.timeout,
+                        fallback_baseline=fb,
+                        zero_egress=False,
+                    )
+
+                teacher_vals = {}
+                for name, definition in schema.fields.items():
+                    answer = cloud_resp.get("answers", {}).get(name)
+                    value = answer.get("value") if isinstance(answer, Mapping) else answer
+                    if value is None:
+                        raise ValueError(f"Teacher response is missing field {name!r}")
+                    validated = definition.validate_value(_teaching_target(definition, value))
+                    teacher_vals[name] = validated
+
+                lc.observe_teacher(encoded_state, teacher_vals)
+                with self._engine_lock:
+                    self._call_count[digest] += 1
+                    self._teacher_sample_count[digest] += 1
+                cloud_resp["auto_cutover_active"] = True
+                cloud_resp["is_cutover"] = bool(lc.compiled_active)
+                cloud_resp["cutover_state"] = lc.state
+                cloud_resp["egress_bytes"] = egress_bytes
+                return cloud_resp
+
             with self._engine_lock:
                 already_cutover = self._has_cutover or (digest in self._has_cutover_schemas)
 
@@ -2577,6 +2699,7 @@ class AsyncTypeSafeClient:
         promotion_policy: Optional[PromotionPolicy] = None,
         drift_detector: Optional[DriftDetector] = None,
         background_compile: bool = False,
+        auto_cutover_lifecycle: Union[bool, Any] = False,
         **kwargs: Any,
     ) -> None:
         self._sync_client = TypeSafeClient(
@@ -2597,6 +2720,7 @@ class AsyncTypeSafeClient:
             promotion_policy=promotion_policy,
             drift_detector=drift_detector,
             background_compile=background_compile,
+            auto_cutover_lifecycle=auto_cutover_lifecycle,
             **kwargs,
         )
 
