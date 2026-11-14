@@ -2554,7 +2554,19 @@ class PackedMultiQuestionKernel:
         model = eng.model
         heads = model.heads
         field_heads = getattr(model, "_field_heads", {})
-        eff_alpha = float(eng.default_alpha if alpha is None else alpha)
+        raw_alpha = (
+            (aci_tracker.alpha_t if aci_tracker is not None else eng.default_alpha)
+            if alpha is None
+            else alpha
+        )
+        if (
+            isinstance(raw_alpha, bool)
+            or not isinstance(raw_alpha, (int, float))
+            or not math.isfinite(float(raw_alpha))
+            or not (0.0 < float(raw_alpha) < 1.0)
+        ):
+            raise ValueError(f"alpha must be in (0, 1), got {raw_alpha!r}")
+        eff_alpha = float(raw_alpha)
         strict_mode = bool(eng.strict_mode if strict is None else strict)
         enable_margin_gating = bool(getattr(eng, "enable_margin_gating", False))
         eng_margin_threshold = eng.margin_threshold if margin_threshold is None else margin_threshold
@@ -3207,10 +3219,17 @@ class FastDecisionCallable:
     """Pre-bound callable compiled from a SystemOneEngine (zero lock/validation/receipt overhead)."""
 
     def __init__(self, eng: Any, *, storage_mode: str = "float32") -> None:
+        self._storage_mode = storage_mode
+        self._aci_tracker = getattr(eng, "aci_tracker", None)
+        self._eng_ref = eng if self._aci_tracker is not None else None
         if hasattr(eng, "compile_packed_kernel"):
-            self.kernel = eng.compile_packed_kernel(storage_mode=storage_mode)
+            kernel = eng.compile_packed_kernel(storage_mode=storage_mode)
         else:
-            self.kernel = PackedMultiQuestionKernel.from_engine(eng, storage_mode=storage_mode)
+            kernel = PackedMultiQuestionKernel.from_engine(eng, storage_mode=storage_mode)
+        self._bind_kernel(kernel, storage_mode=storage_mode)
+
+    def _bind_kernel(self, kernel: PackedMultiQuestionKernel, *, storage_mode: str) -> None:
+        self.kernel = kernel
         self.projector = self.kernel.projector
         self.recency_weighted = self.kernel.recency_weighted
         self.is_det_proj = type(self.projector) is DeterministicSemanticProjector
@@ -3262,6 +3281,18 @@ class FastDecisionCallable:
     def __call__(
         self, prompt: Optional[str] = None, *, embedding: Optional[np.ndarray] = None
     ) -> FastDecisionOutput:
+        if self._aci_tracker is not None and (
+            getattr(self._aci_tracker, "margin_floor", None) is not None
+            or float(self._aci_tracker.alpha_t) != self.alpha
+        ):
+            assert self._eng_ref is not None
+            if hasattr(self._eng_ref, "compile_packed_kernel"):
+                new_kernel = self._eng_ref.compile_packed_kernel(storage_mode=self._storage_mode)
+            else:
+                new_kernel = PackedMultiQuestionKernel.from_engine(
+                    self._eng_ref, storage_mode=self._storage_mode
+                )
+            self._bind_kernel(new_kernel, storage_mode=self._storage_mode)
         if embedding is None:
             if prompt is None:
                 raise ValueError("Either prompt or embedding must be provided")

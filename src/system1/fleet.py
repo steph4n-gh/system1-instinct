@@ -24,9 +24,10 @@ _GLOBAL_TOK_LOCK = threading.Lock()
 
 MAX_FLEET_ARCHIVE_RAW_BYTES = 64 * 1024 * 1024
 MAX_FLEET_ARCHIVE_EXPANDED_BYTES = 128 * 1024 * 1024
-MAX_FLEET_MEMBER_RATIO = 1024
 MAX_FLEET_RUNTIME_BYTES = 256 * 1024 * 1024
 MAX_FLEET_TENANTS = 100_000
+MAX_FLEET_ARCHIVE_ENTRIES = 32
+MAX_FLEET_DIRECTORY_BYTES = 65536
 _FLEET_REQUIRED_ARRAYS = frozenset(
     {
         "W_base",
@@ -771,6 +772,45 @@ class MultiTenantSkillFleet:
             logits=logits,
         )
 
+    @staticmethod
+    def _validate_zip_directory(buf_bytes: bytes) -> None:
+        """Validate ZIP EOCD and central-directory headers before zipfile allocates entry objects."""
+        if len(buf_bytes) < 22 or buf_bytes[:4] != b"PK\x03\x04":
+            raise ValueError("Invalid fleet snapshot zip header")
+        eocd = buf_bytes.rfind(b"PK\x05\x06", max(0, len(buf_bytes) - 65557))
+        if eocd < 0 or eocd + 22 > len(buf_bytes):
+            raise ValueError("Fleet snapshot zip EOCD record missing or malformed")
+        disk, directory_disk, entries, disk_count, directory_size, directory_offset, comment_size = (
+            struct.unpack_from("<HHHHIIH", buf_bytes, eocd + 4)
+        )
+        if (
+            disk != 0
+            or directory_disk != 0
+            or entries != disk_count
+            or entries == 0
+            or entries > MAX_FLEET_ARCHIVE_ENTRIES
+            or directory_size == 0
+            or directory_size > MAX_FLEET_DIRECTORY_BYTES
+            or directory_offset > eocd
+            or directory_offset + directory_size != eocd
+            or eocd + 22 + comment_size != len(buf_bytes)
+        ):
+            raise ValueError(
+                f"Fleet snapshot zip directory invalid or exceeds limits (entries={entries}, size={directory_size})"
+            )
+        pos = directory_offset
+        cd_count = 0
+        while pos < eocd:
+            if pos + 46 > eocd or buf_bytes[pos : pos + 4] != b"PK\x01\x02":
+                raise ValueError("Malformed central directory entry in fleet snapshot")
+            fname_len, extra_len, fcomment_len = struct.unpack_from("<HHH", buf_bytes, pos + 28)
+            pos += 46 + fname_len + extra_len + fcomment_len
+            cd_count += 1
+            if cd_count > MAX_FLEET_ARCHIVE_ENTRIES or pos > eocd:
+                raise ValueError("Fleet snapshot central directory exceeds entry limit or bounds")
+        if pos != eocd or cd_count != entries:
+            raise ValueError("Fleet snapshot central directory count/offset mismatch")
+
     @classmethod
     def _preflight_snapshot_bytes(
         cls,
@@ -779,7 +819,7 @@ class MultiTenantSkillFleet:
         projector: Any,
         max_runtime_bytes: int,
     ) -> Tuple[Tuple[int, int, int, int, int], Dict[str, Tuple[np.dtype, Tuple[int, ...]]]]:
-        """Validate fleet archive bounds, NPY headers, array shapes, and memory budget."""
+        """Validate fleet archive bounds, NPY headers, array dtypes/shapes, and memory budget."""
         import zipfile
 
         if not isinstance(data, (bytes, bytearray, memoryview)) or len(data) == 0:
@@ -791,8 +831,11 @@ class MultiTenantSkillFleet:
         if int(max_runtime_bytes) <= 0:
             raise ValueError(f"max_runtime_bytes must be positive, got {max_runtime_bytes}")
 
+        buf_bytes = data if isinstance(data, bytes) else bytes(data)
+        cls._validate_zip_directory(buf_bytes)
+
         try:
-            zf_raw = zipfile.ZipFile(io.BytesIO(data), "r")
+            zf_raw = zipfile.ZipFile(io.BytesIO(buf_bytes), "r")
         except zipfile.BadZipFile as exc:
             raise ValueError(f"Invalid fleet snapshot zip archive: {exc}") from exc
 
@@ -801,13 +844,17 @@ class MultiTenantSkillFleet:
         headers: Dict[str, Tuple[np.dtype, Tuple[int, ...]]] = {}
         with zf_raw:
             infos = zf_raw.infolist()
-            if len(infos) > 32:
+            if len(infos) > MAX_FLEET_ARCHIVE_ENTRIES:
                 raise ValueError(f"Too many archive entries in fleet snapshot: {len(infos)}")
             for info in infos:
                 if info.is_dir():
                     raise ValueError(f"Unexpected directory entry in fleet snapshot: {info.filename!r}")
                 if info.flag_bits & 0x1:
                     raise ValueError(f"Encrypted fleet snapshot entry is forbidden: {info.filename!r}")
+                if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                    raise ValueError(
+                        f"Unsupported zip compression method {info.compress_type} for {info.filename!r}"
+                    )
                 if not info.filename.endswith(".npy") or "/" in info.filename or "\\" in info.filename:
                     raise ValueError(f"Invalid member name in fleet snapshot: {info.filename!r}")
                 key = info.filename[:-4]
@@ -820,10 +867,6 @@ class MultiTenantSkillFleet:
                 if info.file_size > MAX_FLEET_ARCHIVE_EXPANDED_BYTES:
                     raise ValueError(
                         f"Fleet snapshot member {key!r} expanded size {info.file_size} exceeds limit"
-                    )
-                if info.file_size > max(65536, info.compress_size * MAX_FLEET_MEMBER_RATIO):
-                    raise ValueError(
-                        f"Fleet snapshot member {key!r} exceeds compression ratio bound"
                     )
                 total_expanded += int(info.file_size)
                 if total_expanded > MAX_FLEET_ARCHIVE_EXPANDED_BYTES:
@@ -848,53 +891,62 @@ class MultiTenantSkillFleet:
         if not (16 <= R <= 4096) or (R % 16) != 0 or R < K:
             raise ValueError(f"Invalid subspace dimension r_sub={R} for K={K}")
 
-        W_shape = headers["W_base"][1]
-        if len(W_shape) != 2 or W_shape[0] != K or W_shape[1] < 1:
-            raise ValueError(f"Invalid W_base shape {W_shape}, expected ({K}, D)")
+        W_dtype, W_shape = headers["W_base"]
+        float_dtypes = (np.dtype(np.float16), np.dtype(np.float32))
+        if W_dtype not in float_dtypes or len(W_shape) != 2 or W_shape[0] != K or W_shape[1] < 1:
+            raise ValueError(f"Invalid W_base spec: dtype={W_dtype}, shape={W_shape}, expected ({K}, D)")
         D = W_shape[1]
         proj_dim = getattr(projector, "dimension", None)
         if proj_dim is not None and int(proj_dim) != D:
             raise ValueError(f"Projector dimension {proj_dim} != snapshot feature dimension {D}")
 
-        _, sp_shape = headers["sp_hash"]
-        if len(sp_shape) != 2 or sp_shape[0] != T or sp_shape[1] > 4096:
-            raise ValueError(f"Invalid sp_hash shape {sp_shape}, expected ({T}, <=4096)")
+        sp_dtype, sp_shape = headers["sp_hash"]
+        if sp_dtype != np.dtype(np.uint16) or len(sp_shape) != 2 or sp_shape[0] != T or sp_shape[1] > 4096:
+            raise ValueError(f"Invalid sp_hash spec: dtype={sp_dtype}, shape={sp_shape}, expected ({T}, <=4096)")
         M_sp = sp_shape[1]
 
-        _, ex_shape = headers["ex_vecs_q"]
-        if len(ex_shape) != 3 or ex_shape[0] != T or ex_shape[1] > 1024 or ex_shape[2] != R:
-            raise ValueError(f"Invalid ex_vecs_q shape {ex_shape}, expected ({T}, <=1024, {R})")
+        ex_dtype, ex_shape = headers["ex_vecs_q"]
+        if ex_dtype != np.dtype(np.int8) or len(ex_shape) != 3 or ex_shape[0] != T or ex_shape[1] > 1024 or ex_shape[2] != R:
+            raise ValueError(f"Invalid ex_vecs_q spec: dtype={ex_dtype}, shape={ex_shape}, expected ({T}, <=1024, {R})")
         M_ex = ex_shape[1]
 
-        expected_shapes = {
-            "b_base": (K,),
-            "U_shared": (D, R),
-            "base_tok_df": (cls.BASE_HASH_SIZE,),
-            "q_init": (K,),
-            "dW_scale": (T, K, 1),
-            "P_blk": (T, R // 16, 16, 16),
-            "sp_cls": (T, M_sp),
-            "sp_w": (T, M_sp),
-            "sp_len": (T,),
-            "ex_scales": (T, M_ex),
-            "ex_cls": (T, M_ex),
-            "ex_len": (T,),
-            "q_c": (T, K),
-            "u_c": (T, K),
-            "alpha_c": (T, K),
-            "err_ewma": (T, K),
+        expected_specs: Dict[str, Tuple[Tuple[np.dtype, ...], Tuple[int, ...]]] = {
+            "b_base": (float_dtypes, (K,)),
+            "U_shared": (float_dtypes, (D, R)),
+            "base_tok_df": ((np.dtype(np.uint16),), (cls.BASE_HASH_SIZE,)),
+            "q_init": (float_dtypes, (K,)),
+            "dW_scale": (float_dtypes, (T, K, 1)),
+            "P_blk": (float_dtypes, (T, R // 16, 16, 16)),
+            "sp_cls": ((np.dtype(np.uint16),), (T, M_sp)),
+            "sp_w": (float_dtypes, (T, M_sp)),
+            "sp_len": ((np.dtype(np.uint8),), (T,)),
+            "ex_scales": (float_dtypes, (T, M_ex)),
+            "ex_cls": ((np.dtype(np.int16),), (T, M_ex)),
+            "ex_len": ((np.dtype(np.uint8),), (T,)),
+            "q_c": (float_dtypes, (T, K)),
+            "u_c": (float_dtypes, (T, K)),
+            "alpha_c": (float_dtypes, (T, K)),
+            "err_ewma": (float_dtypes, (T, K)),
         }
-        for arr_name, exp_shape in expected_shapes.items():
-            actual_shape = headers[arr_name][1]
+        for arr_name, (exp_dtypes, exp_shape) in expected_specs.items():
+            actual_dtype, actual_shape = headers[arr_name]
+            if actual_dtype not in exp_dtypes:
+                raise ValueError(
+                    f"Fleet snapshot array {arr_name!r} dtype {actual_dtype} not in {exp_dtypes}"
+                )
             if actual_shape != exp_shape:
                 raise ValueError(
                     f"Fleet snapshot array {arr_name!r} shape {actual_shape} != expected {exp_shape}"
                 )
 
-        if "meta_ints" in headers and headers["meta_ints"][1] != (4,):
-            raise ValueError(f"Invalid meta_ints shape {headers['meta_ints'][1]}, expected (4,)")
-        if "meta_floats" in headers and headers["meta_floats"][1] != (2,):
-            raise ValueError(f"Invalid meta_floats shape {headers['meta_floats'][1]}, expected (2,)")
+        if "meta_ints" in headers:
+            mi_dtype, mi_shape = headers["meta_ints"]
+            if mi_dtype != np.dtype(np.int64) or mi_shape != (4,):
+                raise ValueError(f"Invalid meta_ints spec: dtype={mi_dtype}, shape={mi_shape}")
+        if "meta_floats" in headers:
+            mf_dtype, mf_shape = headers["meta_floats"]
+            if mf_dtype != np.dtype(np.float64) or mf_shape != (2,):
+                raise ValueError(f"Invalid meta_floats spec: dtype={mf_dtype}, shape={mf_shape}")
         if "classes_utf8" in headers:
             c_dtype, c_shape = headers["classes_utf8"]
             if c_dtype != np.dtype(np.uint8) or len(c_shape) != 1 or c_shape[0] > 1_048_576:
@@ -912,9 +964,9 @@ class MultiTenantSkillFleet:
             + T * K * (2 * 4)
         )
         est_runtime = int(base_runtime + arena_runtime)
-        if est_runtime > int(max_runtime_bytes):
+        if est_runtime > int(max_runtime_bytes) or total_expanded > int(max_runtime_bytes) + 65536:
             raise ValueError(
-                f"Fleet snapshot runtime memory {est_runtime} exceeds budget {int(max_runtime_bytes)} bytes"
+                f"Fleet snapshot runtime memory {est_runtime} (expanded {total_expanded}) exceeds budget {int(max_runtime_bytes)} bytes"
             )
         return (T, K, R, M_sp, M_ex), headers
 
@@ -1026,11 +1078,15 @@ class MultiTenantSkillFleet:
             projector=projector,
             max_runtime_bytes=max_runtime_bytes,
         )
-        with np.load(io.BytesIO(data), allow_pickle=False) as zf:
+        raw_bytes = data if isinstance(data, bytes) else bytes(data)
+        with np.load(io.BytesIO(raw_bytes), allow_pickle=False) as zf:
             if classes is not None:
                 resolved_classes = [str(c) for c in classes]
             elif "classes_utf8" in zf:
-                loaded_cls = json.loads(bytes(zf["classes_utf8"].tobytes()).decode("utf-8"))
+                try:
+                    loaded_cls = json.loads(bytes(zf["classes_utf8"].tobytes()).decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"Snapshot classes_utf8 contains invalid UTF-8 JSON: {exc}") from exc
                 if not isinstance(loaded_cls, list):
                     raise ValueError("Snapshot classes_utf8 must decode to a JSON list")
                 resolved_classes = [str(c) for c in loaded_cls]
@@ -1070,19 +1126,76 @@ class MultiTenantSkillFleet:
 
             sp_len_arr = zf["sp_len"]
             ex_len_arr = zf["ex_len"]
-            if int(np.max(sp_len_arr)) > m_sparse:
-                raise ValueError(f"Snapshot sp_len exceeds m_sparse={m_sparse}")
-            if int(np.max(ex_len_arr)) > m_exemplars:
-                raise ValueError(f"Snapshot ex_len exceeds m_exemplars={m_exemplars}")
+            if sp_len_arr.dtype != np.dtype(np.uint8) or int(np.min(sp_len_arr)) < 0 or int(np.max(sp_len_arr)) > m_sparse:
+                raise ValueError(f"Snapshot sp_len invalid or outside [0, {m_sparse}]")
+            if ex_len_arr.dtype != np.dtype(np.uint8) or int(np.min(ex_len_arr)) < 0 or int(np.max(ex_len_arr)) > m_exemplars:
+                raise ValueError(f"Snapshot ex_len invalid or outside [0, {m_exemplars}]")
+
+            sp_cls_arr = zf["sp_cls"]
+            if sp_cls_arr.size > 0 and (int(np.min(sp_cls_arr)) < 0 or int(np.max(sp_cls_arr)) >= K):
+                raise ValueError(f"Snapshot sp_cls index outside [0, {K})")
+
+            ex_cls_arr = zf["ex_cls"]
+            if ex_cls_arr.size > 0:
+                if int(np.min(ex_cls_arr)) < -1 or int(np.max(ex_cls_arr)) >= K:
+                    raise ValueError(f"Snapshot ex_cls index outside [-1, {K})")
+                active_ex = np.arange(M_ex, dtype=np.int64)[None, :] < ex_len_arr.astype(np.int64)[:, None]
+                if bool(np.any(ex_cls_arr[active_ex] < 0)):
+                    raise ValueError("Snapshot contains negative ex_cls in active exemplar slot")
+
+            W_base_arr = zf["W_base"].astype(np.float32)
+            b_base_arr = zf["b_base"].astype(np.float32)
+            U_shared_arr = zf["U_shared"].astype(np.float32)
+            base_tok_df_arr = zf["base_tok_df"].astype(np.uint16)
+            q_init_arr = zf["q_init"].astype(np.float32)
+            dW_q_arr = zf["dW_q"]
+            dW_scale_arr = zf["dW_scale"]
+            P_blk_arr = zf["P_blk"].astype(np.float32)
+            sp_hash_arr = zf["sp_hash"]
+            sp_w_arr = zf["sp_w"]
+            ex_vecs_q_arr = zf["ex_vecs_q"]
+            ex_scales_arr = zf["ex_scales"]
+            q_c_arr = zf["q_c"]
+            u_c_arr = zf["u_c"]
+            alpha_c_arr = zf["alpha_c"]
+            err_ewma_arr = zf["err_ewma"]
+
+            for arr_name, arr_val in (
+                ("W_base", W_base_arr),
+                ("b_base", b_base_arr),
+                ("U_shared", U_shared_arr),
+                ("q_init", q_init_arr),
+                ("dW_scale", dW_scale_arr),
+                ("P_blk", P_blk_arr),
+                ("sp_w", sp_w_arr),
+                ("ex_scales", ex_scales_arr),
+                ("q_c", q_c_arr),
+                ("u_c", u_c_arr),
+                ("alpha_c", alpha_c_arr),
+                ("err_ewma", err_ewma_arr),
+            ):
+                if not bool(np.all(np.isfinite(arr_val))):
+                    raise ValueError(f"Snapshot array {arr_name!r} contains non-finite values")
+
+            if float(np.min(q_init_arr)) < 0.0 or float(np.max(q_init_arr)) > 1.0:
+                raise ValueError("Snapshot q_init outside [0.0, 1.0]")
+            if float(np.min(q_c_arr)) < 0.0 or float(np.max(q_c_arr)) > 1.0:
+                raise ValueError("Snapshot q_c outside [0.0, 1.0]")
+            if float(np.min(u_c_arr)) < 0.0:
+                raise ValueError("Snapshot u_c must be nonnegative")
+            if float(np.min(alpha_c_arr)) <= 0.0 or float(np.max(alpha_c_arr)) >= 1.0:
+                raise ValueError("Snapshot alpha_c outside (0.0, 1.0)")
+            if float(np.min(err_ewma_arr)) < 0.0 or float(np.max(err_ewma_arr)) > 1.0:
+                raise ValueError("Snapshot err_ewma outside [0.0, 1.0]")
 
             fleet = cls(
                 projector=projector,
                 classes=resolved_classes,
-                W_base=zf["W_base"].astype(np.float32),
-                b_base=zf["b_base"].astype(np.float32),
-                U_shared=zf["U_shared"].astype(np.float32),
-                base_tok_df=zf["base_tok_df"].astype(np.uint16),
-                q_init=zf["q_init"].astype(np.float32),
+                W_base=W_base_arr,
+                b_base=b_base_arr,
+                U_shared=U_shared_arr,
+                base_tok_df=base_tok_df_arr,
+                q_init=q_init_arr,
                 num_tenants=num_tenants,
                 r_sub=r_sub,
                 m_sparse=m_sparse,
@@ -1091,21 +1204,21 @@ class MultiTenantSkillFleet:
                 alpha=alpha,
                 token_cache_limit=token_cache_limit,
             )
-            fleet.dW_q[:] = zf["dW_q"]
-            fleet.dW_scale[:] = zf["dW_scale"]
-            fleet.P_blk[:] = zf["P_blk"].astype(np.float32)
-            fleet.sp_hash[:] = zf["sp_hash"]
-            fleet.sp_cls[:] = zf["sp_cls"]
-            fleet.sp_w[:] = zf["sp_w"]
+            fleet.dW_q[:] = dW_q_arr
+            fleet.dW_scale[:] = dW_scale_arr
+            fleet.P_blk[:] = P_blk_arr
+            fleet.sp_hash[:] = sp_hash_arr
+            fleet.sp_cls[:] = sp_cls_arr
+            fleet.sp_w[:] = sp_w_arr
             fleet.sp_len[:] = sp_len_arr
-            fleet.ex_vecs_q[:] = zf["ex_vecs_q"]
-            fleet.ex_scales[:] = zf["ex_scales"]
-            fleet.ex_cls[:] = zf["ex_cls"]
+            fleet.ex_vecs_q[:] = ex_vecs_q_arr
+            fleet.ex_scales[:] = ex_scales_arr
+            fleet.ex_cls[:] = ex_cls_arr
             fleet.ex_len[:] = ex_len_arr
-            fleet.q_c[:] = zf["q_c"]
-            fleet.u_c[:] = zf["u_c"]
-            fleet.alpha_c[:] = zf["alpha_c"]
-            fleet.err_ewma[:] = zf["err_ewma"]
+            fleet.q_c[:] = q_c_arr
+            fleet.u_c[:] = u_c_arr
+            fleet.alpha_c[:] = alpha_c_arr
+            fleet.err_ewma[:] = err_ewma_arr
             fleet._active_views = fleet._bind_views(fleet._active_tid)
             return fleet
 

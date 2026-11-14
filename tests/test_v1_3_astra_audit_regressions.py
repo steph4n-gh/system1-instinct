@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from system1 import (
+    AdaptiveConformalTracker,
     ActiveTeacherSelector,
     AuthError,
     BinaryPlattBetaCalibrator,
@@ -173,6 +174,73 @@ def test_astra_02_fleet_delta_preflight_blocks_header_and_metadata_bombs() -> No
     with pytest.raises(ValueError):
         MultiTenantSkillFleet.fleet_delta_from_bytes(bad_shape_snap, projector=proj)
 
+    # Item B: reject 10k-entry ZIP and forged EOCD in preflight strictly before calling zipfile.ZipFile.
+    buf_10k = io.BytesIO()
+    with zipfile.ZipFile(buf_10k, "w", compression=zipfile.ZIP_STORED) as zf:
+        for i in range(10000):
+            zf.writestr(f"m{i}", b"")
+    zip_10k = buf_10k.getvalue()
+
+    eocd_idx = snap.rfind(b"PK\x05\x06")
+    assert eocd_idx >= 0
+    forged_eocd = snap[: eocd_idx + 8] + struct.pack("<HH", 9999, 9999) + snap[eocd_idx + 12 :]
+
+    with pytest.MonkeyPatch.context() as mp:
+        def _fail_zipfile(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("zipfile.ZipFile must not be called before directory preflight")
+
+        mp.setattr(zipfile, "ZipFile", _fail_zipfile)
+        with pytest.raises(ValueError):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(zip_10k, projector=proj)
+        with pytest.raises(ValueError):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(forged_eocd, projector=proj)
+
+    # Item C: strict NPY dtype, length, class-index, and sentinel bounds checks before construction.
+    def _npy_bytes(arr: np.ndarray) -> bytes:
+        buf = io.BytesIO()
+        np.save(buf, arr, allow_pickle=False)
+        return buf.getvalue()
+
+    with zipfile.ZipFile(io.BytesIO(snap), "r") as zf:
+        sp_len_orig = np.load(io.BytesIO(zf.read("sp_len.npy")), allow_pickle=False)
+        sp_cls_orig = np.load(io.BytesIO(zf.read("sp_cls.npy")), allow_pickle=False)
+        ex_cls_orig = np.load(io.BytesIO(zf.read("ex_cls.npy")), allow_pickle=False)
+
+    bad_sp_len_i16 = np.zeros(sp_len_orig.shape, dtype=np.int16)
+    bad_sp_len_i16[0] = -1
+    bad_sp_len_u8 = np.zeros(sp_len_orig.shape, dtype=np.uint8)
+    bad_sp_len_u8[0] = 99
+    bad_sp_cls = sp_cls_orig.copy()
+    bad_sp_cls[0, 0] = 999
+    sp_len_one = np.zeros(sp_len_orig.shape, dtype=np.uint8)
+    sp_len_one[0] = 1
+    bad_ex_cls = ex_cls_orig.copy()
+    bad_ex_cls[0, 0] = -2
+
+    for member_overrides in (
+        {"sp_len.npy": _npy_bytes(bad_sp_len_i16)},
+        {"sp_len.npy": _npy_bytes(bad_sp_len_u8)},
+        {"sp_cls.npy": _npy_bytes(bad_sp_cls), "sp_len.npy": _npy_bytes(sp_len_one)},
+        {"ex_cls.npy": _npy_bytes(bad_ex_cls)},
+    ):
+        with pytest.raises(ValueError):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(
+                _rewrite_zip_members(snap, member_overrides), projector=proj
+            )
+
+    # Item D: valid fresh large zero-weight fleet round-trips cleanly without false zip-bomb rejection.
+    big_classes = tuple(f"c{i}" for i in range(200))
+    big_fleet, big_proj = _build_tiny_fleet(
+        classes=big_classes, num_tenants=500, r_sub=208, dim=32, alpha=0.10
+    )
+    big_fleet.W_base.fill(0.0)
+    big_fleet.b_base.fill(0.0)
+    big_snap = big_fleet.fleet_delta_to_bytes()
+    big_restored = MultiTenantSkillFleet.fleet_delta_from_bytes(big_snap, projector=big_proj)
+    assert big_restored.num_tenants == 500
+    assert big_restored.num_classes == 200
+    assert big_restored.r_sub == 208
+
 
 def test_astra_03_fleet_concurrent_decide_live_and_adapt_isolation() -> None:
     """Finding #3: MultiTenantSkillFleet isolates tenant snapshots and locks under concurrent access."""
@@ -328,6 +396,70 @@ def test_astra_05_packed_kernel_and_callable_parity_on_gates_ood_and_overrides()
     assert fast_ov.is_ambiguous == ref_ov.is_ambiguous
     assert kern_out["is_ambiguous"][0] == ref_ov.is_ambiguous
     assert fast_ov.confidences["cat"] == pytest.approx(ref_ov.confidences["cat"], abs=1e-5)
+
+    # Item F: biased TF-IDF OOV still abstains because is_tfidf_projector gates all-zero embeddings.
+    cal_data = [(f"invoice refund charge billing {i}", {"cat": "billing"}) for i in range(24)] + [
+        (f"server crash error outage {i}", {"cat": "tech"}) for i in range(24)
+    ]
+    m_tf_f = SystemOneCompiler(_ChoiceOnly, projector=proj, dimension=proj.dimension).compile(
+        {
+            "cat": [
+                ("invoice refund charge billing", "billing"),
+                ("server crash error outage", "tech"),
+            ]
+            * 4
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    m_tf_f.heads["cat"].biases = np.array([3.0, -3.0], dtype=np.float32)
+    eng_f = SystemOneEngine(_ChoiceOnly, compiled_model=m_tf_f, strict_mode=True, use_cache=False)
+    eng_f.calibrate(cal_data)
+    fn_f = eng_f.compile_callable()
+    k_f = eng_f.compile_packed_kernel()
+    assert eng_f.decide("zzzz_unseen_oov_token_xyz", record_receipt=False).is_ambiguous is True
+    assert fn_f("zzzz_unseen_oov_token_xyz").is_ambiguous is True
+    assert bool(k_f.decide_prompt("zzzz_unseen_oov_token_xyz")["is_ambiguous"][0]) is True
+    k_f.is_tfidf_projector = False
+    assert bool(k_f.decide_prompt("zzzz_unseen_oov_token_xyz")["is_ambiguous"][0]) is False
+
+    # Item A: AdaptiveConformalTracker alpha_t and margin_floor parity across engine, callable, and kernel.
+    m_tf_a = SystemOneCompiler(_ChoiceOnly, projector=proj, dimension=proj.dimension).compile(
+        {
+            "cat": [
+                ("invoice refund charge billing", "billing"),
+                ("server crash error outage", "tech"),
+            ]
+            * 4
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    tracker = AdaptiveConformalTracker(alpha_target=0.01, alpha_max=0.25, gamma=1.0)
+    eng_a = SystemOneEngine(
+        _ChoiceOnly,
+        compiled_model=m_tf_a,
+        strict_mode=True,
+        use_cache=False,
+        aci_tracker=tracker,
+    )
+    eng_a.calibrate(cal_data)
+    fn_a = eng_a.compile_callable()
+    assert tracker.alpha_t == pytest.approx(0.01)
+    assert eng_a.decide("invoice refund charge billing", record_receipt=False).is_ambiguous is True
+    assert fn_a("invoice refund charge billing").is_ambiguous is True
+
+    for _ in range(6):
+        tracker.update_accepted(error=False)
+    assert tracker.alpha_t >= 0.06
+    assert eng_a.decide("invoice refund charge billing", record_receipt=False).is_ambiguous is False
+    assert fn_a("invoice refund charge billing").is_ambiguous is False
+    assert eng_a.compile_callable()("invoice refund charge billing").is_ambiguous is False
+    assert bool(eng_a.compile_packed_kernel().decide_prompt("invoice refund charge billing")["is_ambiguous"][0]) is False
+
+    tracker.update_accepted(error=True, margin=100.0)
+    with pytest.raises(ValueError, match="margin_floor"):
+        fn_a("invoice refund charge billing")
 
 
 def test_astra_06_universal_service_fails_closed_without_auth_token() -> None:
@@ -558,6 +690,67 @@ def test_astra_10_fast_explainer_matches_calibrated_engine_and_rejects_nonlinear
     with pytest.raises(ValueError, match="hierarchical"):
         FastExplainer.from_engine(eng, "cat")
 
+    # Item E: learned override on TF-IDF OOV, recency_weighted=True flip, and Boolean tie boundary.
+    class _OvExplainSchema(DecisionSchema):
+        cat = ChoiceField(options=("billing", "tech"))
+
+    proj_tf = TfidfProjector.fit(["invoice refund charge billing", "server crash error outage"], max_features=32)
+    m_ov = SystemOneCompiler(_OvExplainSchema, projector=proj_tf, dimension=proj_tf.dimension).compile(
+        {
+            "cat": [
+                ("invoice refund charge billing", "billing"),
+                ("server crash error outage", "tech"),
+            ]
+            * 4
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_ov = SystemOneEngine(_OvExplainSchema, compiled_model=m_ov, strict_mode=False, use_cache=False)
+    eng_ov.learn("zzzz_unseen_oov_override_xyz", {"cat": "tech"})
+    ov_probe = "  ZZZZ_Unseen_Oov_Override_Xyz  "
+    exp_ov = eng_ov.explain(ov_probe, "cat")
+    exp_ov_m = FastExplainer.from_compiled_model(eng_ov.model, "cat").explain(ov_probe)
+    assert exp_ov.predicted_label == "tech"
+    assert exp_ov_m.predicted_label == "tech"
+    assert exp_ov.additivity_error_target <= 1e-6
+    assert exp_ov.additivity_error_margin <= 1e-6
+
+    proj_rw = DeterministicSemanticProjector(dimension=64)
+    rw_examples = {
+        "cat": [
+            ("invoice payment billing refund charge", "billing"),
+            ("server crash error outage timeout", "tech"),
+        ]
+        * 6
+    }
+    m_flat = SystemOneCompiler(
+        _OvExplainSchema, projector=proj_rw, dimension=64, recency_weighted=False
+    ).compile(rw_examples, calibration_split=0.0, augment=False)
+    m_rw = SystemOneCompiler(
+        _OvExplainSchema, projector=proj_rw, dimension=64, recency_weighted=True
+    ).compile(rw_examples, calibration_split=0.0, augment=False)
+    probe_rw = ("invoice payment billing refund charge " * 6) + ("server crash error outage timeout " * 6)
+    e_flat = SystemOneEngine(_OvExplainSchema, compiled_model=m_flat, strict_mode=False, use_cache=False)
+    e_rw = SystemOneEngine(_OvExplainSchema, compiled_model=m_rw, strict_mode=False, use_cache=False)
+    assert e_flat.decide(probe_rw, record_receipt=False).values["cat"] == "billing"
+    assert e_rw.decide(probe_rw, record_receipt=False).values["cat"] == "tech"
+    exp_rw = e_rw.explain(probe_rw, "cat")
+    exp_rw_m = FastExplainer.from_compiled_model(m_rw, "cat").explain(probe_rw)
+    assert exp_rw.predicted_label == "tech"
+    assert exp_rw_m.predicted_label == "tech"
+    assert exp_rw.additivity_error_target <= 1e-6
+
+    exp_bool_tie = FastExplainer(
+        projector=DeterministicSemanticProjector(dimension=32),
+        weights=np.zeros((1, 32), dtype=np.float32),
+        biases=np.zeros(1, dtype=np.float32),
+        threshold=0.5,
+        is_boolean=True,
+    ).explain("neutral tie check")
+    assert exp_bool_tie.predicted_label == "True"
+    assert exp_bool_tie.additivity_error_target <= 1e-6
+
 
 def test_astra_11_smarts_router_honors_per_call_alpha() -> None:
     """Finding #11: SmartsCrossZeroFewRouter dynamically recomputes quantile q_eff for per-call alpha."""
@@ -709,10 +902,15 @@ def test_astra_14_online_mondrian_and_fleet_conformal_cover_large_label_spaces()
 
     classes = tuple(f"c{i}" for i in range(k))
     fleet, _ = _build_tiny_fleet(classes=classes, num_tenants=1, r_sub=208, dim=32, alpha=0.10)
+    fleet.W_base.fill(0.0)
+    fleet.b_base.fill(0.0)
     for _ in range(40):
         q_val = fleet.update_conformal(0, 0, probs, eta_u=0.5, gamma_aci=0.25)
     assert q_val >= 0.995
-    assert 0 in fleet.decide_live(0, "probe")[2]
+    _, _, mask = fleet.decide_live(0, "probe")
+    assert mask.dtype == np.dtype(bool)
+    assert bool(mask[0]) is True
+    assert "c0" in fleet.decide(0, "probe").conformal_set
 
 
 def test_astra_15_binary_platt_beta_calibrator_uses_identity_below_74_samples() -> None:

@@ -3433,6 +3433,30 @@ class SystemOneEngine:
             for name, fd in sorted(self.schema.fields.items())
             if hasattr(fd, "threshold")
         )
+        aci_obj = getattr(self, "aci_tracker", None)
+        aci_sig = (
+            None
+            if aci_obj is None
+            else (float(aci_obj.alpha_t), getattr(aci_obj, "margin_floor", None))
+        )
+
+        def _ov_snapshot(src_obj: Any) -> Tuple[Any, ...]:
+            ov_map = getattr(src_obj, "_learned_prompt_overrides", None)
+            if not isinstance(ov_map, Mapping) or not ov_map:
+                return ()
+            rec_map = getattr(src_obj, "_learned_prompt_override_recency", {})
+            default_rec = bool(getattr(self, "recency_weighted", False))
+            return tuple(
+                (
+                    str(pk),
+                    bool(rec_map.get(pk, default_rec)) if isinstance(rec_map, Mapping) else default_rec,
+                    tuple(sorted((str(fk), repr(fv)) for fk, fv in f_map.items()))
+                    if isinstance(f_map, Mapping)
+                    else (),
+                )
+                for pk, f_map in sorted(ov_map.items())
+            )
+
         return (
             str(storage_mode),
             int(getattr(self, "model_version", 1)),
@@ -3446,11 +3470,8 @@ class SystemOneEngine:
             bool(getattr(self, "recency_weighted", False)),
             bool(getattr(self, "selective_calibrators", None)),
             getattr(self, "joint_calibrator", None) is not None,
-            getattr(getattr(self, "aci_tracker", None), "margin_floor", None),
-            (
-                len(getattr(self, "_learned_prompt_overrides", {}) or {}),
-                len(getattr(getattr(self, "model", None), "_learned_prompt_overrides", {}) or {}),
-            ),
+            aci_sig,
+            (_ov_snapshot(self), _ov_snapshot(getattr(self, "model", None))),
             thresh_sig,
             cal_sig,
             cp_sig,

@@ -72,18 +72,62 @@ def _normalize_head_weights_and_options(
     return w, b, opts
 
 
-def _project_texts(projector: Any, texts: Sequence[str]) -> np.ndarray:
+def _l2_normalize_batch(mat: np.ndarray) -> np.ndarray:
+    arr = np.asarray(mat, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.shape[0] == 0:
+        return arr
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
+    good = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
+    out = np.zeros_like(arr, dtype=np.float32)
+    if np.any(good):
+        out[good] = (arr[good] / norms[good]).astype(np.float32)
+    return out
+
+
+def _project_one(projector: Any, text: str, *, recency_weighted: bool = False) -> np.ndarray:
+    use_rw = bool(recency_weighted)
+    if hasattr(projector, "project"):
+        try:
+            out = projector.project(text, recency_weighted=use_rw)
+        except TypeError:
+            out = projector.project(text)
+    else:
+        out = projector(text)
+    if isinstance(out, tuple):
+        out = out[0]
+    vec = np.asarray(out, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(vec))
+    if norm > 1e-12 and math.isfinite(norm):
+        return (vec / norm).astype(np.float32)
+    return np.zeros_like(vec, dtype=np.float32)
+
+
+def _project_texts(
+    projector: Any,
+    texts: Sequence[str],
+    *,
+    recency_weighted: bool = False,
+) -> np.ndarray:
     text_list = list(texts)
     if not text_list:
         dim = int(getattr(projector, "dimension", 0))
         return np.empty((0, dim), dtype=np.float32)
+    use_rw = bool(recency_weighted)
     project_batch = getattr(projector, "project_batch", None)
     if callable(project_batch):
-        out = project_batch(text_list)
+        try:
+            out = project_batch(text_list, recency_weighted=use_rw)
+        except TypeError:
+            if not use_rw:
+                out = project_batch(text_list)
+            else:
+                out = np.vstack([_project_one(projector, t, recency_weighted=True) for t in text_list])
         if isinstance(out, tuple):
             out = out[0]
-        return np.asarray(out, dtype=np.float32)
-    return np.vstack([np.asarray(projector.project(t), dtype=np.float32) for t in text_list])
+        return _l2_normalize_batch(np.asarray(out, dtype=np.float32))
+    return np.vstack([_project_one(projector, t, recency_weighted=use_rw) for t in text_list])
 
 
 def _normalize_label_str(label: Any) -> str:
@@ -113,7 +157,8 @@ def _extract_calibrated_head_params(
     *,
     calibrator: Any = None,
     temperature_scale: float = 4.0,
-) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...], float, float]:
+    recency_weighted: Optional[bool] = None,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...], float, float, Dict[str, Any]]:
     """Extract calibrated effective weights, biases, scale, and threshold matching engine decide()."""
     f_def = model.schema.fields[fname]
     field_heads = getattr(model, "_field_heads", None)
@@ -156,10 +201,12 @@ def _extract_calibrated_head_params(
 
     w = np.asarray(head.weights, dtype=np.float64)
     b = np.asarray(head.biases, dtype=np.float64).reshape(-1).copy()
+    is_boolean = isinstance(f_def, BooleanField)
+    is_zero_head = bool(not np.any(w) and not np.any(b))
 
     if adj_raw is not None:
         adj = np.asarray(adj_raw, dtype=np.float64).reshape(-1)
-        if isinstance(f_def, BooleanField) or w.shape[0] == 1:
+        if is_boolean or w.shape[0] == 1:
             if adj.size == 2:
                 delta_adj = float(adj[1] - adj[0])
             elif adj.size == 1:
@@ -169,16 +216,42 @@ def _extract_calibrated_head_params(
                     f"Unsupported logit_adjustments length {adj.size} for BooleanField {fname!r}"
                 )
             b[0] += delta_adj / base_scale
+            adj_eff = np.array([delta_adj / temp], dtype=np.float64)
         elif adj.size == w.shape[0]:
             b += adj / base_scale
+            adj_eff = (adj / temp).astype(np.float64)
         elif adj.size > 0:
             raise ValueError(
                 f"logit_adjustments length {adj.size} != head outputs {w.shape[0]} for field {fname!r}"
             )
+        else:
+            adj_eff = np.zeros(1 if is_boolean else w.shape[0], dtype=np.float64)
+    else:
+        adj_eff = np.zeros(1 if is_boolean else w.shape[0], dtype=np.float64)
 
-    opts = ("False", "True") if isinstance(f_def, BooleanField) else tuple(f_def.options)
-    thr = float(getattr(f_def, "threshold", 0.5)) if isinstance(f_def, BooleanField) else 0.5
-    return w, b, opts, thr, eff_scale
+    default_rec = bool(getattr(model, "recency_weighted", getattr(model.projector, "recency_weighted", False)))
+    eff_recency = default_rec if recency_weighted is None else bool(recency_weighted)
+    learned_overrides: Dict[str, Any] = {}
+    if hasattr(model, "_build_override_eval"):
+        src_ov = getattr(model, "_learned_prompt_overrides", None)
+        src_rec = getattr(model, "_learned_prompt_override_recency", {})
+        if isinstance(src_ov, Mapping):
+            for p_k, f_map in src_ov.items():
+                if isinstance(p_k, str) and isinstance(f_map, Mapping) and fname in f_map:
+                    rec_flag = src_rec.get(p_k, default_rec) if isinstance(src_rec, Mapping) else default_rec
+                    if bool(rec_flag) == eff_recency:
+                        learned_overrides[p_k] = f_map[fname]
+
+    opts = ("False", "True") if is_boolean else tuple(f_def.options)
+    thr = float(getattr(f_def, "threshold", 0.5)) if is_boolean else 0.5
+    meta = {
+        "is_boolean": is_boolean,
+        "is_zero_head": is_zero_head,
+        "adj_eff": adj_eff,
+        "learned_overrides": learned_overrides,
+        "recency_weighted": eff_recency,
+    }
+    return w, b, opts, thr, eff_scale, meta
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,9 +310,30 @@ class FastExplainer:
         train_labels: Optional[Sequence[Any]] = None,
         temperature_scale: float = 4.0,
         threshold: float = 0.5,
+        recency_weighted: Optional[bool] = None,
+        is_boolean: Optional[bool] = None,
+        learned_overrides: Optional[Mapping[str, Any]] = None,
+        is_zero_head: bool = False,
+        adj_eff: Optional[np.ndarray] = None,
     ) -> None:
         self.projector = projector
         self.scale = float(temperature_scale)
+        self.threshold = float(threshold)
+        w_in = np.asarray(weights)
+        inferred_bool = w_in.ndim == 2 and w_in.shape[0] == 1 and (options is None or len(options) in (0, 2))
+        self._is_boolean = bool(inferred_bool if is_boolean is None else is_boolean)
+        t_clamped = min(max(self.threshold, 1e-6), 1.0 - 1e-6)
+        self._bool_logit_shift = math.log(t_clamped / (1.0 - t_clamped))
+        self.recency_weighted = bool(
+            getattr(projector, "recency_weighted", False) if recency_weighted is None else recency_weighted
+        )
+        self._learned_overrides: Dict[str, Any] = (
+            {" ".join(str(k).strip().casefold().split()): v for k, v in learned_overrides.items() if str(k).strip()}
+            if learned_overrides
+            else {}
+        )
+        self._is_zero_head = bool(is_zero_head)
+
         w_norm, b_norm, resolved_options = _normalize_head_weights_and_options(
             weights,
             biases,
@@ -252,6 +346,10 @@ class FastExplainer:
         self.num_classes = len(self.options)
         self.W_eff = np.ascontiguousarray(w_norm * self.scale, dtype=np.float64)
         self.b_eff = np.ascontiguousarray(b_norm * self.scale, dtype=np.float64)
+        if adj_eff is not None:
+            self._adj_eff = np.asarray(adj_eff, dtype=np.float64).reshape(-1)
+        else:
+            self._adj_eff = np.zeros(1 if self._is_boolean else self.num_classes, dtype=np.float64)
 
         if train_texts and train_labels:
             if len(train_texts) != len(train_labels):
@@ -268,7 +366,8 @@ class FastExplainer:
         self.train_label_idx = np.array([self.label_to_idx[lbl] for lbl in self.train_labels], dtype=np.int32)
 
         has_hybrid_fast = (
-            isinstance(projector, HybridProjector)
+            not self.recency_weighted
+            and isinstance(projector, HybridProjector)
             and projector._tfidf_projector is not None
             and not (
                 projector._fitted
@@ -278,13 +377,13 @@ class FastExplainer:
         )
         if has_hybrid_fast:
             self._mode = "hybrid"
-        elif isinstance(projector, TfidfProjector):
+        elif not self.recency_weighted and isinstance(projector, TfidfProjector):
             self._mode = "tfidf"
         else:
             self._mode = "generic"
         self.is_hybrid = self._mode == "hybrid"
 
-        X_train = _project_texts(projector, self.train_texts)
+        X_train = _project_texts(projector, self.train_texts, recency_weighted=self.recency_weighted)
         self.X_train_full = np.ascontiguousarray(X_train, dtype=np.float32)
 
         if self._mode == "hybrid":
@@ -421,7 +520,7 @@ class FastExplainer:
     ) -> FastExplainer:
         """Build a FastExplainer directly from a CompiledSystemOneModel or SystemOneModel."""
         fname = _canonical_explain_field(model.schema, field_name)
-        w, b, opts, thr, eff_scale = _extract_calibrated_head_params(
+        w, b, opts, thr, eff_scale, meta = _extract_calibrated_head_params(
             model,
             fname,
             calibrator=None,
@@ -436,6 +535,11 @@ class FastExplainer:
             train_labels=train_labels,
             temperature_scale=eff_scale,
             threshold=thr,
+            recency_weighted=meta["recency_weighted"],
+            is_boolean=meta["is_boolean"],
+            learned_overrides=meta["learned_overrides"],
+            is_zero_head=meta["is_zero_head"],
+            adj_eff=meta["adj_eff"],
         )
 
     @classmethod
@@ -452,11 +556,13 @@ class FastExplainer:
         fname = _canonical_explain_field(engine.model.schema, field_name)
         calibrators = getattr(engine, "calibrators", None)
         calibrator = calibrators.get(fname) if isinstance(calibrators, Mapping) else None
-        w, b, opts, thr, eff_scale = _extract_calibrated_head_params(
+        eng_rec = bool(getattr(engine, "recency_weighted", getattr(engine.model, "recency_weighted", False)))
+        w, b, opts, thr, eff_scale, meta = _extract_calibrated_head_params(
             engine.model,
             fname,
             calibrator=calibrator,
             temperature_scale=temperature_scale,
+            recency_weighted=eng_rec,
         )
         return cls(
             projector=engine.model.projector,
@@ -467,6 +573,11 @@ class FastExplainer:
             train_labels=train_labels,
             temperature_scale=eff_scale,
             threshold=thr,
+            recency_weighted=meta["recency_weighted"],
+            is_boolean=meta["is_boolean"],
+            learned_overrides=meta["learned_overrides"],
+            is_zero_head=meta["is_zero_head"],
+            adj_eff=meta["adj_eff"],
         )
 
     def _get_char_arr(
@@ -1015,6 +1126,24 @@ class FastExplainer:
         } if need_trace else None
         return u_dn, norm_dn, u_sc, norm_sc, trace
 
+    def _select_winner(self, logits: np.ndarray) -> int:
+        if self._is_boolean and logits.size == 2:
+            if self.threshold <= 0.0:
+                return 1
+            if self.threshold > 1.0:
+                return 0
+            return 1 if float(logits[1]) >= float(logits[0]) else 0
+        return int(np.argmax(logits))
+
+    def _select_top2(self, logits: np.ndarray) -> Tuple[int, int]:
+        if self._is_boolean and logits.size == 2:
+            c1 = self._select_winner(logits)
+            return c1, (0 if c1 == 1 else 1)
+        order = np.argsort(-logits, kind="stable")
+        c1 = int(order[0])
+        c2 = int(order[1]) if len(order) > 1 else c1
+        return c1, c2
+
     def _fast_logits_for_kept(
         self,
         text: str,
@@ -1023,9 +1152,9 @@ class FastExplainer:
     ) -> Tuple[int, np.ndarray]:
         if self._mode == "generic":
             kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
-            x_sub = np.asarray(self.projector.project(kept_text), dtype=np.float64)
+            x_sub = _project_one(self.projector, kept_text, recency_weighted=self.recency_weighted).astype(np.float64)
             logits = (self.W_eff @ x_sub) + self.b_eff
-            return int(np.argmax(logits)), logits
+            return self._select_winner(logits), logits
 
         act_idx, act_raw, norm_sp, _ = self._extract_tfidf_fast(text, spans, kept_mask=kept_mask, need_trace=False)
         if not self.is_hybrid:
@@ -1034,7 +1163,7 @@ class FastExplainer:
                 logits = (v_sp @ self.W_sp_T[act_idx]) + self.b_eff
             else:
                 logits = self.b_eff.copy()
-            return int(np.argmax(logits)), logits
+            return self._select_winner(logits), logits
 
         u_dn, norm_dn, u_sc, norm_sc, _ = self._extract_hybrid_dense_and_spec_fast(
             text, spans, kept_mask=kept_mask, need_trace=False
@@ -1059,7 +1188,7 @@ class FastExplainer:
                 logits = base_logits + self.W_rbf @ u_rbf
             else:
                 logits = base_logits
-            return int(np.argmax(logits)), logits
+            return self._select_winner(logits), logits
 
         g_sp = (self.w_sparse / base_norm) if sp_ok else 0.0
         g_dn = (self.w_dense / base_norm) if dn_ok else 0.0
@@ -1086,7 +1215,7 @@ class FastExplainer:
             if pnorm > 1e-12:
                 logits += self.W_rbf @ (phi / pnorm)
 
-        return int(np.argmax(logits)), logits
+        return self._select_winner(logits), logits
 
     def _accumulate_tfidf_span_attrs(
         self,
@@ -1148,11 +1277,9 @@ class FastExplainer:
         self, text: str, spans: List[Tuple[int, int, str, str]]
     ) -> Tuple[np.ndarray, int, int, float, List[float], List[float], float, float, np.ndarray]:
         n_spans = len(spans)
-        x_full = np.asarray(self.projector.project(text), dtype=np.float64)
+        x_full = _project_one(self.projector, text, recency_weighted=self.recency_weighted).astype(np.float64)
         logits = (self.W_eff @ x_full) + self.b_eff
-        order = np.argsort(-logits)
-        c1 = int(order[0])
-        c2 = int(order[1]) if len(order) > 1 else c1
+        c1, c2 = self._select_top2(logits)
         margin = float(logits[c1] - logits[c2])
         sims_all = (self.X_train_full @ x_full.astype(np.float32)).astype(np.float64)
 
@@ -1163,7 +1290,7 @@ class FastExplainer:
         b_margin = float(self.b_eff[c1] - self.b_eff[c2])
 
         loo_texts = [" ".join(spans[k][2] for k in range(n_spans) if k != j) for j in range(n_spans)]
-        X_loo = _project_texts(self.projector, loo_texts).astype(np.float64)
+        X_loo = _project_texts(self.projector, loo_texts, recency_weighted=self.recency_weighted).astype(np.float64)
         logits_loo = (X_loo @ self.W_eff.T) + self.b_eff
         raw_t = logits[c1] - logits_loo[:, c1]
         raw_m = margin - (logits_loo[:, c1] - logits_loo[:, c2])
@@ -1184,7 +1311,34 @@ class FastExplainer:
         spans = self._tokenize_spans(text)
         n_spans = len(spans)
 
-        if self._mode == "generic":
+        norm_key = " ".join(text.strip().casefold().split()) if text.strip() else ""
+        ov_val = self._learned_overrides.get(norm_key) if norm_key else None
+        override_hit = False
+        if ov_val is not None:
+            emb_ov = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
+            if (not bool(np.any(emb_ov))) or self._is_zero_head:
+                override_hit = True
+                if self._is_boolean:
+                    z_raw = 12.0 if bool(ov_val) else -12.0
+                    s_shifted = (z_raw * self.scale + float(self._adj_eff[0])) - self._bool_logit_shift
+                    logits = np.array([-0.5 * s_shifted, 0.5 * s_shifted], dtype=np.float64)
+                else:
+                    z_raw = np.full(self.num_classes, -12.0, dtype=np.float64)
+                    ov_lbl = _normalize_label_str(ov_val)
+                    if ov_lbl in self.label_to_idx:
+                        z_raw[self.label_to_idx[ov_lbl]] = 12.0
+                    logits = z_raw * self.scale + self._adj_eff
+                c1, c2 = self._select_top2(logits)
+                margin = float(logits[c1] - logits[c2])
+                t_attrs = [0.0] * n_spans
+                m_attrs = [0.0] * n_spans
+                b_target = float(logits[c1])
+                b_margin = margin
+                sims_all = (self.X_train_full @ emb_ov.astype(np.float32)).astype(np.float64)
+
+        if override_hit:
+            pass
+        elif self._mode == "generic":
             logits, c1, c2, margin, t_attrs, m_attrs, b_target, b_margin, sims_all = self._explain_generic(
                 text, spans
             )
@@ -1194,9 +1348,7 @@ class FastExplainer:
             v_sp = (act_raw / norm_sp).astype(np.float32).astype(np.float64) if sp_ok else act_raw
             logits = (v_sp @ self.W_sp_T[act_idx]) + self.b_eff if sp_ok else self.b_eff.copy()
 
-            order = np.argsort(-logits)
-            c1 = int(order[0])
-            c2 = int(order[1]) if len(order) > 1 else c1
+            c1, c2 = self._select_top2(logits)
             margin = float(logits[c1] - logits[c2])
 
             t_attrs = [0.0] * n_spans
@@ -1239,9 +1391,7 @@ class FastExplainer:
                     pnorm = float(np.linalg.norm(phi))
                     if pnorm > 1e-12:
                         logits = logits + self.W_rbf @ (phi / pnorm)
-                order = np.argsort(-logits)
-                c1 = int(order[0])
-                c2 = int(order[1]) if len(order) > 1 else c1
+                c1, c2 = self._select_top2(logits)
                 margin = float(logits[c1] - logits[c2])
                 t_attrs = [0.0] * n_spans
                 m_attrs = [0.0] * n_spans
@@ -1280,9 +1430,7 @@ class FastExplainer:
                     sims = np.empty(0, dtype=np.float64)
                     u_rbf = np.empty(0, dtype=np.float64)
 
-                order = np.argsort(-logits)
-                c1 = int(order[0])
-                c2 = int(order[1]) if len(order) > 1 else c1
+                c1, c2 = self._select_top2(logits)
                 margin = float(logits[c1] - logits[c2])
 
                 if self.has_rbf and self.W_rbf is not None and self.L_sp_T is not None:
