@@ -2372,6 +2372,18 @@ class PackedMultiQuestionKernel:
         s_raw_scale: np.ndarray,
         s_is_cal: np.ndarray,
         storage_mode: str = "float32",
+        c_escalate: Optional[np.ndarray] = None,
+        b_escalate: Optional[np.ndarray] = None,
+        s_escalate: Optional[np.ndarray] = None,
+        learned_overrides: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        model_learned_overrides: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        c_temp: Optional[np.ndarray] = None,
+        c_adj_div_temp: Optional[Tuple[np.ndarray, ...]] = None,
+        c_zero_head: Optional[np.ndarray] = None,
+        b_temp: Optional[np.ndarray] = None,
+        b_adj_div_temp: Optional[np.ndarray] = None,
+        b_zero_head: Optional[np.ndarray] = None,
+        s_zero_head: Optional[np.ndarray] = None,
     ) -> None:
         self.projector = projector
         self.dimension = dimension
@@ -2443,6 +2455,73 @@ class PackedMultiQuestionKernel:
             if (enable_margin_gating and margin_threshold is not None)
             else 0.5
         )
+        self.c_escalate = (
+            np.ones(self.Q_c, dtype=bool)
+            if c_escalate is None
+            else np.asarray(c_escalate, dtype=bool).reshape(-1)
+        )
+        self.b_escalate = (
+            np.ones(self.Q_b, dtype=bool)
+            if b_escalate is None
+            else np.asarray(b_escalate, dtype=bool).reshape(-1)
+        )
+        self.s_escalate = (
+            np.ones(self.Q_s, dtype=bool)
+            if s_escalate is None
+            else np.asarray(s_escalate, dtype=bool).reshape(-1)
+        )
+        self.c_any_escalate = bool(self.Q_c and np.any(self.c_escalate))
+        self.b_any_escalate = bool(self.Q_b and np.any(self.b_escalate))
+        self.s_any_escalate = bool(self.Q_s and np.any(self.s_escalate))
+        self.any_escalating_field = self.c_any_escalate or self.b_any_escalate or self.s_any_escalate
+        from system1.core.text import TfidfProjector
+
+        self.is_tfidf_projector = isinstance(projector, TfidfProjector)
+        self.learned_overrides: Dict[str, Dict[str, Any]] = (
+            {str(k): dict(v) for k, v in learned_overrides.items()}
+            if learned_overrides
+            else {}
+        )
+        self.model_learned_overrides: Dict[str, Dict[str, Any]] = (
+            {str(k): dict(v) for k, v in model_learned_overrides.items()}
+            if model_learned_overrides
+            else {}
+        )
+        self.c_temp = (
+            np.asarray(c_temp, dtype=np.float64)
+            if c_temp is not None
+            else np.ones(self.Q_c, dtype=np.float64)
+        )
+        self.c_adj_div_temp: Tuple[np.ndarray, ...] = (
+            tuple(np.asarray(arr, dtype=np.float64) for arr in c_adj_div_temp)
+            if c_adj_div_temp is not None
+            else tuple(np.zeros(int(k), dtype=np.float64) for k in self.c_K)
+        )
+        self.c_zero_head = (
+            np.asarray(c_zero_head, dtype=bool)
+            if c_zero_head is not None
+            else np.zeros(self.Q_c, dtype=bool)
+        )
+        self.b_temp = (
+            np.asarray(b_temp, dtype=np.float64)
+            if b_temp is not None
+            else np.ones(self.Q_b, dtype=np.float64)
+        )
+        self.b_adj_div_temp = (
+            np.asarray(b_adj_div_temp, dtype=np.float64)
+            if b_adj_div_temp is not None
+            else np.zeros(self.Q_b, dtype=np.float64)
+        )
+        self.b_zero_head = (
+            np.asarray(b_zero_head, dtype=bool)
+            if b_zero_head is not None
+            else np.zeros(self.Q_b, dtype=bool)
+        )
+        self.s_zero_head = (
+            np.asarray(s_zero_head, dtype=bool)
+            if s_zero_head is not None
+            else np.zeros(self.Q_s, dtype=bool)
+        )
         self.Q_total = self.Q_c + self.Q_b + self.Q_s
 
     @classmethod
@@ -2465,6 +2544,13 @@ class PackedMultiQuestionKernel:
         fields = eng.schema.fields
         if not fields:
             raise ValueError("PackedMultiQuestionKernel requires a non-empty schema")
+        if getattr(eng, "selective_calibrators", None):
+            raise ValueError("PackedMultiQuestionKernel does not support engines with active selective_calibrators")
+        if getattr(eng, "joint_calibrator", None) is not None:
+            raise ValueError("PackedMultiQuestionKernel does not support engines with active joint_calibrator")
+        aci_tracker = getattr(eng, "aci_tracker", None)
+        if aci_tracker is not None and getattr(aci_tracker, "margin_floor", None) is not None:
+            raise ValueError("PackedMultiQuestionKernel does not support engines with active aci_tracker margin_floor")
         model = eng.model
         heads = model.heads
         field_heads = getattr(model, "_field_heads", {})
@@ -2475,6 +2561,21 @@ class PackedMultiQuestionKernel:
         eng_rel_odds = getattr(eng, "relative_odds_ratio", None) if relative_odds_ratio is None else relative_odds_ratio
         eng_tau0 = getattr(eng, "confidence_floor_tau0", None) if confidence_floor_tau0 is None else confidence_floor_tau0
         eff_recency = bool(getattr(eng, "recency_weighted", False) if recency_weighted is None else recency_weighted)
+        default_ov_rec = bool(getattr(eng, "recency_weighted", False))
+        learned_overrides_map: Dict[str, Dict[str, Any]] = {}
+        model_overrides_map: Dict[str, Dict[str, Any]] = {}
+        has_model_override_eval = hasattr(model, "_build_override_eval")
+        for src_obj in (model, eng):
+            src_ov = getattr(src_obj, "_learned_prompt_overrides", None)
+            src_rec = getattr(src_obj, "_learned_prompt_override_recency", {})
+            if isinstance(src_ov, Mapping):
+                for p_key, f_map in src_ov.items():
+                    if isinstance(p_key, str) and isinstance(f_map, Mapping):
+                        rec_flag = src_rec.get(p_key, default_ov_rec) if isinstance(src_rec, Mapping) else default_ov_rec
+                        if bool(rec_flag) == eff_recency:
+                            learned_overrides_map.setdefault(p_key, {}).update(f_map)
+                            if src_obj is model and has_model_override_eval:
+                                model_overrides_map.setdefault(p_key, {}).update(f_map)
 
         def _resolve_gate_params(cp_obj: Any) -> Tuple[float, float, float]:
             if strict_mode or not enable_margin_gating:
@@ -2512,6 +2613,10 @@ class PackedMultiQuestionKernel:
         c_eff_m: List[float] = []
         c_gamma: List[float] = []
         c_tau0: List[float] = []
+        c_escalate: List[bool] = []
+        c_temp: List[float] = []
+        c_adj_div_temp: List[np.ndarray] = []
+        c_zero_head: List[bool] = []
 
         bool_names: List[str] = []
         b_thresh: List[float] = []
@@ -2521,6 +2626,10 @@ class PackedMultiQuestionKernel:
         b_eff_m: List[float] = []
         b_gamma: List[float] = []
         b_tau0: List[float] = []
+        b_escalate: List[bool] = []
+        b_temp: List[float] = []
+        b_adj_div_temp: List[float] = []
+        b_zero_head: List[bool] = []
 
         score_names: List[str] = []
         s_min: List[float] = []
@@ -2528,6 +2637,8 @@ class PackedMultiQuestionKernel:
         s_norm_margin: List[float] = []
         s_raw_scale: List[float] = []
         s_is_cal: List[bool] = []
+        s_escalate: List[bool] = []
+        s_zero_head: List[bool] = []
 
         def _validate_head(fname: str) -> Any:
             h = heads[fname]
@@ -2538,6 +2649,10 @@ class PackedMultiQuestionKernel:
                 live_h is not None and getattr(live_h, "_exemplar_bank", None) is not None
             ):
                 raise ValueError(f"PackedMultiQuestionKernel does not support exemplar bank on {fname!r}")
+            if float(getattr(h, "familiarity_threshold", 0.0)) > 0.0:
+                raise ValueError(f"PackedMultiQuestionKernel does not support familiarity_threshold on {fname!r}")
+            if float(getattr(h, "prototype_threshold", 0.0)) > 0.0:
+                raise ValueError(f"PackedMultiQuestionKernel does not support prototype_threshold on {fname!r}")
             return h
 
         def _validate_cp(fname: str) -> Any:
@@ -2571,7 +2686,13 @@ class PackedMultiQuestionKernel:
                 W = np.asarray(head.weights, dtype=np.float64) / (0.25 * temp)
                 b = np.asarray(head.biases, dtype=np.float64).reshape(-1) / (0.25 * temp)
                 if getattr(cal, "logit_adjustments", None) is not None:
-                    b = b + np.asarray(cal.logit_adjustments, dtype=np.float64) / temp
+                    adj_vec = np.asarray(cal.logit_adjustments, dtype=np.float64) / temp
+                    b = b + adj_vec
+                else:
+                    adj_vec = np.zeros(K, dtype=np.float64)
+                c_temp.append(temp)
+                c_adj_div_temp.append(adj_vec)
+                c_zero_head.append(bool(not np.any(head.weights) and not np.any(head.biases)))
                 W_cols.append(W.T)
                 b_cols.append(b)
                 c_offsets.append(cursor)
@@ -2591,6 +2712,7 @@ class PackedMultiQuestionKernel:
                 c_eff_m.append(gm)
                 c_gamma.append(gg)
                 c_tau0.append(gt)
+                c_escalate.append(bool(getattr(f_def, "escalate_on_ambiguity", True)))
 
         for fname, f_def in fields.items():
             if isinstance(f_def, BooleanField):
@@ -2602,8 +2724,12 @@ class PackedMultiQuestionKernel:
                 W = np.asarray(head.weights, dtype=np.float64)[:1] / (0.25 * temp)
                 b = np.asarray(head.biases, dtype=np.float64).reshape(-1)[:1] / (0.25 * temp)
                 adj = getattr(cal, "logit_adjustments", None)
-                if adj is not None and len(adj) == 2:
-                    b = b + (float(adj[1]) - float(adj[0])) / temp
+                adj_scalar = (float(adj[1]) - float(adj[0])) / temp if (adj is not None and len(adj) == 2) else 0.0
+                if adj_scalar != 0.0:
+                    b = b + adj_scalar
+                b_temp.append(temp)
+                b_adj_div_temp.append(adj_scalar)
+                b_zero_head.append(bool(not np.any(head.weights) and not np.any(head.biases)))
                 W_cols.append(W.T)
                 b_cols.append(b)
                 b_thresh.append(float(f_def.threshold))
@@ -2621,6 +2747,7 @@ class PackedMultiQuestionKernel:
                 b_eff_m.append(gm)
                 b_gamma.append(gg)
                 b_tau0.append(gt)
+                b_escalate.append(bool(getattr(f_def, "escalate_on_ambiguity", True)))
 
         for fname, f_def in fields.items():
             if isinstance(f_def, ScoreField):
@@ -2646,6 +2773,8 @@ class PackedMultiQuestionKernel:
                 else:
                     m = rng_val if strict_mode else rng_val * ((1.0 - eff_alpha) / 2.0)
                 s_norm_margin.append(m / max(1e-6, rng_val))
+                s_escalate.append(bool(getattr(f_def, "escalate_on_ambiguity", True)))
+                s_zero_head.append(bool(not np.any(head.weights) and not np.any(head.biases)))
 
         arr_dtype = np.float32 if storage_mode == "float32" else np.float16
         W_packed = np.ascontiguousarray(np.hstack(W_cols), dtype=arr_dtype)
@@ -2687,9 +2816,23 @@ class PackedMultiQuestionKernel:
             s_raw_scale=np.asarray(s_raw_scale, dtype=np.float64),
             s_is_cal=np.asarray(s_is_cal, dtype=bool),
             storage_mode=storage_mode,
+            c_escalate=np.asarray(c_escalate, dtype=bool),
+            b_escalate=np.asarray(b_escalate, dtype=bool),
+            s_escalate=np.asarray(s_escalate, dtype=bool),
+            learned_overrides=learned_overrides_map,
+            model_learned_overrides=model_overrides_map,
+            c_temp=np.asarray(c_temp, dtype=np.float64),
+            c_adj_div_temp=tuple(c_adj_div_temp),
+            c_zero_head=np.asarray(c_zero_head, dtype=bool),
+            b_temp=np.asarray(b_temp, dtype=np.float64),
+            b_adj_div_temp=np.asarray(b_adj_div_temp, dtype=np.float64),
+            b_zero_head=np.asarray(b_zero_head, dtype=bool),
+            s_zero_head=np.asarray(s_zero_head, dtype=bool),
         )
 
-    def forward_embeddings(self, X: np.ndarray) -> Dict[str, Any]:
+    def forward_embeddings(
+        self, X: np.ndarray, *, prompts: Optional[Sequence[str]] = None
+    ) -> Dict[str, Any]:
         """Single contiguous BLAS GEMV (B=1) / GEMM (B>1) + vectorized postprocessing."""
         is_1d = X.ndim == 1
         B_in = 1 if is_1d else int(X.shape[0])
@@ -2724,6 +2867,41 @@ class PackedMultiQuestionKernel:
         if is_1d:
             logits = logits[None, :]
         B = logits.shape[0]
+
+        if prompts is not None and self.model_learned_overrides:
+            if not logits.flags.writeable:
+                logits = logits.copy()
+            for r, raw_p in enumerate(prompts):
+                if r >= B:
+                    break
+                if not isinstance(raw_p, str) or not raw_p.strip():
+                    continue
+                norm_key = " ".join(raw_p.strip().casefold().split())
+                m_ov = self.model_learned_overrides.get(norm_key)
+                if not m_ov:
+                    continue
+                is_zero_r = not bool(np.any(Xm if is_1d else Xm[r]))
+                for ci, fname in enumerate(self.choice_names):
+                    if fname in m_ov and (is_zero_r or bool(self.c_zero_head[ci])):
+                        s0 = int(self.c_offsets[ci])
+                        K = int(self.c_K[ci])
+                        scale_c = 0.25 * float(self.c_temp[ci])
+                        z_ov = np.full(K, -12.0 / scale_c, dtype=np.float64)
+                        if m_ov[fname] in self.c_options[ci]:
+                            z_ov[self.c_options[ci].index(m_ov[fname])] = 12.0 / scale_c
+                        logits[r, s0 : s0 + K] = z_ov + self.c_adj_div_temp[ci]
+                for bi, fname in enumerate(self.bool_names):
+                    if fname in m_ov and (is_zero_r or bool(self.b_zero_head[bi])):
+                        scale_b = 0.25 * float(self.b_temp[bi])
+                        z_raw = 12.0 if bool(m_ov[fname]) else -12.0
+                        logits[r, self.M_c + bi] = (z_raw / scale_b) + float(self.b_adj_div_temp[bi])
+                for si, fname in enumerate(self.score_names):
+                    if fname in m_ov and (is_zero_r or bool(self.s_zero_head[si])):
+                        val_f = float(m_ov[fname])
+                        rng_f = max(1e-6, float(self.s_range[si]))
+                        ratio = float(np.clip((val_f - float(self.s_min[si])) / rng_f, 1e-4, 1.0 - 1e-4))
+                        logit_t = float(np.float32(0.25 * math.log(ratio / (1.0 - ratio))))
+                        logits[r, self.M_c + self.Q_b + si] = (logit_t / 0.25) / float(self.s_raw_scale[si])
 
         zc = logits[:, : self.M_c]
         zb = logits[:, self.M_c : self.M_c + self.Q_b]
@@ -2895,10 +3073,53 @@ class PackedMultiQuestionKernel:
             p_s = s_val = s_conf = np.empty((B, 0), dtype=np.float64)
             s_ambig = np.empty((B, 0), dtype=bool)
 
+        if self.is_tfidf_projector:
+            zero_rows = (
+                np.array([not bool(np.any(Xm))], dtype=bool)
+                if is_1d
+                else (~np.any(Xm, axis=1))
+            )
+            if np.any(zero_rows):
+                if self.Q_c:
+                    in_c[zero_rows, :] = 0
+                    c_ambig[zero_rows, :] = True
+                if self.Q_b:
+                    in_b[zero_rows, :] = 0
+                    b_ambig[zero_rows, :] = True
+                if self.Q_s:
+                    if not s_ambig.flags.writeable:
+                        s_ambig = np.array(s_ambig, dtype=bool, copy=True)
+                    s_ambig[zero_rows, :] = True
+
+        if prompts is not None and self.learned_overrides:
+            for r, raw_p in enumerate(prompts):
+                if r >= B:
+                    break
+                if not isinstance(raw_p, str) or not raw_p.strip():
+                    continue
+                norm_key = " ".join(raw_p.strip().casefold().split())
+                ov = self.learned_overrides.get(norm_key)
+                if not ov:
+                    continue
+                is_zero_r = not bool(np.any(Xm if is_1d else Xm[r]))
+                for ci, fname in enumerate(self.choice_names):
+                    if fname in ov and (is_zero_r or self.c_options[ci][int(best_idx[r, ci])] == ov[fname]):
+                        in_c[r, ci] = 1
+                        c_ambig[r, ci] = False
+                for bi, fname in enumerate(self.bool_names):
+                    if fname in ov and (is_zero_r or bool(b_val[r, bi]) == bool(ov[fname])):
+                        in_b[r, bi] = 1
+                        b_ambig[r, bi] = False
+                for si, fname in enumerate(self.score_names):
+                    if fname in ov:
+                        if not s_ambig.flags.writeable:
+                            s_ambig = np.array(s_ambig, dtype=bool, copy=True)
+                        s_ambig[r, si] = False
+
         row_ambig = (
-            (np.any(c_ambig, axis=1) if self.Q_c else np.zeros(B, dtype=bool))
-            | (np.any(b_ambig, axis=1) if self.Q_b else np.zeros(B, dtype=bool))
-            | (np.any(s_ambig, axis=1) if self.Q_s else np.zeros(B, dtype=bool))
+            (np.any(c_ambig[:, self.c_escalate], axis=1) if self.c_any_escalate else np.zeros(B, dtype=bool))
+            | (np.any(b_ambig[:, self.b_escalate], axis=1) if self.b_any_escalate else np.zeros(B, dtype=bool))
+            | (np.any(s_ambig[:, self.s_escalate], axis=1) if self.s_any_escalate else np.zeros(B, dtype=bool))
         )
 
         return {
@@ -2931,10 +3152,7 @@ class PackedMultiQuestionKernel:
         norm = float(np.linalg.norm(vec))
         if norm > 1e-12:
             return (vec / norm).astype(np.float32)
-        out = np.zeros(self.dimension, dtype=np.float32)
-        if type(self.projector).__name__ not in ("TfidfProjector", "PragmaticCompositeProjector"):
-            out[0] = 1.0
-        return out
+        return np.zeros(self.dimension, dtype=np.float32)
 
     def encode_batch(self, prompts: Sequence[str]) -> np.ndarray:
         if len(prompts) == 0:
@@ -2952,19 +3170,14 @@ class PackedMultiQuestionKernel:
             out = np.zeros((len(prompts), self.dimension), dtype=np.float32)
             if np.any(good):
                 out[good] = (arr[good] / norms[good]).astype(np.float32)
-            if (
-                np.any(~good)
-                and type(self.projector).__name__ not in ("TfidfProjector", "PragmaticCompositeProjector")
-            ):
-                out[~good, 0] = 1.0
             return out
         return np.stack([self.encode_one(p) for p in prompts], axis=0)
 
     def decide_prompt(self, prompt: str) -> Dict[str, Any]:
-        return self.forward_embeddings(self.encode_one(prompt))
+        return self.forward_embeddings(self.encode_one(prompt), prompts=(prompt,))
 
     def decide_batch(self, prompts: Sequence[str]) -> Dict[str, Any]:
-        return self.forward_embeddings(self.encode_batch(prompts))
+        return self.forward_embeddings(self.encode_batch(prompts), prompts=prompts)
 
 
 class FastDecisionOutput:
@@ -3039,6 +3252,12 @@ class FastDecisionCallable:
         self.s_cals = [bool(x) for x in self.kernel.s_is_cal]
         self.s_eff_thresh = float(self.kernel.eff_score_thresh)
         self.s_offset = self.kernel.M_c + self.Q_b
+        self.c_escalate = tuple(bool(x) for x in self.kernel.c_escalate)
+        self.b_escalate = tuple(bool(x) for x in self.kernel.b_escalate)
+        self.s_escalate = tuple(bool(x) for x in self.kernel.s_escalate)
+        self.any_escalating_field = self.kernel.any_escalating_field
+        self.is_tfidf_projector = self.kernel.is_tfidf_projector
+        self.learned_overrides = self.kernel.learned_overrides
 
     def __call__(
         self, prompt: Optional[str] = None, *, embedding: Optional[np.ndarray] = None
@@ -3060,8 +3279,17 @@ class FastDecisionCallable:
                     f"embedding dimension mismatch: expected {self.kernel.dimension}, got {emb.shape[0]}"
                 )
 
-        if not self.small_q:
-            out = self.kernel.forward_embeddings(emb)
+        has_prompt_override = bool(
+            embedding is None
+            and self.learned_overrides
+            and isinstance(prompt, str)
+            and prompt.strip()
+            and (" ".join(prompt.strip().casefold().split()) in self.learned_overrides)
+        )
+        if not self.small_q or has_prompt_override:
+            out = self.kernel.forward_embeddings(
+                emb, prompts=(prompt,) if has_prompt_override else None
+            )
             vals: Dict[str, Any] = {}
             confs: Dict[str, float] = {}
             for ci, fn in enumerate(self.c_names):
@@ -3078,7 +3306,7 @@ class FastDecisionCallable:
         z_list: List[float] = (emb @ self.W_t + self.b).tolist()
         vals = {}
         confs = {}
-        ambig = False
+        ambig = bool(self.is_tfidf_projector and not bool(np.any(emb)) and self.any_escalating_field)
         exp = math.exp
         strict = self.strict
 
@@ -3138,12 +3366,13 @@ class FastDecisionCallable:
                         if cs >= qh - 1e-7:
                             break
 
+            field_ambig = False
             if strict:
                 if (not self.c_cals[ci]) or (cnt != 1):
-                    ambig = True
+                    field_ambig = True
             else:
                 if cnt == 0:
-                    ambig = True
+                    field_ambig = True
                 elif cnt > 1:
                     eff_m = self.c_eff_m[ci]
                     if eff_m > 0.0:
@@ -3158,9 +3387,11 @@ class FastDecisionCallable:
                             and (top_p >= self.c_conf_floor[ci])
                             and (odds >= self.c_gamma[ci])
                         ):
-                            ambig = True
+                            field_ambig = True
                     else:
-                        ambig = True
+                        field_ambig = True
+            if field_ambig and self.c_escalate[ci]:
+                ambig = True
 
         for bi in range(self.Q_b):
             fn = self.b_names[bi]
@@ -3192,12 +3423,13 @@ class FastDecisionCallable:
                 else:
                     cnt = 1 if top >= qh - 1e-7 else 2
 
+            field_ambig = False
             if strict:
                 if (not self.b_cals[bi]) or (cnt != 1):
-                    ambig = True
+                    field_ambig = True
             else:
                 if cnt == 0:
-                    ambig = True
+                    field_ambig = True
                 elif cnt > 1:
                     eff_m = self.b_eff_m[bi]
                     if eff_m > 0.0:
@@ -3209,9 +3441,11 @@ class FastDecisionCallable:
                             and (top >= self.b_conf_floor[bi])
                             and (odds >= self.b_gamma[bi])
                         ):
-                            ambig = True
+                            field_ambig = True
                     else:
-                        ambig = True
+                        field_ambig = True
+            if field_ambig and self.b_escalate[bi]:
+                ambig = True
 
         for si in range(self.Q_s):
             fn = self.s_names[si]
@@ -3223,7 +3457,11 @@ class FastDecisionCallable:
             z_rc = 50.0 if z_raw > 50.0 else (-50.0 if z_raw < -50.0 else z_raw)
             ps_raw = 1.0 / (1.0 + exp(-z_rc))
             confs[fn] = ps_raw if ps_raw >= 0.5 else (1.0 - ps_raw)
-            if strict and ((not self.s_cals[si]) or (self.s_norm_margin[si] > self.s_eff_thresh)):
+            if (
+                strict
+                and self.s_escalate[si]
+                and ((not self.s_cals[si]) or (self.s_norm_margin[si] > self.s_eff_thresh))
+            ):
                 ambig = True
 
         return FastDecisionOutput(vals, confs, ambig)

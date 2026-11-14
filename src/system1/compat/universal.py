@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -329,10 +329,20 @@ def compile_questions_contract(questions: Any) -> CompiledContractSchema:
     int_to_ext: Dict[str, str] = {}
     fingerprint_payload: Dict[str, Any] = {}
 
-    for idx, (ext_name_raw, spec) in enumerate(questions.items()):
+    seen_stripped: Set[str] = set()
+    ordered_items: List[Tuple[str, Any]] = []
+    for ext_name_raw, spec in questions.items():
         ext_name = str(ext_name_raw)
-        if not ext_name:
+        stripped = ext_name.strip()
+        if not stripped:
             raise SchemaValidationError("Question name cannot be empty")
+        if stripped in seen_stripped:
+            raise SchemaValidationError(f"Duplicate normalized question name: {stripped!r}")
+        seen_stripped.add(stripped)
+        ordered_items.append((ext_name, spec))
+    ordered_items.sort(key=lambda kv: (kv[0].strip(), kv[0]))
+
+    for idx, (ext_name, spec) in enumerate(ordered_items):
         if not isinstance(spec, Mapping):
             raise SchemaValidationError(f"Question {ext_name!r} spec must be a mapping")
         q_type = str(spec.get("type") or "").strip().lower()
@@ -374,6 +384,8 @@ def compile_questions_contract(questions: Any) -> CompiledContractSchema:
             if len(set(options)) != len(options):
                 raise SchemaValidationError(f"Duplicate options in question {ext_name!r}")
 
+            norm_descriptions = {opt: descriptions.get(opt, "") for opt in options}
+            thresh = parse_finite_float(spec.get("threshold", 0.5), field_name="threshold")
             contract = QuestionContract(
                 external_name=ext_name,
                 internal_name=internal_name,
@@ -381,9 +393,17 @@ def compile_questions_contract(questions: Any) -> CompiledContractSchema:
                 options=options,
                 descriptions=descriptions,
                 instructions=instructions,
-                threshold=parse_finite_float(spec.get("threshold", 0.5), field_name="threshold"),
+                threshold=thresh,
             )
-            fingerprint_payload[ext_name] = {"type": q_type, "options": list(options)}
+            fp_entry: Dict[str, Any] = {
+                "type": q_type,
+                "options": list(options),
+                "descriptions": norm_descriptions,
+                "instructions": instructions,
+            }
+            if q_type == "multichoice":
+                fp_entry["threshold"] = thresh
+            fingerprint_payload[ext_name] = fp_entry
 
         elif q_type == "noul":
             thresh = parse_finite_float(spec.get("threshold", 0.5), field_name="threshold")
@@ -409,7 +429,13 @@ def compile_questions_contract(questions: Any) -> CompiledContractSchema:
                 true_description=str(t_desc or instructions or f"{ext_name} is true"),
                 false_description=str(f_desc or f"not ({t_desc or instructions or ext_name})"),
             )
-            fingerprint_payload[ext_name] = {"type": "noul", "threshold": thresh}
+            fingerprint_payload[ext_name] = {
+                "type": "noul",
+                "threshold": thresh,
+                "instructions": instructions,
+                "true_description": contract.true_description,
+                "false_description": contract.false_description,
+            }
 
         elif q_type == "score":
             crit = spec.get("criteria")
@@ -429,7 +455,11 @@ def compile_questions_contract(questions: Any) -> CompiledContractSchema:
                     criteria_legend=legend,
                     instructions=instructions,
                 )
-                fingerprint_payload[ext_name] = {"type": "score_ordinal", "criteria": list(legend)}
+                fingerprint_payload[ext_name] = {
+                    "type": "score_ordinal",
+                    "criteria": list(legend),
+                    "instructions": instructions,
+                }
             else:
                 lo = parse_finite_float(0.0 if min_v is None else min_v, field_name="min_value")
                 hi = parse_finite_float(1.0 if max_v is None else max_v, field_name="max_value")
@@ -445,7 +475,14 @@ def compile_questions_contract(questions: Any) -> CompiledContractSchema:
                     low_description=str(spec.get("low_description") or f"Low {lo}"),
                     high_description=str(spec.get("high_description") or f"High {hi}"),
                 )
-                fingerprint_payload[ext_name] = {"type": "score_continuous", "min": lo, "max": hi}
+                fingerprint_payload[ext_name] = {
+                    "type": "score_continuous",
+                    "min": lo,
+                    "max": hi,
+                    "instructions": instructions,
+                    "low_description": contract.low_description,
+                    "high_description": contract.high_description,
+                }
         else:
             raise SchemaValidationError(f"Unsupported question type {q_type!r} for {ext_name!r}")
 
@@ -475,19 +512,57 @@ def diff_schemas(prev: CompiledContractSchema, curr: CompiledContractSchema) -> 
     for qname in sorted(set(prev_map) & set(curr_map)):
         pc = prev_map[qname]
         cc = curr_map[qname]
-        if pc.q_type != cc.q_type:
-            changed[qname] = {"reason": "type_changed", "from": pc.q_type, "to": cc.q_type}
-        elif pc.options != cc.options:
+        pc_is_ord = pc.q_type == "score" and bool(pc.criteria_legend)
+        cc_is_ord = cc.q_type == "score" and bool(cc.criteria_legend)
+        if pc.q_type != cc.q_type or pc_is_ord != cc_is_ord:
             changed[qname] = {
-                "reason": "options_changed",
-                "added_options": sorted(set(cc.options) - set(pc.options)),
-                "removed_options": sorted(set(pc.options) - set(cc.options)),
+                "reason": "type_changed",
+                "from": "score_ordinal" if pc_is_ord else pc.q_type,
+                "to": "score_ordinal" if cc_is_ord else cc.q_type,
             }
         elif pc.criteria_legend != cc.criteria_legend:
             changed[qname] = {
                 "reason": "criteria_changed",
                 "from": list(pc.criteria_legend),
                 "to": list(cc.criteria_legend),
+            }
+        elif pc.options != cc.options:
+            changed[qname] = {
+                "reason": "options_changed",
+                "added_options": sorted(set(cc.options) - set(pc.options)),
+                "removed_options": sorted(set(pc.options) - set(cc.options)),
+            }
+        elif pc.q_type in ("noul", "multichoice") and abs(float(pc.threshold) - float(cc.threshold)) > 1e-12:
+            changed[qname] = {
+                "reason": "threshold_changed",
+                "from": pc.threshold,
+                "to": cc.threshold,
+            }
+        elif pc.q_type == "score" and not pc_is_ord and (
+            abs(float(pc.min_value) - float(cc.min_value)) > 1e-12
+            or abs(float(pc.max_value) - float(cc.max_value)) > 1e-12
+        ):
+            changed[qname] = {
+                "reason": "bounds_changed",
+                "from": [pc.min_value, pc.max_value],
+                "to": [cc.min_value, cc.max_value],
+            }
+        elif pc.instructions != cc.instructions:
+            changed[qname] = {
+                "reason": "instructions_changed",
+                "from": pc.instructions,
+                "to": cc.instructions,
+            }
+        elif (
+            pc.descriptions != cc.descriptions
+            or pc.true_description != cc.true_description
+            or pc.false_description != cc.false_description
+            or pc.low_description != cc.low_description
+            or pc.high_description != cc.high_description
+        ):
+            changed[qname] = {
+                "reason": "descriptions_changed",
+                "question": qname,
             }
     return {
         "drifted": bool(added_q or removed_q or changed),
@@ -660,7 +735,11 @@ class SoftDistillingLifecycle:
             dense_dim=192,
             enable_quarantine=False,
         )
-        self.lifecycle = AutoCutoverLifecycle(contract.schema, config=self.config)
+        self.lifecycle = AutoCutoverLifecycle(
+            contract.schema,
+            config=self.config,
+            post_compile_hook=self._distill_sub_engine_before_qualification,
+        )
         self._soft_records_by_prompt: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._distilled_compile_count: int = 0
         self._soft_distill_applied_count: int = 0
@@ -675,153 +754,161 @@ class SoftDistillingLifecycle:
     def is_cutover(self) -> bool:
         return self.lifecycle.state == CutoverState.SELECTIVE_HOT_SWAP and self.lifecycle.engine is not None
 
-    def _apply_soft_distillation_to_active_engine(self) -> None:
-        """Distill recorded teacher soft-probability distributions into active System 1 heads."""
-        engine = self.lifecycle.engine
-        if engine is None or self.distill_mode != "soft" or self.soft_blend <= 0.0:
-            return
-        train_by_class = getattr(self.lifecycle, "train_by_class", None)
-        if not train_by_class:
-            return
+    def _distill_sub_engine_before_qualification(
+        self,
+        target_engine: Any,
+        train_pairs: Sequence[Tuple[str, Dict[str, Any]]],
+    ) -> bool:
+        """Distill recorded teacher soft-probability distributions before calibration and qualification."""
+        with self._lock:
+            if (
+                target_engine is None
+                or self.distill_mode != "soft"
+                or self.soft_blend <= 0.0
+                or not train_pairs
+            ):
+                return False
 
-        n_events = len(self.lifecycle.cutover_events)
-        if n_events == self._distilled_compile_count:
-            return
-        self._distilled_compile_count = n_events
+            self._distilled_compile_count += 1
+            train_prompts = [p for p, _ in train_pairs]
+            train_vals = [vals for _, vals in train_pairs]
+            model = target_engine.model
+            X_all = np.stack([model.encode(p) for p in train_prompts], axis=0).astype(np.float32)
 
-        train_pairs = [item for items in train_by_class.values() for item in items]
-        if not train_pairs:
-            return
-        train_prompts = [p for p, _ in train_pairs]
-        train_vals = [vals for _, vals in train_pairs]
+            from system1.compiler import SystemOneCompiler
 
-        model = engine.model
-        X_train = np.stack([model.encode(p) for p in train_prompts], axis=0).astype(np.float32)
+            helper_compiler = SystemOneCompiler(
+                self.contract.schema,
+                dimension=model.dimension,
+                regularization=float(model.metadata.get("regularization", 0.1)),
+            )
 
-        from system1.compiler import SystemOneCompiler
-
-        helper_compiler = SystemOneCompiler(
-            self.contract.schema,
-            dimension=model.dimension,
-            regularization=float(model.metadata.get("regularization", 0.1)),
-        )
-
-        updated_any = False
-        field_heads = getattr(model, "_field_heads", {})
-        for c in self.contract.contracts:
-            compiled_head = model.heads.get(c.internal_name)
-            live_head = field_heads.get(c.internal_name)
-            if compiled_head is None and live_head is None:
-                continue
-            ref_head = live_head if live_head is not None else compiled_head
-            assert ref_head is not None
-            if c.q_type in ("choice", "score") and (c.q_type == "choice" or c.criteria_legend):
-                head_options = tuple(getattr(ref_head.field_def, "options", c.options))
-                K = len(head_options)
-                if ref_head.weights.shape[0] != K or ref_head.weights.shape[1] != X_train.shape[1]:
+            updated_any = False
+            field_heads = getattr(model, "_field_heads", {})
+            for c in self.contract.contracts:
+                compiled_head = model.heads.get(c.internal_name)
+                live_head = field_heads.get(c.internal_name)
+                if compiled_head is None and live_head is None:
                     continue
-                opt_idx = {opt: i for i, opt in enumerate(head_options)}
-                Y_hard = np.zeros((len(train_prompts), K), dtype=np.float32)
-                Y_soft = np.zeros((len(train_prompts), K), dtype=np.float32)
-                has_soft = False
-                for i, (prompt, vals) in enumerate(zip(train_prompts, train_vals)):
-                    hard_label = str(vals[c.internal_name])
-                    y_hard = np.zeros(K, dtype=np.float32)
-                    if hard_label in opt_idx:
-                        y_hard[opt_idx[hard_label]] = 1.0
-                    Y_hard[i] = y_hard
-                    soft_entry = self._soft_records_by_prompt.get(prompt, {}).get(c.internal_name)
-                    if soft_entry and "probs" in soft_entry:
-                        p_vec = np.array(
-                            [float(soft_entry["probs"].get(opt, 0.0)) for opt in head_options],
-                            dtype=np.float32,
+                ref_head = live_head if live_head is not None else compiled_head
+                assert ref_head is not None
+
+                idx_keep = [i for i, vals in enumerate(train_vals) if c.internal_name in vals]
+                if not idx_keep:
+                    continue
+                if len(idx_keep) == len(train_prompts):
+                    X_train = X_all
+                    sub_prompts = train_prompts
+                    sub_vals = train_vals
+                else:
+                    X_train = X_all[idx_keep]
+                    sub_prompts = [train_prompts[i] for i in idx_keep]
+                    sub_vals = [train_vals[i] for i in idx_keep]
+
+                if c.q_type in ("choice", "score") and (c.q_type == "choice" or c.criteria_legend):
+                    head_options = tuple(getattr(ref_head.field_def, "options", c.options))
+                    K = len(head_options)
+                    if ref_head.weights.shape[0] != K or ref_head.weights.shape[1] != X_train.shape[1]:
+                        continue
+                    opt_idx = {opt: i for i, opt in enumerate(head_options)}
+                    Y_hard = np.zeros((len(sub_prompts), K), dtype=np.float32)
+                    Y_soft = np.zeros((len(sub_prompts), K), dtype=np.float32)
+                    has_soft = False
+                    for i, (prompt, vals) in enumerate(zip(sub_prompts, sub_vals)):
+                        hard_label = str(vals[c.internal_name])
+                        y_hard = np.zeros(K, dtype=np.float32)
+                        if hard_label in opt_idx:
+                            y_hard[opt_idx[hard_label]] = 1.0
+                        Y_hard[i] = y_hard
+                        soft_entry = self._soft_records_by_prompt.get(prompt, {}).get(c.internal_name)
+                        if soft_entry and "probs" in soft_entry:
+                            p_vec = np.array(
+                                [float(soft_entry["probs"].get(opt, 0.0)) for opt in head_options],
+                                dtype=np.float32,
+                            )
+                            s = float(np.sum(p_vec))
+                            if s > 0.0:
+                                p_vec = p_vec / s
+                                if float(np.max(np.abs(p_vec - y_hard))) > 1e-6:
+                                    has_soft = True
+                                Y_soft[i] = p_vec
+                                continue
+                        Y_soft[i] = y_hard
+
+                    if has_soft and not getattr(ref_head, "hierarchical", False):
+                        eff_reg, sw_choice = helper_compiler._compute_loo_ridge_and_sample_weights(
+                            X_train,
+                            Y_hard,
+                            auto_regularization=True,
+                            noise_robust=True,
                         )
-                        s = float(np.sum(p_vec))
-                        if s > 0.0:
-                            p_vec = p_vec / s
-                            if float(np.max(np.abs(p_vec - y_hard))) > 1e-6:
+                        delta_Y = (self.soft_blend * (Y_soft - Y_hard)).astype(np.float32)
+                        dw, db = helper_compiler._solve_ridge(
+                            X_train,
+                            delta_Y,
+                            eff_reg,
+                            sample_weights=sw_choice,
+                            regularize_bias=False,
+                            return_covariance=False,
+                        )
+                        new_w = (ref_head.weights + dw).astype(np.float32)
+                        new_b = (ref_head.biases + db).astype(np.float32)
+                        if live_head is not None:
+                            live_head.weights = new_w
+                            live_head.biases = new_b
+                        if compiled_head is not None:
+                            compiled_head.weights = new_w
+                            compiled_head.biases = new_b
+                        updated_any = True
+
+                elif c.q_type == "noul":
+                    Y_hard = np.zeros((len(sub_prompts), 1), dtype=np.float32)
+                    Y_soft = np.zeros((len(sub_prompts), 1), dtype=np.float32)
+                    has_soft = False
+                    for i, (prompt, vals) in enumerate(zip(sub_prompts, sub_vals)):
+                        y_hard = 1.0 if bool(vals[c.internal_name]) else -1.0
+                        Y_hard[i, 0] = y_hard
+                        soft_entry = self._soft_records_by_prompt.get(prompt, {}).get(c.internal_name)
+                        if soft_entry and "p_true" in soft_entry:
+                            p_true = float(soft_entry["p_true"])
+                            y_soft = 2.0 * p_true - 1.0
+                            if abs(y_soft - y_hard) > 1e-6:
                                 has_soft = True
-                            Y_soft[i] = p_vec
-                            continue
-                    Y_soft[i] = y_hard
+                            Y_soft[i, 0] = y_soft
+                        else:
+                            Y_soft[i, 0] = y_hard
+                    if has_soft:
+                        Y_bool_oh = np.column_stack(
+                            [(Y_hard[:, 0] < 0).astype(np.float32), (Y_hard[:, 0] > 0).astype(np.float32)]
+                        )
+                        eff_reg_b, sw_b = helper_compiler._compute_loo_ridge_and_sample_weights(
+                            X_train,
+                            Y_bool_oh,
+                            auto_regularization=True,
+                            noise_robust=True,
+                        )
+                        delta_Y = (self.soft_blend * (Y_soft - Y_hard)).astype(np.float32)
+                        dw, db = helper_compiler._solve_ridge(
+                            X_train,
+                            delta_Y,
+                            eff_reg_b,
+                            sample_weights=sw_b,
+                            regularize_bias=True,
+                            return_covariance=False,
+                        )
+                        new_w = (ref_head.weights + dw).astype(np.float32)
+                        new_b = (ref_head.biases + db).astype(np.float32)
+                        if live_head is not None:
+                            live_head.weights = new_w
+                            live_head.biases = new_b
+                        if compiled_head is not None:
+                            compiled_head.weights = new_w
+                            compiled_head.biases = new_b
+                        updated_any = True
 
-                if has_soft and not getattr(ref_head, "hierarchical", False):
-                    eff_reg, sw_choice = helper_compiler._compute_loo_ridge_and_sample_weights(
-                        X_train,
-                        Y_hard,
-                        auto_regularization=True,
-                        noise_robust=True,
-                    )
-                    delta_Y = (self.soft_blend * (Y_soft - Y_hard)).astype(np.float32)
-                    dw, db = helper_compiler._solve_ridge(
-                        X_train,
-                        delta_Y,
-                        eff_reg,
-                        sample_weights=sw_choice,
-                        regularize_bias=False,
-                        return_covariance=False,
-                    )
-                    new_w = (ref_head.weights + dw).astype(np.float32)
-                    new_b = (ref_head.biases + db).astype(np.float32)
-                    if live_head is not None:
-                        live_head.weights = new_w
-                        live_head.biases = new_b
-                    if compiled_head is not None:
-                        compiled_head.weights = new_w
-                        compiled_head.biases = new_b
-                    updated_any = True
-
-            elif c.q_type == "noul":
-                Y_hard = np.zeros((len(train_prompts), 1), dtype=np.float32)
-                Y_soft = np.zeros((len(train_prompts), 1), dtype=np.float32)
-                has_soft = False
-                for i, (prompt, vals) in enumerate(zip(train_prompts, train_vals)):
-                    y_hard = 1.0 if bool(vals[c.internal_name]) else -1.0
-                    Y_hard[i, 0] = y_hard
-                    soft_entry = self._soft_records_by_prompt.get(prompt, {}).get(c.internal_name)
-                    if soft_entry and "p_true" in soft_entry:
-                        p_true = float(soft_entry["p_true"])
-                        y_soft = 2.0 * p_true - 1.0
-                        if abs(y_soft - y_hard) > 1e-6:
-                            has_soft = True
-                        Y_soft[i, 0] = y_soft
-                    else:
-                        Y_soft[i, 0] = y_hard
-                if has_soft:
-                    Y_bool_oh = np.column_stack(
-                        [(Y_hard[:, 0] < 0).astype(np.float32), (Y_hard[:, 0] > 0).astype(np.float32)]
-                    )
-                    eff_reg_b, sw_b = helper_compiler._compute_loo_ridge_and_sample_weights(
-                        X_train,
-                        Y_bool_oh,
-                        auto_regularization=True,
-                        noise_robust=True,
-                    )
-                    delta_Y = (self.soft_blend * (Y_soft - Y_hard)).astype(np.float32)
-                    dw, db = helper_compiler._solve_ridge(
-                        X_train,
-                        delta_Y,
-                        eff_reg_b,
-                        sample_weights=sw_b,
-                        regularize_bias=True,
-                        return_covariance=False,
-                    )
-                    new_w = (ref_head.weights + dw).astype(np.float32)
-                    new_b = (ref_head.biases + db).astype(np.float32)
-                    if live_head is not None:
-                        live_head.weights = new_w
-                        live_head.biases = new_b
-                    if compiled_head is not None:
-                        compiled_head.weights = new_w
-                        compiled_head.biases = new_b
-                    updated_any = True
-
-        if updated_any:
-            self._soft_distill_applied_count += 1
-            if hasattr(engine, "_packed_kernel_cache"):
-                engine._packed_kernel_cache = None
-            if getattr(engine, "cache", None) is not None and hasattr(engine.cache, "clear"):
-                engine.cache.clear()
+            if updated_any:
+                self._soft_distill_applied_count += 1
+            return updated_any
 
     def observe_teacher(
         self,
@@ -832,9 +919,7 @@ class SoftDistillingLifecycle:
         with self._lock:
             if soft_targets:
                 self._soft_records_by_prompt[prompt] = soft_targets
-            admitted = self.lifecycle.observe_teacher(prompt, lifecycle_values)
-            self._apply_soft_distillation_to_active_engine()
-            return admitted
+            return self.lifecycle.observe_teacher(prompt, lifecycle_values)
 
     def _evaluate_frozen_local_locked(self, prompt: str) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
         """Read-only fast-path check mirroring AutoCutoverLifecycle without mutating state."""
@@ -1017,6 +1102,48 @@ def format_provider_response(
     return payload
 
 
+def _canonicalize_origin(origin: str) -> Optional[Tuple[str, str, int]]:
+    """Parse an HTTP(S) Origin into normalized ``(scheme, hostname, port)`` or ``None``."""
+    if not isinstance(origin, str):
+        return None
+    s = origin.strip()
+    if not s or any(ch.isspace() for ch in s):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(s)
+        raw_port = parsed.port
+    except ValueError:
+        return None
+
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return None
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        return None
+    if parsed.query or parsed.fragment or parsed.path not in ("", "/"):
+        return None
+    if not parsed.hostname:
+        return None
+
+    netloc = parsed.netloc
+    if netloc.startswith("["):
+        end_bracket = netloc.find("]")
+        if end_bracket < 0:
+            return None
+        tail = netloc[end_bracket + 1 :]
+        if tail and (not tail.startswith(":") or not tail[1:].isdigit()):
+            return None
+    elif ":" in netloc:
+        _, port_part = netloc.split(":", 1)
+        if not port_part.isdigit():
+            return None
+
+    eff_port = int(raw_port) if raw_port is not None else (443 if scheme == "https" else 80)
+    if not (1 <= eff_port <= 65535):
+        return None
+    return (scheme, parsed.hostname.lower(), eff_port)
+
+
 class UniversalDecisionService:
     """Thread-safe multi-provider gateway engine with shadow-distill-cutover and drift isolation."""
 
@@ -1027,7 +1154,8 @@ class UniversalDecisionService:
             Mapping[str, Callable[[str, Mapping[str, Any], CompiledContractSchema], Mapping[str, Any]]]
         ] = None,
         upstream_urls: Optional[Mapping[str, str]] = None,
-        bearer_token: Optional[str] = "test-universal-secret",
+        bearer_token: Optional[str] = None,
+        require_auth: bool = True,
         allowed_origins: Optional[Sequence[str]] = (
             "http://127.0.0.1",
             "http://localhost",
@@ -1041,8 +1169,23 @@ class UniversalDecisionService:
     ) -> None:
         self.upstream_handlers = dict(upstream_handlers or {})
         self.upstream_urls = dict(upstream_urls or {})
+        self.require_auth = bool(require_auth)
+        if bearer_token is not None and not isinstance(bearer_token, str):
+            raise TypeError(f"bearer_token must be a string or None, got {type(bearer_token).__name__}")
+        if self.require_auth and (bearer_token is None or not bearer_token.strip()):
+            raise ValueError(
+                "UniversalDecisionService requires an explicit non-empty bearer_token when require_auth=True; "
+                "pass require_auth=False to configure unauthenticated loopback operation"
+            )
         self.bearer_token = bearer_token
         self.allowed_origins = set(allowed_origins or ())
+        parsed_origins: Set[Tuple[str, str, int]] = set()
+        for orig in self.allowed_origins:
+            canon = _canonicalize_origin(orig)
+            if canon is None:
+                raise ValueError(f"Invalid allowed origin entry: {orig!r}")
+            parsed_origins.add(canon)
+        self._allowed_origin_tuples: FrozenSet[Tuple[str, str, int]] = frozenset(parsed_origins)
         self.max_body_bytes = int(max_body_bytes)
         self.distill_mode = distill_mode
         self.soft_blend = float(soft_blend)
@@ -1070,15 +1213,15 @@ class UniversalDecisionService:
     def check_headers(self, headers: Mapping[str, str]) -> None:
         lower = {str(k).lower(): str(v) for k, v in headers.items()}
         origin = lower.get("origin")
-        if origin is not None and self.allowed_origins:
-            parsed = urllib.parse.urlparse(origin)
-            norm_origin = f"{parsed.scheme}://{parsed.hostname}" if parsed.hostname else origin
-            if origin not in self.allowed_origins and norm_origin not in self.allowed_origins:
+        if origin is not None and self._allowed_origin_tuples:
+            canon_origin = _canonicalize_origin(origin)
+            if canon_origin is None or canon_origin not in self._allowed_origin_tuples:
                 with self._lock:
                     self.stats["origin_failures"] += 1
                 raise ForbiddenOriginError(f"Disallowed Origin header: {origin!r}")
 
-        if self.bearer_token:
+        if self.require_auth or self.bearer_token is not None:
+            token = self.bearer_token or ""
             auth = lower.get("authorization", "")
             x_api_key = lower.get("x-goog-api-key", "") or lower.get("x-api-key", "")
             candidate = ""
@@ -1086,12 +1229,31 @@ class UniversalDecisionService:
                 candidate = auth[7:].strip()
             elif x_api_key:
                 candidate = x_api_key.strip()
-            if not candidate or not hmac.compare_digest(
-                candidate.encode("utf-8"), self.bearer_token.encode("utf-8")
+            if not token or not candidate or not hmac.compare_digest(
+                candidate.encode("utf-8"), token.encode("utf-8")
             ):
                 with self._lock:
                     self.stats["auth_failures"] += 1
                 raise AuthError("Invalid or missing Bearer / x-goog-api-key credential")
+
+    def preflight_http_headers(self, headers: Mapping[str, str]) -> Optional[int]:
+        """Validate auth/origin headers and declared Content-Length before streaming request body."""
+        lower = {str(k).lower(): str(v) for k, v in headers.items()}
+        self.check_headers(lower)
+        raw_len = lower.get("content-length")
+        if raw_len is None or not raw_len.strip():
+            return None
+        try:
+            content_len = int(raw_len.strip())
+        except ValueError as exc:
+            raise InteropError(f"Invalid Content-Length header: {raw_len!r}", status_code=400) from exc
+        if content_len < 0:
+            raise InteropError(f"Negative Content-Length header: {content_len}", status_code=400)
+        if content_len > self.max_body_bytes:
+            raise PayloadTooLargeError(
+                f"Request Content-Length {content_len} exceeds {self.max_body_bytes} bytes"
+            )
+        return content_len
 
     def _call_upstream(
         self,
@@ -1384,6 +1546,21 @@ class UniversalDecisionASGIApp:
                 await self._send_json(send, 404, {"error": f"Unknown route: {path}"})
             return
 
+        raw_headers = {
+            (k.decode("latin1") if isinstance(k, bytes) else str(k)): (
+                v.decode("latin1") if isinstance(v, bytes) else str(v)
+            )
+            for k, v in scope.get("headers", ())
+        }
+        try:
+            self.service.preflight_http_headers(raw_headers)
+        except InteropError as exc:
+            await self._send_json(send, exc.status_code, {"error": str(exc)})
+            return
+        except ZeroEgressViolationError as exc:
+            await self._send_json(send, 403, {"error": str(exc)})
+            return
+
         chunks: List[bytes] = []
         total_bytes = 0
         more_body = True
@@ -1403,12 +1580,6 @@ class UniversalDecisionASGIApp:
             chunks.append(chunk)
             more_body = bool(msg.get("more_body", False))
 
-        raw_headers = {
-            (k.decode("latin1") if isinstance(k, bytes) else str(k)): (
-                v.decode("latin1") if isinstance(v, bytes) else str(v)
-            )
-            for k, v in scope.get("headers", ())
-        }
         try:
             status, body = self.service.handle_request(
                 path=path,
@@ -1433,12 +1604,25 @@ def add_universal_decisions_gateway(app: Any, service: UniversalDecisionService)
     from starlette.responses import Response as _StarletteResponse
 
     async def _dispatch(request: _StarletteRequest) -> _StarletteResponse:
-        raw_body = await request.body()
+        raw_headers = dict(request.headers)
         try:
+            service.preflight_http_headers(raw_headers)
+            chunks: List[bytes] = []
+            total_bytes = 0
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                data = bytes(chunk)
+                total_bytes += len(data)
+                if total_bytes > service.max_body_bytes:
+                    raise PayloadTooLargeError(
+                        f"Request body exceeds {service.max_body_bytes} bytes"
+                    )
+                chunks.append(data)
             status, payload = service.handle_request(
                 path=request.url.path,
-                headers=dict(request.headers),
-                raw_body=raw_body,
+                headers=raw_headers,
+                raw_body=b"".join(chunks),
             )
         except InteropError as exc:
             status = exc.status_code

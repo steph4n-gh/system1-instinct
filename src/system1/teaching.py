@@ -1488,53 +1488,59 @@ class ActiveTeacherSelector:
         n_cal = int(reserve_calibration)
         if n_cal < 0:
             raise ValueError(f"reserve_calibration must be non-negative, got {n_cal}")
-        selected: List[int] = []
+        cal_selected: List[int] = []
+        train_selected: List[int] = []
         remaining = np.ones(self.n_pool, dtype=bool)
-        init_count = min(n_cal, budget) if n_cal > 0 else 1
-        for idx in all_perm[:init_count]:
-            selected.append(idx)
+        cal_count = min(n_cal, budget)
+        for idx in all_perm[:cal_count]:
+            cal_selected.append(idx)
             remaining[idx] = False
 
-        if len(selected) >= budget:
-            return selected[:budget]
+        if len(cal_selected) >= budget:
+            return cal_selected[:budget]
+
+        train_budget = budget - len(cal_selected)
+        seed_idx = all_perm[cal_count]
+        train_selected.append(seed_idx)
+        remaining[seed_idx] = False
 
         if strategy == "confidence_only":
-            warm = min(max(8, self.num_classes * 2), budget)
-            for idx in all_perm[init_count:]:
-                if len(selected) >= warm and len(set(target_labels[selected].tolist())) >= 2:
+            warm = min(max(8, self.num_classes * 2), train_budget)
+            for idx in all_perm[cal_count + 1:]:
+                if len(train_selected) >= warm and len(set(target_labels[train_selected].tolist())) >= 2:
                     break
-                selected.append(idx)
+                train_selected.append(idx)
                 remaining[idx] = False
-                if len(selected) >= budget:
-                    return selected[:budget]
+                if len(train_selected) >= train_budget:
+                    return (cal_selected + train_selected)[:budget]
 
-            while len(selected) < budget:
-                W, b = _solve_ridge_dual(self.X_pool[selected], targets_2d[selected], reg=self.reg)
+            while len(train_selected) < train_budget:
+                W, b = _solve_ridge_dual(self.X_pool[train_selected], targets_2d[train_selected], reg=self.reg)
                 rem_idx = np.flatnonzero(remaining)
                 if rem_idx.size == 0:
                     break
                 probs = _softmax_rows(self.X_pool[rem_idx] @ W.T + b)
                 uncertainty = 1.0 - np.max(probs, axis=1)
-                step_k = min(self.batch_size, budget - len(selected))
+                step_k = min(self.batch_size, train_budget - len(train_selected))
                 order = np.argsort(-uncertainty, kind="mergesort")[:step_k]
                 for pos in order:
                     chosen = int(rem_idx[int(pos)])
-                    selected.append(chosen)
+                    train_selected.append(chosen)
                     remaining[chosen] = False
-            return selected[:budget]
+            return (cal_selected + train_selected)[:budget]
 
-        S, min_dists = self._sherman_morrison_state(selected)
-        while len(selected) < budget:
+        S, min_dists = self._sherman_morrison_state(train_selected)
+        while len(train_selected) < train_budget:
             rem_idx = np.flatnonzero(remaining)
             if rem_idx.size == 0:
                 break
-            model_wb = self._fit_model_if_ready(selected, targets_2d[selected])
-            step_k = min(self.batch_size, budget - len(selected), int(rem_idx.size))
+            model_wb = self._fit_model_if_ready(train_selected, targets_2d[train_selected])
+            step_k = min(self.batch_size, train_budget - len(train_selected), int(rem_idx.size))
             for _ in range(step_k):
                 if not np.any(remaining):
                     break
-                selected.append(self._pick_next_rls(S, min_dists, remaining, model_wb))
-        return selected[:budget]
+                train_selected.append(self._pick_next_rls(S, min_dists, remaining, model_wb))
+        return (cal_selected + train_selected)[:budget]
 
     def select_next_batch(
         self,

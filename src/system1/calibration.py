@@ -1826,7 +1826,11 @@ class AdaptiveConformalTracker:
 
 
 class OnlineMondrianConformal:
-    """Strictly O(1) per-class quantile tracker in log-nonconformity space u = -log(1 - q) + ACI."""
+    """Strictly O(1) per-class online adaptive quantile tracker in log-nonconformity space.
+
+    Uses ACI-style adaptive tracking toward long-run target coverage under
+    distribution shift rather than a static distribution-free finite-sample guarantee.
+    """
 
     def __init__(
         self,
@@ -1859,11 +1863,11 @@ class OnlineMondrianConformal:
         self.err_ewma = np.full(self.num_classes, a, dtype=np.float64)
         self.alpha_min = max(0.015, 0.35 * a)
         self.alpha_max = min(0.40, 2.5 * a)
-        self.u_max = 5.0
+        self.u_max = 16.0
         self.steps = 0
 
     def thresholds(self) -> np.ndarray:
-        """Return per-class nonconformity score thresholds in [0, 1)."""
+        """Return per-class nonconformity score thresholds in [0, 1]."""
         return self.q_c
 
     def update(
@@ -1888,8 +1892,8 @@ class OnlineMondrianConformal:
             s_val = float(score_y)
             e_flag = (1 if s_val > float(self.q_c[cls_idx]) else 0) if err_y is None else (1 if err_y else 0)
 
-        s_clip = s_val if s_val < 0.9995 else 0.9995
-        u_obs = -math.log(max(1.0 - s_clip, 5e-4))
+        s_clip = s_val if s_val < 1.0 - 1e-7 else (1.0 - 1e-7)
+        u_obs = -math.log(max(1.0 - s_clip, 1e-7))
         if u_obs > self.u_max:
             u_obs = self.u_max
         fe = 1.0 if e_flag else 0.0
@@ -1904,7 +1908,8 @@ class OnlineMondrianConformal:
         self.alpha_c[cls_idx] = a_next
         u_next = self.u_c[cls_idx] + self.eta_u * boost * (fe - a_next)
         if e_flag and shift:
-            u_jump = (1.0 - self.jump_w) * self.u_c[cls_idx] + self.jump_w * min(u_obs, 4.2)
+            jump_cap = max(0.01, self.u_max - 0.5)
+            u_jump = (1.0 - self.jump_w) * self.u_c[cls_idx] + self.jump_w * min(u_obs, jump_cap)
             if u_jump > u_next:
                 u_next = u_jump
         if u_next < 0.01:
@@ -1912,7 +1917,7 @@ class OnlineMondrianConformal:
         elif u_next > self.u_max:
             u_next = self.u_max
         self.u_c[cls_idx] = u_next
-        self.q_c[cls_idx] = 1.0 - math.exp(-u_next)
+        self.q_c[cls_idx] = 1.0 if u_next >= self.u_max - 1e-6 else (1.0 - math.exp(-u_next))
         self.steps += 1
 
     def predict_set(self, probs: Sequence[float]) -> List[int]:
@@ -2775,6 +2780,8 @@ class UtilityCalibrator:
             return -1.0
 
         lam_best = -1.0
+        # Pointwise non-decreasing upper envelope preserves finite-sample CRC validity across ladder switches.
+        env_losses = np.zeros(n, dtype=np.float64)
         for lam in np.linspace(0.0, 1.0, 501):
             lam_f = float(lam)
             acts = self._apply_policy(p_cal, lam_f)
@@ -2782,7 +2789,8 @@ class UtilityCalibrator:
                 losses = (self.cost_matrix[acts, y_arr] > self.c_esc + 1e-12).astype(np.float64)
             else:
                 losses = self.L[acts, y_arr]
-            crc_ub = (float(np.sum(losses)) + 1.0) / float(n + 1)
+            env_losses = np.maximum(env_losses, losses)
+            crc_ub = (float(np.sum(env_losses)) + 1.0) / float(n + 1)
             if crc_ub <= eff_alpha + 1e-12:
                 lam_best = lam_f
 
@@ -2806,11 +2814,21 @@ class UtilityCalibrator:
         if p_train.shape[0] != y_train.shape[0] or y_train.size == 0:
             raise ValueError("probs and y_true must be non-empty and match in length")
 
-        if self.fit_temperature and y_train.size >= 8:
-            self.temperature = self._fit_temperature(p_train, y_train)
+        if cal_probs is not None and cal_y is not None:
+            if self.fit_temperature and y_train.size >= 8:
+                self.temperature = self._fit_temperature(p_train, y_train)
+            p_crc = np.asarray(cal_probs, dtype=np.float64)
+            y_crc = np.asarray(cal_y, dtype=np.int64).ravel()
+        elif self.fit_temperature and y_train.size >= 24:
+            # Keep temperature scaling and CRC holdout samples strictly disjoint.
+            n_temp = max(8, min(y_train.size // 3, 128))
+            self.temperature = self._fit_temperature(p_train[:n_temp], y_train[:n_temp])
+            p_crc = p_train[n_temp:]
+            y_crc = y_train[n_temp:]
+        else:
+            p_crc = p_train
+            y_crc = y_train
 
-        p_crc = p_train if cal_probs is None else np.asarray(cal_probs, dtype=np.float64)
-        y_crc = y_train if cal_y is None else np.asarray(cal_y, dtype=np.int64).ravel()
         if p_crc.shape[0] != y_crc.shape[0] or y_crc.size == 0:
             self.lam_crc = -1.0
             self._is_fitted = True
@@ -3112,18 +3130,20 @@ def cqr_ordinal_intervals(
 class BinaryPlattBetaCalibrator:
     """Adaptive Platt / Beta binary probability calibrator in pure NumPy.
 
-    Selects 2-parameter Platt scaling when ``n_cal < min_beta_samples`` (default 74)
-    to avoid small-sample overfitting, and 3-parameter Beta calibration when
-    ``n_cal >= min_beta_samples``.
+    Returns identity calibration when ``n_cal < min_platt_samples`` (default 74),
+    fits 2-parameter Platt scaling for ``min_platt_samples <= n_cal < min_beta_samples``,
+    and fits 3-parameter Beta calibration when ``n_cal >= min_beta_samples``.
     """
 
     def __init__(
         self,
         *,
-        min_beta_samples: int = 74,
+        min_platt_samples: int = 74,
+        min_beta_samples: int = 150,
         reg: float = 1e-3,
         max_iter: int = 200,
     ) -> None:
+        self.min_platt_samples = max(1, int(min_platt_samples))
         self.min_beta_samples = max(1, int(min_beta_samples))
         self.reg = max(0.0, float(reg))
         self.max_iter = max(10, int(max_iter))
@@ -3154,6 +3174,10 @@ class BinaryPlattBetaCalibrator:
 
         n = y.shape[0]
         self.n_cal = int(n)
+        if n < self.min_platt_samples:
+            self.mode = "identity"
+            self.params_ = np.array([1.0, 0.0], dtype=np.float64)
+            return self
         if n < self.min_beta_samples:
             self.mode = "platt"
             z = np.log(p1 / (1.0 - p1))
@@ -3207,6 +3231,8 @@ class BinaryPlattBetaCalibrator:
         if self.params_ is None or self.mode == "unfitted":
             raise RuntimeError("BinaryPlattBetaCalibrator must be fit before transforming")
         p1 = self._extract_positive_probs(probs)
+        if self.mode == "identity":
+            return p1
         if self.mode == "platt":
             w, c = float(self.params_[0]), float(self.params_[1])
             z = np.log(p1 / (1.0 - p1))

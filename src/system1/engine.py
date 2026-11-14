@@ -3428,6 +3428,11 @@ class SystemOneEngine:
             )
             for name, rcp in sorted(getattr(self, "regression_conformal_predictors", {}).items())
         )
+        thresh_sig = tuple(
+            (name, float(getattr(fd, "threshold", 0.5)))
+            for name, fd in sorted(self.schema.fields.items())
+            if hasattr(fd, "threshold")
+        )
         return (
             str(storage_mode),
             int(getattr(self, "model_version", 1)),
@@ -3439,6 +3444,14 @@ class SystemOneEngine:
             getattr(self, "relative_odds_ratio", None),
             getattr(self, "confidence_floor_tau0", None),
             bool(getattr(self, "recency_weighted", False)),
+            bool(getattr(self, "selective_calibrators", None)),
+            getattr(self, "joint_calibrator", None) is not None,
+            getattr(getattr(self, "aci_tracker", None), "margin_floor", None),
+            (
+                len(getattr(self, "_learned_prompt_overrides", {}) or {}),
+                len(getattr(getattr(self, "model", None), "_learned_prompt_overrides", {}) or {}),
+            ),
+            thresh_sig,
             cal_sig,
             cp_sig,
             rcp_sig,

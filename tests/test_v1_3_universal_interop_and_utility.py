@@ -317,18 +317,32 @@ def test_universal_gateway_strict_json_and_security_headers() -> None:
         )
     assert exc_orig.value.status_code == 403
 
-    # x-goog-api-key + trusted Origin succeeds
-    status, body = svc.handle_request(
-        path="/v1beta/decisions",
-        headers={
-            "x-goog-api-key": "tok-xyz",
-            "Origin": "https://trusted.local:8443",
-            "Content-Type": "application/json",
-        },
-        raw_body=json.dumps({"input": "invoice refund please", "questions": _SUPPORT_QUESTIONS}).encode(),
-    )
-    assert status == 200
-    assert body["answers"]["intent"]["choice"] == "billing"
+    # Non-allowlisted port on trusted host -> 403
+    with pytest.raises(ForbiddenOriginError) as exc_port:
+        svc.handle_request(
+            path="/v1beta/decisions",
+            headers={
+                "x-goog-api-key": "tok-xyz",
+                "Origin": "https://trusted.local:8443",
+                "Content-Type": "application/json",
+            },
+            raw_body=json.dumps({"input": "hello", "questions": _SUPPORT_QUESTIONS}).encode(),
+        )
+    assert exc_port.value.status_code == 403
+
+    # x-goog-api-key + trusted Origin (bare default port or explicit :443) succeeds
+    for trusted_origin in ("https://trusted.local", "https://trusted.local:443"):
+        status, body = svc.handle_request(
+            path="/v1beta/decisions",
+            headers={
+                "x-goog-api-key": "tok-xyz",
+                "Origin": trusted_origin,
+                "Content-Type": "application/json",
+            },
+            raw_body=json.dumps({"input": "invoice refund please", "questions": _SUPPORT_QUESTIONS}).encode(),
+        )
+        assert status == 200
+        assert body["answers"]["intent"]["choice"] == "billing"
 
 
 def test_universal_gateway_soft_distill_cutover_drift_and_freeze() -> None:
@@ -538,7 +552,16 @@ def test_universal_gateway_loopback_http_zero_egress_and_asgi() -> None:
             if msg["type"] == "http.response.start":
                 status_out = int(msg["status"])
 
-        await asgi_small({"type": "http", "method": "POST", "path": "/v1beta/decisions", "headers": []}, _recv, _snd)
+        await asgi_small(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1beta/decisions",
+                "headers": [(b"authorization", b"Bearer loopback-secret")],
+            },
+            _recv,
+            _snd,
+        )
         return status_out
 
     assert asyncio.run(_run_chunked_413()) == 413
@@ -711,17 +734,24 @@ def test_ordinal_heads_cqr_and_binary_platt_beta_calibrator() -> None:
     cov = float(np.mean((lo <= test_y) & (test_y <= hi)))
     assert cov >= 0.80
 
-    # BinaryPlattBetaCalibrator switches at n_cal >= 74
+    # BinaryPlattBetaCalibrator uses identity below 74, Platt at 74..149, Beta at >= 150
     p_raw = 1.0 / (1.0 + np.exp(-np.clip(latent, -10.0, 10.0)))
     y_bin = (y >= 2).astype(np.int64)
-    cal_small = BinaryPlattBetaCalibrator(min_beta_samples=74).fit(p_raw[:73], y_bin[:73])
-    assert cal_small.mode == "platt"
+    cal_small = BinaryPlattBetaCalibrator().fit(p_raw[:73], y_bin[:73])
+    assert cal_small.mode == "identity"
     p_s = cal_small.transform(p_raw[73:90])
     p_s2 = cal_small.predict_proba(p_raw[73:90])
     assert p_s.shape == (17,) and p_s2.shape == (17, 2)
+    assert np.allclose(p_s, np.clip(p_raw[73:90], 1e-6, 1.0 - 1e-6))
     assert np.allclose(p_s2[:, 0] + p_s2[:, 1], 1.0)
 
-    cal_large = BinaryPlattBetaCalibrator(min_beta_samples=74).fit(p_raw[:74], y_bin[:74])
+    cal_mid = BinaryPlattBetaCalibrator().fit(p_raw[:100], y_bin[:100])
+    assert cal_mid.mode == "platt"
+    p_m2 = cal_mid.predict_proba(p_raw[100:120])
+    assert p_m2.shape == (20, 2)
+    assert np.all((p_m2 > 0.0) & (p_m2 < 1.0))
+
+    cal_large = BinaryPlattBetaCalibrator().fit(p_raw, y_bin)
     assert cal_large.mode == "beta"
     p_l2 = cal_large.predict_proba(np.column_stack([1.0 - p_raw[74:], p_raw[74:]]))
     assert p_l2.shape == (n - 74, 2)
@@ -746,7 +776,7 @@ def test_utility_cascade_router_end_to_end() -> None:
 
     router.fit(prompts, tiers, cal_fraction=0.45)
     assert router.ordinal_head is not None
-    assert router.binary_calibrator.mode == "platt"
+    assert router.binary_calibrator.mode == "identity"
 
     d_easy = router.route("simple status check account balance password FAQ 99")
     d_hard = router.route("formal proof distributed consensus deadlock root cause audit 99")

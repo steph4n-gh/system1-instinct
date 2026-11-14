@@ -154,6 +154,7 @@ class AutoCutoverLifecycle:
         teacher: Optional[Callable[[str], Any]] = None,
         *,
         config: Optional[CutoverConfig] = None,
+        post_compile_hook: Optional[Callable[[Any, Sequence[Tuple[str, Dict[str, Any]]]], bool]] = None,
         **overrides: Any,
     ) -> None:
         if isinstance(schema, type) and issubclass(schema, DecisionSchema):
@@ -171,6 +172,7 @@ class AutoCutoverLifecycle:
             self.config = config
 
         self.teacher = teacher
+        self.post_compile_hook = post_compile_hook
         self._lock = threading.RLock()
 
         primary_name = ""
@@ -698,6 +700,27 @@ class AutoCutoverLifecycle:
             aci_tracker=self.aci,
         )
         sub_eng.default_alpha = self.config.alpha_target
+        if self.post_compile_hook is not None and self.post_compile_hook(sub_eng, tr_pairs):
+            seen_cal: Set[str] = set()
+            dedup_cal: List[Tuple[str, Dict[str, Any]]] = []
+            for p_c, vals_c in cal_pairs:
+                if p_c not in seen_cal:
+                    seen_cal.add(p_c)
+                    dedup_cal.append((p_c, dict(vals_c)))
+            if dedup_cal:
+                for cal_obj in sub_eng.calibrators.values():
+                    if getattr(cal_obj, "logit_adjustments", None) is not None:
+                        cal_obj.logit_adjustments = None
+                sub_eng.calibrate(
+                    dedup_cal,
+                    familiarity_alpha=self.config.familiarity_alpha,
+                    prototype_alpha=self.config.prototype_alpha,
+                )
+            if hasattr(sub_eng, "_packed_kernel_cache"):
+                sub_eng._packed_kernel_cache = None
+            exp_cache = getattr(sub_eng, "_explainer_cache", None)
+            if exp_cache is not None:
+                exp_cache.clear()
 
         cal_prompts = [p for p, _ in cal_pairs]
         cal_decs = sub_eng.decide_batch(

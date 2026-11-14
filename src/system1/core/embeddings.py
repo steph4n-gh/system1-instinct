@@ -2932,6 +2932,7 @@ class SmartsCrossZeroFewRouter:
         self._calibrated = False
         self._conformal_q = 1.0
         self._cal_alpha = 0.10
+        self._cal_scores: Optional[np.ndarray] = None
 
     def _normalize_label_str(self, label: Any) -> str:
         if self.is_boolean and isinstance(label, bool):
@@ -3152,6 +3153,7 @@ class SmartsCrossZeroFewRouter:
 
         self._few_examples = list(pairs)
         self._calibrated = False
+        self._cal_scores = None
         if not pairs:
             self.fewshot_active = False
             self.few_proj = None
@@ -3248,6 +3250,7 @@ class SmartsCrossZeroFewRouter:
             self._calibrated = False
             self._conformal_q = 1.0
             self._cal_alpha = float(alpha)
+            self._cal_scores = None
             return self._conformal_q
         scores = np.empty(n, dtype=np.float64)
         for i, (prompt, raw_lbl) in enumerate(zip(prompts, labels)):
@@ -3258,6 +3261,7 @@ class SmartsCrossZeroFewRouter:
         rank = int(math.ceil((n + 1) * (1.0 - float(alpha))))
         self._conformal_q = 1.0 if rank > n else float(sorted_scores[max(0, rank - 1)])
         self._cal_alpha = float(alpha)
+        self._cal_scores = sorted_scores
         self._calibrated = True
         return self._conformal_q
 
@@ -3377,14 +3381,22 @@ class SmartsCrossZeroFewRouter:
 
     def decide(self, prompt: str, alpha: Optional[float] = None) -> RouterDecisionResult:
         eff_alpha = self._cal_alpha if alpha is None else float(alpha)
+        if not (0.0 < eff_alpha < 1.0):
+            raise ValueError(f"alpha must be in (0, 1), got {eff_alpha}")
         t0 = time.perf_counter()
         pred, probs = self.score_and_predict(prompt)
         bi = self.opt_to_idx[self._normalize_label_str(pred)]
         if self._calibrated:
+            if self._cal_scores is not None and len(self._cal_scores) > 0:
+                n_cal = len(self._cal_scores)
+                rank = int(math.ceil((n_cal + 1) * (1.0 - eff_alpha)))
+                q_eff = 1.0 if rank > n_cal else float(self._cal_scores[max(0, rank - 1)])
+            else:
+                q_eff = self._conformal_q
             cset = tuple(
                 self._public_value(self.options[j])
                 for j in range(self.K)
-                if (1.0 - float(probs[j])) <= self._conformal_q + 1e-12
+                if (1.0 - float(probs[j])) <= q_eff + 1e-12
             )
             is_ambig = len(cset) != 1
         else:

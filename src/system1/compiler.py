@@ -293,6 +293,177 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
     _, disk, directory_disk, disk_count, count, directory_size, directory_offset, comment_size = struct.unpack(
         "<4s4H2LH", data[end:end + 22]
     )
+def _validate_skill_shapes_and_runtime_delta(
+    schema: DecisionSchema,
+    dimension: int,
+    shapes: Mapping[str, Tuple[int, ...]],
+    *,
+    heads_meta: Optional[Mapping[str, Any]] = None,
+) -> int:
+    """Validate saved projector and head array shapes and return extra Python/covariance runtime bytes."""
+    runtime_delta = 0
+
+    tfidf_idf_shape = shapes.get("_projector_tfidf_idf")
+    if tfidf_idf_shape is not None and tfidf_idf_shape != (dimension,):
+        raise ValueError("Saved TF-IDF idf array has invalid shape")
+    hyb_idf_shape = shapes.get("_projector_hybrid_tfidf_idf")
+    if hyb_idf_shape is not None and (
+        len(hyb_idf_shape) != 1 or not (1 <= hyb_idf_shape[0] <= dimension)
+    ):
+        raise ValueError("Saved hybrid TF-IDF idf array has invalid shape")
+    prag_base_idf_shape = shapes.get("_projector_prag_base_idf")
+    if prag_base_idf_shape is not None and (
+        len(prag_base_idf_shape) != 1 or not (1 <= prag_base_idf_shape[0] <= dimension)
+    ):
+        raise ValueError("Saved pragmatic base TF-IDF idf array has invalid shape")
+    prag_idf_shape = shapes.get("_projector_prag_idf")
+    if prag_idf_shape is not None and (
+        len(prag_idf_shape) != 1 or not (0 <= prag_idf_shape[0] <= min(dimension, MAX_PRAG_FEATURES))
+    ):
+        raise ValueError("Saved pragmatic TF-IDF idf array has invalid shape")
+    spec_vec_shape = shapes.get("_projector_spectral_vectors")
+    if spec_vec_shape is not None and (
+        len(spec_vec_shape) != 2
+        or not (1 <= spec_vec_shape[0] <= 2048)
+        or not (1 <= spec_vec_shape[1] <= dimension)
+    ):
+        raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
+    spec_basis_shape = shapes.get("_projector_spectral_basis")
+    if spec_basis_shape is not None and (
+        len(spec_basis_shape) != 2
+        or not (1 <= spec_basis_shape[0] <= dimension)
+        or not (1 <= spec_basis_shape[1] <= dimension)
+    ):
+        raise ValueError("Saved hybrid projector spectral_basis has invalid shape")
+    sub_comp_shape = shapes.get("_projector_subspace_components")
+    if sub_comp_shape is not None and (
+        len(sub_comp_shape) != 2
+        or not (1 <= sub_comp_shape[0] <= dimension)
+        or not (1 <= sub_comp_shape[1] <= dimension)
+    ):
+        raise ValueError("Saved hybrid projector subspace_components have invalid shape")
+    rbf_shape = shapes.get("_projector_rbf_landmarks")
+    if rbf_shape is not None and (
+        len(rbf_shape) != 2
+        or not (1 <= rbf_shape[0] <= MAX_SKILL_OPTIONS)
+        or not (1 <= rbf_shape[1] <= dimension)
+        or rbf_shape[0] + rbf_shape[1] != dimension
+    ):
+        raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
+    dense_tbl_shape = shapes.get("_projector_dense_table")
+    if dense_tbl_shape is not None and (
+        len(dense_tbl_shape) != 2
+        or not (1 <= dense_tbl_shape[0] <= 250_000)
+        or not (1 <= dense_tbl_shape[1] <= dimension)
+    ):
+        raise ValueError("Saved hybrid projector dense_table has invalid shape")
+
+    for name, definition in schema.fields.items():
+        widths = (
+            (1, 2)
+            if isinstance(definition, BooleanField)
+            else (len(definition.options),)
+            if hasattr(definition, "options")
+            else (1,)
+        )
+        weight_shape = shapes.get(f"{name}_w", ())
+        if weight_shape not in tuple((width, dimension) for width in widths):
+            raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
+        width = weight_shape[0]
+        required_shapes = {
+            "b": (width,),
+            "P": (dimension + 1, dimension + 1),
+            "B": (dimension + 1, width),
+        }
+        for suffix, shape in required_shapes.items():
+            actual = shapes.get(f"{name}_{suffix}")
+            if (suffix == "b" or actual is not None) and actual != shape:
+                raise ValueError(f"Saved head {name!r} has incompatible {suffix} dimensions")
+        calibration = shapes.get(f"{name}_calib_scores")
+        if calibration is not None and (len(calibration) != 1 or calibration[0] > MAX_SKILL_CALIBRATION_SCORES):
+            raise ValueError("Saved skill calibration exceeds limits")
+        proto_shape = shapes.get(f"{name}_prototypes")
+        if proto_shape is not None:
+            valid_proto_rows = (1, 2) if isinstance(definition, BooleanField) else (width,)
+            if len(proto_shape) != 2 or proto_shape[0] not in valid_proto_rows or proto_shape[1] != dimension:
+                raise ValueError(f"Saved head {name!r} has incompatible prototypes dimensions")
+        proto_scores_shape = shapes.get(f"{name}_proto_scores")
+        if proto_scores_shape is not None and (
+            len(proto_scores_shape) != 1 or proto_scores_shape[0] > MAX_SKILL_CALIBRATION_SCORES
+        ):
+            raise ValueError("Saved skill prototype calibration exceeds limits")
+        coarse_w_shape = shapes.get(f"{name}_coarse_w")
+        coarse_b_shape = shapes.get(f"{name}_coarse_b")
+        if (coarse_w_shape is None) != (coarse_b_shape is None):
+            raise ValueError(f"Saved head {name!r} has incomplete coarse hierarchical arrays")
+        if coarse_w_shape is not None:
+            if (
+                len(coarse_w_shape) != 2
+                or not (1 <= coarse_w_shape[0] <= width)
+                or coarse_w_shape[1] != dimension
+                or coarse_b_shape != (coarse_w_shape[0],)
+            ):
+                raise ValueError(f"Saved head {name!r} has incompatible coarse hierarchical dimensions")
+        fine_w_shape = shapes.get(f"{name}_fine_w")
+        fine_b_shape = shapes.get(f"{name}_fine_b")
+        if (fine_w_shape is None) != (fine_b_shape is None):
+            raise ValueError(f"Saved head {name!r} has incomplete fine hierarchical arrays")
+        if fine_w_shape is not None:
+            if fine_w_shape != (width, dimension) or fine_b_shape != (width,):
+                raise ValueError(f"Saved head {name!r} has incompatible fine hierarchical dimensions")
+        if f"{name}_B" in shapes and f"{name}_P" not in shapes:
+            runtime_delta += 8 * (dimension + 1) ** 2
+        for suffix in ("calib_scores", "proto_scores"):
+            runtime_delta += 32 * shapes.get(f"{name}_{suffix}", (0,))[0]
+        if isinstance(heads_meta, Mapping):
+            h_info = heads_meta.get(name)
+            if isinstance(h_info, Mapping):
+                raw_cls_scores = h_info.get("class_calibration_scores")
+                if raw_cls_scores is not None:
+                    if not isinstance(raw_cls_scores, Mapping):
+                        raise ValueError(f"Saved head {name!r} class_calibration_scores must be a mapping")
+                    total_cls_scores = 0
+                    for c_vals in raw_cls_scores.values():
+                        if not isinstance(c_vals, (list, tuple)):
+                            raise ValueError(f"Saved head {name!r} class_calibration_scores entry must be a list")
+                        total_cls_scores += len(c_vals)
+                        if total_cls_scores > MAX_SKILL_CALIBRATION_SCORES:
+                            raise ValueError(f"Saved head {name!r} class_calibration_scores exceeds limit")
+                    runtime_delta += 32 * total_cls_scores
+        for suffix in EXEMPLAR_ARRAYS:
+            shape = shapes.get(f"{name}_{suffix}")
+            if shape is None:
+                continue
+            valid = (shape == (dimension,)) if suffix == "exemplar_mean" else (
+                len(shape) == 2 and shape[1] == dimension
+                and (suffix not in ("exemplar_centroids", "initial_w") or shape[0] == width)
+            )
+            if not isinstance(definition, ChoiceField) or not valid:
+                raise ValueError(f"Saved head {name!r} has incompatible exemplar dimensions")
+            if suffix in ("shots_p", "shots_c"):
+                runtime_delta += 160 * shape[0]
+    return runtime_delta
+
+
+def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runtime_bytes: int) -> Dict[str, np.ndarray]:
+    """Validate and deserialize `.s1m` v1/v2 NPZ arrays within strict bounds."""
+    if not data.startswith(b"PK\x03\x04"):
+        raise ValueError("Saved skill does not contain a valid NPZ array archive")
+    eocd = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
+    if eocd < 0 or eocd + 22 > len(data):
+        raise ValueError("Saved skill NPZ archive is missing or malformed")
+    disk, directory_disk, entries, disk_count, directory_size, directory_offset, comment_size = struct.unpack_from(
+        "<HHHHIIH", data, eocd + 4
+    )
+    end, count = directory_offset + directory_size, entries
+    if (
+        directory_offset > eocd
+        or entries != disk_count
+        or directory_size == 0
+        or end != eocd
+        or data[directory_offset : directory_offset + 4] != b"PK\x01\x02"
+    ):
+        raise ValueError("Saved skill NPZ directory is malformed")
     if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS)) + 7
             or directory_size > MAX_SKILL_HEADER_BYTES or directory_offset + directory_size != end
             or end + 22 + comment_size != len(data)):
@@ -353,105 +524,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
                 shapes[info.filename[:-4]] = shape
         if effective_array_bytes > MAX_SKILL_ARRAY_BYTES:
             raise ValueError("Saved skill arrays exceed upcast array budget")
-        tfidf_idf_shape = shapes.get("_projector_tfidf_idf")
-        if tfidf_idf_shape is not None and tfidf_idf_shape != (dimension,):
-            raise ValueError("Saved TF-IDF idf array has invalid shape")
-        hyb_idf_shape = shapes.get("_projector_hybrid_tfidf_idf")
-        if hyb_idf_shape is not None and (
-            len(hyb_idf_shape) != 1 or not (1 <= hyb_idf_shape[0] <= dimension)
-        ):
-            raise ValueError("Saved hybrid TF-IDF idf array has invalid shape")
-        prag_base_idf_shape = shapes.get("_projector_prag_base_idf")
-        if prag_base_idf_shape is not None and (
-            len(prag_base_idf_shape) != 1 or not (1 <= prag_base_idf_shape[0] <= dimension)
-        ):
-            raise ValueError("Saved pragmatic base TF-IDF idf array has invalid shape")
-        prag_idf_shape = shapes.get("_projector_prag_idf")
-        if prag_idf_shape is not None and (
-            len(prag_idf_shape) != 1 or not (0 <= prag_idf_shape[0] <= min(dimension, MAX_PRAG_FEATURES))
-        ):
-            raise ValueError("Saved pragmatic TF-IDF idf array has invalid shape")
-        spec_vec_shape = shapes.get("_projector_spectral_vectors")
-        if spec_vec_shape is not None and (
-            len(spec_vec_shape) != 2
-            or not (1 <= spec_vec_shape[0] <= 2048)
-            or not (1 <= spec_vec_shape[1] <= dimension)
-        ):
-            raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
-        sub_comp_shape = shapes.get("_projector_subspace_components")
-        if sub_comp_shape is not None and (
-            len(sub_comp_shape) != 2
-            or not (1 <= sub_comp_shape[0] <= dimension)
-            or not (1 <= sub_comp_shape[1] <= dimension)
-        ):
-            raise ValueError("Saved hybrid projector subspace_components have invalid shape")
-        rbf_shape = shapes.get("_projector_rbf_landmarks")
-        if rbf_shape is not None and (
-            len(rbf_shape) != 2
-            or not (1 <= rbf_shape[0] <= MAX_SKILL_OPTIONS)
-            or not (1 <= rbf_shape[1] <= dimension)
-            or rbf_shape[0] + rbf_shape[1] != dimension
-        ):
-            raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
-        for name, definition in schema.fields.items():
-            widths = (1, 2) if isinstance(definition, BooleanField) else (len(definition.options),) if hasattr(definition, "options") else (1,)
-            weight_shape = shapes.get(f"{name}_w", ())
-            if weight_shape not in tuple((width, dimension) for width in widths):
-                raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
-            width = weight_shape[0]
-            required_shapes = {"b": (width,), "P": (dimension + 1, dimension + 1), "B": (dimension + 1, width)}
-            for suffix, shape in required_shapes.items():
-                actual = shapes.get(f"{name}_{suffix}")
-                if (suffix == "b" or actual is not None) and actual != shape:
-                    raise ValueError(f"Saved head {name!r} has incompatible {suffix} dimensions")
-            calibration = shapes.get(f"{name}_calib_scores")
-            if calibration is not None and (len(calibration) != 1 or calibration[0] > MAX_SKILL_CALIBRATION_SCORES):
-                raise ValueError("Saved skill calibration exceeds limits")
-            proto_shape = shapes.get(f"{name}_prototypes")
-            if proto_shape is not None:
-                valid_proto_rows = (1, 2) if isinstance(definition, BooleanField) else (width,)
-                if len(proto_shape) != 2 or proto_shape[0] not in valid_proto_rows or proto_shape[1] != dimension:
-                    raise ValueError(f"Saved head {name!r} has incompatible prototypes dimensions")
-            proto_scores_shape = shapes.get(f"{name}_proto_scores")
-            if proto_scores_shape is not None and (
-                len(proto_scores_shape) != 1 or proto_scores_shape[0] > MAX_SKILL_CALIBRATION_SCORES
-            ):
-                raise ValueError("Saved skill prototype calibration exceeds limits")
-            coarse_w_shape = shapes.get(f"{name}_coarse_w")
-            coarse_b_shape = shapes.get(f"{name}_coarse_b")
-            if (coarse_w_shape is None) != (coarse_b_shape is None):
-                raise ValueError(f"Saved head {name!r} has incomplete coarse hierarchical arrays")
-            if coarse_w_shape is not None:
-                if (
-                    len(coarse_w_shape) != 2
-                    or not (1 <= coarse_w_shape[0] <= width)
-                    or coarse_w_shape[1] != dimension
-                    or coarse_b_shape != (coarse_w_shape[0],)
-                ):
-                    raise ValueError(f"Saved head {name!r} has incompatible coarse hierarchical dimensions")
-            fine_w_shape = shapes.get(f"{name}_fine_w")
-            fine_b_shape = shapes.get(f"{name}_fine_b")
-            if (fine_w_shape is None) != (fine_b_shape is None):
-                raise ValueError(f"Saved head {name!r} has incomplete fine hierarchical arrays")
-            if fine_w_shape is not None:
-                if fine_w_shape != (width, dimension) or fine_b_shape != (width,):
-                    raise ValueError(f"Saved head {name!r} has incompatible fine hierarchical dimensions")
-            if f"{name}_B" in shapes and f"{name}_P" not in shapes:
-                runtime_bytes += 8 * (dimension + 1) ** 2
-            for suffix in ("calib_scores", "proto_scores"):
-                runtime_bytes += 32 * shapes.get(f"{name}_{suffix}", (0,))[0]
-            for suffix in EXEMPLAR_ARRAYS:
-                shape = shapes.get(f"{name}_{suffix}")
-                if shape is None:
-                    continue
-                valid = (shape == (dimension,)) if suffix == "exemplar_mean" else (
-                    len(shape) == 2 and shape[1] == dimension
-                    and (suffix not in ("exemplar_centroids", "initial_w") or shape[0] == width)
-                )
-                if not isinstance(definition, ChoiceField) or not valid:
-                    raise ValueError(f"Saved head {name!r} has incompatible exemplar dimensions")
-                if suffix in ("shots_p", "shots_c"):
-                    runtime_bytes += 160 * shape[0]  # Retained per-row ndarray views and list slots.
+        runtime_bytes += _validate_skill_shapes_and_runtime_delta(schema, dimension, shapes)
         runtime_bytes += 2 * effective_array_bytes
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
@@ -2384,10 +2457,15 @@ class CompiledSystemOneModel:
         *,
         cov_fields: int,
         max_runtime_bytes: int,
+        extra_runtime_bytes: int = 0,
     ) -> Tuple[Optional[Any], Optional[Any], int]:
         """Validates projector configuration and estimates bounded runtime memory allocation."""
         widths = sum(max(2, len(getattr(f, "options", ()))) for f in schema.fields.values())
-        runtime_bytes = 16 * cov_fields * (dimension + 1) ** 2 + 16 * widths * (dimension + 1)
+        runtime_bytes = (
+            16 * cov_fields * (dimension + 1) ** 2
+            + 16 * widths * (dimension + 1)
+            + int(extra_runtime_bytes)
+        )
         saved_tfidf = None
         saved_prag = None
         if projector_config is not None:
@@ -2582,6 +2660,23 @@ class CompiledSystemOneModel:
                 raise ValueError(f"Saved v3 skill tensor {tname!r} overlaps another tensor region")
             prev_end = end
 
+        shapes_v3: Dict[str, Tuple[int, ...]] = {
+            tname: tuple(spec["shape"]) for tname, spec in raw_tensors.items()
+        }
+        upcast_bytes_v3 = sum(
+            4 * int(math.prod(shapes_v3[tname]))
+            for tname, spec in raw_tensors.items()
+            if np.dtype(spec["dtype"]).itemsize == 2
+            and not tname.endswith(("_calib_scores", "_proto_scores"))
+        )
+        extra_runtime_bytes = _validate_skill_shapes_and_runtime_delta(
+            schema,
+            dimension,
+            shapes_v3,
+            heads_meta=meta.get("heads"),
+        )
+        extra_runtime_bytes += upcast_bytes_v3
+
         cov_fields = sum(
             1
             for fname in schema.fields
@@ -2594,6 +2689,7 @@ class CompiledSystemOneModel:
             projector_config,
             cov_fields=cov_fields,
             max_runtime_bytes=MAX_SKILL_RUNTIME_BYTES_V3,
+            extra_runtime_bytes=extra_runtime_bytes,
         )
 
         views: Dict[str, np.ndarray] = {}

@@ -107,6 +107,80 @@ def _canonical_explain_field(schema: Any, field_name: Optional[str]) -> str:
     return field_name
 
 
+def _extract_calibrated_head_params(
+    model: Any,
+    fname: str,
+    *,
+    calibrator: Any = None,
+    temperature_scale: float = 4.0,
+) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...], float, float]:
+    """Extract calibrated effective weights, biases, scale, and threshold matching engine decide()."""
+    f_def = model.schema.fields[fname]
+    field_heads = getattr(model, "_field_heads", None)
+    compiled_heads = getattr(model, "heads", None)
+    field_head = field_heads.get(fname) if isinstance(field_heads, Mapping) else None
+    compiled_head = compiled_heads.get(fname) if isinstance(compiled_heads, Mapping) else None
+    head = field_head if field_head is not None else compiled_head
+    if head is None:
+        raise KeyError(f"Unknown field head {fname!r} on model")
+
+    for candidate_head in (field_head, compiled_head):
+        if candidate_head is None:
+            continue
+        if (
+            bool(getattr(candidate_head, "hierarchical", False))
+            or getattr(candidate_head, "coarse_weights", None) is not None
+        ):
+            raise ValueError(
+                f"FastExplainer cannot faithfully represent hierarchical head for field {fname!r}"
+            )
+        if getattr(candidate_head, "_exemplar_bank", None) is not None:
+            raise ValueError(
+                f"FastExplainer cannot faithfully represent nonlinear exemplar-bank head for field {fname!r}"
+            )
+
+    base_scale = float(temperature_scale)
+    if base_scale <= 0.0:
+        raise ValueError(f"temperature_scale must be positive, got {temperature_scale}")
+
+    if calibrator is not None:
+        raw_temp = float(getattr(calibrator, "temperature", 1.0))
+        adj_raw = getattr(calibrator, "logit_adjustments", None)
+    else:
+        src_head = compiled_head if compiled_head is not None else head
+        raw_temp = float(getattr(src_head, "temperature", 1.0))
+        adj_raw = getattr(src_head, "logit_adjustments", None)
+
+    temp = max(1e-4, raw_temp)
+    eff_scale = base_scale / temp
+
+    w = np.asarray(head.weights, dtype=np.float64)
+    b = np.asarray(head.biases, dtype=np.float64).reshape(-1).copy()
+
+    if adj_raw is not None:
+        adj = np.asarray(adj_raw, dtype=np.float64).reshape(-1)
+        if isinstance(f_def, BooleanField) or w.shape[0] == 1:
+            if adj.size == 2:
+                delta_adj = float(adj[1] - adj[0])
+            elif adj.size == 1:
+                delta_adj = float(adj[0])
+            else:
+                raise ValueError(
+                    f"Unsupported logit_adjustments length {adj.size} for BooleanField {fname!r}"
+                )
+            b[0] += delta_adj / base_scale
+        elif adj.size == w.shape[0]:
+            b += adj / base_scale
+        elif adj.size > 0:
+            raise ValueError(
+                f"logit_adjustments length {adj.size} != head outputs {w.shape[0]} for field {fname!r}"
+            )
+
+    opts = ("False", "True") if isinstance(f_def, BooleanField) else tuple(f_def.options)
+    thr = float(getattr(f_def, "threshold", 0.5)) if isinstance(f_def, BooleanField) else 0.5
+    return w, b, opts, thr, eff_scale
+
+
 @dataclass(frozen=True, slots=True)
 class SpanAttribution:
     """Single word/span attribution record."""
@@ -347,21 +421,20 @@ class FastExplainer:
     ) -> FastExplainer:
         """Build a FastExplainer directly from a CompiledSystemOneModel or SystemOneModel."""
         fname = _canonical_explain_field(model.schema, field_name)
-        f_def = model.schema.fields[fname]
-        heads_map = getattr(model, "_field_heads", None)
-        if heads_map is None:
-            heads_map = getattr(model, "heads", {})
-        head = heads_map[fname]
-        opts = ("False", "True") if isinstance(f_def, BooleanField) else tuple(f_def.options)
-        thr = float(getattr(f_def, "threshold", 0.5)) if isinstance(f_def, BooleanField) else 0.5
+        w, b, opts, thr, eff_scale = _extract_calibrated_head_params(
+            model,
+            fname,
+            calibrator=None,
+            temperature_scale=temperature_scale,
+        )
         return cls(
             projector=model.projector,
-            weights=head.weights,
-            biases=head.biases,
+            weights=w,
+            biases=b,
             options=opts,
             train_texts=train_texts,
             train_labels=train_labels,
-            temperature_scale=temperature_scale,
+            temperature_scale=eff_scale,
             threshold=thr,
         )
 
@@ -376,12 +449,24 @@ class FastExplainer:
         temperature_scale: float = 4.0,
     ) -> FastExplainer:
         """Build a FastExplainer bound to a live SystemOneEngine head."""
-        return cls.from_compiled_model(
+        fname = _canonical_explain_field(engine.model.schema, field_name)
+        calibrators = getattr(engine, "calibrators", None)
+        calibrator = calibrators.get(fname) if isinstance(calibrators, Mapping) else None
+        w, b, opts, thr, eff_scale = _extract_calibrated_head_params(
             engine.model,
-            field_name=field_name,
+            fname,
+            calibrator=calibrator,
+            temperature_scale=temperature_scale,
+        )
+        return cls(
+            projector=engine.model.projector,
+            weights=w,
+            biases=b,
+            options=opts,
             train_texts=train_texts,
             train_labels=train_labels,
-            temperature_scale=temperature_scale,
+            temperature_scale=eff_scale,
+            threshold=thr,
         )
 
     def _get_char_arr(
