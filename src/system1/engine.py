@@ -3470,6 +3470,7 @@ class SystemOneEngine:
             bool(getattr(self, "recency_weighted", False)),
             bool(getattr(self, "selective_calibrators", None)),
             getattr(self, "joint_calibrator", None) is not None,
+            "validate_decision" in getattr(self.schema, "__dict__", {}),
             aci_sig,
             (_ov_snapshot(self), _ov_snapshot(getattr(self, "model", None))),
             thresh_sig,

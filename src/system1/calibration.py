@@ -1855,15 +1855,21 @@ class OnlineMondrianConformal:
             q0 = np.asarray(q_init, dtype=np.float64)
             if q0.shape != (self.num_classes,):
                 raise ValueError(f"q_init must have shape ({self.num_classes},), got {q0.shape}")
+            if not bool(np.all(np.isfinite(q0))):
+                raise ValueError("q_init must contain only finite values")
         else:
             q0 = np.full(self.num_classes, 0.5, dtype=np.float64)
-        self.q_c = np.clip(q0.copy(), 1e-4, 0.999)
-        self.u_c = -np.log(np.clip(1.0 - self.q_c, 1e-4, 1.0))
+        self.u_max = 16.0
+        self.q_c = np.clip(q0.copy(), 1e-4, 1.0)
+        self.u_c = np.where(
+            self.q_c >= 1.0 - math.exp(-(self.u_max - 1e-6)),
+            self.u_max,
+            -np.log(np.clip(1.0 - self.q_c, 1e-12, 1.0)),
+        )
         self.alpha_c = np.full(self.num_classes, a, dtype=np.float64)
         self.err_ewma = np.full(self.num_classes, a, dtype=np.float64)
         self.alpha_min = max(0.015, 0.35 * a)
         self.alpha_max = min(0.40, 2.5 * a)
-        self.u_max = 16.0
         self.steps = 0
 
     def thresholds(self) -> np.ndarray:
@@ -1951,18 +1957,50 @@ class OnlineMondrianConformal:
         obj = cls(
             num_classes=int(data["num_classes"]),
             alpha=float(data["alpha_target"]),
-            q_init=data.get("q_c"),
+            q_init=None,
             gamma_aci=data.get("gamma_aci"),
             eta_u=float(data.get("eta_u", 0.30)),
             jump_w=float(data.get("jump_w", 0.12)),
         )
-        if "u_c" in data:
-            obj.u_c = np.asarray(data["u_c"], dtype=np.float64).copy()
-        if "alpha_c" in data:
-            obj.alpha_c = np.asarray(data["alpha_c"], dtype=np.float64).copy()
-        if "err_ewma" in data:
-            obj.err_ewma = np.asarray(data["err_ewma"], dtype=np.float64).copy()
-        obj.steps = int(data.get("steps", 0))
+        expected_shape = (obj.num_classes,)
+        if "q_c" in data and data["q_c"] is not None:
+            q_arr = np.asarray(data["q_c"], dtype=np.float64).copy()
+            if q_arr.shape != expected_shape or not bool(np.all(np.isfinite(q_arr))):
+                raise ValueError(f"q_c must be finite with shape {expected_shape}, got {q_arr.shape}")
+            if float(np.min(q_arr)) < 0.0 or float(np.max(q_arr)) > 1.0:
+                raise ValueError("q_c values must lie in [0.0, 1.0]")
+            obj.q_c = q_arr
+        if "u_c" in data and data["u_c"] is not None:
+            u_arr = np.asarray(data["u_c"], dtype=np.float64).copy()
+            if u_arr.shape != expected_shape or not bool(np.all(np.isfinite(u_arr))):
+                raise ValueError(f"u_c must be finite with shape {expected_shape}, got {u_arr.shape}")
+            if float(np.min(u_arr)) < 0.0 or float(np.max(u_arr)) > obj.u_max:
+                raise ValueError(f"u_c values must lie in [0.0, {obj.u_max}]")
+            obj.u_c = u_arr
+        else:
+            obj.u_c = np.where(
+                obj.q_c >= 1.0 - math.exp(-(obj.u_max - 1e-6)),
+                obj.u_max,
+                -np.log(np.clip(1.0 - obj.q_c, 1e-12, 1.0)),
+            )
+        if "alpha_c" in data and data["alpha_c"] is not None:
+            a_arr = np.asarray(data["alpha_c"], dtype=np.float64).copy()
+            if a_arr.shape != expected_shape or not bool(np.all(np.isfinite(a_arr))):
+                raise ValueError(f"alpha_c must be finite with shape {expected_shape}, got {a_arr.shape}")
+            if float(np.min(a_arr)) <= 0.0 or float(np.max(a_arr)) >= 1.0:
+                raise ValueError("alpha_c values must lie in (0.0, 1.0)")
+            obj.alpha_c = a_arr
+        if "err_ewma" in data and data["err_ewma"] is not None:
+            e_arr = np.asarray(data["err_ewma"], dtype=np.float64).copy()
+            if e_arr.shape != expected_shape or not bool(np.all(np.isfinite(e_arr))):
+                raise ValueError(f"err_ewma must be finite with shape {expected_shape}, got {e_arr.shape}")
+            if float(np.min(e_arr)) < 0.0 or float(np.max(e_arr)) > 1.0:
+                raise ValueError("err_ewma values must lie in [0.0, 1.0]")
+            obj.err_ewma = e_arr
+        steps = int(data.get("steps", 0))
+        if steps < 0:
+            raise ValueError(f"steps must be nonnegative, got {steps}")
+        obj.steps = steps
         return obj
 
 

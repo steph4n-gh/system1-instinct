@@ -8,6 +8,7 @@ import io
 import json
 import struct
 import threading
+import warnings
 import zipfile
 from typing import Any, Callable, Dict, List
 
@@ -45,6 +46,7 @@ from system1.compat.universal import (
     compile_questions_contract,
     diff_schemas,
 )
+from system1.core.embeddings import HybridProjector
 
 
 def _mock_universal_handler(
@@ -240,6 +242,26 @@ def test_astra_02_fleet_delta_preflight_blocks_header_and_metadata_bombs() -> No
     assert big_restored.num_tenants == 500
     assert big_restored.num_classes == 200
     assert big_restored.r_sub == 208
+
+    # Overflow into float16 arena (`dW_scale`) or extreme float32 (`W_base`) must fail closed with ValueError.
+    with zipfile.ZipFile(io.BytesIO(snap), "r") as zf:
+        dW_scale_orig = np.load(io.BytesIO(zf.read("dW_scale.npy")), allow_pickle=False)
+        W_base_orig = np.load(io.BytesIO(zf.read("W_base.npy")), allow_pickle=False)
+    bad_dW_scale = np.full(dW_scale_orig.shape, 1e10, dtype=np.float32)
+    bad_W_base = np.full(W_base_orig.shape, 1e20, dtype=np.float32)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        with pytest.raises(ValueError, match="non-finite"):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(
+                _rewrite_zip_members(snap, {"dW_scale.npy": _npy_bytes(bad_dW_scale)}),
+                projector=proj,
+            )
+        assert not any("overflow" in str(w.message).lower() for w in caught)
+    with pytest.raises(ValueError, match="magnitude"):
+        MultiTenantSkillFleet.fleet_delta_from_bytes(
+            _rewrite_zip_members(snap, {"W_base.npy": _npy_bytes(bad_W_base)}),
+            projector=proj,
+        )
 
 
 def test_astra_03_fleet_concurrent_decide_live_and_adapt_isolation() -> None:
@@ -460,6 +482,119 @@ def test_astra_05_packed_kernel_and_callable_parity_on_gates_ood_and_overrides()
     tracker.update_accepted(error=True, margin=100.0)
     with pytest.raises(ValueError, match="margin_floor"):
         fn_a("invoice refund charge billing")
+
+    # Concurrent FastDecisionCallable ACI rebind race must never expose torn (alpha, c_qhats) state.
+    tracker_race = AdaptiveConformalTracker(alpha_target=0.01, alpha_max=0.25, gamma=1.0)
+    eng_race = SystemOneEngine(
+        _ChoiceOnly,
+        compiled_model=m_tf_a,
+        strict_mode=True,
+        use_cache=False,
+        aci_tracker=tracker_race,
+    )
+    eng_race.calibrate(cal_data)
+    qhat_01 = float(eng_race.compile_packed_kernel().c_qhat[0])
+    tracker_race.alpha_t = 0.20
+    qhat_20 = float(eng_race.compile_packed_kernel().c_qhat[0])
+    assert qhat_01 != pytest.approx(qhat_20)
+    tracker_race.alpha_t = 0.20
+    fn_race = eng_race.compile_callable()
+    assert fn_race("invoice refund charge billing").is_ambiguous is False
+
+    # Barrier-staged rebind concurrency: second thread calling after alpha_t flip must wait on rebind.
+    entered_compile = threading.Event()
+    release_compile = threading.Event()
+    orig_compile = eng_race.compile_packed_kernel
+
+    def _slow_compile_packed_kernel(*, storage_mode: str = "float32") -> Any:
+        entered_compile.set()
+        release_compile.wait(timeout=5.0)
+        return orig_compile(storage_mode=storage_mode)
+
+    eng_race.compile_packed_kernel = _slow_compile_packed_kernel  # type: ignore[method-assign]
+    tracker_race.alpha_t = 0.01
+    t1_out: List[Any] = []
+    t2_out: List[Any] = []
+
+    def _call_one(target: List[Any]) -> None:
+        target.append(fn_race("invoice refund charge billing"))
+
+    th1 = threading.Thread(target=_call_one, args=(t1_out,))
+    th1.start()
+    assert entered_compile.wait(timeout=5.0)
+    th2 = threading.Thread(target=_call_one, args=(t2_out,))
+    th2.start()
+    # Give th2 a moment to hit _rebind_lock while th1 is mid-compile.
+    threading.Event().wait(0.02)
+    release_compile.set()
+    th1.join(timeout=5.0)
+    th2.join(timeout=5.0)
+    assert len(t1_out) == 1 and len(t2_out) == 1
+    assert t1_out[0].is_ambiguous is True
+    assert t2_out[0].is_ambiguous is True
+    eng_race.compile_packed_kernel = orig_compile  # type: ignore[method-assign]
+
+    # Free-running multi-thread toggle stress on FastDecisionCallable state invariants.
+    stop_flag = threading.Event()
+    race_errors: List[str] = []
+    race_err_lock = threading.Lock()
+
+    def _toggler() -> None:
+        idx = 0
+        while not stop_flag.is_set() and idx < 80:
+            tracker_race.alpha_t = 0.01 if (idx % 2 == 0) else 0.20
+            idx += 1
+
+    def _reader() -> None:
+        try:
+            for _ in range(120):
+                st = fn_race._state
+                if (st.alpha < 0.10 and abs(st.c_qhats[0] - qhat_01) > 1e-6) or (
+                    st.alpha >= 0.10 and abs(st.c_qhats[0] - qhat_20) > 1e-6
+                ):
+                    with race_err_lock:
+                        race_errors.append(f"torn state alpha={st.alpha} qhat={st.c_qhats[0]}")
+                    return
+                res = fn_race("invoice refund charge billing")
+                if not isinstance(res.is_ambiguous, bool):
+                    with race_err_lock:
+                        race_errors.append("non-bool ambiguity")
+                    return
+        except Exception as exc:
+            with race_err_lock:
+                race_errors.append(repr(exc))
+
+    w_threads = [threading.Thread(target=_reader) for _ in range(5)]
+    t_tog = threading.Thread(target=_toggler)
+    t_tog.start()
+    for t in w_threads:
+        t.start()
+    t_tog.join(timeout=10.0)
+    stop_flag.set()
+    for t in w_threads:
+        t.join(timeout=10.0)
+        assert not t.is_alive()
+    assert race_errors == []
+
+    # Custom DecisionSchema.validate_decision must be rejected by PackedMultiQuestionKernel / callable.
+    class _CustomValidateSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"))
+
+        def validate_decision(self, values: Any) -> Dict[str, Any]:
+            out = super().validate_decision(values)
+            out["cat"] = "b"
+            return out
+
+    m_cv = SystemOneCompiler(_CustomValidateSchema, dimension=16).compile(
+        {"cat": [("alpha case", "a"), ("beta case", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_cv = SystemOneEngine(_CustomValidateSchema, compiled_model=m_cv, strict_mode=False, use_cache=False)
+    with pytest.raises(ValueError, match="validate_decision"):
+        eng_cv.compile_packed_kernel()
+    with pytest.raises(ValueError, match="validate_decision"):
+        eng_cv.compile_callable()
 
 
 def test_astra_06_universal_service_fails_closed_without_auth_token() -> None:
@@ -751,6 +886,140 @@ def test_astra_10_fast_explainer_matches_calibrated_engine_and_rejects_nonlinear
     assert exp_bool_tie.predicted_label == "True"
     assert exp_bool_tie.additivity_error_target <= 1e-6
 
+    # Extreme Boolean thresholds (threshold=1.0 and threshold=0.0) must match engine.decide exactly.
+    for thr, b_val, exp_lbl in (
+        (1.0, 3.5, "False"),
+        (1.0, 10.0, "True"),
+        (0.0, -10.0, "True"),
+    ):
+        class _ExtBoolSchema(DecisionSchema):
+            flag = BooleanField(threshold=thr)
+
+        proj_eb = DeterministicSemanticProjector(dimension=16)
+        m_eb = SystemOneCompiler(_ExtBoolSchema, projector=proj_eb, dimension=16).compile(
+            {"flag": [("alpha token case", True), ("beta token case", False)] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        m_eb.heads["flag"].biases = np.array([b_val], dtype=np.float32)
+        m_eb._field_heads["flag"].biases = np.array([b_val], dtype=np.float32)
+        eng_eb = SystemOneEngine(_ExtBoolSchema, compiled_model=m_eb, strict_mode=False, use_cache=False)
+        dec_eb = eng_eb.decide("alpha token case", record_receipt=False)
+        exp_eb = eng_eb.explain("alpha token case", "flag")
+        exp_eb_m = FastExplainer.from_compiled_model(m_eb, "flag").explain("alpha token case")
+        assert exp_eb.predicted_label == ("True" if dec_eb.values["flag"] else "False") == exp_lbl
+        assert exp_eb_m.predicted_label == exp_lbl
+        assert exp_eb.margin > 0.0
+        assert exp_eb.additivity_error_target <= 1e-6
+        assert exp_eb.additivity_error_margin <= 1e-6
+
+    # Cross-field coupling guards: active joint_calibrator or custom validate_decision must fail closed.
+    class _PairSchema(DecisionSchema):
+        a = ChoiceField(options=("x", "y"))
+        b = ChoiceField(options=("x", "y"))
+
+    pair_data = [
+        ("alpha billing item", {"a": "x", "b": "y"}),
+        ("beta tech item", {"a": "y", "b": "x"}),
+    ] * 8
+    m_pair = SystemOneCompiler(_PairSchema, dimension=32).compile(
+        {
+            "a": [(p, v["a"]) for p, v in pair_data],
+            "b": [(p, v["b"]) for p, v in pair_data],
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_pair = SystemOneEngine(_PairSchema, compiled_model=m_pair, strict_mode=False, use_cache=False)
+    eng_pair.calibrate_joint(pair_data, pair_data)
+    with pytest.raises(ValueError, match="joint_calibrator"):
+        FastExplainer.from_engine(eng_pair, "a")
+    with pytest.raises(ValueError, match="joint_calibrator"):
+        eng_pair.explain("alpha billing item", "a")
+
+    class _CustomExplainValidateSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"))
+
+        def validate_decision(self, values: Any) -> Dict[str, Any]:
+            out = super().validate_decision(values)
+            out["cat"] = "b"
+            return out
+
+    m_cev = SystemOneCompiler(_CustomExplainValidateSchema, dimension=16).compile(
+        {"cat": [("alpha case", "a"), ("beta case", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_cev = SystemOneEngine(
+        _CustomExplainValidateSchema, compiled_model=m_cev, strict_mode=False, use_cache=False
+    )
+    with pytest.raises(ValueError, match="validate_decision"):
+        FastExplainer.from_engine(eng_cev, "cat")
+    with pytest.raises(ValueError, match="validate_decision"):
+        FastExplainer.from_compiled_model(m_cev, "cat")
+
+    # Concurrent multi-threaded FastExplainer.explain with HybridProjector must be thread-safe.
+    corpus_mt = [
+        "invoice refund payment charge billing dispute",
+        "account subscription renewal invoice balance",
+        "server outage timeout crash database error",
+        "api exception latency crash traceback failed",
+    ]
+    labels_mt = ["billing", "billing", "tech", "tech"]
+    proj_mt = HybridProjector(sparse_dim=64, dense_dim=32).fit(corpus_mt, labels=labels_mt, min_df=1)
+    m_mt = SystemOneCompiler(_OvExplainSchema, projector=proj_mt, dimension=proj_mt.dimension).compile(
+        {"cat": list(zip(corpus_mt * 3, labels_mt * 3))},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_mt = SystemOneEngine(_OvExplainSchema, compiled_model=m_mt, strict_mode=False, use_cache=False)
+    prompts_mt = [
+        "invoice payment billing charge refund repeated invoice",
+        "server outage timeout database error crash server",
+        "account subscription invoice dispute",
+        "api latency traceback crash exception",
+    ]
+    serial_refs = [eng_mt.explain(p, "cat") for p in prompts_mt]
+    mt_errors: List[str] = []
+    mt_err_lock = threading.Lock()
+    mt_barrier = threading.Barrier(4)
+
+    def _explain_worker(tid: int) -> None:
+        try:
+            mt_barrier.wait(timeout=5.0)
+            for step in range(40):
+                idx = (tid + step) % len(prompts_mt)
+                got = eng_mt.explain(prompts_mt[idx], "cat")
+                ref = serial_refs[idx]
+                if (
+                    got.predicted_label != ref.predicted_label
+                    or abs(got.predicted_logit - ref.predicted_logit) > 1e-6
+                    or abs(got.margin - ref.margin) > 1e-6
+                    or got.additivity_error_target > 1e-6
+                    or got.additivity_error_margin > 1e-6
+                ):
+                    with mt_err_lock:
+                        mt_errors.append(
+                            f"tid={tid} idx={idx} err_t={got.additivity_error_target} err_m={got.additivity_error_margin}"
+                        )
+                    return
+                for sp_got, sp_ref in zip(got.spans, ref.spans):
+                    if abs(sp_got.target_logit_attr - sp_ref.target_logit_attr) > 1e-6:
+                        with mt_err_lock:
+                            mt_errors.append(f"tid={tid} span_diff={sp_got.target_logit_attr} vs {sp_ref.target_logit_attr}")
+                        return
+        except Exception as exc:
+            with mt_err_lock:
+                mt_errors.append(repr(exc))
+
+    ex_threads = [threading.Thread(target=_explain_worker, args=(i,)) for i in range(4)]
+    for t in ex_threads:
+        t.start()
+    for t in ex_threads:
+        t.join(timeout=15.0)
+        assert not t.is_alive()
+    assert mt_errors == []
+
 
 def test_astra_11_smarts_router_honors_per_call_alpha() -> None:
     """Finding #11: SmartsCrossZeroFewRouter dynamically recomputes quantile q_eff for per-call alpha."""
@@ -899,6 +1168,14 @@ def test_astra_14_online_mondrian_and_fleet_conformal_cover_large_label_spaces()
         omc.update(0, probs=probs)
     assert float(omc.thresholds()[0]) >= 0.995
     assert 0 in omc.predict_set(probs)
+
+    worst_case_probs = [0.0] + [1.0 / (k - 1)] * (k - 1)
+    for _ in range(99):
+        omc.update(0, probs=worst_case_probs)
+    assert float(omc.q_c[0]) == 1.0
+    restored_omc = OnlineMondrianConformal.from_state_dict(omc.state_dict())
+    assert float(restored_omc.q_c[0]) == 1.0
+    assert 0 in restored_omc.predict_set(worst_case_probs)
 
     classes = tuple(f"c{i}" for i in range(k))
     fleet, _ = _build_tiny_fleet(classes=classes, num_tenants=1, r_sub=208, dim=32, alpha=0.10)

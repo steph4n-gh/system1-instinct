@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import json
 import math
 import re
+import threading
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import zlib
@@ -21,7 +22,7 @@ from system1.core.embeddings import (
     _stem_word as _emb_stem_word,
     _tokenize_with_negation_scope,
 )
-from system1.core.schema import BooleanField, ChoiceField
+from system1.core.schema import BooleanField, ChoiceField, DecisionSchema
 from system1.core.text import (
     _CONTRACTION_RE,
     MAX_TERM_LENGTH,
@@ -38,6 +39,35 @@ _CONTRACTION_SPAN_RE = re.compile(
 _GL10_NODES, _GL10_WEIGHTS = np.polynomial.legendre.leggauss(10)
 _IG_T = (0.5 * (_GL10_NODES + 1.0)).astype(np.float64).reshape(-1, 1)
 _IG_W = (0.5 * _GL10_WEIGHTS).astype(np.float64).reshape(-1, 1)
+_MAX_EXPLAIN_OOV_CACHE = 32768
+
+
+def _boolean_threshold_logit_shift(threshold: float) -> float:
+    t = float(threshold)
+    if not math.isfinite(t):
+        raise ValueError(f"threshold must be finite, got {threshold!r}")
+    if t <= 0.0:
+        return -750.0
+    if t > 1.0:
+        return 750.0
+    if t == 1.0:
+        return math.nextafter(53.0 * math.log(2.0), math.inf)
+    return math.log(t) - math.log1p(-t)
+
+
+def _has_custom_validate_decision(schema: Any) -> bool:
+    if schema is None:
+        return False
+    schema_cls = schema if isinstance(schema, type) else type(schema)
+    if not isinstance(schema, type) and "validate_decision" in getattr(schema, "__dict__", {}):
+        return True
+    if (
+        isinstance(schema_cls, type)
+        and issubclass(schema_cls, DecisionSchema)
+        and schema_cls.validate_decision is not DecisionSchema.validate_decision
+    ):
+        return True
+    return False
 
 
 def _normalize_head_weights_and_options(
@@ -57,8 +87,8 @@ def _normalize_head_weights_and_options(
 
     if w.shape[0] == 1 and (not opts or len(opts) == 2):
         # Convert scalar BooleanField head w*x + b >= inv_sigmoid(t) into 2-class symmetric logits.
-        t_clamped = min(max(float(threshold), 1e-6), 1.0 - 1e-6)
-        b_adj = float(b[0]) - (1.0 / float(temperature_scale)) * math.log(t_clamped / (1.0 - t_clamped))
+        logit_shift = _boolean_threshold_logit_shift(threshold)
+        b_adj = float(b[0]) - (1.0 / float(temperature_scale)) * logit_shift
         w2 = np.vstack([-0.5 * w[0], 0.5 * w[0]])
         b2 = np.array([-0.5 * b_adj, 0.5 * b_adj], dtype=np.float64)
         return w2, b2, opts if len(opts) == 2 else ("False", "True")
@@ -160,6 +190,8 @@ def _extract_calibrated_head_params(
     recency_weighted: Optional[bool] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...], float, float, Dict[str, Any]]:
     """Extract calibrated effective weights, biases, scale, and threshold matching engine decide()."""
+    if _has_custom_validate_decision(getattr(model, "schema", None)):
+        raise ValueError("FastExplainer does not support custom DecisionSchema.validate_decision")
     f_def = model.schema.fields[fname]
     field_heads = getattr(model, "_field_heads", None)
     compiled_heads = getattr(model, "heads", None)
@@ -322,8 +354,7 @@ class FastExplainer:
         w_in = np.asarray(weights)
         inferred_bool = w_in.ndim == 2 and w_in.shape[0] == 1 and (options is None or len(options) in (0, 2))
         self._is_boolean = bool(inferred_bool if is_boolean is None else is_boolean)
-        t_clamped = min(max(self.threshold, 1e-6), 1.0 - 1e-6)
-        self._bool_logit_shift = math.log(t_clamped / (1.0 - t_clamped))
+        self._bool_logit_shift = _boolean_threshold_logit_shift(self.threshold)
         self.recency_weighted = bool(
             getattr(projector, "recency_weighted", False) if recency_weighted is None else recency_weighted
         )
@@ -493,14 +524,11 @@ class FastExplainer:
         self._has_same = [bool(np.any(m)) for m in self._class_masks]
         self._has_other = [bool(np.any(m)) for m in self._other_masks]
 
+        self._tls = threading.local()
         if self._mode in ("tfidf", "hybrid"):
             self._idf_f64 = np.asarray(self.tfidf._idf_f64, dtype=np.float64)
             self._scale_f64 = np.asarray(self.tfidf._scale_f64, dtype=np.float64)
             self._base_weight_f64 = self._idf_f64 * self._scale_f64
-            self._sp_cnt_buf = np.zeros(self.sd, dtype=np.int32)
-            self._sp_occ_buf = np.zeros(self.sd, dtype=np.float64)
-            self._tmp_c1_buf = np.empty(self.sd, dtype=np.float64)
-            self._tmp_mg_buf = np.empty(self.sd, dtype=np.float64)
             self._char_arr_cache: Dict[
                 str, Tuple[np.ndarray, np.ndarray, bool, Tuple[int, ...], Tuple[Tuple[int, int], ...]]
             ] = {}
@@ -553,6 +581,10 @@ class FastExplainer:
         temperature_scale: float = 4.0,
     ) -> FastExplainer:
         """Build a FastExplainer bound to a live SystemOneEngine head."""
+        if getattr(engine, "joint_calibrator", None) is not None:
+            raise ValueError("FastExplainer does not support engines with active joint_calibrator")
+        if _has_custom_validate_decision(getattr(engine, "schema", None)):
+            raise ValueError("FastExplainer does not support custom DecisionSchema.validate_decision")
         fname = _canonical_explain_field(engine.model.schema, field_name)
         calibrators = getattr(engine, "calibrators", None)
         calibrator = calibrators.get(fname) if isinstance(calibrators, Mapping) else None
@@ -596,7 +628,8 @@ class FastExplainer:
                     tuple((int(i), int(c)) for i, c in zip(u_idx_tup, u_cnt.tolist())) if has_mult else ()
                 )
                 entry = (u_idx, u_cnt.astype(np.int32), has_mult, u_idx_tup, u_pair_tup)
-            self._char_arr_cache[w] = entry
+            if len(self._char_arr_cache) < _MAX_EXPLAIN_OOV_CACHE:
+                self._char_arr_cache[w] = entry
         return entry
 
     def _get_word_dn_entry(
@@ -622,7 +655,8 @@ class FastExplainer:
                 entry = (h_word, sub_vec, sub_w, sub_l)
             else:
                 entry = (h_word, None, None, None)
-            self._word_dn_cache[w] = entry
+            if len(self._word_dn_cache) < _MAX_EXPLAIN_OOV_CACHE:
+                self._word_dn_cache[w] = entry
         return entry
 
     def _bi_hash(self, a: str, b: str) -> int:
@@ -630,7 +664,8 @@ class FastExplainer:
         h = self._bi_hash_cache.get(key)
         if h is None:
             h = self._hash_token(f"bi:{a}_{b}")
-            self._bi_hash_cache[key] = h
+            if len(self._bi_hash_cache) < _MAX_EXPLAIN_OOV_CACHE:
+                self._bi_hash_cache[key] = h
         return h
 
     def _tokenize_spans(self, text: str) -> List[Tuple[int, int, str, str]]:
@@ -667,179 +702,189 @@ class FastExplainer:
         tfidf = self.tfidf
         w_get = tfidf._word_vocab.get
         bi_first = tfidf._bigram_first_words
-        cnt_buf = self._sp_cnt_buf
+        cnt_buf = getattr(self._tls, "cnt_buf", None)
+        if cnt_buf is None or cnt_buf.shape[0] != self.sd:
+            cnt_buf = np.zeros(self.sd, dtype=np.int32)
+            self._tls.cnt_buf = cnt_buf
         touched: List[int] = []
+        cleaned = False
+        try:
+            if kept_mask is None:
+                active_spans = [(j, s[3]) for j, s in enumerate(spans)]
+                clipped = text[:MAX_TEXT_LENGTH].lower()
+                lowered = _CONTRACTION_RE.sub(lambda m: m.group(0).replace("'", ""), clipped) if "'" in clipped else clipped
+            else:
+                active_spans = [(j, spans[j][3]) for j in range(len(spans)) if kept_mask[j]]
+                lowered = " ".join(w for _, w in active_spans)
 
-        if kept_mask is None:
-            active_spans = [(j, s[3]) for j, s in enumerate(spans)]
-            clipped = text[:MAX_TEXT_LENGTH].lower()
-            lowered = _CONTRACTION_RE.sub(lambda m: m.group(0).replace("'", ""), clipped) if "'" in clipped else clipped
-        else:
-            active_spans = [(j, spans[j][3]) for j in range(len(spans)) if kept_mask[j]]
-            lowered = " ".join(w for _, w in active_spans)
+            words_2: List[Tuple[int, str]] = [(j, w) for j, w in active_spans if len(w) >= 2]
+            w_counts: Dict[str, int] = {}
+            w_to_spans: Dict[str, List[int]] = {}
+            w_unigrams: List[Tuple[int, List[int]]] = []
 
-        words_2: List[Tuple[int, str]] = [(j, w) for j, w in active_spans if len(w) >= 2]
-        w_counts: Dict[str, int] = {}
-        w_to_spans: Dict[str, List[int]] = {}
-        w_unigrams: List[Tuple[int, List[int]]] = []
-
-        for j, w in words_2:
-            w_counts[w] = w_counts.get(w, 0) + 1
-            if need_trace:
-                lst = w_to_spans.get(w)
-                if lst is None:
-                    w_to_spans[w] = [j]
-                else:
-                    lst.append(j)
-            idx = w_get(w)
-            if idx is not None:
-                if cnt_buf[idx] == 0:
-                    touched.append(idx)
-                cnt_buf[idx] += 1
-
-        if need_trace:
-            for w, sp_list in w_to_spans.items():
+            for j, w in words_2:
+                w_counts[w] = w_counts.get(w, 0) + 1
+                if need_trace:
+                    lst = w_to_spans.get(w)
+                    if lst is None:
+                        w_to_spans[w] = [j]
+                    else:
+                        lst.append(j)
                 idx = w_get(w)
                 if idx is not None:
-                    w_unigrams.append((idx, sp_list))
+                    if cnt_buf[idx] == 0:
+                        touched.append(idx)
+                    cnt_buf[idx] += 1
 
-        bi_events: List[Tuple[int, int, int]] = []
-        if bi_first and len(words_2) > 1:
-            for i in range(len(words_2) - 1):
-                j0, a = words_2[i]
-                if a in bi_first:
-                    j1, b = words_2[i + 1]
-                    idx = w_get(f"{a} {b}")
+            if need_trace:
+                for w, sp_list in w_to_spans.items():
+                    idx = w_get(w)
                     if idx is not None:
-                        if cnt_buf[idx] == 0:
-                            touched.append(idx)
-                        cnt_buf[idx] += 1
-                        if need_trace:
-                            bi_events.append((idx, j0, j1))
+                        w_unigrams.append((idx, sp_list))
 
-        negated_words: set[str] = set()
-        special_events: List[Tuple[int, Tuple[int, ...], float]] = []
-        has_neg = not _NEGATION_TOKENS.isdisjoint(w_counts)
-        if has_neg or tfidf._use_skip_bigrams:
-            cursor = 0
-            n_w2 = len(words_2)
-            for clause in _CLAUSE_SPLIT_RE.split(lowered):
-                c_toks = [w for w in _SPAN_WORD_RE.findall(clause) if len(w) >= 2]
-                n_c = len(c_toks)
-                c_spans: List[int] = []
-                if need_trace:
-                    for cw in c_toks:
-                        while cursor < n_w2 and words_2[cursor][1] != cw:
-                            cursor += 1
-                        if cursor < n_w2:
-                            c_spans.append(words_2[cursor][0])
-                            cursor += 1
-                        else:
-                            c_spans.append(active_spans[-1][0] if active_spans else 0)
-                if tfidf._use_skip_bigrams and n_c >= 3:
-                    for i in range(n_c - 2):
-                        idx = w_get(f"skip:{c_toks[i]}_{c_toks[i + 2]}")
+            bi_events: List[Tuple[int, int, int]] = []
+            if bi_first and len(words_2) > 1:
+                for i in range(len(words_2) - 1):
+                    j0, a = words_2[i]
+                    if a in bi_first:
+                        j1, b = words_2[i + 1]
+                        idx = w_get(f"{a} {b}")
                         if idx is not None:
                             if cnt_buf[idx] == 0:
                                 touched.append(idx)
                             cnt_buf[idx] += 1
                             if need_trace:
-                                special_events.append((idx, (c_spans[i], c_spans[i + 2]), 0.5))
-                if has_neg:
-                    for i, w in enumerate(c_toks):
-                        if w in _NEGATION_TOKENS:
-                            bound: List[str] = []
-                            bound_spans: List[int] = []
-                            for j in range(i + 1, min(i + 4, n_c)):
-                                target = c_toks[j]
-                                if target in _NEGATION_TOKENS:
-                                    break
-                                if target in _NEGATION_SKIP_MODIFIERS:
-                                    continue
-                                bound.append(target)
-                                if need_trace:
-                                    bound_spans.append(c_spans[j])
-                                negated_words.add(target)
-                                for tok in (f"neg:{target}", f"{w}_{target}"):
-                                    idx = w_get(tok)
-                                    if idx is not None:
-                                        if cnt_buf[idx] == 0:
-                                            touched.append(idx)
-                                        cnt_buf[idx] += 1
-                                        if need_trace:
-                                            special_events.append((idx, (c_spans[i], c_spans[j]), 0.5))
-                                if j > i + 1:
-                                    idx = w_get(f"{w} {target}")
-                                    if idx is not None:
-                                        if cnt_buf[idx] == 0:
-                                            touched.append(idx)
-                                        cnt_buf[idx] += 1
-                                        if need_trace:
-                                            special_events.append((idx, (c_spans[i], c_spans[j]), 0.5))
-                                if len(bound) == 2:
-                                    idx = w_get(f"{w}_{bound[0]}_{bound[1]}")
-                                    if idx is not None:
-                                        if cnt_buf[idx] == 0:
-                                            touched.append(idx)
-                                        cnt_buf[idx] += 1
-                                        if need_trace:
-                                            special_events.append(
-                                                (idx, (c_spans[i], bound_spans[0], bound_spans[1]), 1.0 / 3.0)
-                                            )
-                                    break
+                                bi_events.append((idx, j0, j1))
 
-        unneg_words: List[
-            Tuple[str, Optional[int], Tuple[int, ...], Tuple[Tuple[int, int], ...], bool]
-        ] = []
-        use_stems = tfidf._use_stems
-        use_chars = bool(tfidf._char_lens)
-        char_chunks: List[np.ndarray] = []
-        if use_stems or use_chars:
-            for w, wc in w_counts.items():
-                if w not in negated_words and len(w) <= MAX_TERM_LENGTH:
-                    s_idx = None
-                    if use_stems and len(w) >= 4:
-                        st = _tfidf_stem_word(w)
-                        if st != w and len(st) >= 3:
-                            s_idx = w_get(f"stem:{st}")
-                            if s_idx is not None:
-                                if cnt_buf[s_idx] == 0:
-                                    touched.append(s_idx)
-                                cnt_buf[s_idx] += wc
-                    u_c_tup: Tuple[int, ...] = ()
-                    u_pair_tup: Tuple[Tuple[int, int], ...] = ()
-                    has_mult = False
-                    if use_chars:
-                        u_c_idx, u_c_mult, has_mult, u_c_tup, u_pair_tup = self._get_char_arr(w)
-                        if u_c_idx.size > 0:
-                            char_chunks.append(u_c_idx)
-                            if has_mult:
-                                cnt_buf[u_c_idx] += wc * u_c_mult
+            negated_words: set[str] = set()
+            special_events: List[Tuple[int, Tuple[int, ...], float]] = []
+            has_neg = not _NEGATION_TOKENS.isdisjoint(w_counts)
+            if has_neg or tfidf._use_skip_bigrams:
+                cursor = 0
+                n_w2 = len(words_2)
+                for clause in _CLAUSE_SPLIT_RE.split(lowered):
+                    c_toks = [w for w in _SPAN_WORD_RE.findall(clause) if len(w) >= 2]
+                    n_c = len(c_toks)
+                    c_spans: List[int] = []
+                    if need_trace:
+                        for cw in c_toks:
+                            while cursor < n_w2 and words_2[cursor][1] != cw:
+                                cursor += 1
+                            if cursor < n_w2:
+                                c_spans.append(words_2[cursor][0])
+                                cursor += 1
                             else:
-                                cnt_buf[u_c_idx] += wc
-                    if need_trace and (s_idx is not None or u_c_tup):
-                        unneg_words.append((w, s_idx, u_c_tup, u_pair_tup, has_mult))
+                                c_spans.append(active_spans[-1][0] if active_spans else 0)
+                    if tfidf._use_skip_bigrams and n_c >= 3:
+                        for i in range(n_c - 2):
+                            idx = w_get(f"skip:{c_toks[i]}_{c_toks[i + 2]}")
+                            if idx is not None:
+                                if cnt_buf[idx] == 0:
+                                    touched.append(idx)
+                                cnt_buf[idx] += 1
+                                if need_trace:
+                                    special_events.append((idx, (c_spans[i], c_spans[i + 2]), 0.5))
+                    if has_neg:
+                        for i, w in enumerate(c_toks):
+                            if w in _NEGATION_TOKENS:
+                                bound: List[str] = []
+                                bound_spans: List[int] = []
+                                for j in range(i + 1, min(i + 4, n_c)):
+                                    target = c_toks[j]
+                                    if target in _NEGATION_TOKENS:
+                                        break
+                                    if target in _NEGATION_SKIP_MODIFIERS:
+                                        continue
+                                    bound.append(target)
+                                    if need_trace:
+                                        bound_spans.append(c_spans[j])
+                                    negated_words.add(target)
+                                    for tok in (f"neg:{target}", f"{w}_{target}"):
+                                        idx = w_get(tok)
+                                        if idx is not None:
+                                            if cnt_buf[idx] == 0:
+                                                touched.append(idx)
+                                            cnt_buf[idx] += 1
+                                            if need_trace:
+                                                special_events.append((idx, (c_spans[i], c_spans[j]), 0.5))
+                                    if j > i + 1:
+                                        idx = w_get(f"{w} {target}")
+                                        if idx is not None:
+                                            if cnt_buf[idx] == 0:
+                                                touched.append(idx)
+                                            cnt_buf[idx] += 1
+                                            if need_trace:
+                                                special_events.append((idx, (c_spans[i], c_spans[j]), 0.5))
+                                    if len(bound) == 2:
+                                        idx = w_get(f"{w}_{bound[0]}_{bound[1]}")
+                                        if idx is not None:
+                                            if cnt_buf[idx] == 0:
+                                                touched.append(idx)
+                                            cnt_buf[idx] += 1
+                                            if need_trace:
+                                                special_events.append(
+                                                    (idx, (c_spans[i], bound_spans[0], bound_spans[1]), 1.0 / 3.0)
+                                                )
+                                        break
 
-        if not touched and not char_chunks:
-            trace = {
-                "w_to_spans": w_to_spans,
-                "w_unigrams": w_unigrams,
-                "unneg_words": unneg_words,
-                "bi_events": bi_events,
-                "special_events": special_events,
-                "touched": np.empty(0, dtype=np.intp),
-            } if need_trace else None
-            return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64), 0.0, trace
+            unneg_words: List[
+                Tuple[str, Optional[int], Tuple[int, ...], Tuple[Tuple[int, int], ...], bool]
+            ] = []
+            use_stems = tfidf._use_stems
+            use_chars = bool(tfidf._char_lens)
+            char_chunks: List[np.ndarray] = []
+            if use_stems or use_chars:
+                for w, wc in w_counts.items():
+                    if w not in negated_words and len(w) <= MAX_TERM_LENGTH:
+                        s_idx = None
+                        if use_stems and len(w) >= 4:
+                            st = _tfidf_stem_word(w)
+                            if st != w and len(st) >= 3:
+                                s_idx = w_get(f"stem:{st}")
+                                if s_idx is not None:
+                                    if cnt_buf[s_idx] == 0:
+                                        touched.append(s_idx)
+                                    cnt_buf[s_idx] += wc
+                        u_c_tup: Tuple[int, ...] = ()
+                        u_pair_tup: Tuple[Tuple[int, int], ...] = ()
+                        has_mult = False
+                        if use_chars:
+                            u_c_idx, u_c_mult, has_mult, u_c_tup, u_pair_tup = self._get_char_arr(w)
+                            if u_c_idx.size > 0:
+                                char_chunks.append(u_c_idx)
+                                if has_mult:
+                                    cnt_buf[u_c_idx] += wc * u_c_mult
+                                else:
+                                    cnt_buf[u_c_idx] += wc
+                        if need_trace and (s_idx is not None or u_c_tup):
+                            unneg_words.append((w, s_idx, u_c_tup, u_pair_tup, has_mult))
 
-        if char_chunks:
-            if touched:
-                char_chunks.append(np.asarray(touched, dtype=np.intp))
-            act_idx = np.unique(np.concatenate(char_chunks))
-        else:
-            act_idx = np.asarray(touched, dtype=np.intp)
+            if not touched and not char_chunks:
+                cleaned = True
+                trace = {
+                    "w_to_spans": w_to_spans,
+                    "w_unigrams": w_unigrams,
+                    "unneg_words": unneg_words,
+                    "bi_events": bi_events,
+                    "special_events": special_events,
+                    "touched": np.empty(0, dtype=np.intp),
+                    "act_occ": np.empty(0, dtype=np.float64),
+                } if need_trace else None
+                return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64), 0.0, trace
 
-        cnts = cnt_buf[act_idx]
-        cnt_buf[act_idx] = 0
+            if char_chunks:
+                if touched:
+                    char_chunks.append(np.asarray(touched, dtype=np.intp))
+                act_idx = np.unique(np.concatenate(char_chunks))
+            else:
+                act_idx = np.asarray(touched, dtype=np.intp)
+
+            cnts = cnt_buf[act_idx]
+            cnt_buf[act_idx] = 0
+            cleaned = True
+        finally:
+            if not cleaned:
+                cnt_buf.fill(0)
 
         if int(np.max(cnts)) <= 1:
             cnts_f = None
@@ -868,7 +913,7 @@ class FastExplainer:
 
         norm_sp = float(np.linalg.norm(act_raw))
         if need_trace:
-            self._sp_occ_buf[act_idx] = act_raw if cnts_f is None else (act_raw / cnts_f)
+            act_occ = act_raw if cnts_f is None else (act_raw / cnts_f)
             trace = {
                 "w_to_spans": w_to_spans,
                 "w_unigrams": w_unigrams,
@@ -876,6 +921,7 @@ class FastExplainer:
                 "bi_events": bi_events,
                 "special_events": special_events,
                 "touched": act_idx,
+                "act_occ": act_occ,
             }
         else:
             trace = None
@@ -1132,7 +1178,13 @@ class FastExplainer:
                 return 1
             if self.threshold > 1.0:
                 return 0
-            return 1 if float(logits[1]) >= float(logits[0]) else 0
+            s_cal = float(logits[1] - logits[0]) + self._bool_logit_shift
+            half_s = 0.5 * s_cal
+            s_max = half_s if half_s >= -half_s else -half_s
+            e0 = math.exp(-half_s - s_max)
+            e1 = math.exp(half_s - s_max)
+            prob_true = e1 / (e0 + e1)
+            return 1 if prob_true >= self.threshold else 0
         return int(np.argmax(logits))
 
     def _select_top2(self, logits: np.ndarray) -> Tuple[int, int]:
@@ -1227,7 +1279,7 @@ class FastExplainer:
         t_attrs: List[float],
         m_attrs: List[float],
     ) -> None:
-        occ_scaled = self._sp_occ_buf[act_idx] * sp_coef
+        occ_scaled = trace["act_occ"] * sp_coef
         act_list = act_idx.tolist()
         c1_map = dict(zip(act_list, (w_sp_c1_act * occ_scaled).tolist()))
         mg_map = dict(zip(act_list, (w_sp_mg_act * occ_scaled).tolist()))

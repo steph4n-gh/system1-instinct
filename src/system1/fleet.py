@@ -317,8 +317,14 @@ class MultiTenantSkillFleet:
         q0 = np.full(K, 0.5, dtype=np.float32) if q_init is None else np.asarray(q_init, dtype=np.float32).reshape(-1)
         if q0.shape[0] != K:
             raise ValueError(f"q_init length {q0.shape[0]} != num_classes {K}")
-        self.q_init = np.clip(q0, 1e-4, 0.999).astype(np.float32)
-        u_init = -np.log(np.clip(1.0 - self.q_init, 1e-4, 1.0))
+        if not bool(np.all(np.isfinite(q0))):
+            raise ValueError("q_init must contain only finite values")
+        self.q_init = np.clip(q0, 1e-4, 1.0).astype(np.float32)
+        u_init = np.where(
+            self.q_init >= 1.0 - math.exp(-(16.0 - 1e-6)),
+            16.0,
+            -np.log(np.clip(1.0 - self.q_init.astype(np.float64), 1e-12, 1.0)),
+        )
         self.q_c = np.broadcast_to(self.q_init.astype(np.float16), (N, K)).copy()
         self.u_c = np.broadcast_to(u_init.astype(np.float16), (N, K)).copy()
         self.alpha_c = np.full((N, K), self.alpha, dtype=np.float16)
@@ -1073,12 +1079,12 @@ class MultiTenantSkillFleet:
         max_runtime_bytes: int = MAX_FLEET_RUNTIME_BYTES,
     ) -> MultiTenantSkillFleet:
         """Restore a MultiTenantSkillFleet from bytes produced by `fleet_delta_to_bytes()`."""
+        raw_bytes = data if isinstance(data, bytes) else bytes(data)
         (T, K, R, M_sp, M_ex), _ = cls._preflight_snapshot_bytes(
-            data,
+            raw_bytes,
             projector=projector,
             max_runtime_bytes=max_runtime_bytes,
         )
-        raw_bytes = data if isinstance(data, bytes) else bytes(data)
         with np.load(io.BytesIO(raw_bytes), allow_pickle=False) as zf:
             if classes is not None:
                 resolved_classes = [str(c) for c in classes]
@@ -1143,22 +1149,23 @@ class MultiTenantSkillFleet:
                 if bool(np.any(ex_cls_arr[active_ex] < 0)):
                     raise ValueError("Snapshot contains negative ex_cls in active exemplar slot")
 
-            W_base_arr = zf["W_base"].astype(np.float32)
-            b_base_arr = zf["b_base"].astype(np.float32)
-            U_shared_arr = zf["U_shared"].astype(np.float32)
-            base_tok_df_arr = zf["base_tok_df"].astype(np.uint16)
-            q_init_arr = zf["q_init"].astype(np.float32)
-            dW_q_arr = zf["dW_q"]
-            dW_scale_arr = zf["dW_scale"]
-            P_blk_arr = zf["P_blk"].astype(np.float32)
-            sp_hash_arr = zf["sp_hash"]
-            sp_w_arr = zf["sp_w"]
-            ex_vecs_q_arr = zf["ex_vecs_q"]
-            ex_scales_arr = zf["ex_scales"]
-            q_c_arr = zf["q_c"]
-            u_c_arr = zf["u_c"]
-            alpha_c_arr = zf["alpha_c"]
-            err_ewma_arr = zf["err_ewma"]
+            with np.errstate(over="ignore", invalid="ignore"):
+                W_base_arr = zf["W_base"].astype(np.float32)
+                b_base_arr = zf["b_base"].astype(np.float32)
+                U_shared_arr = zf["U_shared"].astype(np.float32)
+                base_tok_df_arr = zf["base_tok_df"].astype(np.uint16)
+                q_init_arr = zf["q_init"].astype(np.float32)
+                dW_q_arr = zf["dW_q"]
+                dW_scale_arr = zf["dW_scale"].astype(np.float16)
+                P_blk_arr = zf["P_blk"].astype(np.float32)
+                sp_hash_arr = zf["sp_hash"]
+                sp_w_arr = zf["sp_w"].astype(np.float16)
+                ex_vecs_q_arr = zf["ex_vecs_q"]
+                ex_scales_arr = zf["ex_scales"].astype(np.float16)
+                q_c_arr = zf["q_c"].astype(np.float16)
+                u_c_arr = zf["u_c"].astype(np.float16)
+                alpha_c_arr = zf["alpha_c"].astype(np.float16)
+                err_ewma_arr = zf["err_ewma"].astype(np.float16)
 
             for arr_name, arr_val in (
                 ("W_base", W_base_arr),
@@ -1177,12 +1184,25 @@ class MultiTenantSkillFleet:
                 if not bool(np.all(np.isfinite(arr_val))):
                     raise ValueError(f"Snapshot array {arr_name!r} contains non-finite values")
 
+            for arr_name, arr_val in (
+                ("W_base", W_base_arr),
+                ("b_base", b_base_arr),
+                ("U_shared", U_shared_arr),
+                ("P_blk", P_blk_arr),
+            ):
+                if arr_val.size > 0 and float(np.max(np.abs(arr_val))) > 1e12:
+                    raise ValueError(f"Snapshot array {arr_name!r} exceeds safe float32 magnitude bound")
+
+            if dW_scale_arr.size > 0 and float(np.min(dW_scale_arr)) < 0.0:
+                raise ValueError("Snapshot dW_scale must be nonnegative")
+            if ex_scales_arr.size > 0 and float(np.min(ex_scales_arr)) < 0.0:
+                raise ValueError("Snapshot ex_scales must be nonnegative")
             if float(np.min(q_init_arr)) < 0.0 or float(np.max(q_init_arr)) > 1.0:
                 raise ValueError("Snapshot q_init outside [0.0, 1.0]")
             if float(np.min(q_c_arr)) < 0.0 or float(np.max(q_c_arr)) > 1.0:
                 raise ValueError("Snapshot q_c outside [0.0, 1.0]")
-            if float(np.min(u_c_arr)) < 0.0:
-                raise ValueError("Snapshot u_c must be nonnegative")
+            if u_c_arr.size > 0 and (float(np.min(u_c_arr)) < 0.0 or float(np.max(u_c_arr)) > 16.0):
+                raise ValueError("Snapshot u_c outside [0.0, 16.0]")
             if float(np.min(alpha_c_arr)) <= 0.0 or float(np.max(alpha_c_arr)) >= 1.0:
                 raise ValueError("Snapshot alpha_c outside (0.0, 1.0)")
             if float(np.min(err_ewma_arr)) < 0.0 or float(np.max(err_ewma_arr)) > 1.0:

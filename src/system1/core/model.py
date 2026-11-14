@@ -2544,6 +2544,20 @@ class PackedMultiQuestionKernel:
         fields = eng.schema.fields
         if not fields:
             raise ValueError("PackedMultiQuestionKernel requires a non-empty schema")
+        schema_obj = eng.schema
+        schema_cls = schema_obj if isinstance(schema_obj, type) else type(schema_obj)
+        has_instance_vd = not isinstance(schema_obj, type) and "validate_decision" in getattr(
+            schema_obj, "__dict__", {}
+        )
+        has_override_vd = (
+            isinstance(schema_cls, type)
+            and issubclass(schema_cls, DecisionSchema)
+            and schema_cls.validate_decision is not DecisionSchema.validate_decision
+        )
+        if has_instance_vd or has_override_vd:
+            raise ValueError(
+                "PackedMultiQuestionKernel does not support custom DecisionSchema.validate_decision"
+            )
         if getattr(eng, "selective_calibrators", None):
             raise ValueError("PackedMultiQuestionKernel does not support engines with active selective_calibrators")
         if getattr(eng, "joint_calibrator", None) is not None:
@@ -3215,6 +3229,55 @@ class FastDecisionOutput:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _BoundCallableState:
+    kernel: PackedMultiQuestionKernel
+    projector: Any
+    recency_weighted: bool
+    is_det_proj: bool
+    small_q: bool
+    W_t: np.ndarray
+    b: np.ndarray
+    strict: bool
+    alpha: float
+    Q_c: int
+    Q_b: int
+    Q_s: int
+    c_options: Tuple[Tuple[str, ...], ...]
+    c_names: Tuple[str, ...]
+    c_K_list: Tuple[int, ...]
+    c_starts: Tuple[int, ...]
+    c_qhats: Tuple[float, ...]
+    c_cals: Tuple[bool, ...]
+    c_lacs: Tuple[bool, ...]
+    c_eff_m: Tuple[float, ...]
+    c_gamma: Tuple[float, ...]
+    c_conf_floor: Tuple[float, ...]
+    b_names: Tuple[str, ...]
+    b_thresh: Tuple[float, ...]
+    b_qhats: Tuple[float, ...]
+    b_cals: Tuple[bool, ...]
+    b_lacs: Tuple[bool, ...]
+    b_eff_m: Tuple[float, ...]
+    b_gamma: Tuple[float, ...]
+    b_conf_floor: Tuple[float, ...]
+    b_offset: int
+    s_names: Tuple[str, ...]
+    s_min: Tuple[float, ...]
+    s_range: Tuple[float, ...]
+    s_norm_margin: Tuple[float, ...]
+    s_raw_scale: Tuple[float, ...]
+    s_cals: Tuple[bool, ...]
+    s_eff_thresh: float
+    s_offset: int
+    c_escalate: Tuple[bool, ...]
+    b_escalate: Tuple[bool, ...]
+    s_escalate: Tuple[bool, ...]
+    any_escalating_field: bool
+    is_tfidf_projector: bool
+    learned_overrides: Mapping[str, Mapping[str, Any]]
+
+
 class FastDecisionCallable:
     """Pre-bound callable compiled from a SystemOneEngine (zero lock/validation/receipt overhead)."""
 
@@ -3222,81 +3285,104 @@ class FastDecisionCallable:
         self._storage_mode = storage_mode
         self._aci_tracker = getattr(eng, "aci_tracker", None)
         self._eng_ref = eng if self._aci_tracker is not None else None
+        self._rebind_lock = threading.Lock()
         if hasattr(eng, "compile_packed_kernel"):
             kernel = eng.compile_packed_kernel(storage_mode=storage_mode)
         else:
             kernel = PackedMultiQuestionKernel.from_engine(eng, storage_mode=storage_mode)
-        self._bind_kernel(kernel, storage_mode=storage_mode)
+        self._state = self._build_state(kernel, storage_mode=storage_mode)
+
+    @staticmethod
+    def _build_state(kernel: PackedMultiQuestionKernel, *, storage_mode: str) -> _BoundCallableState:
+        W_t = np.ascontiguousarray(kernel.W_packed, dtype=np.float32)
+        b = np.ascontiguousarray(kernel.b_packed, dtype=np.float32)
+        W_t.setflags(write=False)
+        b.setflags(write=False)
+        return _BoundCallableState(
+            kernel=kernel,
+            projector=kernel.projector,
+            recency_weighted=kernel.recency_weighted,
+            is_det_proj=type(kernel.projector) is DeterministicSemanticProjector,
+            small_q=kernel.Q_total <= 8 and storage_mode == "float32",
+            W_t=W_t,
+            b=b,
+            strict=kernel.strict,
+            alpha=kernel.alpha,
+            Q_c=kernel.Q_c,
+            Q_b=kernel.Q_b,
+            Q_s=kernel.Q_s,
+            c_options=tuple(tuple(opts) for opts in kernel.c_options),
+            c_names=tuple(kernel.choice_names),
+            c_K_list=tuple(int(x) for x in kernel.c_K),
+            c_starts=tuple(int(x) for x in kernel.c_offsets),
+            c_qhats=tuple(float(x) for x in kernel.c_qhat),
+            c_cals=tuple(bool(x) for x in kernel.c_is_cal),
+            c_lacs=tuple(bool(x) for x in kernel.c_is_lac),
+            c_eff_m=tuple(float(x) for x in kernel.c_eff_m),
+            c_gamma=tuple(float(x) for x in kernel.c_gamma),
+            c_conf_floor=tuple(float(x) for x in kernel.c_conf_floor),
+            b_names=tuple(kernel.bool_names),
+            b_thresh=tuple(float(x) for x in kernel.b_thresh),
+            b_qhats=tuple(float(x) for x in kernel.b_qhat),
+            b_cals=tuple(bool(x) for x in kernel.b_is_cal),
+            b_lacs=tuple(bool(x) for x in kernel.b_is_lac),
+            b_eff_m=tuple(float(x) for x in kernel.b_eff_m),
+            b_gamma=tuple(float(x) for x in kernel.b_gamma),
+            b_conf_floor=tuple(float(x) for x in kernel.b_conf_floor),
+            b_offset=kernel.M_c,
+            s_names=tuple(kernel.score_names),
+            s_min=tuple(float(x) for x in kernel.s_min),
+            s_range=tuple(float(x) for x in kernel.s_range),
+            s_norm_margin=tuple(float(x) for x in kernel.s_norm_margin),
+            s_raw_scale=tuple(float(x) for x in kernel.s_raw_scale),
+            s_cals=tuple(bool(x) for x in kernel.s_is_cal),
+            s_eff_thresh=float(kernel.eff_score_thresh),
+            s_offset=kernel.M_c + kernel.Q_b,
+            c_escalate=tuple(bool(x) for x in kernel.c_escalate),
+            b_escalate=tuple(bool(x) for x in kernel.b_escalate),
+            s_escalate=tuple(bool(x) for x in kernel.s_escalate),
+            any_escalating_field=kernel.any_escalating_field,
+            is_tfidf_projector=kernel.is_tfidf_projector,
+            learned_overrides=kernel.learned_overrides,
+        )
 
     def _bind_kernel(self, kernel: PackedMultiQuestionKernel, *, storage_mode: str) -> None:
-        self.kernel = kernel
-        self.projector = self.kernel.projector
-        self.recency_weighted = self.kernel.recency_weighted
-        self.is_det_proj = type(self.projector) is DeterministicSemanticProjector
-        self.small_q = self.kernel.Q_total <= 8 and storage_mode == "float32"
+        self._state = self._build_state(kernel, storage_mode=storage_mode)
 
-        self.W_t = np.ascontiguousarray(self.kernel.W_packed, dtype=np.float32)
-        self.b = np.ascontiguousarray(self.kernel.b_packed, dtype=np.float32)
-        self.strict = self.kernel.strict
-        self.alpha = self.kernel.alpha
-        self.Q_c = self.kernel.Q_c
-        self.Q_b = self.kernel.Q_b
-        self.Q_s = self.kernel.Q_s
-        self.c_options = self.kernel.c_options
-        self.c_names = self.kernel.choice_names
-        self.c_K_list = [int(x) for x in self.kernel.c_K]
-        self.c_starts = [int(x) for x in self.kernel.c_offsets]
-        self.c_qhats = [float(x) for x in self.kernel.c_qhat]
-        self.c_cals = [bool(x) for x in self.kernel.c_is_cal]
-        self.c_lacs = [bool(x) for x in self.kernel.c_is_lac]
-        self.c_eff_m = [float(x) for x in self.kernel.c_eff_m]
-        self.c_gamma = [float(x) for x in self.kernel.c_gamma]
-        self.c_conf_floor = [float(x) for x in self.kernel.c_conf_floor]
-
-        self.b_names = self.kernel.bool_names
-        self.b_thresh = [float(x) for x in self.kernel.b_thresh]
-        self.b_qhats = [float(x) for x in self.kernel.b_qhat]
-        self.b_cals = [bool(x) for x in self.kernel.b_is_cal]
-        self.b_lacs = [bool(x) for x in self.kernel.b_is_lac]
-        self.b_eff_m = [float(x) for x in self.kernel.b_eff_m]
-        self.b_gamma = [float(x) for x in self.kernel.b_gamma]
-        self.b_conf_floor = [float(x) for x in self.kernel.b_conf_floor]
-        self.b_offset = self.kernel.M_c
-
-        self.s_names = self.kernel.score_names
-        self.s_min = [float(x) for x in self.kernel.s_min]
-        self.s_range = [float(x) for x in self.kernel.s_range]
-        self.s_norm_margin = [float(x) for x in self.kernel.s_norm_margin]
-        self.s_raw_scale = [float(x) for x in self.kernel.s_raw_scale]
-        self.s_cals = [bool(x) for x in self.kernel.s_is_cal]
-        self.s_eff_thresh = float(self.kernel.eff_score_thresh)
-        self.s_offset = self.kernel.M_c + self.Q_b
-        self.c_escalate = tuple(bool(x) for x in self.kernel.c_escalate)
-        self.b_escalate = tuple(bool(x) for x in self.kernel.b_escalate)
-        self.s_escalate = tuple(bool(x) for x in self.kernel.s_escalate)
-        self.any_escalating_field = self.kernel.any_escalating_field
-        self.is_tfidf_projector = self.kernel.is_tfidf_projector
-        self.learned_overrides = self.kernel.learned_overrides
+    def __getattr__(self, name: str) -> Any:
+        state = object.__getattribute__(self, "_state")
+        return getattr(state, name)
 
     def __call__(
         self, prompt: Optional[str] = None, *, embedding: Optional[np.ndarray] = None
     ) -> FastDecisionOutput:
-        if self._aci_tracker is not None and (
-            getattr(self._aci_tracker, "margin_floor", None) is not None
-            or float(self._aci_tracker.alpha_t) != self.alpha
+        st = self._state
+        tracker = self._aci_tracker
+        if tracker is not None and (
+            getattr(tracker, "margin_floor", None) is not None
+            or float(tracker.alpha_t) != st.alpha
         ):
-            assert self._eng_ref is not None
-            if hasattr(self._eng_ref, "compile_packed_kernel"):
-                new_kernel = self._eng_ref.compile_packed_kernel(storage_mode=self._storage_mode)
-            else:
-                new_kernel = PackedMultiQuestionKernel.from_engine(
-                    self._eng_ref, storage_mode=self._storage_mode
-                )
-            self._bind_kernel(new_kernel, storage_mode=self._storage_mode)
+            with self._rebind_lock:
+                st = self._state
+                if (
+                    getattr(tracker, "margin_floor", None) is not None
+                    or float(tracker.alpha_t) != st.alpha
+                ):
+                    assert self._eng_ref is not None
+                    if hasattr(self._eng_ref, "compile_packed_kernel"):
+                        new_kernel = self._eng_ref.compile_packed_kernel(
+                            storage_mode=self._storage_mode
+                        )
+                    else:
+                        new_kernel = PackedMultiQuestionKernel.from_engine(
+                            self._eng_ref, storage_mode=self._storage_mode
+                        )
+                    st = self._build_state(new_kernel, storage_mode=self._storage_mode)
+                    self._state = st
         if embedding is None:
             if prompt is None:
                 raise ValueError("Either prompt or embedding must be provided")
-            emb = self.kernel.encode_one(prompt)
+            emb = st.kernel.encode_one(prompt)
         else:
             emb = (
                 embedding
@@ -3305,46 +3391,46 @@ class FastDecisionCallable:
             )
             if emb.ndim != 1:
                 emb = emb.ravel()
-            if emb.shape[0] != self.kernel.dimension:
+            if emb.shape[0] != st.kernel.dimension:
                 raise ValueError(
-                    f"embedding dimension mismatch: expected {self.kernel.dimension}, got {emb.shape[0]}"
+                    f"embedding dimension mismatch: expected {st.kernel.dimension}, got {emb.shape[0]}"
                 )
 
         has_prompt_override = bool(
             embedding is None
-            and self.learned_overrides
+            and st.learned_overrides
             and isinstance(prompt, str)
             and prompt.strip()
-            and (" ".join(prompt.strip().casefold().split()) in self.learned_overrides)
+            and (" ".join(prompt.strip().casefold().split()) in st.learned_overrides)
         )
-        if not self.small_q or has_prompt_override:
-            out = self.kernel.forward_embeddings(
+        if not st.small_q or has_prompt_override:
+            out = st.kernel.forward_embeddings(
                 emb, prompts=(prompt,) if has_prompt_override else None
             )
             vals: Dict[str, Any] = {}
             confs: Dict[str, float] = {}
-            for ci, fn in enumerate(self.c_names):
-                vals[fn] = self.c_options[ci][int(out["best_idx"][0, ci])]
+            for ci, fn in enumerate(st.c_names):
+                vals[fn] = st.c_options[ci][int(out["best_idx"][0, ci])]
                 confs[fn] = float(out["c_conf"][0, ci])
-            for bi, fn in enumerate(self.b_names):
+            for bi, fn in enumerate(st.b_names):
                 vals[fn] = bool(out["b_val"][0, bi])
                 confs[fn] = float(out["b_conf"][0, bi])
-            for si, fn in enumerate(self.s_names):
+            for si, fn in enumerate(st.s_names):
                 vals[fn] = float(out["s_val"][0, si])
                 confs[fn] = float(out["s_conf"][0, si])
             return FastDecisionOutput(vals, confs, bool(out["is_ambiguous"][0]))
 
-        z_list: List[float] = (emb @ self.W_t + self.b).tolist()
+        z_list: List[float] = (emb @ st.W_t + st.b).tolist()
         vals = {}
         confs = {}
-        ambig = bool(self.is_tfidf_projector and not bool(np.any(emb)) and self.any_escalating_field)
+        ambig = bool(st.is_tfidf_projector and not bool(np.any(emb)) and st.any_escalating_field)
         exp = math.exp
-        strict = self.strict
+        strict = st.strict
 
-        for ci in range(self.Q_c):
-            fn = self.c_names[ci]
-            K = self.c_K_list[ci]
-            s0 = self.c_starts[ci]
+        for ci in range(st.Q_c):
+            fn = st.c_names[ci]
+            K = st.c_K_list[ci]
+            s0 = st.c_starts[ci]
             z_slice = z_list[s0 : s0 + K]
             m = max(z_slice)
             exps = [exp(v - m) for v in z_slice]
@@ -3356,26 +3442,26 @@ class FastDecisionCallable:
                 if probs[j] > best_p:
                     best_p = probs[j]
                     best_i = j
-            vals[fn] = self.c_options[ci][best_i]
+            vals[fn] = st.c_options[ci][best_i]
             confs[fn] = best_p
 
             ps: Optional[List[float]] = None
-            if not self.c_cals[ci]:
+            if not st.c_cals[ci]:
                 if strict:
                     cnt = K
                 else:
                     ps = sorted(probs, reverse=True)
                     cs = 0.0
                     cnt = 0
-                    thr = 1.0 - self.alpha - 1e-7
+                    thr = 1.0 - st.alpha - 1e-7
                     for pv in ps:
                         cs += pv
                         cnt += 1
                         if cs >= thr:
                             break
             else:
-                qh = self.c_qhats[ci]
-                if self.c_lacs[ci]:
+                qh = st.c_qhats[ci]
+                if st.c_lacs[ci]:
                     cnt = sum(1 for pv in probs if (1.0 - pv) <= qh + 1e-7)
                 elif strict:
                     ps = sorted(probs, reverse=True)
@@ -3399,13 +3485,13 @@ class FastDecisionCallable:
 
             field_ambig = False
             if strict:
-                if (not self.c_cals[ci]) or (cnt != 1):
+                if (not st.c_cals[ci]) or (cnt != 1):
                     field_ambig = True
             else:
                 if cnt == 0:
                     field_ambig = True
                 elif cnt > 1:
-                    eff_m = self.c_eff_m[ci]
+                    eff_m = st.c_eff_m[ci]
                     if eff_m > 0.0:
                         if ps is None:
                             ps = sorted(probs, reverse=True)
@@ -3415,37 +3501,37 @@ class FastDecisionCallable:
                         odds = top_p / (run_p if run_p > 1e-6 else 1e-6)
                         if not (
                             (marg >= eff_m)
-                            and (top_p >= self.c_conf_floor[ci])
-                            and (odds >= self.c_gamma[ci])
+                            and (top_p >= st.c_conf_floor[ci])
+                            and (odds >= st.c_gamma[ci])
                         ):
                             field_ambig = True
                     else:
                         field_ambig = True
-            if field_ambig and self.c_escalate[ci]:
+            if field_ambig and st.c_escalate[ci]:
                 ambig = True
 
-        for bi in range(self.Q_b):
-            fn = self.b_names[bi]
-            zv = z_list[self.b_offset + bi]
+        for bi in range(st.Q_b):
+            fn = st.b_names[bi]
+            zv = z_list[st.b_offset + bi]
             if zv > 50.0:
                 zv = 50.0
             elif zv < -50.0:
                 zv = -50.0
             pt = 1.0 / (1.0 + exp(-zv))
             pf = 1.0 - pt
-            bv = pt >= self.b_thresh[bi]
+            bv = pt >= st.b_thresh[bi]
             vals[fn] = bv
             confs[fn] = pt if bv else pf
 
             top = pt if pt >= pf else pf
-            if not self.b_cals[bi]:
+            if not st.b_cals[bi]:
                 if strict:
                     cnt = 2
                 else:
-                    cnt = 1 if top >= (1.0 - self.alpha - 1e-7) else 2
+                    cnt = 1 if top >= (1.0 - st.alpha - 1e-7) else 2
             else:
-                qh = self.b_qhats[bi]
-                if self.b_lacs[bi]:
+                qh = st.b_qhats[bi]
+                if st.b_lacs[bi]:
                     cnt = (1 if (1.0 - pt) <= qh + 1e-7 else 0) + (
                         1 if (1.0 - pf) <= qh + 1e-7 else 0
                     )
@@ -3456,42 +3542,42 @@ class FastDecisionCallable:
 
             field_ambig = False
             if strict:
-                if (not self.b_cals[bi]) or (cnt != 1):
+                if (not st.b_cals[bi]) or (cnt != 1):
                     field_ambig = True
             else:
                 if cnt == 0:
                     field_ambig = True
                 elif cnt > 1:
-                    eff_m = self.b_eff_m[bi]
+                    eff_m = st.b_eff_m[bi]
                     if eff_m > 0.0:
                         bot = 1.0 - top
                         marg = top - bot
                         odds = top / (bot if bot > 1e-6 else 1e-6)
                         if not (
                             (marg >= eff_m)
-                            and (top >= self.b_conf_floor[bi])
-                            and (odds >= self.b_gamma[bi])
+                            and (top >= st.b_conf_floor[bi])
+                            and (odds >= st.b_gamma[bi])
                         ):
                             field_ambig = True
                     else:
                         field_ambig = True
-            if field_ambig and self.b_escalate[bi]:
+            if field_ambig and st.b_escalate[bi]:
                 ambig = True
 
-        for si in range(self.Q_s):
-            fn = self.s_names[si]
-            zv = z_list[self.s_offset + si]
+        for si in range(st.Q_s):
+            fn = st.s_names[si]
+            zv = z_list[st.s_offset + si]
             zv_c = 50.0 if zv > 50.0 else (-50.0 if zv < -50.0 else zv)
             ps = 1.0 / (1.0 + exp(-zv_c))
-            vals[fn] = self.s_min[si] + self.s_range[si] * ps
-            z_raw = zv * self.s_raw_scale[si]
+            vals[fn] = st.s_min[si] + st.s_range[si] * ps
+            z_raw = zv * st.s_raw_scale[si]
             z_rc = 50.0 if z_raw > 50.0 else (-50.0 if z_raw < -50.0 else z_raw)
             ps_raw = 1.0 / (1.0 + exp(-z_rc))
             confs[fn] = ps_raw if ps_raw >= 0.5 else (1.0 - ps_raw)
             if (
                 strict
-                and self.s_escalate[si]
-                and ((not self.s_cals[si]) or (self.s_norm_margin[si] > self.s_eff_thresh))
+                and st.s_escalate[si]
+                and ((not st.s_cals[si]) or (st.s_norm_margin[si] > st.s_eff_thresh))
             ):
                 ambig = True
 
