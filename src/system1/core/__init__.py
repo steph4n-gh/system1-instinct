@@ -13,7 +13,12 @@ SQLite (ActionLedger), or disk I/O.
 
 from __future__ import annotations
 
-from system1.core.text import TfidfProjector
+from system1.core.text import (
+    MAX_PRAG_FEATURES,
+    PragmaticCompositeProjector,
+    TfidfProjector,
+    extract_pragmatic_features,
+)
 
 from system1.core.schema import (
     BooleanField,
@@ -48,9 +53,13 @@ from system1.core.model import (
 from system1.core.embeddings import (
     HybridProjector,
     HybridSemanticProjector,
+    RouterDecisionResult,
+    SmartsCrossZeroFewRouter,
     StaticEmbeddingTable,
     SubwordSemanticEmbeddings,
     UnifiedHybridProjector,
+    clear_embedding_caches,
+    set_embedding_cache_maxsize,
 )
 
 # Core submodules
@@ -75,13 +84,20 @@ __all__ = [
     "SchemaMeta",
     # Evaluation Kernel & Projectors
     "DeterministicSemanticProjector",
+    "MAX_PRAG_FEATURES",
     "TfidfProjector",
+    "PragmaticCompositeProjector",
+    "extract_pragmatic_features",
     "LocalNeuralProjector",
     "HybridProjector",
     "HybridSemanticProjector",
     "UnifiedHybridProjector",
+    "RouterDecisionResult",
+    "SmartsCrossZeroFewRouter",
     "SubwordSemanticEmbeddings",
     "StaticEmbeddingTable",
+    "clear_embedding_caches",
+    "set_embedding_cache_maxsize",
     "SystemOneModel",
     "DecisionFieldHead",
     "RawFieldEvaluation",

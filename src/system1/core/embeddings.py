@@ -7,11 +7,13 @@ no workload-independent latency bound is asserted."""
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import json
 import math
 import re
+import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 
@@ -86,8 +88,10 @@ _ANCHOR_STOPWORDS: frozenset[str] = frozenset({
 })
 
 
-@lru_cache(maxsize=65536)
-def _stem_word(word: str) -> str:
+_EMBEDDING_CACHE_MAXSIZE = 16384
+
+
+def _stem_word_impl(word: str) -> str:
     """Deterministic Porter-style English morphological stemmer for cold-start alignment."""
     w = word.lower().strip()
     if len(w) <= 3 or not w.isalpha():
@@ -136,6 +140,18 @@ def _stem_word(word: str) -> str:
     if len(w) >= 4 and w.endswith("ll"):
         w = w[:-1]
     return w
+
+
+_stem_word_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_stem_word_impl)
+
+
+def _stem_word(word: str) -> str:
+    """Deterministic Porter-style English morphological stemmer with bounded configurable cache."""
+    return _stem_word_cached(word)
+
+
+_stem_word.cache_clear = lambda: _stem_word_cached.cache_clear()  # type: ignore[attr-defined]
+_stem_word.cache_info = lambda: _stem_word_cached.cache_info()  # type: ignore[attr-defined]
 
 
 _CLAUSE_SPLIT_RE = re.compile(r"[.!?;,]+")
@@ -841,10 +857,65 @@ def match_semantic_concepts(text: str) -> Dict[str, float]:
     return dict(scores)
 
 
-@lru_cache(maxsize=65536)
-def _cached_token_hash(token_norm: str, vocab_size: int) -> int:
+def _cached_token_hash_impl(token_norm: str, vocab_size: int) -> int:
     h = hashlib.sha256(token_norm.encode("utf-8")).digest()
     return int.from_bytes(h[:4], "big") % vocab_size
+
+
+_cached_token_hash_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_cached_token_hash_impl)
+
+
+def _cached_token_hash(token_norm: str, vocab_size: int) -> int:
+    return _cached_token_hash_cached(token_norm, vocab_size)
+
+
+_cached_token_hash.cache_clear = lambda: _cached_token_hash_cached.cache_clear()  # type: ignore[attr-defined]
+_cached_token_hash.cache_info = lambda: _cached_token_hash_cached.cache_info()  # type: ignore[attr-defined]
+
+
+def _sparse_word_hashes_impl(token: str, sparse_dim: int, count: int = 4) -> Tuple[Tuple[int, float], ...]:
+    h = hashlib.sha256(f"word:{token}".encode("utf-8")).digest()
+    res: List[Tuple[int, float]] = []
+    for i in range(count):
+        chunk = h[i * 4 : (i + 1) * 4]
+        val = int.from_bytes(chunk, byteorder="big", signed=False)
+        idx = val % sparse_dim
+        sign = 1.0 if ((val >> 16) & 1) == 0 else -1.0
+        res.append((idx, sign))
+    return tuple(res)
+
+
+def _sparse_single_hash_impl(prefix_token: str, sparse_dim: int) -> Tuple[int, float]:
+    h = hashlib.sha256(prefix_token.encode("utf-8")).digest()
+    idx = int.from_bytes(h[:4], "big") % sparse_dim
+    sign = 1.0 if (h[4] & 1) == 0 else -1.0
+    return idx, sign
+
+
+_sparse_word_hashes_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_sparse_word_hashes_impl)
+_sparse_single_hash_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_sparse_single_hash_impl)
+
+
+def set_embedding_cache_maxsize(maxsize: int) -> None:
+    """Update maxsize for module-level token/stem/subword LRU caches and flush old entries."""
+    global _EMBEDDING_CACHE_MAXSIZE
+    global _stem_word_cached, _cached_token_hash_cached
+    global _sparse_word_hashes_cached, _sparse_single_hash_cached
+    if type(maxsize) is not int or maxsize < 0:
+        raise ValueError(f"maxsize must be a non-negative integer, got {maxsize}")
+    _EMBEDDING_CACHE_MAXSIZE = int(maxsize)
+    _stem_word_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_stem_word_impl)
+    _cached_token_hash_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_cached_token_hash_impl)
+    _sparse_word_hashes_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_sparse_word_hashes_impl)
+    _sparse_single_hash_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_sparse_single_hash_impl)
+
+
+def clear_embedding_caches() -> None:
+    """Clear all module-level token/stem/subword LRU caches."""
+    _stem_word_cached.cache_clear()
+    _cached_token_hash_cached.cache_clear()
+    _sparse_word_hashes_cached.cache_clear()
+    _sparse_single_hash_cached.cache_clear()
 
 
 class SubwordSemanticEmbeddings:
@@ -1947,25 +2018,12 @@ class HybridProjector:
     fit = _HybridFitDescriptor()
 
     @staticmethod
-    @lru_cache(maxsize=65536)
     def _sparse_word_hashes(token: str, sparse_dim: int, count: int = 4) -> Tuple[Tuple[int, float], ...]:
-        h = hashlib.sha256(f"word:{token}".encode("utf-8")).digest()
-        res: List[Tuple[int, float]] = []
-        for i in range(count):
-            chunk = h[i * 4 : (i + 1) * 4]
-            val = int.from_bytes(chunk, byteorder="big", signed=False)
-            idx = val % sparse_dim
-            sign = 1.0 if ((val >> 16) & 1) == 0 else -1.0
-            res.append((idx, sign))
-        return tuple(res)
+        return _sparse_word_hashes_cached(token, sparse_dim, count)
 
     @staticmethod
-    @lru_cache(maxsize=65536)
     def _sparse_single_hash(prefix_token: str, sparse_dim: int) -> Tuple[int, float]:
-        h = hashlib.sha256(prefix_token.encode("utf-8")).digest()
-        idx = int.from_bytes(h[:4], "big") % sparse_dim
-        sign = 1.0 if (h[4] & 1) == 0 else -1.0
-        return idx, sign
+        return _sparse_single_hash_cached(prefix_token, sparse_dim)
 
     def _hash_to_sparse_vec(
         self,
@@ -2667,12 +2725,697 @@ HybridSemanticProjector = HybridProjector
 UnifiedHybridProjector = HybridProjector
 
 
+_BM25_WORD_SPLIT_RE = re.compile(r"[a-z0-9]+")
+_BM25_CRIT_SPLIT_RE = re.compile(r"[;.]+")
+_BM25_ITEM_SPLIT_RE = re.compile(r"[;]+")
+_BM25_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "to", "of", "in", "on", "at", "for", "with", "by", "from", "as", "into",
+    "or", "and", "that", "this", "these", "those", "it", "its", "my", "your",
+    "our", "their", "we", "you", "i", "me", "us", "they", "them", "do", "does",
+    "did", "can", "could", "will", "would", "should", "may", "might", "please",
+    "how", "what", "when", "where", "why", "which", "who", "whom", "about",
+    "any", "all", "if", "so", "than", "then", "also", "just", "only", "already",
+    "needs", "need", "related", "issues", "problems", "requests", "questions",
+    "handling", "select", "classify", "appropriate", "category", "option",
+})
+
+
+def _extract_bm25_feats(
+    text: str,
+    *,
+    include_char: bool = True,
+    include_prag: bool = True,
+) -> Dict[str, float]:
+    from system1.core.text import _stem_word as _text_stem_word, extract_pragmatic_features
+
+    feats: Dict[str, float] = {}
+    words = [w for w in _BM25_WORD_SPLIT_RE.findall(text.lower()) if len(w) >= 2]
+    prev_st: Optional[str] = None
+    for w in words:
+        if w in _BM25_STOPWORDS:
+            prev_st = None
+            continue
+        wk = f"w_{w}"
+        feats[wk] = feats.get(wk, 0.0) + 1.0
+        st = _text_stem_word(w)
+        if len(st) >= 3 and st not in _BM25_STOPWORDS:
+            sk = f"s_{st}"
+            feats[sk] = feats.get(sk, 0.0) + 0.90
+            if prev_st is not None:
+                bk = f"bg_{prev_st}_{st}"
+                feats[bk] = feats.get(bk, 0.0) + 1.15
+            prev_st = st
+        else:
+            prev_st = None
+        if include_char and len(w) >= 4:
+            padded = f"<{w}>"
+            for i in range(len(padded) - 3):
+                ck = f"c4_{padded[i : i + 4]}"
+                feats[ck] = feats.get(ck, 0.0) + 0.16
+
+    if include_prag and ("{" in text or "=" in text or any(c.isdigit() for c in text)):
+        raw_prag = extract_pragmatic_features(
+            text,
+            enable_negation=False,
+            enable_num_http=True,
+            enable_json_kv=True,
+        )
+        for term, val in raw_prag.items():
+            if term.startswith(("HTTP_", "KV_")):
+                feats[term] = feats.get(term, 0.0) + float(val)
+    return feats
+
+
+def _split_criterion_units(opt: str, desc_val: Any) -> List[str]:
+    units: List[str] = []
+    clean_opt = opt.replace("_", " ").replace("-", " ")
+    if isinstance(desc_val, (list, tuple)):
+        for item in desc_val:
+            for sub in _BM25_ITEM_SPLIT_RE.split(str(item)):
+                if sub.strip():
+                    units.append(sub.strip())
+    elif isinstance(desc_val, str) and desc_val.strip():
+        for sub in _BM25_CRIT_SPLIT_RE.split(desc_val):
+            if sub.strip():
+                units.append(sub.strip())
+    return units or [clean_opt]
+
+
+def _solve_dual_or_primal_ridge_np(
+    X: np.ndarray,
+    Y: np.ndarray,
+    reg: float,
+    sample_weights: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Closed-form weighted multi-output ridge regression in pure NumPy."""
+    n, d = X.shape
+    if sample_weights is None:
+        w = np.full(n, 1.0 / max(1, n), dtype=np.float64)
+    else:
+        w_raw = np.maximum(1e-6, np.asarray(sample_weights, dtype=np.float64))
+        w = w_raw / np.sum(w_raw)
+    mu_x = (w[:, None] * X).sum(axis=0)
+    mu_y = (w[:, None] * Y).sum(axis=0)
+    Xc = X - mu_x
+    Yc = Y - mu_y
+    sw = np.sqrt(w * float(n))
+    Xw = Xc * sw[:, None]
+    Yw = Yc * sw[:, None]
+    if n < d:
+        kmat = Xw @ Xw.T
+        kmat[np.diag_indices(n)] += float(reg)
+        dual = np.linalg.solve(kmat, Yw)
+        U = (Xw.T @ dual).T
+    else:
+        xtx = Xw.T @ Xw
+        xtx[np.diag_indices(d)] += float(reg)
+        U = np.linalg.solve(xtx, Xw.T @ Yw).T
+    c = mu_y - U @ mu_x
+    return U, c
+
+
+@dataclass(frozen=True)
+class RouterDecisionResult:
+    """Lightweight isolated zero/few-shot decision output matching DecisionResult attributes."""
+
+    schema_name: str
+    schema_digest: str
+    prompt: str
+    values: Dict[str, Any]
+    confidences: Dict[str, float]
+    probabilities: Dict[str, Dict[str, float]]
+    conformal_sets: Dict[str, Tuple[Any, ...]]
+    is_ambiguous: bool
+    latency_ms: float
+    alpha: float = 0.05
+    receipt: Optional[Any] = None
+
+
+class SmartsCrossZeroFewRouter:
+    """Zero-pretrained-weight 0/few-shot router combining BM25F, MaxSim criteria, concept interaction, and ridge."""
+
+    def __init__(
+        self,
+        schema_cls: Any,
+        field_name: Optional[str] = None,
+        options: Optional[Sequence[str]] = None,
+        descriptions: Optional[Mapping[str, Any]] = None,
+        instruction: str = "",
+        *,
+        disable_concept_gate: bool = False,
+        dimension: int = 384,
+    ) -> None:
+        from system1.core.model import SystemOneModel
+        from system1.core.schema import BooleanField, DecisionSchema
+
+        if isinstance(schema_cls, DecisionSchema):
+            s_inst = schema_cls
+            self.schema_name = s_inst.schema_name
+        elif isinstance(schema_cls, type) and issubclass(schema_cls, DecisionSchema):
+            s_inst = schema_cls()
+            self.schema_name = schema_cls.__name__
+        else:
+            raise TypeError(f"Expected DecisionSchema subclass or instance, got {type(schema_cls).__name__}")
+
+        if field_name is None:
+            field_name = next(iter(s_inst.fields))
+        if field_name not in s_inst.fields:
+            raise KeyError(f"Field {field_name!r} not found in schema")
+
+        f_def = s_inst.fields[field_name]
+        self.is_boolean = isinstance(f_def, BooleanField)
+        if options is None:
+            if self.is_boolean:
+                options = ("False", "True")
+            elif hasattr(f_def, "options"):
+                options = list(f_def.options)
+            else:
+                raise ValueError(f"Field {field_name!r} does not define discrete options")
+        if descriptions is None:
+            if self.is_boolean:
+                descriptions = {
+                    "False": f_def.false_description,
+                    "True": f_def.true_description,
+                }
+            else:
+                descriptions = dict(getattr(f_def, "descriptions", {}) or {})
+        if not instruction:
+            instruction = str(getattr(f_def, "description", "") or "")
+
+        self.options: List[str] = [str(o) for o in options]
+        if not self.options:
+            raise ValueError("options must not be empty")
+        self.K = len(self.options)
+        self.opt_to_idx: Dict[str, int] = {o: i for i, o in enumerate(self.options)}
+        self.descriptions = dict(descriptions)
+        self.instruction = instruction
+        self.field_name = field_name
+        self.disable_concept_gate = bool(disable_concept_gate)
+        self.schema_digest = s_inst.schema_digest()
+        self.rich_descriptions = (
+            float(np.mean([len(str(self.descriptions.get(o, "")).split()) for o in self.options])) >= 4.0
+        )
+        self.s1_model = SystemOneModel(s_inst, dimension=dimension, backend="numpy")
+        self._compile_bm25f_and_concepts()
+        self.fewshot_active = False
+        self.k_per_class = 0
+        self.few_proj: Optional[Any] = None
+        self.few_vocab: Dict[str, int] = {}
+        self.few_W: Optional[np.ndarray] = None
+        self.few_b: Optional[np.ndarray] = None
+        self.few_protos: Optional[np.ndarray] = None
+        self.few_X: Optional[np.ndarray] = None
+        self.few_y: Optional[np.ndarray] = None
+        self.few_idf: Optional[np.ndarray] = None
+        self._few_examples: List[Tuple[str, str]] = []
+        self._calibrated = False
+        self._conformal_q = 1.0
+        self._cal_alpha = 0.10
+
+    def _normalize_label_str(self, label: Any) -> str:
+        if self.is_boolean and isinstance(label, bool):
+            key = "True" if label else "False"
+        else:
+            key = str(label)
+        if key not in self.opt_to_idx:
+            raise ValueError(f"Unknown label {label!r}; expected one of {self.options}")
+        return key
+
+    def _public_value(self, label_str: str) -> Any:
+        if self.is_boolean:
+            if label_str == "True":
+                return True
+            if label_str == "False":
+                return False
+        return label_str
+
+    def _compile_bm25f_and_concepts(self) -> None:
+        K = self.K
+        name_feats: List[Dict[str, float]] = []
+        pool_feats: List[Dict[str, float]] = []
+        crit_units: List[Tuple[int, Dict[str, float], Dict[str, float]]] = []
+        opt_concept_pool: List[Counter[str]] = [Counter() for _ in range(K)]
+
+        for c_idx, opt in enumerate(self.options):
+            clean_opt = opt.replace("_", " ").replace("-", " ")
+            nf = _extract_bm25_feats(clean_opt, include_char=True)
+            name_feats.append(nf)
+            units = _split_criterion_units(opt, self.descriptions.get(opt, ""))
+            pf: Counter[str] = Counter()
+            for k, v in nf.items():
+                pf[k] += v * 1.5
+            for ck, cv in match_semantic_concepts(clean_opt).items():
+                opt_concept_pool[c_idx][ck] += float(cv) * 1.2
+            if len(units) == 1:
+                uf = _extract_bm25_feats(f"{clean_opt} {units[0]}", include_char=True)
+                uc = dict(match_semantic_concepts(f"{clean_opt}: {units[0]}"))
+                crit_units.append((c_idx, uf, uc))
+                for k, v in uf.items():
+                    pf[k] += v
+                for ck, cv in uc.items():
+                    opt_concept_pool[c_idx][ck] += float(cv)
+            else:
+                for u in units:
+                    uf = _extract_bm25_feats(u, include_char=True)
+                    uc = dict(match_semantic_concepts(f"{clean_opt}: {u}"))
+                    crit_units.append((c_idx, uf, uc))
+                    for k, v in uf.items():
+                        pf[k] += v
+                    for ck, cv in uc.items():
+                        opt_concept_pool[c_idx][ck] += float(cv)
+            pool_feats.append(dict(pf))
+
+        self.M = len(crit_units)
+        self.crit_opt_idx = np.array([c for c, _, _ in crit_units], dtype=np.int32)
+        self.opt_to_crit_idxs = [np.where(self.crit_opt_idx == c)[0] for c in range(K)]
+
+        all_ck = sorted({ck for cp in opt_concept_pool for ck in cp})
+        if self.disable_concept_gate:
+            self.concept_gate = 1.0
+        elif all_ck:
+            c_mat = np.zeros((K, len(all_ck)), dtype=np.float64)
+            ck_to_i = {ck: i for i, ck in enumerate(all_ck)}
+            for c_idx, cp in enumerate(opt_concept_pool):
+                for ck, cv in cp.items():
+                    c_mat[c_idx, ck_to_i[ck]] = cv
+            max_strength = float(np.mean(np.max(c_mat, axis=1)))
+            norms = np.linalg.norm(c_mat, axis=1, keepdims=True)
+            c_unit = c_mat / np.maximum(1e-8, norms)
+            sim_mat = c_unit @ c_unit.T
+            off_diag = (float(np.sum(sim_mat)) - float(np.trace(sim_mat))) / max(1, K * (K - 1))
+            ortho = max(0.0, 1.0 - off_diag)
+            self.concept_gate = ortho * min(1.0, max(0.0, (max_strength - 2.5) / 8.0))
+        else:
+            self.concept_gate = 0.0
+
+        df_opt: Counter[str] = Counter()
+        for pf in pool_feats:
+            for t in pf:
+                df_opt[t] += 1
+        df_crit: Counter[str] = Counter()
+        for _, uf, _ in crit_units:
+            for t in uf:
+                df_crit[t] += 1
+
+        def _idf(df: int, n_docs: int) -> float:
+            return math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+
+        avg_name = max(1.0, float(np.mean([sum(f.values()) for f in name_feats])))
+        avg_pool = max(1.0, float(np.mean([sum(f.values()) for f in pool_feats])))
+        avg_crit = max(1.0, float(np.mean([sum(f.values()) for _, f, _ in crit_units])))
+        k1, b_field = 1.2, 0.45
+
+        self.opt_lex_tbl: Dict[str, np.ndarray] = {}
+        self.crit_lex_tbl: Dict[str, np.ndarray] = {}
+        for t in set(df_opt.keys()) | set(df_crit.keys()):
+            idf = 0.65 * _idf(df_opt.get(t, 0), K) + 0.35 * _idf(df_crit.get(t, 0), max(1, self.M))
+            v_opt = np.zeros(K, dtype=np.float64)
+            for c_idx in range(K):
+                tf_n = name_feats[c_idx].get(t, 0.0)
+                if tf_n > 0.0:
+                    norm_n = (1.0 - b_field) + b_field * (sum(name_feats[c_idx].values()) / avg_name)
+                    v_opt[c_idx] += 2.3 * (tf_n * (k1 + 1.0)) / (tf_n + k1 * norm_n)
+                tf_p = pool_feats[c_idx].get(t, 0.0)
+                if tf_p > 0.0:
+                    norm_p = (1.0 - b_field) + b_field * (sum(pool_feats[c_idx].values()) / avg_pool)
+                    v_opt[c_idx] += 1.2 * (tf_p * (k1 + 1.0)) / (tf_p + k1 * norm_p)
+            if np.any(v_opt > 0.0):
+                self.opt_lex_tbl[t] = idf * v_opt
+
+            v_crit = np.zeros(self.M, dtype=np.float64)
+            any_c = False
+            for m_idx, (_, uf, _) in enumerate(crit_units):
+                tf_u = uf.get(t, 0.0)
+                if tf_u > 0.0:
+                    any_c = True
+                    norm_u = (1.0 - 0.50) + 0.50 * (sum(uf.values()) / avg_crit)
+                    v_crit[m_idx] = idf * (tf_u * (k1 + 1.0)) / (tf_u + k1 * norm_u)
+            if any_c:
+                self.crit_lex_tbl[t] = v_crit
+
+        opt_sq = np.zeros(K, dtype=np.float64)
+        for v in self.opt_lex_tbl.values():
+            opt_sq += v * v
+        opt_inv = 1.0 / np.maximum(1e-6, np.sqrt(opt_sq))
+        for t in self.opt_lex_tbl:
+            self.opt_lex_tbl[t] *= opt_inv
+
+        crit_sq = np.zeros(self.M, dtype=np.float64)
+        for v in self.crit_lex_tbl.values():
+            crit_sq += v * v
+        crit_inv = 1.0 / np.maximum(1e-6, np.sqrt(crit_sq))
+        for t in self.crit_lex_tbl:
+            self.crit_lex_tbl[t] *= crit_inv
+
+        df_co: Counter[str] = Counter()
+        for cp in opt_concept_pool:
+            for ck in cp:
+                df_co[ck] += 1
+        df_cc: Counter[str] = Counter()
+        for _, _, uc in crit_units:
+            for ck in uc:
+                df_cc[ck] += 1
+
+        self.opt_concept_tbl: Dict[str, np.ndarray] = {}
+        self.crit_concept_tbl: Dict[str, np.ndarray] = {}
+        for ck in set(df_co.keys()) | set(df_cc.keys()):
+            idf_ck = 0.65 * _idf(df_co.get(ck, 0), K) + 0.35 * _idf(df_cc.get(ck, 0), max(1, self.M))
+            vo = np.array(
+                [
+                    idf_ck * math.log1p(opt_concept_pool[c].get(ck, 0.0))
+                    if opt_concept_pool[c].get(ck, 0.0) > 0
+                    else 0.0
+                    for c in range(K)
+                ],
+                dtype=np.float64,
+            )
+            if np.any(vo > 0.0):
+                self.opt_concept_tbl[ck] = vo
+            vc = np.zeros(self.M, dtype=np.float64)
+            any_cc = False
+            for m_idx, (_, _, uc) in enumerate(crit_units):
+                val = uc.get(ck, 0.0)
+                if val > 0.0:
+                    any_cc = True
+                    vc[m_idx] = idf_ck * math.log1p(val)
+            if any_cc:
+                self.crit_concept_tbl[ck] = vc
+
+        oc_sq = np.zeros(K, dtype=np.float64)
+        for v in self.opt_concept_tbl.values():
+            oc_sq += v * v
+        oc_inv = 1.0 / np.maximum(1e-6, np.sqrt(oc_sq))
+        for ck in self.opt_concept_tbl:
+            self.opt_concept_tbl[ck] *= oc_inv
+
+        cc_sq = np.zeros(self.M, dtype=np.float64)
+        for v in self.crit_concept_tbl.values():
+            cc_sq += v * v
+        cc_inv = 1.0 / np.maximum(1e-6, np.sqrt(cc_sq))
+        for ck in self.crit_concept_tbl:
+            self.crit_concept_tbl[ck] *= cc_inv
+
+    def _featurize_with_concepts(self, lex_feats: Mapping[str, float], q_concepts: Mapping[str, float]) -> Dict[str, float]:
+        feats = dict(lex_feats)
+        if self.concept_gate > 0.15:
+            for ck, cv in q_concepts.items():
+                feats[f"CNC_{ck}"] = float(cv) * 1.4
+        return feats
+
+    def _vectorize_few(self, feats: Mapping[str, float]) -> np.ndarray:
+        vec = np.zeros(len(self.few_vocab), dtype=np.float64)
+        vocab = self.few_vocab
+        idf = self.few_idf
+        for t, w in feats.items():
+            idx = vocab.get(t)
+            if idx is not None and idf is not None:
+                vec[idx] = math.log1p(w) * idf[idx]
+        nrm = float(np.linalg.norm(vec))
+        if nrm > 1e-12:
+            vec /= nrm
+        return vec
+
+    def fit_few_shot(
+        self,
+        examples_or_prompts: Union[Sequence[Tuple[str, Any]], Sequence[str]],
+        labels: Optional[Sequence[Any]] = None,
+    ) -> "SmartsCrossZeroFewRouter":
+        from system1.core.text import TfidfProjector
+
+        if labels is not None:
+            if len(examples_or_prompts) != len(labels):
+                raise ValueError("prompts and labels must have equal length")
+            pairs = [(str(p), self._normalize_label_str(lbl)) for p, lbl in zip(examples_or_prompts, labels)]
+        else:
+            pairs = [(str(item[0]), self._normalize_label_str(item[1])) for item in examples_or_prompts]  # type: ignore[index]
+
+        self._few_examples = list(pairs)
+        self._calibrated = False
+        if not pairs:
+            self.fewshot_active = False
+            self.few_proj = None
+            self.k_per_class = 0
+            return self
+
+        all_texts = [txt for txt, _ in pairs]
+        all_labels_str = [lbl for _, lbl in pairs]
+        all_labels = [self.opt_to_idx[lbl] for lbl in all_labels_str]
+        counts = np.bincount(all_labels, minlength=self.K)
+        self.k_per_class = max(1, int(np.min(counts[counts > 0]))) if np.any(counts > 0) else 0
+        schema_texts = [
+            f"{opt.replace('_', ' ')}: {' '.join(_split_criterion_units(opt, self.descriptions.get(opt, '')))}"
+            for opt in self.options
+        ]
+
+        if self.rich_descriptions:
+            self.few_proj = None
+            shot_fmaps = [
+                self._featurize_with_concepts(_extract_bm25_feats(t, include_char=True), match_semantic_concepts(t))
+                for t in all_texts
+            ]
+            schema_fmaps = [
+                self._featurize_with_concepts(_extract_bm25_feats(s, include_char=True), match_semantic_concepts(s))
+                for s in schema_texts
+            ]
+            df: Counter[str] = Counter()
+            for fm in shot_fmaps + schema_fmaps:
+                for t in fm:
+                    df[t] += 1
+            n_docs = len(shot_fmaps) + len(schema_fmaps)
+            terms_sorted = sorted(df.keys(), key=lambda t: (-df[t], t))[:1536]
+            self.few_vocab = {t: i for i, t in enumerate(terms_sorted)}
+            self.few_idf = np.array([math.log((n_docs + 1.0) / (df[t] + 1.0)) + 1.0 for t in terms_sorted], dtype=np.float64)
+            X_shots = np.vstack([self._vectorize_few(fm) for fm in shot_fmaps])
+            X_schema = np.vstack([self._vectorize_few(fm) for fm in schema_fmaps])
+            reg = 0.85 if self.k_per_class <= 1 else (0.30 if self.k_per_class <= 3 else 0.16)
+        else:
+            self.few_vocab = {}
+            self.few_idf = None
+            self.few_proj = TfidfProjector.fit(
+                all_texts + schema_texts,
+                max_features=2048,
+                labels=all_labels_str + list(self.options),
+                selection="chi2",
+                char_ngrams=(3, 5),
+            )
+            X_shots = np.asarray(self.few_proj.project_batch(all_texts), dtype=np.float64)
+            X_schema = np.asarray(self.few_proj.project_batch(schema_texts), dtype=np.float64)
+            reg = 0.45 if self.k_per_class <= 1 else (0.20 if self.k_per_class <= 3 else 0.10)
+
+        w_prior = math.sqrt(max(0.25, 1.5 / (1.0 + 0.4 * float(self.k_per_class))))
+        X_aug = np.vstack([X_shots, w_prior * X_schema])
+        Y_shots = np.zeros((len(all_labels), self.K), dtype=np.float64)
+        for i, c in enumerate(all_labels):
+            Y_shots[i, c] = 1.0
+        Y_aug = np.vstack([Y_shots, w_prior * np.eye(self.K, dtype=np.float64)])
+
+        self.few_W, self.few_b = _solve_dual_or_primal_ridge_np(X_aug, Y_aug, reg=reg)
+        self.few_X = X_shots
+        self.few_y = np.array(all_labels, dtype=np.int32)
+        self.few_protos = np.zeros((self.K, X_shots.shape[1]), dtype=np.float64)
+        for c in range(self.K):
+            mask = self.few_y == c
+            p = np.mean(X_shots[mask], axis=0) if np.any(mask) else X_schema[c]
+            nrm = float(np.linalg.norm(p))
+            if nrm > 1e-12:
+                self.few_protos[c] = p / nrm
+        self.fewshot_active = True
+        return self
+
+    def learn(self, prompt: str, label: Any) -> "SmartsCrossZeroFewRouter":
+        """Incrementally add one labeled example and refresh few-shot weights."""
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt must be a non-empty string")
+        norm_lbl = self._normalize_label_str(label)
+        self._few_examples.append((prompt, norm_lbl))
+        return self.fit_few_shot(self._few_examples)
+
+    def calibrate(
+        self,
+        prompts: Sequence[str],
+        labels: Sequence[Any],
+        *,
+        alpha: float = 0.10,
+    ) -> float:
+        """Fit split-conformal LAC quantile over held-out calibration examples."""
+        if len(prompts) != len(labels):
+            raise ValueError("prompts and labels must have equal length")
+        if not (0.0 < float(alpha) < 1.0):
+            raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+        n = len(prompts)
+        if n == 0:
+            self._calibrated = False
+            self._conformal_q = 1.0
+            self._cal_alpha = float(alpha)
+            return self._conformal_q
+        scores = np.empty(n, dtype=np.float64)
+        for i, (prompt, raw_lbl) in enumerate(zip(prompts, labels)):
+            _, probs = self.score_and_predict(str(prompt))
+            lbl_idx = self.opt_to_idx[self._normalize_label_str(raw_lbl)]
+            scores[i] = 1.0 - float(probs[lbl_idx])
+        sorted_scores = np.sort(scores)
+        rank = int(math.ceil((n + 1) * (1.0 - float(alpha))))
+        self._conformal_q = 1.0 if rank > n else float(sorted_scores[max(0, rank - 1)])
+        self._cal_alpha = float(alpha)
+        self._calibrated = True
+        return self._conformal_q
+
+    def score_and_predict(self, text: str) -> Tuple[Any, np.ndarray]:
+        if not isinstance(text, str):
+            raise TypeError(f"Prompt must be a string, got {type(text).__name__}")
+        lf = _extract_bm25_feats(text, include_char=True)
+        opt_l = np.zeros(self.K, dtype=np.float64)
+        crit_l = np.zeros(self.M, dtype=np.float64)
+        ql_sq = 0.0
+        opt_tbl, crit_tbl = self.opt_lex_tbl, self.crit_lex_tbl
+        for t, tf in lf.items():
+            qw = math.log1p(tf)
+            vo = opt_tbl.get(t)
+            if vo is not None:
+                opt_l += qw * vo
+            vc = crit_tbl.get(t)
+            if vc is not None:
+                crit_l += qw * vc
+                ql_sq += qw * qw
+        if ql_sq > 1e-12:
+            inv_q = 1.0 / math.sqrt(ql_sq)
+            opt_l *= inv_q
+            crit_l *= inv_q
+        crit_l_max = np.array(
+            [float(np.max(crit_l[idxs])) if len(idxs) else 0.0 for idxs in self.opt_to_crit_idxs],
+            dtype=np.float64,
+        )
+        s_lex_c = 0.60 * opt_l + 0.40 * crit_l_max
+        s_lex_c -= float(np.mean(s_lex_c))
+
+        qc: Dict[str, float] = {}
+        if self.concept_gate > 0.05:
+            qc = match_semantic_concepts(text)
+            opt_c = np.zeros(self.K, dtype=np.float64)
+            crit_c = np.zeros(self.M, dtype=np.float64)
+            qc_sq = 0.0
+            for ck, cv in qc.items():
+                qw = math.log1p(cv)
+                vo = self.opt_concept_tbl.get(ck)
+                if vo is not None:
+                    opt_c += qw * vo
+                vc = self.crit_concept_tbl.get(ck)
+                if vc is not None:
+                    crit_c += qw * vc
+                    qc_sq += qw * qw
+            if qc_sq > 1e-12:
+                inv_c = 1.0 / math.sqrt(qc_sq)
+                opt_c *= inv_c
+                crit_c *= inv_c
+            crit_c_max = np.array(
+                [float(np.max(crit_c[idxs])) if len(idxs) else 0.0 for idxs in self.opt_to_crit_idxs],
+                dtype=np.float64,
+            )
+            s_cnc_c = 0.40 * opt_c + 0.60 * crit_c_max
+            s_cnc_c -= float(np.mean(s_cnc_c))
+        else:
+            s_cnc_c = np.zeros(self.K, dtype=np.float64)
+
+        s1_raw = np.asarray(self.s1_model.forward_single(text).fields[self.field_name].logits, dtype=np.float64).ravel()
+        s1_c = s1_raw - float(np.mean(s1_raw))
+        s1_w = 0.42 if self.concept_gate > 0.90 else 0.28
+        zs = 1.50 * s_lex_c + (1.10 * self.concept_gate) * s_cnc_c + s1_w * s1_c
+
+        if not self.fewshot_active or self.few_W is None or self.few_b is None:
+            probs = np.exp((zs - np.max(zs)) * 4.0)
+            probs /= probs.sum()
+            return self._public_value(self.options[int(np.argmax(zs))]), probs
+
+        assert self.few_protos is not None and self.few_X is not None and self.few_y is not None
+        if self.few_proj is not None:
+            v = np.asarray(self.few_proj.project(text), dtype=np.float64)
+            rc = v @ self.few_W.T + self.few_b
+            rc -= float(np.mean(rc))
+            pc = self.few_protos @ v
+            pc -= float(np.mean(pc))
+            shot_cos = self.few_X @ v
+            ec = np.array(
+                [float(np.max(shot_cos[self.few_y == c])) if np.any(self.few_y == c) else 0.0 for c in range(self.K)],
+                dtype=np.float64,
+            )
+            ec -= float(np.mean(ec))
+            fs_comb = 0.72 * rc + 0.18 * pc + 0.10 * ec
+            w_zs = 1.2 / (1.2 + float(self.k_per_class))
+        else:
+            v = self._vectorize_few(self._featurize_with_concepts(lf, qc))
+            r_c = v @ self.few_W.T + self.few_b
+            r_c -= float(np.mean(r_c))
+            p_c = self.few_protos @ v
+            p_c -= float(np.mean(p_c))
+            shot_cos = self.few_X @ v
+            e_c = np.array(
+                [float(np.max(shot_cos[self.few_y == c])) if np.any(self.few_y == c) else 0.0 for c in range(self.K)],
+                dtype=np.float64,
+            )
+            e_c -= float(np.mean(e_c))
+            fs_comb = 0.70 * r_c + 0.20 * p_c + 0.10 * e_c
+            w_zs = 2.4 / (2.4 + float(self.k_per_class))
+        zs_std = float(np.std(zs))
+        fs_std = float(np.std(fs_comb))
+        zs_scaled = zs * (fs_std / zs_std) if (zs_std > 1e-6 and fs_std > 1e-6) else zs
+        comb = w_zs * zs_scaled + (1.0 - w_zs) * fs_comb
+        probs = np.exp((comb - np.max(comb)) * 4.0)
+        probs /= probs.sum()
+        return self._public_value(self.options[int(np.argmax(comb))]), probs
+
+    def predict(self, prompt: str) -> Any:
+        pred, _ = self.score_and_predict(prompt)
+        return pred
+
+    def predict_proba(self, prompt: str) -> Dict[str, float]:
+        _, probs = self.score_and_predict(prompt)
+        return {self.options[j]: float(probs[j]) for j in range(self.K)}
+
+    def predict_batch(self, prompts: Sequence[str]) -> List[Any]:
+        return [self.predict(p) for p in prompts]
+
+    def decide(self, prompt: str, alpha: Optional[float] = None) -> RouterDecisionResult:
+        eff_alpha = self._cal_alpha if alpha is None else float(alpha)
+        t0 = time.perf_counter()
+        pred, probs = self.score_and_predict(prompt)
+        bi = self.opt_to_idx[self._normalize_label_str(pred)]
+        if self._calibrated:
+            cset = tuple(
+                self._public_value(self.options[j])
+                for j in range(self.K)
+                if (1.0 - float(probs[j])) <= self._conformal_q + 1e-12
+            )
+            is_ambig = len(cset) != 1
+        else:
+            cset = (pred,)
+            is_ambig = False
+        lat_ms = (time.perf_counter() - t0) * 1000.0
+        return RouterDecisionResult(
+            schema_name=self.schema_name,
+            schema_digest=self.schema_digest,
+            prompt=prompt,
+            values={self.field_name: pred},
+            confidences={self.field_name: float(probs[bi])},
+            probabilities={self.field_name: {self.options[j]: float(probs[j]) for j in range(self.K)}},
+            conformal_sets={self.field_name: cset},
+            is_ambiguous=is_ambig,
+            latency_ms=lat_ms,
+            alpha=eff_alpha,
+            receipt=None,
+        )
+
+
 __all__ = [
     "SubwordSemanticEmbeddings",
     "StaticEmbeddingTable",
     "HybridProjector",
     "HybridSemanticProjector",
     "UnifiedHybridProjector",
+    "SmartsCrossZeroFewRouter",
+    "RouterDecisionResult",
+    "set_embedding_cache_maxsize",
+    "clear_embedding_caches",
     "_build_default_table",
     "_stem_word",
     "_ANCHOR_STOPWORDS",

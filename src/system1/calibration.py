@@ -11,10 +11,12 @@ Implements:
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import itertools
 import json
 import math
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
@@ -1724,7 +1726,8 @@ class AdaptiveConformalTracker:
         self.accepted_steps = 0
         self.accepted_errors = 0
         self.escalation_steps = 0
-        self._scores: List[float] = []
+        self._scores: deque[float] = deque(maxlen=max(1, self.max_window))
+        self._sorted_scores: List[float] = []
 
     def should_accept_margin(self, margin: float) -> bool:
         if self.margin_floor is None:
@@ -1765,10 +1768,20 @@ class AdaptiveConformalTracker:
 
     def push_calibration_score(self, score: float) -> np.ndarray:
         """Append a nonconformity score into the bounded sliding window and return sorted scores."""
-        self._scores.append(float(score))
-        if len(self._scores) > self.max_window:
-            self._scores = self._scores[-self.max_window :]
-        return np.sort(np.asarray(self._scores, dtype=np.float64))
+        val = float(score)
+        if self.max_window <= 0:
+            return np.array([], dtype=np.float64)
+        if len(self._scores) >= self.max_window:
+            oldest = self._scores[0]
+            rm_idx = bisect.bisect_left(self._sorted_scores, oldest)
+            if rm_idx < len(self._sorted_scores) and self._sorted_scores[rm_idx] == oldest:
+                self._sorted_scores.pop(rm_idx)
+            else:
+                self._scores.popleft()
+                self._sorted_scores = sorted(self._scores)
+        self._scores.append(val)
+        bisect.insort(self._sorted_scores, val)
+        return np.asarray(self._sorted_scores, dtype=np.float64)
 
     def rescore_calibration_window(
         self,
@@ -1778,7 +1791,7 @@ class AdaptiveConformalTracker:
         default_floor: float = 0.30,
     ) -> Tuple[np.ndarray, float]:
         """Re-score a bounded calibration window after online weight updates and ratchet margin_floor."""
-        window = list(pairs)[-self.max_window :]
+        window = list(pairs)[-self.max_window :] if self.max_window > 0 else []
         scores: List[float] = []
         err_margins: List[float] = []
         for prompt_c, label_c in window:
@@ -1786,13 +1799,14 @@ class AdaptiveConformalTracker:
             scores.append(float(nc_score))
             if not is_correct and math.isfinite(float(margin_c)):
                 err_margins.append(float(margin_c))
-        self._scores = list(scores)
+        self._scores = deque(scores, maxlen=max(1, self.max_window))
+        self._sorted_scores = sorted(self._scores)
         new_floor = (max(err_margins) + 1e-4) if err_margins else float(default_floor)
         if self.margin_floor is not None:
             self.margin_floor = max(self.margin_floor, new_floor)
         else:
             self.margin_floor = new_floor
-        return np.sort(np.asarray(self._scores, dtype=np.float64)), float(self.margin_floor)
+        return np.asarray(self._sorted_scores, dtype=np.float64), float(self.margin_floor)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -1809,6 +1823,142 @@ class AdaptiveConformalTracker:
             "accepted_errors": self.accepted_errors,
             "escalation_steps": self.escalation_steps,
         }
+
+
+class OnlineMondrianConformal:
+    """Strictly O(1) per-class quantile tracker in log-nonconformity space u = -log(1 - q) + ACI."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        alpha: float = 0.10,
+        q_init: Optional[Sequence[float]] = None,
+        gamma_aci: Optional[float] = None,
+        eta_u: float = 0.30,
+        jump_w: float = 0.12,
+    ) -> None:
+        if int(num_classes) < 1:
+            raise ValueError("num_classes must be >= 1")
+        a = float(alpha)
+        if not math.isfinite(a) or not (0.0 < a < 1.0):
+            raise ValueError("alpha must be finite and in (0, 1)")
+        self.num_classes = int(num_classes)
+        self.alpha_target = a
+        self.gamma_aci = float(gamma_aci) if gamma_aci is not None else max(0.03, 0.4 * a)
+        self.eta_u = float(eta_u)
+        self.jump_w = float(jump_w)
+        if q_init is not None:
+            q0 = np.asarray(q_init, dtype=np.float64)
+            if q0.shape != (self.num_classes,):
+                raise ValueError(f"q_init must have shape ({self.num_classes},), got {q0.shape}")
+        else:
+            q0 = np.full(self.num_classes, 0.5, dtype=np.float64)
+        self.q_c = np.clip(q0.copy(), 1e-4, 0.999)
+        self.u_c = -np.log(np.clip(1.0 - self.q_c, 1e-4, 1.0))
+        self.alpha_c = np.full(self.num_classes, a, dtype=np.float64)
+        self.err_ewma = np.full(self.num_classes, a, dtype=np.float64)
+        self.alpha_min = max(0.015, 0.35 * a)
+        self.alpha_max = min(0.40, 2.5 * a)
+        self.u_max = 5.0
+        self.steps = 0
+
+    def thresholds(self) -> np.ndarray:
+        """Return per-class nonconformity score thresholds in [0, 1)."""
+        return self.q_c
+
+    def update(
+        self,
+        y: int,
+        score_y: Optional[float] = None,
+        err_y: Optional[int] = None,
+        *,
+        probs: Optional[Sequence[float]] = None,
+    ) -> None:
+        """O(1) update after observing true class y and either (score_y, err_y) or probs."""
+        cls_idx = int(y)
+        if cls_idx < 0 or cls_idx >= self.num_classes:
+            raise IndexError(f"Class index {cls_idx} out of range [0, {self.num_classes})")
+        if probs is not None:
+            p_arr = np.asarray(probs, dtype=np.float64)
+            s_val = 1.0 - float(p_arr[cls_idx]) if score_y is None else float(score_y)
+            e_flag = (1 if s_val > float(self.q_c[cls_idx]) else 0) if err_y is None else (1 if err_y else 0)
+        else:
+            if score_y is None:
+                raise ValueError("Either score_y or probs must be provided to update()")
+            s_val = float(score_y)
+            e_flag = (1 if s_val > float(self.q_c[cls_idx]) else 0) if err_y is None else (1 if err_y else 0)
+
+        s_clip = s_val if s_val < 0.9995 else 0.9995
+        u_obs = -math.log(max(1.0 - s_clip, 5e-4))
+        if u_obs > self.u_max:
+            u_obs = self.u_max
+        fe = 1.0 if e_flag else 0.0
+        self.err_ewma[cls_idx] = 0.85 * self.err_ewma[cls_idx] + 0.15 * fe
+        shift = self.err_ewma[cls_idx] > 1.6 * self.alpha_target
+        boost = 1.6 if shift else 1.0
+        a_next = self.alpha_c[cls_idx] + self.gamma_aci * boost * (self.alpha_target - fe)
+        if a_next < self.alpha_min:
+            a_next = self.alpha_min
+        elif a_next > self.alpha_max:
+            a_next = self.alpha_max
+        self.alpha_c[cls_idx] = a_next
+        u_next = self.u_c[cls_idx] + self.eta_u * boost * (fe - a_next)
+        if e_flag and shift:
+            u_jump = (1.0 - self.jump_w) * self.u_c[cls_idx] + self.jump_w * min(u_obs, 4.2)
+            if u_jump > u_next:
+                u_next = u_jump
+        if u_next < 0.01:
+            u_next = 0.01
+        elif u_next > self.u_max:
+            u_next = self.u_max
+        self.u_c[cls_idx] = u_next
+        self.q_c[cls_idx] = 1.0 - math.exp(-u_next)
+        self.steps += 1
+
+    def predict_set(self, probs: Sequence[float]) -> List[int]:
+        """Return class indices whose nonconformity score (1 - p_k) <= q_c[k]."""
+        p_arr = np.asarray(probs, dtype=np.float64)
+        if p_arr.shape != (self.num_classes,):
+            raise ValueError(f"probs must have shape ({self.num_classes},), got {p_arr.shape}")
+        scores = 1.0 - p_arr
+        return [k for k in range(self.num_classes) if float(scores[k]) <= float(self.q_c[k]) + 1e-12]
+
+    def should_accept(self, probs: Sequence[float]) -> bool:
+        """Accept locally when the Mondrian prediction set is a singleton."""
+        return len(self.predict_set(probs)) == 1
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "num_classes": self.num_classes,
+            "alpha_target": self.alpha_target,
+            "gamma_aci": self.gamma_aci,
+            "eta_u": self.eta_u,
+            "jump_w": self.jump_w,
+            "q_c": [float(v) for v in self.q_c],
+            "u_c": [float(v) for v in self.u_c],
+            "alpha_c": [float(v) for v in self.alpha_c],
+            "err_ewma": [float(v) for v in self.err_ewma],
+            "steps": self.steps,
+        }
+
+    @classmethod
+    def from_state_dict(cls, data: Mapping[str, Any]) -> "OnlineMondrianConformal":
+        obj = cls(
+            num_classes=int(data["num_classes"]),
+            alpha=float(data["alpha_target"]),
+            q_init=data.get("q_c"),
+            gamma_aci=data.get("gamma_aci"),
+            eta_u=float(data.get("eta_u", 0.30)),
+            jump_w=float(data.get("jump_w", 0.12)),
+        )
+        if "u_c" in data:
+            obj.u_c = np.asarray(data["u_c"], dtype=np.float64).copy()
+        if "alpha_c" in data:
+            obj.alpha_c = np.asarray(data["alpha_c"], dtype=np.float64).copy()
+        if "err_ewma" in data:
+            obj.err_ewma = np.asarray(data["err_ewma"], dtype=np.float64).copy()
+        obj.steps = int(data.get("steps", 0))
+        return obj
 
 
 VALID_MONITOR_MODES = (
@@ -2339,6 +2489,7 @@ __all__ = [
     "DecisionCalibrator",
     "JointSchemaCalibrator",
     "JointSelectiveCertificate",
+    "OnlineMondrianConformal",
     "RecalibrationMetrics",
     "RecalibrationReport",
     "RegressionConformalInterval",

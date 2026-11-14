@@ -40,7 +40,7 @@ from system1.core.schema import (
 from system1.calibration import ConformalPredictor, DecisionCalibrator
 from system1.core.embeddings import compute_strict_loo_weights
 from system1.core.telemetry import TelemetryProjector
-from system1.core.text import TfidfProjector
+from system1.core.text import MAX_PRAG_FEATURES, PragmaticCompositeProjector, TfidfProjector
 from system1.cache import SemanticSystemOneCache
 
 MAGIC_HEADER = b"S1M\x02"
@@ -68,6 +68,186 @@ def _snap_f16(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
         return a32
     a16 = a32.astype(np.float16)
     return a16.astype(np.float32) if np.all(np.isfinite(a16)) else a32
+
+
+def _centered_log_odds(probs: np.ndarray, eps: float = 5e-3) -> np.ndarray:
+    """Map probability simplex rows into zero-sum centered log-odds."""
+    p = np.clip(np.asarray(probs, dtype=np.float64), float(eps), 1.0)
+    p = p / np.maximum(1e-12, p.sum(axis=1, keepdims=True))
+    lp = np.log(p)
+    return lp - lp.mean(axis=1, keepdims=True)
+
+
+def _soft_fit_temperature_np(logits: np.ndarray, P_T: np.ndarray) -> float:
+    """Pure-NumPy grid + golden-section temperature search minimizing KL(P_T || softmax(logits / T))."""
+    logits64 = np.asarray(logits, dtype=np.float64)
+    P64 = np.clip(np.asarray(P_T, dtype=np.float64), 0.0, 1.0)
+    P64 = P64 / np.maximum(1e-12, P64.sum(axis=1, keepdims=True))
+    if logits64.shape[0] == 0:
+        return 1.0
+
+    def _obj(log_t: float) -> float:
+        lt = max(-2.5, min(2.5, float(log_t)))
+        T = math.exp(lt)
+        s = logits64 / T
+        s = s - np.max(s, axis=1, keepdims=True)
+        lse = np.log(np.maximum(1e-12, np.sum(np.exp(s), axis=1, keepdims=True)))
+        nll = -float(np.mean(np.sum(P64 * (s - lse), axis=1)))
+        return nll + 0.01 * (lt * lt)
+
+    grid = np.linspace(-2.5, 2.5, 41)
+    vals = [_obj(float(g)) for g in grid]
+    best_i = int(np.argmin(vals))
+    lo = float(grid[max(0, best_i - 1)])
+    hi = float(grid[min(len(grid) - 1, best_i + 1)])
+    phi = (math.sqrt(5.0) - 1.0) / 2.0
+    c = hi - phi * (hi - lo)
+    d = lo + phi * (hi - lo)
+    fc, fd = _obj(c), _obj(d)
+    for _ in range(40):
+        if fc < fd:
+            hi = d
+            d, fd = c, fc
+            c = hi - phi * (hi - lo)
+            fc = _obj(c)
+        else:
+            lo = c
+            c, fc = d, fd
+            d = lo + phi * (hi - lo)
+            fd = _obj(d)
+    best_log_t = 0.5 * (lo + hi)
+    return float(math.exp(max(-2.5, min(2.5, best_log_t))))
+
+
+def _soft_student_sample_weights(
+    P_clean: np.ndarray,
+    y_lbl_idx: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Compute entropy-weighted + bounded class-balanced sample weights."""
+    N, K = P_clean.shape
+    entropy = -np.sum(P_clean * np.log(np.clip(P_clean, 1e-12, 1.0)), axis=1) / math.log(max(2, K))
+    sw = 0.45 + 0.55 * (1.0 - np.clip(entropy, 0.0, 1.0))
+    idx = np.asarray(y_lbl_idx, dtype=np.int64) if y_lbl_idx is not None else np.argmax(P_clean, axis=1)
+    counts = np.bincount(idx, minlength=K).astype(np.float64)
+    present = counts > 0
+    k_eff = max(1, int(np.sum(present)))
+    cls_w = np.ones(K, dtype=np.float64)
+    cls_w[present] = np.clip(float(N) / (float(k_eff) * counts[present]), 0.35, 3.0)
+    sw = sw * cls_w[idx]
+    mean_sw = float(np.mean(sw))
+    if mean_sw > 1e-12:
+        sw = sw / mean_sw
+    return sw
+
+
+def _solve_soft_ridge_student_raw(
+    X: np.ndarray,
+    P_T: np.ndarray,
+    Y_hard_oh: Optional[np.ndarray] = None,
+    *,
+    beta: float = 0.25,
+    reg: float = 0.5,
+    eps_smooth: float = 5e-3,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Closed-form dual/primal weighted ridge over centered soft log-odds mixed with optional hard targets."""
+    X64 = np.asarray(X, dtype=np.float64)
+    N, D = X64.shape
+    P_raw = np.clip(np.asarray(P_T, dtype=np.float64), 0.0, 1.0)
+    K = P_raw.shape[1]
+    row_s = P_raw.sum(axis=1, keepdims=True)
+    P_norm = np.where(row_s > 1e-12, P_raw / np.maximum(1e-12, row_s), 1.0 / max(1, K))
+    P_clean = (1.0 - eps_smooth) * P_norm + eps_smooth / K
+    P_clean = P_clean / np.maximum(1e-12, P_clean.sum(axis=1, keepdims=True))
+
+    y_idx = np.argmax(Y_hard_oh, axis=1) if Y_hard_oh is not None else np.argmax(P_clean, axis=1)
+    sw = _soft_student_sample_weights(P_clean, y_idx)
+
+    Z_soft = _centered_log_odds(P_clean, eps=eps_smooth)
+    if Y_hard_oh is not None and beta > 0.0:
+        P_hard = (1.0 - eps_smooth) * np.asarray(Y_hard_oh, dtype=np.float64) + eps_smooth / K
+        Y_centered = _centered_log_odds(P_hard, eps=eps_smooth)
+        Z = (1.0 - float(beta)) * Z_soft + float(beta) * Y_centered
+    else:
+        Z = Z_soft
+
+    w_sum = max(1e-12, float(np.sum(sw)))
+    mu_X = (sw @ X64) / w_sum
+    mu_Z = (sw @ Z) / w_sum
+    sw_sqrt = np.sqrt(np.maximum(1e-8, sw))[:, None]
+    Xc = (X64 - mu_X) * sw_sqrt
+    Zc = (Z - mu_Z) * sw_sqrt
+
+    reg_val = max(1e-4, float(reg))
+    if 0 < N < D:
+        gram = np.eye(N, dtype=np.float64) + (1.0 / reg_val) * (Xc @ Xc.T)
+        try:
+            alpha_dual = np.linalg.solve(gram, Zc)
+            U = ((1.0 / reg_val) * (Xc.T @ alpha_dual)).T
+        except np.linalg.LinAlgError:
+            A = Xc.T @ Xc + reg_val * np.eye(D, dtype=np.float64)
+            U = np.linalg.lstsq(A, Xc.T @ Zc, rcond=None)[0].T
+    else:
+        A = Xc.T @ Xc + reg_val * np.eye(D, dtype=np.float64)
+        try:
+            U = np.linalg.solve(A, Xc.T @ Zc).T
+        except np.linalg.LinAlgError:
+            U = np.linalg.lstsq(A, Xc.T @ Zc, rcond=None)[0].T
+    c = mu_Z - U @ mu_X
+    return U, c, Z, sw
+
+
+def _oof_conservative_soft_conformal(
+    p_oof: np.ndarray,
+    P_T: np.ndarray,
+    *,
+    y_true_idx: Optional[np.ndarray] = None,
+    alpha: float = 0.05,
+) -> Tuple[float, float]:
+    """Finite-sample weighted conformal LAC quantile + Laplace OOF confidence floor."""
+    N, K = p_oof.shape
+    if N == 0:
+        return 1.0, 0.0
+    y_target = (
+        np.asarray(y_true_idx, dtype=np.int64)
+        if y_true_idx is not None
+        else np.argmax(P_T, axis=1)
+    )
+    scores_arg = 1.0 - p_oof[np.arange(N), y_target]
+    w_arg = np.ones(N, dtype=np.float64) if y_true_idx is not None else np.maximum(1e-6, np.max(P_T, axis=1))
+    order = np.argsort(scores_arg)
+    v_s = scores_arg[order]
+    w_s = w_arg[order]
+    w_sum = float(np.sum(w_s))
+    n_eff = (w_sum * w_sum) / max(1e-12, float(np.sum(w_s * w_s)))
+    target = (1.0 - float(alpha)) * (n_eff + 1.0) / n_eff
+    if target >= 1.0:
+        q_lac = float(np.max(v_s)) if N >= 20 else 1.0
+    else:
+        cdf = np.cumsum(w_s) / w_sum
+        idx = int(np.searchsorted(cdf, target, side="left"))
+        q_lac = float(v_s[min(idx, len(v_s) - 1)])
+
+    top_pred = np.argmax(p_oof, axis=1)
+    top_prob = np.max(p_oof, axis=1)
+    is_err = (top_pred != y_target).astype(np.float64)
+    singletons = np.sum((1.0 - p_oof) <= q_lac + 1e-12, axis=1) == 1
+    cands = sorted(set([0.0] + [float(x) for x in np.round(top_prob, 4)]))
+    chosen_floor = 0.0
+    found = False
+    for fl in cands:
+        mask = singletons & (top_prob >= fl)
+        n_m = int(np.sum(mask))
+        if n_m == 0:
+            continue
+        if (float(np.sum(is_err[mask])) + 0.5) / (n_m + 1.0) <= float(alpha) + 1e-9:
+            chosen_floor = fl
+            found = True
+            break
+    if not found:
+        chosen_floor = float(np.max(top_prob)) + 1e-3
+    elif N <= 80 and np.any(singletons):
+        chosen_floor = max(chosen_floor, float(np.quantile(top_prob[singletons], 0.35)))
+    return float(q_lac), float(chosen_floor)
 
 
 def _roundtrip_unit_f16(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -102,7 +282,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
     _, disk, directory_disk, disk_count, count, directory_size, directory_offset, comment_size = struct.unpack(
         "<4s4H2LH", data[end:end + 22]
     )
-    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS)) + 5
+    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS)) + 7
             or directory_size > MAX_SKILL_HEADER_BYTES or directory_offset + directory_size != end
             or end + 22 + comment_size != len(data)):
         raise ValueError("Saved skill NPZ directory exceeds limits or is malformed")
@@ -128,6 +308,8 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
         "_projector_rbf_landmarks.npy",
         "_projector_tfidf_idf.npy",
         "_projector_hybrid_tfidf_idf.npy",
+        "_projector_prag_base_idf.npy",
+        "_projector_prag_idf.npy",
     }
     shapes: Dict[str, Tuple[int, ...]] = {}
     effective_array_bytes = 0
@@ -168,6 +350,16 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
             len(hyb_idf_shape) != 1 or not (1 <= hyb_idf_shape[0] <= dimension)
         ):
             raise ValueError("Saved hybrid TF-IDF idf array has invalid shape")
+        prag_base_idf_shape = shapes.get("_projector_prag_base_idf")
+        if prag_base_idf_shape is not None and (
+            len(prag_base_idf_shape) != 1 or not (1 <= prag_base_idf_shape[0] <= dimension)
+        ):
+            raise ValueError("Saved pragmatic base TF-IDF idf array has invalid shape")
+        prag_idf_shape = shapes.get("_projector_prag_idf")
+        if prag_idf_shape is not None and (
+            len(prag_idf_shape) != 1 or not (0 <= prag_idf_shape[0] <= min(dimension, MAX_PRAG_FEATURES))
+        ):
+            raise ValueError("Saved pragmatic TF-IDF idf array has invalid shape")
         spec_vec_shape = shapes.get("_projector_spectral_vectors")
         if spec_vec_shape is not None and (
             len(spec_vec_shape) != 2
@@ -266,6 +458,8 @@ def _projector_config(projector: Any, *, include_arrays: bool = True) -> Dict[st
                 "recency_weighted": projector.recency_weighted}
     if type(projector) is TfidfProjector:
         return projector.to_config(include_arrays=include_arrays)
+    if isinstance(projector, PragmaticCompositeProjector):
+        return projector.to_config(include_arrays=include_arrays)
     if isinstance(projector, HybridProjector):
         return projector.to_config(include_arrays=include_arrays)
     config = {"type": "external", "class": f"{type(projector).__module__}.{type(projector).__qualname__}",
@@ -342,6 +536,8 @@ class CompiledSystemOneModel:
         self.recency_weighted = bool(recency_weighted)
         if type(projector) is TfidfProjector and self.recency_weighted:
             raise ValueError("TF-IDF does not support recency weighting")
+        if isinstance(projector, PragmaticCompositeProjector) and self.recency_weighted:
+            raise ValueError("PragmaticCompositeProjector does not support recency weighting")
         self.projector = (
             projector
             if projector is not None
@@ -522,7 +718,7 @@ class CompiledSystemOneModel:
             emb = emb / norm
         else:
             emb = np.zeros(self.dimension, dtype=np.float32)
-            if not isinstance(self.projector, TfidfProjector):
+            if not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector)):
                 emb[0] = 1.0
         if telemetry is not None:
             emb = self.telemetry_projector.fuse(emb, telemetry)
@@ -1364,6 +1560,13 @@ class CompiledSystemOneModel:
                 type(self.projector) is TfidfProjector
                 and (compact is True or len(self.projector._terms) > 128)
             )
+            use_binary_prag_tfidf = (
+                isinstance(self.projector, PragmaticCompositeProjector)
+                and (
+                    compact is True
+                    or (len(self.projector.base_tfidf._terms) + len(self.projector._prag_terms)) > 128
+                )
+            )
             header_meta = {
                 "version": 2,
                 "projector": _projector_config(
@@ -1371,7 +1574,11 @@ class CompiledSystemOneModel:
                     include_arrays=(
                         not use_binary_tfidf_idf
                         if type(self.projector) is TfidfProjector
-                        else False
+                        else (
+                            not use_binary_prag_tfidf
+                            if isinstance(self.projector, PragmaticCompositeProjector)
+                            else False
+                        )
                     ),
                 ),
                 "schema_name": self.schema.schema_name,
@@ -1405,6 +1612,14 @@ class CompiledSystemOneModel:
 
             if use_binary_tfidf_idf:
                 arrays_to_save["_projector_tfidf_idf"] = np.asarray(self.projector._idf, dtype=np.float64)
+            if use_binary_prag_tfidf:
+                arrays_to_save["_projector_prag_base_idf"] = np.asarray(
+                    self.projector.base_tfidf._idf, dtype=np.float64
+                )
+                if self.projector.prag_dim > 0:
+                    arrays_to_save["_projector_prag_idf"] = np.asarray(
+                        self.projector.prag_idf, dtype=np.float64
+                    )
             if isinstance(self.projector, HybridProjector) and getattr(self.projector, "_fitted", False):
                 if getattr(self.projector, "_spectral_vectors", None) is not None:
                     arrays_to_save["_projector_spectral_vectors"] = _pack_array(
@@ -1532,6 +1747,7 @@ class CompiledSystemOneModel:
         )
         runtime_bytes = 16 * cov_fields * (dimension + 1) ** 2 + 16 * widths * (dimension + 1)
         saved_tfidf = None
+        saved_prag = None
         saved_hybrid = None
         if projector_config is not None:
             kind = projector_config["type"]
@@ -1543,6 +1759,16 @@ class CompiledSystemOneModel:
                     raise ValueError("Saved TF-IDF dimension does not match the skill")
                 if "idf" in projector_config:
                     saved_tfidf = TfidfProjector.from_config(projector_config)
+            if kind == "pragmatic_tfidf":
+                _, _, prag_total_dim = PragmaticCompositeProjector.validate_header_config(
+                    projector_config, allow_missing_idf=True
+                )
+                if prag_total_dim != dimension:
+                    raise ValueError("Saved pragmatic TF-IDF dimension does not match the skill")
+                runtime_bytes += 64 * prag_total_dim
+                base_cfg = projector_config.get("base_tfidf", {})
+                if "prag_idf" in projector_config and isinstance(base_cfg, dict) and "idf" in base_cfg:
+                    saved_prag = PragmaticCompositeProjector.from_config(projector_config)
             if kind == "deterministic" and projector_config.get("dimension") != dimension:
                 raise ValueError("Saved projector dimension does not match the skill")
             if kind == "hybrid":
@@ -1583,6 +1809,10 @@ class CompiledSystemOneModel:
             "_projector_tfidf_idf" in npz_file
         ):
             raise ValueError("Saved skill contains unexpected TF-IDF idf array")
+        if (projector_config is None or projector_config.get("type") != "pragmatic_tfidf") and (
+            "_projector_prag_base_idf" in npz_file or "_projector_prag_idf" in npz_file
+        ):
+            raise ValueError("Saved skill contains unexpected pragmatic TF-IDF idf array")
         if (projector_config is None or projector_config.get("type") != "hybrid") and (
             "_projector_spectral_vectors" in npz_file
             or "_projector_subspace_components" in npz_file
@@ -1600,6 +1830,12 @@ class CompiledSystemOneModel:
             saved_tfidf = TfidfProjector.from_config(
                 projector_config,
                 idf_array=npz_file.get("_projector_tfidf_idf"),
+            )
+        if projector_config is not None and projector_config["type"] == "pragmatic_tfidf" and saved_prag is None:
+            saved_prag = PragmaticCompositeProjector.from_config(
+                projector_config,
+                tfidf_idf_array=npz_file.get("_projector_prag_base_idf"),
+                prag_idf_array=npz_file.get("_projector_prag_idf"),
             )
         if projector_config is not None and projector_config["type"] == "hybrid":
             rbf_arr = npz_file.get("_projector_rbf_landmarks")
@@ -1648,6 +1884,12 @@ class CompiledSystemOneModel:
                         != _projector_config(saved_tfidf, include_arrays=True)
                     ):
                         raise ValueError("Supplied projector does not match the saved skill's feature space")
+                elif projector_config["type"] == "pragmatic_tfidf" and saved_prag is not None:
+                    if (
+                        not isinstance(projector, PragmaticCompositeProjector)
+                        or projector.projector_digest() != saved_prag.projector_digest()
+                    ):
+                        raise ValueError("Supplied projector does not match the saved skill's feature space")
                 elif _projector_config(projector) != projector_config:
                     raise ValueError("Supplied projector does not match the saved skill's feature space")
             elif projector_config["type"] == "deterministic":
@@ -1659,6 +1901,8 @@ class CompiledSystemOneModel:
                 projector = saved_hybrid
             elif saved_tfidf is not None:
                 projector = saved_tfidf
+            elif saved_prag is not None:
+                projector = saved_prag
             else:
                 raise ValueError("This skill requires its original external projector; pass projector= when loading")
 
@@ -2778,6 +3022,473 @@ class SystemOneCompiler:
             thresh = float(max(0.0, min_sim * 0.90)) if min_sim > 0.0 else 0.0
         return thresh, scores_tuple
 
+    @staticmethod
+    def _normalize_soft_probs(
+        raw_probs: Any,
+        f_def: Union[ChoiceField, BooleanField],
+        *,
+        expected_len: Optional[int] = None,
+    ) -> np.ndarray:
+        arr = np.asarray(raw_probs, dtype=np.float64)
+        if isinstance(f_def, BooleanField):
+            if arr.ndim == 1:
+                arr = np.column_stack([1.0 - arr, arr])
+            elif arr.ndim == 2 and arr.shape[1] == 1:
+                p_true = arr[:, 0]
+                arr = np.column_stack([1.0 - p_true, p_true])
+            elif arr.ndim != 2 or arr.shape[1] != 2:
+                raise ValueError(f"soft_probs for BooleanField {f_def.name!r} must have shape (N, 2) or (N,)")
+        elif isinstance(f_def, ChoiceField):
+            K = len(f_def.options)
+            if arr.ndim != 2 or arr.shape[1] != K:
+                raise ValueError(f"soft_probs for ChoiceField {f_def.name!r} must have shape (N, {K})")
+        else:
+            raise ValueError(f"Soft distillation supports ChoiceField and BooleanField, got {type(f_def).__name__}")
+        if arr.shape[0] < 2:
+            raise ValueError("Soft distillation requires at least 2 examples")
+        if expected_len is not None and arr.shape[0] != expected_len:
+            raise ValueError(f"soft_probs length ({arr.shape[0]}) does not match exemplars ({expected_len})")
+        if not np.all(np.isfinite(arr)) or np.any(arr < 0.0):
+            raise ValueError("soft_probs must contain finite non-negative probabilities")
+        row_sums = arr.sum(axis=1, keepdims=True)
+        if np.any(row_sums <= 1e-12):
+            raise ValueError("Each soft_probs row must sum to a positive value")
+        return arr / row_sums
+
+    @staticmethod
+    def _encode_texts_with_projector(
+        texts: Sequence[str],
+        projector: Any,
+        *,
+        recency_weighted: bool = False,
+    ) -> np.ndarray:
+        text_list = [str(t) for t in texts]
+        use_rw = bool(recency_weighted) and not isinstance(projector, (TfidfProjector, PragmaticCompositeProjector))
+        if hasattr(projector, "project_batch"):
+            try:
+                raw_mat = (
+                    projector.project_batch(text_list, recency_weighted=True)
+                    if use_rw
+                    else projector.project_batch(text_list)
+                )
+            except TypeError:
+                raw_mat = projector.project_batch(text_list)
+            arr = np.asarray(raw_mat, dtype=np.float32)
+        else:
+            rows = []
+            for p in text_list:
+                if hasattr(projector, "project"):
+                    try:
+                        v = projector.project(p, recency_weighted=True) if use_rw else projector.project(p)
+                    except TypeError:
+                        v = projector.project(p)
+                else:
+                    v = projector(p)
+                rows.append(np.asarray(v, dtype=np.float32))
+            arr = np.stack(rows, axis=0)
+        norms = np.linalg.norm(arr, axis=1, keepdims=True)
+        return np.where(norms > 1e-12, arr / np.maximum(norms, 1e-12), arr).astype(np.float32)
+
+    @staticmethod
+    def _stratified_folds(y_idx: np.ndarray, k_classes: int) -> Tuple[int, np.ndarray]:
+        N = len(y_idx)
+        n_folds = min(5, max(2, N // max(4, k_classes)))
+        if N < n_folds:
+            n_folds = max(2, N)
+        fold_ids = np.zeros(N, dtype=np.int64)
+        fc = 0
+        for c in range(max(1, k_classes)):
+            idxs = np.where(y_idx == c)[0]
+            for i in idxs:
+                fold_ids[i] = fc % n_folds
+                fc += 1
+        return n_folds, fold_ids
+
+    def _soft_distill_discrete_head(
+        self,
+        field_name: str,
+        f_def: Union[ChoiceField, BooleanField],
+        prompts: Sequence[str],
+        P_T: np.ndarray,
+        *,
+        y_true_idx: Optional[np.ndarray] = None,
+        alpha: float = 0.05,
+        beta_grid: Sequence[float] = (0.15, 0.35, 0.55),
+        reg_grid: Sequence[float] = (0.15, 0.5, 1.5, 5.0),
+        X_precomputed: Optional[np.ndarray] = None,
+        fold_projector_factory: Optional[Any] = None,
+        mondrian: bool = False,
+        fam_thresh: float = 0.0,
+    ) -> CompiledHeadWeights:
+        N, K = P_T.shape
+        y_arg = (
+            np.asarray(y_true_idx, dtype=np.int64)
+            if y_true_idx is not None
+            else np.argmax(P_T, axis=1)
+        )
+        Y_hard_oh = np.eye(K, dtype=np.float64)[y_arg] if y_true_idx is not None else None
+        X_all = (
+            np.asarray(X_precomputed, dtype=np.float32)
+            if X_precomputed is not None
+            else self._encode_texts_with_projector(prompts, self.projector, recency_weighted=self.recency_weighted)
+        )
+
+        n_folds, fold_ids = self._stratified_folds(y_arg, K)
+        fold_features: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        prompt_list = [str(p) for p in prompts]
+        for f in range(n_folds):
+            tri = np.where(fold_ids != f)[0]
+            vai = np.where(fold_ids == f)[0]
+            if len(tri) == 0 or len(vai) == 0:
+                continue
+            if fold_projector_factory is not None:
+                fold_proj = fold_projector_factory(
+                    [prompt_list[i] for i in tri],
+                    [int(y_arg[i]) for i in tri],
+                )
+                Xf_tr = self._encode_texts_with_projector([prompt_list[i] for i in tri], fold_proj).astype(np.float64)
+                Xf_va = self._encode_texts_with_projector([prompt_list[i] for i in vai], fold_proj).astype(np.float64)
+            else:
+                Xf_tr = X_all[tri].astype(np.float64)
+                Xf_va = X_all[vai].astype(np.float64)
+            fold_features.append((tri, vai, Xf_tr, Xf_va))
+
+        betas = tuple(float(b) for b in beta_grid) if Y_hard_oh is not None else (0.0,)
+        regs = tuple(max(1e-4, float(r)) for r in reg_grid)
+        best_nll = float("inf")
+        best_beta = betas[0]
+        best_reg = regs[0]
+        best_oof_logits = np.zeros((N, K), dtype=np.float64)
+
+        for beta_v in betas:
+            for reg_v in regs:
+                oof_logits = np.zeros((N, K), dtype=np.float64)
+                for tri, vai, Xf_tr, Xf_va in fold_features:
+                    U_f, c_f, _, _ = _solve_soft_ridge_student_raw(
+                        Xf_tr,
+                        P_T[tri],
+                        (Y_hard_oh[tri] if Y_hard_oh is not None else None),
+                        beta=beta_v,
+                        reg=reg_v,
+                    )
+                    oof_logits[vai] = Xf_va @ U_f.T + c_f
+                p_cand = _stable_softmax(oof_logits, temperature=1.0)
+                nll = -float(np.mean(np.sum(P_T * np.log(np.clip(p_cand, 1e-12, 1.0)), axis=1)))
+                if nll < best_nll:
+                    best_nll = nll
+                    best_beta = beta_v
+                    best_reg = reg_v
+                    best_oof_logits = oof_logits
+
+        T_soft = _soft_fit_temperature_np(best_oof_logits, P_T)
+        p_oof = _stable_softmax(best_oof_logits / T_soft, temperature=1.0)
+        q_lac, p_floor = _oof_conservative_soft_conformal(
+            p_oof,
+            P_T,
+            y_true_idx=(y_arg if y_true_idx is not None else None),
+            alpha=float(alpha),
+        )
+
+        lac_scores = 1.0 - p_oof[np.arange(N), y_arg]
+        sorted_calib_scores = np.sort(lac_scores)
+        options = f_def.options if isinstance(f_def, ChoiceField) else ("False", "True")
+        per_class_scores = (
+            {
+                options[c]: tuple(float(v) for v in np.sort(lac_scores[y_arg == c]))
+                for c in range(K)
+                if np.any(y_arg == c)
+            }
+            if mondrian
+            else {}
+        )
+        err_mask = np.argmax(p_oof, axis=1) != y_arg
+        if np.any(err_mask):
+            sorted_p = -np.sort(-p_oof[err_mask], axis=1)
+            runner_diff = sorted_p[:, 0] - (sorted_p[:, 1] if K > 1 else 0.0)
+            m_thresh = float(np.clip(np.quantile(runner_diff, 0.95) + 0.05, 0.15, 0.85))
+        else:
+            m_thresh = 0.20
+
+        U_full, c_full, Z_full, sw_full = _solve_soft_ridge_student_raw(
+            X_all.astype(np.float64),
+            P_T,
+            Y_hard_oh,
+            beta=best_beta,
+            reg=best_reg,
+        )
+        if isinstance(f_def, BooleanField):
+            weights = (0.25 * (U_full[1:2] - U_full[0:1])).astype(np.float32)
+            biases = np.array([0.25 * float(c_full[1] - c_full[0])], dtype=np.float32)
+            target_scaled = (0.25 * (Z_full[:, 1] - Z_full[:, 0])).reshape(-1, 1).astype(np.float32)
+            head_options: Tuple[str, ...] = ()
+        else:
+            weights = (0.25 * U_full).astype(np.float32)
+            biases = (0.25 * c_full).astype(np.float32)
+            target_scaled = (0.25 * Z_full).astype(np.float32)
+            head_options = f_def.options
+
+        _, _, P_mat, B_mat = self._solve_ridge(
+            X_all,
+            target_scaled,
+            best_reg,
+            sample_weights=sw_full.astype(np.float32),
+            regularize_bias=False,
+            return_covariance=True,
+        )
+        tau0 = max(0.0, float(p_floor) - (1.0 / max(1, K)))
+        return CompiledHeadWeights(
+            field_name=field_name,
+            field_type=f_def.field_type,
+            weights=weights,
+            biases=biases,
+            temperature=float(T_soft),
+            conformal_quantile=float(q_lac),
+            options=head_options,
+            P=P_mat,
+            B=B_mat,
+            margin_threshold=m_thresh,
+            forgetting_factor=self.forgetting_factor,
+            relative_odds_ratio=self.relative_odds_ratio,
+            confidence_floor_tau0=float(tau0),
+            escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
+            calibration_scores=tuple(float(s) for s in sorted_calib_scores),
+            score_method="lac",
+            mondrian=bool(mondrian),
+            class_calibration_scores=per_class_scores,
+            familiarity_threshold=float(fam_thresh),
+        )
+
+    def compile_soft_distilled(
+        self,
+        prompts: Union[Sequence[str], Mapping[str, Sequence[str]]],
+        *,
+        soft_probs: Union[Sequence[Sequence[float]], Mapping[str, Sequence[Sequence[float]]]],
+        hard_labels: Optional[Union[Sequence[Any], Mapping[str, Sequence[Any]]]] = None,
+        field_name: Optional[str] = None,
+        alpha: Optional[float] = None,
+        beta_grid: Sequence[float] = (0.15, 0.35, 0.55),
+        reg_grid: Sequence[float] = (0.15, 0.5, 1.5, 5.0),
+        semantic_mode: Optional[str] = None,
+        pragmatic: bool = False,
+        max_features: int = 2048,
+        prag_max_dim: int = 384,
+    ) -> CompiledSystemOneModel:
+        """Distill continuous teacher probabilities into a calibrated zero-egress .s1m student."""
+        eff_alpha = 0.05 if alpha is None else float(alpha)
+        if not math.isfinite(eff_alpha) or not (0.0 < eff_alpha < 1.0):
+            raise ValueError("alpha must be finite and in (0, 1)")
+        eff_semantic_mode = self.semantic_mode if semantic_mode is None else semantic_mode
+        if not isinstance(eff_semantic_mode, str) or eff_semantic_mode not in VALID_SEMANTIC_MODES:
+            raise ValueError(
+                f"Unsupported semantic_mode {eff_semantic_mode!r}; expected one of {VALID_SEMANTIC_MODES}"
+            )
+
+        if isinstance(prompts, Mapping):
+            if not isinstance(soft_probs, Mapping):
+                raise ValueError("soft_probs must be a mapping when prompts is a mapping")
+            prompt_map: Dict[str, List[str]] = {k: [str(x) for x in v] for k, v in prompts.items()}
+            soft_map_raw: Dict[str, Any] = dict(soft_probs)
+            hard_map_raw: Dict[str, Any] = dict(hard_labels) if isinstance(hard_labels, Mapping) else {}
+        else:
+            if isinstance(soft_probs, Mapping):
+                raise ValueError("soft_probs must be a sequence/array when prompts is a sequence")
+            if field_name is not None:
+                target_field = field_name
+            elif len(self.schema.fields) == 1:
+                target_field = next(iter(self.schema.fields))
+            else:
+                raise ValueError("field_name is required for multi-field schemas")
+            prompt_map = {target_field: [str(x) for x in prompts]}
+            soft_map_raw = {target_field: soft_probs}
+            hard_map_raw = {target_field: hard_labels} if hard_labels is not None else {}
+
+        if not prompt_map or set(prompt_map) != set(soft_map_raw):
+            raise ValueError("prompts and soft_probs must cover the same schema field(s)")
+
+        parsed_fields: Dict[str, Dict[str, Any]] = {}
+        all_texts: List[str] = []
+        proj_labels: List[str] = []
+        multi_field = len(prompt_map) > 1
+
+        for fname, p_list in prompt_map.items():
+            f_def = self.schema.fields.get(fname)
+            if f_def is None or not isinstance(f_def, (ChoiceField, BooleanField)):
+                raise ValueError(f"Unsupported field for soft distillation: {fname!r}")
+            P_norm = self._normalize_soft_probs(soft_map_raw[fname], f_def, expected_len=len(p_list))
+            y_idx_arr: Optional[np.ndarray] = None
+            raw_hard = hard_map_raw.get(fname)
+            if raw_hard is not None:
+                if len(raw_hard) != len(p_list):
+                    raise ValueError(f"hard_labels length mismatch for field {fname!r}")
+                if isinstance(f_def, ChoiceField):
+                    opt_idx = {opt: i for i, opt in enumerate(f_def.options)}
+                    idx_list = []
+                    for lbl in raw_hard:
+                        if lbl not in opt_idx:
+                            raise ValueError(f"Invalid hard label {lbl!r} for field {fname!r}")
+                        idx_list.append(opt_idx[lbl])
+                    y_idx_arr = np.asarray(idx_list, dtype=np.int64)
+                else:
+                    y_idx_arr = np.asarray([1 if bool(lbl) else 0 for lbl in raw_hard], dtype=np.int64)
+            parsed_fields[fname] = {"f_def": f_def, "prompts": p_list, "P_T": P_norm, "y_idx": y_idx_arr}
+            lbl_source = y_idx_arr if y_idx_arr is not None else np.argmax(P_norm, axis=1)
+            for txt, idx_val in zip(p_list, lbl_source):
+                all_texts.append(txt)
+                proj_labels.append(f"{fname}:{int(idx_val)}" if multi_field else str(int(idx_val)))
+
+        from system1.core.embeddings import HybridProjector
+
+        needs_hybrid_fit = (
+            eff_semantic_mode in ("v1_1", "v1_2_fisher", "v1_2_rbf")
+            and (
+                not self._explicit_projector
+                or (isinstance(self.projector, HybridProjector) and not getattr(self.projector, "_fitted", False))
+            )
+        )
+        fold_factory = None
+        if needs_hybrid_fit:
+            fit_labels = proj_labels if len(set(proj_labels)) >= 2 else None
+            extra_fit_kw: Dict[str, Any] = {}
+            if isinstance(self.projector, HybridProjector):
+                extra_fit_kw["sparse_dim"] = self.projector.sparse_dim
+                extra_fit_kw["dense_dim"] = self.projector.dense_dim
+                extra_fit_kw["alpha"] = self.projector.alpha
+                extra_fit_kw["seed"] = self.projector.seed
+            if eff_semantic_mode == "v1_1":
+                fitted_proj = HybridProjector.fit(
+                    all_texts,
+                    labels=fit_labels,
+                    backend=self.backend,
+                    **extra_fit_kw,
+                )
+            else:
+                fitted_proj = HybridProjector.fit_v1_2(
+                    all_texts,
+                    labels=fit_labels,
+                    schema=self.schema,
+                    backend=self.backend,
+                    attach_rbf=bool(eff_semantic_mode == "v1_2_rbf" and fit_labels is not None),
+                    **extra_fit_kw,
+                )
+            self.projector = fitted_proj
+            self.dimension = int(fitted_proj.dimension)
+            self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
+        elif pragmatic and (not self._explicit_projector or not isinstance(self.projector, PragmaticCompositeProjector)):
+            base_cap = min(int(max_features), MAX_SKILL_DIMENSION - int(prag_max_dim))
+            eff_min_df = 1 if len(all_texts) < 24 else (2 if len(all_texts) < 48 else 3)
+            fit_labels = proj_labels if len(set(proj_labels)) >= 2 else None
+            fitted_prag = PragmaticCompositeProjector.fit(
+                all_texts,
+                labels=fit_labels,
+                max_features=max(16, base_cap),
+                prag_max_dim=min(int(prag_max_dim), MAX_PRAG_FEATURES),
+                min_df=eff_min_df,
+                char_ngrams=(3, 5),
+            )
+            self.projector = fitted_prag
+            self.dimension = int(fitted_prag.dimension)
+            self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
+            if not multi_field:
+                def fold_factory(tr_texts: List[str], tr_lbls: List[int]) -> PragmaticCompositeProjector:
+                    flabels = [str(v) for v in tr_lbls] if len(set(tr_lbls)) >= 2 else None
+                    mdf = 1 if len(tr_texts) < 24 else (2 if len(tr_texts) < 48 else 3)
+                    return PragmaticCompositeProjector.fit(
+                        tr_texts,
+                        labels=flabels,
+                        max_features=max(16, base_cap),
+                        prag_max_dim=min(int(prag_max_dim), MAX_PRAG_FEATURES),
+                        min_df=mdf,
+                        char_ngrams=(3, 5),
+                    )
+        elif not self._explicit_projector:
+            feat_cap = min(int(max_features), MAX_SKILL_DIMENSION)
+            fit_labels = proj_labels if len(set(proj_labels)) >= 2 else None
+            fitted_tfidf = TfidfProjector.fit(
+                all_texts,
+                max_features=max(16, feat_cap),
+                labels=fit_labels,
+                selection="chi2" if fit_labels is not None else "frequency",
+                char_ngrams=(3, 5),
+            )
+            self.projector = fitted_tfidf
+            self.dimension = int(fitted_tfidf.dimension)
+            self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
+            if not multi_field:
+                def fold_factory(tr_texts: List[str], tr_lbls: List[int]) -> TfidfProjector:
+                    flabels = [str(v) for v in tr_lbls] if len(set(tr_lbls)) >= 2 else None
+                    return TfidfProjector.fit(
+                        tr_texts,
+                        max_features=max(16, feat_cap),
+                        labels=flabels,
+                        selection="chi2" if flabels is not None else "frequency",
+                        char_ngrams=(3, 5),
+                    )
+
+        eff_recency = (
+            False
+            if isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector))
+            else self.recency_weighted
+        )
+        compiled_heads: Dict[str, CompiledHeadWeights] = {}
+        sample_counts: Dict[str, Dict[str, int]] = {}
+        for fname, f_def in self.schema.fields.items():
+            info = parsed_fields.get(fname)
+            if info is None:
+                head = DecisionFieldHead(f_def, dimension=self.dimension, projector=self.projector)
+                compiled_heads[fname] = CompiledHeadWeights(
+                    field_name=fname,
+                    field_type=f_def.field_type,
+                    weights=head.weights,
+                    biases=head.biases,
+                    temperature=1.0,
+                    conformal_quantile=0.0,
+                    options=getattr(f_def, "options", ()),
+                    forgetting_factor=self.forgetting_factor,
+                    relative_odds_ratio=self.relative_odds_ratio,
+                    confidence_floor_tau0=self.confidence_floor_tau0,
+                    escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
+                )
+                continue
+            head_w = self._soft_distill_discrete_head(
+                fname,
+                info["f_def"],
+                info["prompts"],
+                info["P_T"],
+                y_true_idx=info["y_idx"],
+                alpha=eff_alpha,
+                beta_grid=beta_grid,
+                reg_grid=reg_grid,
+                fold_projector_factory=fold_factory,
+                mondrian=self.mondrian,
+            )
+            compiled_heads[fname] = head_w
+            sample_counts[fname] = {
+                "fit": len(info["prompts"]),
+                "calibration": len(info["prompts"]),
+                "temperature": len(info["prompts"]),
+                "generated": 0,
+            }
+
+        return CompiledSystemOneModel(
+            schema=self.schema,
+            heads=compiled_heads,
+            dimension=self.dimension,
+            projector=self.projector,
+            backend=self.backend,
+            forgetting_factor=self.forgetting_factor,
+            recency_weighted=eff_recency,
+            metadata={
+                "regularization": self.regularization,
+                "choice_solver": "soft_ridge_oof",
+                "teaching_mode": "soft_distilled",
+                "pragmatic": bool(isinstance(self.projector, PragmaticCompositeProjector)),
+                "semantic_mode": eff_semantic_mode,
+                "alpha": eff_alpha,
+                "sample_counts": sample_counts,
+                "compiled_at": time.time(),
+            },
+        )
+
     def compile(
         self,
         exemplars: Optional[Dict[str, Sequence[Tuple[str, Any]]]] = None,
@@ -2797,6 +3508,7 @@ class SystemOneCompiler:
         semantic_mode: Optional[str] = None,
         proto_blend: Optional[float] = None,
         fisher_reg: Optional[float] = None,
+        soft_targets: Optional[Mapping[str, Sequence[Sequence[float]]]] = None,
     ) -> CompiledSystemOneModel:
         """Compile a local model, optionally using supplied examples only.
 
@@ -2872,6 +3584,19 @@ class SystemOneCompiler:
             if training_inputs & calibration_inputs:
                 raise ValueError("Training and calibration inputs must be disjoint")
 
+        validated_soft: Dict[str, np.ndarray] = {}
+        if soft_targets is not None:
+            if not isinstance(soft_targets, Mapping):
+                raise ValueError("soft_targets must be a mapping of field_name -> probability sequences")
+            for s_fname, s_probs in soft_targets.items():
+                f_def_s = self.schema.fields.get(s_fname)
+                if f_def_s is None or not isinstance(f_def_s, (ChoiceField, BooleanField)):
+                    raise ValueError(f"soft_targets supports ChoiceField and BooleanField only, got {s_fname!r}")
+                raw_rows = dataset.get(s_fname, [])
+                validated_soft[s_fname] = self._normalize_soft_probs(
+                    s_probs, f_def_s, expected_len=len(raw_rows)
+                )
+
         compiled_heads: Dict[str, CompiledHeadWeights] = {}
         sample_counts: Dict[str, Dict[str, int]] = {}
         partitioned_fields: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -2886,6 +3611,34 @@ class SystemOneCompiler:
                 if not augment:
                     raise ValueError(f"Teaching requires examples for field {field_name!r}")
                 partitioned_fields[field_name] = None
+                continue
+
+            soft_probs_field = validated_soft.get(field_name)
+            if soft_probs_field is not None:
+                calibration_samples = list(calibration_data.get(field_name, [])) if calibration_data is not None else []
+                num_train = len(samples)
+                num_calib = len(calibration_samples)
+                sample_counts[field_name] = {
+                    "fit": num_train,
+                    "calibration": num_calib if num_calib > 0 else num_train,
+                    "temperature": num_calib // 2 if num_calib >= 2 else num_train,
+                    "generated": 0,
+                }
+                for row in samples:
+                    p_txt = row[0]
+                    if isinstance(p_txt, str):
+                        all_train_texts.append(p_txt)
+                        discrete_texts.append(p_txt)
+                        lbl_str = str(row[1])
+                        discrete_labels.append(f"{field_name}:{lbl_str}" if multi_field_schema else lbl_str)
+                partitioned_fields[field_name] = {
+                    "samples": samples + calibration_samples,
+                    "num_train": num_train,
+                    "num_calib": num_calib,
+                    "num_temperature": (num_calib // 2 if num_calib >= 2 else 0),
+                    "generated_count": 0,
+                    "soft_probs": soft_probs_field,
+                }
                 continue
 
             # Teaching from examples keeps repeated inputs in one partition.
@@ -3127,7 +3880,7 @@ class SystemOneCompiler:
                         need_norm_set.add(p)
 
             if unique_prompts and hasattr(self.projector, "project_batch"):
-                use_rw = self.recency_weighted and not isinstance(self.projector, TfidfProjector)
+                use_rw = self.recency_weighted and not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector))
                 want_any_norm = bool(need_norm_set)
                 raw_norms_batch: Optional[np.ndarray] = None
                 try:
@@ -3190,7 +3943,7 @@ class SystemOneCompiler:
                     emb = emb_base
                 else:
                     if hasattr(self.projector, "project"):
-                        if self.recency_weighted and not isinstance(self.projector, TfidfProjector):
+                        if self.recency_weighted and not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector)):
                             try:
                                 raw_emb = self.projector.project(p, recency_weighted=self.recency_weighted)
                             except TypeError:
@@ -3231,6 +3984,123 @@ class SystemOneCompiler:
             X_conf = X_calib[num_temperature:] if isinstance(f_def, ChoiceField) else X_calib
             if len(X_conf) == 0:
                 X_conf = X_calib
+
+            soft_probs_field = part.get("soft_probs")
+            if soft_probs_field is not None and isinstance(f_def, (ChoiceField, BooleanField)):
+                y_raw_train = raw_labels[:num_train]
+                if isinstance(f_def, ChoiceField):
+                    opt_idx_map = {opt: idx for idx, opt in enumerate(f_def.options)}
+                    y_idx_train = np.asarray([opt_idx_map[lbl] for lbl in y_raw_train], dtype=np.int64)
+                else:
+                    y_idx_train = np.asarray([1 if bool(lbl) else 0 for lbl in y_raw_train], dtype=np.int64)
+
+                if num_calib == 0:
+                    compiled_heads[field_name] = self._soft_distill_discrete_head(
+                        field_name,
+                        f_def,
+                        prompts[:num_train],
+                        soft_probs_field,
+                        y_true_idx=y_idx_train,
+                        alpha=0.05,
+                        X_precomputed=X_train,
+                        mondrian=eff_mondrian,
+                        fam_thresh=fam_thresh,
+                    )
+                else:
+                    K_s = soft_probs_field.shape[1]
+                    Y_hard_s = np.eye(K_s, dtype=np.float64)[y_idx_train]
+                    n_f_s, f_ids_s = self._stratified_folds(y_idx_train, K_s)
+                    best_b_s, best_r_s, best_nll_s = 0.25, 0.5, float("inf")
+                    X_tr64 = X_train.astype(np.float64)
+                    for beta_s in (0.15, 0.35, 0.55):
+                        for reg_s in (0.15, 0.5, 1.5, 5.0):
+                            oof_s = np.zeros((num_train, K_s), dtype=np.float64)
+                            for f_k in range(n_f_s):
+                                tri_s = np.where(f_ids_s != f_k)[0]
+                                vai_s = np.where(f_ids_s == f_k)[0]
+                                if len(tri_s) == 0 or len(vai_s) == 0:
+                                    continue
+                                U_fk, c_fk, _, _ = _solve_soft_ridge_student_raw(
+                                    X_tr64[tri_s], soft_probs_field[tri_s], Y_hard_s[tri_s], beta=beta_s, reg=reg_s
+                                )
+                                oof_s[vai_s] = X_tr64[vai_s] @ U_fk.T + c_fk
+                            p_s = _stable_softmax(oof_s, temperature=1.0)
+                            nll_s = -float(np.mean(np.sum(soft_probs_field * np.log(np.clip(p_s, 1e-12, 1.0)), axis=1)))
+                            if nll_s < best_nll_s:
+                                best_nll_s, best_b_s, best_r_s = nll_s, beta_s, reg_s
+                    U_s, c_s, Z_s, sw_s = _solve_soft_ridge_student_raw(
+                        X_tr64, soft_probs_field, Y_hard_s, beta=best_b_s, reg=best_r_s
+                    )
+                    if isinstance(f_def, BooleanField):
+                        w_s = (0.25 * (U_s[1:2] - U_s[0:1])).astype(np.float32)
+                        b_s = np.array([0.25 * float(c_s[1] - c_s[0])], dtype=np.float32)
+                        t_scaled = (0.25 * (Z_s[:, 1] - Z_s[:, 0])).reshape(-1, 1).astype(np.float32)
+                        h_opts: Tuple[str, ...] = ()
+                        raw_cal = (X_calib.astype(np.float64) @ U_s.T + c_s)
+                        y_cal_idx = np.asarray([1 if bool(l) else 0 for l in raw_labels[num_train:]], dtype=np.int64)
+                    else:
+                        w_s = (0.25 * U_s).astype(np.float32)
+                        b_s = (0.25 * c_s).astype(np.float32)
+                        t_scaled = (0.25 * Z_s).astype(np.float32)
+                        h_opts = f_def.options
+                        opt_idx_map = {opt: idx for idx, opt in enumerate(f_def.options)}
+                        raw_cal = X_calib.astype(np.float64) @ U_s.T + c_s
+                        y_cal_idx = np.asarray([opt_idx_map[l] for l in raw_labels[num_train:]], dtype=np.int64)
+                    _, _, P_s, B_s = self._solve_ridge(
+                        X_train,
+                        t_scaled,
+                        best_r_s,
+                        sample_weights=sw_s.astype(np.float32),
+                        regularize_bias=False,
+                        return_covariance=True,
+                    )
+                    n_temp_s = max(0, min(num_temperature, len(raw_cal) - 1))
+                    if n_temp_s >= 1:
+                        y_t_oh = np.eye(K_s, dtype=np.float64)[y_cal_idx[:n_temp_s]]
+                        T_cal = _soft_fit_temperature_np(raw_cal[:n_temp_s], y_t_oh)
+                        cal_logits_c = raw_cal[n_temp_s:]
+                        cal_y_c = y_cal_idx[n_temp_s:]
+                    else:
+                        T_cal = 1.0
+                        cal_logits_c = raw_cal
+                        cal_y_c = y_cal_idx
+                    p_cal_c = _stable_softmax(cal_logits_c / T_cal, temperature=1.0)
+                    sc_cal = 1.0 - p_cal_c[np.arange(len(cal_y_c)), cal_y_c]
+                    sorted_sc_cal = np.sort(sc_cal)
+                    n_sc_c = len(sorted_sc_cal)
+                    k_c = int(math.ceil((n_sc_c + 1) * 0.95))
+                    conf_q_c = (1.0 if k_c > n_sc_c else float(sorted_sc_cal[k_c - 1])) if n_sc_c else 0.0
+                    c_opts_lbl = f_def.options if isinstance(f_def, ChoiceField) else ("False", "True")
+                    cls_sc_c = (
+                        {
+                            c_opts_lbl[c]: tuple(float(v) for v in np.sort(sc_cal[cal_y_c == c]))
+                            for c in range(K_s)
+                            if np.any(cal_y_c == c)
+                        }
+                        if eff_mondrian
+                        else {}
+                    )
+                    compiled_heads[field_name] = CompiledHeadWeights(
+                        field_name=field_name,
+                        field_type=f_def.field_type,
+                        weights=w_s,
+                        biases=b_s,
+                        temperature=float(T_cal),
+                        conformal_quantile=float(conf_q_c),
+                        options=h_opts,
+                        P=P_s,
+                        B=B_s,
+                        forgetting_factor=self.forgetting_factor,
+                        relative_odds_ratio=self.relative_odds_ratio,
+                        confidence_floor_tau0=self.confidence_floor_tau0,
+                        escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
+                        calibration_scores=tuple(float(v) for v in sorted_sc_cal),
+                        score_method="lac",
+                        mondrian=eff_mondrian,
+                        class_calibration_scores=cls_sc_c,
+                        familiarity_threshold=fam_thresh,
+                    )
+                continue
 
             # Construct target Y matrix
             if isinstance(f_def, ChoiceField):
@@ -3738,6 +4608,7 @@ class SystemOneCompiler:
         semantic_mode: Optional[str] = None,
         proto_blend: Optional[float] = None,
         fisher_reg: Optional[float] = None,
+        soft_targets: Optional[Mapping[str, Sequence[Sequence[float]]]] = None,
     ) -> CompiledSystemOneModel:
         """Compiles model and writes directly to target .s1m binary file."""
         model = self.compile(
@@ -3757,6 +4628,7 @@ class SystemOneCompiler:
             semantic_mode=semantic_mode,
             proto_blend=proto_blend,
             fisher_reg=fisher_reg,
+            soft_targets=soft_targets,
         )
         model.save(output_path)
         return model
