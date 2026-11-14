@@ -1,10 +1,10 @@
 # System 1: Instinct — teaching bounded decisions for local reuse
 
-**steph4n-gh · System 1: Instinct 1.0.0 · 14 October 2026**
+**steph4n-gh · System 1: Instinct 1.2.0 · 13 November 2026**
 Maintainer-authored technical whitepaper; not a peer-reviewed publication.
 [Source repository](https://github.com/steph4n-gh/system1-instinct)
 
-This document describes **System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
+This document describes **System 1: Instinct 1.2.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
 the original source revisions and evidence linked in each experiment; this
 release includes the 6-category benchmark gauntlet and neural baseline comparisons alongside historical results.
 
@@ -95,7 +95,7 @@ count both parts; the default projector measurements cannot be applied to them.
 
 ### Retained lessons, candidate assessment and explicit adoption
 
-`TeachingSession`, introduced in 1.1.0 and expanded in 1.4.0, adds a reproducible correction workflow for
+`TeachingSession` adds a reproducible correction workflow for
 single-field or multi-field schemas (`ChoiceField`, `BooleanField`, `MultiChoiceField`, `ScoreField`), with ambiguity escalation enabled on at least one field so uncertain answers
 request review. It retains explicitly labeled `teach`, `calibrate` and
 `evaluate` records (or deterministic 60%/20%/20% `split="auto"` routing). A same-input correction replaces a record; normalized inputs

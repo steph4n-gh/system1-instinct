@@ -120,7 +120,7 @@ Because `TfidfProjector` freezes its vocabulary and IDF weights inside the `.s1m
 To fit `ChoiceField` heads with cross-entropy optimization instead of the default ridge solver, install the `teaching` extra and pass `choice_solver="logistic"`:
 
 ```bash
-python -m pip install 'system1-instinct[teaching]>=1.0.0'
+python -m pip install 'system1-instinct[teaching]>=1.2.0'
 ```
 
 In Python, pass `choice_solver="logistic"` and `regularization` to `SystemOneCompiler`:
@@ -187,5 +187,19 @@ To fix an error in a deployed skill, correct the mislabeled example, add represe
 When you update a live engine in place:
 - **High-level online learning (`engine.learn(...)`, `engine.learn_from_outcome(...)`, and `BoundedReviewFallback(..., auto_online_update=True)`).** Defaults to `preserve_calibration=True`, applying Sherman-Morrison directional gain scaling to preserve conformal quantiles across rank-1 updates.
 - **Low-level tier updates (`learn_from_tier2(...)`, `learn_from_system2(...)`, and `learn_from_tier3(...)`).** Defaults to `preserve_calibration=False`, which invalidates calibration on modified heads so strict mode requests review until you call `engine.calibrate(...)` or pass `preserve_calibration=True`.
+
+## Discriminative hybrid modes (`v1_2_fisher` and `v1_2_rbf`) and imbalance-aware calibration
+
+For harder multi-class routing tasks with zero pretrained weights and zero runtime SciPy dependency, pass `semantic_mode="v1_2_fisher"` or `semantic_mode="v1_2_rbf"` to `SystemOneCompiler`:
+
+- **`HybridProjector.fit_v1_2(...)`.** Extends hybrid TF-IDF + spectral SVD features with stemmed and skip-bigram tokens, schema-anchor spectral weighting, and (when `semantic_mode="v1_2_rbf"` or `attach_rbf=True`) LOO-filtered class-centroid RBF-Cosine similarity landmarks (`attach_rbf_landmarks`).
+- **LOO-filtered class-balanced blending (`compute_strict_loo_weights`).** In `"v1_2_fisher"` and `"v1_2_rbf"`, the compiler computes pure-NumPy closed-form leave-one-out margins (`compute_strict_loo_weights`) to downweight noisy training rows and blends a class-balanced ridge head into the primary ridge weights (`proto_blend=0.22`).
+- **Imbalance-aware probability calibration (`DecisionCalibrator.fit_imbalance_aware`).** Fits class-prior logit adjustments (`-tau * log(pi)`), balanced temperature scaling, and a fail-closed LTT selective margin threshold using only NumPy.
+
+## Factor-graph joint calibration, batch decisions, and sequential monitoring
+
+- **Joint multi-field calibration (`engine.calibrate_joint`).** For correlated multi-field schemas, call `engine.calibrate_joint(train_examples, calibration_examples, alpha=0.05)` to fit a `JointSchemaCalibrator` (pairwise factor-graph exact MAP decoder with Joint LTT selective-risk qualification).
+- **Vectorized batch scoring (`engine.decide_batch`).** Call `engine.decide_batch(prompts)` to evaluate a batch of prompts through `HybridProjector` / `TfidfProjector` / `DeterministicSemanticProjector` and compiled `ChoiceField` / `BooleanField` heads with single-call numerical parity.
+- **Anytime-valid sequential monitoring (`SequentialRiskMonitor`).** Track live post-deployment audited errors with `SequentialRiskMonitor(alpha=0.05, delta=0.05, mode="capital_ons")` (or `"ons_betting"`, `"capital_eb"`, `"fixed_mixture"`) to detect conditional risk drift when `e_value >= threshold`.
 
 For multi-step synthetic bootstrapping, online updates, and skill composition, see [`examples/train_expert.py`](../../examples/train_expert.py).

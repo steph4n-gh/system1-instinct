@@ -53,6 +53,7 @@ with Client(mode="auto_cutover", zero_egress=False) as client:
 ```
 
 - **Custom teacher callback (`baseline_handler`).** `Client(..., baseline_handler=teacher)` observes a Python callable instead of the Jev HTTP API. The callable receives `(state, questions)` and returns a mapping with an `"answers"` dictionary where each entry contains `"type"` and `"choice"`, `"noul"`, `"score"`, or `"value"`. Setting `zero_egress=True` blocks the built-in Jev HTTP transport, not custom code inside `baseline_handler`.
+- **Autonomous milestone cutover (`auto_cutover_lifecycle`).** Pass `auto_cutover_lifecycle=True` (or a `CutoverConfig(...)` / `AutoCutoverLifecycle` instance) to `Client` or `AsyncClient` to enable progressive milestone `HybridProjector` compilation over quarantine-filtered disjoint train/calibration reservoirs, OOD centroid + Adaptive Conformal gating, selective hot-swap, and sequential e-process drift recalibration.
 - **Reloading a promoted `.s1m` skill (`model_path`).** `Client(mode="auto_cutover", model_path="queue.s1m")` loads a saved `.s1m` file without a teacher or API key. The `questions` mapping passed to `client.systemone(...)` must match the saved schema. The `.s1m` artifact restores built-in hashed, `TfidfProjector`, and `HybridProjector` settings, weights, temperatures, conformal scores, and strict-mode flags. Custom external projectors passed to `Client(...)` must implement `projector_digest()`.
 - **Multi-exemplar option criteria.** `Choice(criteria=...)` accepts a description string per option, a semicolon-separated string of phrases, or a list or tuple of example strings per option. Multiple phrases per option compile into sibling-contrastive sub-prototypes for zero-shot cold-start routing before cutover.
 
@@ -81,16 +82,16 @@ With `require_statistical_bound=True` (the default), validation attempt `k` allo
 
 | Component | Behavior |
 |---|---|
-| `Client` and `AsyncClient` | Sync and async context managers, `close()` and `aclose()`, `systemone(...)`, constructor model defaults, `background_compile=True`, `wait_for_compilation()`, and `export_teaching_session(path)`. |
+| `Client` and `AsyncClient` | Sync and async context managers, `close()` and `aclose()`, `systemone(...)`, constructor model defaults, `background_compile=True`, `auto_cutover_lifecycle`, `wait_for_compilation()`, and `export_teaching_session(path)`. |
 | Structured `state` | Accepts strings, JSON objects, and JSON arrays. Canonical JSON text feeds local feature extraction, and the client sends the original JSON value over HTTP when calling Jev. |
 | Questions | Supports `Choice`, `Noul`, `NoulCriteria`, and ordinal `Score`, plus dicts and objects implementing `model_dump()`. |
 | Responses | Provides `.answers`, `.choices`, `.nouls`, `.scores`, attribute access, and token usage on mutable response dictionaries. |
 | Ordinal `Score` | Supports `2` to `10` ordered integer levels, returning per-level probabilities, an integer-keyed legend, and the probability-weighted mean score. Observed scalar scores map to the nearest level during fitting. |
-| Local extensions | Supports continuous `ScoreField` ranges, `MultiChoice`, signed receipts, conformal sets, `background_compile=True`, `export_teaching_session(path)`, and `.s1m` export. |
+| Local extensions | Supports continuous `ScoreField` ranges, `MultiChoice`, signed receipts, conformal sets, `background_compile=True`, `auto_cutover_lifecycle` (`AutoCutoverLifecycle` / `CutoverConfig`), `export_teaching_session(path)`, and `.s1m` export. |
 | Unsupported SDK options | Custom HTTP transports, retry policies, custom headers, extra request bodies, custom Pydantic response models, and remote model-management endpoints raise `NotImplementedError`. |
 
 ## Artifact format and online updates
 
-- **`.s1m` v2 format.** Newly saved skills write format v2 with Least Ambiguous Set Classifier (LAC) conformal scores (`1 - probability(label)`). System 1: Instinct 1.0.0 reads both v1 (APS) and v2 (LAC) artifacts and rejects corrupted headers, mismatched schemas, or nonfinite weights.
+- **`.s1m` v2 format.** Newly saved skills write format v2 with Least Ambiguous Set Classifier (LAC) conformal scores (`1 - probability(label)`). System 1: Instinct 1.2.0 reads both v1 (APS) and v2 (LAC) artifacts and rejects corrupted headers, mismatched schemas, or nonfinite weights.
 - **Calibration and online updates.** `engine.calibrate(...)` stores conformal scores in the compiled model. Low-level `learn_from_tier2(...)` defaults to `preserve_calibration=False` and invalidates calibration on updated heads until recalibration. Passing `preserve_calibration=True` to `learn_from_tier2(...)`, or calling `engine.learn(...)`, `engine.learn_from_outcome(...)`, or `BoundedReviewFallback(..., auto_online_update=True)`, applies Sherman-Morrison directional gain scaling to preserve conformal quantiles.
 - **Exporting to `TeachingSession`.** `client.export_teaching_session(path)` writes all observed fitting, calibration, and validation records into a persistent [`TeachingSession`](guides/correcting_skills.md) directory.

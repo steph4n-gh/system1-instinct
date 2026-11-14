@@ -61,7 +61,7 @@ from system1.core import (
     schema,
 )
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 __all__ = [
     # Schema primitives

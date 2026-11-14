@@ -1,9 +1,9 @@
 # Mathematical notes: uncertainty, prototype geometry and online correction
 
-**System 1: Instinct 1.0.0 · 14 October 2026 · Implementation notes, not new theorems**
+**System 1: Instinct 1.2.0 · 13 November 2026 · Implementation notes, not new theorems**
 
 This note describes the runtime mathematics in
-**System 1: Instinct 1.0.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)) and the assumptions needed to interpret it,
+**System 1: Instinct 1.2.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)) and the assumptions needed to interpret it,
 including Mondrian class-conditional calibration, dual OOD familiarity and prototype similarity gating, the teaching workflow, and calibration-preserving online RLS updates. The [whitepaper](system1_whitepaper.md) contains the
 product evaluation; the [architecture reference](../architecture/technical_specification.md)
 maps behavior to code. Earlier claims of guaranteed safe execution, universal
@@ -205,15 +205,15 @@ limit exact equivalence. A positive diagonal alone does not prove positive
 definiteness; rescaling a matrix alone does not improve its condition number.
 No fixed latency, unlimited stability or immunity to forgetting is implied.
 
-The `TeachingSession` workflow introduced in 1.1.0 (and expanded to multi-field
-schemas in 1.4.0) retains corrected examples and
+The `TeachingSession` workflow retains corrected examples across single-field and
+multi-field schemas and
 recompiles a separate TF-IDF or `HybridProjector` candidate, then recalibrates it on its separate
 calibration records. It does not mutate
 the approved skill during assessment. When `learn_from_tier2` is called with the
 default `preserve_calibration=False`,
 changed weights invalidate their old calibration in memory and saved artifacts, so strict inference requests review until separate recalibration.
 When `learn_from_tier2(..., preserve_calibration=True)` is used (such as inside
-`BoundedReviewFallback(..., auto_online_update=True)`), System 1 1.4.0 preserves
+`BoundedReviewFallback(..., auto_online_update=True)`), System 1 preserves
 existing conformal calibration scores and uses exact Sherman-Morrison directional
 gain scaling $y_{\text{step}} = ((\lambda_f + g) y_{\text{desired}} - \lambda_f W_t x) / g$
 (with $g = x^T P_t x$) so that only the target class and competing positive runner-up
@@ -222,9 +222,9 @@ teacher label is fallible supervision, and online updates do not re-establish
 formal split-conformal exchangeability; periodic batch recompilation on retained
 lessons remains recommended.
 
-### Mondrian class-conditional calibration and dual OOD gating in 1.4.0
+### Mondrian class-conditional calibration and dual OOD gating
 
-In System 1 1.4.0, `ConformalPredictor(mondrian=True)` partitions the calibration
+With `ConformalPredictor(mondrian=True)`, System 1 partitions the calibration
 fold by true class $c\in\{1,\ldots,K\}$ and computes per-class quantiles
 $q_c = s_{c,(\lceil (n_c + 1)(1 - \alpha)\rceil)}$ (falling back to the marginal
 quantile when $n_c < 3$). Candidate label $y$ is included in $C(x)$ iff
@@ -275,3 +275,34 @@ better decision policy without considering coverage and application costs.
 The separate 1.2.0 qualification gate adds fresh-data lower-bound checks under
 the assumptions above; it does not retroactively qualify this experiment or any
 full-scope workload. No new encoder or lesson-selection result is asserted here.
+
+## 6. Selective risk, factor-graph joint LTT, and sequential monitoring (1.2.0)
+
+Version 1.2.0 adds finite-sample selective risk gates, imbalance-aware
+calibrators, factor-graph joint decoding, and anytime-valid online risk
+monitors in [calibration.py](../../src/system1/calibration.py):
+
+- **`SelectiveRiskCalibrator`:** Selects a threshold $\lambda$ on scalar
+  confidence or margin scores using Learn Then Test (`"ltt_fst"` fixed-sequence
+  testing or `"ltt_bonferroni"`) for conditional selective error
+  $\Pr(\hat{Y} \ne Y \mid g(X) \ge \lambda) \le \alpha$, or Risk-Controlling
+  Prediction Sets (`"rcps_joint"`) for joint selective risk
+  $\Pr(\hat{Y} \ne Y \text{ and } g(X) \ge \lambda) \le \alpha$, each backed
+  by exact binomial tail p-values and `clopper_pearson_upper` bounds at failure
+  probability $\delta$. When no threshold qualifies, `should_accept(...)`
+  fails closed (`False`).
+- **`DecisionCalibrator.fit_imbalance_aware`:** Applies class-prior logit
+  adjustment (`-tau * log(pi)`), balanced temperature scaling, and a fail-closed
+  LTT margin gate using pure NumPy without requiring SciPy at runtime.
+- **`JointSchemaCalibrator` (`engine.calibrate_joint`):** Fits pairwise label
+  log-prior potentials over structured schema combinations (`fit_structure`),
+  runs exact MAP decoding (`decode_batch` / `decode_one`), and certifies
+  complete-assignment acceptance with `SelectiveRiskCalibrator(method="ltt_fst")`.
+- **`AdaptiveConformalTracker` & `SequentialRiskMonitor`:** Track live
+  residual error after deployment. `AdaptiveConformalTracker` updates online
+  $\alpha_t$ via Gibbs-Candes Adaptive Conformal Inference with a bounded
+  sliding window and error-triggered `margin_floor` ratcheting.
+  `SequentialRiskMonitor` maintains a nonnegative supermartingale (e-process)
+  across audited error indicators in `"capital_ons"`, `"ons_betting"`,
+  `"capital_eb"`, or `"fixed_mixture"` mode, raising an anytime-valid drift
+  alarm whenever the e-value reaches $1/\delta$.

@@ -1,6 +1,6 @@
 # System 1: Instinct documentation
 
-Current package version: **1.0.0** (`Development Status :: 4 - Beta`).
+Current package version: **1.2.0** (`Development Status :: 5 - Production/Stable`).
 
 **System 1: Instinct** is a local decision runtime. It is not an LLM, and it ships no pretrained weights by default. Each skill defines a `DecisionSchema` (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`). A skill runs from option descriptions or fits weights from labeled examples, updates online via `adapt_zero_shot` and `BoundedReviewFallback`, and serializes to a `.s1m` artifact. Latency and file size depend on the host and the vocabulary; see the [README honest limits](../README.md#honest-limits).
 
@@ -28,9 +28,9 @@ The index in [`docs/drop_in/README.md`](drop_in/README.md) covers drop-in integr
 | [Quickstart](../README.md#quickstart) | Environment setup and runnable quickstart commands |
 | [Teach your first skill](guides/first_skill.md) | Tutorial for building a two-choice routing skill from an editable JSON file |
 | [Correct, compare, and adopt a skill](guides/correcting_skills.md) | `TeachingSession` lifecycle, candidate assessment, qualification, and rollback |
-| [Teach and compile a decision skill](guides/training_experts.md) | Label formats, `SystemOneCompiler`, `TfidfProjector`, and online updates |
-| [Teacher observation (`TypeSafeClient`)](typesafe.md) | Reference for `system1.compat.typesafe.Client`, promotion policies, and `.s1m` export |
-| [Application integrations](integrations.md) | Reference for LangChain, the in-process MCP guard, FastAPI, ASGI, and gRPC adapters |
+| [Teach and compile a decision skill](guides/training_experts.md) | Label formats, `SystemOneCompiler`, `TfidfProjector`, `HybridProjector` (`v1_2_fisher`, `v1_2_rbf`), `calibrate_joint`, and online updates |
+| [Teacher observation (`TypeSafeClient`)](typesafe.md) | Reference for `system1.compat.typesafe.Client`, `AutoCutoverLifecycle`, promotion policies, and `.s1m` export |
+| [Application integrations](integrations.md) | Reference for LangChain, MCP (in-process guard, stdio proxy, and Streamable HTTP server), FastAPI, ASGI, and gRPC adapters |
 | [Add an explicit tool policy](guides/policy_guard.md) | How to configure `SystemOneGuard`, `PolicyEngine`, Ed25519 receipts, and `ActionLedger` |
 | [Deployment boundaries](deployment.md) | Security boundaries, `.s1m` loader limits, and production checklists |
 | [Observability](observability/README.md) | Prometheus metrics and OpenTelemetry tracing |
@@ -43,6 +43,7 @@ The index in [`docs/drop_in/README.md`](drop_in/README.md) covers drop-in integr
 | Document | Scope |
 | :--- | :--- |
 | [Fresh traffic with a fallible teacher](../benchmarks/heldout_traffic/REPORT.md) | `HWU64` with `10%` noisy lessons, `1%` and `5%` local error budgets, cache and classifier comparisons, and binary `.s1m` verification |
+| [Offline prequential cassette benchmark](../benchmarks/prequential/README.md) | `system1.cassette.v1` socket-blocked causal test-then-train replay, selective risk, and teacher-call reduction |
 | [Six-category benchmark report](../benchmarks/quality/instinct_gauntlet_report.md) | `BANKING77` (32 and 77 intents), `CLINC150-OOS`, `NotInject`, authored drift probes, four-field extraction, and zero-shot routing |
 | [Drop-in and adaptation curve report](../benchmarks/quality/drop_in_and_adaptation_report.md) | Zero-shot, `adapt_zero_shot`, few-shot, and compiled `.s1m` curves on `BANKING77` and `CLINC150` |
 | [`poke-env` Showdown benchmark report](../benchmarks/quality/poke_env_showdown_report.md) | Live `gen9randombattle` Showdown results against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer` |

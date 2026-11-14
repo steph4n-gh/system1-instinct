@@ -1,6 +1,6 @@
 # Configure deployment boundaries and runtime limits
 
-System 1: Instinct 1.0.0 provides NumPy-based compilation, conformal calibration, local `.s1m` inference, teacher observation, closed-loop review fallback (`BoundedReviewFallback`), and deterministic tool authorization (`SystemOneGuard`). See the [six-category benchmark report](../benchmarks/quality/instinct_gauntlet_report.md), [drop-in replacement guides](drop_in/README.md), [changelog](../CHANGELOG.md), and [benchmark suite index](../benchmarks/quality/README.md). Follow the procedures below to enforce security boundaries, statistical checks, and resource limits in production.
+System 1: Instinct 1.2.0 provides NumPy-based compilation, conformal calibration, local `.s1m` inference, teacher observation, closed-loop review fallback (`BoundedReviewFallback`), and deterministic tool authorization (`SystemOneGuard`). See the [six-category benchmark report](../benchmarks/quality/instinct_gauntlet_report.md), [drop-in replacement guides](drop_in/README.md), [changelog](../CHANGELOG.md), and [benchmark suite index](../benchmarks/quality/README.md). Follow the procedures below to enforce security boundaries, statistical checks, and resource limits in production.
 
 ## Enforce deterministic tool authorization
 
@@ -75,7 +75,7 @@ When you deploy the gRPC server (`system1-instinct[grpc]`):
 | Per-member compression ratio | `1,024:1` |
 | Estimated model allocation budget | `256 MiB` |
 
-The loader disables Python `pickle`, verifies NPY header shapes and `float32` or `float64` dtypes before reading arrays, and raises `ValueError` on malformed or over-budget files. `HybridProjector` skills store their spectral, subspace, landmark, and IDF arrays as binary `.npz` members (`_projector_spectral_vectors`, `_projector_subspace_components`, `_projector_rbf_landmarks`, `_projector_tfidf_idf`, and `_projector_hybrid_tfidf_idf`) for `v1_2_fisher` and `v1_2_rbf` compiled skills. Both v1 (APS) and v2 (LAC) `.s1m` files remain readable in System 1: Instinct 1.0.0.
+The loader disables Python `pickle`, verifies NPY header shapes and `float32` or `float64` dtypes before reading arrays, and raises `ValueError` on malformed or over-budget files. `HybridProjector` skills store their spectral, subspace, landmark, and IDF arrays as binary `.npz` members (`_projector_spectral_vectors`, `_projector_subspace_components`, `_projector_rbf_landmarks`, `_projector_tfidf_idf`, and `_projector_hybrid_tfidf_idf`) for `v1_2_fisher` and `v1_2_rbf` compiled skills. Both v1 (APS) and v2 (LAC) `.s1m` files remain readable in System 1: Instinct 1.2.0.
 
 ## Measure end-to-end latency on target hardware
 
