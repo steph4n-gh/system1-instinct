@@ -339,6 +339,9 @@ class MultiTenantSkillFleet:
         else:
             self._zero_unit0 = True if zero_unit0 is None else bool(zero_unit0)
         self._accepts_recency = _accepts_recency_weighted(getattr(self.projector, "project", None))
+        self._pwn_accepts_recency = _accepts_recency_weighted(
+            getattr(self.projector, "project_with_norm", None)
+        )
         self._batch_accepts_recency = _accepts_recency_weighted(
             getattr(self.projector, "project_batch", None)
         )
@@ -493,6 +496,7 @@ class MultiTenantSkillFleet:
             recency_weighted=self.recency_weighted,
             zero_unit0=self._zero_unit0,
             accepts_recency=self._accepts_recency,
+            pwn_accepts_recency=self._pwn_accepts_recency,
         )
 
     def _project_batch(self, texts: Sequence[str]) -> np.ndarray:
@@ -504,6 +508,7 @@ class MultiTenantSkillFleet:
             zero_unit0=self._zero_unit0,
             accepts_recency=self._accepts_recency,
             batch_accepts_recency=self._batch_accepts_recency,
+            pwn_accepts_recency=self._pwn_accepts_recency,
         )
 
     def _bind_views(self, tid: int) -> Tuple[Any, ...]:
@@ -609,13 +614,10 @@ class MultiTenantSkillFleet:
         if not (bool(np.all(np.isfinite(raw_w_arr))) and bool(np.all(np.isfinite(raw_b_arr)))):
             raise ValueError("_raw_source_head contains non-finite weights or biases")
 
-        w_dtype = (
-            np.float64
-            if (raw_w_arr.dtype == np.dtype(np.float64) or raw_b_arr.dtype == np.dtype(np.float64))
-            else np.float32
-        )
+        w_dtype = np.float64 if raw_w_arr.dtype == np.dtype(np.float64) else np.float32
+        b_dtype = np.float64 if raw_b_arr.dtype == np.dtype(np.float64) else np.float32
         w_auth = np.array(raw_w_arr, dtype=w_dtype, copy=True)
-        b_auth = np.array(raw_b_arr, dtype=w_dtype, copy=True)
+        b_auth = np.array(raw_b_arr, dtype=b_dtype, copy=True)
         w_auth.setflags(write=False)
         b_auth.setflags(write=False)
 
@@ -717,14 +719,18 @@ class MultiTenantSkillFleet:
         head = live_h if live_h is not None else ch
         if head is None:
             raise ValueError(f"Model has no head for field {field_name!r}")
-        if (
-            not isinstance(f_def, BooleanField)
-            and getattr(head, "hierarchical", False)
-            and getattr(head, "coarse_weights", None) is not None
-            and getattr(head, "coarse_biases", None) is not None
-            and len(getattr(head, "cluster_assignments", ()) or ()) == np.asarray(head.weights).shape[0]
-        ):
-            raise ValueError(f"MultiTenantSkillFleet does not support hierarchical head {field_name!r}")
+        candidates = (head,) if (ch is None or ch is head) else (head, ch)
+        for cand in candidates:
+            if (
+                not isinstance(f_def, BooleanField)
+                and getattr(cand, "hierarchical", False)
+                and getattr(cand, "coarse_weights", None) is not None
+                and getattr(cand, "coarse_biases", None) is not None
+                and len(getattr(cand, "cluster_assignments", ()) or ()) == np.asarray(cand.weights).shape[0]
+            ):
+                raise ValueError(f"MultiTenantSkillFleet does not support hierarchical head {field_name!r}")
+            if getattr(cand, "_exemplar_bank", None) is not None:
+                raise ValueError(f"MultiTenantSkillFleet does not support exemplar-bank head {field_name!r}")
 
         calibrators = getattr(model, "calibrators", None)
         cal_obj = calibrators.get(field_name) if isinstance(calibrators, Mapping) else None
@@ -743,9 +749,10 @@ class MultiTenantSkillFleet:
 
         raw_w_in = np.asarray(head.weights)
         raw_b_in = np.asarray(head.biases).reshape(-1)
-        w_dtype = np.float64 if (raw_w_in.dtype == np.float64 or raw_b_in.dtype == np.float64) else np.float32
+        w_dtype = np.float64 if raw_w_in.dtype == np.float64 else np.float32
+        b_dtype = np.float64 if raw_b_in.dtype == np.float64 else np.float32
         raw_w_auth = np.array(raw_w_in, dtype=w_dtype, copy=True)
-        raw_b_auth = np.array(raw_b_in, dtype=w_dtype, copy=True).reshape(-1)
+        raw_b_auth = np.array(raw_b_in, dtype=b_dtype, copy=True).reshape(-1)
         raw_w_auth.setflags(write=False)
         raw_b_auth.setflags(write=False)
         raw_w64 = np.asarray(raw_w_auth, dtype=np.float64)
@@ -1067,9 +1074,14 @@ class MultiTenantSkillFleet:
             if self._raw_source_head is not None:
                 raw_w_auth, raw_b_auth, cal_t, cal_adj = self._raw_source_head
                 x_in = x_f32.astype(raw_w_auth.dtype, copy=False)
-                raw_lin = x_in @ raw_w_auth.T + raw_b_auth
+                raw_dot = x_in @ raw_w_auth.T
+                raw_lin = raw_dot + raw_b_auth
                 z_col = raw_lin.astype(np.float64) / 0.25
-                if not bool(np.all(np.isfinite(raw_lin))) or not bool(np.all(np.isfinite(z_col))):
+                if (
+                    not bool(np.all(np.isfinite(raw_dot)))
+                    or not bool(np.all(np.isfinite(raw_lin)))
+                    or not bool(np.all(np.isfinite(z_col)))
+                ):
                     return np.full(self.num_classes, np.nan, dtype=np.float64), False
                 if self.is_boolean:
                     two = np.array([-0.5 * float(z_col[0]), 0.5 * float(z_col[0])], dtype=np.float64)
@@ -1974,6 +1986,11 @@ class MultiTenantSkillFleet:
             fleet.alpha_c[:] = alpha_c_arr
             fleet.err_ewma[:] = err_ewma_arr
             fleet._active_views = fleet._bind_views(fleet._active_tid)
+            actual_runtime = int(fleet.base_nbytes() + fleet.arena_nbytes())
+            if actual_runtime > int(max_runtime_bytes):
+                raise ValueError(
+                    f"Fleet reconstructed runtime memory {actual_runtime} exceeds budget {int(max_runtime_bytes)} bytes"
+                )
             return fleet
 
 

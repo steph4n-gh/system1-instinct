@@ -24,6 +24,7 @@ from system1.core.embeddings import (
     _tokenize_with_negation_scope,
 )
 from system1.core.model import (
+    _accepts_recency_weighted,
     _has_custom_validate_decision,
     _normalize_raw_projection,
     _owned_readonly_array,
@@ -103,11 +104,14 @@ def _project_one(
     dimension: Optional[int] = None,
 ) -> np.ndarray:
     use_rw = bool(recency_weighted)
-    if hasattr(projector, "project"):
-        try:
-            out = projector.project(text, recency_weighted=use_rw)
-        except TypeError:
-            out = projector.project(text)
+    pwn_fn = getattr(projector, "project_with_norm", None)
+    proj_fn = getattr(projector, "project", None)
+    pwn_rw = _accepts_recency_weighted(pwn_fn)
+    proj_rw = _accepts_recency_weighted(proj_fn)
+    if callable(pwn_fn) and (pwn_rw or not proj_rw):
+        out = pwn_fn(text, recency_weighted=use_rw) if pwn_rw else pwn_fn(text)
+    elif callable(proj_fn):
+        out = proj_fn(text, recency_weighted=use_rw) if proj_rw else proj_fn(text)
     else:
         out = projector(text)
     if isinstance(out, tuple):

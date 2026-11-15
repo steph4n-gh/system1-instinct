@@ -339,9 +339,10 @@ class GuardShield:
 
         raw_w_in = np.asarray(self.head.weights)
         raw_b_in = np.asarray(self.head.biases).reshape(-1)
-        w_dtype = np.float64 if (raw_w_in.dtype == np.float64 or raw_b_in.dtype == np.float64) else np.float32
+        w_dtype = np.float64 if raw_w_in.dtype == np.float64 else np.float32
+        b_dtype = np.float64 if raw_b_in.dtype == np.float64 else np.float32
         self.raw_W = np.array(raw_w_in, dtype=w_dtype, copy=True)
-        self.raw_b = np.array(raw_b_in, dtype=w_dtype, copy=True).reshape(-1)
+        self.raw_b = np.array(raw_b_in, dtype=b_dtype, copy=True).reshape(-1)
         if (
             self.raw_W.ndim != 2
             or self.raw_b.shape != (self.raw_W.shape[0],)
@@ -373,12 +374,58 @@ class GuardShield:
             and getattr(self.head, "coarse_biases", None) is not None
             and len(cluster_assign_raw) == self.raw_W.shape[0]
         )
+        if (
+            not self.is_hier
+            and ch is not None
+            and ch is not self.head
+            and getattr(ch, "_exemplar_bank", None) is not None
+            and getattr(self.head, "_exemplar_bank", None) is None
+        ):
+            raise ValueError(
+                f"Field head {self.field_name!r} has mismatched compiled vs live exemplar bank state"
+            )
+        ex_bank = getattr(self.head, "_exemplar_bank", None)
+        if ex_bank is not None:
+            if (
+                self.is_boolean
+                or self.is_hier
+                or not callable(getattr(self.head, "compute_logits", None))
+                or not isinstance(ex_bank, tuple)
+                or len(ex_bank) != 2
+            ):
+                raise ValueError(
+                    f"Field head {self.field_name!r} has invalid or unsupported exemplar bank configuration"
+                )
+            w_cons_b, sub_banks_b = ex_bank
+            w_cons_arr = np.asarray(w_cons_b)
+            if (
+                w_cons_arr.ndim != 2
+                or w_cons_arr.shape != self.raw_W.shape
+                or not bool(np.all(np.isfinite(w_cons_arr)))
+                or isinstance(sub_banks_b, (str, bytes, bytearray))
+                or not isinstance(sub_banks_b, Sequence)
+                or len(sub_banks_b) != self.raw_W.shape[0]
+            ):
+                raise ValueError(
+                    f"Field head {self.field_name!r} has invalid exemplar bank array shapes or non-finite entries"
+                )
+            for bank_arr in sub_banks_b:
+                ba = np.asarray(bank_arr)
+                if (
+                    ba.ndim != 2
+                    or ba.shape[1] != self.raw_W.shape[1]
+                    or not bool(np.all(np.isfinite(ba)))
+                ):
+                    raise ValueError(
+                        f"Field head {self.field_name!r} has invalid sub-bank array in exemplar bank"
+                    )
+        self._uses_head_exemplar_bank = ex_bank is not None
         self._raw_coarse_w: Optional[np.ndarray] = None
         self._raw_coarse_b: Optional[np.ndarray] = None
         self._raw_fine_w: Optional[np.ndarray] = None
         self._raw_fine_b: Optional[np.ndarray] = None
         self._cluster_assign: Optional[np.ndarray] = None
-        self._hier_dtype: Any = w_dtype
+        self._hier_dtype: Any = np.result_type(w_dtype, b_dtype)
         if self.is_hier:
             cw_in = np.asarray(self.head.coarse_weights)
             cb_in = np.asarray(self.head.coarse_biases).reshape(-1)
@@ -394,11 +441,17 @@ class GuardShield:
                 or (c_assign.size > 0 and np.any((c_assign < 0) | (c_assign >= cw_in.shape[0])))
             ):
                 raise ValueError(f"Field head {self.field_name!r} has invalid hierarchical cluster configuration")
-            cw_dtype = np.float64 if (cw_in.dtype == np.float64 or cb_in.dtype == np.float64) else np.float32
+            cw_dtype = np.float64 if cw_in.dtype == np.float64 else np.float32
+            cb_dtype = np.float64 if cb_in.dtype == np.float64 else np.float32
             self._raw_coarse_w = np.array(cw_in, dtype=cw_dtype, copy=True)
-            self._raw_coarse_b = np.array(cb_in, dtype=cw_dtype, copy=True).reshape(-1)
+            self._raw_coarse_b = np.array(cb_in, dtype=cb_dtype, copy=True).reshape(-1)
             self._cluster_assign = c_assign
-            has_f64_h = (w_dtype == np.float64) or (cw_dtype == np.float64)
+            has_f64_h = (
+                (w_dtype == np.float64)
+                or (b_dtype == np.float64)
+                or (cw_dtype == np.float64)
+                or (cb_dtype == np.float64)
+            )
             if (
                 getattr(self.head, "fine_weights", None) is not None
                 and getattr(self.head, "fine_biases", None) is not None
@@ -409,10 +462,11 @@ class GuardShield:
                     raise ValueError(f"Field head {self.field_name!r} contains non-finite hierarchical fine weights")
                 if fw_in.shape != self.raw_W.shape or fb_in.shape != (self.raw_W.shape[0],):
                     raise ValueError(f"Field head {self.field_name!r} hierarchical fine tensor shape mismatch")
-                fw_dtype = np.float64 if (fw_in.dtype == np.float64 or fb_in.dtype == np.float64) else np.float32
+                fw_dtype = np.float64 if fw_in.dtype == np.float64 else np.float32
+                fb_dtype = np.float64 if fb_in.dtype == np.float64 else np.float32
                 self._raw_fine_w = np.array(fw_in, dtype=fw_dtype, copy=True)
-                self._raw_fine_b = np.array(fb_in, dtype=fw_dtype, copy=True).reshape(-1)
-                has_f64_h = has_f64_h or (fw_dtype == np.float64)
+                self._raw_fine_b = np.array(fb_in, dtype=fb_dtype, copy=True).reshape(-1)
+                has_f64_h = has_f64_h or (fw_dtype == np.float64) or (fb_dtype == np.float64)
             self._hier_dtype = np.float64 if has_f64_h else np.float32
 
         resolved_unsafe = _normalize_unsafe_label_arg(unsafe_label, unsafe_labels)
@@ -443,6 +497,9 @@ class GuardShield:
         self.recency_weighted = bool(getattr(resolved, "recency_weighted", False))
         self._zero_unit0 = _model_zero_unit0(resolved, self.projector)
         self._accepts_recency = _accepts_recency_weighted(getattr(self.projector, "project", None))
+        self._pwn_accepts_recency = _accepts_recency_weighted(
+            getattr(self.projector, "project_with_norm", None)
+        )
         self._batch_accepts_recency = _accepts_recency_weighted(
             getattr(self.projector, "project_batch", None)
         )
@@ -466,6 +523,7 @@ class GuardShield:
             zero_unit0=self._zero_unit0,
             accepts_recency=self._accepts_recency,
             batch_accepts_recency=self._batch_accepts_recency,
+            pwn_accepts_recency=self._pwn_accepts_recency,
         )
 
     def _batch_eval_logits_and_emb(self, texts: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
@@ -494,8 +552,25 @@ class GuardShield:
                         self._raw_fine_b,
                     )
                     raw_logits[r_i] = hier_ex[0]
+            elif (not self.is_boolean) and (
+                self._uses_head_exemplar_bank
+                or getattr(self.head, "_exemplar_bank", None) is not None
+            ):
+                raw_logits = np.full((n_views, k_out), np.nan, dtype=np.float64)
+                fin_idx = np.flatnonzero(x_fin).tolist()
+                if fin_idx:
+                    fin_texts = [str(texts[i]) for i in fin_idx]
+                    ex_logits = np.asarray(
+                        self.head.compute_logits(X[fin_idx], prompts=fin_texts),
+                        dtype=np.float64,
+                    )
+                    raw_logits[fin_idx] = ex_logits
             elif self.is_boolean:
-                raw_logits = np.full((n_views, 1), np.nan, dtype=self.raw_W.dtype)
+                raw_logits = np.full(
+                    (n_views, 1),
+                    np.nan,
+                    dtype=np.result_type(self.raw_W.dtype, self.raw_b.dtype),
+                )
                 for r_i in np.flatnonzero(x_fin).tolist():
                     x_in = X[r_i : r_i + 1].astype(self.raw_W.dtype, copy=False)
                     raw_logits[r_i] = (x_in @ self.raw_W.T + self.raw_b)[0]

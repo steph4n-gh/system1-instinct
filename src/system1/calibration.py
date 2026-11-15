@@ -2646,21 +2646,30 @@ class SequentialRiskMonitor:
 
 def _expit_np(x: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """Numerically bounded pure-NumPy logistic sigmoid."""
-    arr = np.asarray(x, dtype=np.float64)
-    clipped = np.clip(arr, -60.0, 60.0)
-    out = 1.0 / (1.0 + np.exp(-clipped))
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        arr = np.asarray(x, dtype=np.float64)
+        nan_mask = np.isnan(arr)
+        arr_safe = np.where(nan_mask, 0.0, arr)
+        clipped = np.clip(arr_safe, -60.0, 60.0)
+        out = np.where(nan_mask, np.nan, 1.0 / (1.0 + np.exp(-clipped)))
     if np.ndim(x) == 0:
         return float(out)
     return out
 
 
 def _softmax_np(logits: np.ndarray, axis: int = -1) -> np.ndarray:
-    """Numerically stable pure-NumPy softmax."""
-    arr = np.asarray(logits, dtype=np.float64)
-    shifted = arr - np.max(arr, axis=axis, keepdims=True)
-    exps = np.exp(np.clip(shifted, -60.0, 60.0))
-    denom = np.maximum(np.sum(exps, axis=axis, keepdims=True), 1e-12)
-    return exps / denom
+    """Numerically stable pure-NumPy softmax failing closed with NaN on non-finite slices."""
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        arr = np.asarray(logits, dtype=np.float64)
+        if arr.size == 0:
+            return arr.copy()
+        slice_ok = np.all(np.isfinite(arr), axis=axis, keepdims=True)
+        arr_safe = np.where(slice_ok, arr, 0.0)
+        shifted = arr_safe - np.max(arr_safe, axis=axis, keepdims=True)
+        exps = np.exp(np.clip(shifted, -60.0, 60.0))
+        denom = np.maximum(np.sum(exps, axis=axis, keepdims=True), 1e-12)
+        out = exps / denom
+        return np.where(slice_ok, out, np.nan)
 
 
 def _minimize_lbfgs_np(
@@ -2918,6 +2927,8 @@ class UtilityCalibrator:
         scaled = np.full(p2.shape, np.nan, dtype=np.float64)
         if bool(np.any(valid)):
             p_ok = p2[valid]
+            if not math.isfinite(self.temperature) or self.temperature <= 0.0:
+                return scaled[0] if single else scaled
             if abs(self.temperature - 1.0) <= 1e-12:
                 scaled[valid] = p_ok
             else:
@@ -3206,20 +3217,48 @@ class CumulativeLogitOrdinalHead:
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if self.weights_ is None or self.thresholds_ is None or self.n_classes is None:
             raise RuntimeError("CumulativeLogitOrdinalHead must be fit before calling predict_proba")
-        X_arr = np.asarray(X, dtype=np.float64)
+        X_raw = np.asarray(X)
+        if X_raw.dtype == np.dtype(np.bool_) or X_raw.dtype.kind not in ("i", "u", "f"):
+            raise ValueError(f"X must have real numeric dtype, got {X_raw.dtype}")
+        X_arr = np.asarray(X_raw, dtype=np.float64)
         single = X_arr.ndim == 1
         X2 = X_arr.reshape(1, -1) if single else X_arr
-        eta = X2 @ self.weights_
+        w = np.asarray(self.weights_, dtype=np.float64)
+        thetas = np.asarray(self.thresholds_, dtype=np.float64).reshape(-1)
+        k = int(self.n_classes)
+        if X2.ndim != 2 or w.ndim != 1 or X2.shape[1] != w.shape[0] or thetas.shape != (k - 1,):
+            raise ValueError(
+                f"Input/model shape mismatch in CumulativeLogitOrdinalHead: X={X2.shape}, w={w.shape}, thresholds={thetas.shape}"
+            )
         n = X2.shape[0]
-        k = self.n_classes
-        cum = np.ones((n, k), dtype=np.float64)
-        cum[:, : k - 1] = _expit_np(self.thresholds_[None, :] - eta[:, None])
-        probs = np.empty((n, k), dtype=np.float64)
-        probs[:, 0] = cum[:, 0]
-        if k > 1:
-            probs[:, 1:] = cum[:, 1:] - cum[:, :-1]
-        probs = np.clip(probs, 1e-12, 1.0)
-        probs /= np.sum(probs, axis=1, keepdims=True)
+        probs = np.full((n, k), np.nan, dtype=np.float64)
+        params_ok = (
+            bool(np.all(np.isfinite(w)))
+            and bool(np.all(np.isfinite(thetas)))
+            and (thetas.size <= 1 or bool(np.all(np.diff(thetas) >= -1e-12)))
+        )
+        if params_ok and n > 0:
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                eta = X2 @ w
+                diff = thetas[None, :] - eta[:, None]
+                row_ok = (
+                    np.all(np.isfinite(X2), axis=1)
+                    & np.isfinite(eta)
+                    & np.all(np.isfinite(diff), axis=1)
+                )
+                if bool(np.any(row_ok)):
+                    cum = np.ones((int(np.sum(row_ok)), k), dtype=np.float64)
+                    cum[:, : k - 1] = _expit_np(diff[row_ok])
+                    p_ok = np.empty((cum.shape[0], k), dtype=np.float64)
+                    p_ok[:, 0] = cum[:, 0]
+                    if k > 1:
+                        p_ok[:, 1:] = cum[:, 1:] - cum[:, :-1]
+                    p_ok = np.clip(p_ok, 1e-12, 1.0)
+                    p_ok /= np.sum(p_ok, axis=1, keepdims=True)
+                    p_fin = np.all(np.isfinite(p_ok), axis=1)
+                    good_idx = np.flatnonzero(row_ok)[p_fin]
+                    if good_idx.size > 0:
+                        probs[good_idx] = p_ok[p_fin]
         return probs[0] if single else probs
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -3265,10 +3304,21 @@ class SoftOrdinalHead:
         return _softmax_np(logits, axis=1)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "SoftOrdinalHead":
-        X_arr = np.asarray(X, dtype=np.float64)
-        y_arr = np.asarray(y, dtype=np.int64).ravel()
-        if X_arr.ndim != 2 or X_arr.shape[0] != y_arr.shape[0] or y_arr.size == 0:
-            raise ValueError("X must be 2D and match non-empty 1D y")
+        X_raw = np.asarray(X)
+        if X_raw.dtype == np.dtype(np.bool_) or X_raw.dtype.kind not in ("i", "u", "f"):
+            raise ValueError(f"X must have real numeric dtype, got {X_raw.dtype}")
+        X_arr = np.asarray(X_raw, dtype=np.float64)
+        y_raw = np.asarray(y)
+        if y_raw.dtype == np.dtype(np.bool_) or y_raw.dtype.kind not in ("i", "u"):
+            raise ValueError(f"y must have integer dtype, got {y_raw.dtype}")
+        y_arr = np.asarray(y_raw, dtype=np.int64).ravel()
+        if (
+            X_arr.ndim != 2
+            or X_arr.shape[0] != y_arr.shape[0]
+            or y_arr.size == 0
+            or not bool(np.all(np.isfinite(X_arr)))
+        ):
+            raise ValueError("X must be finite 2D and match non-empty 1D y")
         n, d = X_arr.shape
         k = int(self.n_classes) if self.n_classes is not None else int(np.max(y_arr)) + 1
         if k < 2:
@@ -3304,10 +3354,35 @@ class SoftOrdinalHead:
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if self.weights_ is None or self.bias_ is None:
             raise RuntimeError("SoftOrdinalHead must be fit before calling predict_proba")
-        X_arr = np.asarray(X, dtype=np.float64)
+        X_raw = np.asarray(X)
+        if X_raw.dtype == np.dtype(np.bool_) or X_raw.dtype.kind not in ("i", "u", "f"):
+            raise ValueError(f"X must have real numeric dtype, got {X_raw.dtype}")
+        X_arr = np.asarray(X_raw, dtype=np.float64)
         single = X_arr.ndim == 1
         X2 = X_arr.reshape(1, -1) if single else X_arr
-        probs = _softmax_np(X2 @ self.weights_ + self.bias_, axis=1)
+        w = np.asarray(self.weights_, dtype=np.float64)
+        b = np.asarray(self.bias_, dtype=np.float64).reshape(-1)
+        if X2.ndim != 2 or w.ndim != 2 or X2.shape[1] != w.shape[0] or b.shape != (w.shape[1],):
+            raise ValueError(
+                f"Input/model shape mismatch in SoftOrdinalHead: X={X2.shape}, w={w.shape}, b={b.shape}"
+            )
+        k = w.shape[1]
+        probs = np.full((X2.shape[0], k), np.nan, dtype=np.float64)
+        if bool(np.all(np.isfinite(w))) and bool(np.all(np.isfinite(b))) and X2.shape[0] > 0:
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                lin = X2 @ w
+                logits = lin + b
+                row_ok = (
+                    np.all(np.isfinite(X2), axis=1)
+                    & np.all(np.isfinite(lin), axis=1)
+                    & np.all(np.isfinite(logits), axis=1)
+                )
+                if bool(np.any(row_ok)):
+                    p_ok = _softmax_np(logits[row_ok], axis=1)
+                    p_fin = np.all(np.isfinite(p_ok), axis=1)
+                    good_idx = np.flatnonzero(row_ok)[p_fin]
+                    if good_idx.size > 0:
+                        probs[good_idx] = p_ok[p_fin]
         return probs[0] if single else probs
 
     def predict(self, X: np.ndarray) -> np.ndarray:

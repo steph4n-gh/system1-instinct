@@ -57,6 +57,7 @@ from system1.core.model import (
     PackedMultiQuestionKernel,
     _compute_engine_inference_signature,
     _compute_hierarchical_logits_np,
+    _encode_projector_one,
     _has_custom_validate_decision,
     _model_zero_unit0,
     _normalize_raw_projection,
@@ -949,12 +950,13 @@ class SystemOneEngine:
             except TypeError:
                 return self.model.encode(prompt, telemetry=telemetry)
         if self.projector is not None:
-            try:
-                emb = self.projector.project(prompt, recency_weighted=use_recency)
-            except TypeError:
-                emb = self.projector.project(prompt)
-            norm = float(np.linalg.norm(emb))
-            return (emb / norm).astype(np.float32) if norm > 1e-12 else emb
+            return _encode_projector_one(
+                self.projector,
+                prompt,
+                self.dimension,
+                recency_weighted=use_recency,
+                zero_unit0=_model_zero_unit0(self.model, self.projector),
+            )
         v = np.zeros(self.dimension, dtype=np.float32)
         v[0] = 1.0
         return v

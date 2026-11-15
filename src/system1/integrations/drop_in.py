@@ -563,8 +563,12 @@ class UtilityCascadeRouter:
         vec = self.engine.encode(prompt).astype(np.float64)
         if not bool(np.all(np.isfinite(vec))):
             return np.full(len(CASCADE_TIERS), np.nan, dtype=np.float64)
-        head_probs = np.asarray(self.ordinal_head.predict_proba(vec), dtype=np.float64)
-        if not bool(np.all(np.isfinite(head_probs))):
+        head_probs = np.asarray(self.ordinal_head.predict_proba(vec), dtype=np.float64).reshape(-1)
+        if (
+            head_probs.shape != (len(CASCADE_TIERS),)
+            or not bool(np.all(np.isfinite(head_probs)))
+            or float(np.sum(head_probs)) <= 0.0
+        ):
             return np.full(len(CASCADE_TIERS), np.nan, dtype=np.float64)
         blended = 0.65 * head_probs + 0.35 * engine_probs
         b_sum = float(np.sum(blended))
@@ -603,8 +607,12 @@ class UtilityCascadeRouter:
                 out[idx] = np.nan
                 continue
             if head_probs_all is not None:
-                hp_i = np.asarray(head_probs_all[idx], dtype=np.float64)
-                if not bool(np.all(np.isfinite(hp_i))):
+                hp_arr = np.asarray(head_probs_all, dtype=np.float64)
+                if hp_arr.ndim != 2 or hp_arr.shape != (len(prompts), len(CASCADE_TIERS)):
+                    out[idx] = np.nan
+                    continue
+                hp_i = hp_arr[idx]
+                if not bool(np.all(np.isfinite(hp_i))) or float(np.sum(hp_i)) <= 0.0:
                     out[idx] = np.nan
                     continue
                 blended = 0.65 * hp_i + 0.35 * ep

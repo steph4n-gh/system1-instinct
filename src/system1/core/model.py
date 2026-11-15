@@ -653,9 +653,14 @@ def _exact_choice_probs_row(
 ) -> Tuple[np.ndarray, bool]:
     """Recompute single-row Choice probabilities matching DecisionFieldHead dot order."""
     with np.errstate(over="ignore", invalid="ignore"):
-        z_exact = (emb_row @ w_raw.T + b_raw).astype(np.float64).ravel()
+        lin_ex = emb_row @ w_raw.T
+        z_exact = (lin_ex + b_raw).astype(np.float64).ravel()
         z_cal_ex = ((z_exact / 0.25) + adj) / temp
-        if bool(np.all(np.isfinite(z_exact))) and bool(np.all(np.isfinite(z_cal_ex))):
+        if (
+            bool(np.all(np.isfinite(lin_ex)))
+            and bool(np.all(np.isfinite(z_exact)))
+            and bool(np.all(np.isfinite(z_cal_ex)))
+        ):
             m_ex = float(np.max(z_cal_ex))
             ez_ex = np.exp(z_cal_ex - m_ex)
             sum_ex = float(np.sum(ez_ex))
@@ -676,11 +681,17 @@ def _exact_bool_probs_row(
 ) -> Tuple[float, float, float, float, float, bool]:
     """Recompute single-row Boolean probabilities matching DecisionFieldHead dot order."""
     with np.errstate(over="ignore", invalid="ignore"):
-        zv_ex = float((emb_row @ w_raw.T + b_raw)[0, 0])
+        lin_ex = emb_row @ w_raw.T
+        zv_ex = float((lin_ex + b_raw)[0, 0])
         sz_ex = zv_ex / 0.25
         s0_ex = (-0.5 * sz_ex + adj0) / temp
         s1_ex = (0.5 * sz_ex + adj1) / temp
-        if math.isfinite(zv_ex) and math.isfinite(s0_ex) and math.isfinite(s1_ex):
+        if (
+            bool(np.all(np.isfinite(lin_ex)))
+            and math.isfinite(zv_ex)
+            and math.isfinite(s0_ex)
+            and math.isfinite(s1_ex)
+        ):
             mb_ex = s0_ex if s0_ex >= s1_ex else s1_ex
             e0_ex = math.exp(s0_ex - mb_ex)
             e1_ex = math.exp(s1_ex - mb_ex)
@@ -793,12 +804,20 @@ def _is_native_scalar_projector(projector: Any) -> bool:
     from system1.core.embeddings import HybridProjector, SubwordSemanticEmbeddings
     from system1.core.text import PragmaticCompositeProjector, TfidfProjector
 
-    return type(projector) in (
+    native_classes = (
         DeterministicSemanticProjector,
         HybridProjector,
         SubwordSemanticEmbeddings,
         TfidfProjector,
         PragmaticCompositeProjector,
+    )
+    proj_type = type(projector)
+    if proj_type in native_classes:
+        return True
+    return any(
+        isinstance(projector, cls)
+        and getattr(proj_type, "project_batch", None) is getattr(cls, "project_batch", None)
+        for cls in native_classes
     )
 
 
@@ -810,16 +829,29 @@ def _encode_projector_one(
     recency_weighted: bool = False,
     zero_unit0: bool = False,
     accepts_recency: Optional[bool] = None,
+    pwn_accepts_recency: Optional[bool] = None,
 ) -> np.ndarray:
     """Project one string using model encoding normalization and recency semantics."""
     proj_fn = getattr(projector, "project", None)
+    pwn_fn = getattr(projector, "project_with_norm", None)
     use_rw = (
         _accepts_recency_weighted(proj_fn)
         if accepts_recency is None
         else bool(accepts_recency)
     )
+    pwn_rw = (
+        _accepts_recency_weighted(pwn_fn)
+        if pwn_accepts_recency is None
+        else bool(pwn_accepts_recency)
+    )
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        if callable(proj_fn):
+        if callable(pwn_fn) and (pwn_rw or not use_rw):
+            raw = (
+                pwn_fn(text, recency_weighted=bool(recency_weighted))
+                if pwn_rw
+                else pwn_fn(text)
+            )
+        elif callable(proj_fn):
             raw = proj_fn(text, recency_weighted=bool(recency_weighted)) if use_rw else proj_fn(text)
         else:
             raw = projector(text)
@@ -837,18 +869,26 @@ def _encode_projector_batch(
     zero_unit0: bool = False,
     accepts_recency: Optional[bool] = None,
     batch_accepts_recency: Optional[bool] = None,
+    pwn_accepts_recency: Optional[bool] = None,
 ) -> np.ndarray:
     """Batch-project strings using model encoding normalization and recency semantics."""
     text_list = list(texts)
     if not text_list:
         return np.empty((0, dimension), dtype=np.float32)
     proj_fn = getattr(projector, "project", None)
+    pwn_fn = getattr(projector, "project_with_norm", None)
     batch_fn = getattr(projector, "project_batch", None)
-    one_rw = (
+    proj_rw = (
         _accepts_recency_weighted(proj_fn)
         if accepts_recency is None
         else bool(accepts_recency)
     )
+    pwn_rw = (
+        _accepts_recency_weighted(pwn_fn)
+        if pwn_accepts_recency is None
+        else bool(pwn_accepts_recency)
+    )
+    one_rw = proj_rw or pwn_rw
     batch_rw = (
         _accepts_recency_weighted(batch_fn)
         if batch_accepts_recency is None
@@ -877,7 +917,8 @@ def _encode_projector_batch(
                     dimension,
                     recency_weighted=recency_weighted,
                     zero_unit0=zero_unit0,
-                    accepts_recency=one_rw,
+                    accepts_recency=proj_rw,
+                    pwn_accepts_recency=pwn_rw,
                 )
                 for t in text_list
             ]
@@ -3275,45 +3316,48 @@ class PackedMultiQuestionKernel:
             or (i < len(self.s_raw_b) and self.s_raw_b[i].dtype == np.float64)
             for i in range(self.Q_s)
         )
-        self.c_w_l1_max = _owned_readonly_array(
-            np.array(
-                [
-                    float(np.max(np.sum(np.abs(w), axis=1))) if w.size else 0.0
-                    for w in self.c_raw_w
-                ],
+        self._proj_accepts_recency = _accepts_recency_weighted(getattr(projector, "project", None))
+        self._pwn_accepts_recency = _accepts_recency_weighted(getattr(projector, "project_with_norm", None))
+        with np.errstate(over="ignore", invalid="ignore"):
+            self.c_w_l1_max = _owned_readonly_array(
+                np.array(
+                    [
+                        float(np.max(np.sum(np.abs(np.asarray(w, dtype=np.float64)), axis=1))) if w.size else 0.0
+                        for w in self.c_raw_w
+                    ],
+                    dtype=np.float64,
+                )
+                if len(self.c_raw_w) == self.Q_c and self.Q_c > 0
+                else np.empty(0, dtype=np.float64),
                 dtype=np.float64,
             )
-            if len(self.c_raw_w) == self.Q_c and self.Q_c > 0
-            else np.empty(0, dtype=np.float64),
-            dtype=np.float64,
-        )
-        self.c_b_abs_max = _owned_readonly_array(
-            np.array(
-                [float(np.max(np.abs(b))) if b.size else 0.0 for b in self.c_raw_b],
+            self.c_b_abs_max = _owned_readonly_array(
+                np.array(
+                    [float(np.max(np.abs(np.asarray(b, dtype=np.float64)))) if b.size else 0.0 for b in self.c_raw_b],
+                    dtype=np.float64,
+                )
+                if len(self.c_raw_b) == self.Q_c and self.Q_c > 0
+                else np.empty(0, dtype=np.float64),
                 dtype=np.float64,
             )
-            if len(self.c_raw_b) == self.Q_c and self.Q_c > 0
-            else np.empty(0, dtype=np.float64),
-            dtype=np.float64,
-        )
-        self.b_w_l1 = _owned_readonly_array(
-            np.array(
-                [float(np.sum(np.abs(w))) if w.size else 0.0 for w in self.b_raw_w],
+            self.b_w_l1 = _owned_readonly_array(
+                np.array(
+                    [float(np.sum(np.abs(np.asarray(w, dtype=np.float64)))) if w.size else 0.0 for w in self.b_raw_w],
+                    dtype=np.float64,
+                )
+                if len(self.b_raw_w) == self.Q_b and self.Q_b > 0
+                else np.empty(0, dtype=np.float64),
                 dtype=np.float64,
             )
-            if len(self.b_raw_w) == self.Q_b and self.Q_b > 0
-            else np.empty(0, dtype=np.float64),
-            dtype=np.float64,
-        )
-        self.b_b_abs = _owned_readonly_array(
-            np.array(
-                [float(np.max(np.abs(b))) if b.size else 0.0 for b in self.b_raw_b],
+            self.b_b_abs = _owned_readonly_array(
+                np.array(
+                    [float(np.max(np.abs(np.asarray(b, dtype=np.float64)))) if b.size else 0.0 for b in self.b_raw_b],
+                    dtype=np.float64,
+                )
+                if len(self.b_raw_b) == self.Q_b and self.Q_b > 0
+                else np.empty(0, dtype=np.float64),
                 dtype=np.float64,
             )
-            if len(self.b_raw_b) == self.Q_b and self.Q_b > 0
-            else np.empty(0, dtype=np.float64),
-            dtype=np.float64,
-        )
 
     @classmethod
     def from_engine(
@@ -3916,9 +3960,11 @@ class PackedMultiQuestionKernel:
                     z_cal_pad[:, self.c_pad_rows, self.c_pad_cols] = zc_cal
                     z_cal_sorted = -np.sort(-z_cal_pad, axis=2)
                     if self.K_max >= 2:
-                        near_c = (z_cal_sorted[:, :, 0] - z_cal_sorted[:, :, 1]) <= 2.0 * dz_cal_bound_c
+                        near_c = ((z_cal_sorted[:, :, 0] - z_cal_sorted[:, :, 1]) <= 2.0 * dz_cal_bound_c) | (
+                            ~np.isfinite(dp_bound_c)
+                        )
                     else:
-                        near_c = np.zeros((B, self.Q_c), dtype=bool)
+                        near_c = ~np.isfinite(dp_bound_c)
 
                     csum_chk = np.cumsum(np.maximum(p_sorted, 0.0), axis=2)
                     prev_csum_chk = np.concatenate(
@@ -4133,8 +4179,10 @@ class PackedMultiQuestionKernel:
                     dz_cal_b = (dz_bound_b / 0.25) / self.b_temp[None, :]
                     dp_bound_b = np.minimum(1.0, 0.5 * dz_cal_b + 1e-9)
 
-                    near_b = (np.abs(p_true - self.b_thresh[None, :]) <= dp_bound_b) | (
-                        np.abs(p_true - 0.5) <= dp_bound_b
+                    near_b = (
+                        (np.abs(p_true - self.b_thresh[None, :]) <= dp_bound_b)
+                        | (np.abs(p_true - 0.5) <= dp_bound_b)
+                        | (~np.isfinite(dp_bound_b))
                     )
                     lac_thr_b = self.b_qhat[None, :] + 1e-7
                     near_lac_b = (
@@ -4393,15 +4441,14 @@ class PackedMultiQuestionKernel:
             )
         if not isinstance(prompt, str):
             raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
-        if hasattr(self.projector, "project"):
-            try:
-                raw = self.projector.project(prompt, recency_weighted=self.recency_weighted)
-            except TypeError:
-                raw = self.projector.project(prompt)
-        else:
-            raw = self.projector(prompt)
-        return _normalize_raw_projection(
-            raw, self.dimension, zero_unit0=self.zero_emb_unit0
+        return _encode_projector_one(
+            self.projector,
+            prompt,
+            self.dimension,
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self.zero_emb_unit0,
+            accepts_recency=self._proj_accepts_recency,
+            pwn_accepts_recency=self._pwn_accepts_recency,
         )
 
     def encode_batch(self, prompts: Sequence[str]) -> np.ndarray:
@@ -4892,10 +4939,10 @@ class FastDecisionCallable:
                     )
                     dz_cal_b = (dz_b / 0.25) / temp
                     dp_b = min(1.0, dz_cal_b + 1e-9)
-                    near_ci = False
-                    if K >= 2:
+                    near_ci = not (isfinite(dz_cal_b) and isfinite(dp_b))
+                    if not near_ci and K >= 2:
                         zcs = sorted(z_cal, reverse=True)
-                        if (zcs[0] - zcs[1]) <= 2.0 * dz_cal_b:
+                        if (not isfinite(zcs[0] - zcs[1])) or (zcs[0] - zcs[1]) <= 2.0 * dz_cal_b:
                             near_ci = True
                     if not near_ci:
                         if st.c_cals[ci]:
@@ -5089,9 +5136,14 @@ class FastDecisionCallable:
                         * _FLOAT32_EPS
                         * (x_inf_val * st.b_w_l1[bi] + st.b_b_abs[bi])
                     )
-                    dp_b = min(1.0, 0.5 * ((dz_b / 0.25) / temp_b) + 1e-9)
+                    dz_cal_b = (dz_b / 0.25) / temp_b
+                    dp_b = min(1.0, 0.5 * dz_cal_b + 1e-9)
                     top_chk = pt if pt >= pf else pf
-                    near_bi = abs(pt - st.b_thresh[bi]) <= dp_b or abs(pt - 0.5) <= dp_b
+                    near_bi = (
+                        (not (isfinite(dz_cal_b) and isfinite(dp_b)))
+                        or abs(pt - st.b_thresh[bi]) <= dp_b
+                        or abs(pt - 0.5) <= dp_b
+                    )
                     if not near_bi:
                         if st.b_cals[bi]:
                             qh_chk = st.b_qhats[bi]

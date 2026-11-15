@@ -7602,5 +7602,615 @@ def test_astra_26_round13_regressions() -> None:
         assert math.isnan(pdec.confidence)
 
 
+def test_astra_27_round14_regressions() -> None:
+    """R14-1..R14-6: GuardShield/Fleet exemplar-bank parity, recency_weighted
+    forwarding via project_with_norm, independent raw_W/raw_b dtypes & runtime
+    snapshot memory check, ordinal/softmax overflow fail-closed, native scalar
+    projector subclass parity, and PackedMultiQuestionKernel float64 L1 bounds.
+    """
+    import warnings
+    from system1.calibration import (
+        CumulativeLogitOrdinalHead,
+        SoftOrdinalHead,
+        _softmax_np,
+    )
+    from system1.core.model import _is_native_scalar_projector
+    from system1.guard import GuardShield
+    from system1.integrations.drop_in import UtilityCascadeRouter
 
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
 
+        # ------------------------------------------------------------------
+        # R14-1: GuardShield uses _exemplar_bank on non-boolean ChoiceField;
+        #        MultiTenantSkillFleet rejects exemplar-bank heads everywhere.
+        # ------------------------------------------------------------------
+        class _R14ExemplarGuardSchema(DecisionSchema):
+            verdict = ChoiceField(
+                options=("safe", "unsafe"),
+                descriptions={
+                    "safe": (
+                        "view public backup configuration",
+                        "inspect public folder documentation",
+                        "list public snapshot status",
+                    ),
+                    "unsafe": (
+                        "delete public backup folder",
+                        "reformat entire kernel disk partition",
+                        "exfiltrate shadow credentials",
+                    ),
+                },
+            )
+
+        eng_ex = SystemOneEngine(
+            _R14ExemplarGuardSchema,
+            backend="numpy",
+            use_cache=False,
+            strict_mode=False,
+        )
+        ex_head = eng_ex.model.heads["verdict"]
+        assert ex_head._exemplar_bank is not None
+
+        probe_ex = "delete public backup folder"
+        eng_ex_dec = eng_ex.decide(probe_ex, record_receipt=False)
+        assert eng_ex_dec.values["verdict"] == "unsafe"
+
+        shield_ex = GuardShield(
+            eng_ex.model,
+            field_name="verdict",
+            unsafe_label="unsafe",
+            canonicalize=False,
+            use_windows=False,
+        )
+        sdec_ex = shield_ex.evaluate_single(probe_ex)
+        assert sdec_ex.is_unsafe is True
+        assert sdec_ex.predicted_label == "unsafe"
+        assert sdec_ex.max_window_unsafe_prob == pytest.approx(
+            eng_ex_dec.probabilities["verdict"]["unsafe"], abs=1e-6
+        )
+
+        # Default canonicalized windowed GuardShield must also match unsafe
+        shield_win = GuardShield(
+            eng_ex.model,
+            field_name="verdict",
+            unsafe_label="unsafe",
+        )
+        assert shield_win.evaluate_single(probe_ex).is_unsafe is True
+        assert shield_win.evaluate_single(probe_ex).predicted_label == "unsafe"
+
+        # Online learning updates exemplar bank; fresh GuardShield tracks parity
+        eng_ex.learn("purge remote snapshot archive", {"verdict": "unsafe"})
+        near_learn = "purge remote snapshot archive now"
+        eng_ex_dec2 = eng_ex.decide(near_learn, record_receipt=False)
+        shield_ex2 = GuardShield(
+            eng_ex.model,
+            field_name="verdict",
+            unsafe_label="unsafe",
+            canonicalize=False,
+            use_windows=False,
+        )
+        sdec_ex2 = shield_ex2.evaluate_single(near_learn)
+        assert sdec_ex2.is_unsafe is (eng_ex_dec2.values["verdict"] == "unsafe")
+        assert sdec_ex2.max_window_unsafe_prob == pytest.approx(
+            eng_ex_dec2.probabilities["verdict"]["unsafe"], abs=1e-6
+        )
+
+        # Invalid _exemplar_bank on live/compiled head rejected by GuardShield
+        eng_ex_bad = SystemOneEngine(
+            _R14ExemplarGuardSchema,
+            backend="numpy",
+            use_cache=False,
+            strict_mode=False,
+        )
+        eng_ex_bad.model.heads["verdict"]._exemplar_bank = object()
+        with pytest.raises(ValueError):
+            GuardShield(eng_ex_bad.model, field_name="verdict", unsafe_label="unsafe")
+
+        # MultiTenantSkillFleet must reject exemplar-bank heads on both live & compiled
+        with pytest.raises(ValueError, match="exemplar"):
+            MultiTenantSkillFleet.from_compiled_model(
+                eng_ex, num_tenants=1, field_name="verdict"
+            )
+        with pytest.raises(ValueError, match="exemplar"):
+            MultiTenantSkillFleet.from_compiled_model(
+                eng_ex.model, num_tenants=1, field_name="verdict"
+            )
+
+        # ------------------------------------------------------------------
+        # R14-2: recency_weighted via project_with_norm across Engine, Fleet,
+        #        GuardShield, Kernel, FastCallable, and FastExplainer.
+        # ------------------------------------------------------------------
+        class _PwnRecencyProj16:
+            dimension = 16
+
+            def _e0(self) -> np.ndarray:
+                v = np.zeros(16, dtype=np.float32)
+                v[0] = 1.0
+                return v
+
+            def _e1(self) -> np.ndarray:
+                v = np.zeros(16, dtype=np.float32)
+                v[1] = 1.0
+                return v
+
+            def project(self, text: str) -> np.ndarray:
+                return self._e0()
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                return np.vstack([self._e0() for _ in texts])
+
+            def project_with_norm(
+                self, text: str, recency_weighted: bool = False
+            ) -> Tuple[np.ndarray, float]:
+                return (self._e1() if recency_weighted else self._e0(), 1.0)
+
+            def projector_digest(self) -> str:
+                return "r14-pwn-recency-16"
+
+        class _R14ChoiceSchema(DecisionSchema):
+            v = ChoiceField(options=("safe", "unsafe"))
+
+        e0_vec = np.zeros(16, dtype=np.float32)
+        e0_vec[0] = 1.0
+        e1_vec = np.zeros(16, dtype=np.float32)
+        e1_vec[1] = 1.0
+        w_rw = np.zeros((2, 16), dtype=np.float32)
+        w_rw[0, 0] = 4.0
+        w_rw[0, 1] = -4.0
+        w_rw[1, 0] = -4.0
+        w_rw[1, 1] = 4.0
+        b_rw = np.zeros(2, dtype=np.float32)
+
+        for rw_flag, expected_lbl, expected_vec in (
+            (True, "unsafe", e1_vec),
+            (False, "safe", e0_vec),
+        ):
+            proj_rw = _PwnRecencyProj16()
+            eng_rw = SystemOneEngine(
+                _R14ChoiceSchema,
+                dimension=16,
+                backend="numpy",
+                projector=proj_rw,
+                recency_weighted=rw_flag,
+                contrastive_whitening=False,
+                use_cache=False,
+                strict_mode=False,
+            )
+            eng_rw.model.heads["v"].set_weights(w_rw, b_rw)
+
+            np.testing.assert_allclose(eng_rw.encode("alpha"), expected_vec, atol=1e-6)
+            assert eng_rw.decide("alpha", record_receipt=False).values["v"] == expected_lbl
+
+            shield_rw = GuardShield(
+                eng_rw.model,
+                field_name="v",
+                unsafe_label="unsafe",
+                canonicalize=False,
+                use_windows=False,
+            )
+            np.testing.assert_allclose(shield_rw._project_batch(["alpha"])[0], expected_vec, atol=1e-6)
+            assert shield_rw.evaluate_single("alpha").predicted_label == expected_lbl
+
+            fleet_rw = MultiTenantSkillFleet.from_compiled_model(
+                eng_rw, num_tenants=1, field_name="v"
+            )
+            np.testing.assert_allclose(fleet_rw._encode_one("alpha"), expected_vec, atol=1e-6)
+            np.testing.assert_allclose(fleet_rw._project_batch(["alpha"])[0], expected_vec, atol=1e-6)
+            assert fleet_rw.decide(0, "alpha").predicted_label == expected_lbl
+
+            pk_rw = eng_rw.compile_packed_kernel()
+            out_pk_rw = pk_rw.decide_prompt("alpha")
+            assert pk_rw.c_options[0][int(out_pk_rw["best_idx"][0, 0])] == expected_lbl
+
+            fn_rw = eng_rw.compile_callable()
+            assert fn_rw("alpha").values["v"] == expected_lbl
+
+            exp_rw = FastExplainer.from_engine(eng_rw, "v")
+            assert exp_rw.explain("alpha", include_counterfactual=False).predicted_label == expected_lbl
+
+            # Direct SystemOneEngine.encode projector fallback (self.model is None)
+            eng_rw_fb = SystemOneEngine(
+                _R14ChoiceSchema,
+                dimension=16,
+                backend="numpy",
+                projector=proj_rw,
+                recency_weighted=rw_flag,
+                contrastive_whitening=False,
+                use_cache=False,
+                strict_mode=False,
+            )
+            eng_rw_fb.model = None  # type: ignore[assignment]
+            np.testing.assert_allclose(eng_rw_fb.encode("alpha"), expected_vec, atol=1e-6)
+
+        # ------------------------------------------------------------------
+        # R14-3: Independent raw_W / raw_b dtypes + Fleet snapshot runtime memory check
+        # ------------------------------------------------------------------
+        class _ConstQuarter16:
+            dimension = 16
+
+            def project(self, text: str) -> np.ndarray:
+                return np.full(16, 0.25, dtype=np.float32)
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                return np.full((len(texts), 16), 0.25, dtype=np.float32)
+
+            def projector_digest(self) -> str:
+                return "r14-quarter-16"
+
+        q_proj = _ConstQuarter16()
+        eng_mix = SystemOneEngine(
+            _R14ChoiceSchema,
+            dimension=16,
+            backend="numpy",
+            projector=q_proj,
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        w_mix = np.zeros((2, 16), dtype=np.float32)
+        w_mix[0, :] = np.float32(1e38)
+        b_mix64 = np.zeros(2, dtype=np.float64)
+        h_mix = eng_mix.model.heads["v"]
+        h_mix.weights = w_mix
+        h_mix.biases = b_mix64
+        eng_mix.calibrators["v"].temperature = 1e30
+
+        eng_mix_dec = eng_mix.decide("probe", record_receipt=False)
+        assert eng_mix_dec.abstention_reasons.get("v") == "non_finite_input"
+        assert math.isnan(eng_mix_dec.confidences["v"])
+
+        # GuardShield must preserve float32 raw_W (not widen to float64 via raw_b) and fail closed
+        shield_mix = GuardShield(
+            eng_mix.model,
+            field_name="v",
+            unsafe_label="unsafe",
+            canonicalize=False,
+            use_windows=False,
+        )
+        assert shield_mix.raw_W.dtype == np.dtype(np.float32)
+        assert shield_mix.raw_b.dtype == np.dtype(np.float64)
+        sdec_mix = shield_mix.evaluate_single("probe")
+        assert sdec_mix.is_unsafe is True
+        assert sdec_mix.predicted_label == "unsafe"
+        assert sdec_mix.max_window_unsafe_prob == 1.0
+
+        # Also check Boolean mixed-dtype Shield fail-closed
+        class _R14BoolSchema(DecisionSchema):
+            is_safe = BooleanField(threshold=0.5)
+
+        eng_bmix = SystemOneEngine(
+            _R14BoolSchema,
+            dimension=16,
+            backend="numpy",
+            projector=q_proj,
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        hb_mix = eng_bmix.model.heads["is_safe"]
+        hb_mix.weights = np.full((1, 16), np.float32(1e38), dtype=np.float32)
+        hb_mix.biases = np.zeros(1, dtype=np.float64)
+        eng_bmix.calibrators["is_safe"].temperature = 1e30
+        shield_bmix = GuardShield(
+            eng_bmix.model,
+            field_name="is_safe",
+            unsafe_label="False",
+            canonicalize=False,
+            use_windows=False,
+        )
+        assert shield_bmix.raw_W.dtype == np.dtype(np.float32)
+        assert shield_bmix.raw_b.dtype == np.dtype(np.float64)
+        sb_dec = shield_bmix.evaluate_single("probe")
+        assert sb_dec.is_unsafe is True
+        assert sb_dec.max_window_unsafe_prob == 1.0
+
+        # Fleet must preserve float32 raw_W_auth & float64 raw_b_auth live & after restore
+        fleet_mix = MultiTenantSkillFleet.from_compiled_model(
+            eng_mix, num_tenants=1, field_name="v"
+        )
+        assert fleet_mix._raw_source_head is not None
+        assert fleet_mix._raw_source_head[0].dtype == np.dtype(np.float32)
+        assert fleet_mix._raw_source_head[1].dtype == np.dtype(np.float64)
+        fdec_mix = fleet_mix.decide(0, "probe")
+        assert fdec_mix.is_ambiguous is True
+        assert math.isnan(fdec_mix.confidence)
+
+        snap_mix = fleet_mix.fleet_delta_to_bytes()
+        fleet_mix_re = MultiTenantSkillFleet.fleet_delta_from_bytes(snap_mix, projector=q_proj)
+        assert fleet_mix_re._raw_source_head is not None
+        assert fleet_mix_re._raw_source_head[0].dtype == np.dtype(np.float32)
+        assert fleet_mix_re._raw_source_head[1].dtype == np.dtype(np.float64)
+        fdec_mix_re = fleet_mix_re.decide(0, "probe")
+        assert fdec_mix_re.is_ambiguous is True
+        assert math.isnan(fdec_mix_re.confidence)
+
+        pk_mix = eng_mix.compile_packed_kernel()
+        pk_mix_out = pk_mix.decide_prompt("probe")
+        assert bool(pk_mix_out["is_ambiguous"][0]) is True
+        assert math.isnan(float(pk_mix_out["c_conf"][0, 0]))
+
+        fn_mix = eng_mix.compile_callable()
+        fn_mix_dec = fn_mix("probe")
+        assert fn_mix_dec.is_ambiguous is True
+        assert math.isnan(fn_mix_dec.confidences["v"])
+
+        # Exact snapshot runtime memory budget check with raw_W_auth(f32) + raw_b_auth(f64)
+        class _Dummy4096Proj:
+            dimension = 4096
+
+            def project(self, text: str) -> np.ndarray:
+                v = np.zeros(4096, dtype=np.float32)
+                v[0] = 1.0
+                return v
+
+        fleet_mem = MultiTenantSkillFleet(
+            projector=_Dummy4096Proj(),
+            classes=("safe", "unsafe"),
+            W_base=np.zeros((2, 4096), dtype=np.float32),
+            b_base=np.zeros(2, dtype=np.float32),
+            num_tenants=1,
+            r_sub=16,
+            m_sparse=0,
+            m_exemplars=0,
+            _raw_source_head=(
+                np.zeros((2, 4096), dtype=np.float32),
+                np.zeros(2, dtype=np.float64),
+                1.0,
+                None,
+            ),
+        )
+        snap_mem = fleet_mem.fleet_delta_to_bytes()
+        expected_rt = int(fleet_mem.base_nbytes() + fleet_mem.arena_nbytes())
+        expected_preflight_rt = expected_rt + 8  # accounts for serialized 8-byte raw_cal_temp
+        assert expected_preflight_rt == 337_002
+        fleet_mem_ok = MultiTenantSkillFleet.fleet_delta_from_bytes(
+            snap_mem,
+            projector=_Dummy4096Proj(),
+            max_runtime_bytes=expected_preflight_rt,
+        )
+        assert int(fleet_mem_ok.base_nbytes() + fleet_mem_ok.arena_nbytes()) == expected_rt
+        assert int(fleet_mem_ok.base_nbytes() + fleet_mem_ok.arena_nbytes()) <= expected_preflight_rt
+        with pytest.raises(ValueError, match="exceeds budget"):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(
+                snap_mem,
+                projector=_Dummy4096Proj(),
+                max_runtime_bytes=expected_preflight_rt - 1,
+            )
+
+        # ------------------------------------------------------------------
+        # R14-4: _softmax_np, SoftOrdinalHead, CumulativeLogitOrdinalHead,
+        #        and UtilityCascadeRouter overflow fail-closed without warnings.
+        # ------------------------------------------------------------------
+        sm_bad = _softmax_np(
+            np.array(
+                [[1e308, 0.0], [float("inf"), 1.0], [0.0, float("-inf")], [0.0, 0.0]],
+                dtype=np.float64,
+            ),
+            axis=1,
+        )
+        assert sm_bad[0, 0] == pytest.approx(1.0, abs=1e-12) and sm_bad[0, 1] < 1e-12
+        assert bool(np.all(np.isnan(sm_bad[1])))
+        assert bool(np.all(np.isnan(sm_bad[2])))
+        assert sm_bad[3, 0] == pytest.approx(0.5, abs=1e-9)
+
+        router = UtilityCascadeRouter(error_multiplier=20.0, alpha=0.10)
+        prompts_r14: List[str] = []
+        tiers_r14: List[str] = []
+        for i in range(18):
+            prompts_r14.append(f"simple status check account balance password FAQ {i}")
+            tiers_r14.append("system1_local")
+            prompts_r14.append(f"summarize meeting notes rewrite email grammar table {i}")
+            tiers_r14.append("fast_small_model")
+            prompts_r14.append(f"formal proof distributed consensus deadlock root cause audit {i}")
+            tiers_r14.append("frontier_reasoning_model")
+        router.fit(prompts_r14, tiers_r14, cal_fraction=0.45)
+        assert router.ordinal_head is not None
+
+        v_probe = router.engine.encode("probe").astype(np.float64)
+        assert router.ordinal_head.bias_ is not None
+        orig_weights = router.ordinal_head.weights_.copy()
+        orig_bias = router.ordinal_head.bias_.copy()
+
+        router.ordinal_head.weights_[:, 2] = -1e308 * np.sign(v_probe)
+        p_soft_ov = router.ordinal_head.predict_proba(v_probe)
+        assert p_soft_ov.shape == (3,)
+        assert bool(np.all(np.isnan(p_soft_ov)))
+
+        r_single = router.route("probe")
+        assert r_single.action_index == 2
+        assert r_single.selected_tier == "frontier_reasoning_model"
+        assert r_single.used_crc_fallback is True
+        assert math.isnan(r_single.confidence)
+
+        rp_batch = router._batch_raw_probs(["probe"])
+        assert rp_batch.shape == (1, 3)
+        assert bool(np.all(np.isnan(rp_batch[0])))
+
+        # Test elementwise lin+bias overflow in SoftOrdinalHead (lin finite, lin+b -> +inf)
+        v_unit = np.zeros_like(v_probe)
+        v_unit[0] = 1.0
+        soft_only = SoftOrdinalHead(n_classes=3, sigma=0.5, l2=1e-2)
+        soft_only.weights_ = orig_weights.copy()
+        soft_only.bias_ = orig_bias.copy()
+        soft_only.weights_[:] = 0.0
+        soft_only.weights_[0, 0] = 1.2e308
+        soft_only.bias_[:] = 0.0
+        soft_only.bias_[0] = 1.2e308
+        p_lb_ov = soft_only.predict_proba(v_unit)
+        assert p_lb_ov.shape == (3,)
+        assert bool(np.all(np.isnan(p_lb_ov)))
+
+        # CumulativeLogitOrdinalHead overflow fail-closed (both matmul & thetas-eta overflow)
+        cum_rng = np.random.default_rng(7)
+        X_cum = cum_rng.normal(size=(30, v_probe.shape[0]))
+        y_cum = np.array([0, 1, 2] * 10, dtype=np.int64)
+        cum_head = CumulativeLogitOrdinalHead(n_classes=3, l2=1e-2).fit(X_cum, y_cum)
+        assert cum_head.weights_ is not None
+        cum_head.weights_ = 1e308 * np.sign(v_probe)
+        p_cum_ov = cum_head.predict_proba(v_probe)
+        assert p_cum_ov.shape == (3,)
+        assert bool(np.all(np.isnan(p_cum_ov)))
+
+        cum_head.thresholds_ = orig_thetas = cum_head.thresholds_.copy()
+        cum_head.weights_ = np.zeros_like(cum_head.weights_)
+        cum_head.weights_[0] = 1.2e308
+        cum_head.thresholds_ = np.array([-1.2e308, -1.0e308], dtype=np.float64)
+        p_cum_sub_ov = cum_head.predict_proba(v_unit)
+        assert p_cum_sub_ov.shape == (3,)
+        assert bool(np.all(np.isnan(p_cum_sub_ov)))
+
+        cum_head.thresholds_ = orig_thetas
+        cum_head.weights_ = 1e308 * np.sign(v_probe)
+        router.ordinal_head = cum_head  # type: ignore[assignment]
+        r_cum = router.route("probe")
+        assert r_cum.action_index == 2
+        assert r_cum.selected_tier == "frontier_reasoning_model"
+        assert r_cum.used_crc_fallback is True
+        assert math.isnan(r_cum.confidence)
+
+        # ------------------------------------------------------------------
+        # R14-5: _is_native_scalar_projector recognizes HybridProjector subclass
+        # ------------------------------------------------------------------
+        class CustomHybrid(HybridProjector):
+            pass
+
+        custom_hp = CustomHybrid.from_config(
+            {
+                "type": "hybrid",
+                "sparse_dim": 16,
+                "dense_dim": 16,
+                "fitted": True,
+                "use_subspace": True,
+                "subspace_components": np.ones((4, 32), dtype=float).tolist(),
+                "subspace_weight": 0.5,
+                "rbf_landmarks": [[0.2] * 32],
+                "rbf_weight": 0.5,
+                "rbf_gamma": 1.0,
+            }
+        )
+        assert _is_native_scalar_projector(custom_hp) is True
+
+        probe_sub = "check system status now"
+        v_scalar = custom_hp.project(probe_sub)
+        v_batch_raw = custom_hp.project_batch([probe_sub])[0]
+        assert not np.array_equal(v_scalar, v_batch_raw)
+
+        # Place Boolean boundary strictly between scalar and batch projections
+        diff_sub = (v_scalar.astype(np.float64) - v_batch_raw.astype(np.float64))
+        w_dir = np.where(np.abs(diff_sub) > 0.0, diff_sub, 0.0)
+        w_f32 = (w_dir / float(np.linalg.norm(w_dir))).astype(np.float32)
+        dot_sc = float(v_scalar @ w_f32)
+        dot_bt = float(v_batch_raw @ w_f32)
+        assert dot_sc != dot_bt
+        mid_b = np.float32(-0.5 * (dot_sc + dot_bt))
+
+        class _R14SubBoolSchema(DecisionSchema):
+            ok = BooleanField(threshold=0.5)
+
+        eng_sub = SystemOneEngine(
+            _R14SubBoolSchema,
+            dimension=32,
+            backend="numpy",
+            projector=custom_hp,
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        eng_sub.model.heads["ok"].set_weights(w_f32.reshape(1, -1), np.array([mid_b], dtype=np.float32))
+        eng_sub_val = bool(eng_sub.decide(probe_sub, record_receipt=False).values["ok"])
+
+        fleet_sub = MultiTenantSkillFleet.from_compiled_model(
+            eng_sub, num_tenants=1, field_name="ok"
+        )
+        np.testing.assert_array_equal(
+            fleet_sub._project_batch([probe_sub])[0],
+            fleet_sub._encode_one(probe_sub),
+        )
+        assert (fleet_sub.decide(0, probe_sub).predicted_label == "True") is eng_sub_val
+
+        shield_sub = GuardShield(
+            eng_sub.model,
+            field_name="ok",
+            unsafe_label="False",
+            canonicalize=False,
+            use_windows=False,
+        )
+        np.testing.assert_array_equal(
+            shield_sub._project_batch([probe_sub])[0],
+            fleet_sub._encode_one(probe_sub),
+        )
+        assert (shield_sub.evaluate_single(probe_sub).predicted_label == "True") is eng_sub_val
+
+        # ------------------------------------------------------------------
+        # R14-6: PackedMultiQuestionKernel / FastDecisionCallable float64 L1
+        #        bounds avoid float32 sum overflow warnings & bogus inf bounds.
+        # ------------------------------------------------------------------
+        class _MultiProbeProj16:
+            dimension = 16
+
+            def project(self, text: str) -> np.ndarray:
+                v = np.zeros(16, dtype=np.float32)
+                if text == "orth":
+                    v[8] = np.float32(1.0)
+                elif text == "over":
+                    v[:4] = np.float32(0.5)
+                elif text == "bias_over":
+                    v[0] = np.float32(1.0)
+                return v
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                return np.vstack([self.project(t) for t in texts])
+
+            def projector_digest(self) -> str:
+                return "r14-l1-probe-16"
+
+        class _R14KernelL1Schema(DecisionSchema):
+            c = ChoiceField(options=("a", "b"))
+            b = BooleanField(threshold=0.5)
+
+        eng_l1 = SystemOneEngine(
+            _R14KernelL1Schema,
+            dimension=16,
+            backend="numpy",
+            projector=_MultiProbeProj16(),
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        w_c_l1 = np.zeros((2, 16), dtype=np.float32)
+        w_c_l1[0, :4] = np.float32(2e38)
+        w_c_l1[1, 8] = np.float32(2.0)
+        b_c_l1 = np.array([np.float32(0.0), np.float32(0.1)], dtype=np.float32)
+        eng_l1.model.heads["c"].set_weights(w_c_l1, b_c_l1)
+
+        w_b_l1 = np.zeros((1, 16), dtype=np.float32)
+        w_b_l1[0, :4] = np.float32(2e38)
+        w_b_l1[0, 8] = np.float32(-2.0)
+        b_b_l1 = np.array([np.float32(0.2)], dtype=np.float32)
+        eng_l1.model.heads["b"].set_weights(w_b_l1, b_b_l1)
+
+        pk_l1 = eng_l1.compile_packed_kernel()
+        fn_l1 = eng_l1.compile_callable()
+
+        assert math.isfinite(float(pk_l1.c_w_l1_max[0]))
+        assert math.isfinite(float(pk_l1.b_w_l1[0]))
+        assert float(pk_l1.c_w_l1_max[0]) == pytest.approx(8e38, rel=1e-5)
+        assert float(pk_l1.b_w_l1[0]) == pytest.approx(8e38, rel=1e-5)
+
+        for probe_k in ("zero", "orth", "over"):
+            d_eng_k = eng_l1.decide(probe_k, record_receipt=False)
+            d_pk_k = pk_l1.decide_prompt(probe_k)
+            d_fn_k = fn_l1(probe_k)
+            if probe_k == "over":
+                assert bool(d_pk_k["is_ambiguous"][0]) is True
+                assert d_fn_k.is_ambiguous is True
+                assert d_eng_k.is_ambiguous is True
+                assert math.isnan(float(d_pk_k["c_conf"][0, 0]))
+                assert math.isnan(float(d_pk_k["b_conf"][0, 0]))
+                assert math.isnan(d_fn_k.confidences["c"])
+                assert math.isnan(d_fn_k.confidences["b"])
+            else:
+                assert pk_l1.c_options[0][int(d_pk_k["best_idx"][0, 0])] == d_eng_k.values["c"]
+                assert bool(d_pk_k["b_val"][0, 0]) is bool(d_eng_k.values["b"])
+                assert d_fn_k.values["c"] == d_eng_k.values["c"]
+                assert bool(d_fn_k.values["b"]) is bool(d_eng_k.values["b"])
