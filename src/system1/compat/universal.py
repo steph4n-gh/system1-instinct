@@ -1412,9 +1412,18 @@ class _GatewayThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServe
 class UniversalDecisionsHTTPServer:
     """Stdlib 127.0.0.1 loopback HTTP gateway supporting Gemini / Laya / Jev endpoints."""
 
-    def __init__(self, service: UniversalDecisionService, *, host: str = "127.0.0.1", port: int = 0) -> None:
+    def __init__(
+        self,
+        service: UniversalDecisionService,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 0,
+        bind_and_activate: bool = True,
+    ) -> None:
         if host not in _LOOPBACK_HOSTS:
             raise ValueError(f"Gateway must bind strictly to loopback, got {host!r}")
+        if type(bind_and_activate) is not bool:
+            raise TypeError("bind_and_activate must be a bool")
         self.service = service
 
         class _Handler(http.server.BaseHTTPRequestHandler):
@@ -1491,8 +1500,13 @@ class UniversalDecisionsHTTPServer:
                 self_h.end_headers()
                 self_h.wfile.write(encoded)
 
-        self._httpd = _GatewayThreadingServer((host, port), _Handler)
-        self.host, self.port = self._httpd.server_address[:2]
+        self._httpd = _GatewayThreadingServer(
+            (host, port), _Handler, bind_and_activate=bind_and_activate
+        )
+        if bind_and_activate:
+            self.host, self.port = self._httpd.server_address[:2]
+        else:
+            self.host, self.port = host, int(port)
         self.base_url = f"http://{self.host}:{self.port}"
         self._thread: Optional[threading.Thread] = None
 

@@ -719,6 +719,18 @@ def _normalize_raw_projection_batch(
         return out
 
 
+def _resolve_authoritative_head(model: Any, fname: str) -> Tuple[Any, Optional[Any]]:
+    """Return (exec_head, meta_head) matching scalar inference precedence (_field_heads before heads)."""
+    field_heads = getattr(model, "_field_heads", None)
+    compiled_heads = getattr(model, "heads", None)
+    live_head = field_heads.get(fname) if isinstance(field_heads, Mapping) else None
+    meta_head = compiled_heads.get(fname) if isinstance(compiled_heads, Mapping) else None
+    exec_head = live_head if live_head is not None else meta_head
+    if exec_head is None:
+        raise ValueError(f"PackedMultiQuestionKernel missing model head for {fname!r}")
+    return exec_head, meta_head
+
+
 def _validate_packed_engine_support(eng: Any) -> None:
     """Validate that an engine and all heads/predictors are supported by PackedMultiQuestionKernel."""
     schema = getattr(eng, "schema", None)
@@ -748,8 +760,6 @@ def _validate_packed_engine_support(eng: Any) -> None:
             "PackedMultiQuestionKernel does not support engines with active aci_tracker margin_floor"
         )
 
-    heads = getattr(model, "heads", {}) or {}
-    field_heads = getattr(model, "_field_heads", {}) or {}
     calibrators = getattr(eng, "calibrators", {}) or {}
     conformal_predictors = getattr(eng, "conformal_predictors", {}) or {}
     reg_conformal_predictors = getattr(eng, "regression_conformal_predictors", {}) or {}
@@ -759,11 +769,8 @@ def _validate_packed_engine_support(eng: Any) -> None:
             raise ValueError(
                 f"PackedMultiQuestionKernel does not support field {fname!r} of type {type(f_def).__name__}"
             )
-        if fname not in heads:
-            raise ValueError(f"PackedMultiQuestionKernel missing model head for {fname!r}")
-        h = heads[fname]
-        live_h = field_heads.get(fname)
-        candidates = (h,) if (live_h is None or live_h is h) else (h, live_h)
+        exec_h, meta_h = _resolve_authoritative_head(model, fname)
+        candidates = (exec_h,) if (meta_h is None or meta_h is exec_h) else (exec_h, meta_h)
         for cand in candidates:
             if getattr(cand, "hierarchical", False) and getattr(cand, "coarse_weights", None) is not None:
                 raise ValueError(f"PackedMultiQuestionKernel does not support hierarchical head {fname!r}")
@@ -3068,8 +3075,34 @@ class PackedMultiQuestionKernel:
 
         self.c_raw_w = _freeze_raw_tuple(c_raw_w)
         self.c_raw_b = _freeze_raw_tuple(c_raw_b)
+        self.c_has_raw_f64 = _owned_readonly_array(
+            np.array(
+                [
+                    (i < len(self.c_raw_w) and self.c_raw_w[i].dtype == np.float64)
+                    or (i < len(self.c_raw_b) and self.c_raw_b[i].dtype == np.float64)
+                    for i in range(self.Q_c)
+                ],
+                dtype=bool,
+            )
+            if self.Q_c > 0
+            else np.empty(0, dtype=bool),
+            dtype=bool,
+        )
         self.b_raw_w = _freeze_raw_tuple(b_raw_w)
         self.b_raw_b = _freeze_raw_tuple(b_raw_b)
+        self.b_has_raw_f64 = _owned_readonly_array(
+            np.array(
+                [
+                    (i < len(self.b_raw_w) and self.b_raw_w[i].dtype == np.float64)
+                    or (i < len(self.b_raw_b) and self.b_raw_b[i].dtype == np.float64)
+                    for i in range(self.Q_b)
+                ],
+                dtype=bool,
+            )
+            if self.Q_b > 0
+            else np.empty(0, dtype=bool),
+            dtype=bool,
+        )
         self.s_raw_w = _freeze_raw_tuple(s_raw_w)
         self.s_raw_b = _freeze_raw_tuple(s_raw_b)
         self.s_has_raw_f64 = tuple(
@@ -3276,19 +3309,20 @@ class PackedMultiQuestionKernel:
         s_raw_b: List[np.ndarray] = []
 
         def _validate_head(fname: str) -> Any:
-            h = heads[fname]
-            live_h = field_heads.get(fname)
-            if getattr(h, "hierarchical", False) and getattr(h, "coarse_weights", None) is not None:
-                raise ValueError(f"PackedMultiQuestionKernel does not support hierarchical head {fname!r}")
-            if getattr(h, "_exemplar_bank", None) is not None or (
-                live_h is not None and getattr(live_h, "_exemplar_bank", None) is not None
-            ):
-                raise ValueError(f"PackedMultiQuestionKernel does not support exemplar bank on {fname!r}")
-            if float(getattr(h, "familiarity_threshold", 0.0)) > 0.0:
-                raise ValueError(f"PackedMultiQuestionKernel does not support familiarity_threshold on {fname!r}")
-            if float(getattr(h, "prototype_threshold", 0.0)) > 0.0:
-                raise ValueError(f"PackedMultiQuestionKernel does not support prototype_threshold on {fname!r}")
-            return h
+            exec_h, meta_h = _resolve_authoritative_head(model, fname)
+            candidates = (exec_h,) if (meta_h is None or meta_h is exec_h) else (exec_h, meta_h)
+            for cand in candidates:
+                if getattr(cand, "hierarchical", False) and getattr(cand, "coarse_weights", None) is not None:
+                    raise ValueError(f"PackedMultiQuestionKernel does not support hierarchical head {fname!r}")
+                if getattr(cand, "_exemplar_bank", None) is not None:
+                    raise ValueError(f"PackedMultiQuestionKernel does not support exemplar bank on {fname!r}")
+                fam_h = float(getattr(cand, "familiarity_threshold", 0.0))
+                if not math.isfinite(fam_h) or fam_h > 0.0:
+                    raise ValueError(f"PackedMultiQuestionKernel does not support familiarity_threshold on {fname!r}")
+                proto_h = float(getattr(cand, "prototype_threshold", 0.0))
+                if not math.isfinite(proto_h) or proto_h > 0.0:
+                    raise ValueError(f"PackedMultiQuestionKernel does not support prototype_threshold on {fname!r}")
+            return exec_h
 
         def _validate_cp(fname: str) -> Any:
             cp = eng.conformal_predictors[fname]
@@ -3306,6 +3340,7 @@ class PackedMultiQuestionKernel:
                     f"PackedMultiQuestionKernel does not support field {fname!r} of type {type(f_def).__name__}"
                 )
 
+        dim = int(eng.dimension)
         cursor = 0
         for fname, f_def in fields.items():
             if isinstance(f_def, ChoiceField):
@@ -3320,10 +3355,16 @@ class PackedMultiQuestionKernel:
                 temp = float(cal.temperature)
                 if not math.isfinite(temp) or temp <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
-                W = np.asarray(head.weights, dtype=np.float64)
-                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)
                 raw_w_arr = np.asarray(head.weights)
                 raw_b_arr = np.asarray(head.biases).reshape(-1)
+                if raw_w_arr.ndim != 2 or raw_w_arr.shape != (K, dim) or raw_b_arr.shape != (K,):
+                    raise ValueError(
+                        f"Choice head {fname!r} shape mismatch: expected ({K}, {dim}) and ({K},), got {raw_w_arr.shape} and {raw_b_arr.shape}"
+                    )
+                if not (np.all(np.isfinite(raw_w_arr)) and np.all(np.isfinite(raw_b_arr))):
+                    raise ValueError(f"Choice head weights for {fname!r} contain non-finite values")
+                W = np.asarray(raw_w_arr, dtype=np.float64)
+                b = np.asarray(raw_b_arr, dtype=np.float64)
                 c_raw_w.append(
                     _owned_readonly_array(
                         raw_w_arr,
@@ -3345,7 +3386,7 @@ class PackedMultiQuestionKernel:
                     adj_vec = np.zeros(K, dtype=np.float64)
                 c_temp.append(temp)
                 c_adj.append(adj_vec)
-                c_zero_head.append(bool(not np.any(head.weights) and not np.any(head.biases)))
+                c_zero_head.append(bool(not np.any(raw_w_arr) and not np.any(raw_b_arr)))
                 W_cols.append(W.T)
                 b_cols.append(b)
                 c_offsets.append(cursor)
@@ -3376,10 +3417,23 @@ class PackedMultiQuestionKernel:
                 temp = float(cal.temperature)
                 if not math.isfinite(temp) or temp <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
-                W = np.asarray(head.weights, dtype=np.float64)[:1]
-                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)[:1]
-                raw_w_arr = np.asarray(head.weights)[:1]
-                raw_b_arr = np.asarray(head.biases).reshape(-1)[:1]
+                raw_w_full = np.asarray(head.weights)
+                raw_b_full = np.asarray(head.biases).reshape(-1)
+                if (
+                    raw_w_full.ndim != 2
+                    or raw_w_full.shape[0] < 1
+                    or raw_w_full.shape[1] != dim
+                    or raw_b_full.shape[0] < 1
+                ):
+                    raise ValueError(
+                        f"Boolean head {fname!r} shape mismatch: expected (>=1, {dim}) and (>=1,), got {raw_w_full.shape} and {raw_b_full.shape}"
+                    )
+                raw_w_arr = raw_w_full[:1]
+                raw_b_arr = raw_b_full[:1]
+                if not (np.all(np.isfinite(raw_w_arr)) and np.all(np.isfinite(raw_b_arr))):
+                    raise ValueError(f"Boolean head weights for {fname!r} contain non-finite values")
+                W = np.asarray(raw_w_arr, dtype=np.float64)
+                b = np.asarray(raw_b_arr, dtype=np.float64)
                 b_raw_w.append(
                     _owned_readonly_array(
                         raw_w_arr,
@@ -3410,7 +3464,7 @@ class PackedMultiQuestionKernel:
                 b_temp.append(temp)
                 b_adj0.append(adj0_val)
                 b_adj1.append(adj1_val)
-                b_zero_head.append(bool(not np.any(head.weights) and not np.any(head.biases)))
+                b_zero_head.append(bool(not np.any(raw_w_arr) and not np.any(raw_b_arr)))
                 W_cols.append(W.T)
                 b_cols.append(b)
                 b_thresh.append(float(f_def.threshold))
@@ -3439,34 +3493,35 @@ class PackedMultiQuestionKernel:
                 if not math.isfinite(raw_t) or raw_t <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {raw_t!r}")
                 temp = max(1e-4, raw_t)
-                raw_w_arr = np.asarray(head.weights)
-                raw_b_arr = np.asarray(head.biases).reshape(-1)
-                field_heads = getattr(eng.model, "_field_heads", None)
+                raw_w_full = np.asarray(head.weights)
+                raw_b_full = np.asarray(head.biases).reshape(-1)
                 if (
-                    isinstance(field_heads, dict)
-                    and fname in field_heads
-                    and raw_w_arr.dtype != np.float64
-                    and raw_b_arr.dtype != np.float64
+                    raw_w_full.ndim != 2
+                    or raw_w_full.shape[0] < 1
+                    or raw_w_full.shape[1] != dim
+                    or raw_b_full.shape[0] < 1
                 ):
-                    fh = field_heads[fname]
-                    fw_attr = getattr(fh, "weights", getattr(fh, "_weights", None))
-                    fb_attr = getattr(fh, "biases", getattr(fh, "_biases", None))
-                    if fw_attr is not None and fb_attr is not None:
-                        fw_arr = np.asarray(fw_attr)
-                        fb_arr = np.asarray(fb_attr).reshape(-1)
-                        if (
-                            (fw_arr.dtype == np.float64 or fb_arr.dtype == np.float64)
-                            and fw_arr.shape == raw_w_arr.shape
-                            and fb_arr.shape == raw_b_arr.shape
-                        ):
-                            if not (np.all(np.isfinite(fw_arr)) and np.all(np.isfinite(fb_arr))):
-                                raise ValueError(f"Score head weights for {fname!r} contain non-finite values")
-                            raw_w_arr = fw_arr
-                            raw_b_arr = fb_arr
-                W = np.asarray(raw_w_arr, dtype=np.float64)[:1]
-                b = np.asarray(raw_b_arr, dtype=np.float64).reshape(-1)[:1]
-                s_raw_w.append(np.ascontiguousarray(raw_w_arr)[:1])
-                s_raw_b.append(np.ascontiguousarray(raw_b_arr).reshape(-1)[:1])
+                    raise ValueError(
+                        f"Score head {fname!r} shape mismatch: expected (>=1, {dim}) and (>=1,), got {raw_w_full.shape} and {raw_b_full.shape}"
+                    )
+                raw_w_arr = raw_w_full[:1]
+                raw_b_arr = raw_b_full[:1]
+                if not (np.all(np.isfinite(raw_w_arr)) and np.all(np.isfinite(raw_b_arr))):
+                    raise ValueError(f"Score head weights for {fname!r} contain non-finite values")
+                W = np.asarray(raw_w_arr, dtype=np.float64)
+                b = np.asarray(raw_b_arr, dtype=np.float64)
+                s_raw_w.append(
+                    _owned_readonly_array(
+                        raw_w_arr,
+                        dtype=raw_w_arr.dtype if raw_w_arr.dtype in (np.float32, np.float64) else np.float32,
+                    )
+                )
+                s_raw_b.append(
+                    _owned_readonly_array(
+                        raw_b_arr,
+                        dtype=raw_b_arr.dtype if raw_b_arr.dtype in (np.float32, np.float64) else np.float32,
+                    )
+                )
                 W_cols.append(W.T)
                 b_cols.append(b)
                 s_raw_scale.append(temp)
@@ -3489,7 +3544,7 @@ class PackedMultiQuestionKernel:
                     m = rng_val if strict_mode else rng_val * ((1.0 - eff_alpha) / 2.0)
                 s_norm_margin.append(m / max(1e-6, rng_val))
                 s_escalate.append(bool(getattr(f_def, "escalate_on_ambiguity", True)))
-                s_zero_head.append(bool(not np.any(W) and not np.any(b)))
+                s_zero_head.append(bool(not np.any(raw_w_arr) and not np.any(raw_b_arr)))
 
         arr_dtype = np.float32 if storage_mode == "float32" else np.float16
         with np.errstate(over="ignore", invalid="ignore"):
@@ -3753,7 +3808,11 @@ class PackedMultiQuestionKernel:
                         )
                         near_c |= near_mg_c
 
-                    near_c &= (~c_nonfin) & (~self.c_zero_head[None, :]) & (~c_model_ov)
+                    if np.any(self.c_has_raw_f64):
+                        near_c = np.where(self.c_has_raw_f64[None, :], True, near_c & (~c_nonfin))
+                        near_c &= (~x_row_nonfin[:, None]) & (~self.c_zero_head[None, :]) & (~c_model_ov)
+                    else:
+                        near_c &= (~c_nonfin) & (~self.c_zero_head[None, :]) & (~c_model_ov)
                 if np.any(near_c):
                     r_idxs, c_idxs = np.nonzero(near_c)
                     for r_pos, ci_pos in zip(r_idxs.tolist(), c_idxs.tolist()):
@@ -3773,6 +3832,7 @@ class PackedMultiQuestionKernel:
                             best_idx[r_pos, ci_pos] = best_i_ex
                             c_conf[r_pos, ci_pos] = float(p_ex[best_i_ex])
                             p_sorted[r_pos, ci_pos] = -np.sort(-p_pad[r_pos, ci_pos])
+                            c_nonfin[r_pos, ci_pos] = False
                         else:
                             p_c[r_pos, s0 : s0 + K] = np.nan
                             p_pad[r_pos, ci_pos, :K] = np.nan
@@ -3943,7 +4003,11 @@ class PackedMultiQuestionKernel:
                         )
                         near_b |= near_mg_b
 
-                    near_b &= (~b_nonfin) & (~self.b_zero_head[None, :]) & (~b_model_ov)
+                    if np.any(self.b_has_raw_f64):
+                        near_b = np.where(self.b_has_raw_f64[None, :], True, near_b & (~b_nonfin))
+                        near_b &= (~x_row_nonfin[:, None]) & (~self.b_zero_head[None, :]) & (~b_model_ov)
+                    else:
+                        near_b &= (~b_nonfin) & (~self.b_zero_head[None, :]) & (~b_model_ov)
                 if np.any(near_b):
                     r_idxs, b_idxs = np.nonzero(near_b)
                     for r_pos, bi_pos in zip(r_idxs.tolist(), b_idxs.tolist()):
@@ -3965,6 +4029,7 @@ class PackedMultiQuestionKernel:
                             s0[r_pos, bi_pos] = s0_ex
                             s1[r_pos, bi_pos] = s1_ex
                             p_false[r_pos, bi_pos] = pf_ex
+                            b_nonfin[r_pos, bi_pos] = False
                         else:
                             p_true[r_pos, bi_pos] = float("nan")
                             b_val[r_pos, bi_pos] = False
@@ -4026,14 +4091,23 @@ class PackedMultiQuestionKernel:
 
         if self.Q_s > 0:
             zs = np.array(logits[:, self.M_c + self.Q_b :], dtype=np.float64, copy=True)
-            if self.storage_mode == "float32":
-                for si in range(self.Q_s):
-                    if si < len(self.s_has_raw_f64) and self.s_has_raw_f64[si]:
-                        mask_s = ~s_model_ov[:, si]
-                        if np.any(mask_s):
-                            w64 = np.asarray(self.s_raw_w[si], dtype=np.float64)[0]
-                            b64 = float(np.asarray(self.s_raw_b[si], dtype=np.float64).reshape(-1)[0])
-                            zs[mask_s, si] = np.asarray(Xm_2d[mask_s], dtype=np.float64) @ w64 + b64
+            if (
+                self.storage_mode == "float32"
+                and len(self.s_raw_w) == self.Q_s
+                and len(self.s_raw_b) == self.Q_s
+            ):
+                with np.errstate(over="ignore", invalid="ignore"):
+                    for si in range(self.Q_s):
+                        valid_s = (~x_row_nonfin) & (~s_model_ov[:, si])
+                        if not np.any(valid_s):
+                            continue
+                        if self.s_zero_head[si]:
+                            zs[valid_s, si] = 0.0
+                        else:
+                            w_s = self.s_raw_w[si]
+                            b_s = self.s_raw_b[si]
+                            for r_pos in np.flatnonzero(valid_s).tolist():
+                                zs[r_pos, si] = float((Xm_2d[r_pos : r_pos + 1] @ w_s.T + b_s)[0, 0])
             with np.errstate(over="ignore", invalid="ignore"):
                 scaled_zs = zs / 0.25
                 zs_cal = scaled_zs / self.s_raw_scale[None, :]
@@ -4272,12 +4346,15 @@ class _BoundCallableState:
     dimension_f: float = 0.0
     c_zero_head: Tuple[bool, ...] = ()
     b_zero_head: Tuple[bool, ...] = ()
+    s_zero_head: Tuple[bool, ...] = ()
     c_raw_w: Tuple[np.ndarray, ...] = ()
     c_raw_b: Tuple[np.ndarray, ...] = ()
+    c_has_raw_f64: Tuple[bool, ...] = ()
     c_w_l1_max: Tuple[float, ...] = ()
     c_b_abs_max: Tuple[float, ...] = ()
     b_raw_w: Tuple[np.ndarray, ...] = ()
     b_raw_b: Tuple[np.ndarray, ...] = ()
+    b_has_raw_f64: Tuple[bool, ...] = ()
     s_raw_w: Tuple[np.ndarray, ...] = ()
     s_raw_b: Tuple[np.ndarray, ...] = ()
     s_has_raw_f64: Tuple[bool, ...] = ()
@@ -4419,12 +4496,15 @@ class FastDecisionCallable:
             dimension_f=float(kernel.dimension),
             c_zero_head=tuple(bool(x) for x in kernel.c_zero_head),
             b_zero_head=tuple(bool(x) for x in kernel.b_zero_head),
+            s_zero_head=tuple(bool(x) for x in kernel.s_zero_head),
             c_raw_w=kernel.c_raw_w,
             c_raw_b=kernel.c_raw_b,
+            c_has_raw_f64=tuple(bool(x) for x in kernel.c_has_raw_f64),
             c_w_l1_max=tuple(float(x) for x in kernel.c_w_l1_max),
             c_b_abs_max=tuple(float(x) for x in kernel.c_b_abs_max),
             b_raw_w=kernel.b_raw_w,
             b_raw_b=kernel.b_raw_b,
+            b_has_raw_f64=tuple(bool(x) for x in kernel.b_has_raw_f64),
             s_raw_w=kernel.s_raw_w,
             s_raw_b=kernel.s_raw_b,
             s_has_raw_f64=kernel.s_has_raw_f64,
@@ -4598,53 +4678,87 @@ class FastDecisionCallable:
             s0 = st.c_starts[ci]
             temp = st.c_temp[ci]
             adj_vec = st.c_adj[ci]
-            z_cal = [(z_list[s0 + j] / 0.25 + adj_vec[j]) / temp for j in range(K)]
-            if (not emb_ok) or not (
-                all(isfinite(z_list[s0 + j]) for j in range(K))
-                and all(isfinite(v) for v in z_cal)
+            if (
+                emb_ok
+                and len(st.c_raw_w) == st.Q_c
+                and ci < len(st.c_has_raw_f64)
+                and st.c_has_raw_f64[ci]
+                and not st.c_zero_head[ci]
             ):
-                vals[fn] = st.c_options[ci][0]
-                confs[fn] = float("nan")
-                ambig = True
-                continue
-            m = max(z_cal)
-            exps = [exp(v - m) for v in z_cal]
-            sum_e = sum(exps)
-            if not (isfinite(sum_e) and sum_e > 0.0):
-                vals[fn] = st.c_options[ci][0]
-                confs[fn] = float("nan")
-                ambig = True
-                continue
-            inv_sum = 1.0 / sum_e
-            probs = [e * inv_sum for e in exps]
-            if not all(isfinite(pv) for pv in probs):
-                vals[fn] = st.c_options[ci][0]
-                confs[fn] = float("nan")
-                ambig = True
-                continue
-            if len(st.c_raw_w) == st.Q_c and not st.c_zero_head[ci]:
-                dz_b = (
-                    4.0
-                    * (st.dimension_f + 4.0)
-                    * _FLOAT32_EPS
-                    * (x_inf_val * st.c_w_l1_max[ci] + st.c_b_abs_max[ci])
+                p_ex, ok_ex = _exact_choice_probs_row(
+                    emb.reshape(1, -1),
+                    st.c_raw_w[ci],
+                    st.c_raw_b[ci],
+                    np.asarray(adj_vec, dtype=np.float64),
+                    temp,
                 )
-                dz_cal_b = (dz_b / 0.25) / temp
-                dp_b = min(1.0, dz_cal_b + 1e-9)
-                near_ci = False
-                if K >= 2:
-                    zcs = sorted(z_cal, reverse=True)
-                    if (zcs[0] - zcs[1]) <= 2.0 * dz_cal_b:
-                        near_ci = True
-                if not near_ci:
-                    if st.c_cals[ci]:
-                        qh_chk = st.c_qhats[ci]
-                        if st.c_lacs[ci]:
-                            thr_lac = qh_chk + 1e-7
-                            if any(abs((1.0 - pv) - thr_lac) <= dp_b for pv in probs):
-                                near_ci = True
-                        else:
-                            aps_thr = qh_chk + (1e-7 if strict else -1e-7)
+                if not ok_ex:
+                    vals[fn] = st.c_options[ci][0]
+                    confs[fn] = float("nan")
+                    ambig = True
+                    continue
+                probs = p_ex.tolist()
+            else:
+                z_cal = [(z_list[s0 + j] / 0.25 + adj_vec[j]) / temp for j in range(K)]
+                if (not emb_ok) or not (
+                    all(isfinite(z_list[s0 + j]) for j in range(K))
+                    and all(isfinite(v) for v in z_cal)
+                ):
+                    vals[fn] = st.c_options[ci][0]
+                    confs[fn] = float("nan")
+                    ambig = True
+                    continue
+                m = max(z_cal)
+                exps = [exp(v - m) for v in z_cal]
+                sum_e = sum(exps)
+                if not (isfinite(sum_e) and sum_e > 0.0):
+                    vals[fn] = st.c_options[ci][0]
+                    confs[fn] = float("nan")
+                    ambig = True
+                    continue
+                inv_sum = 1.0 / sum_e
+                probs = [e * inv_sum for e in exps]
+                if not all(isfinite(pv) for pv in probs):
+                    vals[fn] = st.c_options[ci][0]
+                    confs[fn] = float("nan")
+                    ambig = True
+                    continue
+                if len(st.c_raw_w) == st.Q_c and not st.c_zero_head[ci]:
+                    dz_b = (
+                        4.0
+                        * (st.dimension_f + 4.0)
+                        * _FLOAT32_EPS
+                        * (x_inf_val * st.c_w_l1_max[ci] + st.c_b_abs_max[ci])
+                    )
+                    dz_cal_b = (dz_b / 0.25) / temp
+                    dp_b = min(1.0, dz_cal_b + 1e-9)
+                    near_ci = False
+                    if K >= 2:
+                        zcs = sorted(z_cal, reverse=True)
+                        if (zcs[0] - zcs[1]) <= 2.0 * dz_cal_b:
+                            near_ci = True
+                    if not near_ci:
+                        if st.c_cals[ci]:
+                            qh_chk = st.c_qhats[ci]
+                            if st.c_lacs[ci]:
+                                thr_lac = qh_chk + 1e-7
+                                if any(abs((1.0 - pv) - thr_lac) <= dp_b for pv in probs):
+                                    near_ci = True
+                            else:
+                                aps_thr = qh_chk + (1e-7 if strict else -1e-7)
+                                aps_buf = (K + 1.0) * dp_b + 1e-6
+                                ps_chk = sorted(probs, reverse=True)
+                                cs_chk = 0.0
+                                for pv in ps_chk:
+                                    if abs(cs_chk - aps_thr) <= aps_buf:
+                                        near_ci = True
+                                        break
+                                    cs_chk += pv
+                                    if abs(cs_chk - aps_thr) <= aps_buf:
+                                        near_ci = True
+                                        break
+                        elif not strict:
+                            aps_thr = (1.0 - st.alpha) - 1e-7
                             aps_buf = (K + 1.0) * dp_b + 1e-6
                             ps_chk = sorted(probs, reverse=True)
                             cs_chk = 0.0
@@ -4656,48 +4770,35 @@ class FastDecisionCallable:
                                 if abs(cs_chk - aps_thr) <= aps_buf:
                                     near_ci = True
                                     break
-                    elif not strict:
-                        aps_thr = (1.0 - st.alpha) - 1e-7
-                        aps_buf = (K + 1.0) * dp_b + 1e-6
+                    if (not near_ci) and (not strict) and st.c_eff_m[ci] > 0.0:
                         ps_chk = sorted(probs, reverse=True)
-                        cs_chk = 0.0
-                        for pv in ps_chk:
-                            if abs(cs_chk - aps_thr) <= aps_buf:
-                                near_ci = True
-                                break
-                            cs_chk += pv
-                            if abs(cs_chk - aps_thr) <= aps_buf:
-                                near_ci = True
-                                break
-                if (not near_ci) and (not strict) and st.c_eff_m[ci] > 0.0:
-                    ps_chk = sorted(probs, reverse=True)
-                    tp_chk = ps_chk[0]
-                    ru_chk = ps_chk[1] if K > 1 else 0.0
-                    mg_chk = (tp_chk - ru_chk) if K > 1 else 1.0
-                    eff_m_chk = st.c_eff_m[ci]
-                    gam_chk = st.c_gamma[ci]
-                    if (
-                        abs(mg_chk - eff_m_chk) <= 2.0 * dp_b + 1e-9
-                        or abs(tp_chk - st.c_conf_floor[ci]) <= dp_b + 1e-9
-                        or abs(tp_chk - gam_chk * (ru_chk if ru_chk > 1e-6 else 1e-6))
-                        <= (1.0 + gam_chk) * dp_b + 1e-9
-                        or abs(ru_chk - 1e-6) <= dp_b + 1e-9
-                    ):
-                        near_ci = True
-                if near_ci:
-                    p_ex, ok_ex = _exact_choice_probs_row(
-                        emb.reshape(1, -1),
-                        st.c_raw_w[ci],
-                        st.c_raw_b[ci],
-                        np.asarray(adj_vec, dtype=np.float64),
-                        temp,
-                    )
-                    if not ok_ex:
-                        vals[fn] = st.c_options[ci][0]
-                        confs[fn] = float("nan")
-                        ambig = True
-                        continue
-                    probs = p_ex.tolist()
+                        tp_chk = ps_chk[0]
+                        ru_chk = ps_chk[1] if K > 1 else 0.0
+                        mg_chk = (tp_chk - ru_chk) if K > 1 else 1.0
+                        eff_m_chk = st.c_eff_m[ci]
+                        gam_chk = st.c_gamma[ci]
+                        if (
+                            abs(mg_chk - eff_m_chk) <= 2.0 * dp_b + 1e-9
+                            or abs(tp_chk - st.c_conf_floor[ci]) <= dp_b + 1e-9
+                            or abs(tp_chk - gam_chk * (ru_chk if ru_chk > 1e-6 else 1e-6))
+                            <= (1.0 + gam_chk) * dp_b + 1e-9
+                            or abs(ru_chk - 1e-6) <= dp_b + 1e-9
+                        ):
+                            near_ci = True
+                    if near_ci:
+                        p_ex, ok_ex = _exact_choice_probs_row(
+                            emb.reshape(1, -1),
+                            st.c_raw_w[ci],
+                            st.c_raw_b[ci],
+                            np.asarray(adj_vec, dtype=np.float64),
+                            temp,
+                        )
+                        if not ok_ex:
+                            vals[fn] = st.c_options[ci][0]
+                            confs[fn] = float("nan")
+                            ambig = True
+                            continue
+                        probs = p_ex.tolist()
             best_i = 0
             best_p = probs[0]
             for j in range(1, K):
@@ -4777,84 +4878,105 @@ class FastDecisionCallable:
             zv = z_list[st.b_offset + bi]
             scaled_z = zv / 0.25
             temp_b = st.b_temp[bi]
-            s0 = (-0.5 * scaled_z + st.b_adj0[bi]) / temp_b
-            s1 = (0.5 * scaled_z + st.b_adj1[bi]) / temp_b
-            if (not emb_ok) or not (isfinite(zv) and isfinite(s0) and isfinite(s1)):
-                vals[fn] = False
-                confs[fn] = float("nan")
-                ambig = True
-                continue
-            mb = s0 if s0 >= s1 else s1
-            e0 = exp(s0 - mb)
-            e1 = exp(s1 - mb)
-            denom_b = e0 + e1
-            if not (isfinite(denom_b) and denom_b > 0.0):
-                vals[fn] = False
-                confs[fn] = float("nan")
-                ambig = True
-                continue
-            pf = e0 / denom_b
-            pt = e1 / denom_b
-            if not (isfinite(pt) and isfinite(pf)):
-                vals[fn] = False
-                confs[fn] = float("nan")
-                ambig = True
-                continue
-            if len(st.b_raw_w) == st.Q_b and not st.b_zero_head[bi]:
-                dz_b = (
-                    4.0
-                    * (st.dimension_f + 4.0)
-                    * _FLOAT32_EPS
-                    * (x_inf_val * st.b_w_l1[bi] + st.b_b_abs[bi])
+            if (
+                emb_ok
+                and len(st.b_raw_w) == st.Q_b
+                and bi < len(st.b_has_raw_f64)
+                and st.b_has_raw_f64[bi]
+                and not st.b_zero_head[bi]
+            ):
+                _, _, _, pt, pf, ok_ex = _exact_bool_probs_row(
+                    emb.reshape(1, -1),
+                    st.b_raw_w[bi],
+                    st.b_raw_b[bi],
+                    st.b_adj0[bi],
+                    st.b_adj1[bi],
+                    temp_b,
                 )
-                dp_b = min(1.0, 0.5 * ((dz_b / 0.25) / temp_b) + 1e-9)
-                top_chk = pt if pt >= pf else pf
-                near_bi = abs(pt - st.b_thresh[bi]) <= dp_b or abs(pt - 0.5) <= dp_b
-                if not near_bi:
-                    if st.b_cals[bi]:
-                        qh_chk = st.b_qhats[bi]
-                        if st.b_lacs[bi]:
-                            thr_lac = qh_chk + 1e-7
-                            if (
-                                abs((1.0 - pt) - thr_lac) <= dp_b
-                                or abs((1.0 - pf) - thr_lac) <= dp_b
-                            ):
-                                near_bi = True
-                        else:
-                            aps_thr = qh_chk + (1e-7 if strict else -1e-7)
+                if not ok_ex:
+                    vals[fn] = False
+                    confs[fn] = float("nan")
+                    ambig = True
+                    continue
+            else:
+                s0 = (-0.5 * scaled_z + st.b_adj0[bi]) / temp_b
+                s1 = (0.5 * scaled_z + st.b_adj1[bi]) / temp_b
+                if (not emb_ok) or not (isfinite(zv) and isfinite(s0) and isfinite(s1)):
+                    vals[fn] = False
+                    confs[fn] = float("nan")
+                    ambig = True
+                    continue
+                mb = s0 if s0 >= s1 else s1
+                e0 = exp(s0 - mb)
+                e1 = exp(s1 - mb)
+                denom_b = e0 + e1
+                if not (isfinite(denom_b) and denom_b > 0.0):
+                    vals[fn] = False
+                    confs[fn] = float("nan")
+                    ambig = True
+                    continue
+                pf = e0 / denom_b
+                pt = e1 / denom_b
+                if not (isfinite(pt) and isfinite(pf)):
+                    vals[fn] = False
+                    confs[fn] = float("nan")
+                    ambig = True
+                    continue
+                if len(st.b_raw_w) == st.Q_b and not st.b_zero_head[bi]:
+                    dz_b = (
+                        4.0
+                        * (st.dimension_f + 4.0)
+                        * _FLOAT32_EPS
+                        * (x_inf_val * st.b_w_l1[bi] + st.b_b_abs[bi])
+                    )
+                    dp_b = min(1.0, 0.5 * ((dz_b / 0.25) / temp_b) + 1e-9)
+                    top_chk = pt if pt >= pf else pf
+                    near_bi = abs(pt - st.b_thresh[bi]) <= dp_b or abs(pt - 0.5) <= dp_b
+                    if not near_bi:
+                        if st.b_cals[bi]:
+                            qh_chk = st.b_qhats[bi]
+                            if st.b_lacs[bi]:
+                                thr_lac = qh_chk + 1e-7
+                                if (
+                                    abs((1.0 - pt) - thr_lac) <= dp_b
+                                    or abs((1.0 - pf) - thr_lac) <= dp_b
+                                ):
+                                    near_bi = True
+                            else:
+                                aps_thr = qh_chk + (1e-7 if strict else -1e-7)
+                                if abs(top_chk - aps_thr) <= dp_b:
+                                    near_bi = True
+                        elif not strict:
+                            aps_thr = (1.0 - st.alpha) - 1e-7
                             if abs(top_chk - aps_thr) <= dp_b:
                                 near_bi = True
-                    elif not strict:
-                        aps_thr = (1.0 - st.alpha) - 1e-7
-                        if abs(top_chk - aps_thr) <= dp_b:
+                    if (not near_bi) and (not strict) and st.b_eff_m[bi] > 0.0:
+                        bot_chk = 1.0 - top_chk
+                        mg_chk = top_chk - bot_chk
+                        eff_m_chk = st.b_eff_m[bi]
+                        gam_chk = st.b_gamma[bi]
+                        if (
+                            abs(mg_chk - eff_m_chk) <= 2.0 * dp_b + 1e-9
+                            or abs(top_chk - st.b_conf_floor[bi]) <= dp_b + 1e-9
+                            or abs(top_chk - gam_chk * (bot_chk if bot_chk > 1e-6 else 1e-6))
+                            <= (1.0 + gam_chk) * dp_b + 1e-9
+                            or abs(bot_chk - 1e-6) <= dp_b + 1e-9
+                        ):
                             near_bi = True
-                if (not near_bi) and (not strict) and st.b_eff_m[bi] > 0.0:
-                    bot_chk = 1.0 - top_chk
-                    mg_chk = top_chk - bot_chk
-                    eff_m_chk = st.b_eff_m[bi]
-                    gam_chk = st.b_gamma[bi]
-                    if (
-                        abs(mg_chk - eff_m_chk) <= 2.0 * dp_b + 1e-9
-                        or abs(top_chk - st.b_conf_floor[bi]) <= dp_b + 1e-9
-                        or abs(top_chk - gam_chk * (bot_chk if bot_chk > 1e-6 else 1e-6))
-                        <= (1.0 + gam_chk) * dp_b + 1e-9
-                        or abs(bot_chk - 1e-6) <= dp_b + 1e-9
-                    ):
-                        near_bi = True
-                if near_bi:
-                    _, _, _, pt, pf, ok_ex = _exact_bool_probs_row(
-                        emb.reshape(1, -1),
-                        st.b_raw_w[bi],
-                        st.b_raw_b[bi],
-                        st.b_adj0[bi],
-                        st.b_adj1[bi],
-                        temp_b,
-                    )
-                    if not ok_ex:
-                        vals[fn] = False
-                        confs[fn] = float("nan")
-                        ambig = True
-                        continue
+                    if near_bi:
+                        _, _, _, pt, pf, ok_ex = _exact_bool_probs_row(
+                            emb.reshape(1, -1),
+                            st.b_raw_w[bi],
+                            st.b_raw_b[bi],
+                            st.b_adj0[bi],
+                            st.b_adj1[bi],
+                            temp_b,
+                        )
+                        if not ok_ex:
+                            vals[fn] = False
+                            confs[fn] = float("nan")
+                            ambig = True
+                            continue
             bv = pt >= st.b_thresh[bi]
             vals[fn] = bv
             confs[fn] = pt if bv else pf
@@ -4902,18 +5024,22 @@ class FastDecisionCallable:
 
         for si in range(st.Q_s):
             fn = st.s_names[si]
-            zv = float(z_list[st.s_offset + si])
-            if (
-                si < len(st.s_has_raw_f64)
-                and st.s_has_raw_f64[si]
-                and (np.any(st.s_raw_w[si] != 0.0) or np.any(st.s_raw_b[si] != 0.0))
-            ):
-                w64 = np.asarray(st.s_raw_w[si], dtype=np.float64)[0]
-                b64 = float(np.asarray(st.s_raw_b[si], dtype=np.float64).reshape(-1)[0])
-                zv = float(np.asarray(emb, dtype=np.float64) @ w64 + b64)
+            if not emb_ok:
+                vals[fn] = st.s_default[si]
+                confs[fn] = float("nan")
+                ambig = True
+                continue
+            if si < len(st.s_raw_w) and si < len(st.s_raw_b):
+                if si < len(st.s_zero_head) and st.s_zero_head[si]:
+                    zv = 0.0
+                else:
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        zv = float((emb.reshape(1, -1) @ st.s_raw_w[si].T + st.s_raw_b[si])[0, 0])
+            else:
+                zv = float(z_list[st.s_offset + si])
             scaled_zs = zv / 0.25
             z_cal = scaled_zs / float(st.s_raw_scale[si])
-            if (not emb_ok) or not (isfinite(zv) and isfinite(scaled_zs) and isfinite(z_cal)):
+            if not (isfinite(zv) and isfinite(scaled_zs) and isfinite(z_cal)):
                 vals[fn] = st.s_default[si]
                 confs[fn] = float("nan")
                 ambig = True
@@ -4950,6 +5076,7 @@ class FastDecisionCallable:
 __all__ = [
     "DeterministicSemanticProjector",
     "_fast_deterministic_project",
+    "_resolve_authoritative_head",
     "DecisionFieldHead",
     "RawFieldEvaluation",
     "ModelInferenceResult",

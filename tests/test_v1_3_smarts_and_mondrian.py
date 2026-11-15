@@ -329,8 +329,13 @@ def test_smarts_cross_zero_few_router_and_cache_controls() -> None:
 
 
 def test_core_isolation_after_wave1_imports() -> None:
-    code = """
+    src_root = str(Path(__file__).resolve().parent.parent / "src")
+    code = f"""
 import sys
+sys.path.insert(0, {src_root!r})
+sys.modules['mlx'] = None
+sys.modules['mlx.core'] = None
+sys.modules['mlx.nn'] = None
 import system1.core as core
 p = core.PragmaticCompositeProjector.fit(
     ["http 503 gateway timeout error", "healthy 200 ok response"],
@@ -341,11 +346,11 @@ p = core.PragmaticCompositeProjector.fit(
 )
 _ = p.project("not ok http 503")
 class S(core.DecisionSchema):
-    choice = core.ChoiceField(options=("err", "ok"), descriptions={"err": "http 503 error", "ok": "200 ok healthy"})
+    choice = core.ChoiceField(options=("err", "ok"), descriptions={{"err": "http 503 error", "ok": "200 ok healthy"}})
 r = core.SmartsCrossZeroFewRouter(S).fit_few_shot(["http 503 fail", "http 200 ok"], ["err", "ok"])
 _ = r.decide("http 503 fail")
 forbidden = [m for m in ("scipy", "cryptography", "sqlite3", "system1.engine") if m in sys.modules]
-assert not forbidden, f"Forbidden modules loaded in system1.core: {forbidden}"
+assert not forbidden, f"Forbidden modules loaded in system1.core: {{forbidden}}"
 """
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stderr + proc.stdout

@@ -1760,7 +1760,8 @@ class FastExplainer:
         logits, c1, c2 = self._eval_reference_logits_and_top2_from_emb(x_f32)
         _require_finite_array(logits, "logits")
         margin = _require_finite_scalar(float(logits[c1]) - float(logits[c2]), "margin")
-        sims_all = (self.X_train_full @ x_full.astype(np.float32)).astype(np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            sims_all = (self.X_train_full @ x_full.astype(np.float32)).astype(np.float64)
 
         if n_spans == 0:
             return logits, c1, c2, margin, [], [], _require_finite_scalar(logits[c1], "baseline target logit"), margin, sims_all
@@ -1827,6 +1828,8 @@ class FastExplainer:
                 zero_unit0=self.zero_emb_unit0,
                 dimension=self.dimension,
             )
+            if not bool(np.all(np.isfinite(emb_ov))):
+                raise ValueError("Reference explanation logits are non-finite (non-finite embedding)")
             if (not bool(np.any(emb_ov))) or self._is_zero_head:
                 override_hit = True
                 with np.errstate(over="ignore", invalid="ignore"):
@@ -1863,7 +1866,8 @@ class FastExplainer:
                 m_attrs = [0.0] * n_spans
                 b_target = float(logits[c1])
                 b_margin = margin
-                sims_all = (self.X_train_full @ emb_ov.astype(np.float32)).astype(np.float64)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    sims_all = (self.X_train_full @ emb_ov.astype(np.float32)).astype(np.float64)
 
         has_active_spans = False
         if override_hit:
@@ -1895,11 +1899,12 @@ class FastExplainer:
             else:
                 b_target = float(logits[c1])
                 b_margin = margin
-            sims_all = (
-                (v_sp.astype(np.float32) @ self.X_train_sp_T[act_idx]).astype(np.float64)
-                if sp_ok
-                else np.zeros(len(self.train_texts), dtype=np.float64)
-            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                sims_all = (
+                    (v_sp.astype(np.float32) @ self.X_train_sp_T[act_idx]).astype(np.float64)
+                    if sp_ok
+                    else np.zeros(len(self.train_texts), dtype=np.float64)
+                )
         else:
             act_idx, act_raw, norm_sp, sp_trace = self._extract_tfidf_fast(text, spans, need_trace=True)
             u_dn, norm_dn, u_sc, norm_sc, hd_trace = self._extract_hybrid_dense_and_spec_fast(
@@ -2114,10 +2119,11 @@ class FastExplainer:
                 if self.has_rbf:
                     rest_pieces.append((u_rbf * self.wr).astype(np.float32))
                 v_rest = np.concatenate(rest_pieces) if len(rest_pieces) > 1 else rest_pieces[0]
-                sims_all = (self.X_train_rest @ v_rest).astype(np.float64)
-                if sp_ok:
-                    sp_scaled = (v_sp * (self.wb * g_sp)).astype(np.float32)
-                    sims_all += (sp_scaled @ self.X_train_sp_T[act_idx]).astype(np.float64)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    sims_all = (self.X_train_rest @ v_rest).astype(np.float64)
+                    if sp_ok:
+                        sp_scaled = (v_sp * (self.wb * g_sp)).astype(np.float32)
+                        sims_all += (sp_scaled @ self.X_train_sp_T[act_idx]).astype(np.float64)
 
         if not (all(math.isfinite(float(v)) for v in t_attrs) and all(math.isfinite(float(v)) for v in m_attrs)):
             raise ValueError("Non-finite span attribution in FastExplainer")
@@ -2153,6 +2159,7 @@ class FastExplainer:
         sum_m = _require_finite_scalar(sum(m_attrs) + b_margin, "margin attribution sum")
         err_t = _require_finite_scalar(abs(sum_t - float(logits[c1])), "target additivity error")
         err_m = _require_finite_scalar(abs(sum_m - margin), "margin additivity error")
+        _require_finite_array(sims_all, "exemplar similarities")
 
         same_mask = self._class_masks[c1]
         if self._has_same[c1]:
@@ -2251,11 +2258,15 @@ class FastExplainer:
             nearest_exemplar_idx=near_idx,
             nearest_exemplar_label=self.train_labels[near_idx],
             nearest_exemplar_text=self.train_texts[near_idx],
-            nearest_exemplar_similarity=float(sims_all[near_idx]),
+            nearest_exemplar_similarity=_require_finite_scalar(
+                float(sims_all[near_idx]), "nearest exemplar similarity"
+            ),
             contrast_exemplar_idx=ctr_idx,
             contrast_exemplar_label=self.train_labels[ctr_idx],
             contrast_exemplar_text=self.train_texts[ctr_idx],
-            contrast_exemplar_similarity=float(sims_all[ctr_idx]),
+            contrast_exemplar_similarity=_require_finite_scalar(
+                float(sims_all[ctr_idx]), "contrast exemplar similarity"
+            ),
             counterfactual_found=cf_found,
             counterfactual_k=cf_k,
             counterfactual_tokens=cf_tokens,

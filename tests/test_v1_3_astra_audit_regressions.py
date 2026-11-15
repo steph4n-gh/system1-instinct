@@ -683,6 +683,7 @@ def test_astra_05_packed_kernel_and_callable_parity_on_gates_ood_and_overrides()
         augment=False,
     )
     m_tf_f.heads["cat"].biases = np.array([3.0, -3.0], dtype=np.float32)
+    m_tf_f._field_heads["cat"].biases = np.array([3.0, -3.0], dtype=np.float32)
     eng_f = SystemOneEngine(_ChoiceOnly, compiled_model=m_tf_f, strict_mode=True, use_cache=False)
     eng_f.calibrate(cal_data)
     fn_f = eng_f.compile_callable()
@@ -4344,7 +4345,7 @@ def test_astra_21_round8_regressions() -> None:
         allowed_origins=("https://app.system1.local",),
         max_body_bytes=1024,
     )
-    srv_http = UniversalDecisionsHTTPServer(svc_http, port=0)
+    srv_http = UniversalDecisionsHTTPServer(svc_http, port=0, bind_and_activate=False)
     try:
         handler_cls = srv_http._httpd.RequestHandlerClass
 
@@ -4505,7 +4506,8 @@ def test_astra_21_round8_regressions() -> None:
         lambda: omc_r8.update(np.bool_(False), 0.1),
         lambda: omc_r8.update(0, True),
         lambda: omc_r8.update(0, np.bool_(True)),
-        lambda: omc_r8.update(0, err_y=True),
+        lambda: omc_r8.update(0, score_y=0.2, err_y=True),
+        lambda: omc_r8.update(0, probs=[0.7, 0.2, 0.1], err_y=np.bool_(False)),
     ):
         with pytest.raises((TypeError, ValueError)):
             bad_upd()
@@ -4554,3 +4556,707 @@ def test_astra_21_round8_regressions() -> None:
     np.testing.assert_array_equal(fleet_r8.u_c[0], snap_fu)
     np.testing.assert_array_equal(fleet_r8.alpha_c[0], snap_fa)
     np.testing.assert_array_equal(fleet_r8.err_ewma[0], snap_fe)
+
+
+def test_astra_22_round9_regressions() -> None:
+    """Regressions for GPT-6-Astra Round-9 findings R9-1 through R9-5."""
+    from system1 import ScoreField
+    from system1.calibration import DecisionCalibrator
+    from system1.core.model import FastDecisionCallable
+
+    # R9-1: ScoreField exact float32 & float64 SIMD/accumulation parity across small_q=True/False
+    # and single/multi-row batches, including both boundary (0.5) and unsaturated cancellation targets.
+    class _R9MixedSmallSchema(DecisionSchema):
+        s = ScoreField(min_value=0.0, max_value=1.0)
+        c = ChoiceField(("a", "b", "c"))
+        flag = BooleanField(threshold=0.5)
+
+    class _R9MixedWideSchema(DecisionSchema):
+        c1 = ChoiceField(("a", "b", "c"))
+        c2 = ChoiceField(("a", "b", "c"))
+        c3 = ChoiceField(("a", "b", "c"))
+        c4 = ChoiceField(("a", "b", "c"))
+        c5 = ChoiceField(("a", "b", "c"))
+        c6 = ChoiceField(("a", "b", "c"))
+        flag = BooleanField(threshold=0.5)
+        s = ScoreField(min_value=0.0, max_value=1.0)
+        s2 = ScoreField(min_value=-2.0, max_value=6.0)
+
+    r91_prompt = "boundary probe"
+    r91_alt_prompt = "secondary unsaturated probe"
+    r91_batch = [r91_prompt, r91_alt_prompt] * 9  # 18 rows -> exercises multi-row GEMM accumulation
+
+    r91_cases = (
+        (_R9MixedSmallSchema, True, np.float32, 1e7, 1e4, 16),
+        (_R9MixedSmallSchema, True, np.float32, 1e7, 1e4, 32),
+        (_R9MixedSmallSchema, True, np.float64, 1e16, 1e12, 16),
+        (_R9MixedSmallSchema, True, np.float64, 1e16, 1e12, 256),
+        (_R9MixedWideSchema, False, np.float32, 1e7, 1e4, 16),
+        (_R9MixedWideSchema, False, np.float64, 1e16, 1e12, 256),
+    )
+
+    for schema_cls, exp_small_q, dt, mag_zero, mag_unsat, dim in r91_cases:
+        if schema_cls is _R9MixedSmallSchema:
+            train_r91 = {
+                "s": [(r91_prompt, 0.2), (r91_alt_prompt, 0.8)] * 3,
+                "c": [(r91_prompt, "a"), (r91_alt_prompt, "b"), ("gamma z", "c")] * 3,
+                "flag": [(r91_prompt, True), (r91_alt_prompt, False)] * 3,
+            }
+        else:
+            train_r91 = {
+                "c1": [(r91_prompt, "a"), (r91_alt_prompt, "b"), ("gamma z", "c")] * 3,
+                "c2": [(r91_prompt, "b"), (r91_alt_prompt, "c"), ("gamma z", "a")] * 3,
+                "c3": [(r91_prompt, "c"), (r91_alt_prompt, "a"), ("gamma z", "b")] * 3,
+                "c4": [(r91_prompt, "a"), (r91_alt_prompt, "b"), ("gamma z", "c")] * 3,
+                "c5": [(r91_prompt, "b"), (r91_alt_prompt, "c"), ("gamma z", "a")] * 3,
+                "c6": [(r91_prompt, "c"), (r91_alt_prompt, "a"), ("gamma z", "b")] * 3,
+                "flag": [(r91_prompt, True), (r91_alt_prompt, False)] * 3,
+                "s": [(r91_prompt, 0.2), (r91_alt_prompt, 0.8)] * 3,
+                "s2": [(r91_prompt, 0.0), (r91_alt_prompt, 4.0)] * 3,
+            }
+        mdl_r91 = SystemOneCompiler(schema_cls, dimension=dim).compile(
+            train_r91,
+            calibration_split=0.0,
+            augment=False,
+        )
+        rng_r91 = np.random.default_rng(dim + (0 if dt == np.float32 else 1000))
+        x_probe = mdl_r91.encode(r91_prompt)
+        x_alt = mdl_r91.encode(r91_alt_prompt)
+        x_probe_mat = x_probe.reshape(1, -1)
+
+        # Boundary score head "s": exact zero cancellation logit -> 0.5
+        w_s = (rng_r91.normal(size=(1, dim)).astype(dt) * mag_zero).astype(dt)
+        b_s = -(x_probe_mat @ w_s.T).ravel().astype(dt)
+        for h_dict in (mdl_r91.heads, mdl_r91._field_heads):
+            h_dict["s"].weights = w_s.copy()
+            h_dict["s"].biases = b_s.copy()
+
+        # Unsaturated score target: on small schema override a copy after checking boundary 0.5,
+        # and on wide schema set s2 concurrently to an unsaturated cancellation point.
+        if schema_cls is _R9MixedWideSchema:
+            w_s2 = (rng_r91.normal(size=(1, dim)).astype(dt) * mag_unsat).astype(dt)
+            b_s2 = (-(x_probe_mat @ w_s2.T).ravel().astype(np.float64) + 0.25).astype(dt)
+            for h_dict in (mdl_r91.heads, mdl_r91._field_heads):
+                h_dict["s2"].weights = w_s2.copy()
+                h_dict["s2"].biases = b_s2.copy()
+
+        eng_r91 = SystemOneEngine(
+            schema_cls, compiled_model=mdl_r91, use_cache=False, strict_mode=False
+        )
+        # Exercise engine.decide_batch fallback before compiling packed kernel, then packed & callable.
+        db_1_pre = eng_r91.decide_batch([r91_prompt], record_receipt=False)
+        db_n_pre = eng_r91.decide_batch(r91_batch, record_receipt=False)
+
+        kern_r91 = eng_r91.compile_packed_kernel()
+        fn_r91 = eng_r91.compile_callable()
+        assert bool(fn_r91._state.small_q) is exp_small_q
+
+        dec_scalar = eng_r91.decide(r91_prompt, record_receipt=False)
+        dec_alt_scalar = eng_r91.decide(r91_alt_prompt, record_receipt=False)
+        db_1_post = eng_r91.decide_batch([r91_prompt], record_receipt=False)
+        db_n_post = eng_r91.decide_batch(r91_batch, record_receipt=False)
+        dk_prompt = kern_r91.decide_prompt(r91_prompt)
+        dk_1 = kern_r91.decide_batch([r91_prompt])
+        dk_n = kern_r91.decide_batch(r91_batch)
+        fe_1d = kern_r91.forward_embeddings(x_probe)
+        fe_2d = kern_r91.forward_embeddings(np.stack([x_probe, x_alt], axis=0))
+        fn_prompt = fn_r91(r91_prompt)
+        fn_emb = fn_r91(embedding=x_probe)
+
+        score_names = ("s", "s2") if schema_cls is _R9MixedWideSchema else ("s",)
+        assert math.isclose(dec_scalar.values["s"], 0.5, rel_tol=0.0, abs_tol=1e-6)
+        if schema_cls is _R9MixedWideSchema:
+            expected_s2 = -2.0 + 8.0 * (1.0 / (1.0 + math.exp(-1.0)))
+            assert math.isclose(dec_scalar.values["s2"], expected_s2, rel_tol=0.0, abs_tol=1e-2)
+            assert 0.5 < abs(dec_scalar.values["s2"] - 2.0) < 3.5
+
+        for si, sname in enumerate(score_names):
+            ref_v = dec_scalar.values[sname]
+            ref_c = dec_scalar.confidences[sname]
+            assert db_1_pre[0].values[sname] == ref_v
+            assert db_1_pre[0].confidences[sname] == ref_c
+            assert db_n_pre[0].values[sname] == ref_v
+            assert db_n_pre[0].confidences[sname] == ref_c
+            assert db_1_post[0].values[sname] == ref_v
+            assert db_1_post[0].confidences[sname] == ref_c
+            assert db_n_post[0].values[sname] == ref_v
+            assert db_n_post[0].confidences[sname] == ref_c
+            assert db_n_post[1].values[sname] == dec_alt_scalar.values[sname]
+            assert float(dk_prompt["s_val"][0, si]) == ref_v
+            assert float(dk_prompt["s_conf"][0, si]) == ref_c
+            assert float(dk_1["s_val"][0, si]) == ref_v
+            assert float(dk_1["s_conf"][0, si]) == ref_c
+            for r_row in range(0, len(r91_batch), 2):
+                assert float(dk_n["s_val"][r_row, si]) == ref_v
+                assert float(dk_n["s_conf"][r_row, si]) == ref_c
+                assert float(dk_n["s_val"][r_row + 1, si]) == dec_alt_scalar.values[sname]
+            assert float(fe_1d["s_val"][0, si]) == ref_v
+            assert float(fe_1d["s_conf"][0, si]) == ref_c
+            assert float(fe_2d["s_val"][0, si]) == ref_v
+            assert float(fe_2d["s_conf"][0, si]) == ref_c
+            assert float(fe_2d["s_val"][1, si]) == dec_alt_scalar.values[sname]
+            assert fn_prompt.values[sname] == ref_v
+            assert fn_prompt.confidences[sname] == ref_c
+            assert fn_emb.values[sname] == ref_v
+            assert fn_emb.confidences[sname] == ref_c
+
+        if schema_cls is _R9MixedSmallSchema:
+            # Also verify unsaturated cancellation logit on small_q=True path
+            w_u = (rng_r91.normal(size=(1, dim)).astype(dt) * mag_unsat).astype(dt)
+            b_u = (-(x_probe_mat @ w_u.T).ravel().astype(np.float64) + 0.25).astype(dt)
+            for h_dict in (mdl_r91.heads, mdl_r91._field_heads):
+                h_dict["s"].weights = w_u.copy()
+                h_dict["s"].biases = b_u.copy()
+            ref_u = eng_r91.decide(r91_prompt, record_receipt=False)
+            assert 0.65 < ref_u.values["s"] < 0.85
+            kern_u = eng_r91.compile_packed_kernel()
+            assert eng_r91.decide_batch([r91_prompt], record_receipt=False)[0].values["s"] == ref_u.values["s"]
+            assert eng_r91.decide_batch(r91_batch, record_receipt=False)[0].values["s"] == ref_u.values["s"]
+            assert float(kern_u.decide_prompt(r91_prompt)["s_val"][0, 0]) == ref_u.values["s"]
+            assert float(kern_u.decide_batch([r91_prompt])["s_val"][0, 0]) == ref_u.values["s"]
+            assert float(kern_u.decide_batch(r91_batch)["s_val"][0, 0]) == ref_u.values["s"]
+            assert fn_r91(r91_prompt).values["s"] == ref_u.values["s"]
+            assert fn_r91(embedding=x_probe).values["s"] == ref_u.values["s"]
+
+    # R9-2: Authoritative _field_heads precedence over stale heads for Choice, Boolean, and Score,
+    # including float64 cancellation, Boolean threshold boundary, float32-only _field_heads updates,
+    # tiny 1e-306/3e-308 float64 weights underflowing float32, and unsupported-structure gating.
+    class _PairOneProj16:
+        dimension = 16
+
+        def project(self, text: str) -> np.ndarray:
+            v = np.zeros(16, dtype=np.float32)
+            v[0] = 1.0
+            if "neg" in text:
+                v[1] = -1.0
+            else:
+                v[1] = 1.0
+            return v
+
+        def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+            return np.stack([self.project(t) for t in texts], axis=0)
+
+    class _R9PairSmallSchema(DecisionSchema):
+        c = ChoiceField(("a", "b"))
+        b = BooleanField(threshold=0.6)
+        s = ScoreField(min_value=0.0, max_value=1.0)
+
+    class _R9PairVecSchema(DecisionSchema):
+        c = ChoiceField(("a", "b"))
+        b = BooleanField(threshold=0.6)
+
+    class _R9PairWideSchema(DecisionSchema):
+        c = ChoiceField(("a", "b"))
+        c2 = ChoiceField(("x", "y", "z"))
+        c3 = ChoiceField(("x", "y", "z"))
+        c4 = ChoiceField(("x", "y", "z"))
+        c5 = ChoiceField(("x", "y", "z"))
+        c6 = ChoiceField(("x", "y", "z"))
+        c7 = ChoiceField(("x", "y", "z"))
+        c8 = ChoiceField(("x", "y", "z"))
+        b = BooleanField(threshold=0.6)
+
+    proj16 = _PairOneProj16()
+    p_pos = "pos probe"
+    p_neg = "neg probe"
+
+    for vec_schema, is_wide in (
+        (_R9PairSmallSchema, False),
+        (_R9PairVecSchema, False),
+        (_R9PairWideSchema, True),
+    ):
+        train_r92: Dict[str, Any] = {
+            "c": [(p_pos, "a"), (p_neg, "b")] * 3,
+            "b": [(p_pos, True), (p_neg, False)] * 3,
+        }
+        if vec_schema is _R9PairSmallSchema:
+            train_r92["s"] = [(p_pos, 0.2), (p_neg, 0.8)] * 3
+        if is_wide:
+            train_r92["c2"] = [(p_pos, "x"), (p_neg, "y"), ("neg c3", "z")] * 2
+            train_r92["c3"] = [(p_pos, "y"), (p_neg, "z"), ("neg c4", "x")] * 2
+            train_r92["c4"] = [(p_pos, "z"), (p_neg, "x"), ("neg c2", "y")] * 2
+            train_r92["c5"] = [(p_pos, "x"), (p_neg, "y"), ("neg c3", "z")] * 2
+            train_r92["c6"] = [(p_pos, "y"), (p_neg, "z"), ("neg c4", "x")] * 2
+            train_r92["c7"] = [(p_pos, "z"), (p_neg, "x"), ("neg c2", "y")] * 2
+            train_r92["c8"] = [(p_pos, "x"), (p_neg, "z"), ("neg c2", "y")] * 2
+
+        mdl_r92 = SystemOneCompiler(vec_schema, dimension=16, projector=proj16).compile(
+            train_r92,
+            calibration_split=0.0,
+            augment=False,
+        )
+        # Keep model.heads stale as float32 zeros while updating ONLY _field_heads.
+        mdl_r92.heads["c"].weights = np.zeros((2, 16), dtype=np.float32)
+        mdl_r92.heads["c"].biases = np.zeros(2, dtype=np.float32)
+        mdl_r92.heads["b"].weights = np.zeros((1, 16), dtype=np.float32)
+        mdl_r92.heads["b"].biases = np.zeros(1, dtype=np.float32)
+
+        w_c_f64 = np.zeros((2, 16), dtype=np.float64)
+        w_c_f64[1, 0] = 100000001.0
+        w_c_f64[1, 1] = -100000000.0
+        mdl_r92._field_heads["c"].weights = w_c_f64
+        mdl_r92._field_heads["c"].biases = np.zeros(2, dtype=np.float64)
+
+        w_b_f64 = np.zeros((1, 16), dtype=np.float64)
+        w_b_f64[0, 0] = 100000001.0
+        w_b_f64[0, 1] = -100000000.0
+        mdl_r92._field_heads["b"].weights = w_b_f64
+        mdl_r92._field_heads["b"].biases = np.zeros(1, dtype=np.float64)
+
+        if vec_schema is _R9PairSmallSchema:
+            mdl_r92.heads["s"].weights = np.zeros((1, 16), dtype=np.float32)
+            mdl_r92.heads["s"].biases = np.array([-0.5], dtype=np.float32)
+            w_s_f32 = np.zeros((1, 16), dtype=np.float32)
+            w_s_f32[0, 0] = 0.25
+            mdl_r92._field_heads["s"].weights = w_s_f32
+            mdl_r92._field_heads["s"].biases = np.zeros(1, dtype=np.float32)
+
+        eng_r92 = SystemOneEngine(
+            vec_schema, compiled_model=mdl_r92, strict_mode=False, use_cache=False
+        )
+        fn_r92 = eng_r92.compile_callable()
+        assert bool(fn_r92._state.small_q) is (not is_wide)
+        kern_r92 = eng_r92.compile_packed_kernel()
+
+        d_sc = eng_r92.decide(p_pos, record_receipt=False)
+        d_b1 = eng_r92.decide_batch([p_pos], record_receipt=False)
+        d_bn = eng_r92.decide_batch([p_pos, p_neg, p_pos], record_receipt=False)
+        dk_p = kern_r92.decide_prompt(p_pos)
+        dk_b = kern_r92.decide_batch([p_pos, p_neg])
+        df_p = fn_r92(p_pos)
+        exp_c = FastExplainer.from_engine(eng_r92, "c").explain(p_pos)
+        exp_b = FastExplainer.from_engine(eng_r92, "b").explain(p_pos)
+
+        assert d_sc.values["c"] == "b"
+        assert d_sc.values["b"] is True
+        assert d_b1[0].values == d_sc.values
+        assert d_bn[0].values == d_sc.values
+        assert d_bn[2].values == d_sc.values
+        assert ("a", "b")[int(dk_p["best_idx"][0, 0])] == "b"
+        assert ("a", "b")[int(dk_b["best_idx"][0, 0])] == "b"
+        assert bool(dk_p["b_val"][0, 0]) is True
+        assert bool(dk_b["b_val"][0, 0]) is True
+        assert df_p.values == d_sc.values
+        assert exp_c.predicted_label == "b"
+        assert exp_b.predicted_label == "True"
+        for fk in eng_r92.schema.fields:
+            assert math.isclose(df_p.confidences[fk], d_sc.confidences[fk], rel_tol=0.0, abs_tol=1e-12)
+            assert math.isclose(d_b1[0].confidences[fk], d_sc.confidences[fk], rel_tol=0.0, abs_tol=1e-12)
+            assert math.isclose(d_bn[0].confidences[fk], d_sc.confidences[fk], rel_tol=0.0, abs_tol=1e-12)
+
+        # Boolean(threshold=0.6) exact boundary z = 0.25 * log(0.6 / 0.4) +/- 1e-12 on _field_heads only
+        x_pos_bnd = mdl_r92.encode(p_pos).reshape(1, -1)
+        z_thr60 = 0.25 * math.log(0.6 / 0.4)
+        for sign_delta, exp_bool in ((1e-12, True), (-1e-12, False)):
+            w_b_bnd = np.zeros((1, 16), dtype=np.float64)
+            w_b_bnd[0, 0] = 1.0
+            dot_bnd = float((x_pos_bnd @ w_b_bnd.T)[0, 0])
+            mdl_r92._field_heads["b"].weights = w_b_bnd
+            mdl_r92._field_heads["b"].biases = np.array([z_thr60 - dot_bnd + sign_delta], dtype=np.float64)
+            d_bnd = eng_r92.decide(p_pos, record_receipt=False)
+            assert d_bnd.values["b"] is exp_bool
+            assert eng_r92.decide_batch([p_pos], record_receipt=False)[0].values["b"] is exp_bool
+            assert eng_r92.decide_batch([p_pos, p_neg], record_receipt=False)[0].values["b"] is exp_bool
+            assert bool(eng_r92.compile_packed_kernel().decide_prompt(p_pos)["b_val"][0, 0]) is exp_bool
+            assert fn_r92(p_pos).values["b"] is exp_bool
+            assert FastExplainer.from_engine(eng_r92, "b").explain(p_pos).predicted_label == str(exp_bool)
+
+        # Float32-only _field_heads live update + FastDecisionCallable live rebinding
+        w_c_f32 = np.zeros((2, 16), dtype=np.float32)
+        w_c_f32[0, 0] = 1.5
+        mdl_r92._field_heads["c"].weights = w_c_f32
+        mdl_r92._field_heads["c"].biases = np.zeros(2, dtype=np.float32)
+        w_b_f32 = np.zeros((1, 16), dtype=np.float32)
+        w_b_f32[0, 0] = -2.0
+        mdl_r92._field_heads["b"].weights = w_b_f32
+        mdl_r92._field_heads["b"].biases = np.zeros(1, dtype=np.float32)
+        d_f32_upd = eng_r92.decide(p_pos, record_receipt=False)
+        assert d_f32_upd.values["c"] == "a"
+        assert d_f32_upd.values["b"] is False
+        assert fn_r92(p_pos).values == d_f32_upd.values
+        assert eng_r92.decide_batch([p_pos, p_neg], record_receipt=False)[0].values == d_f32_upd.values
+        assert FastExplainer.from_engine(eng_r92, "c").explain(p_pos).predicted_label == "a"
+
+    # Tiny float64 weights (5e-308) with temperature=1e-307 on _field_heads only (float32 underflows to 0.0)
+    mdl_tiny = SystemOneCompiler(_R9PairVecSchema, dimension=16, projector=proj16).compile(
+        {"c": [(p_pos, "a"), (p_neg, "b")] * 3, "b": [(p_pos, True), (p_neg, False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    mdl_tiny.heads["c"].weights = np.zeros((2, 16), dtype=np.float32)
+    mdl_tiny.heads["c"].biases = np.zeros(2, dtype=np.float32)
+    mdl_tiny.heads["b"].weights = np.zeros((1, 16), dtype=np.float32)
+    mdl_tiny.heads["b"].biases = np.zeros(1, dtype=np.float32)
+    w_tc = np.zeros((2, 16), dtype=np.float64)
+    w_tc[1, 0] = 5e-308
+    mdl_tiny._field_heads["c"].weights = w_tc
+    mdl_tiny._field_heads["c"].biases = np.zeros(2, dtype=np.float64)
+    w_tb = np.zeros((1, 16), dtype=np.float64)
+    w_tb[0, 0] = 5e-308
+    mdl_tiny._field_heads["b"].weights = w_tb
+    mdl_tiny._field_heads["b"].biases = np.zeros(1, dtype=np.float64)
+    eng_tiny = SystemOneEngine(
+        _R9PairVecSchema, compiled_model=mdl_tiny, strict_mode=False, use_cache=False
+    )
+    for fk in ("c", "b"):
+        eng_tiny.calibrators[fk] = DecisionCalibrator()
+        eng_tiny.calibrators[fk].temperature = 1e-307
+    d_tiny = eng_tiny.decide(p_pos, record_receipt=False)
+    assert d_tiny.values["c"] == "b"
+    assert d_tiny.values["b"] is True
+    assert d_tiny.confidences["c"] > 0.8 and d_tiny.confidences["b"] > 0.8
+    assert eng_tiny.decide_batch([p_pos, p_neg], record_receipt=False)[0].values == d_tiny.values
+    assert math.isclose(
+        eng_tiny.decide_batch([p_pos], record_receipt=False)[0].confidences["c"],
+        d_tiny.confidences["c"],
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
+    kern_tiny = eng_tiny.compile_packed_kernel()
+    fn_tiny = eng_tiny.compile_callable()
+    assert ("a", "b")[int(kern_tiny.decide_prompt(p_pos)["best_idx"][0, 0])] == "b"
+    assert bool(kern_tiny.decide_prompt(p_pos)["b_val"][0, 0]) is True
+    assert fn_tiny(p_pos).values == d_tiny.values
+    assert FastExplainer.from_engine(eng_tiny, "c").explain(p_pos).predicted_label == "b"
+    assert FastExplainer.from_engine(eng_tiny, "b").explain(p_pos).predicted_label == "True"
+
+    # Unsupported structure added ONLY to _field_heads must gate packed/callable/explainer & keep batch parity
+    mdl_gate = SystemOneCompiler(_R9PairVecSchema, dimension=16, projector=proj16).compile(
+        {"c": [(p_pos, "a"), (p_neg, "b")] * 3, "b": [(p_pos, True), (p_neg, False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    mdl_gate._field_heads["c"].hierarchical = True
+    mdl_gate._field_heads["c"].coarse_weights = np.full((1, 16), 2.0, dtype=np.float32)
+    mdl_gate._field_heads["c"].coarse_biases = np.zeros(1, dtype=np.float32)
+    mdl_gate._field_heads["c"].cluster_assignments = (0, 0)
+    eng_gate = SystemOneEngine(
+        _R9PairVecSchema, compiled_model=mdl_gate, strict_mode=False, use_cache=False
+    )
+    with pytest.raises(ValueError, match="hierarchical"):
+        eng_gate.compile_packed_kernel()
+    with pytest.raises(ValueError, match="hierarchical"):
+        FastDecisionCallable(eng_gate)
+    with pytest.raises(ValueError, match="hierarchical"):
+        FastExplainer.from_engine(eng_gate, "c")
+    assert eng_gate.decide_batch([p_pos], record_receipt=False)[0].values == eng_gate.decide(
+        p_pos, record_receipt=False
+    ).values
+
+    mdl_ex_gate = SystemOneCompiler(_R9PairVecSchema, dimension=16, projector=proj16).compile(
+        {"c": [(p_pos, "a"), (p_neg, "b")] * 3, "b": [(p_pos, True), (p_neg, False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    mdl_ex_gate._field_heads["c"]._exemplar_bank = object()
+    eng_ex_gate = SystemOneEngine(
+        _R9PairVecSchema, compiled_model=mdl_ex_gate, strict_mode=False, use_cache=False
+    )
+    with pytest.raises(ValueError, match="exemplar"):
+        eng_ex_gate.compile_packed_kernel()
+    with pytest.raises(ValueError, match="exemplar"):
+        FastDecisionCallable(eng_ex_gate)
+    with pytest.raises(ValueError, match="exemplar"):
+        FastExplainer.from_engine(eng_ex_gate, "c")
+
+    # R9-3: OnlineMondrianConformal.update strict err_y validation (must reject bool/np.bool_/non-{0,1})
+    omc_r9 = OnlineMondrianConformal(num_classes=3, alpha=0.1)
+    omc_r9.update(1, probs=[0.2, 0.7, 0.1], err_y=0)
+    snap_q = omc_r9.q_c.copy()
+    snap_u = omc_r9.u_c.copy()
+    snap_a = omc_r9.alpha_c.copy()
+    snap_e = omc_r9.err_ewma.copy()
+    snap_steps = omc_r9.steps
+
+    invalid_err_ys: Tuple[Any, ...] = (
+        True,
+        False,
+        np.bool_(True),
+        np.bool_(False),
+        2,
+        -1,
+        0.5,
+        0.0,
+        1.0,
+        np.float64(0.0),
+        float("nan"),
+        float("inf"),
+        "0",
+        "1",
+        "false",
+        "",
+        [0],
+        {},
+    )
+    for bad_err in invalid_err_ys:
+        with pytest.raises((TypeError, ValueError)):
+            omc_r9.update(0, score_y=0.2, err_y=bad_err)
+        with pytest.raises((TypeError, ValueError)):
+            omc_r9.update(0, probs=[0.7, 0.2, 0.1], err_y=bad_err)
+
+    np.testing.assert_array_equal(omc_r9.q_c, snap_q)
+    np.testing.assert_array_equal(omc_r9.u_c, snap_u)
+    np.testing.assert_array_equal(omc_r9.alpha_c, snap_a)
+    np.testing.assert_array_equal(omc_r9.err_ewma, snap_e)
+    assert omc_r9.steps == snap_steps
+
+    for idx_v, ok_err in enumerate((None, 0, 1, np.int64(0), np.int32(1))):
+        omc_r9.update(idx_v % 3, score_y=0.2, err_y=ok_err)
+    assert omc_r9.steps == snap_steps + 5
+
+    # R9-4: FastExplainer must reject non-finite embeddings even under zero-head learned overrides
+    # across both ChoiceField and BooleanField, while keeping finite zero-head overrides functional.
+    class _NanInfOverrideProj16:
+        dimension = 16
+
+        def project(self, text: str) -> np.ndarray:
+            v = np.zeros(16, dtype=np.float32)
+            if text == "bad_nan":
+                v[0] = float("nan")
+            elif text == "bad_inf":
+                v[0] = float("inf")
+            elif text == "bad_ninf":
+                v[0] = float("-inf")
+            elif "neg" in text:
+                v[1] = 1.0
+            else:
+                v[0] = 1.0
+            return v
+
+        def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+            return np.stack([self.project(t) for t in texts], axis=0)
+
+    class _R9ZeroOvSchema(DecisionSchema):
+        c = ChoiceField(("a", "b"))
+        b = BooleanField(threshold=0.5)
+
+    proj_r94 = _NanInfOverrideProj16()
+    mdl_r94 = SystemOneCompiler(_R9ZeroOvSchema, dimension=16, projector=proj_r94).compile(
+        {
+            "c": [("pos a", "a"), ("neg b", "b")] * 3,
+            "b": [("pos a", True), ("neg b", False)] * 3,
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    for fk, rows in (("c", 2), ("b", 1)):
+        z_w = np.zeros((rows, 16), dtype=np.float32)
+        z_b = np.zeros(rows, dtype=np.float32)
+        mdl_r94.heads[fk].weights = z_w.copy()
+        mdl_r94.heads[fk].biases = z_b.copy()
+        mdl_r94._field_heads[fk].weights = z_w.copy()
+        mdl_r94._field_heads[fk].biases = z_b.copy()
+    mdl_r94._learned_prompt_overrides = {
+        "bad_nan": {"c": "b", "b": True},
+        "bad_inf": {"c": "b", "b": True},
+        "bad_ninf": {"c": "b", "b": True},
+        "good_ov": {"c": "b", "b": True},
+    }
+    eng_r94 = SystemOneEngine(
+        _R9ZeroOvSchema, compiled_model=mdl_r94, strict_mode=False, use_cache=False
+    )
+    exp_r94_c = FastExplainer.from_engine(eng_r94, "c")
+    exp_r94_b = FastExplainer.from_engine(eng_r94, "b")
+
+    for bad_key in ("bad_nan", "bad_inf", "bad_ninf"):
+        d_bad = eng_r94.decide(bad_key, record_receipt=False)
+        assert d_bad.is_ambiguous is True
+        assert d_bad.abstention_reasons["c"] == "non_finite_input"
+        assert d_bad.abstention_reasons["b"] == "non_finite_input"
+        with pytest.raises(ValueError, match="non-finite"):
+            exp_r94_c.explain(bad_key)
+        with pytest.raises(ValueError, match="non-finite"):
+            exp_r94_b.explain(bad_key)
+
+    res_good_c = exp_r94_c.explain("good_ov")
+    res_good_b = exp_r94_b.explain("good_ov")
+    assert res_good_c.predicted_label == "b"
+    assert res_good_b.predicted_label == "True"
+    for res_ok in (res_good_c, res_good_b):
+        assert math.isfinite(res_ok.nearest_exemplar_similarity)
+        assert math.isfinite(res_ok.contrast_exemplar_similarity)
+        assert res_ok.additivity_error_target <= 1e-6
+
+    # R9-5: Hybrid S1M TF-IDF and dense_embed_vocab validation across v2, v3 (embed_vocab=False/True)
+    # both with projector=None and with external projector=fitted_hybrid.
+    class _R9HybridSchema(DecisionSchema):
+        topic = ChoiceField(("billing", "outage"))
+
+    hyb_texts = [
+        "invoice charge refund duplicate payment receipt",
+        "server 503 outage timeout database crash incident",
+        "subscription plan renewal card billing charge",
+        "api gateway latency spike error 502 cluster down",
+        "annual invoice credit memo payment pending",
+        "worker pod crashloop timeout kubelet unhealthy",
+    ]
+    fitted_hyb = HybridProjector(sparse_dim=32, dense_dim=32, seed=17).fit(hyb_texts)
+    mdl_hyb = SystemOneCompiler(_R9HybridSchema, dimension=fitted_hyb.dimension, projector=fitted_hyb).compile(
+        {
+            "topic": [
+                (hyb_texts[0], "billing"),
+                (hyb_texts[1], "outage"),
+                (hyb_texts[2], "billing"),
+                (hyb_texts[3], "outage"),
+                (hyb_texts[4], "billing"),
+                (hyb_texts[5], "outage"),
+            ]
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+
+    v2_bytes = mdl_hyb.to_bytes(compact=False, format_version=2)
+    v3_ext_bytes = mdl_hyb.to_bytes(compact=False, format_version=3, embed_vocab=False)
+    v3_emb_bytes = mdl_hyb.to_bytes(compact=False, format_version=3, embed_vocab=True)
+
+    # Clean baseline loads must succeed before testing mutations.
+    assert CompiledSystemOneModel.from_bytes(v2_bytes).projector is not None
+    assert CompiledSystemOneModel.from_bytes(v2_bytes, projector=fitted_hyb).projector is not None
+    assert CompiledSystemOneModel.from_bytes(v3_ext_bytes).projector is not None
+    assert CompiledSystemOneModel.from_bytes(v3_ext_bytes, projector=fitted_hyb).projector is not None
+    assert CompiledSystemOneModel.from_bytes(v3_emb_bytes).projector is not None
+    assert CompiledSystemOneModel.from_bytes(v3_emb_bytes, projector=fitted_hyb).projector is not None
+
+    def _mutate_v2_hdr(src_b: bytes, mutator: Callable[[Dict[str, Any]], None]) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(src_b), "r") as zin, zipfile.ZipFile(buf, "w") as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "metadata.json":
+                    meta = json.loads(data.decode("utf-8"))
+                    mutator(meta)
+                    data = json.dumps(meta).encode("utf-8")
+                zout.writestr(info, data)
+        return buf.getvalue()
+
+    def _mutate_v3_hdr(src_b: bytes, mutator: Callable[[Dict[str, Any]], None]) -> bytes:
+        old_hdr_len = struct.unpack_from("<Q", src_b, 8)[0]
+        meta_obj = json.loads(src_b[16 : 16 + old_hdr_len].decode("utf-8"))
+        payload = src_b[16 + old_hdr_len :]
+        mutator(meta_obj)
+        enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(enc) <= old_hdr_len:
+            new_hdr_len = old_hdr_len
+        else:
+            extra_pages = (len(enc) - old_hdr_len + 4095) // 4096
+            new_hdr_len = old_hdr_len + extra_pages * 4096
+            delta = new_hdr_len - old_hdr_len
+            for spec in meta_obj["tensors"].values():
+                spec["offset"] += delta
+            enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            assert len(enc) <= new_hdr_len
+        hdr_padded = enc + b" " * (new_hdr_len - len(enc))
+        return b"S1M\x03\x00\x00\x00\x00" + struct.pack("<Q", new_hdr_len) + hdr_padded + payload
+
+    def _assert_hyb_rejected(src_b: bytes, rewrite_fn: Callable[[bytes, Callable[[Dict[str, Any]], None]], bytes], mutator: Callable[[Dict[str, Any]], None]) -> None:
+        bad_b = rewrite_fn(src_b, mutator)
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(bad_b)
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(bad_b, projector=fitted_hyb)
+
+    shared_cfg_mutations: Tuple[Callable[[Dict[str, Any]], None], ...] = (
+        lambda m: m["projector"].__setitem__("tfidf_use_stems", 1),
+        lambda m: m["projector"].__setitem__("tfidf_use_skip_bigrams", 1),
+        lambda m: m["projector"].__setitem__("tfidf_stem_weight", True),
+        lambda m: m["projector"].__setitem__("tfidf_skip_weight", -0.5),
+        lambda m: m["projector"].__setitem__("tfidf_word_quota_frac", 0.99),
+        lambda m: m["projector"].__setitem__("tfidf_char_weight", 0.0),
+        lambda m: m["projector"].__setitem__("tfidf_char_ngrams", "bad"),
+        lambda m: m["projector"].__setitem__("tfidf_terms", 123),
+        lambda m: m["projector"].__setitem__("tfidf_terms", ["x"] * 100),
+        lambda m: m["projector"].__setitem__("direct_spectral", 1),
+        lambda m: m["projector"].__setitem__("spectral_terms", 123),
+        lambda m: m["projector"].__setitem__("rbf_landmarks", 123),
+        lambda m: (m["projector"].__setitem__("fitted", False), m["projector"].__setitem__("tfidf_use_stems", True)),
+        lambda m: (m["projector"].pop("tfidf_terms", None), m["projector"].__setitem__("tfidf_use_stems", True)),
+        lambda m: m["projector"].__setitem__(
+            "tfidf_idf",
+            [float(v) + 1.0 for v in fitted_hyb._tfidf_projector._idf],  # type: ignore[union-attr]
+        ),
+    )
+
+    for mut in shared_cfg_mutations:
+        _assert_hyb_rejected(v2_bytes, _mutate_v2_hdr, mut)
+        _assert_hyb_rejected(v3_ext_bytes, _mutate_v3_hdr, mut)
+        _assert_hyb_rejected(v3_emb_bytes, _mutate_v3_hdr, mut)
+
+    # Embedded v3-specific header tampering cases
+    emb_mutations: Tuple[Callable[[Dict[str, Any]], None], ...] = (
+        lambda m: m["projector"].__setitem__("tfidf_use_stems", True),  # mismatches dense_embed_vocab["sparse"]
+        lambda m: m["dense_embed_vocab"].__setitem__("seed", 999),
+        lambda m: m["dense_embed_vocab"].__setitem__("unexpected_extra", 1),
+        lambda m: m["dense_embed_vocab"].__setitem__("sparse", None),
+        lambda m: m["projector"].__setitem__("fitted", False),
+    )
+    for mut in emb_mutations:
+        _assert_hyb_rejected(v3_emb_bytes, _mutate_v3_hdr, mut)
+
+    # Non-embedded v3 carrying unexpected dense_embed_vocab must also reject
+    _assert_hyb_rejected(
+        v3_ext_bytes,
+        _mutate_v3_hdr,
+        lambda m: m.__setitem__("dense_embed_vocab", {"vocab_size": 10}),
+    )
+
+    # Dropping _projector_hybrid_tfidf_idf on unfitted=False vs retaining on unfitted=True,
+    # and dropping _projector_dense_table when embed_vocab=True
+    def _drop_tensor(src_b: bytes, tname: str, *, set_unfitted: bool = False) -> bytes:
+        old_hdr_len = struct.unpack_from("<Q", src_b, 8)[0]
+        meta_obj = json.loads(src_b[16 : 16 + old_hdr_len].decode("utf-8"))
+        payload = src_b[16 + old_hdr_len :]
+        meta_obj["tensors"].pop(tname, None)
+        if set_unfitted:
+            meta_obj["projector"]["fitted"] = False
+            for k in list(meta_obj["projector"]):
+                if k.startswith("tfidf_"):
+                    meta_obj["projector"].pop(k)
+        enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        hdr_padded = enc + b" " * (old_hdr_len - len(enc))
+        return b"S1M\x03\x00\x00\x00\x00" + struct.pack("<Q", old_hdr_len) + hdr_padded + payload
+
+    for bad_bin in (
+        _drop_tensor(v3_emb_bytes, "_projector_dense_table"),
+        _drop_tensor(v3_ext_bytes, "_projector_hybrid_tfidf_idf", set_unfitted=False),
+    ):
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(bad_bin)
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(bad_bin, projector=fitted_hyb)
+
+    # Also verify unfitted header with binary _projector_hybrid_tfidf_idf tensor rejected
+    def _unfit_only_cfg(m: Dict[str, Any]) -> None:
+        m["projector"] = {
+            "type": "hybrid",
+            "sparse_dim": 32,
+            "dense_dim": 32,
+            "alpha": 0.5,
+            "seed": 17,
+        }
+
+    _assert_hyb_rejected(v3_ext_bytes, _mutate_v3_hdr, _unfit_only_cfg)
+
+    # Direct HybridProjector.from_config validation parity
+    base_hyb_cfg = fitted_hyb.to_config(include_arrays=True)
+    bad_unfit_cfg = {
+        "type": "hybrid",
+        "sparse_dim": 32,
+        "dense_dim": 32,
+        "alpha": 0.5,
+        "seed": 17,
+        "tfidf_use_stems": True,
+    }
+    with pytest.raises(ValueError):
+        HybridProjector.from_config(bad_unfit_cfg)
+
+    bad_incomplete_cfg = dict(base_hyb_cfg)
+    bad_incomplete_cfg.pop("tfidf_terms", None)
+    bad_incomplete_cfg["tfidf_use_stems"] = True
+    with pytest.raises(ValueError):
+        HybridProjector.from_config(bad_incomplete_cfg)
+
+    mismatch_idf_arr = np.asarray(fitted_hyb._tfidf_projector._idf, dtype=np.float64) + 1.0  # type: ignore[union-attr]
+    with pytest.raises(ValueError):
+        HybridProjector.from_config(base_hyb_cfg, tfidf_idf_array=mismatch_idf_arr)
+

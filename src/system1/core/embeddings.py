@@ -2610,31 +2610,66 @@ class HybridProjector:
         proj._direct_spectral_dim = int(config.get("direct_spectral_dim", 0)) if proj._direct_spectral else 0
         proj._context_smooth = float(config.get("context_smooth", 1.0))
 
+        _hybrid_tfidf_key_map = (
+            ("tfidf_use_stems", "use_stems"),
+            ("tfidf_stem_weight", "stem_weight"),
+            ("tfidf_use_skip_bigrams", "use_skip_bigrams"),
+            ("tfidf_skip_weight", "skip_weight"),
+            ("tfidf_word_quota_frac", "word_quota_frac"),
+            ("tfidf_char_weight", "char_weight"),
+        )
+        _hybrid_all_tfidf_keys = {
+            "tfidf_terms",
+            "tfidf_idf",
+            "tfidf_char_ngrams",
+            *(src_k for src_k, _ in _hybrid_tfidf_key_map),
+        }
+        has_any_tfidf_cfg = bool(set(config.keys()) & _hybrid_all_tfidf_keys)
+
         if config.get("fitted"):
-            if "tfidf_terms" in config:
+            if "tfidf_terms" not in config:
+                if has_any_tfidf_cfg or tfidf_idf_array is not None:
+                    raise ValueError("Saved hybrid projector has incomplete TF-IDF configuration")
+            else:
                 from system1.core.text import DEFAULT_MAX_FEATURES, TfidfProjector
 
                 tf_terms = config["tfidf_terms"]
                 if not isinstance(tf_terms, (list, tuple)) or not 0 < len(tf_terms) <= sparse:
                     raise ValueError("Saved hybrid TF-IDF vocabulary exceeds sparse_dim")
                 tf_cfg: Dict[str, Any] = {"type": "tfidf", "terms": list(tf_terms)}
-                if "tfidf_char_ngrams" in config and config["tfidf_char_ngrams"] is not None:
+                if "tfidf_char_ngrams" in config:
                     tf_cfg["char_ngrams"] = config["tfidf_char_ngrams"]
-                for src_k, dst_k in (
-                    ("tfidf_use_stems", "use_stems"),
-                    ("tfidf_stem_weight", "stem_weight"),
-                    ("tfidf_use_skip_bigrams", "use_skip_bigrams"),
-                    ("tfidf_skip_weight", "skip_weight"),
-                    ("tfidf_word_quota_frac", "word_quota_frac"),
-                    ("tfidf_char_weight", "char_weight"),
-                ):
+                for src_k, dst_k in _hybrid_tfidf_key_map:
                     if src_k in config:
                         tf_cfg[dst_k] = config[src_k]
                 if len(tf_terms) > DEFAULT_MAX_FEATURES:
                     tf_cfg["max_features"] = len(tf_terms)
-                if tfidf_idf_array is None and "tfidf_idf" in config:
+                if "tfidf_idf" in config:
                     tf_cfg["idf"] = config["tfidf_idf"]
-                proj._tfidf_projector = TfidfProjector.from_config(tf_cfg, idf_array=tfidf_idf_array)
+                    tf_proj = TfidfProjector.from_config(tf_cfg)
+                    if tfidf_idf_array is not None:
+                        bin_idf = np.asarray(tfidf_idf_array, dtype=np.float64)
+                        if (
+                            bin_idf.ndim != 1
+                            or len(bin_idf) != len(tf_terms)
+                            or not np.all(np.isfinite(bin_idf))
+                            or not np.allclose(
+                                np.asarray(tf_proj._idf, dtype=np.float64),
+                                bin_idf,
+                                rtol=0.0,
+                                atol=1e-5,
+                            )
+                        ):
+                            raise ValueError(
+                                "Saved hybrid projector inline tfidf_idf mismatches binary IDF tensor"
+                            )
+                    proj._tfidf_projector = tf_proj
+                else:
+                    if tfidf_idf_array is None:
+                        raise ValueError("Saved hybrid projector missing TF-IDF idf weights")
+                    proj._tfidf_projector = TfidfProjector.from_config(
+                        tf_cfg, idf_array=tfidf_idf_array
+                    )
             raw_weights = config.get("spectral_weights", ())
             if not isinstance(raw_weights, (list, tuple)):
                 raise ValueError("Saved hybrid projector spectral weights must be a sequence")
@@ -2717,6 +2752,8 @@ class HybridProjector:
 
             proj._update_dimension()
             proj._fitted = True
+        elif has_any_tfidf_cfg or tfidf_idf_array is not None:
+            raise ValueError("Unfitted saved hybrid projector cannot carry TF-IDF state")
         proj._digest = None
         return proj
 

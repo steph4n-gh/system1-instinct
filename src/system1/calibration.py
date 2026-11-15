@@ -1938,8 +1938,13 @@ class OnlineMondrianConformal:
         cls_idx = int(y)
         if cls_idx < 0 or cls_idx >= self.num_classes:
             raise IndexError(f"Class index {cls_idx} out of range [0, {self.num_classes})")
-        if err_y is not None and isinstance(err_y, (float, np.floating)) and not math.isfinite(float(err_y)):
-            raise ValueError(f"err_y must be finite, got {err_y!r}")
+        err_int: Optional[int] = None
+        if err_y is not None:
+            if _is_bool_scalar(err_y) or not isinstance(err_y, (int, np.integer)):
+                raise ValueError(f"err_y must be 0 or 1 (non-boolean integer), got {err_y!r}")
+            err_int = int(err_y)
+            if err_int not in (0, 1):
+                raise ValueError(f"err_y must be 0 or 1, got {err_y!r}")
         if probs is not None:
             p_arr = self._validate_probs(probs)
             if score_y is None:
@@ -1957,7 +1962,7 @@ class OnlineMondrianConformal:
         if not math.isfinite(s_val) or s_val < -1e-9 or s_val > 1.0 + 1e-9:
             raise ValueError(f"Nonconformity score {s_val!r} must be finite in [0, 1]")
         s_val = min(1.0, max(0.0, s_val))
-        e_flag = (1 if s_val > float(self.q_c[cls_idx]) else 0) if err_y is None else (1 if err_y else 0)
+        e_flag = (1 if s_val > float(self.q_c[cls_idx]) else 0) if err_int is None else err_int
 
         s_clip = s_val if s_val < 1.0 - 1e-7 else (1.0 - 1e-7)
         u_obs = -math.log(max(1.0 - s_clip, 1e-7))

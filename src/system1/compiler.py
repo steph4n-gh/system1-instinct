@@ -43,7 +43,12 @@ from system1.core.schema import (
 from system1.calibration import ConformalPredictor, DecisionCalibrator
 from system1.core.embeddings import compute_strict_loo_weights
 from system1.core.telemetry import TelemetryProjector
-from system1.core.text import MAX_PRAG_FEATURES, PragmaticCompositeProjector, TfidfProjector
+from system1.core.text import (
+    DEFAULT_MAX_FEATURES,
+    MAX_PRAG_FEATURES,
+    PragmaticCompositeProjector,
+    TfidfProjector,
+)
 from system1.cache import SemanticSystemOneCache
 
 MAGIC_HEADER = b"S1M\x02"
@@ -2130,8 +2135,8 @@ class CompiledSystemOneModel:
         projector_config: Mapping[str, Any],
         array_map: Mapping[str, np.ndarray],
         dimension: int,
-    ) -> int:
-        """Validate HybridProjector config scalars and tensor shapes before either reconstruction branch."""
+    ) -> Tuple[int, Optional[TfidfProjector]]:
+        """Validate HybridProjector config scalars, TF-IDF header, and tensor shapes before reconstruction."""
         from system1.core.embeddings import HybridProjector
 
         if not isinstance(projector_config, Mapping):
@@ -2188,6 +2193,67 @@ class CompiledSystemOneModel:
         raw_ds_dim = projector_config.get("direct_spectral_dim", 0)
         if type(raw_ds_dim) is not int or not (0 <= raw_ds_dim <= 1024):
             raise ValueError("Saved hybrid projector direct_spectral_dim is invalid")
+
+        _HYBRID_TFIDF_KEY_MAP = (
+            ("tfidf_use_stems", "use_stems"),
+            ("tfidf_stem_weight", "stem_weight"),
+            ("tfidf_use_skip_bigrams", "use_skip_bigrams"),
+            ("tfidf_skip_weight", "skip_weight"),
+            ("tfidf_word_quota_frac", "word_quota_frac"),
+            ("tfidf_char_weight", "char_weight"),
+        )
+        _HYBRID_ALL_TFIDF_KEYS = {
+            "tfidf_terms",
+            "tfidf_idf",
+            "tfidf_char_ngrams",
+            *(src_k for src_k, _ in _HYBRID_TFIDF_KEY_MAP),
+        }
+        has_any_tfidf_cfg = bool(set(projector_config.keys()) & _HYBRID_ALL_TFIDF_KEYS)
+        has_hybrid_idf_arr = "_projector_hybrid_tfidf_idf" in array_map
+        top_tfidf: Optional[TfidfProjector] = None
+        if not fitted:
+            if has_any_tfidf_cfg or has_hybrid_idf_arr:
+                raise ValueError("Unfitted saved hybrid projector cannot carry TF-IDF state")
+        elif "tfidf_terms" not in projector_config:
+            if has_any_tfidf_cfg or has_hybrid_idf_arr:
+                raise ValueError("Saved hybrid projector has incomplete TF-IDF configuration")
+        else:
+            tf_terms = projector_config["tfidf_terms"]
+            if not isinstance(tf_terms, (list, tuple)) or not 0 < len(tf_terms) <= sparse:
+                raise ValueError("Saved hybrid TF-IDF vocabulary exceeds sparse_dim")
+            top_tf_cfg: Dict[str, Any] = {"type": "tfidf", "terms": list(tf_terms)}
+            if "tfidf_char_ngrams" in projector_config:
+                top_tf_cfg["char_ngrams"] = projector_config["tfidf_char_ngrams"]
+            for src_k, dst_k in _HYBRID_TFIDF_KEY_MAP:
+                if src_k in projector_config:
+                    top_tf_cfg[dst_k] = projector_config[src_k]
+            if len(tf_terms) > DEFAULT_MAX_FEATURES:
+                top_tf_cfg["max_features"] = len(tf_terms)
+            bin_idf = array_map.get("_projector_hybrid_tfidf_idf")
+            if "tfidf_idf" in projector_config:
+                top_tf_cfg["idf"] = projector_config["tfidf_idf"]
+                TfidfProjector.validate_header_config(top_tf_cfg, allow_missing_idf=False)
+                top_tfidf = TfidfProjector.from_config(top_tf_cfg)
+                if bin_idf is not None:
+                    if (
+                        bin_idf.ndim != 1
+                        or len(bin_idf) != len(tf_terms)
+                        or not np.all(np.isfinite(bin_idf))
+                        or not np.allclose(
+                            np.asarray(top_tfidf._idf, dtype=np.float64),
+                            bin_idf,
+                            rtol=0.0,
+                            atol=1e-5,
+                        )
+                    ):
+                        raise ValueError(
+                            "Saved hybrid projector inline tfidf_idf mismatches binary IDF tensor"
+                        )
+            else:
+                if bin_idf is None:
+                    raise ValueError("Saved hybrid projector missing TF-IDF idf weights")
+                TfidfProjector.validate_header_config(top_tf_cfg, allow_missing_idf=True)
+                top_tfidf = TfidfProjector.from_config(top_tf_cfg, idf_array=bin_idf)
 
         raw_terms = projector_config.get("spectral_terms", ())
         raw_weights = projector_config.get("spectral_weights", ())
@@ -2279,7 +2345,7 @@ class CompiledSystemOneModel:
 
         if base_dim + rbf_rows != dimension:
             raise ValueError("Saved hybrid projector dimensions do not match the skill")
-        return eff_spec_dim
+        return eff_spec_dim, top_tfidf
 
     @classmethod
     def _reconstruct_model_from_parts(
@@ -2329,6 +2395,13 @@ class CompiledSystemOneModel:
             "_projector_dense_table" in array_map or "_projector_spectral_basis" in array_map
         ):
             raise ValueError("Saved skill contains unexpected dense vocab projector arrays")
+        if (
+            not is_v3
+            or not embed_vocab_flag
+            or projector_config is None
+            or projector_config.get("type") != "hybrid"
+        ) and "dense_embed_vocab" in meta:
+            raise ValueError("Saved skill contains unexpected dense_embed_vocab metadata")
 
         for proj_arr_key in (
             "_projector_tfidf_idf",
@@ -2371,17 +2444,23 @@ class CompiledSystemOneModel:
 
         saved_hybrid = None
         if projector_config is not None and projector_config["type"] == "hybrid":
-            eff_spec_dim = cls._validate_hybrid_projector_config_and_tensors(
+            eff_spec_dim, top_tfidf = cls._validate_hybrid_projector_config_and_tensors(
                 projector_config,
                 array_map,
                 dimension,
             )
             rbf_arr = array_map.get("_projector_rbf_landmarks")
 
-            if is_v3 and embed_vocab_flag and "_projector_dense_table" in array_map:
+            if is_v3 and embed_vocab_flag:
+                if "_projector_dense_table" not in array_map:
+                    raise ValueError(
+                        "Saved v3 skill with embed_vocab=True missing _projector_dense_table"
+                    )
                 vocab_meta = meta.get("dense_embed_vocab")
                 if not isinstance(vocab_meta, Mapping):
                     raise ValueError("Saved v3 skill missing dense_embed_vocab metadata")
+                if set(vocab_meta) - {"vocab_size", "seed", "explicit_alpha", "multiword_by_space3", "sparse"}:
+                    raise ValueError("Saved v3 skill dense_embed_vocab contains unsupported settings")
                 vocab_size = vocab_meta.get("vocab_size")
                 if type(vocab_size) is not int or not 1 <= vocab_size <= 250_000:
                     raise ValueError("Saved v3 skill dense_embed_vocab vocab_size is invalid")
@@ -2414,6 +2493,14 @@ class CompiledSystemOneModel:
 
                 sparse_cfg = vocab_meta.get("sparse")
                 tfidf_proj: Optional[Any] = None
+                if top_tfidf is None and sparse_cfg is not None:
+                    raise ValueError(
+                        "Saved v3 skill sparse projector config mismatches top-level hybrid header"
+                    )
+                if top_tfidf is not None and sparse_cfg is None:
+                    raise ValueError(
+                        "Saved v3 skill missing sparse projector config for fitted hybrid TF-IDF"
+                    )
                 if sparse_cfg is not None:
                     if not isinstance(sparse_cfg, Mapping):
                         raise ValueError("Saved v3 skill sparse projector config is invalid")
@@ -2424,13 +2511,20 @@ class CompiledSystemOneModel:
                     )
                     if tfidf_proj.dimension > int(projector_config["sparse_dim"]):
                         raise ValueError("Saved hybrid TF-IDF vocabulary exceeds sparse_dim")
+                    if top_tfidf is not None and (
+                        tfidf_proj.to_config(include_arrays=True)
+                        != top_tfidf.to_config(include_arrays=True)
+                    ):
+                        raise ValueError(
+                            "Saved v3 skill sparse projector config mismatches top-level hybrid header"
+                        )
 
                 dense_engine = object.__new__(SubwordSemanticEmbeddings)
                 dense_engine.dimension = dense_dim
                 dense_engine.vocab_size = vocab_size
                 vm_seed = vocab_meta.get("seed", projector_config.get("seed", 42))
-                if type(vm_seed) is not int:
-                    raise ValueError("Saved v3 skill dense_embed_vocab seed is invalid")
+                if type(vm_seed) is not int or vm_seed != int(projector_config.get("seed", 42)):
+                    raise ValueError("Saved v3 skill dense_embed_vocab seed mismatches hybrid projector seed")
                 dense_engine.seed = vm_seed
                 dense_engine._table = dense_table
                 dense_engine._multiword_by_space3 = mw_map
@@ -2856,12 +2950,14 @@ class CompiledSystemOneModel:
                 if set(projector_config) - HybridProjector.CONFIG_KEYS:
                     raise ValueError("Saved hybrid projector contains unsupported settings")
                 sparse, dense = projector_config.get("sparse_dim"), projector_config.get("dense_dim")
-                direct_spec = (
-                    projector_config.get("direct_spectral_dim", 0)
-                    if projector_config.get("direct_spectral")
-                    else 0
-                )
-                inline_rbf_rows = len(projector_config.get("rbf_landmarks") or ())
+                ds_flag = projector_config.get("direct_spectral", False)
+                if "direct_spectral" in projector_config and type(ds_flag) is not bool:
+                    raise ValueError("Saved hybrid projector direct_spectral must be a boolean")
+                direct_spec = projector_config.get("direct_spectral_dim", 0) if ds_flag else 0
+                raw_rbf = projector_config.get("rbf_landmarks")
+                if raw_rbf is not None and not isinstance(raw_rbf, (list, tuple)):
+                    raise ValueError("Saved hybrid projector rbf_landmarks must be a sequence")
+                inline_rbf_rows = len(raw_rbf) if raw_rbf is not None else 0
                 if (
                     type(sparse) is not int
                     or type(dense) is not int
@@ -2872,14 +2968,24 @@ class CompiledSystemOneModel:
                     or sparse + dense + direct_spec + inline_rbf_rows > dimension
                 ):
                     raise ValueError("Saved hybrid projector dimensions do not match the skill")
+                tf_terms_raw = projector_config.get("tfidf_terms", ())
+                spec_terms_raw = projector_config.get("spectral_terms", ())
+                if not isinstance(tf_terms_raw, (list, tuple)):
+                    raise ValueError("Saved hybrid projector tfidf_terms must be a sequence")
+                if not isinstance(spec_terms_raw, (list, tuple)):
+                    raise ValueError("Saved hybrid projector spectral_terms must be a sequence")
                 runtime_bytes += 16 * 25000 * dense
-                runtime_bytes += 64 * len(projector_config.get("tfidf_terms", ()))
-                runtime_bytes += 16 * len(projector_config.get("spectral_terms", ())) * dense
-                runtime_bytes += 8 * sum(
-                    len(row)
-                    for key in ("spectral_vectors", "subspace_components", "rbf_landmarks")
-                    for row in (projector_config.get(key) or ())
-                )
+                runtime_bytes += 64 * len(tf_terms_raw)
+                runtime_bytes += 16 * len(spec_terms_raw) * dense
+                for mat_key in ("spectral_vectors", "subspace_components", "rbf_landmarks"):
+                    mat_val = projector_config.get(mat_key)
+                    if mat_val is None:
+                        continue
+                    if not isinstance(mat_val, (list, tuple)) or any(
+                        not isinstance(row, (list, tuple)) for row in mat_val
+                    ):
+                        raise ValueError(f"Saved hybrid projector {mat_key} must be a 2D sequence")
+                    runtime_bytes += 8 * sum(len(row) for row in mat_val)
         if runtime_bytes > max_runtime_bytes:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
         return saved_tfidf, saved_prag, runtime_bytes

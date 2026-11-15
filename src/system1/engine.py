@@ -59,6 +59,7 @@ from system1.core.model import (
     _has_custom_validate_decision,
     _normalize_raw_projection,
     _normalize_raw_projection_batch,
+    _resolve_authoritative_head,
     _stable_sigmoid,
     _validate_packed_engine_support,
 )
@@ -2140,12 +2141,19 @@ class SystemOneEngine:
 
             from system1.core.text import TfidfProjector
             prompt_raw_norm: Optional[float] = getattr(raw_result, "raw_norm", None)
-            needs_raw_norm = any(
-                float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
-                for cp in self.conformal_predictors.values()
-            ) or any(
-                float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
-                for ch in getattr(self.model, "heads", {}).values()
+            needs_raw_norm = (
+                any(
+                    float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
+                    for cp in self.conformal_predictors.values()
+                )
+                or any(
+                    float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                    for ch in getattr(self.model, "heads", {}).values()
+                )
+                or any(
+                    float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                    for ch in getattr(self.model, "_field_heads", {}).values()
+                )
             )
             if prompt_raw_norm is None and embedding is None and needs_raw_norm and hasattr(self.projector, "raw_norm"):
                 try:
@@ -2176,12 +2184,19 @@ class SystemOneEngine:
                 calibrator = self.calibrators[name]
                 has_learned_override = name in learned_overrides
                 conformal = self.conformal_predictors.get(name)
+                live_h = (
+                    self.model._field_heads.get(name)
+                    if hasattr(self.model, "_field_heads") and isinstance(self.model._field_heads, Mapping)
+                    else None
+                )
                 head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                 fam_thresh = max(
+                    float(getattr(live_h, "familiarity_threshold", 0.0)) if live_h is not None else 0.0,
                     float(getattr(head_obj, "familiarity_threshold", 0.0)) if head_obj is not None else 0.0,
                     float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0,
                 )
                 proto_thresh = max(
+                    float(getattr(live_h, "prototype_threshold", 0.0)) if live_h is not None else 0.0,
                     float(getattr(head_obj, "prototype_threshold", 0.0)) if head_obj is not None else 0.0,
                     float(getattr(conformal, "prototype_threshold", 0.0)) if conformal is not None else 0.0,
                 )
@@ -2478,9 +2493,15 @@ class SystemOneEngine:
                             escalated_fields.append(name)
             if prompt_raw_norm is not None:
                 for name, definition in self.schema.fields.items():
+                    live_h = (
+                        self.model._field_heads.get(name)
+                        if hasattr(self.model, "_field_heads") and isinstance(self.model._field_heads, Mapping)
+                        else None
+                    )
                     head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                     cp_obj = self.conformal_predictors.get(name)
                     fam_t = max(
+                        float(getattr(live_h, "familiarity_threshold", 0.0)) if live_h is not None else 0.0,
                         float(getattr(head_obj, "familiarity_threshold", 0.0)) if head_obj is not None else 0.0,
                         float(getattr(cp_obj, "familiarity_threshold", 0.0)) if cp_obj is not None else 0.0,
                     )
@@ -2497,9 +2518,15 @@ class SystemOneEngine:
                             if name not in escalated_fields:
                                 escalated_fields.append(name)
             for name, definition in self.schema.fields.items():
+                live_h = (
+                    self.model._field_heads.get(name)
+                    if hasattr(self.model, "_field_heads") and isinstance(self.model._field_heads, Mapping)
+                    else None
+                )
                 head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                 cp_obj = self.conformal_predictors.get(name)
                 proto_t = max(
+                    float(getattr(live_h, "prototype_threshold", 0.0)) if live_h is not None else 0.0,
                     float(getattr(head_obj, "prototype_threshold", 0.0)) if head_obj is not None else 0.0,
                     float(getattr(cp_obj, "prototype_threshold", 0.0)) if cp_obj is not None else 0.0,
                 )
@@ -3794,12 +3821,19 @@ class SystemOneEngine:
 
             online_bank_map = getattr(self.model, "_online_prototype_bank", {})
             model_field_heads = getattr(self.model, "_field_heads", {})
-            needs_raw_norm = any(
-                float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
-                for cp in self.conformal_predictors.values()
-            ) or any(
-                float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
-                for ch in getattr(self.model, "heads", {}).values()
+            needs_raw_norm = (
+                any(
+                    float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
+                    for cp in self.conformal_predictors.values()
+                )
+                or any(
+                    float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                    for ch in getattr(self.model, "heads", {}).values()
+                )
+                or any(
+                    float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                    for ch in model_field_heads.values()
+                )
             )
             sel_cals = getattr(self, "selective_calibrators", {}) or {}
             aci = getattr(self, "aci_tracker", None)
@@ -3808,7 +3842,7 @@ class SystemOneEngine:
 
             field_specs: List[Dict[str, Any]] = []
             for fname, f_def in self.schema.fields.items():
-                head = self.model.heads[fname]
+                head, meta_head = _resolve_authoritative_head(self.model, fname)
                 calibrator = self.calibrators[fname]
                 conformal = self.conformal_predictors.get(fname)
                 is_bool = isinstance(f_def, BooleanField)
@@ -3816,9 +3850,14 @@ class SystemOneEngine:
                 k_opts = len(options)
 
                 raw_w_arr = np.asarray(head.weights)
+                raw_b_arr = np.asarray(head.biases).reshape(-1)
+                if is_bool:
+                    raw_w_arr = raw_w_arr[:1]
+                    raw_b_arr = raw_b_arr[:1]
+                if not (np.all(np.isfinite(raw_w_arr)) and np.all(np.isfinite(raw_b_arr))):
+                    raise ValueError(f"Field head {fname!r} contains non-finite weights or biases")
                 if raw_w_arr.dtype not in (np.float32, np.float64):
                     raw_w_arr = raw_w_arr.astype(np.float32)
-                raw_b_arr = np.asarray(head.biases).reshape(-1)
                 if raw_b_arr.dtype not in (np.float32, np.float64):
                     raw_b_arr = raw_b_arr.astype(np.float32)
                 w_mat = np.asarray(raw_w_arr, dtype=np.float32)
@@ -3848,15 +3887,19 @@ class SystemOneEngine:
 
                 fam_t = max(
                     float(getattr(head, "familiarity_threshold", 0.0)),
+                    float(getattr(meta_head, "familiarity_threshold", 0.0)) if meta_head is not None else 0.0,
                     float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0,
                 )
                 proto_t = max(
                     float(getattr(head, "prototype_threshold", 0.0)),
+                    float(getattr(meta_head, "prototype_threshold", 0.0)) if meta_head is not None else 0.0,
                     float(getattr(conformal, "prototype_threshold", 0.0)) if conformal is not None else 0.0,
                 )
 
                 proto_chunks: List[np.ndarray] = []
                 head_protos = getattr(head, "prototypes", None)
+                if head_protos is None and meta_head is not None:
+                    head_protos = getattr(meta_head, "prototypes", None)
                 if head_protos is not None and np.ndim(head_protos) == 2 and head_protos.shape[1] == self.dimension:
                     hp = np.asarray(head_protos, dtype=np.float32)
                     hnorms = np.linalg.norm(hp, axis=1, keepdims=True)
@@ -4627,6 +4670,16 @@ class SystemOneEngine:
             and callable(getattr(proj_obj, "project_batch", None))
             and not hasattr(proj_obj, "project_with_norm")
             and all(isinstance(f, (ChoiceField, BooleanField)) for f in self.schema.fields.values())
+            and all(
+                getattr(h, "_exemplar_bank", None) is None
+                and getattr(h, "backend", "numpy") != "mlx"
+                for h in getattr(self.model, "heads", {}).values()
+            )
+            and all(
+                getattr(h, "_exemplar_bank", None) is None
+                and getattr(h, "backend", "numpy") != "mlx"
+                for h in getattr(self.model, "_field_heads", {}).values()
+            )
             and not getattr(self.model, "_learned_prompt_overrides", None)
             and not getattr(self, "_learned_prompt_overrides", None)
         )
