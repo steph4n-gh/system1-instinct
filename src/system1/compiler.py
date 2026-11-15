@@ -57,6 +57,59 @@ MAX_SKILL_ARRAY_BYTES_V3 = 256 * 1024 * 1024
 MAX_SKILL_RUNTIME_BYTES_V3 = 512 * 1024 * 1024
 _ALLOWED_V3_DTYPES = frozenset(("float16", "float32", "float64"))
 
+
+def _strict_json_parse_float(num_str: str) -> float:
+    """Reject JSON float tokens that overflow IEEE-754 float64 to +/-inf."""
+    val = float(num_str)
+    if not math.isfinite(val):
+        raise ValueError(f"Saved skill header contains overflowing float token: {num_str!r}")
+    return val
+
+
+def _strict_header_bool(
+    mapping: Mapping[str, Any],
+    key: str,
+    default: bool,
+    context: str,
+) -> bool:
+    """Validate an optional boolean header field without coercing non-bool types."""
+    if key not in mapping:
+        return default
+    raw = mapping[key]
+    if type(raw) is not bool:
+        raise ValueError(f"{context} field {key!r} must be a boolean, got {raw!r}")
+    return raw
+
+
+def _strict_header_float(
+    mapping: Mapping[str, Any],
+    key: str,
+    default: float,
+    context: str,
+    *,
+    min_val: Optional[float] = None,
+    min_inclusive: bool = True,
+    max_val: Optional[float] = None,
+    max_inclusive: bool = True,
+) -> float:
+    """Validate an optional finite numeric header field within inclusive/exclusive bounds."""
+    if key not in mapping:
+        return default
+    raw = mapping[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"{context} field {key!r} must be a finite number, got {raw!r}")
+    try:
+        val = float(raw)
+    except OverflowError as exc:
+        raise ValueError(f"{context} field {key!r} overflows float64: {raw!r}") from exc
+    if not math.isfinite(val):
+        raise ValueError(f"{context} field {key!r} must be finite, got {raw!r}")
+    if min_val is not None and (val < min_val if min_inclusive else val <= min_val):
+        raise ValueError(f"{context} field {key!r} out of range: {val!r}")
+    if max_val is not None and (val > max_val if max_inclusive else val >= max_val):
+        raise ValueError(f"{context} field {key!r} out of range: {val!r}")
+    return val
+
 # Fixed budgets for portable, bounded skills. Check before decoding/allocating.
 MAX_SKILL_BYTES = 64 * 1024 * 1024
 MAX_SKILL_HEADER_BYTES = 1024 * 1024
@@ -2355,7 +2408,9 @@ class CompiledSystemOneModel:
                 hp.dense_dim = dense_dim
                 hp.dimension = int(dimension)
                 hp.alpha = float(projector_config.get("alpha", 0.5))
-                hp._explicit_alpha = bool(vocab_meta.get("explicit_alpha", True))
+                hp._explicit_alpha = _strict_header_bool(
+                    vocab_meta, "explicit_alpha", True, "Saved v3 skill dense_embed_vocab"
+                )
                 hp.seed = int(projector_config.get("seed", 42))
                 hp.svd_power = float(projector_config.get("svd_power", 0.5))
                 hp.spectral_blend = float(projector_config.get("spectral_blend", 0.35))
@@ -2447,9 +2502,14 @@ class CompiledSystemOneModel:
                 elif _projector_config(projector) != projector_config:
                     raise ValueError("Supplied projector does not match the saved skill's feature space")
             elif projector_config["type"] == "deterministic":
+                det_rw = _strict_header_bool(
+                    projector_config, "recency_weighted", False, "Saved deterministic projector"
+                )
+                if type(projector_config.get("dimension")) is not int or projector_config["dimension"] != dimension:
+                    raise ValueError("Saved projector dimension does not match the skill")
                 projector = DeterministicSemanticProjector(
-                    dimension=projector_config["dimension"],
-                    recency_weighted=projector_config["recency_weighted"],
+                    dimension=dimension,
+                    recency_weighted=det_rw,
                 )
             elif saved_hybrid is not None:
                 projector = saved_hybrid
@@ -2460,14 +2520,45 @@ class CompiledSystemOneModel:
             else:
                 raise ValueError("This skill requires its original external projector; pass projector= when loading")
 
+        top_created_at = _strict_header_float(
+            meta, "created_at", 0.0, "Saved skill header", min_val=0.0, min_inclusive=True
+        )
         saved_meta = meta.get("metadata", {})
         if not isinstance(saved_meta, dict):
             raise ValueError("Saved skill metadata must be a mapping")
-        is_cold_skill = bool(saved_meta.get("cold_start", False))
+        is_cold_skill = _strict_header_bool(saved_meta, "cold_start", False, "Saved skill metadata")
+        meta_ff = _strict_header_float(
+            saved_meta,
+            "forgetting_factor",
+            0.995,
+            "Saved skill metadata",
+            min_val=0.0,
+            min_inclusive=False,
+            max_val=1.0,
+            max_inclusive=True,
+        )
+        meta_rw = _strict_header_bool(saved_meta, "recency_weighted", False, "Saved skill metadata")
+        meta_created_at = _strict_header_float(
+            saved_meta, "created_at", top_created_at, "Saved skill metadata", min_val=0.0, min_inclusive=True
+        )
+        _strict_header_bool(saved_meta, "strict_mode", True, "Saved skill metadata")
+        _strict_header_float(
+            saved_meta,
+            "default_alpha",
+            0.05,
+            "Saved skill metadata",
+            min_val=0.0,
+            min_inclusive=False,
+            max_val=1.0,
+            max_inclusive=False,
+        )
 
         heads: Dict[str, CompiledHeadWeights] = {}
         for name, h_info in meta["heads"].items():
-            if name not in schema.fields or h_info["field_type"] != schema.fields[name].field_type:
+            if not isinstance(h_info, Mapping):
+                raise ValueError(f"Saved head {name!r} metadata must be a mapping")
+            ctx = f"Saved head {name!r}"
+            if name not in schema.fields or h_info.get("field_type") != schema.fields[name].field_type:
                 raise ValueError(f"Saved head {name!r} does not match the schema")
             definition = schema.fields[name]
             if f"{name}_w" not in array_map or f"{name}_b" not in array_map:
@@ -2487,9 +2578,9 @@ class CompiledSystemOneModel:
                 raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
             if not np.all(np.isfinite(w)) or not np.all(np.isfinite(b)):
                 raise ValueError(f"Saved head {name!r} contains non-finite weights")
-            temperature = float(h_info.get("temperature", 1.0))
-            if not math.isfinite(temperature) or temperature <= 0:
-                raise ValueError(f"Saved head {name!r} has an invalid temperature")
+            temperature = _strict_header_float(
+                h_info, "temperature", 1.0, ctx, min_val=0.0, min_inclusive=False
+            )
             if h_info.get("score_method", "aps") not in ("aps", "lac"):
                 raise ValueError(f"Saved head {name!r} uses an unsupported conformal score")
             if isinstance(definition, (ChoiceField, MultiChoiceField)) and tuple(h_info.get("options", ())) != definition.options:
@@ -2528,12 +2619,12 @@ class CompiledSystemOneModel:
                             raise ValueError(f"Saved head {name!r} contains invalid class calibration score")
                         parsed_vals.append(fv)
                     parsed_class_scores[str(c_key)] = tuple(parsed_vals)
-            fam_thresh = float(h_info.get("familiarity_threshold", 0.0))
-            if not math.isfinite(fam_thresh) or fam_thresh < 0:
-                raise ValueError(f"Saved head {name!r} has an invalid familiarity_threshold")
-            proto_thresh = float(h_info.get("prototype_threshold", 0.0))
-            if not math.isfinite(proto_thresh) or proto_thresh < 0:
-                raise ValueError(f"Saved head {name!r} has an invalid prototype_threshold")
+            fam_thresh = _strict_header_float(
+                h_info, "familiarity_threshold", 0.0, ctx, min_val=0.0, min_inclusive=True
+            )
+            proto_thresh = _strict_header_float(
+                h_info, "prototype_threshold", 0.0, ctx, min_val=0.0, min_inclusive=True
+            )
             raw_proto_arr = array_map[f"{name}_prototypes"] if f"{name}_prototypes" in array_map else None
             proto_mat = _as_f32(raw_proto_arr)
             if proto_mat is not None and not np.all(np.isfinite(proto_mat)):
@@ -2560,7 +2651,7 @@ class CompiledSystemOneModel:
             proto_scores = tuple(float(s) for s in proto_scores_arr) if proto_scores_arr is not None else ()
             if any(not math.isfinite(score) or score < 0 for score in proto_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid prototype calibration scores")
-            is_hier = bool(h_info.get("hierarchical", False))
+            is_hier = _strict_header_bool(h_info, "hierarchical", False, ctx)
             raw_assign = h_info.get("cluster_assignments", ())
             if is_hier and (
                 not isinstance(raw_assign, (list, tuple))
@@ -2603,24 +2694,57 @@ class CompiledSystemOneModel:
                     raise ValueError(f"Saved head {name!r} has unexpected exemplar arrays without exemplar_state")
                 exemplar_state = None
 
+            cq_max = None if isinstance(definition, ScoreField) else (1.0 + 1e-6)
+            conformal_q = _strict_header_float(
+                h_info,
+                "conformal_quantile",
+                0.0,
+                ctx,
+                min_val=0.0,
+                min_inclusive=True,
+                max_val=cq_max,
+                max_inclusive=True,
+            )
+            margin_t = _strict_header_float(
+                h_info, "margin_threshold", 0.20, ctx, min_val=0.0, min_inclusive=True
+            )
+            head_ff = _strict_header_float(
+                h_info,
+                "forgetting_factor",
+                0.995,
+                ctx,
+                min_val=0.0,
+                min_inclusive=False,
+                max_val=1.0,
+                max_inclusive=True,
+            )
+            rel_odds = _strict_header_float(
+                h_info, "relative_odds_ratio", 1.5, ctx, min_val=0.0, min_inclusive=False
+            )
+            conf_tau0 = _strict_header_float(
+                h_info, "confidence_floor_tau0", 0.15, ctx, min_val=0.0, min_inclusive=True
+            )
+            esc_ambig = _strict_header_bool(h_info, "escalate_on_ambiguity", True, ctx)
+            is_mondrian = _strict_header_bool(h_info, "mondrian", False, ctx)
+
             heads[name] = CompiledHeadWeights(
                 field_name=name,
                 field_type=h_info["field_type"],
                 weights=w,
                 biases=b,
                 temperature=temperature,
-                conformal_quantile=float(h_info.get("conformal_quantile", 0.0)),
+                conformal_quantile=conformal_q,
                 score_method=h_info.get("score_method", "aps"),
                 options=tuple(h_info.get("options", [])),
                 P=p_mat,
                 B=b_mat,
-                margin_threshold=float(h_info.get("margin_threshold", 0.20)),
-                forgetting_factor=float(h_info.get("forgetting_factor", 0.995)),
-                relative_odds_ratio=float(h_info.get("relative_odds_ratio", 1.5)),
-                confidence_floor_tau0=float(h_info.get("confidence_floor_tau0", 0.15)),
-                escalate_on_ambiguity=bool(h_info.get("escalate_on_ambiguity", True)),
+                margin_threshold=margin_t,
+                forgetting_factor=head_ff,
+                relative_odds_ratio=rel_odds,
+                confidence_floor_tau0=conf_tau0,
+                escalate_on_ambiguity=esc_ambig,
                 calibration_scores=calib_scores,
-                mondrian=bool(h_info.get("mondrian", False)),
+                mondrian=is_mondrian,
                 class_calibration_scores=parsed_class_scores,
                 familiarity_threshold=fam_thresh,
                 prototypes=proto_mat,
@@ -2635,16 +2759,18 @@ class CompiledSystemOneModel:
                 exemplar_state=exemplar_state,
             )
 
-        return cls(
+        inst = cls(
             schema=schema,
             heads=heads,
             dimension=dimension,
             projector=projector,
             backend=backend,
             metadata=dict(saved_meta),
-            forgetting_factor=float(saved_meta.get("forgetting_factor", 0.995)),
-            recency_weighted=bool(saved_meta.get("recency_weighted", False)),
+            forgetting_factor=meta_ff,
+            recency_weighted=meta_rw,
         )
+        inst.created_at = meta_created_at
+        return inst
 
     @staticmethod
     def _validate_projector_and_budget(
@@ -2666,6 +2792,8 @@ class CompiledSystemOneModel:
         saved_tfidf = None
         saved_prag = None
         if projector_config is not None:
+            if not isinstance(projector_config, Mapping) or not isinstance(projector_config.get("type"), str):
+                raise ValueError("Saved projector config must be a mapping with a string type")
             kind = projector_config["type"]
             if kind == "tfidf":
                 tfidf_terms, _ = TfidfProjector.validate_header_config(
@@ -2782,7 +2910,7 @@ class CompiledSystemOneModel:
         def _reject_nonfinite(tok: str) -> Any:
             raise ValueError(f"Saved v3 skill header contains non-finite constant: {tok!r}")
 
-        meta = json.loads(header_json, parse_constant=_reject_nonfinite)
+        meta = json.loads(header_json, parse_constant=_reject_nonfinite, parse_float=_strict_json_parse_float)
         if not isinstance(meta, dict) or meta.get("version") != 3:
             raise ValueError("Unsupported or inconsistent saved v3 skill format version")
         if "embed_vocab" in meta and type(meta["embed_vocab"]) is not bool:
@@ -3020,7 +3148,7 @@ class CompiledSystemOneModel:
         def _reject_nonfinite(tok: str) -> Any:
             raise ValueError(f"Saved skill header contains non-finite constant: {tok!r}")
 
-        meta = json.loads(header_json, parse_constant=_reject_nonfinite)
+        meta = json.loads(header_json, parse_constant=_reject_nonfinite, parse_float=_strict_json_parse_float)
         if meta.get("version") not in (1, 2) or meta["version"] != raw_bytes[3]:
             raise ValueError("Unsupported or inconsistent saved skill format version")
 

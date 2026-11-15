@@ -145,6 +145,11 @@ def fingerprint(value: Any) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
+def _finite_float_or_zero(value: Any) -> float:
+    f = float(value)
+    return f if math.isfinite(f) else 0.0
+
+
 def _canonical_probabilities(
     probs: Optional[Mapping[str, Any]]
 ) -> Dict[str, Dict[str, float]]:
@@ -155,7 +160,7 @@ def _canonical_probabilities(
     for field_name, p_dist in sorted(probs.items()):
         if isinstance(p_dist, MappingABC):
             result[str(field_name)] = {
-                str(opt): round(float(p), 12) for opt, p in sorted(p_dist.items())
+                str(opt): round(_finite_float_or_zero(p), 12) for opt, p in sorted(p_dist.items())
             }
     return result
 
@@ -560,7 +565,7 @@ def compute_receipt_digest(receipt_data: Mapping[str, Any]) -> str:
         "schema_digest": str(receipt_data.get("schema_digest", "")),
         "prompt_digest": str(receipt_data.get("prompt_digest", "")),
         "values": receipt_data.get("values", {}),
-        "confidences": {k: float(v) for k, v in (receipt_data.get("confidences") or {}).items()},
+        "confidences": {k: _finite_float_or_zero(v) for k, v in (receipt_data.get("confidences") or {}).items()},
         "conformal_sets": {k: list(v) for k, v in (receipt_data.get("conformal_sets") or {}).items()},
         "probabilities": _canonical_probabilities(receipt_data.get("probabilities")),
         "latency_ms": round(float(receipt_data.get("latency_ms", 0.0)), 4),
@@ -668,6 +673,12 @@ def create_decision_receipt(
         else:
             coerced_epoch = policy_epoch
 
+    clean_confidences = {str(k): _finite_float_or_zero(v) for k, v in confidences.items()}
+    clean_probabilities = {
+        str(k): {str(opt): _finite_float_or_zero(p) for opt, p in p_dist.items()}
+        for k, p_dist in probabilities.items()
+    }
+
     unbound_receipt = DecisionWitnessReceipt(
         decision_id=decision_id,
         schema_name=schema_name,
@@ -675,9 +686,9 @@ def create_decision_receipt(
         prompt=prompt,
         prompt_digest=prompt_digest,
         values=dict(values),
-        confidences={k: float(v) for k, v in confidences.items()},
+        confidences=dict(clean_confidences),
         conformal_sets={k: list(v) for k, v in conformal_sets.items()},
-        probabilities={k: {str(opt): float(p) for opt, p in p_dist.items()} for k, p_dist in probabilities.items()},
+        probabilities={k: dict(p_dist) for k, p_dist in clean_probabilities.items()},
         latency_ms=float(latency_ms),
         is_ambiguous=bool(is_ambiguous),
         timestamp=ts,
@@ -740,9 +751,9 @@ def create_decision_receipt(
         envelope_payload_mutation["request_id"] = str(request_id)
 
     envelope_payload_guard: Dict[str, Any] = {
-        "confidences": {k: float(v) for k, v in confidences.items()},
+        "confidences": dict(clean_confidences),
         "conformal_sets": {k: list(v) for k, v in conformal_sets.items()},
-        "probabilities": _canonical_probabilities(probabilities),
+        "probabilities": _canonical_probabilities(clean_probabilities),
         "is_ambiguous": is_ambiguous,
         "latency_ms": round(float(latency_ms), 4),
     }
@@ -795,9 +806,9 @@ def create_decision_receipt(
         prompt=prompt,
         prompt_digest=prompt_digest,
         values=dict(values),
-        confidences={k: float(v) for k, v in confidences.items()},
+        confidences=dict(clean_confidences),
         conformal_sets={k: list(v) for k, v in conformal_sets.items()},
-        probabilities={k: {str(opt): float(p) for opt, p in p_dist.items()} for k, p_dist in probabilities.items()},
+        probabilities={k: dict(p_dist) for k, p_dist in clean_probabilities.items()},
         latency_ms=float(latency_ms),
         is_ambiguous=bool(is_ambiguous),
         timestamp=ts,

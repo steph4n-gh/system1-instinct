@@ -16,6 +16,7 @@ import re
 import struct
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union
 import numpy as np
@@ -565,6 +566,19 @@ def _pack_f64_scalar(val: Any) -> Optional[bytes]:
     return struct.pack("<d", f)
 
 
+def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
+    """Return an owned C-contiguous read-only copy without mutating caller array flags."""
+    if dtype is None:
+        raw = np.asarray(arr)
+        target = raw.dtype
+    else:
+        raw = arr
+        target = dtype
+    out = np.array(raw, dtype=target, order="C", copy=True)
+    out.setflags(write=False)
+    return out
+
+
 def _pack_array_sig(arr: Any) -> Optional[Tuple[Tuple[int, ...], str, bytes]]:
     """Serialize an array's shape, dtype, and contiguous raw bytes for signature comparisons."""
     if arr is None:
@@ -861,6 +875,9 @@ def _compute_engine_inference_signature(
             else None,
             _pack_f64_scalar(getattr(f_def, "max_value", 1.0))
             if hasattr(f_def, "max_value")
+            else None,
+            _pack_f64_scalar(getattr(f_def, "default", None))
+            if isinstance(f_def, ScoreField) and getattr(f_def, "default", None) is not None
             else None,
             bool(getattr(f_def, "escalate_on_ambiguity", True)),
         )
@@ -2285,14 +2302,6 @@ class SystemOneModel:
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         if telemetry is not None and len(telemetry) == len(prompts):
             return np.stack([self.encode(p, telemetry[i], recency_weighted=use_recency) for i, p in enumerate(prompts)], axis=0).astype(np.float32)
-        if hasattr(self.projector, "project_batch"):
-            try:
-                embs = self.projector.project_batch(prompts, recency_weighted=use_recency)
-            except TypeError:
-                embs = self.projector.project_batch(prompts)
-            return _normalize_raw_projection_batch(
-                embs, len(prompts), self.dimension, zero_unit0=False
-            )
         return np.stack([self.encode(p, recency_weighted=use_recency) for p in prompts], axis=0).astype(np.float32)
 
     def forward_single(
@@ -2835,6 +2844,7 @@ class PackedMultiQuestionKernel:
         c_raw_b: Optional[Tuple[np.ndarray, ...]] = None,
         b_raw_w: Optional[Tuple[np.ndarray, ...]] = None,
         b_raw_b: Optional[Tuple[np.ndarray, ...]] = None,
+        s_default: Optional[np.ndarray] = None,
         zero_emb_unit0: bool = False,
     ) -> None:
         self.projector = projector
@@ -2846,81 +2856,94 @@ class PackedMultiQuestionKernel:
         self.recency_weighted = recency_weighted
         self.storage_mode = storage_mode
 
-        self.W_packed = W_packed
-        self.b_packed = b_packed
-        self.M_total = int(W_packed.shape[1])
+        self.W_packed = _owned_readonly_array(W_packed)
+        self.b_packed = _owned_readonly_array(b_packed)
+        self.M_total = int(self.W_packed.shape[1])
 
         self.choice_names = choice_names
         self.c_options = c_options
-        self.c_K = c_K
+        self.c_K = _owned_readonly_array(c_K, dtype=np.int32)
         self.Q_c = len(choice_names)
-        self.M_c = int(np.sum(c_K)) if self.Q_c else 0
-        self.c_offsets = c_offsets
-        self.c_seg_idx = c_seg_idx
-        self.c_qhat = c_qhat
-        self.c_is_cal = c_is_cal
-        self.c_is_lac = c_is_lac
-        self.c_eff_m = c_eff_m
-        self.c_gamma = c_gamma
-        self.c_tau0 = c_tau0
-        self.c_all_lac = bool(self.Q_c and np.all(c_is_lac) and np.all(c_is_cal))
-        self.c_all_aps_cal = bool(self.Q_c and np.all(~c_is_lac) and np.all(c_is_cal))
+        self.M_c = int(np.sum(self.c_K)) if self.Q_c else 0
+        self.c_offsets = _owned_readonly_array(c_offsets, dtype=np.int32)
+        self.c_seg_idx = _owned_readonly_array(c_seg_idx, dtype=np.int32)
+        self.c_qhat = _owned_readonly_array(c_qhat, dtype=np.float64)
+        self.c_is_cal = _owned_readonly_array(c_is_cal, dtype=bool)
+        self.c_is_lac = _owned_readonly_array(c_is_lac, dtype=bool)
+        self.c_eff_m = _owned_readonly_array(c_eff_m, dtype=np.float64)
+        self.c_gamma = _owned_readonly_array(c_gamma, dtype=np.float64)
+        self.c_tau0 = _owned_readonly_array(c_tau0, dtype=np.float64)
+        self.c_all_lac = bool(self.Q_c and np.all(self.c_is_lac) and np.all(self.c_is_cal))
+        self.c_all_aps_cal = bool(self.Q_c and np.all(~self.c_is_lac) and np.all(self.c_is_cal))
         self.K_max = int(self.c_K.max()) if self.Q_c else 0
-        self.c_pad_rows = (
+        self.c_pad_rows = _owned_readonly_array(
             np.repeat(np.arange(self.Q_c, dtype=np.int32), self.c_K)
             if self.Q_c
-            else np.empty(0, dtype=np.int32)
+            else np.empty(0, dtype=np.int32),
+            dtype=np.int32,
         )
-        self.c_pad_cols = (
+        self.c_pad_cols = _owned_readonly_array(
             np.concatenate([np.arange(int(k), dtype=np.int32) for k in self.c_K])
             if self.Q_c
-            else np.empty(0, dtype=np.int32)
+            else np.empty(0, dtype=np.int32),
+            dtype=np.int32,
         )
-        self.c_conf_floor = (
+        self.c_conf_floor = _owned_readonly_array(
             (1.0 / np.maximum(1.0, self.c_K)) + self.c_tau0
             if self.Q_c
-            else np.empty(0, dtype=np.float64)
+            else np.empty(0, dtype=np.float64),
+            dtype=np.float64,
         )
 
         self.bool_names = bool_names
         self.Q_b = len(bool_names)
-        self.b_thresh = b_thresh
-        self.b_qhat = b_qhat
-        self.b_is_cal = b_is_cal
-        self.b_is_lac = b_is_lac
-        self.b_eff_m = b_eff_m
-        self.b_gamma = b_gamma
-        self.b_tau0 = b_tau0
-        self.b_all_lac = bool(self.Q_b and np.all(b_is_lac) and np.all(b_is_cal))
-        self.b_all_aps_cal = bool(self.Q_b and np.all(~b_is_lac) and np.all(b_is_cal))
-        self.b_conf_floor = 0.5 + self.b_tau0 if self.Q_b else np.empty(0, dtype=np.float64)
+        self.b_thresh = _owned_readonly_array(b_thresh, dtype=np.float64)
+        self.b_qhat = _owned_readonly_array(b_qhat, dtype=np.float64)
+        self.b_is_cal = _owned_readonly_array(b_is_cal, dtype=bool)
+        self.b_is_lac = _owned_readonly_array(b_is_lac, dtype=bool)
+        self.b_eff_m = _owned_readonly_array(b_eff_m, dtype=np.float64)
+        self.b_gamma = _owned_readonly_array(b_gamma, dtype=np.float64)
+        self.b_tau0 = _owned_readonly_array(b_tau0, dtype=np.float64)
+        self.b_all_lac = bool(self.Q_b and np.all(self.b_is_lac) and np.all(self.b_is_cal))
+        self.b_all_aps_cal = bool(self.Q_b and np.all(~self.b_is_lac) and np.all(self.b_is_cal))
+        self.b_conf_floor = _owned_readonly_array(
+            0.5 + self.b_tau0 if self.Q_b else np.empty(0, dtype=np.float64),
+            dtype=np.float64,
+        )
 
         self.score_names = score_names
         self.Q_s = len(score_names)
-        self.s_min = s_min
-        self.s_range = s_range
-        self.s_norm_margin = s_norm_margin
-        self.s_raw_scale = s_raw_scale
-        self.s_is_cal = s_is_cal
+        self.s_min = _owned_readonly_array(s_min, dtype=np.float64)
+        self.s_range = _owned_readonly_array(s_range, dtype=np.float64)
+        self.s_default = _owned_readonly_array(
+            self.s_min if s_default is None else s_default,
+            dtype=np.float64,
+        )
+        self.s_norm_margin = _owned_readonly_array(s_norm_margin, dtype=np.float64)
+        self.s_raw_scale = _owned_readonly_array(s_raw_scale, dtype=np.float64)
+        self.s_is_cal = _owned_readonly_array(s_is_cal, dtype=bool)
         self.eff_score_thresh = (
             float(margin_threshold)
             if (enable_margin_gating and margin_threshold is not None)
             else 0.5
         )
-        self.c_escalate = (
+        self.c_escalate = _owned_readonly_array(
             np.ones(self.Q_c, dtype=bool)
             if c_escalate is None
-            else np.asarray(c_escalate, dtype=bool).reshape(-1)
+            else np.asarray(c_escalate, dtype=bool).reshape(-1),
+            dtype=bool,
         )
-        self.b_escalate = (
+        self.b_escalate = _owned_readonly_array(
             np.ones(self.Q_b, dtype=bool)
             if b_escalate is None
-            else np.asarray(b_escalate, dtype=bool).reshape(-1)
+            else np.asarray(b_escalate, dtype=bool).reshape(-1),
+            dtype=bool,
         )
-        self.s_escalate = (
+        self.s_escalate = _owned_readonly_array(
             np.ones(self.Q_s, dtype=bool)
             if s_escalate is None
-            else np.asarray(s_escalate, dtype=bool).reshape(-1)
+            else np.asarray(s_escalate, dtype=bool).reshape(-1),
+            dtype=bool,
         )
         self.c_any_escalate = bool(self.Q_c and np.any(self.c_escalate))
         self.b_any_escalate = bool(self.Q_b and np.any(self.b_escalate))
@@ -2939,71 +2962,90 @@ class PackedMultiQuestionKernel:
             if model_learned_overrides
             else {}
         )
-        self.c_temp = (
-            np.asarray(c_temp, dtype=np.float64)
-            if c_temp is not None
-            else np.ones(self.Q_c, dtype=np.float64)
+        self.c_temp = _owned_readonly_array(
+            c_temp if c_temp is not None else np.ones(self.Q_c, dtype=np.float64),
+            dtype=np.float64,
         )
         if c_adj is not None:
             self.c_adj: Tuple[np.ndarray, ...] = tuple(
-                np.asarray(arr, dtype=np.float64).reshape(-1) for arr in c_adj
+                _owned_readonly_array(np.asarray(arr, dtype=np.float64).reshape(-1), dtype=np.float64)
+                for arr in c_adj
             )
             self.c_adj_div_temp = tuple(
-                arr / float(t) for arr, t in zip(self.c_adj, self.c_temp)
+                _owned_readonly_array(arr / float(t), dtype=np.float64)
+                for arr, t in zip(self.c_adj, self.c_temp)
             )
         elif c_adj_div_temp is not None:
             self.c_adj_div_temp = tuple(
-                np.asarray(arr, dtype=np.float64).reshape(-1) for arr in c_adj_div_temp
+                _owned_readonly_array(np.asarray(arr, dtype=np.float64).reshape(-1), dtype=np.float64)
+                for arr in c_adj_div_temp
             )
             self.c_adj = tuple(
-                arr * float(t) for arr, t in zip(self.c_adj_div_temp, self.c_temp)
+                _owned_readonly_array(arr * float(t), dtype=np.float64)
+                for arr, t in zip(self.c_adj_div_temp, self.c_temp)
             )
         else:
-            self.c_adj = tuple(np.zeros(int(k), dtype=np.float64) for k in self.c_K)
-            self.c_adj_div_temp = tuple(
-                np.zeros(int(k), dtype=np.float64) for k in self.c_K
+            self.c_adj = tuple(
+                _owned_readonly_array(np.zeros(int(k), dtype=np.float64), dtype=np.float64)
+                for k in self.c_K
             )
-        self.c_adj_flat = (
-            np.ascontiguousarray(np.concatenate(self.c_adj), dtype=np.float64)
-            if self.Q_c
-            else np.empty(0, dtype=np.float64)
+            self.c_adj_div_temp = tuple(
+                _owned_readonly_array(np.zeros(int(k), dtype=np.float64), dtype=np.float64)
+                for k in self.c_K
+            )
+        self.c_adj_flat = _owned_readonly_array(
+            np.concatenate(self.c_adj) if self.Q_c else np.empty(0, dtype=np.float64),
+            dtype=np.float64,
         )
-        self.c_temp_flat = (
-            np.ascontiguousarray(self.c_temp[self.c_seg_idx], dtype=np.float64)
-            if self.Q_c
-            else np.empty(0, dtype=np.float64)
+        self.c_temp_flat = _owned_readonly_array(
+            self.c_temp[self.c_seg_idx] if self.Q_c else np.empty(0, dtype=np.float64),
+            dtype=np.float64,
         )
-        self.c_zero_head = (
-            np.asarray(c_zero_head, dtype=bool)
-            if c_zero_head is not None
-            else np.zeros(self.Q_c, dtype=bool)
+        self.c_zero_head = _owned_readonly_array(
+            c_zero_head if c_zero_head is not None else np.zeros(self.Q_c, dtype=bool),
+            dtype=bool,
         )
-        self.b_temp = (
-            np.asarray(b_temp, dtype=np.float64)
-            if b_temp is not None
-            else np.ones(self.Q_b, dtype=np.float64)
+        self.b_temp = _owned_readonly_array(
+            b_temp if b_temp is not None else np.ones(self.Q_b, dtype=np.float64),
+            dtype=np.float64,
         )
         if b_adj0 is not None and b_adj1 is not None:
-            self.b_adj0 = np.asarray(b_adj0, dtype=np.float64).reshape(-1)
-            self.b_adj1 = np.asarray(b_adj1, dtype=np.float64).reshape(-1)
-            self.b_adj_div_temp = (self.b_adj1 - self.b_adj0) / self.b_temp
+            self.b_adj0 = _owned_readonly_array(
+                np.asarray(b_adj0, dtype=np.float64).reshape(-1), dtype=np.float64
+            )
+            self.b_adj1 = _owned_readonly_array(
+                np.asarray(b_adj1, dtype=np.float64).reshape(-1), dtype=np.float64
+            )
+            self.b_adj_div_temp = _owned_readonly_array(
+                (self.b_adj1 - self.b_adj0) / self.b_temp, dtype=np.float64
+            )
         elif b_adj_div_temp is not None:
-            self.b_adj_div_temp = np.asarray(b_adj_div_temp, dtype=np.float64).reshape(-1)
-            self.b_adj0 = np.zeros(self.Q_b, dtype=np.float64)
-            self.b_adj1 = self.b_adj_div_temp * self.b_temp
+            self.b_adj_div_temp = _owned_readonly_array(
+                np.asarray(b_adj_div_temp, dtype=np.float64).reshape(-1), dtype=np.float64
+            )
+            self.b_adj0 = _owned_readonly_array(
+                np.zeros(self.Q_b, dtype=np.float64), dtype=np.float64
+            )
+            self.b_adj1 = _owned_readonly_array(
+                self.b_adj_div_temp * self.b_temp, dtype=np.float64
+            )
         else:
-            self.b_adj0 = np.zeros(self.Q_b, dtype=np.float64)
-            self.b_adj1 = np.zeros(self.Q_b, dtype=np.float64)
-            self.b_adj_div_temp = np.zeros(self.Q_b, dtype=np.float64)
-        self.b_zero_head = (
-            np.asarray(b_zero_head, dtype=bool)
-            if b_zero_head is not None
-            else np.zeros(self.Q_b, dtype=bool)
+            self.b_adj0 = _owned_readonly_array(
+                np.zeros(self.Q_b, dtype=np.float64), dtype=np.float64
+            )
+            self.b_adj1 = _owned_readonly_array(
+                np.zeros(self.Q_b, dtype=np.float64), dtype=np.float64
+            )
+            self.b_adj_div_temp = _owned_readonly_array(
+                np.zeros(self.Q_b, dtype=np.float64), dtype=np.float64
+            )
+        self.b_zero_head = _owned_readonly_array(
+            b_zero_head if b_zero_head is not None else np.zeros(self.Q_b, dtype=bool),
+            dtype=bool,
         )
-        self.s_zero_head = (
-            np.asarray(s_zero_head, dtype=bool)
-            if s_zero_head is not None
-            else np.zeros(self.Q_s, dtype=bool)
+        self.s_zero_head = _owned_readonly_array(
+            s_zero_head if s_zero_head is not None else np.zeros(self.Q_s, dtype=bool),
+            dtype=bool,
         )
         self.Q_total = self.Q_c + self.Q_b + self.Q_s
         self.zero_emb_unit0 = bool(zero_emb_unit0)
@@ -3017,18 +3059,15 @@ class PackedMultiQuestionKernel:
             frozen: List[np.ndarray] = []
             for item in seq:
                 arr = np.asarray(item)
-                if arr.dtype not in (np.float32, np.float64):
-                    arr = arr.astype(np.float32)
-                arr = np.ascontiguousarray(arr)
-                arr.setflags(write=False)
-                frozen.append(arr)
+                dt = arr.dtype if arr.dtype in (np.float32, np.float64) else np.float32
+                frozen.append(_owned_readonly_array(arr, dtype=dt))
             return tuple(frozen)
 
         self.c_raw_w = _freeze_raw_tuple(c_raw_w)
         self.c_raw_b = _freeze_raw_tuple(c_raw_b)
         self.b_raw_w = _freeze_raw_tuple(b_raw_w)
         self.b_raw_b = _freeze_raw_tuple(b_raw_b)
-        self.c_w_l1_max = (
+        self.c_w_l1_max = _owned_readonly_array(
             np.array(
                 [
                     float(np.max(np.sum(np.abs(w), axis=1))) if w.size else 0.0
@@ -3037,31 +3076,35 @@ class PackedMultiQuestionKernel:
                 dtype=np.float64,
             )
             if len(self.c_raw_w) == self.Q_c and self.Q_c > 0
-            else np.empty(0, dtype=np.float64)
+            else np.empty(0, dtype=np.float64),
+            dtype=np.float64,
         )
-        self.c_b_abs_max = (
+        self.c_b_abs_max = _owned_readonly_array(
             np.array(
                 [float(np.max(np.abs(b))) if b.size else 0.0 for b in self.c_raw_b],
                 dtype=np.float64,
             )
             if len(self.c_raw_b) == self.Q_c and self.Q_c > 0
-            else np.empty(0, dtype=np.float64)
+            else np.empty(0, dtype=np.float64),
+            dtype=np.float64,
         )
-        self.b_w_l1 = (
+        self.b_w_l1 = _owned_readonly_array(
             np.array(
                 [float(np.sum(np.abs(w))) if w.size else 0.0 for w in self.b_raw_w],
                 dtype=np.float64,
             )
             if len(self.b_raw_w) == self.Q_b and self.Q_b > 0
-            else np.empty(0, dtype=np.float64)
+            else np.empty(0, dtype=np.float64),
+            dtype=np.float64,
         )
-        self.b_b_abs = (
+        self.b_b_abs = _owned_readonly_array(
             np.array(
                 [float(np.max(np.abs(b))) if b.size else 0.0 for b in self.b_raw_b],
                 dtype=np.float64,
             )
             if len(self.b_raw_b) == self.Q_b and self.Q_b > 0
-            else np.empty(0, dtype=np.float64)
+            else np.empty(0, dtype=np.float64),
+            dtype=np.float64,
         )
 
     @classmethod
@@ -3081,6 +3124,35 @@ class PackedMultiQuestionKernel:
             raise ValueError(
                 f"storage_mode must be one of {_VALID_PACKED_STORAGE_MODES}, got {storage_mode!r}"
             )
+        eng_lock = getattr(eng, "_lock", None)
+        mdl_lock = getattr(getattr(eng, "model", None), "_lock", None)
+        with (eng_lock if eng_lock is not None else nullcontext()), (
+            mdl_lock if mdl_lock is not None else nullcontext()
+        ):
+            return cls._from_engine_locked(
+                eng,
+                storage_mode=storage_mode,
+                alpha=alpha,
+                strict=strict,
+                margin_threshold=margin_threshold,
+                relative_odds_ratio=relative_odds_ratio,
+                confidence_floor_tau0=confidence_floor_tau0,
+                recency_weighted=recency_weighted,
+            )
+
+    @classmethod
+    def _from_engine_locked(
+        cls,
+        eng: Any,
+        *,
+        storage_mode: str = "float32",
+        alpha: Optional[float] = None,
+        strict: Optional[bool] = None,
+        margin_threshold: Optional[float] = None,
+        relative_odds_ratio: Optional[float] = None,
+        confidence_floor_tau0: Optional[float] = None,
+        recency_weighted: Optional[bool] = None,
+    ) -> "PackedMultiQuestionKernel":
         _validate_packed_engine_support(eng)
         fields = eng.schema.fields
         model = eng.model
@@ -3184,6 +3256,7 @@ class PackedMultiQuestionKernel:
         score_names: List[str] = []
         s_min: List[float] = []
         s_range: List[float] = []
+        s_default: List[float] = []
         s_norm_margin: List[float] = []
         s_raw_scale: List[float] = []
         s_is_cal: List[bool] = []
@@ -3240,17 +3313,15 @@ class PackedMultiQuestionKernel:
                 raw_w_arr = np.asarray(head.weights)
                 raw_b_arr = np.asarray(head.biases).reshape(-1)
                 c_raw_w.append(
-                    np.ascontiguousarray(
-                        raw_w_arr
-                        if raw_w_arr.dtype in (np.float32, np.float64)
-                        else raw_w_arr.astype(np.float32)
+                    _owned_readonly_array(
+                        raw_w_arr,
+                        dtype=raw_w_arr.dtype if raw_w_arr.dtype in (np.float32, np.float64) else np.float32,
                     )
                 )
                 c_raw_b.append(
-                    np.ascontiguousarray(
-                        raw_b_arr
-                        if raw_b_arr.dtype in (np.float32, np.float64)
-                        else raw_b_arr.astype(np.float32)
+                    _owned_readonly_array(
+                        raw_b_arr,
+                        dtype=raw_b_arr.dtype if raw_b_arr.dtype in (np.float32, np.float64) else np.float32,
                     )
                 )
                 raw_adj = getattr(cal, "logit_adjustments", None)
@@ -3298,17 +3369,15 @@ class PackedMultiQuestionKernel:
                 raw_w_arr = np.asarray(head.weights)[:1]
                 raw_b_arr = np.asarray(head.biases).reshape(-1)[:1]
                 b_raw_w.append(
-                    np.ascontiguousarray(
-                        raw_w_arr
-                        if raw_w_arr.dtype in (np.float32, np.float64)
-                        else raw_w_arr.astype(np.float32)
+                    _owned_readonly_array(
+                        raw_w_arr,
+                        dtype=raw_w_arr.dtype if raw_w_arr.dtype in (np.float32, np.float64) else np.float32,
                     )
                 )
                 b_raw_b.append(
-                    np.ascontiguousarray(
-                        raw_b_arr
-                        if raw_b_arr.dtype in (np.float32, np.float64)
-                        else raw_b_arr.astype(np.float32)
+                    _owned_readonly_array(
+                        raw_b_arr,
+                        dtype=raw_b_arr.dtype if raw_b_arr.dtype in (np.float32, np.float64) else np.float32,
                     )
                 )
                 adj = getattr(cal, "logit_adjustments", None)
@@ -3366,6 +3435,11 @@ class PackedMultiQuestionKernel:
                 rng_val = float(f_def.max_value - f_def.min_value)
                 s_min.append(float(f_def.min_value))
                 s_range.append(rng_val)
+                s_default.append(
+                    float(f_def.default)
+                    if getattr(f_def, "default", None) is not None
+                    else float(f_def.min_value)
+                )
                 rcp = eng.regression_conformal_predictors[fname]
                 n_res = len(rcp.residuals)
                 cal_ok = bool(rcp.is_calibrated and n_res > 0)
@@ -3448,6 +3522,7 @@ class PackedMultiQuestionKernel:
             c_raw_b=tuple(c_raw_b),
             b_raw_w=tuple(b_raw_w),
             b_raw_b=tuple(b_raw_b),
+            s_default=np.asarray(s_default, dtype=np.float64),
             zero_emb_unit0=zero_emb_unit0,
         )
         kernel._inference_sig = _compute_engine_inference_signature(
@@ -3741,6 +3816,8 @@ class PackedMultiQuestionKernel:
                 )
                 c_ambig = (in_c == 0) | ((in_c > 1) & (~mg))
             if np.any(c_nonfin):
+                best_idx = np.array(best_idx, dtype=np.int32, copy=True)
+                best_idx[c_nonfin] = 0
                 in_c = np.array(in_c, dtype=np.int32, copy=True)
                 in_c[c_nonfin] = 0
                 c_ambig[c_nonfin] = True
@@ -3896,6 +3973,7 @@ class PackedMultiQuestionKernel:
                 )
                 b_ambig = (in_b == 0) | ((in_b > 1) & (~mg_b))
             if np.any(b_nonfin):
+                b_val[b_nonfin] = False
                 in_b[b_nonfin] = 0
                 b_ambig[b_nonfin] = True
                 b_conf[b_nonfin] = np.nan
@@ -3933,6 +4011,7 @@ class PackedMultiQuestionKernel:
                 if not s_ambig.flags.writeable:
                     s_ambig = np.array(s_ambig, dtype=bool, copy=True)
                 s_ambig[s_nonfin] = True
+                s_val[s_nonfin] = np.broadcast_to(self.s_default[None, :], s_val.shape)[s_nonfin]
                 s_conf[s_nonfin] = np.nan
         else:
             p_s = s_val = s_conf = np.empty((B, 0), dtype=np.float64)
@@ -4048,22 +4127,7 @@ class PackedMultiQuestionKernel:
                 raise TypeError(
                     f"All elements in prompts must be strings, got {type(p).__name__} at index {idx}"
                 )
-        proj_cls_name = type(self.projector).__name__
-        if (
-            hasattr(self.projector, "project_batch")
-            and type(self.projector) is not DeterministicSemanticProjector
-            and proj_cls_name != "HybridProjector"
-        ):
-            try:
-                raw_mat = self.projector.project_batch(
-                    list(prompts), recency_weighted=self.recency_weighted
-                )
-            except TypeError:
-                raw_mat = self.projector.project_batch(list(prompts))
-            return _normalize_raw_projection_batch(
-                raw_mat, len(prompts), self.dimension, zero_unit0=self.zero_emb_unit0
-            )
-        return np.stack([self.encode_one(p) for p in prompts], axis=0)
+        return np.stack([self.encode_one(p) for p in prompts], axis=0).astype(np.float32, copy=False)
 
     def decide_prompt(self, prompt: str) -> Dict[str, Any]:
         return self.forward_embeddings(self.encode_one(prompt), prompts=(prompt,))
@@ -4165,6 +4229,7 @@ class _BoundCallableState:
     b_raw_b: Tuple[np.ndarray, ...] = ()
     b_w_l1: Tuple[float, ...] = ()
     b_b_abs: Tuple[float, ...] = ()
+    s_default: Tuple[float, ...] = ()
 
 
 def _snapshot_engine_schema_state(eng: Any) -> Tuple[Any, Any, int, Optional[str], int, Optional[str]]:
@@ -4193,31 +4258,36 @@ class FastDecisionCallable:
         self._aci_tracker = getattr(eng, "aci_tracker", None)
         self._eng_ref = eng
         self._rebind_lock = threading.Lock()
-        live_schema, live_model_schema, s_id, s_dig, ms_id, ms_dig = _snapshot_engine_schema_state(eng)
-        self._schema_ref = live_schema
-        self._model_schema_ref = live_model_schema
-        mv = int(getattr(eng, "model_version", 1))
-        pe = int(getattr(eng, "policy_epoch", 0))
-        if hasattr(eng, "compile_packed_kernel"):
-            kernel = eng.compile_packed_kernel(storage_mode=storage_mode)
-        else:
-            kernel = PackedMultiQuestionKernel.from_engine(eng, storage_mode=storage_mode)
-        live_sig = getattr(kernel, "_inference_sig", None)
-        if live_sig is None:
-            live_sig = _compute_engine_inference_signature(
-                eng, storage_mode, effective_alpha=kernel.alpha
+        eng_lock = getattr(eng, "_lock", None)
+        mdl_lock = getattr(getattr(eng, "model", None), "_lock", None)
+        with (eng_lock if eng_lock is not None else nullcontext()), (
+            mdl_lock if mdl_lock is not None else nullcontext()
+        ):
+            live_schema, live_model_schema, s_id, s_dig, ms_id, ms_dig = _snapshot_engine_schema_state(eng)
+            self._schema_ref = live_schema
+            self._model_schema_ref = live_model_schema
+            mv = int(getattr(eng, "model_version", 1))
+            pe = int(getattr(eng, "policy_epoch", 0))
+            if hasattr(eng, "compile_packed_kernel"):
+                kernel = eng.compile_packed_kernel(storage_mode=storage_mode)
+            else:
+                kernel = PackedMultiQuestionKernel.from_engine(eng, storage_mode=storage_mode)
+            live_sig = getattr(kernel, "_inference_sig", None)
+            if live_sig is None:
+                live_sig = _compute_engine_inference_signature(
+                    eng, storage_mode, effective_alpha=kernel.alpha
+                )
+            self._state = self._build_state(
+                kernel,
+                storage_mode=storage_mode,
+                schema_id=s_id,
+                schema_digest=s_dig,
+                model_schema_id=ms_id,
+                model_schema_digest=ms_dig,
+                model_version=mv,
+                policy_epoch=pe,
+                engine_sig=live_sig,
             )
-        self._state = self._build_state(
-            kernel,
-            storage_mode=storage_mode,
-            schema_id=s_id,
-            schema_digest=s_dig,
-            model_schema_id=ms_id,
-            model_schema_digest=ms_dig,
-            model_version=mv,
-            policy_epoch=pe,
-            engine_sig=live_sig,
-        )
 
     @staticmethod
     def _build_state(
@@ -4232,10 +4302,8 @@ class FastDecisionCallable:
         policy_epoch: int = 0,
         engine_sig: Tuple[Any, ...] = (),
     ) -> _BoundCallableState:
-        W_t = np.ascontiguousarray(kernel.W_packed, dtype=np.float32)
-        b = np.ascontiguousarray(kernel.b_packed, dtype=np.float32)
-        W_t.setflags(write=False)
-        b.setflags(write=False)
+        W_t = _owned_readonly_array(kernel.W_packed, dtype=np.float32)
+        b = _owned_readonly_array(kernel.b_packed, dtype=np.float32)
         return _BoundCallableState(
             kernel=kernel,
             projector=kernel.projector,
@@ -4305,6 +4373,7 @@ class FastDecisionCallable:
             b_raw_b=kernel.b_raw_b,
             b_w_l1=tuple(float(x) for x in kernel.b_w_l1),
             b_b_abs=tuple(float(x) for x in kernel.b_b_abs),
+            s_default=tuple(float(x) for x in kernel.s_default),
         )
 
     def _bind_kernel(self, kernel: PackedMultiQuestionKernel, *, storage_mode: str) -> None:
@@ -4357,47 +4426,52 @@ class FastDecisionCallable:
             )
             if eff_alpha != st.alpha or live_sig != st.engine_sig:
                 with self._rebind_lock:
-                    st = self._state
-                    live_schema, live_model_schema, s_id, s_dig, ms_id, ms_dig = (
-                        _snapshot_engine_schema_state(eng_ref)
-                    )
-                    tracker = getattr(eng_ref, "aci_tracker", None)
-                    self._validate_live_constraints(eng_ref, live_schema, live_model_schema, tracker)
-                    eff_alpha = (
-                        float(tracker.alpha_t)
-                        if tracker is not None
-                        else float(getattr(eng_ref, "default_alpha", st.alpha))
-                    )
-                    live_sig = _compute_engine_inference_signature(
-                        eng_ref, self._storage_mode, effective_alpha=eff_alpha
-                    )
-                    if eff_alpha != st.alpha or live_sig != st.engine_sig:
-                        if hasattr(eng_ref, "compile_packed_kernel"):
-                            new_kernel = eng_ref.compile_packed_kernel(
-                                storage_mode=self._storage_mode
-                            )
-                        else:
-                            new_kernel = PackedMultiQuestionKernel.from_engine(
-                                eng_ref,
-                                storage_mode=self._storage_mode,
-                                alpha=eff_alpha,
-                            )
-                        live_mv = int(getattr(eng_ref, "model_version", st.model_version))
-                        live_pe = int(getattr(eng_ref, "policy_epoch", st.policy_epoch))
-                        st = self._build_state(
-                            new_kernel,
-                            storage_mode=self._storage_mode,
-                            schema_id=s_id,
-                            schema_digest=s_dig,
-                            model_schema_id=ms_id,
-                            model_schema_digest=ms_dig,
-                            model_version=live_mv,
-                            policy_epoch=live_pe,
-                            engine_sig=getattr(new_kernel, "_inference_sig", None) or live_sig,
+                    eng_lock = getattr(eng_ref, "_lock", None)
+                    mdl_lock = getattr(getattr(eng_ref, "model", None), "_lock", None)
+                    with (eng_lock if eng_lock is not None else nullcontext()), (
+                        mdl_lock if mdl_lock is not None else nullcontext()
+                    ):
+                        st = self._state
+                        live_schema, live_model_schema, s_id, s_dig, ms_id, ms_dig = (
+                            _snapshot_engine_schema_state(eng_ref)
                         )
-                        self._state = st
-                        self._schema_ref = live_schema
-                        self._model_schema_ref = live_model_schema
+                        tracker = getattr(eng_ref, "aci_tracker", None)
+                        self._validate_live_constraints(eng_ref, live_schema, live_model_schema, tracker)
+                        eff_alpha = (
+                            float(tracker.alpha_t)
+                            if tracker is not None
+                            else float(getattr(eng_ref, "default_alpha", st.alpha))
+                        )
+                        live_sig = _compute_engine_inference_signature(
+                            eng_ref, self._storage_mode, effective_alpha=eff_alpha
+                        )
+                        if eff_alpha != st.alpha or live_sig != st.engine_sig:
+                            if hasattr(eng_ref, "compile_packed_kernel"):
+                                new_kernel = eng_ref.compile_packed_kernel(
+                                    storage_mode=self._storage_mode
+                                )
+                            else:
+                                new_kernel = PackedMultiQuestionKernel.from_engine(
+                                    eng_ref,
+                                    storage_mode=self._storage_mode,
+                                    alpha=eff_alpha,
+                                )
+                            live_mv = int(getattr(eng_ref, "model_version", st.model_version))
+                            live_pe = int(getattr(eng_ref, "policy_epoch", st.policy_epoch))
+                            st = self._build_state(
+                                new_kernel,
+                                storage_mode=self._storage_mode,
+                                schema_id=s_id,
+                                schema_digest=s_dig,
+                                model_schema_id=ms_id,
+                                model_schema_digest=ms_dig,
+                                model_version=live_mv,
+                                policy_epoch=live_pe,
+                                engine_sig=getattr(new_kernel, "_inference_sig", None) or live_sig,
+                            )
+                            self._state = st
+                            self._schema_ref = live_schema
+                            self._model_schema_ref = live_model_schema
         else:
             self._validate_live_constraints(
                 None, self._schema_ref, self._model_schema_ref, self._aci_tracker
@@ -4775,7 +4849,7 @@ class FastDecisionCallable:
             scaled_zs = zv / 0.25
             z_cal = scaled_zs / st.s_raw_scale[si]
             if (not emb_ok) or not (isfinite(zv) and isfinite(scaled_zs) and isfinite(z_cal)):
-                vals[fn] = float("nan")
+                vals[fn] = st.s_default[si]
                 confs[fn] = float("nan")
                 ambig = True
                 continue
@@ -4792,7 +4866,7 @@ class FastDecisionCallable:
                 ps_raw = ez_raw / (1.0 + ez_raw)
             s_conf = ps_raw if ps_raw >= 0.5 else (1.0 - ps_raw)
             if not (isfinite(s_val) and isfinite(s_conf)):
-                vals[fn] = s_val
+                vals[fn] = st.s_default[si]
                 confs[fn] = float("nan")
                 ambig = True
                 continue

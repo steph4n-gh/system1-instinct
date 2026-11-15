@@ -500,21 +500,55 @@ class UtilityCascadeRouter:
         *,
         cal_prompts: Optional[Sequence[str]] = None,
         cal_tiers: Optional[Sequence[Union[int, str]]] = None,
-        cal_fraction: float = 0.0,
+        cal_fraction: float = 0.35,
     ) -> "UtilityCascadeRouter":
         """Train ordinal tier predictor and calibrate utility + escalation risk."""
         if len(prompts) != len(true_tiers) or len(prompts) == 0:
             raise ValueError("prompts and true_tiers must be non-empty and match in length")
+        if (cal_prompts is None) != (cal_tiers is None):
+            raise ValueError("cal_prompts and cal_tiers must both be provided or both be None")
+        if isinstance(cal_fraction, bool) or not isinstance(cal_fraction, (int, float, np.integer, np.floating)):
+            raise ValueError(f"cal_fraction must be a finite float in [0.0, 1.0), got {cal_fraction!r}")
+        cal_frac = float(cal_fraction)
+        if not np.isfinite(cal_frac) or not (0.0 <= cal_frac < 1.0):
+            raise ValueError(f"cal_fraction must lie in [0.0, 1.0), got {cal_fraction!r}")
 
-        if cal_prompts is None and cal_tiers is None and cal_fraction > 0.0 and len(prompts) >= 10:
-            split = max(1, min(len(prompts) - 1, int(round(len(prompts) * (1.0 - float(cal_fraction))))))
-            fit_prompts, cal_prompts_eff = list(prompts[:split]), list(prompts[split:])
-            fit_tiers, cal_tiers_eff = list(true_tiers[:split]), list(true_tiers[split:])
+        if cal_prompts is not None and cal_tiers is not None:
+            fit_prompts = list(prompts)
+            fit_tiers = list(true_tiers)
+            cal_prompts_eff: Optional[List[str]] = list(cal_prompts)
+            cal_tiers_eff: Optional[List[Union[int, str]]] = list(cal_tiers)
+            if len(cal_prompts_eff) != len(cal_tiers_eff) or len(cal_prompts_eff) == 0:
+                raise ValueError("cal_prompts and cal_tiers must be non-empty and match in length")
+        elif cal_frac > 0.0 and len(prompts) >= 2:
+            all_y = self._parse_tiers(true_tiers)
+            buckets: Dict[int, List[int]] = {}
+            for idx in range(len(all_y)):
+                buckets.setdefault(int(all_y[idx]), []).append(idx)
+            cal_set = set()
+            for idxs in buckets.values():
+                c_len = len(idxs)
+                if c_len < 2:
+                    continue
+                n_cal_c = max(1, min(c_len - 1, int(round(c_len * cal_frac))))
+                for j in range(n_cal_c):
+                    pos = (j * c_len + c_len // 2) // n_cal_c
+                    cal_set.add(idxs[pos])
+            if cal_set:
+                fit_prompts = [prompts[i] for i in range(len(prompts)) if i not in cal_set]
+                fit_tiers = [true_tiers[i] for i in range(len(true_tiers)) if i not in cal_set]
+                cal_prompts_eff = [prompts[i] for i in range(len(prompts)) if i in cal_set]
+                cal_tiers_eff = [true_tiers[i] for i in range(len(true_tiers)) if i in cal_set]
+            else:
+                fit_prompts = list(prompts)
+                fit_tiers = list(true_tiers)
+                cal_prompts_eff = None
+                cal_tiers_eff = None
         else:
             fit_prompts = list(prompts)
             fit_tiers = list(true_tiers)
-            cal_prompts_eff = list(cal_prompts) if cal_prompts is not None else None
-            cal_tiers_eff = list(cal_tiers) if cal_tiers is not None else None
+            cal_prompts_eff = None
+            cal_tiers_eff = None
 
         y_fit = self._parse_tiers(fit_tiers)
         for prompt, tier_idx in zip(fit_prompts, y_fit):
@@ -536,7 +570,17 @@ class UtilityCascadeRouter:
 
         if cal_prompts_eff is not None and cal_tiers_eff is not None:
             return self.calibrate(cal_prompts_eff, cal_tiers_eff)
-        return self.calibrate(fit_prompts, fit_tiers, _features=x_fit, _y=y_fit)
+        self.utility_calibrator = UtilityCalibrator(
+            self.cost_matrix,
+            safe_action=self.safe_action,
+            alpha=self.alpha,
+            ladder_mode=self.ladder_mode,
+        )
+        self.binary_calibrator = BinaryPlattBetaCalibrator(
+            min_beta_samples=self.min_beta_samples
+        )
+        self._is_calibrated = False
+        return self
 
     def calibrate(
         self,
@@ -574,7 +618,7 @@ class UtilityCascadeRouter:
             costs_vec = self.utility_calibrator.expected_costs(raw_p, apply_temperature=False)
             action = int(np.argmin(costs_vec))
             used_crc_fallback = False
-            is_vacuous = False
+            is_vacuous = True
 
         tier = CASCADE_TIERS[action]
         latency_ms = (time.perf_counter() - t0) * 1000.0

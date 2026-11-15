@@ -1916,11 +1916,7 @@ class OnlineMondrianConformal:
         if err_y is not None and isinstance(err_y, (float, np.floating)) and not math.isfinite(float(err_y)):
             raise ValueError(f"err_y must be finite, got {err_y!r}")
         if probs is not None:
-            p_arr = np.asarray(probs, dtype=np.float64)
-            if p_arr.ndim != 1 or p_arr.shape[0] != self.num_classes or not bool(np.all(np.isfinite(p_arr))):
-                raise ValueError(f"probs must be 1D finite with length {self.num_classes}")
-            if not bool(np.all((p_arr >= 0.0) & (p_arr <= 1.0))):
-                raise ValueError("probs entries must lie in [0.0, 1.0]")
+            p_arr = self._validate_probs(probs)
             if score_y is None:
                 s_val = 1.0 - float(p_arr[cls_idx])
             else:
@@ -1966,11 +1962,26 @@ class OnlineMondrianConformal:
         self.q_c[cls_idx] = 1.0 if u_next >= self.u_max - 1e-6 else (1.0 - math.exp(-u_next))
         self.steps += 1
 
+    def _validate_probs(self, probs: Sequence[float]) -> np.ndarray:
+        """Validate 1D finite probability vector in [0.0, 1.0] (rejecting bool/str/object)."""
+        if isinstance(probs, (str, bytes)):
+            raise ValueError("probs must be a numeric 1D sequence, not str or bytes")
+        if not isinstance(probs, np.ndarray) and isinstance(probs, Sequence):
+            if any(isinstance(v, bool) for v in probs):
+                raise ValueError("probs entries must be real numbers, not bool")
+        raw = np.asarray(probs)
+        if raw.dtype == np.bool_ or raw.dtype.kind not in ("i", "u", "f"):
+            raise ValueError(f"probs must have numeric dtype, got {raw.dtype}")
+        p_arr = np.asarray(raw, dtype=np.float64)
+        if p_arr.ndim != 1 or p_arr.shape[0] != self.num_classes or not bool(np.all(np.isfinite(p_arr))):
+            raise ValueError(f"probs must be 1D finite with length {self.num_classes}")
+        if not bool(np.all((p_arr >= 0.0) & (p_arr <= 1.0))):
+            raise ValueError("probs entries must lie in [0.0, 1.0]")
+        return p_arr
+
     def predict_set(self, probs: Sequence[float]) -> List[int]:
         """Return class indices whose nonconformity score (1 - p_k) <= q_c[k]."""
-        p_arr = np.asarray(probs, dtype=np.float64)
-        if p_arr.shape != (self.num_classes,):
-            raise ValueError(f"probs must have shape ({self.num_classes},), got {p_arr.shape}")
+        p_arr = self._validate_probs(probs)
         scores = 1.0 - p_arr
         return [k for k in range(self.num_classes) if float(scores[k]) <= float(self.q_c[k]) + 1e-12]
 

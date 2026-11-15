@@ -1,6 +1,7 @@
 """Sub-100us exact additive attribution, exemplar witness, and counterfactual explainer."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 import math
@@ -22,12 +23,17 @@ from system1.core.embeddings import (
     _stem_word as _emb_stem_word,
     _tokenize_with_negation_scope,
 )
-from system1.core.model import _has_custom_validate_decision
+from system1.core.model import (
+    _has_custom_validate_decision,
+    _normalize_raw_projection,
+    _owned_readonly_array,
+)
 from system1.core.schema import BooleanField, ChoiceField
 from system1.core.text import (
     _CONTRACTION_RE,
     MAX_TERM_LENGTH,
     MAX_TEXT_LENGTH,
+    PragmaticCompositeProjector,
     TfidfProjector,
     _stem_word as _tfidf_stem_word,
 )
@@ -88,21 +94,14 @@ def _normalize_head_weights_and_options(
     return w, b, opts
 
 
-def _l2_normalize_batch(mat: np.ndarray) -> np.ndarray:
-    arr = np.asarray(mat, dtype=np.float32)
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    if arr.shape[0] == 0:
-        return arr
-    norms = np.linalg.norm(arr, axis=1, keepdims=True)
-    good = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
-    out = np.zeros_like(arr, dtype=np.float32)
-    if np.any(good):
-        out[good] = (arr[good] / norms[good]).astype(np.float32)
-    return out
-
-
-def _project_one(projector: Any, text: str, *, recency_weighted: bool = False) -> np.ndarray:
+def _project_one(
+    projector: Any,
+    text: str,
+    *,
+    recency_weighted: bool = False,
+    zero_unit0: bool = False,
+    dimension: Optional[int] = None,
+) -> np.ndarray:
     use_rw = bool(recency_weighted)
     if hasattr(projector, "project"):
         try:
@@ -113,11 +112,9 @@ def _project_one(projector: Any, text: str, *, recency_weighted: bool = False) -
         out = projector(text)
     if isinstance(out, tuple):
         out = out[0]
-    vec = np.asarray(out, dtype=np.float32).reshape(-1)
-    norm = float(np.linalg.norm(vec))
-    if norm > 1e-12 and math.isfinite(norm):
-        return (vec / norm).astype(np.float32)
-    return np.zeros_like(vec, dtype=np.float32)
+    raw_arr = np.asarray(out, dtype=np.float32).reshape(-1)
+    dim = int(raw_arr.shape[0] if dimension is None else dimension)
+    return _normalize_raw_projection(raw_arr, dim, zero_unit0=bool(zero_unit0))
 
 
 def _project_texts(
@@ -125,25 +122,26 @@ def _project_texts(
     texts: Sequence[str],
     *,
     recency_weighted: bool = False,
+    zero_unit0: bool = False,
+    dimension: Optional[int] = None,
 ) -> np.ndarray:
     text_list = list(texts)
     if not text_list:
-        dim = int(getattr(projector, "dimension", 0))
+        dim = int(getattr(projector, "dimension", 0) if dimension is None else dimension)
         return np.empty((0, dim), dtype=np.float32)
     use_rw = bool(recency_weighted)
-    project_batch = getattr(projector, "project_batch", None)
-    if callable(project_batch):
-        try:
-            out = project_batch(text_list, recency_weighted=use_rw)
-        except TypeError:
-            if not use_rw:
-                out = project_batch(text_list)
-            else:
-                out = np.vstack([_project_one(projector, t, recency_weighted=True) for t in text_list])
-        if isinstance(out, tuple):
-            out = out[0]
-        return _l2_normalize_batch(np.asarray(out, dtype=np.float32))
-    return np.vstack([_project_one(projector, t, recency_weighted=use_rw) for t in text_list])
+    return np.vstack(
+        [
+            _project_one(
+                projector,
+                t,
+                recency_weighted=use_rw,
+                zero_unit0=zero_unit0,
+                dimension=dimension,
+            )
+            for t in text_list
+        ]
+    )
 
 
 def _normalize_label_str(label: Any) -> str:
@@ -171,14 +169,18 @@ def _extract_calibrated_head_params(
     model: Any,
     fname: str,
     *,
+    schema: Optional[Any] = None,
     calibrator: Any = None,
     temperature_scale: float = 4.0,
     recency_weighted: Optional[bool] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...], float, float, Dict[str, Any]]:
-    """Extract calibrated effective weights, biases, scale, and threshold matching engine decide()."""
-    if _has_custom_validate_decision(getattr(model, "schema", None)):
+    """Extract calibrated head weights, biases, scale, and threshold matching engine decide()."""
+    eff_schema = model.schema if schema is None else schema
+    if _has_custom_validate_decision(eff_schema) or _has_custom_validate_decision(
+        getattr(model, "schema", None)
+    ):
         raise ValueError("FastExplainer does not support custom DecisionSchema.validate_decision")
-    f_def = model.schema.fields[fname]
+    f_def = eff_schema.fields[fname]
     field_heads = getattr(model, "_field_heads", None)
     compiled_heads = getattr(model, "heads", None)
     field_head = field_heads.get(fname) if isinstance(field_heads, Mapping) else None
@@ -221,52 +223,56 @@ def _extract_calibrated_head_params(
     temp = float(raw_temp_obj)
     if not math.isfinite(temp) or temp <= 0.0:
         raise ValueError(f"calibrator temperature must be finite and positive, got {raw_temp_obj!r}")
-    eff_scale = base_scale / temp
 
     w = np.asarray(head.weights, dtype=np.float64)
     b = np.asarray(head.biases, dtype=np.float64).reshape(-1).copy()
     is_boolean = isinstance(f_def, BooleanField)
+    if is_boolean:
+        if w.ndim != 2 or w.shape[0] not in (1, 2) or b.size != w.shape[0]:
+            raise ValueError(f"Incompatible BooleanField head shapes weights={w.shape}, biases={b.shape} for {fname!r}")
+    else:
+        if w.ndim != 2 or w.shape[0] != len(f_def.options) or b.size != w.shape[0]:
+            raise ValueError(f"Incompatible ChoiceField head shapes weights={w.shape}, biases={b.shape} for {fname!r}")
+
+    if not (bool(np.all(np.isfinite(w))) and bool(np.all(np.isfinite(b)))):
+        raise ValueError(f"Head weights or biases for {fname!r} contain non-finite values")
+
     is_zero_head = bool(not np.any(w) and not np.any(b))
-    raw_w_f32 = (
-        np.ascontiguousarray(head.weights, dtype=np.float32)[:1]
-        if is_boolean
-        else np.ascontiguousarray(head.weights, dtype=np.float32)
-    )
-    raw_b_f32 = (
-        np.ascontiguousarray(head.biases, dtype=np.float32).reshape(-1)[:1]
-        if is_boolean
-        else np.ascontiguousarray(head.biases, dtype=np.float32).reshape(-1)
-    )
+    raw_w_src = np.asarray(head.weights)
+    raw_w_dt = raw_w_src.dtype if raw_w_src.dtype in (np.float32, np.float64) else np.float32
+    raw_w_slice = raw_w_src[:1] if (is_boolean and raw_w_src.shape[0] == 1) else raw_w_src
+    raw_w = _owned_readonly_array(raw_w_slice, dtype=raw_w_dt)
+
+    raw_b_src = np.asarray(head.biases).reshape(-1)
+    raw_b_dt = raw_b_src.dtype if raw_b_src.dtype in (np.float32, np.float64) else np.float32
+    raw_b_slice = raw_b_src[:1] if (is_boolean and raw_w_src.shape[0] == 1) else raw_b_src
+    raw_b = _owned_readonly_array(raw_b_slice, dtype=raw_b_dt)
+
+    delta_adj = 0.0
     cal_adj_2: Optional[np.ndarray] = None
     cal_adj_choice: Optional[np.ndarray] = None
 
     if adj_raw is not None:
         adj = np.asarray(adj_raw, dtype=np.float64).reshape(-1)
+        if not bool(np.all(np.isfinite(adj))):
+            raise ValueError(f"logit_adjustments contains non-finite values for field {fname!r}")
         if is_boolean or w.shape[0] == 1:
             if adj.size == 2:
                 delta_adj = float(adj[1] - adj[0])
                 cal_adj_2 = adj.astype(np.float64).copy()
             elif adj.size == 1:
                 delta_adj = float(adj[0])
-                cal_adj_2 = np.array([-0.5 * float(adj[0]), 0.5 * float(adj[0])], dtype=np.float64)
-            else:
+                cal_adj_2 = np.array([-0.5 * delta_adj, 0.5 * delta_adj], dtype=np.float64)
+            elif adj.size > 0:
                 raise ValueError(
                     f"Unsupported logit_adjustments length {adj.size} for BooleanField {fname!r}"
                 )
-            b[0] += delta_adj / base_scale
-            adj_eff = np.array([delta_adj / temp], dtype=np.float64)
         elif adj.size == w.shape[0]:
-            b += adj / base_scale
-            adj_eff = (adj / temp).astype(np.float64)
             cal_adj_choice = adj.astype(np.float64).copy()
         elif adj.size > 0:
             raise ValueError(
                 f"logit_adjustments length {adj.size} != head outputs {w.shape[0]} for field {fname!r}"
             )
-        else:
-            adj_eff = np.zeros(1 if is_boolean else w.shape[0], dtype=np.float64)
-    else:
-        adj_eff = np.zeros(1 if is_boolean else w.shape[0], dtype=np.float64)
 
     default_rec = bool(getattr(model, "recency_weighted", getattr(model.projector, "recency_weighted", False)))
     eff_recency = default_rec if recency_weighted is None else bool(recency_weighted)
@@ -281,22 +287,29 @@ def _extract_calibrated_head_params(
                     if bool(rec_flag) == eff_recency:
                         learned_overrides[p_k] = f_map[fname]
 
+    proj_obj = getattr(model, "projector", None)
+    is_compiled_model = any(cls_mro.__name__ == "CompiledSystemOneModel" for cls_mro in type(model).__mro__)
+    zero_emb_unit0 = bool(
+        is_compiled_model and not isinstance(proj_obj, (TfidfProjector, PragmaticCompositeProjector))
+    )
+
     opts = ("False", "True") if is_boolean else tuple(f_def.options)
     thr = float(getattr(f_def, "threshold", 0.5)) if is_boolean else 0.5
     meta = {
         "is_boolean": is_boolean,
         "is_zero_head": is_zero_head,
-        "adj_eff": adj_eff,
         "learned_overrides": learned_overrides,
         "recency_weighted": eff_recency,
-        "raw_w_f32": raw_w_f32,
-        "raw_b_f32": raw_b_f32,
+        "raw_w": raw_w,
+        "raw_b": raw_b,
         "base_scale": base_scale,
         "cal_temp": temp,
+        "delta_adj": delta_adj,
         "cal_adj_2": cal_adj_2,
         "cal_adj_choice": cal_adj_choice,
+        "zero_emb_unit0": zero_emb_unit0,
     }
-    return w, b, opts, thr, eff_scale, meta
+    return w, b, opts, thr, base_scale, meta
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,12 +373,39 @@ class FastExplainer:
         learned_overrides: Optional[Mapping[str, Any]] = None,
         is_zero_head: bool = False,
         adj_eff: Optional[np.ndarray] = None,
+        calibrator_temperature: float = 1.0,
+        zero_emb_unit0: bool = False,
         _bool_raw_meta: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.projector = projector
-        self.scale = float(temperature_scale)
+        if isinstance(temperature_scale, bool) or not isinstance(temperature_scale, (int, float, np.integer, np.floating)):
+            raise ValueError(f"temperature_scale must be finite and positive, got {temperature_scale!r}")
+        base_scale = float(temperature_scale)
+        if not math.isfinite(base_scale) or base_scale <= 0.0:
+            raise ValueError(f"temperature_scale must be finite and positive, got {temperature_scale!r}")
+        raw_cal_temp = (
+            _bool_raw_meta["cal_temp"]
+            if (_bool_raw_meta is not None and "cal_temp" in _bool_raw_meta)
+            else calibrator_temperature
+        )
+        if isinstance(raw_cal_temp, bool) or not isinstance(raw_cal_temp, (int, float, np.integer, np.floating)):
+            raise ValueError(f"calibrator temperature must be finite and positive, got {raw_cal_temp!r}")
+        eff_cal_temp = float(raw_cal_temp)
+        if not math.isfinite(eff_cal_temp) or eff_cal_temp <= 0.0:
+            raise ValueError(f"calibrator temperature must be finite and positive, got {raw_cal_temp!r}")
+
+        self.scale = base_scale
+        self.cal_temp = eff_cal_temp
         self.threshold = float(threshold)
+        self.zero_emb_unit0 = bool(
+            _bool_raw_meta.get("zero_emb_unit0", zero_emb_unit0)
+            if _bool_raw_meta is not None
+            else zero_emb_unit0
+        )
         w_in = np.asarray(weights)
+        b_in = np.asarray(biases).reshape(-1)
+        if not (bool(np.all(np.isfinite(w_in))) and bool(np.all(np.isfinite(b_in)))):
+            raise ValueError("Head weights and biases must be finite")
         inferred_bool = w_in.ndim == 2 and w_in.shape[0] == 1 and (options is None or len(options) in (0, 2))
         self._is_boolean = bool(inferred_bool if is_boolean is None else is_boolean)
         self._bool_logit_shift = _boolean_threshold_logit_shift(self.threshold)
@@ -379,7 +419,7 @@ class FastExplainer:
         )
         self._is_zero_head = bool(is_zero_head)
 
-        w_norm, b_norm, resolved_options = _normalize_head_weights_and_options(
+        _, _, resolved_options = _normalize_head_weights_and_options(
             weights,
             biases,
             options,
@@ -389,79 +429,154 @@ class FastExplainer:
         self.options = resolved_options
         self.label_to_idx = {lbl: i for i, lbl in enumerate(self.options)}
         self.num_classes = len(self.options)
-        self.W_eff = np.ascontiguousarray(w_norm * self.scale, dtype=np.float64)
-        self.b_eff = np.ascontiguousarray(b_norm * self.scale, dtype=np.float64)
+        w_f64 = np.asarray(w_in, dtype=np.float64)
+        b_f64 = np.asarray(b_in, dtype=np.float64)
+        opts_in = tuple(str(o) for o in options) if options is not None else ()
+        is_scalar_bool = w_f64.shape[0] == 1 and (not opts_in or len(opts_in) == 2)
+
+        adj_eff_in: Optional[np.ndarray] = None
         if adj_eff is not None:
-            self._adj_eff = np.asarray(adj_eff, dtype=np.float64).reshape(-1)
-        else:
-            self._adj_eff = np.zeros(1 if self._is_boolean else self.num_classes, dtype=np.float64)
+            adj_eff_in = np.asarray(adj_eff, dtype=np.float64).reshape(-1)
+            if not bool(np.all(np.isfinite(adj_eff_in))):
+                raise ValueError("adj_eff contains non-finite values")
+
+        delta_adj = 0.0
+        with np.errstate(over="ignore", invalid="ignore"):
+            if is_scalar_bool:
+                w_scaled = (w_f64[0] * self.scale) / self.cal_temp
+                if _bool_raw_meta is not None:
+                    delta_adj = float(_bool_raw_meta.get("delta_adj", 0.0))
+                    b_scaled = ((float(b_f64[0]) * self.scale) + delta_adj) / self.cal_temp - self._bool_logit_shift
+                    adj_eff_vec = np.array([delta_adj / self.cal_temp], dtype=np.float64)
+                else:
+                    adj_term = float(adj_eff_in[0]) if (adj_eff_in is not None and adj_eff_in.size == 1) else 0.0
+                    delta_adj = adj_term * self.cal_temp
+                    b_scaled = ((float(b_f64[0]) * self.scale) / self.cal_temp + adj_term) - self._bool_logit_shift
+                    adj_eff_vec = np.array([adj_term], dtype=np.float64)
+                self.W_eff = np.ascontiguousarray(np.vstack([-0.5 * w_scaled, 0.5 * w_scaled]), dtype=np.float64)
+                self.b_eff = np.ascontiguousarray(np.array([-0.5 * b_scaled, 0.5 * b_scaled], dtype=np.float64))
+            else:
+                self.W_eff = np.ascontiguousarray((w_f64 * self.scale) / self.cal_temp, dtype=np.float64)
+                if _bool_raw_meta is not None:
+                    raw_c_adj = (
+                        _bool_raw_meta.get("cal_adj_2")
+                        if self._is_boolean
+                        else _bool_raw_meta.get("cal_adj_choice")
+                    )
+                    adj_vec = (
+                        np.asarray(raw_c_adj, dtype=np.float64).reshape(-1)
+                        if raw_c_adj is not None
+                        else np.zeros(self.num_classes, dtype=np.float64)
+                    )
+                    b_vec = ((b_f64 * self.scale) + adj_vec) / self.cal_temp
+                    adj_eff_vec = (adj_vec / self.cal_temp).astype(np.float64)
+                    if self._is_boolean and adj_vec.size == 2:
+                        delta_adj = float(adj_vec[1] - adj_vec[0])
+                else:
+                    adj_eff_vec = (
+                        adj_eff_in.copy()
+                        if (adj_eff_in is not None and adj_eff_in.size == self.num_classes)
+                        else np.zeros(self.num_classes, dtype=np.float64)
+                    )
+                    b_vec = (b_f64 * self.scale) / self.cal_temp + adj_eff_vec
+                    if self._is_boolean and adj_eff_vec.size == 2:
+                        delta_adj = float(adj_eff_vec[1] - adj_eff_vec[0]) * self.cal_temp
+                if self._is_boolean and w_f64.shape[0] == 2:
+                    b_vec = b_vec + np.array([0.5 * self._bool_logit_shift, -0.5 * self._bool_logit_shift], dtype=np.float64)
+                self.b_eff = np.ascontiguousarray(b_vec, dtype=np.float64)
+
+        if not (
+            bool(np.all(np.isfinite(self.W_eff)))
+            and bool(np.all(np.isfinite(self.b_eff)))
+            and bool(np.all(np.isfinite(adj_eff_vec)))
+        ):
+            raise ValueError("Derived effective attribution parameters overflowed float64")
+        self.dimension = int(self.W_eff.shape[1])
+        self._adj_eff = adj_eff_vec
+        self._delta_adj = float(delta_adj)
 
         self._bool_has_scalar_raw = False
-        self._bool_raw_w_f32 = np.empty((0, 0), dtype=np.float32)
-        self._bool_raw_b_f32 = np.empty(0, dtype=np.float32)
+        self._bool_raw_w = np.empty((0, 0), dtype=np.float32)
+        self._bool_raw_b = np.empty(0, dtype=np.float32)
         self._bool_raw_base_scale = 4.0
         self._bool_cal_temp = 1.0
         self._bool_cal_adj_2: Optional[np.ndarray] = None
         self._choice_has_raw = False
-        self._choice_raw_w_f32 = np.empty((0, 0), dtype=np.float32)
-        self._choice_raw_b_f32 = np.empty(0, dtype=np.float32)
+        self._choice_raw_w = np.empty((0, 0), dtype=np.float32)
+        self._choice_raw_b = np.empty(0, dtype=np.float32)
         self._choice_raw_base_scale = 4.0
         self._choice_cal_temp = 1.0
         self._choice_cal_adj: Optional[np.ndarray] = None
         if self._is_boolean:
-            if _bool_raw_meta is not None:
+            if _bool_raw_meta is not None and w_f64.shape[0] == 1:
                 self._bool_has_scalar_raw = True
-                self._bool_raw_w_f32 = np.ascontiguousarray(_bool_raw_meta["raw_w_f32"], dtype=np.float32)[:1]
-                self._bool_raw_b_f32 = np.ascontiguousarray(
-                    _bool_raw_meta["raw_b_f32"], dtype=np.float32
-                ).reshape(-1)[:1]
+                rw_src = np.asarray(_bool_raw_meta["raw_w"])
+                rb_src = np.asarray(_bool_raw_meta["raw_b"]).reshape(-1)
+                self._bool_raw_w = _owned_readonly_array(
+                    rw_src[:1], dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
+                )
+                self._bool_raw_b = _owned_readonly_array(
+                    rb_src[:1], dtype=rb_src.dtype if rb_src.dtype in (np.float32, np.float64) else np.float32
+                )
                 self._bool_raw_base_scale = float(_bool_raw_meta["base_scale"])
                 self._bool_cal_temp = float(_bool_raw_meta["cal_temp"])
                 raw_c_adj = _bool_raw_meta.get("cal_adj_2")
                 self._bool_cal_adj_2 = (
-                    None if raw_c_adj is None else np.ascontiguousarray(raw_c_adj, dtype=np.float64).reshape(2)
+                    None
+                    if raw_c_adj is None
+                    else _owned_readonly_array(np.asarray(raw_c_adj, dtype=np.float64).reshape(2), dtype=np.float64)
                 )
-            elif w_in.ndim == 2 and w_in.shape[0] == 1:
+            elif _bool_raw_meta is None and w_in.ndim == 2 and w_in.shape[0] == 1:
                 self._bool_has_scalar_raw = True
-                self._bool_raw_w_f32 = np.ascontiguousarray(w_in[:1], dtype=np.float32)
-                b_flat = np.asarray(biases, dtype=np.float32).reshape(-1)
-                self._bool_raw_b_f32 = np.ascontiguousarray(
-                    b_flat[:1] if b_flat.size >= 1 else np.zeros(1, dtype=np.float32),
-                    dtype=np.float32,
+                rw_dt = w_in.dtype if w_in.dtype in (np.float32, np.float64) else np.float32
+                rb_dt = b_in.dtype if b_in.dtype in (np.float32, np.float64) else np.float32
+                self._bool_raw_w = _owned_readonly_array(w_in[:1], dtype=rw_dt)
+                self._bool_raw_b = _owned_readonly_array(
+                    b_in[:1] if b_in.size >= 1 else np.zeros(1, dtype=rb_dt),
+                    dtype=rb_dt,
                 )
-                self._bool_raw_base_scale = float(temperature_scale)
-                self._bool_cal_temp = 1.0
+                self._bool_raw_base_scale = float(self.scale)
+                self._bool_cal_temp = float(self.cal_temp)
                 self._bool_cal_adj_2 = (
-                    np.array(
-                        [-0.5 * float(self._adj_eff[0]), 0.5 * float(self._adj_eff[0])],
+                    _owned_readonly_array(
+                        np.array([-0.5 * self._delta_adj, 0.5 * self._delta_adj], dtype=np.float64),
                         dtype=np.float64,
                     )
-                    if (self._adj_eff.size == 1 and float(self._adj_eff[0]) != 0.0)
+                    if self._delta_adj != 0.0
                     else None
                 )
         else:
             if _bool_raw_meta is not None:
                 self._choice_has_raw = True
-                self._choice_raw_w_f32 = np.ascontiguousarray(_bool_raw_meta["raw_w_f32"], dtype=np.float32)
-                self._choice_raw_b_f32 = np.ascontiguousarray(
-                    _bool_raw_meta["raw_b_f32"], dtype=np.float32
-                ).reshape(-1)
+                rw_src = np.asarray(_bool_raw_meta["raw_w"])
+                rb_src = np.asarray(_bool_raw_meta["raw_b"]).reshape(-1)
+                self._choice_raw_w = _owned_readonly_array(
+                    rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
+                )
+                self._choice_raw_b = _owned_readonly_array(
+                    rb_src, dtype=rb_src.dtype if rb_src.dtype in (np.float32, np.float64) else np.float32
+                )
                 self._choice_raw_base_scale = float(_bool_raw_meta["base_scale"])
                 self._choice_cal_temp = float(_bool_raw_meta["cal_temp"])
                 raw_c_adj_c = _bool_raw_meta.get("cal_adj_choice")
                 self._choice_cal_adj = (
                     None
                     if raw_c_adj_c is None
-                    else np.ascontiguousarray(raw_c_adj_c, dtype=np.float64).reshape(-1)
+                    else _owned_readonly_array(np.asarray(raw_c_adj_c, dtype=np.float64).reshape(-1), dtype=np.float64)
                 )
             else:
                 self._choice_has_raw = True
-                self._choice_raw_w_f32 = np.ascontiguousarray(w_norm, dtype=np.float32)
-                self._choice_raw_b_f32 = np.ascontiguousarray(b_norm, dtype=np.float32).reshape(-1)
+                rw_dt = w_in.dtype if w_in.dtype in (np.float32, np.float64) else np.float32
+                rb_dt = b_in.dtype if b_in.dtype in (np.float32, np.float64) else np.float32
+                self._choice_raw_w = _owned_readonly_array(w_in, dtype=rw_dt)
+                self._choice_raw_b = _owned_readonly_array(b_in, dtype=rb_dt)
                 self._choice_raw_base_scale = float(self.scale)
-                self._choice_cal_temp = 1.0
+                self._choice_cal_temp = float(self.cal_temp)
                 self._choice_cal_adj = (
-                    np.ascontiguousarray(self._adj_eff, dtype=np.float64).reshape(-1)
+                    _owned_readonly_array(
+                        (self._adj_eff * self.cal_temp).reshape(-1),
+                        dtype=np.float64,
+                    )
                     if (self._adj_eff.size == self.num_classes and np.any(self._adj_eff))
                     else None
                 )
@@ -504,7 +619,13 @@ class FastExplainer:
             self._mode = "generic"
         self.is_hybrid = self._mode == "hybrid"
 
-        X_train = _project_texts(projector, self.train_texts, recency_weighted=self.recency_weighted)
+        X_train = _project_texts(
+            projector,
+            self.train_texts,
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self.zero_emb_unit0,
+            dimension=self.dimension,
+        )
         self.X_train_full = np.ascontiguousarray(X_train, dtype=np.float32)
         self._cache_lock = threading.Lock()
 
@@ -639,9 +760,10 @@ class FastExplainer:
     ) -> FastExplainer:
         """Build a FastExplainer directly from a CompiledSystemOneModel or SystemOneModel."""
         fname = _canonical_explain_field(model.schema, field_name)
-        w, b, opts, thr, eff_scale, meta = _extract_calibrated_head_params(
+        w, b, opts, thr, base_scale, meta = _extract_calibrated_head_params(
             model,
             fname,
+            schema=model.schema,
             calibrator=None,
             temperature_scale=temperature_scale,
         )
@@ -652,13 +774,14 @@ class FastExplainer:
             options=opts,
             train_texts=train_texts,
             train_labels=train_labels,
-            temperature_scale=eff_scale,
+            temperature_scale=base_scale,
             threshold=thr,
             recency_weighted=meta["recency_weighted"],
             is_boolean=meta["is_boolean"],
             learned_overrides=meta["learned_overrides"],
             is_zero_head=meta["is_zero_head"],
-            adj_eff=meta["adj_eff"],
+            calibrator_temperature=meta["cal_temp"],
+            zero_emb_unit0=meta["zero_emb_unit0"],
             _bool_raw_meta=meta,
         )
 
@@ -673,39 +796,47 @@ class FastExplainer:
         temperature_scale: float = 4.0,
     ) -> FastExplainer:
         """Build a FastExplainer bound to a live SystemOneEngine head."""
-        if getattr(engine, "joint_calibrator", None) is not None:
-            raise ValueError("FastExplainer does not support engines with active joint_calibrator")
-        if _has_custom_validate_decision(getattr(engine, "schema", None)) or _has_custom_validate_decision(
-            getattr(getattr(engine, "model", None), "schema", None)
+        eng_lock = getattr(engine, "_lock", None)
+        mdl_lock = getattr(getattr(engine, "model", None), "_lock", None)
+        with (eng_lock if eng_lock is not None else nullcontext()), (
+            mdl_lock if mdl_lock is not None else nullcontext()
         ):
-            raise ValueError("FastExplainer does not support custom DecisionSchema.validate_decision")
-        fname = _canonical_explain_field(engine.model.schema, field_name)
-        calibrators = getattr(engine, "calibrators", None)
-        calibrator = calibrators.get(fname) if isinstance(calibrators, Mapping) else None
-        eng_rec = bool(getattr(engine, "recency_weighted", getattr(engine.model, "recency_weighted", False)))
-        w, b, opts, thr, eff_scale, meta = _extract_calibrated_head_params(
-            engine.model,
-            fname,
-            calibrator=calibrator,
-            temperature_scale=temperature_scale,
-            recency_weighted=eng_rec,
-        )
-        return cls(
-            projector=engine.model.projector,
-            weights=w,
-            biases=b,
-            options=opts,
-            train_texts=train_texts,
-            train_labels=train_labels,
-            temperature_scale=eff_scale,
-            threshold=thr,
-            recency_weighted=meta["recency_weighted"],
-            is_boolean=meta["is_boolean"],
-            learned_overrides=meta["learned_overrides"],
-            is_zero_head=meta["is_zero_head"],
-            adj_eff=meta["adj_eff"],
-            _bool_raw_meta=meta,
-        )
+            if getattr(engine, "joint_calibrator", None) is not None:
+                raise ValueError("FastExplainer does not support engines with active joint_calibrator")
+            live_schema = engine.schema
+            if _has_custom_validate_decision(live_schema) or _has_custom_validate_decision(
+                getattr(getattr(engine, "model", None), "schema", None)
+            ):
+                raise ValueError("FastExplainer does not support custom DecisionSchema.validate_decision")
+            fname = _canonical_explain_field(live_schema, field_name)
+            calibrators = getattr(engine, "calibrators", None)
+            calibrator = calibrators.get(fname) if isinstance(calibrators, Mapping) else None
+            eng_rec = bool(getattr(engine, "recency_weighted", getattr(engine.model, "recency_weighted", False)))
+            w, b, opts, thr, base_scale, meta = _extract_calibrated_head_params(
+                engine.model,
+                fname,
+                schema=live_schema,
+                calibrator=calibrator,
+                temperature_scale=temperature_scale,
+                recency_weighted=eng_rec,
+            )
+            return cls(
+                projector=engine.model.projector,
+                weights=w,
+                biases=b,
+                options=opts,
+                train_texts=train_texts,
+                train_labels=train_labels,
+                temperature_scale=base_scale,
+                threshold=thr,
+                recency_weighted=meta["recency_weighted"],
+                is_boolean=meta["is_boolean"],
+                learned_overrides=meta["learned_overrides"],
+                is_zero_head=meta["is_zero_head"],
+                calibrator_temperature=meta["cal_temp"],
+                zero_emb_unit0=meta["zero_emb_unit0"],
+                _bool_raw_meta=meta,
+            )
 
     def _get_char_arr(
         self, w: str
@@ -1302,7 +1433,10 @@ class FastExplainer:
         arr = np.array([-0.5 * scaled_z, 0.5 * scaled_z], dtype=np.float64)
         if self._bool_cal_adj_2 is not None:
             arr = arr + self._bool_cal_adj_2
-        scaled = arr / self._bool_cal_temp
+        with np.errstate(over="ignore", invalid="ignore"):
+            scaled = arr / self._bool_cal_temp
+        if not bool(np.all(np.isfinite(scaled))):
+            raise ValueError("Reference explanation logits are non-finite (input or temperature overflow)")
         s = scaled - float(np.max(scaled))
         exp = np.exp(s)
         prob_true = float((exp / float(np.sum(exp)))[1])
@@ -1310,24 +1444,25 @@ class FastExplainer:
 
     def _eval_boolean_embedding_winner(self, emb: np.ndarray) -> int:
         x_f32 = np.asarray(emb, dtype=np.float32).reshape(1, -1)
-        raw_l = (x_f32 @ self._bool_raw_w_f32.T + self._bool_raw_b_f32).ravel()[0]
+        raw_l = (x_f32 @ self._bool_raw_w.T + self._bool_raw_b).ravel()[0]
         return self._eval_boolean_raw_logit_f32(float(raw_l))
 
     def _eval_choice_raw_logits_and_top2_f32(
         self, emb_f32: np.ndarray
     ) -> Tuple[np.ndarray, int, int]:
         x_f32 = np.asarray(emb_f32, dtype=np.float32).reshape(1, -1)
-        raw_f32 = (x_f32 @ self._choice_raw_w_f32.T + self._choice_raw_b_f32).ravel()
-        scaled = (
-            raw_f32.astype(np.float64) / 0.25
-            if self._choice_raw_base_scale == 4.0
-            else raw_f32.astype(np.float64) * self._choice_raw_base_scale
-        )
-        if self._choice_cal_adj is not None and self._choice_cal_adj.size == self.num_classes:
-            scaled = scaled + self._choice_cal_adj
-        cal_logits = scaled / self._choice_cal_temp
+        with np.errstate(over="ignore", invalid="ignore"):
+            raw_vals = (x_f32 @ self._choice_raw_w.T + self._choice_raw_b).ravel()
+            scaled = (
+                raw_vals.astype(np.float64) / 0.25
+                if self._choice_raw_base_scale == 4.0
+                else raw_vals.astype(np.float64) * self._choice_raw_base_scale
+            )
+            if self._choice_cal_adj is not None and self._choice_cal_adj.size == self.num_classes:
+                scaled = scaled + self._choice_cal_adj
+            cal_logits = scaled / self._choice_cal_temp
         if not bool(np.all(np.isfinite(cal_logits))):
-            return cal_logits, 0, (1 if self.num_classes > 1 else 0)
+            raise ValueError("Reference explanation logits are non-finite (input or temperature overflow)")
         s = cal_logits - float(np.max(cal_logits))
         exps = np.exp(s)
         denom = float(np.sum(exps))
@@ -1350,40 +1485,63 @@ class FastExplainer:
     def _eval_reference_logits_and_top2_from_emb(
         self, emb_f32: np.ndarray
     ) -> Tuple[np.ndarray, int, int]:
+        if not bool(np.all(np.isfinite(emb_f32))):
+            raise ValueError("Reference explanation logits are non-finite (non-finite embedding)")
         if self._is_boolean:
             if self._bool_has_scalar_raw:
                 x_f32 = np.asarray(emb_f32, dtype=np.float32).reshape(1, -1)
-                raw_l = float((x_f32 @ self._bool_raw_w_f32.T + self._bool_raw_b_f32).ravel()[0])
-                scaled_z = (
-                    raw_l / 0.25
-                    if self._bool_raw_base_scale == 4.0
-                    else raw_l * self._bool_raw_base_scale
-                )
-                delta_adj = (
-                    float(self._bool_cal_adj_2[1] - self._bool_cal_adj_2[0])
-                    if (self._bool_cal_adj_2 is not None and self._bool_cal_adj_2.size == 2)
-                    else 0.0
-                )
-                s_eff = (scaled_z + delta_adj) / self._bool_cal_temp - self._bool_logit_shift
+                with np.errstate(over="ignore", invalid="ignore"):
+                    raw_l = float((x_f32 @ self._bool_raw_w.T + self._bool_raw_b).ravel()[0])
+                    scaled_z = (
+                        raw_l / 0.25
+                        if self._bool_raw_base_scale == 4.0
+                        else raw_l * self._bool_raw_base_scale
+                    )
+                    delta_adj = (
+                        float(self._bool_cal_adj_2[1] - self._bool_cal_adj_2[0])
+                        if (self._bool_cal_adj_2 is not None and self._bool_cal_adj_2.size == 2)
+                        else 0.0
+                    )
+                    s_eff = (scaled_z + delta_adj) / self._bool_cal_temp - self._bool_logit_shift
                 ref_logits = np.array([-0.5 * s_eff, 0.5 * s_eff], dtype=np.float64)
+                if not bool(np.all(np.isfinite(ref_logits))):
+                    raise ValueError("Reference explanation logits are non-finite (input or temperature overflow)")
                 c1 = self._eval_boolean_raw_logit_f32(raw_l)
                 c2 = 0 if c1 == 1 else 1
                 return ref_logits, c1, c2
-            ref_logits = (self.W_eff @ emb_f32.astype(np.float64)) + self.b_eff
+            with np.errstate(over="ignore", invalid="ignore"):
+                ref_logits = (self.W_eff @ emb_f32.astype(np.float64)) + self.b_eff
+            if not bool(np.all(np.isfinite(ref_logits))):
+                raise ValueError("Reference explanation logits are non-finite (input or temperature overflow)")
             c1, c2 = self._select_top2(ref_logits)
             return ref_logits, c1, c2
         if self._choice_has_raw:
             return self._eval_choice_raw_logits_and_top2_f32(emb_f32)
-        ref_logits = (self.W_eff @ emb_f32.astype(np.float64)) + self.b_eff
+        with np.errstate(over="ignore", invalid="ignore"):
+            ref_logits = (self.W_eff @ emb_f32.astype(np.float64)) + self.b_eff
+        if not bool(np.all(np.isfinite(ref_logits))):
+            raise ValueError("Reference explanation logits are non-finite (input or temperature overflow)")
         c1, c2 = self._select_top2(ref_logits)
         return ref_logits, c1, c2
 
     def _eval_reference_logits_and_top2_text(self, text: str) -> Tuple[np.ndarray, int, int]:
-        emb_f32 = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
+        emb_f32 = _project_one(
+            self.projector,
+            text,
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self.zero_emb_unit0,
+            dimension=self.dimension,
+        )
         return self._eval_reference_logits_and_top2_from_emb(emb_f32)
 
     def _eval_boolean_text_winner(self, text: str) -> int:
-        emb = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
+        emb = _project_one(
+            self.projector,
+            text,
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self.zero_emb_unit0,
+            dimension=self.dimension,
+        )
         return self._eval_boolean_embedding_winner(emb)
 
     def _select_top2_text(self, text: str, logits: np.ndarray) -> Tuple[int, int]:
@@ -1436,7 +1594,13 @@ class FastExplainer:
     ) -> Tuple[int, np.ndarray]:
         if self._mode == "generic":
             kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
-            x_sub_f32 = _project_one(self.projector, kept_text, recency_weighted=self.recency_weighted)
+            x_sub_f32 = _project_one(
+                self.projector,
+                kept_text,
+                recency_weighted=self.recency_weighted,
+                zero_unit0=self.zero_emb_unit0,
+                dimension=self.dimension,
+            )
             logits, c_win, _ = self._eval_reference_logits_and_top2_from_emb(x_sub_f32)
             return c_win, logits
 
@@ -1561,7 +1725,13 @@ class FastExplainer:
         self, text: str, spans: List[Tuple[int, int, str, str]]
     ) -> Tuple[np.ndarray, int, int, float, List[float], List[float], float, float, np.ndarray]:
         n_spans = len(spans)
-        x_f32 = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
+        x_f32 = _project_one(
+            self.projector,
+            text,
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self.zero_emb_unit0,
+            dimension=self.dimension,
+        )
         x_full = x_f32.astype(np.float64)
         logits, c1, c2 = self._eval_reference_logits_and_top2_from_emb(x_f32)
         margin = float(logits[c1] - logits[c2])
@@ -1570,11 +1740,25 @@ class FastExplainer:
         if n_spans == 0:
             return logits, c1, c2, margin, [], [], float(logits[c1]), margin, sims_all
 
-        b_target = float(self.b_eff[c1])
-        b_margin = float(self.b_eff[c1] - self.b_eff[c2])
+        x_base = _project_one(
+            self.projector,
+            "",
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self.zero_emb_unit0,
+            dimension=self.dimension,
+        )
+        base_logits, _, _ = self._eval_reference_logits_and_top2_from_emb(x_base)
+        b_target = float(base_logits[c1])
+        b_margin = float(base_logits[c1] - base_logits[c2])
 
         loo_texts = [" ".join(spans[k][2] for k in range(n_spans) if k != j) for j in range(n_spans)]
-        X_loo = _project_texts(self.projector, loo_texts, recency_weighted=self.recency_weighted)
+        X_loo = _project_texts(
+            self.projector,
+            loo_texts,
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self.zero_emb_unit0,
+            dimension=self.dimension,
+        )
         logits_loo = np.empty((len(loo_texts), self.num_classes), dtype=np.float64)
         for r_idx in range(len(loo_texts)):
             rl, _, _ = self._eval_reference_logits_and_top2_from_emb(X_loo[r_idx])
@@ -1602,25 +1786,43 @@ class FastExplainer:
         ov_val = self._learned_overrides.get(norm_key) if norm_key else None
         override_hit = False
         if ov_val is not None:
-            emb_ov = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
+            emb_ov = _project_one(
+                self.projector,
+                text,
+                recency_weighted=self.recency_weighted,
+                zero_unit0=self.zero_emb_unit0,
+                dimension=self.dimension,
+            )
             if (not bool(np.any(emb_ov))) or self._is_zero_head:
                 override_hit = True
-                if self._is_boolean:
-                    z_raw = 12.0 if bool(ov_val) else -12.0
-                    s_shifted = (z_raw * self.scale + float(self._adj_eff[0])) - self._bool_logit_shift
-                    logits = np.array([-0.5 * s_shifted, 0.5 * s_shifted], dtype=np.float64)
-                    if self._bool_has_scalar_raw:
-                        c1 = self._eval_boolean_raw_logit_f32(z_raw)
-                        c2 = 0 if c1 == 1 else 1
+                with np.errstate(over="ignore", invalid="ignore"):
+                    if self._is_boolean:
+                        z_raw = 12.0 if bool(ov_val) else -12.0
+                        s_shifted = (z_raw * self.scale + self._delta_adj) / self.cal_temp - self._bool_logit_shift
+                        logits = np.array([-0.5 * s_shifted, 0.5 * s_shifted], dtype=np.float64)
+                        if not bool(np.all(np.isfinite(logits))):
+                            raise ValueError(
+                                "Reference explanation logits are non-finite (input or temperature overflow)"
+                            )
+                        if self._bool_has_scalar_raw:
+                            c1 = self._eval_boolean_raw_logit_f32(z_raw)
+                            c2 = 0 if c1 == 1 else 1
+                        else:
+                            c1, c2 = self._select_top2(logits)
                     else:
+                        z_raw = np.full(self.num_classes, -12.0, dtype=np.float64)
+                        ov_lbl = _normalize_label_str(ov_val)
+                        if ov_lbl in self.label_to_idx:
+                            z_raw[self.label_to_idx[ov_lbl]] = 12.0
+                        scaled_ov = z_raw * self.scale
+                        if self._choice_cal_adj is not None and self._choice_cal_adj.size == self.num_classes:
+                            scaled_ov = scaled_ov + self._choice_cal_adj
+                        logits = scaled_ov / self.cal_temp
+                        if not bool(np.all(np.isfinite(logits))):
+                            raise ValueError(
+                                "Reference explanation logits are non-finite (input or temperature overflow)"
+                            )
                         c1, c2 = self._select_top2(logits)
-                else:
-                    z_raw = np.full(self.num_classes, -12.0, dtype=np.float64)
-                    ov_lbl = _normalize_label_str(ov_val)
-                    if ov_lbl in self.label_to_idx:
-                        z_raw[self.label_to_idx[ov_lbl]] = 12.0
-                    logits = z_raw * self.scale + self._adj_eff
-                    c1, c2 = self._select_top2(logits)
                 margin = float(logits[c1] - logits[c2])
                 t_attrs = [0.0] * n_spans
                 m_attrs = [0.0] * n_spans

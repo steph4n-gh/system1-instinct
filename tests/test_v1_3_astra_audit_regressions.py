@@ -143,19 +143,37 @@ def test_astra_01_crc_ladder_monotone_envelope_and_disjoint_temp_split() -> None
         draw_risks.append(float(np.mean(c_draw.L[act_draw])))
     assert float(np.mean(draw_risks)) <= 0.05
 
+    seen_temp_rows: List[tuple[float, ...]] = []
+    seen_crc_rows: List[tuple[float, ...]] = []
+    seen_temp_n: List[int] = []
     seen_crc_n: List[int] = []
     cal_temp = UtilityCalibrator(cost_matrix, safe_action=10, alpha=0.10, fit_temperature=True)
+    orig_fit_temp = cal_temp._fit_temperature
     orig_fit_crc = cal_temp.fit_crc
+
+    def _spy_fit_temp(probs_t: np.ndarray, y_t: np.ndarray) -> float:
+        seen_temp_n.append(len(y_t))
+        seen_temp_rows.extend(tuple(np.round(r, 12)) for r in probs_t)
+        return orig_fit_temp(probs_t, y_t)
 
     def _spy_fit_crc(probs_cal: np.ndarray, y_cal: np.ndarray, alpha: float | None = None) -> float:
         seen_crc_n.append(len(y_cal))
+        seen_crc_rows.extend(tuple(np.round(r, 12)) for r in probs_cal)
         return orig_fit_crc(probs_cal, y_cal, alpha=alpha)
 
+    cal_temp._fit_temperature = _spy_fit_temp  # type: ignore[method-assign]
     cal_temp.fit_crc = _spy_fit_crc  # type: ignore[method-assign]
-    probs_40 = np.tile(p, (40, 1))
+    probs_40 = np.tile(p, (40, 1)).astype(np.float64)
+    deltas = np.linspace(-0.02, 0.02, 40, dtype=np.float64)
+    probs_40[:, 0] += deltas
+    probs_40[:, 1] -= deltas
     y_40 = np.arange(40, dtype=np.int64) % 10
     cal_temp.fit(probs_40, y_40)
+    assert seen_temp_n == [13]
     assert seen_crc_n == [27]
+    assert len(seen_temp_rows) == 13
+    assert len(seen_crc_rows) == 27
+    assert set(seen_temp_rows).isdisjoint(set(seen_crc_rows))
 
 
 def test_astra_02_fleet_delta_preflight_blocks_header_and_metadata_bombs() -> None:
@@ -2689,6 +2707,35 @@ def test_astra_19_round6_regressions() -> None:
     finally:
         eng2.schema.fields["flag"].threshold = 0.5
 
+    class _UnitE0Proj:
+        dimension = 16
+
+        def project(self, prompt: str, recency_weighted: bool = False) -> np.ndarray:
+            v = np.zeros(16, dtype=np.float32)
+            v[0] = 1.0
+            return v
+
+    m_f64 = SystemOneModel(_R6TwoChoiceSchema, dimension=16, projector=_UnitE0Proj())
+    w_f64 = np.zeros((2, 16), dtype=np.float64)
+    w_f64[0, 0] = 1.0
+    w_f64[1, 0] = 1.0
+    m_f64.heads["cat"].weights = w_f64
+    m_f64.heads["cat"].biases = np.zeros(2, dtype=np.float64)
+    eng_f64 = SystemOneEngine(_R6TwoChoiceSchema, model=m_f64, strict_mode=False, use_cache=False)
+    k_f64_a = eng_f64.compile_packed_kernel()
+    fn_f64 = eng_f64.compile_callable()
+    assert k_f64_a.c_raw_w[0].dtype == np.float64
+    assert k_f64_a.W_packed.flags.writeable is False
+    assert fn_f64("probe").values["cat"] == "a"
+    # 1e-10 delta vanishes completely under float32 rounding (1.0 + 1e-10 == float32(1.0)),
+    # yet must invalidate packed-kernel & callable caches and flip "a" -> "b".
+    m_f64.heads["cat"].weights[1, 0] = 1.0 + 1e-10
+    k_f64_b = eng_f64.compile_packed_kernel()
+    assert k_f64_b is not k_f64_a
+    assert k_f64_b.decide_prompt("probe")["best_idx"][0, 0] == 1
+    assert fn_f64("probe").values["cat"] == "b"
+    assert eng_f64.decide("probe", record_receipt=False).values["cat"] == "b"
+
     # R6-3: Encoding bit-parity (second norm, HybridProjector, zero fallback) and float32 near-boundary fallback.
     class _BoundarySchema(DecisionSchema):
         c0 = ChoiceField(options=("a", "b", "c"))
@@ -2884,6 +2931,37 @@ def test_astra_19_round6_regressions() -> None:
                 assert dfn_item.is_ambiguous is True
                 assert math.isnan(dfn_item.confidences["cat"])
 
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from system1 import check_decision_receipt_integrity, verify_decision_witness_receipt
+
+            sk_nan = Ed25519PrivateKey.generate()
+            cm_cache_bad = SystemOneCompiler(_R6TwoChoiceSchema, dimension=16).compile(
+                {"cat": [("good", "a"), ("other", "b")] * 3},
+                calibration_split=0.0,
+                augment=False,
+            )
+            _set_head(cm_cache_bad, "cat", np.zeros((2, 16), dtype=np.float32), np.array([2.0, 0.0], dtype=np.float32))
+            cm_cache_bad.projector = _NaNProj(bad_scalar)
+            eng_cache_bad = SystemOneEngine(
+                _R6TwoChoiceSchema,
+                compiled_model=cm_cache_bad,
+                strict_mode=strict_val,
+                use_cache=True,
+                signing_key=sk_nan,
+            )
+            eng_cache_bad.projector = cm_cache_bad.projector
+            d_c1 = eng_cache_bad.decide("good", record_receipt=True)
+            d_cb = eng_cache_bad.decide_batch(["good"], record_receipt=True)[0]
+            assert eng_cache_bad.cache is not None and eng_cache_bad.cache.size == 0
+            for d_c in (d_c1, d_cb):
+                assert d_c.is_ambiguous is True
+                assert math.isnan(d_c.confidences["cat"])
+                assert d_c.abstention_reasons["cat"] == "non_finite_input"
+                assert d_c.receipt is not None
+                rec_c = d_c.receipt.to_dict()
+                assert check_decision_receipt_integrity(rec_c) is True
+                assert verify_decision_witness_receipt(rec_c, public_key=sk_nan.public_key()) is True
+
     # R6-5: FastExplainer preserves sub-1e-4 calibrator temperature on ChoiceField & BooleanField.
     eng_t = _make_r6_engine(strict=False)
     eng_t.calibrators["cat"] = DecisionCalibrator()
@@ -2919,6 +2997,48 @@ def test_astra_19_round6_regressions() -> None:
     res_tf_t = FastExplainer.from_engine(eng_tf_t, "ok").explain("alpha refund")
     assert res_tf_t.additivity_error_target < 1e-6
     assert res_tf_t.additivity_error_margin < 1e-6
+
+    # Subnormal / near-min-normal temperature (1e-308, 5e-324) must not produce 0 * inf = nan on zero/tiny heads,
+    # and must raise ValueError cleanly when weights * scale / cal_temp overflows float64.
+    for tiny_t in (1e-308, 5e-324):
+        for w_tiny in (0.0, 1e-306):
+            eng_ut = _make_r6_engine(strict=False)
+            _set_head(
+                eng_ut.model,
+                "cat",
+                np.full((3, 32), w_tiny, dtype=np.float32),
+                np.zeros(3, dtype=np.float32),
+            )
+            _set_head(
+                eng_ut.model,
+                "flag",
+                np.full((1, 32), w_tiny, dtype=np.float32),
+                np.zeros(1, dtype=np.float32),
+            )
+            eng_ut.calibrators["cat"] = DecisionCalibrator()
+            eng_ut.calibrators["cat"].temperature = tiny_t
+            eng_ut.calibrators["flag"] = DecisionCalibrator()
+            eng_ut.calibrators["flag"].temperature = tiny_t
+            for f_nm in ("cat", "flag"):
+                exp_ut = FastExplainer.from_engine(eng_ut, f_nm)
+                res_ut = exp_ut.explain("alpha signal test")
+                dec_ut = eng_ut.decide("alpha signal test", record_receipt=False)
+                assert math.isfinite(res_ut.predicted_logit)
+                assert math.isfinite(res_ut.margin)
+                assert res_ut.predicted_label == str(dec_ut.values[f_nm])
+                assert res_ut.additivity_error_target <= 1e-4
+
+    eng_ovf = _make_r6_engine(strict=False)
+    _set_head(
+        eng_ovf.model,
+        "cat",
+        np.ones((3, 32), dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+    )
+    eng_ovf.calibrators["cat"] = DecisionCalibrator()
+    eng_ovf.calibrators["cat"].temperature = 1e-308
+    with pytest.raises(ValueError, match="non-finite|overflow"):
+        FastExplainer.from_engine(eng_ovf, "cat")
 
     for bad_temp in (0.0, -1.0, float("nan"), float("inf"), True):
         eng_bad_t = _make_r6_engine(strict=False)
@@ -3031,3 +3151,853 @@ def test_astra_19_round6_regressions() -> None:
     np.testing.assert_array_equal(fl_base.dW_q[0], snap_dw)
     np.testing.assert_array_equal(fl_base.sp_len[0], snap_sp)
     np.testing.assert_array_equal(fl_base.ex_len[0], snap_ex)
+
+
+def test_astra_20_round7_regressions(tmp_path: Path) -> None:
+    """Verify all Round-7 Astra audit fixes (R7-1 through R7-12) against independent truth."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    import system1.explain as sys1_explain
+    import system1.integrations.drop_in as drop_in_mod
+    from system1 import (
+        ScoreField,
+        canonical_json,
+        check_decision_receipt_integrity,
+        compute_receipt_digest,
+        create_decision_receipt,
+        verify_decision_witness_receipt,
+    )
+    from system1.calibration import ConformalPredictor, DecisionCalibrator
+    from system1.core.model import SystemOneModel
+
+    # ------------------------------------------------------------------
+    # R7-1: Snapshot read-only freeze never freezes live weights; locks synchronize snapshot reads.
+    # ------------------------------------------------------------------
+    class _LockSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"))
+        flag = BooleanField(threshold=0.5)
+
+    class _UnitE0Proj:
+        dimension = 16
+
+        def __init__(self, *, event: threading.Event | None = None) -> None:
+            self._event = event
+
+        def project(self, prompt: str, recency_weighted: bool = False) -> np.ndarray:
+            if self._event is not None:
+                self._event.set()
+            v = np.zeros(16, dtype=np.float32)
+            v[0] = 1.0
+            return v
+
+    m_lock = SystemOneModel(_LockSchema, dimension=16, projector=_UnitE0Proj())
+    m_lock.heads["cat"].weights = np.array(
+        [[5.0] + [0.0] * 15, [-5.0] + [0.0] * 15], dtype=np.float32
+    )
+    m_lock.heads["cat"].biases = np.array([-5.0, 5.0], dtype=np.float32)
+    m_lock.heads["flag"].weights = np.array([[5.0] + [0.0] * 15], dtype=np.float32)
+    m_lock.heads["flag"].biases = np.array([-5.0], dtype=np.float32)
+    eng_lock = SystemOneEngine(_LockSchema, model=m_lock, strict_mode=False, use_cache=False)
+
+    k_snap = eng_lock.compile_packed_kernel()
+    fn_snap = eng_lock.compile_callable()
+    assert k_snap.W_packed.flags.writeable is False
+    assert k_snap.c_raw_w[0].flags.writeable is False
+    assert k_snap.b_raw_w[0].flags.writeable is False
+    assert m_lock.heads["cat"].weights.flags.writeable is True
+    assert m_lock.heads["cat"].biases.flags.writeable is True
+    assert m_lock.heads["flag"].weights.flags.writeable is True
+
+    # Mutating live model weights after kernel snapshot must stay writable and not corrupt snapshot.
+    prev_kw = k_snap.c_raw_w[0].copy()
+    m_lock.heads["cat"].weights[0, 0] = -5.0
+    m_lock.heads["cat"].weights[1, 0] = 5.0
+    m_lock.heads["cat"].biases[:] = np.array([5.0, -5.0], dtype=np.float32)
+    np.testing.assert_array_equal(k_snap.c_raw_w[0], prev_kw)
+    assert fn_snap("x").values["cat"] in ("a", "b")
+
+    # Contiguous Choice weight array on CompiledSystemOneModel must stay writable after compile_packed_kernel().
+    cm_lock = SystemOneCompiler(_LockSchema, dimension=16).compile(
+        {"cat": [("x", "a"), ("y", "b")] * 3, "flag": [("x", True), ("y", False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    w_contig = np.ascontiguousarray(np.zeros((2, 16), dtype=np.float32))
+    cm_lock._field_heads["cat"].weights = w_contig
+    cm_lock.heads["cat"].weights = w_contig
+    eng_cm_lock = SystemOneEngine(_LockSchema, compiled_model=cm_lock, strict_mode=False, use_cache=False)
+    k_cm_lock = eng_cm_lock.compile_packed_kernel()
+    assert k_cm_lock.c_raw_w[0].flags.writeable is False
+    assert cm_lock._field_heads["cat"].weights.flags.writeable is True
+    cm_lock._field_heads["cat"].weights[:] = 0.25
+
+    # Exact R7-1 deterministic pause-inside-encode_one reproduction on two Boolean heads.
+    class _TwoBoolSchema(DecisionSchema):
+        a = BooleanField(threshold=0.5)
+        b = BooleanField(threshold=0.5)
+
+    enter_evt = threading.Event()
+    resume_evt = threading.Event()
+    pause_arm = [False]
+
+    class _PauseZeroProj:
+        dimension = 16
+
+        def project(self, prompt: str, recency_weighted: bool = False) -> np.ndarray:
+            if pause_arm[0]:
+                enter_evt.set()
+                resume_evt.wait(timeout=5.0)
+            return np.zeros(16, dtype=np.float32)
+
+    cm_pause = SystemOneCompiler(_TwoBoolSchema, dimension=16, projector=_PauseZeroProj()).compile(
+        {"a": [("x", True), ("y", False)] * 3, "b": [("x", True), ("y", False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    for fnm, bv in (("a", 1e-10), ("b", 0.25)):
+        cm_pause._field_heads[fnm].weights = np.zeros((1, 16), dtype=np.float32)
+        cm_pause._field_heads[fnm].biases = np.array([bv], dtype=np.float32)
+        cm_pause.heads[fnm].weights = cm_pause._field_heads[fnm].weights
+        cm_pause.heads[fnm].biases = cm_pause._field_heads[fnm].biases
+    eng_pause = SystemOneEngine(_TwoBoolSchema, compiled_model=cm_pause, strict_mode=False, use_cache=False)
+    fn_pause = eng_pause.compile_callable()
+    assert fn_pause("x").values == {"a": True, "b": True}
+
+    pause_arm[0] = True
+    pause_out: List[Dict[str, Any]] = []
+    t_pause = threading.Thread(target=lambda: pause_out.append(fn_pause("x").values))
+    t_pause.start()
+    assert enter_evt.wait(timeout=5.0)
+    with eng_pause._lock, cm_pause._lock:
+        for fnm in ("a", "b"):
+            cm_pause._field_heads[fnm].biases[:] = -0.25
+            cm_pause.heads[fnm].biases[:] = -0.25
+    pause_arm[0] = False
+    resume_evt.set()
+    t_pause.join(timeout=5.0)
+    assert pause_out == [{"a": True, "b": True}]
+    assert fn_pause("x").values == {"a": False, "b": False}
+
+    # Concurrent atomic (weights + biases) flip under (eng._lock, model._lock):
+    # True logits stay (0.0, 0.0) in both states -> torn reads produce +/-10 logits (conf != 0.5).
+    stop_flag = threading.Event()
+    race_errors: List[str] = []
+
+    def _mutator() -> None:
+        state = False
+        try:
+            for _ in range(120):
+                state = not state
+                s = 5.0 if state else -5.0
+                with eng_lock._lock, m_lock._lock:
+                    m_lock.heads["cat"].weights[0, 0] = s
+                    m_lock.heads["cat"].weights[1, 0] = -s
+                    m_lock.heads["cat"].biases[0] = -s
+                    m_lock.heads["cat"].biases[1] = s
+                time.sleep(0.0002)
+        except Exception as exc:
+            race_errors.append(f"mutator: {exc!r}")
+        finally:
+            stop_flag.set()
+
+    def _reader() -> None:
+        try:
+            while not stop_flag.is_set():
+                k_cur = eng_lock.compile_packed_kernel()
+                rk = k_cur.decide_prompt("x")
+                c_conf = float(rk["c_conf"][0, 0])
+                if not math.isclose(c_conf, 0.5, rel_tol=1e-4, abs_tol=1e-4):
+                    race_errors.append(f"kernel torn state confidence={c_conf}")
+                    return
+                rf = fn_snap("x")
+                f_conf = float(rf.confidences["cat"])
+                if not math.isclose(f_conf, 0.5, rel_tol=1e-4, abs_tol=1e-4):
+                    race_errors.append(f"callable torn state confidence={f_conf}")
+                    return
+        except Exception as exc:
+            race_errors.append(f"reader: {exc!r}")
+
+    t_mut = threading.Thread(target=_mutator)
+    t_readers = [threading.Thread(target=_reader) for _ in range(3)]
+    t_mut.start()
+    for t in t_readers:
+        t.start()
+    t_mut.join(timeout=10.0)
+    for t in t_readers:
+        t.join(timeout=10.0)
+    assert race_errors == []
+
+    # ------------------------------------------------------------------
+    # R7-2: Exact Repro A & B (single-row vs batch parity across extreme + near-tie + ScoreField + float64).
+    # ------------------------------------------------------------------
+    class _R7ParitySchema(DecisionSchema):
+        score = ScoreField(min_value=0.0, max_value=10.0)
+        cat = ChoiceField(options=("a", "b", "c"))
+        flag = BooleanField(threshold=0.5)
+
+    proj_par = DeterministicSemanticProjector(dimension=256)
+    p_extreme = "urgent critical outage failure disaster severe incident 999"
+    p_tie = "boundary probe near equal canceling terms 42"
+    x_tie = proj_par.project(p_tie).astype(np.float64)
+
+    # Construct float32 near-tie weights with large cancelling blocks in high dim.
+    rng_par = np.random.default_rng(19)
+    w_half = rng_par.standard_normal(128).astype(np.float32) * 50.0
+    w_cat = np.zeros((3, 256), dtype=np.float32)
+    w_cat[0, :128] = w_half
+    w_cat[0, 128:] = 0.0
+    # Make row 1 closely match row 0 projection dot product on x_tie within float32 noise.
+    w_cat[1, :] = w_cat[0, :].copy()
+    idx_nz = int(np.argmax(np.abs(x_tie)))
+    if float(x_tie[idx_nz]) != 0.0:
+        w_cat[1, idx_nz] += np.float32(1e-6 / float(x_tie[idx_nz]))
+    w_cat[2, :] = -np.float32(5.0) * w_cat[0, :]
+
+    m_par = SystemOneCompiler(_R7ParitySchema, dimension=256, projector=proj_par).compile(
+        {
+            "score": [(p_extreme, 9.5), (p_tie, 5.0)] * 3,
+            "cat": [(p_extreme, "a"), (p_tie, "b"), ("gamma z", "c")] * 3,
+            "flag": [(p_extreme, True), (p_tie, False)] * 4,
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    _set_head(m_par, "score", np.full((1, 256), 500.0, dtype=np.float32), np.array([0.0], dtype=np.float32))
+    _set_head(m_par, "cat", w_cat, np.zeros(3, dtype=np.float32))
+    _set_head(m_par, "flag", w_cat[:1, :].copy(), np.array([-float(np.dot(x_tie.astype(np.float32), w_cat[0]))], dtype=np.float32))
+
+    eng_par = SystemOneEngine(_R7ParitySchema, compiled_model=m_par, strict_mode=False, use_cache=False)
+    k_par = eng_par.compile_packed_kernel()
+    fn_par = eng_par.compile_callable()
+
+    batch_prompts = [p_extreme, p_tie]
+    d_batch = eng_par.decide_batch(batch_prompts, record_receipt=False)
+    d_solo_tie = eng_par.decide(p_tie, record_receipt=False)
+    db_solo_tie = eng_par.decide_batch([p_tie], record_receipt=False)[0]
+    dk_batch = k_par.decide_batch(batch_prompts)
+    dk_solo_tie = k_par.decide_prompt(p_tie)
+    df_tie = fn_par(p_tie)
+
+    assert d_batch[1].values == d_solo_tie.values == db_solo_tie.values
+    for discrete_k in ("cat", "flag"):
+        assert df_tie.values[discrete_k] == d_solo_tie.values[discrete_k]
+    assert math.isclose(df_tie.values["score"], d_solo_tie.values["score"], rel_tol=1e-4, abs_tol=1e-5)
+    assert d_batch[1].conformal_sets == d_solo_tie.conformal_sets == db_solo_tie.conformal_sets
+    assert d_batch[1].is_ambiguous is d_solo_tie.is_ambiguous is db_solo_tie.is_ambiguous is df_tie.is_ambiguous
+    assert d_batch[1].confidences == d_solo_tie.confidences == db_solo_tie.confidences == df_tie.confidences
+    assert dk_batch["best_idx"][1].tolist() == dk_solo_tie["best_idx"][0].tolist()
+    assert dk_batch["in_c"][1].tolist() == dk_solo_tie["in_c"][0].tolist()
+    assert dk_batch["in_b"][1].tolist() == dk_solo_tie["in_b"][0].tolist()
+    assert dk_batch["b_val"][1].tolist() == dk_solo_tie["b_val"][0].tolist()
+    assert math.isclose(float(dk_batch["s_val"][1, 0]), float(dk_solo_tie["s_val"][0, 0]), rel_tol=1e-4, abs_tol=1e-5)
+    assert bool(dk_batch["is_ambiguous"][1]) == bool(dk_solo_tie["is_ambiguous"][0])
+
+    # Exact R7-2 Reproduction A (1-row compiled Boolean model) & Reproduction B (generic projector).
+    class _R7SingleBoolSchema(DecisionSchema):
+        b = BooleanField(threshold=0.5)
+
+    prompt_r2a = "alpha beta probe 20"
+    cm_r2a = SystemOneCompiler(_R7SingleBoolSchema, dimension=32).compile(
+        {"b": [("x", True), ("y", False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    x_r2a = cm_r2a.encode(prompt_r2a)
+    w_r2a = np.random.default_rng(20).normal(size=(1, 32)).astype(np.float32)
+    b_r2a = -(x_r2a.reshape(1, -1) @ w_r2a.T).ravel().astype(np.float32)
+    _set_head(cm_r2a, "b", w_r2a, b_r2a)
+    eng_r2a = SystemOneEngine(_R7SingleBoolSchema, compiled_model=cm_r2a, strict_mode=False, use_cache=False)
+    d_r2a_single = eng_r2a.decide(prompt_r2a, record_receipt=False)
+    d_r2a_batch = eng_r2a.decide_batch([prompt_r2a], record_receipt=False)[0]
+    assert d_r2a_single.values["b"] is True
+    assert d_r2a_batch.values["b"] is True
+    assert math.isclose(d_r2a_batch.probabilities["b"]["True"], 0.5, rel_tol=0.0, abs_tol=1e-12)
+
+    class _FixedRng6Proj:
+        dimension = 32
+
+        def __init__(self) -> None:
+            self._v = np.random.default_rng(6).normal(size=32).astype(np.float32)
+
+        def project(self, prompt: str, recency_weighted: bool = False) -> np.ndarray:
+            return self._v.copy()
+
+        def project_batch(self, prompts: Sequence[str], recency_weighted: bool = False) -> np.ndarray:
+            return np.tile(self._v, (len(prompts), 1))
+
+    cm_r2b = SystemOneCompiler(_R7SingleBoolSchema, dimension=32, projector=_FixedRng6Proj()).compile(
+        {"b": [("x", True), ("y", False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    x_r2b = cm_r2b.encode("probe")
+    w_r2b = np.random.default_rng(106).normal(size=(1, 32)).astype(np.float32)
+    b_r2b = -(x_r2b.reshape(1, -1) @ w_r2b.T).ravel().astype(np.float32)
+    _set_head(cm_r2b, "b", w_r2b, b_r2b)
+    eng_r2b = SystemOneEngine(_R7SingleBoolSchema, compiled_model=cm_r2b, strict_mode=False, use_cache=False)
+    k_r2b = eng_r2b.compile_packed_kernel()
+    assert np.array_equal(k_r2b.encode_one("probe"), k_r2b.encode_batch(["probe"])[0])
+    assert (
+        eng_r2b.decide("probe", record_receipt=False).values["b"]
+        == eng_r2b.decide_batch(["probe"], record_receipt=False)[0].values["b"]
+        == bool(k_r2b.decide_prompt("probe")["b_val"][0, 0])
+        == bool(k_r2b.decide_batch(["probe"])["b_val"][0, 0])
+    )
+
+    # ------------------------------------------------------------------
+    # R7-3 & R7-4: ScoreField non-finite fallback + cache non-poisoning + NaN/Inf receipt sanitization.
+    # ------------------------------------------------------------------
+    class _R7ScoreSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"))
+        s_min = ScoreField(min_value=2.0, max_value=10.0)
+        s_def = ScoreField(min_value=0.0, max_value=10.0, default=4.5)
+
+    class _NaNProj16:
+        dimension = 16
+
+        def __init__(self, val: float) -> None:
+            self.val = val
+
+        def project(self, prompt: str, recency_weighted: bool = False) -> np.ndarray:
+            v = np.zeros(16, dtype=np.float32)
+            v[0] = np.float32(self.val)
+            return v
+
+        def project_batch(self, prompts: Sequence[str], recency_weighted: bool = False) -> np.ndarray:
+            out = np.zeros((len(prompts), 16), dtype=np.float32)
+            out[:, 0] = np.float32(self.val)
+            return out
+
+    sk_r7 = Ed25519PrivateKey.generate()
+    pub_r7 = sk_r7.public_key()
+    for bad_v in (float("nan"), float("inf")):
+        for strict_m in (True, False):
+            cm_nf = SystemOneCompiler(_R7ScoreSchema, dimension=16).compile(
+                {
+                    "cat": [("good", "a"), ("other", "b")] * 3,
+                    "s_min": [("good", 8.0), ("other", 3.0)] * 3,
+                    "s_def": [("good", 7.0), ("other", 2.0)] * 3,
+                },
+                calibration_split=0.0,
+                augment=False,
+            )
+            cm_nf.projector = _NaNProj16(bad_v)
+            eng_nf = SystemOneEngine(
+                _R7ScoreSchema,
+                compiled_model=cm_nf,
+                strict_mode=strict_m,
+                use_cache=True,
+                signing_key=sk_r7,
+            )
+            eng_nf.projector = cm_nf.projector
+            d_s1 = eng_nf.decide("probe score", record_receipt=True)
+            d_sb = eng_nf.decide_batch(["probe score"], record_receipt=True)[0]
+            assert eng_nf.cache is not None and eng_nf.cache.size == 0
+            for d_item in (d_s1, d_sb):
+                eng_nf.schema.validate_decision(d_item.values)
+                assert d_item.values["s_min"] == 2.0
+                assert d_item.values["s_def"] == 4.5
+                assert d_item.is_ambiguous is True
+                assert d_item.abstention_reasons["cat"] == "non_finite_input"
+                assert d_item.abstention_reasons["s_min"] == "non_finite_input"
+                assert d_item.abstention_reasons["s_def"] == "non_finite_input"
+                assert math.isnan(d_item.confidences["s_min"])
+                assert d_item.receipt is not None
+                rec_d = d_item.receipt.to_dict()
+                assert check_decision_receipt_integrity(rec_d) is True
+                assert verify_decision_witness_receipt(rec_d, public_key=pub_r7) is True
+
+            # Swapping back to clean projector produces finite decision and populates cache cleanly.
+            clean_p = DeterministicSemanticProjector(dimension=16)
+            cm_nf.projector = clean_p
+            eng_nf.projector = clean_p
+            d_ok = eng_nf.decide("probe score", record_receipt=True)
+            assert d_ok.abstention_reasons == {}
+            assert math.isfinite(float(d_ok.values["s_min"]))
+            if not strict_m:
+                assert eng_nf.cache.size == 1
+
+    # Score-only schema under NaN across all 4 (use_cache x record_receipt) combinations.
+    class _R7ScoreOnlySchema(DecisionSchema):
+        s = ScoreField(min_value=0.0, max_value=1.0)
+
+    for cache_flag in (False, True):
+        for receipt_flag in (False, True):
+            cm_so = SystemOneCompiler(_R7ScoreOnlySchema, dimension=16).compile(
+                {"s": [("hi", 0.9), ("lo", 0.1)] * 3},
+                calibration_split=0.0,
+                augment=False,
+            )
+            cm_so.projector = _NaNProj16(float("nan"))
+            eng_so = SystemOneEngine(
+                _R7ScoreOnlySchema,
+                compiled_model=cm_so,
+                strict_mode=True,
+                use_cache=cache_flag,
+                signing_key=sk_r7,
+            )
+            eng_so.projector = cm_so.projector
+            d_so1 = eng_so.decide("probe score", record_receipt=receipt_flag)
+            d_sob = eng_so.decide_batch(["probe score"], record_receipt=receipt_flag)[0]
+            if cache_flag and eng_so.cache is not None:
+                assert eng_so.cache.size == 0
+            for d_s_item in (d_so1, d_sob):
+                assert d_s_item.values["s"] == 0.0
+                assert d_s_item.is_ambiguous is True
+                assert d_s_item.abstention_reasons["s"] == "non_finite_input"
+                if receipt_flag:
+                    assert d_s_item.receipt is not None
+                    rec_so = d_s_item.receipt.to_dict()
+                    assert check_decision_receipt_integrity(rec_so) is True
+                    assert verify_decision_witness_receipt(rec_so, public_key=pub_r7) is True
+                else:
+                    assert d_s_item.receipt is None
+
+    # Direct receipt functions sanitize without mutating caller dicts, while canonical_json stays strict.
+    caller_confs = {"cat": float("nan"), "s_min": float("inf")}
+    caller_probs = {"cat": {"a": float("nan"), "b": 0.5}}
+    rec_direct = create_decision_receipt(
+        schema_name="_R7ScoreSchema",
+        schema_digest="abc",
+        prompt="probe",
+        values={"cat": "a", "s_min": 2.0, "s_def": 4.5},
+        confidences=caller_confs,
+        conformal_sets={"cat": []},
+        probabilities=caller_probs,
+        latency_ms=0.1,
+        is_ambiguous=True,
+        signing_key=sk_r7,
+    )
+    assert math.isnan(caller_confs["cat"])
+    assert math.isinf(caller_confs["s_min"])
+    assert math.isnan(caller_probs["cat"]["a"])
+    rec_direct_d = rec_direct.to_dict()
+    assert rec_direct_d["confidences"] == {"cat": 0.0, "s_min": 0.0}
+    assert rec_direct_d["probabilities"] == {"cat": {"a": 0.0, "b": 0.5}}
+    assert compute_receipt_digest(rec_direct_d) == rec_direct.digest
+    assert check_decision_receipt_integrity(rec_direct_d) is True
+    assert verify_decision_witness_receipt(rec_direct_d, public_key=pub_r7) is True
+    for bad_json_val in (float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            canonical_json({"bad": bad_json_val})
+
+    # ------------------------------------------------------------------
+    # R7-5, R7-6, R7-7, R7-8: FastExplainer schema sync, "" baseline, float64 weights, override & overflow, no batch L2.
+    # ------------------------------------------------------------------
+    assert not hasattr(sys1_explain, "_l2_normalize_batch")
+
+    class _R7BaseSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"))
+        flag = BooleanField(threshold=0.5)
+        score = ScoreField(min_value=0.0, max_value=10.0)
+
+    class _R7ReplacedSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"))
+        flag = BooleanField(threshold=0.8)
+        score = ScoreField(min_value=0.0, max_value=10.0)
+
+    cm_exp = SystemOneCompiler(_R7BaseSchema, dimension=16).compile(
+        {
+            "cat": [("alpha one", "a"), ("beta two", "b")] * 3,
+            "flag": [("alpha one", True), ("beta two", False)] * 3,
+            "score": [("alpha one", 8.0), ("beta two", 2.0)] * 3,
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    # Compiled Boolean head uses scale=4.0: sigmoid(4.0 * 0.25) ~ 0.731 -> True at 0.5, False at 0.8!
+    _set_head(cm_exp, "flag", np.zeros((1, 16), dtype=np.float32), np.array([0.25], dtype=np.float32))
+    eng_exp = SystemOneEngine(_R7BaseSchema, compiled_model=cm_exp, strict_mode=False, use_cache=False)
+    eng_exp.schema = _R7ReplacedSchema()
+    exp_flag_new = FastExplainer.from_engine(eng_exp, "flag")
+    assert exp_flag_new.explain("alpha one").predicted_label == "False"
+    assert eng_exp.explain("alpha one", field_name="flag").predicted_label == "False"
+    assert eng_exp.decide("alpha one", record_receipt=False).values["flag"] is False
+
+    # Empty string "" normalizes to unit0 [1, 0, ...] on CompiledSystemOneModel across Choice/Boolean/Score.
+    _set_head(cm_exp, "cat", np.array([[2.0] + [0.0] * 15, [0.5] + [0.0] * 15], dtype=np.float32), np.zeros(2, dtype=np.float32))
+    _set_head(cm_exp, "flag", np.array([[1.2] + [0.0] * 15], dtype=np.float32), np.array([-0.2], dtype=np.float32))
+    _set_head(cm_exp, "score", np.array([[3.0] + [0.0] * 15], dtype=np.float32), np.array([1.0], dtype=np.float32))
+    for f_nm in ("cat", "flag"):
+        fe_zero = FastExplainer.from_engine(eng_exp, f_nm)
+        r_fe_empty = fe_zero.explain("")
+        r_eng_empty = eng_exp.explain("", field_name=f_nm)
+        d_empty = eng_exp.decide("", record_receipt=False)
+        assert r_fe_empty.predicted_label == r_eng_empty.predicted_label == str(d_empty.values[f_nm])
+        assert math.isclose(r_fe_empty.predicted_logit, r_eng_empty.predicted_logit, rel_tol=1e-5, abs_tol=1e-5)
+        assert r_fe_empty.additivity_error_target <= 1e-5
+
+        r_fe_nonempty = fe_zero.explain("alpha one signal")
+        assert r_fe_nonempty.additivity_error_target <= 1e-5
+        for z_u0 in (False, True):
+            pt = sys1_explain._project_texts(cm_exp.projector, ["", "alpha one signal"], zero_unit0=z_u0, dimension=16)
+            p0 = sys1_explain._project_one(cm_exp.projector, "", zero_unit0=z_u0, dimension=16)
+            p1 = sys1_explain._project_one(cm_exp.projector, "alpha one signal", zero_unit0=z_u0, dimension=16)
+            np.testing.assert_array_equal(pt[0], p0)
+            np.testing.assert_array_equal(pt[1], p1)
+
+    # Generic BooleanField & ScoreField baseline with TfidfProjector (R7-7).
+    tp_r7 = TfidfProjector.fit(["alpha refund card", "beta outage crash"])
+    cm_tf7 = SystemOneCompiler(_R7BaseSchema, dimension=tp_r7.dimension, projector=tp_r7).compile(
+        {
+            "cat": [("alpha refund card", "a"), ("beta outage crash", "b")] * 3,
+            "flag": [("alpha refund card", True), ("beta outage crash", False)] * 3,
+            "score": [("alpha refund card", 8.0), ("beta outage crash", 2.0)] * 3,
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_tf7 = SystemOneEngine(_R7BaseSchema, compiled_model=cm_tf7, strict_mode=False, use_cache=False)
+    for f_nm in ("cat", "flag"):
+        res_tf7 = FastExplainer.from_engine(eng_tf7, f_nm).explain("alpha refund card")
+        assert res_tf7.additivity_error_target <= 1e-5
+
+    # Float64 weights 1e-10 precision in FastExplainer on SystemOneModel (R7-5).
+    class _TwoCatSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"))
+
+    m_exp64 = SystemOneModel(_TwoCatSchema, dimension=16, projector=_UnitE0Proj())
+    w_e64 = np.zeros((2, 16), dtype=np.float64)
+    w_e64[0, 0] = 1.0
+    w_e64[1, 0] = 1.0 + 1e-10
+    m_exp64.heads["cat"].weights = w_e64
+    m_exp64.heads["cat"].biases = np.zeros(2, dtype=np.float64)
+    eng_exp64 = SystemOneEngine(_TwoCatSchema, model=m_exp64, strict_mode=False, use_cache=False)
+    fe_64 = FastExplainer.from_engine(eng_exp64, "cat")
+    r_64 = fe_64.explain("probe")
+    assert r_64.predicted_label == "b"
+    assert eng_exp64.decide("probe", record_receipt=False).values["cat"] == "b"
+
+    # Exact R7-6 generic zero-projector case on compiled Boolean head: unit0 [1, 0, ...] -> True.
+    class _GenericZeroProj16:
+        dimension = 16
+
+        def project(self, prompt: str, recency_weighted: bool = False) -> np.ndarray:
+            return np.zeros(16, dtype=np.float32)
+
+    class _FlagOnlySchema(DecisionSchema):
+        flag = BooleanField(threshold=0.5)
+
+    cm_z6 = SystemOneCompiler(_FlagOnlySchema, dimension=16, projector=_GenericZeroProj16()).compile(
+        {"flag": [("x", True), ("y", False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    w_z6 = np.zeros((1, 16), dtype=np.float32)
+    w_z6[0, 0] = 1.0
+    _set_head(cm_z6, "flag", w_z6, np.array([-0.5], dtype=np.float32))
+    eng_z6 = SystemOneEngine(_FlagOnlySchema, compiled_model=cm_z6, strict_mode=False, use_cache=False)
+    res_z6 = FastExplainer.from_engine(eng_z6, "flag").explain("probe")
+    assert eng_z6.decide("probe", record_receipt=False).values["flag"] is True
+    assert res_z6.predicted_label == "True"
+    assert res_z6.additivity_error_target <= 1e-6
+
+    # Exact R7-8 float64 Boolean ULP boundary on both SystemOneModel and CompiledSystemOneModel.
+    class _Bool75Schema(DecisionSchema):
+        b = BooleanField(threshold=0.75)
+
+    bias_ulp75 = np.nextafter(math.log(3.0) / 4.0, -np.inf)
+    for use_comp in (False, True):
+        if use_comp:
+            m_u75: Any = SystemOneCompiler(_Bool75Schema, dimension=16).compile(
+                {"b": [("x", True), ("y", False)] * 3},
+                calibration_split=0.0,
+                augment=False,
+            )
+            m_u75._field_heads["b"].weights = np.zeros((1, 16), dtype=np.float64)
+            m_u75._field_heads["b"].biases = np.array([bias_ulp75], dtype=np.float64)
+            m_u75.heads["b"].weights = m_u75._field_heads["b"].weights
+            m_u75.heads["b"].biases = m_u75._field_heads["b"].biases
+            eng_u75 = SystemOneEngine(_Bool75Schema, compiled_model=m_u75, strict_mode=False, use_cache=False)
+        else:
+            m_u75 = SystemOneModel(_Bool75Schema, dimension=16)
+            m_u75.heads["b"].weights = np.zeros((1, 16), dtype=np.float64)
+            m_u75.heads["b"].biases = np.array([bias_ulp75], dtype=np.float64)
+            eng_u75 = SystemOneEngine(_Bool75Schema, model=m_u75, strict_mode=False, use_cache=False)
+        assert eng_u75.decide("probe", record_receipt=False).values["b"] is False
+        assert FastExplainer.from_engine(eng_u75, "b").explain("probe").predicted_label == "False"
+        assert eng_u75.explain("probe", field_name="b").predicted_label == "False"
+
+    # Generic override branch uses calibrated (z * scale + adj) / cal_temp and rejects 1e-308 overflow (R7-5/R7-6).
+    eng_ov = SystemOneEngine(_R7BaseSchema, compiled_model=cm_exp, strict_mode=False, use_cache=False)
+    eng_ov.calibrators["flag"] = DecisionCalibrator(temperature=0.5)
+    eng_ov.learn("exact override trigger phrase", {"flag": True})
+    fe_ov = FastExplainer.from_engine(eng_ov, "flag")
+    r_ov_fast = fe_ov.explain("exact override trigger phrase")
+    r_ov_eng = eng_ov.explain("exact override trigger phrase", field_name="flag")
+    assert r_ov_fast.predicted_label == "True"
+    assert math.isclose(r_ov_fast.predicted_logit, r_ov_eng.predicted_logit, rel_tol=1e-5, abs_tol=1e-5)
+
+    eng_ov.calibrators["flag"].temperature = 1e-308
+    with pytest.raises(ValueError, match="non-finite|overflow"):
+        FastExplainer.from_engine(eng_ov, "flag")
+
+    # ------------------------------------------------------------------
+    # R7-9: Strict JSON float/bool/range parsing across both S1M v2 and S1M v3 headers.
+    # ------------------------------------------------------------------
+    cm_hdr = SystemOneCompiler(_R7BaseSchema, dimension=16).compile(
+        {
+            "cat": [("alpha one", "a"), ("beta two", "b")] * 3,
+            "flag": [("alpha one", True), ("beta two", False)] * 3,
+            "score": [("alpha one", 8.0), ("beta two", 2.0)] * 3,
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    cm_hdr.heads["score"].conformal_quantile = 2.5
+    cm_hdr.heads["cat"].conformal_quantile = 1.0000000000000002
+    cm_hdr.heads["flag"].conformal_quantile = 0.25
+    v2_ok = cm_hdr.to_bytes(compact=False, format_version=2)
+    v3_ok = cm_hdr.to_bytes(compact=False, format_version=3)
+    v2_loaded = CompiledSystemOneModel.from_bytes(v2_ok)
+    v3_loaded = CompiledSystemOneModel.from_bytes(v3_ok)
+    assert v2_loaded.heads["score"].conformal_quantile == 2.5
+    assert v3_loaded.heads["score"].conformal_quantile == 2.5
+    assert v2_loaded.heads["cat"].conformal_quantile == 1.0000000000000002
+    assert v3_loaded.heads["cat"].conformal_quantile == 1.0000000000000002
+
+    def _tamper_v2(mut_fn: Callable[[Dict[str, Any]], None]) -> bytes:
+        hl = struct.unpack(">I", v2_ok[4:8])[0]
+        meta = json.loads(v2_ok[8 : 8 + hl].decode("utf-8"))
+        mut_fn(meta)
+        enc = json.dumps(meta, sort_keys=True).encode("utf-8")
+        return b"S1M\x02" + struct.pack(">I", len(enc)) + enc + v2_ok[8 + hl :]
+
+    def _tamper_v3_raw_json(mut_str_fn: Callable[[str], str]) -> bytes:
+        hl = struct.unpack_from("<Q", v3_ok, 8)[0]
+        raw_str = v3_ok[16 : 16 + hl].decode("utf-8")
+        mut_str = mut_str_fn(raw_str)
+        assert mut_str != raw_str
+        new_str = mut_str.encode("utf-8")
+        hdr_dict = json.loads(v3_ok[16 : 16 + hl].decode("utf-8"))
+        first_off = min(spec["offset"] for spec in hdr_dict["tensors"].values())
+        assert 16 + len(new_str) <= first_off
+        out = bytearray(v3_ok)
+        struct.pack_into("<Q", out, 8, len(new_str))
+        out[16:first_off] = new_str.ljust(first_off - 16, b" ")
+        return bytes(out)
+
+    def _tamper_v2_raw_json(mut_str_fn: Callable[[str], str]) -> bytes:
+        hl = struct.unpack(">I", v2_ok[4:8])[0]
+        raw_str = v2_ok[8 : 8 + hl].decode("utf-8")
+        mut_str = mut_str_fn(raw_str)
+        assert mut_str != raw_str
+        new_b = mut_str.encode("utf-8")
+        return b"S1M\x02" + struct.pack(">I", len(new_b)) + new_b + v2_ok[8 + hl :]
+
+    def _tamper_v3(mut_fn: Callable[[Dict[str, Any]], None]) -> bytes:
+        hl = struct.unpack_from("<Q", v3_ok, 8)[0]
+        meta = json.loads(v3_ok[16 : 16 + hl].decode("utf-8"))
+        mut_fn(meta)
+        enc = json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        first_off = min(spec["offset"] for spec in meta["tensors"].values())
+        assert 16 + len(enc) <= first_off
+        out = bytearray(v3_ok)
+        struct.pack_into("<Q", out, 8, len(enc))
+        out[16:first_off] = enc.ljust(first_off - 16, b" ")
+        return bytes(out)
+
+    # Raw JSON non-finite, overflowing float literal, and 10**400 huge integer literal.
+    import re
+
+    def _sub_json_field(field_key: str, raw_lit: str) -> Callable[[str], str]:
+        return lambda s: re.sub(
+            rf'"{field_key}":\s*[-+0-9.eE]+',
+            f'"{field_key}": {raw_lit}',
+            s,
+            count=1,
+        )
+
+    for raw_lit in ("NaN", "Infinity", "-Infinity", "1e309", "1" + "0" * 400):
+        b2_raw = _tamper_v2_raw_json(_sub_json_field("temperature", raw_lit))
+        b3_raw = _tamper_v3_raw_json(_sub_json_field("temperature", raw_lit))
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(b2_raw)
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(b3_raw)
+
+    for ovf_field in (
+        "conformal_quantile",
+        "margin_threshold",
+        "forgetting_factor",
+        "relative_odds_ratio",
+        "confidence_floor_tau0",
+    ):
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(_tamper_v2_raw_json(_sub_json_field(ovf_field, "1e400")))
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(_tamper_v3_raw_json(_sub_json_field(ovf_field, "1e400")))
+
+    structured_mutators: List[Callable[[Dict[str, Any]], None]] = [
+        lambda m: m["heads"]["cat"].__setitem__("temperature", True),
+        lambda m: m["heads"]["cat"].__setitem__("temperature", "1.0"),
+        lambda m: m["heads"]["cat"].__setitem__("temperature", 0.0),
+        lambda m: m["heads"]["cat"].__setitem__("temperature", -0.5),
+        lambda m: m["heads"]["cat"].__setitem__("conformal_quantile", True),
+        lambda m: m["heads"]["cat"].__setitem__("conformal_quantile", "1e400"),
+        lambda m: m["heads"]["cat"].__setitem__("conformal_quantile", 1.5),
+        lambda m: m["heads"]["flag"].__setitem__("conformal_quantile", -0.1),
+        lambda m: m["heads"]["cat"].__setitem__("forgetting_factor", True),
+        lambda m: m["heads"]["cat"].__setitem__("forgetting_factor", 0.0),
+        lambda m: m["heads"]["cat"].__setitem__("forgetting_factor", 1.1),
+        lambda m: m["heads"]["cat"].__setitem__("relative_odds_ratio", 0.0),
+        lambda m: m["heads"]["cat"].__setitem__("confidence_floor_tau0", -0.1),
+        lambda m: m["heads"]["cat"].__setitem__("margin_threshold", -0.1),
+        lambda m: m["heads"]["cat"].__setitem__("familiarity_threshold", -0.1),
+        lambda m: m["heads"]["cat"].__setitem__("prototype_threshold", -0.1),
+        lambda m: m["heads"]["cat"].__setitem__("hierarchical", 1),
+        lambda m: m["heads"]["cat"].__setitem__("escalate_on_ambiguity", 0),
+        lambda m: m["heads"]["cat"].__setitem__("mondrian", 1),
+        lambda m: m["metadata"].__setitem__("cold_start", "false"),
+        lambda m: m["metadata"].__setitem__("forgetting_factor", False),
+        lambda m: m["metadata"].__setitem__("recency_weighted", 1),
+        lambda m: m.__setitem__("created_at", "1e400"),
+        lambda m: m["metadata"].__setitem__("created_at", True),
+        lambda m: m["metadata"].__setitem__("strict_mode", "false"),
+        lambda m: m["metadata"].__setitem__("default_alpha", 1.5),
+    ]
+    for mut in structured_mutators:
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(_tamper_v2(mut))
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(_tamper_v3(mut))
+
+    # ------------------------------------------------------------------
+    # R7-10: OnlineMondrianConformal rejects invalid prediction vectors without mutating state.
+    # ------------------------------------------------------------------
+    omc = OnlineMondrianConformal(num_classes=3, alpha=0.1)
+    omc.update(0, 0.2, probs=[0.7, 0.2, 0.1])
+    snap_alpha = omc.alpha_c.copy()
+    snap_q = omc.q_c.copy()
+    snap_u = omc.u_c.copy()
+    snap_err = omc.err_ewma.copy()
+    snap_t = omc.steps
+
+    invalid_probs: List[Any] = [
+        ["0.5", "0.3", "0.2"],
+        [True, False, False],
+        [0.5, float("nan"), 0.5],
+        [0.5, float("inf"), 0.0],
+        [-0.1, 0.6, 0.5],
+        [0.5, 1.2, 0.0],
+        [0.5, 0.5],
+        [[0.4, 0.4, 0.2]],
+        b"abc",
+    ]
+    for bad_p in invalid_probs:
+        with pytest.raises((ValueError, TypeError)):
+            omc.update(0, 0.1, probs=bad_p)
+        with pytest.raises((ValueError, TypeError)):
+            omc.predict_set(bad_p)
+        with pytest.raises((ValueError, TypeError)):
+            omc.should_accept(bad_p)
+
+    np.testing.assert_array_equal(omc.alpha_c, snap_alpha)
+    np.testing.assert_array_equal(omc.q_c, snap_q)
+    np.testing.assert_array_equal(omc.u_c, snap_u)
+    np.testing.assert_array_equal(omc.err_ewma, snap_err)
+    assert omc.steps == snap_t
+
+    # ------------------------------------------------------------------
+    # R7-12: UtilityCascadeRouter.fit holds out disjoint cal split by default & resets when uncalibrated.
+    # ------------------------------------------------------------------
+    router = drop_in_mod.UtilityCascadeRouter(error_multiplier=20.0, alpha=0.10)
+    r_prompts: List[str] = []
+    r_tiers: List[str] = []
+    for idx in range(15):
+        r_prompts.append(f"simple faq order check token_a_{idx}")
+        r_tiers.append("system1_local")
+        r_prompts.append(f"rewrite summarize email paragraph token_b_{idx}")
+        r_tiers.append("fast_small_model")
+        r_prompts.append(f"prove distributed consensus safety invariant token_c_{idx}")
+        r_tiers.append("frontier_reasoning_model")
+
+    seen_train_embs: List[tuple[float, ...]] = []
+    seen_cal_prompts: List[str] = []
+    seen_cal_y: List[int] = []
+
+    orig_head_fit = drop_in_mod.SoftOrdinalHead.fit
+    orig_batch_raw = router._batch_raw_probs
+    orig_util_fit = router.utility_calibrator.fit
+
+    def _spy_head_fit(self_h: Any, x_tr: np.ndarray, y_tr: np.ndarray) -> Any:
+        seen_train_embs.extend(tuple(np.round(row, 8)) for row in x_tr)
+        return orig_head_fit(self_h, x_tr, y_tr)
+
+    def _spy_batch_raw(prompts_c: Sequence[str], **kwargs: Any) -> np.ndarray:
+        seen_cal_prompts.extend(list(prompts_c))
+        return orig_batch_raw(prompts_c, **kwargs)
+
+    def _spy_util_fit(probs_c: np.ndarray, y_c: np.ndarray, **kwargs: Any) -> Any:
+        seen_cal_y.extend(int(v) for v in y_c)
+        return orig_util_fit(probs_c, y_c, **kwargs)
+
+    drop_in_mod.SoftOrdinalHead.fit = _spy_head_fit  # type: ignore[method-assign]
+    router._batch_raw_probs = _spy_batch_raw  # type: ignore[method-assign]
+    router.utility_calibrator.fit = _spy_util_fit  # type: ignore[method-assign]
+    try:
+        router.fit(r_prompts, r_tiers)
+    finally:
+        drop_in_mod.SoftOrdinalHead.fit = orig_head_fit  # type: ignore[method-assign]
+        router._batch_raw_probs = orig_batch_raw  # type: ignore[method-assign]
+        router.utility_calibrator.fit = orig_util_fit  # type: ignore[method-assign]
+
+    assert router._is_calibrated is True
+    assert len(seen_train_embs) + len(seen_cal_y) == len(r_prompts)
+    assert len(seen_cal_prompts) == len(seen_cal_y) >= 3
+    cal_embs = router._encode_prompts(seen_cal_prompts)
+    cal_row_keys = {tuple(np.round(row, 8)) for row in cal_embs}
+    assert set(seen_train_embs).isdisjoint(cal_row_keys)
+
+    # Partial external calibration args and invalid cal_fraction must fail closed.
+    with pytest.raises(ValueError):
+        router.fit(r_prompts, r_tiers, cal_prompts=r_prompts[:3])
+    with pytest.raises(ValueError):
+        router.fit(r_prompts, r_tiers, cal_tiers=r_tiers[:3])
+    for bad_cf in (-0.1, 1.0, 1.5, float("nan"), True):
+        with pytest.raises(ValueError):
+            router.fit(r_prompts, r_tiers, cal_fraction=bad_cf)  # type: ignore[arg-type]
+
+    # Refitting an already-calibrated router with cal_fraction=0.0 must reset calibrators and mark route vacuous.
+    router.fit(r_prompts, r_tiers, cal_fraction=0.0)
+    assert router._is_calibrated is False
+    assert router.utility_calibrator.is_vacuous is True
+    assert router.binary_calibrator.mode == "unfitted"
+    d_uncal = router.route("simple faq order check token_a_0")
+    assert d_uncal.is_vacuous is True
+
+    # Exact R7-12 18-prompt default fit() check spying on engine.learn and router.calibrate.
+    router_18 = drop_in_mod.UtilityCascadeRouter(error_multiplier=20.0, alpha=0.10)
+    prompts_18: List[str] = []
+    tiers_18: List[str] = []
+    for idx in range(6):
+        prompts_18.append(f"r7_12_faq_{idx}")
+        tiers_18.append("system1_local")
+        prompts_18.append(f"r7_12_mid_{idx}")
+        tiers_18.append("fast_small_model")
+        prompts_18.append(f"r7_12_hard_{idx}")
+        tiers_18.append("frontier_reasoning_model")
+    learned_18: List[str] = []
+    calibrated_18: List[str] = []
+    orig_learn_18 = router_18.engine.learn
+    orig_cal_18 = router_18.calibrate
+
+    def _spy_learn_18(prompt_s: str, target_d: Any) -> Any:
+        learned_18.append(str(prompt_s))
+        return orig_learn_18(prompt_s, target_d)
+
+    def _spy_cal_18(prompts_c: Sequence[str], tiers_c: Sequence[Any], **kwargs: Any) -> Any:
+        calibrated_18.extend(str(p_s) for p_s in prompts_c)
+        return orig_cal_18(prompts_c, tiers_c, **kwargs)
+
+    router_18.engine.learn = _spy_learn_18  # type: ignore[method-assign]
+    router_18.calibrate = _spy_cal_18  # type: ignore[method-assign]
+    try:
+        router_18.fit(prompts_18, tiers_18)
+    finally:
+        router_18.engine.learn = orig_learn_18  # type: ignore[method-assign]
+        router_18.calibrate = orig_cal_18  # type: ignore[method-assign]
+    assert router_18._is_calibrated is True
+    assert len(learned_18) + len(calibrated_18) == 18
+    assert len(calibrated_18) >= 3
+    assert set(learned_18).isdisjoint(set(calibrated_18))

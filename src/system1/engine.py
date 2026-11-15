@@ -2018,25 +2018,26 @@ class SystemOneEngine:
                 if cached is None:
                     if query_emb is None:
                         query_emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
-                    cached = self.cache.get(
-                        prompt,
-                        embedding=query_emb,
-                        telemetry=telemetry,
-                        schema_digest=self.schema.schema_digest(),
-                        model_version=self.model_version,
-                        policy_scope=eff_scope,
-                        alpha=alpha,
-                        margin_threshold=eff_m_thresh if self.enable_margin_gating else 0.0,
-                        strict=is_strict,
-                        relative_odds_ratio=eff_gamma,
-                        confidence_floor_tau0=eff_tau0,
-                        recency_weighted=recency_weighted,
-                        model_digest=m_dig,
-                        projector_digest=p_dig,
-                        calibration_digest=c_dig,
-                        policy_epoch=self.policy_epoch,
-                        enforce_durability=is_fail_closed,
-                    )
+                    if bool(np.all(np.isfinite(query_emb))):
+                        cached = self.cache.get(
+                            prompt,
+                            embedding=query_emb,
+                            telemetry=telemetry,
+                            schema_digest=self.schema.schema_digest(),
+                            model_version=self.model_version,
+                            policy_scope=eff_scope,
+                            alpha=alpha,
+                            margin_threshold=eff_m_thresh if self.enable_margin_gating else 0.0,
+                            strict=is_strict,
+                            relative_odds_ratio=eff_gamma,
+                            confidence_floor_tau0=eff_tau0,
+                            recency_weighted=recency_weighted,
+                            model_digest=m_dig,
+                            projector_digest=p_dig,
+                            calibration_digest=c_dig,
+                            policy_epoch=self.policy_epoch,
+                            enforce_durability=is_fail_closed,
+                        )
 
                 if cached is not None:
                     entry, sim = cached
@@ -2411,7 +2412,11 @@ class SystemOneEngine:
                         val = f_def.min_value + (f_def.max_value - f_def.min_value) * prob
                         conf = float(getattr(raw_eval, "confidence", max(prob, 1.0 - prob)))
                     if not (emb_finite and math.isfinite(val) and math.isfinite(conf)):
-                        values[name] = float("nan")
+                        values[name] = (
+                            float(f_def.default)
+                            if getattr(f_def, "default", None) is not None
+                            else float(f_def.min_value)
+                        )
                         confidences[name] = float("nan")
                         probabilities[name] = {"score_ratio": float("nan")}
                         conformal_sets[name] = []
@@ -2709,7 +2714,7 @@ class SystemOneEngine:
                 metadata=result_meta,
             )
 
-            if eff_use_cache and not is_ambiguous:
+            if eff_use_cache and not is_ambiguous and emb_finite:
                 self.cache.put(
                     prompt,
                     result,
@@ -3810,8 +3815,14 @@ class SystemOneEngine:
                 options = ("False", "True") if is_bool else tuple(f_def.options)
                 k_opts = len(options)
 
-                w_mat = np.asarray(head.weights, dtype=np.float32)
-                b_vec = np.asarray(head.biases, dtype=np.float32).reshape(-1)
+                raw_w_arr = np.asarray(head.weights)
+                if raw_w_arr.dtype not in (np.float32, np.float64):
+                    raw_w_arr = raw_w_arr.astype(np.float32)
+                raw_b_arr = np.asarray(head.biases).reshape(-1)
+                if raw_b_arr.dtype not in (np.float32, np.float64):
+                    raw_b_arr = raw_b_arr.astype(np.float32)
+                w_mat = np.asarray(raw_w_arr, dtype=np.float32)
+                b_vec = np.asarray(raw_b_arr, dtype=np.float32)
 
                 cluster_assign_raw = getattr(head, "cluster_assignments", ()) or ()
                 is_hier = bool(
@@ -3938,6 +3949,8 @@ class SystemOneEngine:
                         "escalate": bool(getattr(f_def, "escalate_on_ambiguity", True)),
                         "w": w_mat,
                         "b": b_vec,
+                        "raw_w": raw_w_arr,
+                        "raw_b": raw_b_arr,
                         "is_hier": is_hier,
                         "coarse_w": coarse_w,
                         "coarse_b": coarse_b,
@@ -3971,57 +3984,32 @@ class SystemOneEngine:
                 t_chunk_start = time.perf_counter()
 
                 raw_norms_arr: Optional[np.ndarray] = None
-                X_raw_2d: Optional[np.ndarray] = None
-                if is_hybrid_proj:
-                    hyb_rows: List[np.ndarray] = []
-                    for p in chunk_prompts:
-                        try:
-                            raw_p = proj_obj.project(p, recency_weighted=recency_flag)
-                        except TypeError:
-                            raw_p = proj_obj.project(p)
-                        hyb_rows.append(
-                            _normalize_raw_projection(raw_p, self.dimension, zero_unit0=zero_unit0)
-                        )
-                    X = np.stack(hyb_rows, axis=0)
-                    if needs_raw_norm and hasattr(proj_obj, "raw_norm"):
-                        raw_norms_arr = np.array(
-                            [float(proj_obj.raw_norm(p)) for p in chunk_prompts], dtype=np.float64
-                        )
-                else:
-                    if needs_raw_norm:
-                        try:
-                            proj_ret = proj_obj.project_batch(
-                                chunk_prompts, recency_weighted=recency_flag, return_norms=True
-                            )
-                        except TypeError:
-                            proj_ret = proj_obj.project_batch(chunk_prompts, return_norms=True)
-                        if isinstance(proj_ret, tuple):
-                            X_raw, raw_norms_arr = proj_ret
-                            raw_norms_arr = np.asarray(raw_norms_arr, dtype=np.float64).reshape(-1)
-                        else:
-                            X_raw = proj_ret
-                            if hasattr(proj_obj, "raw_norm"):
-                                raw_norms_arr = np.array(
-                                    [float(proj_obj.raw_norm(p)) for p in chunk_prompts], dtype=np.float64
-                                )
+                enc_rows: List[np.ndarray] = []
+                rn_list: Optional[List[float]] = [] if needs_raw_norm else None
+                has_model_encode_with_norm = hasattr(self.model, "_encode_with_norm")
+                for p in chunk_prompts:
+                    if has_model_encode_with_norm:
+                        emb_p, rn_p = self.model._encode_with_norm(p, recency_weighted=recency_flag)
                     else:
-                        try:
-                            X_raw = proj_obj.project_batch(chunk_prompts, recency_weighted=recency_flag)
-                        except TypeError:
-                            X_raw = proj_obj.project_batch(chunk_prompts)
-
-                    X_raw_2d = np.asarray(X_raw)
-                    if X_raw_2d.ndim == 1:
-                        X_raw_2d = X_raw_2d.reshape(1, -1)
-                    X = _normalize_raw_projection_batch(
-                        X_raw_2d, m_docs, self.dimension, zero_unit0=zero_unit0
-                    )
+                        emb_p = self.model.encode(p, recency_weighted=recency_flag)
+                        rn_p = None
+                    enc_rows.append(np.asarray(emb_p, dtype=np.float32).ravel())
+                    if rn_list is not None:
+                        if rn_p is None and hasattr(proj_obj, "raw_norm"):
+                            try:
+                                rn_p = float(proj_obj.raw_norm(p, recency_weighted=recency_flag))
+                            except TypeError:
+                                rn_p = float(proj_obj.raw_norm(p))
+                        rn_list.append(float(rn_p) if rn_p is not None else float("nan"))
+                X = np.stack(enc_rows, axis=0).astype(np.float32, copy=False)
+                if rn_list is not None and (
+                    hasattr(proj_obj, "raw_norm") or any(math.isfinite(v) for v in rn_list)
+                ):
+                    raw_norms_arr = np.asarray(rn_list, dtype=np.float64)
                 nonfin_rows = ~np.all(np.isfinite(X), axis=1)
-                x_inf_chunk = (
-                    np.max(np.abs(np.where(np.isfinite(X), X, 0.0)), axis=1).astype(np.float64)
-                    if m_docs > 1
-                    else np.empty(0, dtype=np.float64)
-                )
+                x_inf_chunk = np.max(
+                    np.abs(np.where(np.isfinite(X), X, 0.0)), axis=1
+                ).astype(np.float64)
                 if is_tfidf_proj:
                     zero_emb_mask = (~nonfin_rows) & (~np.any(X, axis=1))
                 else:
@@ -4075,13 +4063,15 @@ class SystemOneEngine:
                             else:
                                 logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
 
-                        if m_docs > 1 and not spec["is_hier"]:
+                        if not spec["is_hier"]:
+                            raw_w_s = spec["raw_w"]
+                            raw_b_s = spec["raw_b"]
                             w_l1 = (
-                                float(np.sum(np.abs(spec["w"])))
+                                float(np.sum(np.abs(raw_w_s[0])))
                                 if spec["is_bool"]
-                                else (float(np.max(np.sum(np.abs(spec["w"]), axis=1))) if spec["w"].size else 0.0)
+                                else (float(np.max(np.sum(np.abs(raw_w_s), axis=1))) if raw_w_s.size else 0.0)
                             )
-                            b_abs = float(np.max(np.abs(spec["b"]))) if spec["b"].size else 0.0
+                            b_abs = float(np.max(np.abs(raw_b_s))) if raw_b_s.size else 0.0
                             dz_bound = (
                                 4.0
                                 * (float(self.dimension) + 4.0)
@@ -4100,7 +4090,7 @@ class SystemOneEngine:
                             probs = calibrator.calibrate_logits(two_logits)
                             if probs.ndim == 1:
                                 probs = probs.reshape(1, -1)
-                            if m_docs > 1 and not spec["is_hier"]:
+                            if not spec["is_hier"]:
                                 row_finite = (
                                     (~nonfin_rows) & np.isfinite(z_col) & np.all(np.isfinite(probs), axis=1)
                                 )
@@ -4138,18 +4128,16 @@ class SystemOneEngine:
                                         )
                                 if spec["sel_cal"] is not None or aci_has_floor:
                                     near_rows |= row_finite
-                                near_rows &= row_finite
+                                if spec["raw_w"].dtype == np.float64 or spec["raw_b"].dtype == np.float64:
+                                    near_rows |= ~nonfin_rows
+                                near_rows &= ~nonfin_rows
                                 if np.any(near_rows):
                                     probs = np.array(probs, dtype=np.float64, copy=True)
+                                    raw_w_b = spec["raw_w"]
+                                    raw_b_b = spec["raw_b"]
                                     for r_i in np.flatnonzero(near_rows).tolist():
-                                        x_ex = (
-                                            X[r_i]
-                                            if X_raw_2d is None
-                                            else _normalize_raw_projection(
-                                                X_raw_2d[r_i], self.dimension, zero_unit0=zero_unit0
-                                            )
-                                        )
-                                        z_ex = float((x_ex @ spec["w"].T + spec["b"])[0]) / 0.25
+                                        x_ex = X[r_i : r_i + 1]
+                                        z_ex = float((x_ex @ raw_w_b.T + raw_b_b)[0, 0]) / 0.25
                                         probs[r_i] = calibrator.calibrate_logits(
                                             np.array([-0.5 * z_ex, 0.5 * z_ex], dtype=np.float64)
                                         ).reshape(-1)
@@ -4165,7 +4153,7 @@ class SystemOneEngine:
                             probs = calibrator.calibrate_logits(logits.astype(np.float64) / 0.25)
                             if probs.ndim == 1:
                                 probs = probs.reshape(1, -1)
-                            if m_docs > 1 and not spec["is_hier"]:
+                            if not spec["is_hier"]:
                                 row_finite = (
                                     (~nonfin_rows)
                                     & np.all(np.isfinite(logits), axis=1)
@@ -4213,18 +4201,16 @@ class SystemOneEngine:
                                         )
                                 if spec["sel_cal"] is not None or aci_has_floor:
                                     near_rows |= row_finite
-                                near_rows &= row_finite
+                                if spec["raw_w"].dtype == np.float64 or spec["raw_b"].dtype == np.float64:
+                                    near_rows |= ~nonfin_rows
+                                near_rows &= ~nonfin_rows
                                 if np.any(near_rows):
                                     probs = np.array(probs, dtype=np.float64, copy=True)
+                                    raw_w_c = spec["raw_w"]
+                                    raw_b_c = spec["raw_b"]
                                     for r_i in np.flatnonzero(near_rows).tolist():
-                                        x_ex = (
-                                            X[r_i]
-                                            if X_raw_2d is None
-                                            else _normalize_raw_projection(
-                                                X_raw_2d[r_i], self.dimension, zero_unit0=zero_unit0
-                                            )
-                                        )
-                                        z_ex = (x_ex @ spec["w"].T + spec["b"]).astype(np.float64).ravel() / 0.25
+                                        x_ex = X[r_i : r_i + 1]
+                                        z_ex = (x_ex @ raw_w_c.T + raw_b_c).astype(np.float64).ravel() / 0.25
                                         probs[r_i] = calibrator.calibrate_logits(z_ex).reshape(-1)
                             best_idx = np.argmax(probs, axis=1)
                             confs = probs[np.arange(m_docs), best_idx]
