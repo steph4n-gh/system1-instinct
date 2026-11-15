@@ -29,6 +29,7 @@ from system1.core.model import (
     RawFieldEvaluation,
     SystemOneModel,
     _normalize_raw_projection,
+    _normalize_raw_projection_batch,
     _stable_sigmoid,
     _stable_softmax,
 )
@@ -2272,10 +2273,12 @@ class CompiledSystemOneModel:
             terms.append(tm)
         if len(set(terms)) != len(terms):
             raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
-        if len(terms) != len(raw_weights):
-            raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
+        if len(terms) > 2048:
+            raise ValueError("Saved hybrid spectral terms exceed maximum allowed size")
         for w_val in raw_weights:
             _req_num(w_val, "spectral_weights")
+        if len(terms) != len(raw_weights):
+            raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
         try:
             with np.errstate(over="ignore", invalid="ignore"):
                 spec_w_f32 = np.asarray([float(w_val) for w_val in raw_weights], dtype=np.float32)
@@ -2346,6 +2349,7 @@ class CompiledSystemOneModel:
         if not fitted:
             if (
                 terms
+                or len(raw_weights) > 0
                 or (spec_arr is not None and len(spec_arr) > 0)
                 or basis_arr is not None
                 or (sub_arr is not None and len(sub_arr) > 0)
@@ -4404,21 +4408,21 @@ class SystemOneCompiler:
                 )
             except TypeError:
                 raw_mat = projector.project_batch(text_list)
-            arr = np.asarray(raw_mat, dtype=np.float32)
-        else:
-            rows = []
-            for p in text_list:
-                if hasattr(projector, "project"):
-                    try:
-                        v = projector.project(p, recency_weighted=True) if use_rw else projector.project(p)
-                    except TypeError:
-                        v = projector.project(p)
-                else:
-                    v = projector(p)
-                rows.append(np.asarray(v, dtype=np.float32))
-            arr = np.stack(rows, axis=0)
-        norms = np.linalg.norm(arr, axis=1, keepdims=True)
-        return np.where(norms > 1e-12, arr / np.maximum(norms, 1e-12), arr).astype(np.float32)
+            raw_mat_arr = np.asarray(raw_mat)
+            dim_out = int(raw_mat_arr.shape[1]) if raw_mat_arr.ndim == 2 else 0
+            return _normalize_raw_projection_batch(raw_mat_arr, len(text_list), dim_out, zero_unit0=False)
+        rows = []
+        for p in text_list:
+            if hasattr(projector, "project"):
+                try:
+                    v = projector.project(p, recency_weighted=True) if use_rw else projector.project(p)
+                except TypeError:
+                    v = projector.project(p)
+            else:
+                v = projector(p)
+            v_arr = np.asarray(v).ravel()
+            rows.append(_normalize_raw_projection(v_arr, int(v_arr.shape[0]), zero_unit0=False))
+        return np.stack(rows, axis=0)
 
     @staticmethod
     def _stratified_folds(y_idx: np.ndarray, k_classes: int) -> Tuple[int, np.ndarray]:
@@ -5245,13 +5249,12 @@ class SystemOneCompiler:
                             raw_mat = self.projector.project_batch(unique_prompts)
                     else:
                         raw_mat = self.projector.project_batch(unique_prompts)
-                raw_mat_arr = np.asarray(raw_mat, dtype=np.float32)
-                row_norms = np.linalg.norm(raw_mat_arr, axis=1, keepdims=True)
-                normed_mat = np.where(
-                    row_norms > 1e-12,
-                    raw_mat_arr / np.maximum(row_norms, 1e-12),
-                    raw_mat_arr,
-                ).astype(np.float32)
+                normed_mat = _normalize_raw_projection_batch(
+                    raw_mat,
+                    len(unique_prompts),
+                    self.dimension,
+                    zero_unit0=False,
+                )
                 for u_idx, p in enumerate(unique_prompts):
                     if raw_norms_batch is not None and p in need_norm_set:
                         rn_val_b: Optional[float] = float(raw_norms_batch[u_idx])
@@ -5284,12 +5287,7 @@ class SystemOneCompiler:
                     else:
                         raw_emb = self.projector(p)
                     rn_val = float(self.projector.raw_norm(p)) if want_raw else None
-                    norm = float(np.linalg.norm(raw_emb))
-                    emb_base = (
-                        (raw_emb / norm).astype(np.float32)
-                        if norm > 1e-12
-                        else np.asarray(raw_emb, dtype=np.float32)
-                    )
+                    emb_base = _normalize_raw_projection(raw_emb, self.dimension, zero_unit0=False)
                     if isinstance(p, str):
                         proj_cache[p] = (emb_base, rn_val)
                     emb = emb_base

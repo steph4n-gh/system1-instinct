@@ -2158,15 +2158,23 @@ class HybridProjector:
         if not counts:
             return None, False
         r_spec = self._spectral_vectors.shape[1]
-        spec_accum = np.zeros(r_spec, dtype=np.float32)
-        for tm, cnt in counts.items():
-            idx = self._spectral_vocab[tm]
-            w = (1.0 + math.log(cnt)) * self._spectral_weights[idx]
-            spec_accum += w * self._spectral_vectors[idx]
-        s_norm = float(np.linalg.norm(spec_accum))
-        if s_norm < 1e-12:
-            return None, False
-        return (spec_accum / s_norm).astype(np.float32), True
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            spec_accum = np.zeros(r_spec, dtype=np.float32)
+            for tm, cnt in counts.items():
+                idx = self._spectral_vocab[tm]
+                w = (1.0 + math.log(cnt)) * self._spectral_weights[idx]
+                spec_accum += w * self._spectral_vectors[idx]
+            if not bool(np.all(np.isfinite(spec_accum))):
+                return np.full(r_spec, np.nan, dtype=np.float32), True
+            s_norm = float(np.linalg.norm(spec_accum))
+            if not math.isfinite(s_norm):
+                return np.full(r_spec, np.nan, dtype=np.float32), True
+            if s_norm < 1e-12:
+                return None, False
+            out = (spec_accum / s_norm).astype(np.float32)
+            if not bool(np.all(np.isfinite(out))):
+                return np.full(r_spec, np.nan, dtype=np.float32), True
+            return out, True
 
     def _extract_spectral_unit_batch(self, texts: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
         """Batched unit-normalized raw spectral vectors and validity mask via chunked SGEMM."""
@@ -2189,37 +2197,46 @@ class HybridProjector:
         out = np.zeros((n_docs, r_spec), dtype=np.float32)
         has_spec = np.zeros(n_docs, dtype=bool)
         chunk_size = 256
-        for start in range(0, n_docs, chunk_size):
-            end = min(start + chunk_size, n_docs)
-            c_len = end - start
-            counts_mat = np.zeros((c_len, v_size), dtype=np.float32)
-            non_empty_rows: List[int] = []
-            for local_i, t in enumerate(texts[start:end]):
-                terms = _extract_corpus_terms(t)
-                if not terms:
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            for start in range(0, n_docs, chunk_size):
+                end = min(start + chunk_size, n_docs)
+                c_len = end - start
+                counts_mat = np.zeros((c_len, v_size), dtype=np.float32)
+                non_empty_rows: List[int] = []
+                for local_i, t in enumerate(texts[start:end]):
+                    terms = _extract_corpus_terms(t)
+                    if not terms:
+                        continue
+                    cnts: Dict[int, int] = {}
+                    for tm in terms:
+                        idx = sv.get(tm)
+                        if idx is not None:
+                            cnts[idx] = cnts.get(idx, 0) + 1
+                    if cnts:
+                        cols = list(cnts.keys())
+                        vals = [
+                            float(sw_arr[idx]) if c == 1 else (1.0 + math.log(c)) * float(sw_arr[idx])
+                            for idx, c in cnts.items()
+                        ]
+                        counts_mat[local_i, cols] = np.asarray(vals, dtype=np.float32)
+                        non_empty_rows.append(local_i)
+                if not non_empty_rows:
                     continue
-                cnts: Dict[int, int] = {}
-                for tm in terms:
-                    idx = sv.get(tm)
-                    if idx is not None:
-                        cnts[idx] = cnts.get(idx, 0) + 1
-                if cnts:
-                    cols = list(cnts.keys())
-                    vals = [
-                        float(sw_arr[idx]) if c == 1 else (1.0 + math.log(c)) * float(sw_arr[idx])
-                        for idx, c in cnts.items()
-                    ]
-                    counts_mat[local_i, cols] = np.asarray(vals, dtype=np.float32)
-                    non_empty_rows.append(local_i)
-            if not non_empty_rows:
-                continue
-            accums = counts_mat @ self._spectral_vectors
-            norms = np.linalg.norm(accums, axis=1, keepdims=True)
-            valid = (norms[:, 0] >= 1e-12) & np.isfinite(norms[:, 0])
-            if np.any(valid):
-                accums[valid] /= norms[valid]
-                out[start:end][valid] = accums[valid].astype(np.float32)
-                has_spec[start:end] = valid
+                accums = counts_mat @ self._spectral_vectors
+                norms = np.linalg.norm(accums, axis=1, keepdims=True)
+                row_fin = np.all(np.isfinite(accums), axis=1) & np.isfinite(norms[:, 0])
+                valid = row_fin & (norms[:, 0] >= 1e-12)
+                bad = ~row_fin
+                if np.any(valid):
+                    normed = (accums[valid] / norms[valid]).astype(np.float32)
+                    norm_bad = ~np.all(np.isfinite(normed), axis=1)
+                    if np.any(norm_bad):
+                        normed[norm_bad] = np.nan
+                    out[start:end][valid] = normed
+                    has_spec[start:end] = has_spec[start:end] | valid
+                if np.any(bad):
+                    out[start:end][bad] = np.nan
+                    has_spec[start:end] = has_spec[start:end] | bad
         return out, has_spec
 
     def _encode_spectral_dense(self, text: str, base_dense: np.ndarray) -> np.ndarray:
@@ -2229,14 +2246,28 @@ class HybridProjector:
         spec_unit, ok = self._extract_spectral_unit(text)
         if not ok or spec_unit is None:
             return base_dense
-        spec_dense = spec_unit @ self._spectral_basis
-        sd_norm = float(np.linalg.norm(spec_dense))
-        if sd_norm > 1e-12:
-            spec_dense = spec_dense / sd_norm
-        blend = min(1.0, max(0.0, float(self.spectral_blend)))
-        blended = (1.0 - blend) * base_dense + blend * spec_dense
-        b_norm = float(np.linalg.norm(blended))
-        return (blended / b_norm).astype(np.float32) if b_norm > 1e-12 else base_dense
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if not bool(np.all(np.isfinite(spec_unit))) or not bool(np.all(np.isfinite(base_dense))):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            spec_dense = spec_unit @ self._spectral_basis
+            if not bool(np.all(np.isfinite(spec_dense))):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            sd_norm = float(np.linalg.norm(spec_dense))
+            if not math.isfinite(sd_norm):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            if sd_norm > 1e-12:
+                spec_dense = spec_dense / sd_norm
+            blend = min(1.0, max(0.0, float(self.spectral_blend)))
+            blended = (1.0 - blend) * base_dense + blend * spec_dense
+            if not bool(np.all(np.isfinite(blended))):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            b_norm = float(np.linalg.norm(blended))
+            if not math.isfinite(b_norm):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            if b_norm > 1e-12:
+                out = (blended / b_norm).astype(np.float32)
+                return out if bool(np.all(np.isfinite(out))) else np.full(base_dense.shape, np.nan, dtype=np.float32)
+            return base_dense
 
     def _project_base(self, text: str) -> np.ndarray:
         fit_cache = getattr(self, "_fit_base_cache", None)
@@ -2262,47 +2293,56 @@ class HybridProjector:
             v_sparse = self._hash_to_sparse_vec(text, _pretokenized=pretok)
         v_dense = self._dense_engine.encode(text, _pretokenized=pretok)
 
-        if self._direct_spectral:
-            sd = self.sparse_dim
-            dd = self.dense_dim
-            spd = self._direct_spectral_dim
-            base_dim = sd + dd + spd
-            w_sparse = math.sqrt(self.alpha)
-            if spd > 0:
-                w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
-                w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
-            else:
-                w_dense = math.sqrt(1.0 - self.alpha)
-                w_spec = 0.0
-            v_out = np.empty(base_dim, dtype=np.float32)
-            np.multiply(v_sparse, w_sparse, out=v_out[:sd])
-            np.multiply(v_dense, w_dense, out=v_out[sd : sd + dd])
-            if spd > 0:
-                spec_unit, ok = self._extract_spectral_unit(text)
-                if ok and spec_unit is not None and spec_unit.shape[0] == spd:
-                    np.multiply(spec_unit, w_spec, out=v_out[sd + dd :])
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if self._direct_spectral:
+                sd = self.sparse_dim
+                dd = self.dense_dim
+                spd = self._direct_spectral_dim
+                base_dim = sd + dd + spd
+                w_sparse = math.sqrt(self.alpha)
+                if spd > 0:
+                    w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
+                    w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
                 else:
-                    v_out[sd + dd :] = 0.0
-            norm = float(np.linalg.norm(v_out))
-            if norm > 1e-12 and np.isfinite(norm):
-                return (v_out / norm).astype(np.float32)
-            v_fallback = np.zeros(base_dim, dtype=np.float32)
-            v_fallback[0] = 1.0
-            return v_fallback
+                    w_dense = math.sqrt(1.0 - self.alpha)
+                    w_spec = 0.0
+                v_out = np.empty(base_dim, dtype=np.float32)
+                np.multiply(v_sparse, w_sparse, out=v_out[:sd])
+                np.multiply(v_dense, w_dense, out=v_out[sd : sd + dd])
+                if spd > 0:
+                    spec_unit, ok = self._extract_spectral_unit(text)
+                    if ok and spec_unit is not None and spec_unit.shape[0] == spd:
+                        np.multiply(spec_unit, w_spec, out=v_out[sd + dd :])
+                    else:
+                        v_out[sd + dd :] = 0.0
+                all_fin = bool(np.all(np.isfinite(v_out)))
+                norm = float(np.linalg.norm(v_out)) if all_fin else float("nan")
+                if all_fin and math.isfinite(norm) and norm > 1e-12:
+                    normed = (v_out / norm).astype(np.float32)
+                    return normed if bool(np.all(np.isfinite(normed))) else np.full(base_dim, np.nan, dtype=np.float32)
+                if all_fin and math.isfinite(norm):
+                    v_fallback = np.zeros(base_dim, dtype=np.float32)
+                    v_fallback[0] = 1.0
+                    return v_fallback
+                return np.full(base_dim, np.nan, dtype=np.float32)
 
-        if self._fitted:
-            v_dense = self._encode_spectral_dense(text, v_dense)
+            if self._fitted:
+                v_dense = self._encode_spectral_dense(text, v_dense)
 
-        w_sparse = math.sqrt(self.alpha)
-        w_dense = math.sqrt(1.0 - self.alpha)
+            w_sparse = math.sqrt(self.alpha)
+            w_dense = math.sqrt(1.0 - self.alpha)
 
-        v_hybrid = np.concatenate([w_sparse * v_sparse, w_dense * v_dense]).astype(np.float32)
-        norm = float(np.linalg.norm(v_hybrid))
-        if norm > 1e-12:
-            return (v_hybrid / norm).astype(np.float32)
-        v_fallback = np.zeros(self._base_dimension, dtype=np.float32)
-        v_fallback[0] = 1.0
-        return v_fallback
+            v_hybrid = np.concatenate([w_sparse * v_sparse, w_dense * v_dense]).astype(np.float32)
+            all_fin = bool(np.all(np.isfinite(v_hybrid)))
+            norm = float(np.linalg.norm(v_hybrid)) if all_fin else float("nan")
+            if all_fin and math.isfinite(norm) and norm > 1e-12:
+                normed = (v_hybrid / norm).astype(np.float32)
+                return normed if bool(np.all(np.isfinite(normed))) else np.full(self._base_dimension, np.nan, dtype=np.float32)
+            if all_fin and math.isfinite(norm):
+                v_fallback = np.zeros(self._base_dimension, dtype=np.float32)
+                v_fallback[0] = 1.0
+                return v_fallback
+            return np.full(self._base_dimension, np.nan, dtype=np.float32)
 
     def _project_base_batch(
         self,
@@ -2353,65 +2393,91 @@ class HybridProjector:
             ] if pretok_list is not None else None,
         )
 
-        if self._direct_spectral:
-            sd = self.sparse_dim
-            dd = self.dense_dim
-            spd = self._direct_spectral_dim
-            w_sparse = math.sqrt(self.alpha)
-            if spd > 0:
-                w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
-                w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
-            else:
-                w_dense = math.sqrt(1.0 - self.alpha)
-                w_spec = 0.0
-
-            base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
-            np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, :sd])
-            np.multiply(v_dense_mat, w_dense, out=base_mat[:, sd : sd + dd])
-            if spd > 0:
-                spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
-                if spec_mat.shape[1] == spd:
-                    np.multiply(spec_mat, w_spec, out=base_mat[:, sd + dd :])
-                    if np.any(~has_spec):
-                        base_mat[~has_spec, sd + dd :] = 0.0
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if self._direct_spectral:
+                sd = self.sparse_dim
+                dd = self.dense_dim
+                spd = self._direct_spectral_dim
+                w_sparse = math.sqrt(self.alpha)
+                if spd > 0:
+                    w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
+                    w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
                 else:
-                    base_mat[:, sd + dd :] = 0.0
-        else:
-            if (
-                self._fitted
-                and self._spectral_vectors is not None
-                and self._spectral_basis is not None
-                and self._spectral_vocab
-                and self.spectral_blend > 0.0
-            ):
-                spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
-                if np.any(has_spec):
-                    spec_dense = spec_mat[has_spec] @ self._spectral_basis
-                    sd_norms = np.linalg.norm(spec_dense, axis=1, keepdims=True)
-                    good_sd = sd_norms[:, 0] > 1e-12
-                    if np.any(good_sd):
-                        spec_dense[good_sd] = spec_dense[good_sd] / sd_norms[good_sd]
-                    blend = min(1.0, max(0.0, float(self.spectral_blend)))
-                    blended = (1.0 - blend) * v_dense_mat[has_spec] + blend * spec_dense
-                    b_norms = np.linalg.norm(blended, axis=1, keepdims=True)
-                    good_b = b_norms[:, 0] > 1e-12
-                    has_idx = np.flatnonzero(has_spec)
-                    if np.any(good_b):
-                        v_dense_mat[has_idx[good_b]] = (blended[good_b] / b_norms[good_b]).astype(np.float32)
+                    w_dense = math.sqrt(1.0 - self.alpha)
+                    w_spec = 0.0
 
-            w_sparse = math.sqrt(self.alpha)
-            w_dense = math.sqrt(1.0 - self.alpha)
-            base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
-            np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, : self.sparse_dim])
-            np.multiply(v_dense_mat, w_dense, out=base_mat[:, self.sparse_dim :])
+                base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
+                np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, :sd])
+                np.multiply(v_dense_mat, w_dense, out=base_mat[:, sd : sd + dd])
+                if spd > 0:
+                    spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
+                    if spec_mat.shape[1] == spd:
+                        np.multiply(spec_mat, w_spec, out=base_mat[:, sd + dd :])
+                        if np.any(~has_spec):
+                            base_mat[~has_spec, sd + dd :] = 0.0
+                    else:
+                        base_mat[:, sd + dd :] = 0.0
+            else:
+                if (
+                    self._fitted
+                    and self._spectral_vectors is not None
+                    and self._spectral_basis is not None
+                    and self._spectral_vocab
+                    and self.spectral_blend > 0.0
+                ):
+                    spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
+                    if np.any(has_spec):
+                        spec_dense = spec_mat[has_spec] @ self._spectral_basis
+                        sd_fin = np.all(np.isfinite(spec_mat[has_spec]), axis=1) & np.all(
+                            np.isfinite(spec_dense), axis=1
+                        )
+                        sd_norms = np.linalg.norm(spec_dense, axis=1, keepdims=True)
+                        sd_fin &= np.isfinite(sd_norms[:, 0])
+                        good_sd = sd_fin & (sd_norms[:, 0] > 1e-12)
+                        if np.any(good_sd):
+                            spec_dense[good_sd] = spec_dense[good_sd] / sd_norms[good_sd]
+                        blend = min(1.0, max(0.0, float(self.spectral_blend)))
+                        blended = (1.0 - blend) * v_dense_mat[has_spec] + blend * spec_dense
+                        b_norms = np.linalg.norm(blended, axis=1, keepdims=True)
+                        b_fin = (
+                            sd_fin
+                            & np.all(np.isfinite(v_dense_mat[has_spec]), axis=1)
+                            & np.all(np.isfinite(blended), axis=1)
+                            & np.isfinite(b_norms[:, 0])
+                        )
+                        good_b = b_fin & (b_norms[:, 0] > 1e-12)
+                        has_idx = np.flatnonzero(has_spec)
+                        if np.any(good_b):
+                            v_dense_mat[has_idx[good_b]] = (blended[good_b] / b_norms[good_b]).astype(
+                                np.float32
+                            )
+                        bad_b = ~b_fin
+                        if np.any(bad_b):
+                            v_dense_mat[has_idx[bad_b]] = np.nan
 
-        norms = np.linalg.norm(base_mat, axis=1, keepdims=True)
-        valid = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
-        if np.any(valid):
-            base_mat[valid] = (base_mat[valid] / norms[valid]).astype(np.float32)
-        if np.any(~valid):
-            base_mat[~valid] = 0.0
-            base_mat[~valid, 0] = 1.0
+                w_sparse = math.sqrt(self.alpha)
+                w_dense = math.sqrt(1.0 - self.alpha)
+                base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
+                np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, : self.sparse_dim])
+                np.multiply(v_dense_mat, w_dense, out=base_mat[:, self.sparse_dim :])
+
+            row_fin = np.all(np.isfinite(base_mat), axis=1)
+            norms = np.linalg.norm(base_mat, axis=1, keepdims=True)
+            fin_norm = row_fin & np.isfinite(norms[:, 0])
+            unit_mask = fin_norm & (norms[:, 0] > 1e-12)
+            zero_mask = fin_norm & (norms[:, 0] <= 1e-12)
+            bad_mask = ~fin_norm
+            if np.any(unit_mask):
+                normed = (base_mat[unit_mask] / norms[unit_mask]).astype(np.float32)
+                bad_after = ~np.all(np.isfinite(normed), axis=1)
+                if np.any(bad_after):
+                    normed[bad_after] = np.nan
+                base_mat[unit_mask] = normed
+            if np.any(zero_mask):
+                base_mat[zero_mask] = 0.0
+                base_mat[zero_mask, 0] = 1.0
+            if np.any(bad_mask):
+                base_mat[bad_mask] = np.nan
 
         if return_norms:
             assert raw_norms is not None
@@ -2432,38 +2498,60 @@ class HybridProjector:
             raise TypeError(f"Expected text to be a string, got {type(text).__name__}")
 
         v_base = self._project_base(text)
-        if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
-            coords = self._subspace_components @ v_base
-            v_sub = self._subspace_components.T @ coords
-            v_base = v_base + float(self._subspace_weight) * v_sub
-            norm = float(np.linalg.norm(v_base))
-            if norm > 1e-12 and np.isfinite(norm):
-                v_base = (v_base / norm).astype(np.float32)
-            else:
-                v_base = np.zeros(self._base_dimension, dtype=np.float32)
-                v_base[0] = 1.0
+        if not bool(np.all(np.isfinite(v_base))):
+            return np.full(self.dimension, np.nan, dtype=np.float32)
 
-        if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
-            sims = self._rbf_landmarks @ v_base
-            phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
-            pnorm = float(np.linalg.norm(phi))
-            wb = math.sqrt(1.0 - self._rbf_weight)
-            wr = math.sqrt(self._rbf_weight)
-            d_b = len(v_base)
-            v_out = np.empty(self.dimension, dtype=np.float32)
-            np.multiply(v_base, wb, out=v_out[:d_b])
-            if pnorm > 1e-12:
-                np.multiply(phi, wr / pnorm, out=v_out[d_b:])
-                if not np.any(v_base):
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
+                coords = self._subspace_components @ v_base
+                v_sub = self._subspace_components.T @ coords
+                v_base = (v_base + float(self._subspace_weight) * v_sub).astype(np.float32)
+                sub_fin = (
+                    bool(np.all(np.isfinite(coords)))
+                    and bool(np.all(np.isfinite(v_sub)))
+                    and bool(np.all(np.isfinite(v_base)))
+                )
+                norm = float(np.linalg.norm(v_base)) if sub_fin else float("nan")
+                if sub_fin and math.isfinite(norm) and norm > 1e-12:
+                    v_base = (v_base / norm).astype(np.float32)
+                    if not bool(np.all(np.isfinite(v_base))):
+                        return np.full(self.dimension, np.nan, dtype=np.float32)
+                elif sub_fin and math.isfinite(norm):
+                    v_base = np.zeros(self._base_dimension, dtype=np.float32)
+                    v_base[0] = 1.0
+                else:
+                    return np.full(self.dimension, np.nan, dtype=np.float32)
+
+            if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
+                sims = self._rbf_landmarks @ v_base
+                phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
+                rbf_fin = bool(np.all(np.isfinite(sims))) and bool(np.all(np.isfinite(phi)))
+                pnorm = float(np.linalg.norm(phi)) if rbf_fin else float("nan")
+                if not rbf_fin or not math.isfinite(pnorm):
+                    return np.full(self.dimension, np.nan, dtype=np.float32)
+                wb = math.sqrt(1.0 - self._rbf_weight)
+                wr = math.sqrt(self._rbf_weight)
+                d_b = len(v_base)
+                v_out = np.empty(self.dimension, dtype=np.float32)
+                np.multiply(v_base, wb, out=v_out[:d_b])
+                if pnorm > 1e-12:
+                    np.multiply(phi, wr / pnorm, out=v_out[d_b:])
+                    if not np.any(v_base):
+                        on = float(np.linalg.norm(v_out))
+                        if math.isfinite(on) and on > 1e-12:
+                            v_out /= on
+                        elif not math.isfinite(on):
+                            return np.full(self.dimension, np.nan, dtype=np.float32)
+                else:
+                    v_out[d_b:] = 0.0
                     on = float(np.linalg.norm(v_out))
-                    if on > 1e-12:
+                    if math.isfinite(on) and on > 1e-12:
                         v_out /= on
-            else:
-                v_out[d_b:] = 0.0
-                on = float(np.linalg.norm(v_out))
-                if on > 1e-12:
-                    v_out /= on
-            return v_out
+                    elif not math.isfinite(on):
+                        return np.full(self.dimension, np.nan, dtype=np.float32)
+                if not bool(np.all(np.isfinite(v_out))):
+                    return np.full(self.dimension, np.nan, dtype=np.float32)
+                return v_out
 
         return v_base
 
@@ -2501,39 +2589,79 @@ class HybridProjector:
             v_base_mat = self._project_base_batch(text_list, return_norms=False)
             raw_norms = None
 
-        if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
-            coords = v_base_mat @ self._subspace_components.T
-            v_sub = coords @ self._subspace_components
-            v_base_mat = (v_base_mat + float(self._subspace_weight) * v_sub).astype(np.float32)
-            s_norms = np.linalg.norm(v_base_mat, axis=1, keepdims=True)
-            valid = (s_norms[:, 0] > 1e-12) & np.isfinite(s_norms[:, 0])
-            if np.any(valid):
-                v_base_mat[valid] = (v_base_mat[valid] / s_norms[valid]).astype(np.float32)
-            if np.any(~valid):
-                v_base_mat[~valid] = 0.0
-                v_base_mat[~valid, 0] = 1.0
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
+                in_fin = np.all(np.isfinite(v_base_mat), axis=1)
+                coords = v_base_mat @ self._subspace_components.T
+                v_sub = coords @ self._subspace_components
+                v_base_mat = (v_base_mat + float(self._subspace_weight) * v_sub).astype(np.float32)
+                s_norms = np.linalg.norm(v_base_mat, axis=1, keepdims=True)
+                row_fin = (
+                    in_fin
+                    & np.all(np.isfinite(coords), axis=1)
+                    & np.all(np.isfinite(v_sub), axis=1)
+                    & np.all(np.isfinite(v_base_mat), axis=1)
+                    & np.isfinite(s_norms[:, 0])
+                )
+                unit_sub = row_fin & (s_norms[:, 0] > 1e-12)
+                zero_sub = row_fin & (s_norms[:, 0] <= 1e-12)
+                bad_sub = ~row_fin
+                if np.any(unit_sub):
+                    normed_sub = (v_base_mat[unit_sub] / s_norms[unit_sub]).astype(np.float32)
+                    bad_after = ~np.all(np.isfinite(normed_sub), axis=1)
+                    if np.any(bad_after):
+                        normed_sub[bad_after] = np.nan
+                    v_base_mat[unit_sub] = normed_sub
+                if np.any(zero_sub):
+                    v_base_mat[zero_sub] = 0.0
+                    v_base_mat[zero_sub, 0] = 1.0
+                if np.any(bad_sub):
+                    v_base_mat[bad_sub] = np.nan
 
-        if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
-            sims = v_base_mat @ self._rbf_landmarks.T
-            phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
-            p_norms = np.linalg.norm(phi, axis=1, keepdims=True)
-            phi_unit = np.where(p_norms > 1e-12, phi / np.maximum(p_norms, 1e-12), 0.0).astype(np.float32)
-            wb = math.sqrt(1.0 - self._rbf_weight)
-            wr = math.sqrt(self._rbf_weight)
-            d_b = v_base_mat.shape[1]
-            v_out = np.empty((len(text_list), self.dimension), dtype=np.float32)
-            np.multiply(v_base_mat, wb, out=v_out[:, :d_b])
-            np.multiply(phi_unit, wr, out=v_out[:, d_b:])
-            row_norms = np.linalg.norm(v_out, axis=1, keepdims=True)
-            valid_out = (row_norms[:, 0] > 1e-12) & np.isfinite(row_norms[:, 0])
-            if np.any(valid_out):
-                v_out[valid_out] = (v_out[valid_out] / row_norms[valid_out]).astype(np.float32)
-            if np.any(~valid_out):
-                v_out[~valid_out] = 0.0
-                v_out[~valid_out, 0] = 1.0
-            res = v_out
-        else:
-            res = v_base_mat
+            if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
+                base_fin = np.all(np.isfinite(v_base_mat), axis=1)
+                sims = v_base_mat @ self._rbf_landmarks.T
+                phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
+                p_norms = np.linalg.norm(phi, axis=1, keepdims=True)
+                rbf_fin = (
+                    base_fin
+                    & np.all(np.isfinite(sims), axis=1)
+                    & np.all(np.isfinite(phi), axis=1)
+                    & np.isfinite(p_norms[:, 0])
+                )
+                phi_unit = np.full(phi.shape, np.nan, dtype=np.float32)
+                nz_phi = rbf_fin & (p_norms[:, 0] > 1e-12)
+                zero_phi = rbf_fin & (p_norms[:, 0] <= 1e-12)
+                if np.any(nz_phi):
+                    phi_unit[nz_phi] = (phi[nz_phi] / p_norms[nz_phi]).astype(np.float32)
+                if np.any(zero_phi):
+                    phi_unit[zero_phi] = 0.0
+
+                wb = math.sqrt(1.0 - self._rbf_weight)
+                wr = math.sqrt(self._rbf_weight)
+                d_b = v_base_mat.shape[1]
+                v_out = np.empty((len(text_list), self.dimension), dtype=np.float32)
+                np.multiply(v_base_mat, wb, out=v_out[:, :d_b])
+                np.multiply(phi_unit, wr, out=v_out[:, d_b:])
+                row_norms = np.linalg.norm(v_out, axis=1, keepdims=True)
+                fin_out = rbf_fin & np.all(np.isfinite(v_out), axis=1) & np.isfinite(row_norms[:, 0])
+                unit_out = fin_out & (row_norms[:, 0] > 1e-12)
+                zero_out = fin_out & (row_norms[:, 0] <= 1e-12)
+                bad_out = ~fin_out
+                if np.any(unit_out):
+                    normed_out = (v_out[unit_out] / row_norms[unit_out]).astype(np.float32)
+                    bad_after_o = ~np.all(np.isfinite(normed_out), axis=1)
+                    if np.any(bad_after_o):
+                        normed_out[bad_after_o] = np.nan
+                    v_out[unit_out] = normed_out
+                if np.any(zero_out):
+                    v_out[zero_out] = 0.0
+                    v_out[zero_out, 0] = 1.0
+                if np.any(bad_out):
+                    v_out[bad_out] = np.nan
+                res = v_out
+            else:
+                res = v_base_mat
 
         if return_norms:
             assert raw_norms is not None
@@ -2558,15 +2686,15 @@ class HybridProjector:
         }
         if self._fitted:
             cfg["fitted"] = True
-            cfg["svd_power"] = round(float(self.svd_power), 6)
-            cfg["spectral_blend"] = round(float(self.spectral_blend), 6)
+            cfg["svd_power"] = float(self.svd_power)
+            cfg["spectral_blend"] = float(self.spectral_blend)
             cfg["spectral_terms"] = list(self._spectral_terms)
-            cfg["spectral_weights"] = [round(float(w), 6) for w in self._spectral_weights]
+            cfg["spectral_weights"] = [float(w) for w in self._spectral_weights]
             if self._direct_spectral:
                 cfg["direct_spectral"] = True
                 cfg["direct_spectral_dim"] = int(self._direct_spectral_dim)
-            if abs(self._context_smooth - 1.0) > 1e-9:
-                cfg["context_smooth"] = round(float(self._context_smooth), 6)
+            if self._context_smooth != 1.0:
+                cfg["context_smooth"] = float(self._context_smooth)
             if self._tfidf_projector is not None:
                 tp_cfg = self._tfidf_projector.to_config(include_arrays=include_arrays)
                 cfg["tfidf_terms"] = tp_cfg["terms"]
@@ -2587,22 +2715,22 @@ class HybridProjector:
             if self._use_subspace:
                 cfg["use_subspace"] = True
             if self._rbf_landmarks is not None:
-                cfg["rbf_gamma"] = round(float(self._rbf_gamma), 6)
-                cfg["rbf_weight"] = round(float(self._rbf_weight), 6)
+                cfg["rbf_gamma"] = float(self._rbf_gamma)
+                cfg["rbf_weight"] = float(self._rbf_weight)
                 if include_arrays:
                     cfg["rbf_landmarks"] = [
-                        [round(float(x), 6) for x in row] for row in self._rbf_landmarks
+                        [float(x) for x in row] for row in self._rbf_landmarks
                     ]
             if include_arrays:
                 if self._spectral_vectors is not None:
                     cfg["spectral_vectors"] = [
-                        [round(float(x), 6) for x in row] for row in self._spectral_vectors
+                        [float(x) for x in row] for row in self._spectral_vectors
                     ]
                 if self._subspace_components is not None:
                     cfg["subspace_components"] = [
-                        [round(float(x), 6) for x in row] for row in self._subspace_components
+                        [float(x) for x in row] for row in self._subspace_components
                     ]
-            cfg["subspace_weight"] = round(float(self._subspace_weight), 6)
+            cfg["subspace_weight"] = float(self._subspace_weight)
         return cfg
 
     @classmethod
@@ -2653,8 +2781,71 @@ class HybridProjector:
         if not isinstance(raw_terms, (list, tuple)):
             raise ValueError("Saved hybrid spectral terms must be a sequence")
         terms = tuple(raw_terms)
-        if any(not isinstance(term, str) or not term.strip() for term in terms) or len(set(terms)) != len(terms):
+        if (
+            len(terms) > 2048
+            or any(not isinstance(term, str) or not term.strip() for term in terms)
+            or len(set(terms)) != len(terms)
+        ):
             raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
+        has_spectral_weights_key = "spectral_weights" in config and config["spectral_weights"] is not None
+        raw_weights = config.get("spectral_weights") if has_spectral_weights_key else ()
+        if not isinstance(raw_weights, (list, tuple)):
+            raise ValueError("Saved hybrid projector spectral weights must be a sequence")
+        weights = tuple(cls._require_finite_scalar(w, "spectral_weights") for w in raw_weights)
+        if len(terms) != len(weights):
+            raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
+        with np.errstate(over="ignore", invalid="ignore"):
+            weights_arr = (
+                np.asarray(weights, dtype=np.float32)
+                if weights
+                else np.empty(0, dtype=np.float32)
+            )
+        if not bool(np.all(np.isfinite(weights_arr))):
+            raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
+
+        def _resolve_hybrid_matrix(
+            cfg_key: str,
+            arg_arr: Optional[np.ndarray],
+        ) -> Optional[np.ndarray]:
+            raw_cfg = config.get(cfg_key)
+            cfg_arr: Optional[np.ndarray] = None
+            if cfg_key in config and raw_cfg is not None:
+                if not isinstance(raw_cfg, (list, tuple)) or len(raw_cfg) == 0:
+                    raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                row_len: Optional[int] = None
+                for row in raw_cfg:
+                    if not isinstance(row, (list, tuple)) or len(row) == 0:
+                        raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                    if row_len is None:
+                        row_len = len(row)
+                    elif len(row) != row_len:
+                        raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                    for elem in row:
+                        if isinstance(elem, bool) or not isinstance(elem, (int, float)):
+                            raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                with np.errstate(over="ignore", invalid="ignore"):
+                    cfg_arr = np.asarray(raw_cfg, dtype=np.float32)
+                if cfg_arr.ndim != 2 or not bool(np.all(np.isfinite(cfg_arr))):
+                    raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
+            if arg_arr is not None:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    out_arr = np.asarray(arg_arr, dtype=np.float32)
+                if not bool(np.all(np.isfinite(out_arr))):
+                    raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
+                if cfg_arr is not None and (
+                    cfg_arr.shape != out_arr.shape
+                    or not np.allclose(cfg_arr, out_arr, rtol=0.0, atol=1e-4)
+                ):
+                    raise ValueError(
+                        f"Saved hybrid projector inline {cfg_key} mismatches binary tensor"
+                    )
+                return out_arr
+            return cfg_arr
+
+        spec_arr = _resolve_hybrid_matrix("spectral_vectors", spectral_vectors)
+        sub_arr = _resolve_hybrid_matrix("subspace_components", subspace_components)
+        rbf_arr = _resolve_hybrid_matrix("rbf_landmarks", rbf_landmarks)
+
         proj = cls(
             sparse_dim=sparse,
             dense_dim=dense,
@@ -2729,65 +2920,11 @@ class HybridProjector:
                     proj._tfidf_projector = TfidfProjector.from_config(
                         tf_cfg, idf_array=tfidf_idf_array
                     )
-            raw_weights = config.get("spectral_weights", ())
-            if not isinstance(raw_weights, (list, tuple)):
-                raise ValueError("Saved hybrid projector spectral weights must be a sequence")
-            weights = tuple(cls._require_finite_scalar(w, "spectral_weights") for w in raw_weights)
-            if len(terms) != len(weights):
-                raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
-            with np.errstate(over="ignore", invalid="ignore"):
-                weights_arr = (
-                    np.asarray(weights, dtype=np.float32)
-                    if weights
-                    else np.empty(0, dtype=np.float32)
-                )
-            if not bool(np.all(np.isfinite(weights_arr))):
-                raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
             proj._spectral_terms = terms
             proj._spectral_vocab = {tm: i for i, tm in enumerate(terms)}
             proj._spectral_weights = weights
             proj._spectral_weights_arr = weights_arr
 
-            def _resolve_hybrid_matrix(
-                cfg_key: str,
-                arg_arr: Optional[np.ndarray],
-            ) -> Optional[np.ndarray]:
-                raw_cfg = config.get(cfg_key)
-                cfg_arr: Optional[np.ndarray] = None
-                if cfg_key in config and raw_cfg is not None:
-                    if not isinstance(raw_cfg, (list, tuple)) or len(raw_cfg) == 0:
-                        raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
-                    row_len: Optional[int] = None
-                    for row in raw_cfg:
-                        if not isinstance(row, (list, tuple)) or len(row) == 0:
-                            raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
-                        if row_len is None:
-                            row_len = len(row)
-                        elif len(row) != row_len:
-                            raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
-                        for elem in row:
-                            if isinstance(elem, bool) or not isinstance(elem, (int, float)):
-                                raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
-                    with np.errstate(over="ignore", invalid="ignore"):
-                        cfg_arr = np.asarray(raw_cfg, dtype=np.float32)
-                    if cfg_arr.ndim != 2 or not bool(np.all(np.isfinite(cfg_arr))):
-                        raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
-                if arg_arr is not None:
-                    with np.errstate(over="ignore", invalid="ignore"):
-                        out_arr = np.asarray(arg_arr, dtype=np.float32)
-                    if not bool(np.all(np.isfinite(out_arr))):
-                        raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
-                    if cfg_arr is not None and (
-                        cfg_arr.shape != out_arr.shape
-                        or not np.allclose(cfg_arr, out_arr, rtol=0.0, atol=1e-4)
-                    ):
-                        raise ValueError(
-                            f"Saved hybrid projector inline {cfg_key} mismatches binary tensor"
-                        )
-                    return out_arr
-                return cfg_arr
-
-            spec_arr = _resolve_hybrid_matrix("spectral_vectors", spectral_vectors)
             if spec_arr is not None and len(spec_arr) > 0:
                 if proj._direct_spectral:
                     max_r = proj._direct_spectral_dim if proj._direct_spectral_dim > 0 else spec_arr.shape[1]
@@ -2822,7 +2959,6 @@ class HybridProjector:
                 raise ValueError("Saved hybrid projector missing spectral_vectors")
 
             proj._update_dimension()
-            sub_arr = _resolve_hybrid_matrix("subspace_components", subspace_components)
             if sub_arr is not None and len(sub_arr) > 0:
                 base_dim = proj._base_dimension
                 if (
@@ -2835,7 +2971,6 @@ class HybridProjector:
                 proj._subspace_components = sub_arr
             proj._subspace_weight = subspace_weight
 
-            rbf_arr = _resolve_hybrid_matrix("rbf_landmarks", rbf_landmarks)
             if rbf_arr is not None and len(rbf_arr) > 0:
                 base_dim = proj._base_dimension
                 if rbf_arr.ndim != 2 or rbf_arr.shape[0] < 1 or rbf_arr.shape[1] != base_dim or not np.all(np.isfinite(rbf_arr)):
@@ -2855,6 +2990,11 @@ class HybridProjector:
             has_any_tfidf_cfg
             or tfidf_idf_array is not None
             or terms
+            or weights
+            or (has_spectral_weights_key and len(raw_weights) > 0)
+            or spec_arr is not None
+            or sub_arr is not None
+            or rbf_arr is not None
             or config.get("spectral_vectors") is not None
             or config.get("subspace_components") is not None
             or config.get("rbf_landmarks") is not None

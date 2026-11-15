@@ -1653,9 +1653,16 @@ class FastExplainer:
                 base_logits = self.W_base[:, 0] + self.b_eff
                 if self.has_rbf and self.L_sp_T is not None and self.W_rbf is not None:
                     sims = self.L_sp_T[0]
-                    phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
-                    u_rbf = phi / float(np.linalg.norm(phi))
-                    logits = base_logits + self.W_rbf @ u_rbf
+                    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                        phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
+                        pnorm = float(np.linalg.norm(phi))
+                    _require_finite_array(phi, "counterfactual kept rbf features")
+                    _require_finite_scalar(pnorm, "counterfactual kept rbf norm")
+                    if pnorm > 1e-12:
+                        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                            logits = base_logits + self.W_rbf @ (phi / pnorm)
+                    else:
+                        logits = base_logits
                 else:
                     logits = base_logits
                 _require_finite_array(logits, "counterfactual kept logits")
@@ -1674,17 +1681,21 @@ class FastExplainer:
                 logits += g_sc * (self.W_sc @ u_sc)
 
             if self.has_rbf and self.L_sp_T is not None and self.L_dn is not None and self.L_sc is not None and self.W_rbf is not None:
-                sims = np.zeros(self.num_landmarks, dtype=np.float64)
-                if sp_ok:
-                    sims += g_sp * (v_sp @ self.L_sp_T[act_idx])
-                if dn_ok:
-                    sims += g_dn * (self.L_dn @ u_dn)
-                if sc_ok:
-                    sims += g_sc * (self.L_sc @ u_sc)
-                phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
-                pnorm = float(np.linalg.norm(phi))
+                with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                    sims = np.zeros(self.num_landmarks, dtype=np.float64)
+                    if sp_ok:
+                        sims += g_sp * (v_sp @ self.L_sp_T[act_idx])
+                    if dn_ok:
+                        sims += g_dn * (self.L_dn @ u_dn)
+                    if sc_ok:
+                        sims += g_sc * (self.L_sc @ u_sc)
+                    phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
+                    pnorm = float(np.linalg.norm(phi))
+                _require_finite_array(phi, "counterfactual kept rbf features")
+                _require_finite_scalar(pnorm, "counterfactual kept rbf norm")
                 if pnorm > 1e-12:
-                    logits += self.W_rbf @ (phi / pnorm)
+                    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                        logits += self.W_rbf @ (phi / pnorm)
 
             _require_finite_array(logits, "counterfactual kept logits")
             return self._select_winner_kept(logits, spans, kept_mask), logits
@@ -1938,15 +1949,18 @@ class FastExplainer:
                 g_sc = (self.w_spec / base_norm) if sc_ok else 0.0
 
                 if self.has_rbf and self.L_sp_T is not None and self.L_dn is not None and self.L_sc is not None and self.W_rbf is not None:
-                    sims = np.zeros(self.num_landmarks, dtype=np.float64)
-                    if sp_ok:
-                        sims += g_sp * (v_sp @ self.L_sp_T[act_idx])
-                    if dn_ok:
-                        sims += g_dn * (self.L_dn @ u_dn)
-                    if sc_ok:
-                        sims += g_sc * (self.L_sc @ u_sc)
-                    phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
-                    pnorm = float(np.linalg.norm(phi))
+                    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                        sims = np.zeros(self.num_landmarks, dtype=np.float64)
+                        if sp_ok:
+                            sims += g_sp * (v_sp @ self.L_sp_T[act_idx])
+                        if dn_ok:
+                            sims += g_dn * (self.L_dn @ u_dn)
+                        if sc_ok:
+                            sims += g_sc * (self.L_sc @ u_sc)
+                        phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
+                        pnorm = float(np.linalg.norm(phi))
+                    _require_finite_array(phi, "explained rbf features")
+                    _require_finite_scalar(pnorm, "explained rbf norm")
                     if pnorm > 1e-12:
                         u_rbf = phi / pnorm
                     else:

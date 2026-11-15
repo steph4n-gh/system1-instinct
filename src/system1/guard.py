@@ -39,6 +39,12 @@ from system1.core import (
     DecisionSchema,
     ScoreField,
 )
+from system1.core.model import (
+    _accepts_recency_weighted,
+    _compute_hierarchical_logits_np,
+    _encode_projector_batch,
+)
+from system1.core.text import PragmaticCompositeProjector, TfidfProjector
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,254}$")
@@ -210,9 +216,29 @@ def make_sliding_windows(
 
 
 def _l2_normalize_rows(X: np.ndarray) -> np.ndarray:
-    with np.errstate(over="ignore", invalid="ignore"):
-        norms = np.linalg.norm(X, axis=1, keepdims=True)
-        return X / np.maximum(norms, 1e-12)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        arr = np.asarray(X, dtype=np.float64)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        out = np.full(arr.shape, np.nan, dtype=np.float32)
+        if arr.shape[0] == 0:
+            return out
+        row_fin = np.all(np.isfinite(arr), axis=1)
+        if bool(np.any(row_fin)):
+            good = arr[row_fin]
+            norms = np.linalg.norm(good, axis=1, keepdims=True)
+            fin_n = np.isfinite(norms[:, 0])
+            nz = fin_n & (norms[:, 0] > 1e-12)
+            zero = fin_n & (norms[:, 0] <= 1e-12)
+            good_idx = np.flatnonzero(row_fin)
+            if bool(np.any(nz)):
+                normed = (good[nz] / norms[nz]).astype(np.float32)
+                ok_n = np.all(np.isfinite(normed), axis=1)
+                if bool(np.any(ok_n)):
+                    out[good_idx[nz][ok_n]] = normed[ok_n]
+            if bool(np.any(zero)):
+                out[good_idx[zero]] = 0.0
+        return out
 
 
 def _normalize_unsafe_label_arg(
@@ -252,8 +278,6 @@ class GuardShield:
         unsafe_exemplars: Optional[Sequence[str]] = None,
         sim_threshold: Optional[float] = None,
     ) -> None:
-        from system1.explain import _boolean_threshold_logit_shift
-
         resolved = getattr(model, "model", model)
         schema = getattr(model, "schema", None) or resolved.schema
         self.model = resolved
@@ -268,6 +292,10 @@ class GuardShield:
         if self.head is None:
             raise ValueError(f"Model has no head for field {field_name!r}")
         f_def = schema.fields[self.field_name]
+        if not isinstance(f_def, (BooleanField, ChoiceField)):
+            raise ValueError(
+                f"GuardShield supports ChoiceField and BooleanField, got {type(f_def).__name__}"
+            )
 
         calibrators = getattr(model, "calibrators", None)
         cal_obj = calibrators.get(self.field_name) if isinstance(calibrators, Mapping) else None
@@ -285,35 +313,86 @@ class GuardShield:
         adj = None if raw_adj is None else np.asarray(raw_adj, dtype=np.float64).reshape(-1)
         if adj is not None and not bool(np.all(np.isfinite(adj))):
             raise ValueError(f"Calibration logit_adjustments for {self.field_name!r} contain non-finite values")
+        self.cal_temp = temp
+        self.cal_adj = None if adj is None else adj.copy()
 
-        with np.errstate(over="ignore", invalid="ignore"):
-            raw_w_in = np.asarray(self.head.weights)
-            raw_b_in = np.asarray(self.head.biases).reshape(-1)
-            w_dtype = np.float64 if (raw_w_in.dtype == np.float64 or raw_b_in.dtype == np.float64) else np.float32
-            raw_w = np.asarray(raw_w_in, dtype=w_dtype)
-            raw_b = np.asarray(raw_b_in, dtype=w_dtype).reshape(-1)
-            if isinstance(f_def, BooleanField) or raw_w.shape[0] == 1:
-                self.options: Tuple[str, ...] = ("False", "True")
-                raw_w64 = np.asarray(raw_w_in, dtype=np.float64)
-                raw_b64 = np.asarray(raw_b_in, dtype=np.float64).reshape(-1)
-                delta_adj = float(adj[1] - adj[0]) if (adj is not None and adj.size == 2) else 0.0
-                logit_shift = _boolean_threshold_logit_shift(float(getattr(f_def, "threshold", 0.5)))
-                w_diff_eff = raw_w64[0] / temp
-                b_diff_eff = (float(raw_b64[0]) + 0.25 * delta_adj) / temp - 0.25 * logit_shift
-                self.W = np.vstack([-0.5 * w_diff_eff, 0.5 * w_diff_eff]).astype(w_dtype)
-                self.b = np.array([-0.5 * b_diff_eff, 0.5 * b_diff_eff], dtype=w_dtype)
-            else:
-                self.options = tuple(str(o) for o in f_def.options)
-                has_adj = adj is not None and adj.size == len(self.options) and bool(np.any(adj != 0.0))
-                if temp != 1.0 or has_adj:
-                    raw_w64 = np.asarray(raw_w_in, dtype=np.float64)
-                    raw_b64 = np.asarray(raw_b_in, dtype=np.float64).reshape(-1)
-                    adj_vec = adj if has_adj else np.zeros(len(self.options), dtype=np.float64)
-                    self.W = (raw_w64 / temp).astype(w_dtype)
-                    self.b = ((raw_b64 + 0.25 * adj_vec) / temp).astype(w_dtype)
-                else:
-                    self.W = raw_w
-                    self.b = raw_b
+        raw_w_in = np.asarray(self.head.weights)
+        raw_b_in = np.asarray(self.head.biases).reshape(-1)
+        w_dtype = np.float64 if (raw_w_in.dtype == np.float64 or raw_b_in.dtype == np.float64) else np.float32
+        self.raw_W = np.array(raw_w_in, dtype=w_dtype, copy=True)
+        self.raw_b = np.array(raw_b_in, dtype=w_dtype, copy=True).reshape(-1)
+        if (
+            self.raw_W.ndim != 2
+            or self.raw_b.shape != (self.raw_W.shape[0],)
+            or not (np.all(np.isfinite(self.raw_W)) and np.all(np.isfinite(self.raw_b)))
+        ):
+            raise ValueError(f"Field head {self.field_name!r} contains invalid or non-finite weights or biases")
+        self.raw_W.setflags(write=False)
+        self.raw_b.setflags(write=False)
+        self.W = self.raw_W
+        self.b = self.raw_b
+
+        self.is_boolean = bool(isinstance(f_def, BooleanField) or self.raw_W.shape[0] == 1)
+        if self.is_boolean:
+            self.options: Tuple[str, ...] = ("False", "True")
+            self.bool_threshold = float(getattr(f_def, "threshold", 0.5)) if isinstance(f_def, BooleanField) else 0.5
+            if not math.isfinite(self.bool_threshold) or not (0.0 <= self.bool_threshold <= 1.0):
+                raise ValueError(
+                    f"BooleanField threshold for {self.field_name!r} must be in [0.0, 1.0], got {self.bool_threshold!r}"
+                )
+        else:
+            self.options = tuple(str(o) for o in f_def.options)
+            self.bool_threshold = 0.5
+
+        cluster_assign_raw = getattr(self.head, "cluster_assignments", ()) or ()
+        self.is_hier = bool(
+            (not self.is_boolean)
+            and getattr(self.head, "hierarchical", False)
+            and getattr(self.head, "coarse_weights", None) is not None
+            and getattr(self.head, "coarse_biases", None) is not None
+            and len(cluster_assign_raw) == self.raw_W.shape[0]
+        )
+        self._raw_coarse_w: Optional[np.ndarray] = None
+        self._raw_coarse_b: Optional[np.ndarray] = None
+        self._raw_fine_w: Optional[np.ndarray] = None
+        self._raw_fine_b: Optional[np.ndarray] = None
+        self._cluster_assign: Optional[np.ndarray] = None
+        self._hier_dtype: Any = w_dtype
+        if self.is_hier:
+            cw_in = np.asarray(self.head.coarse_weights)
+            cb_in = np.asarray(self.head.coarse_biases).reshape(-1)
+            if not (np.all(np.isfinite(cw_in)) and np.all(np.isfinite(cb_in))):
+                raise ValueError(f"Field head {self.field_name!r} contains non-finite hierarchical coarse weights")
+            c_assign = np.asarray(cluster_assign_raw, dtype=np.int64)
+            if (
+                cw_in.ndim != 2
+                or cw_in.shape[1] != self.raw_W.shape[1]
+                or cb_in.shape[0] != cw_in.shape[0]
+                or c_assign.ndim != 1
+                or c_assign.size != self.raw_W.shape[0]
+                or (c_assign.size > 0 and np.any((c_assign < 0) | (c_assign >= cw_in.shape[0])))
+            ):
+                raise ValueError(f"Field head {self.field_name!r} has invalid hierarchical cluster configuration")
+            cw_dtype = np.float64 if (cw_in.dtype == np.float64 or cb_in.dtype == np.float64) else np.float32
+            self._raw_coarse_w = np.array(cw_in, dtype=cw_dtype, copy=True)
+            self._raw_coarse_b = np.array(cb_in, dtype=cw_dtype, copy=True).reshape(-1)
+            self._cluster_assign = c_assign
+            has_f64_h = (w_dtype == np.float64) or (cw_dtype == np.float64)
+            if (
+                getattr(self.head, "fine_weights", None) is not None
+                and getattr(self.head, "fine_biases", None) is not None
+            ):
+                fw_in = np.asarray(self.head.fine_weights)
+                fb_in = np.asarray(self.head.fine_biases).reshape(-1)
+                if not (np.all(np.isfinite(fw_in)) and np.all(np.isfinite(fb_in))):
+                    raise ValueError(f"Field head {self.field_name!r} contains non-finite hierarchical fine weights")
+                if fw_in.shape != self.raw_W.shape or fb_in.shape != (self.raw_W.shape[0],):
+                    raise ValueError(f"Field head {self.field_name!r} hierarchical fine tensor shape mismatch")
+                fw_dtype = np.float64 if (fw_in.dtype == np.float64 or fb_in.dtype == np.float64) else np.float32
+                self._raw_fine_w = np.array(fw_in, dtype=fw_dtype, copy=True)
+                self._raw_fine_b = np.array(fb_in, dtype=fw_dtype, copy=True).reshape(-1)
+                has_f64_h = has_f64_h or (fw_dtype == np.float64)
+            self._hier_dtype = np.float64 if has_f64_h else np.float32
 
         resolved_unsafe = _normalize_unsafe_label_arg(unsafe_label, unsafe_labels)
         self.unsafe_idxs: List[int] = [self.options.index(lbl) for lbl in resolved_unsafe]
@@ -334,30 +413,94 @@ class GuardShield:
         self.short_doc_words = int(short_doc_words)
         self.sim_threshold = float(sim_threshold) if sim_threshold is not None else None
         self.projector = resolved.projector
+        self.recency_weighted = bool(getattr(resolved, "recency_weighted", False))
+        self._zero_unit0 = not isinstance(
+            self.projector, (TfidfProjector, PragmaticCompositeProjector)
+        )
+        self._accepts_recency = _accepts_recency_weighted(getattr(self.projector, "project", None))
+        self._batch_accepts_recency = _accepts_recency_weighted(
+            getattr(self.projector, "project_batch", None)
+        )
 
         self.unsafe_bank: Optional[np.ndarray] = None
         if unsafe_exemplars:
             U = self._project_batch(unsafe_exemplars)
             if len(U) > 0:
                 self.unsafe_bank = _l2_normalize_rows(U)
+                if not bool(np.all(np.isfinite(self.unsafe_bank))):
+                    raise ValueError("unsafe_exemplars produced non-finite embeddings")
 
     def _project_batch(self, texts: Sequence[str]) -> np.ndarray:
-        text_list = list(texts)
-        project_batch = getattr(self.projector, "project_batch", None)
-        with np.errstate(over="ignore", invalid="ignore"):
-            if callable(project_batch):
-                out = project_batch(text_list)
-                if isinstance(out, tuple):
-                    out = out[0]
-                return np.asarray(out, dtype=np.float32)
-            return np.vstack([np.asarray(self.projector.project(t), dtype=np.float32) for t in text_list])
+        return _encode_projector_batch(
+            self.projector,
+            texts,
+            int(self.raw_W.shape[1]),
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self._zero_unit0,
+            accepts_recency=self._accepts_recency,
+            batch_accepts_recency=self._batch_accepts_recency,
+        )
 
     def _batch_eval_logits_and_emb(self, texts: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
         X = self._project_batch(texts)
-        with np.errstate(over="ignore", invalid="ignore"):
-            X_in = X.astype(self.W.dtype, copy=False)
-            scaled = ((X_in @ self.W.T) + self.b) / 0.25
-        return scaled, X
+        n_views = X.shape[0]
+        k_out = 2 if self.is_boolean else len(self.options)
+        cal_logits = np.full((n_views, k_out), np.nan, dtype=np.float64)
+        if n_views == 0:
+            return cal_logits, X
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            x_fin = np.all(np.isfinite(X), axis=1)
+            if self.is_hier:
+                assert self._raw_coarse_w is not None and self._raw_coarse_b is not None and self._cluster_assign is not None
+                raw_logits = np.full((n_views, k_out), np.nan, dtype=self._hier_dtype)
+                for r_i in np.flatnonzero(x_fin).tolist():
+                    x_row = X[r_i : r_i + 1]
+                    x_in = x_row.astype(self.raw_W.dtype, copy=False)
+                    base_ex = x_in @ self.raw_W.T + self.raw_b
+                    hier_ex = _compute_hierarchical_logits_np(
+                        x_row,
+                        base_ex,
+                        self._raw_coarse_w,
+                        self._raw_coarse_b,
+                        self._cluster_assign,
+                        self._raw_fine_w,
+                        self._raw_fine_b,
+                    )
+                    raw_logits[r_i] = hier_ex[0]
+            elif self.is_boolean:
+                raw_logits = np.full((n_views, 1), np.nan, dtype=self.raw_W.dtype)
+                for r_i in np.flatnonzero(x_fin).tolist():
+                    x_in = X[r_i : r_i + 1].astype(self.raw_W.dtype, copy=False)
+                    raw_logits[r_i] = (x_in @ self.raw_W.T + self.raw_b)[0]
+            else:
+                raw_logits = X.astype(self.raw_W.dtype, copy=False) @ self.raw_W.T + self.raw_b
+                if bool(np.any(~x_fin)):
+                    raw_logits = np.array(raw_logits, copy=True)
+                    raw_logits[~x_fin] = np.nan
+
+            z_col = raw_logits.astype(np.float64) / 0.25
+            raw_ok = (
+                x_fin
+                & np.all(np.isfinite(raw_logits), axis=1)
+                & np.all(np.isfinite(z_col), axis=1)
+            )
+            if bool(np.any(raw_ok)):
+                if self.is_boolean:
+                    z_vals = z_col[raw_ok, 0]
+                    two = np.column_stack([-0.5 * z_vals, 0.5 * z_vals])
+                    if self.cal_adj is not None and self.cal_adj.shape == (2,):
+                        two = two + self.cal_adj
+                    scaled_ok = two / self.cal_temp
+                else:
+                    arr = z_col[raw_ok]
+                    if self.cal_adj is not None and self.cal_adj.shape == (k_out,):
+                        arr = arr + self.cal_adj
+                    scaled_ok = arr / self.cal_temp
+                scaled_fin = np.all(np.isfinite(scaled_ok), axis=1)
+                good_idx = np.flatnonzero(raw_ok)[scaled_fin]
+                if len(good_idx) > 0:
+                    cal_logits[good_idx] = scaled_ok[scaled_fin]
+        return cal_logits, X
 
     def _score_views(
         self, text: str
@@ -397,25 +540,28 @@ class GuardShield:
             )
 
         scaled_logits, X_views = self._batch_eval_logits_and_emb(all_views)
-        with np.errstate(over="ignore", invalid="ignore"):
-            shifted = scaled_logits - np.max(scaled_logits, axis=1, keepdims=True)
-            exps = np.exp(np.clip(shifted, -50.0, 50.0))
-            probs = exps / np.sum(exps, axis=1, keepdims=True)
+        probs = np.full(scaled_logits.shape, np.nan, dtype=np.float64)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            x_fin = np.all(np.isfinite(X_views), axis=1)
+            row_fin = x_fin & np.all(np.isfinite(scaled_logits), axis=1)
+            if bool(np.any(row_fin)):
+                fin_s = scaled_logits[row_fin]
+                shifted = fin_s - np.max(fin_s, axis=1, keepdims=True)
+                exps = np.exp(shifted)
+                sums = np.sum(exps, axis=1, keepdims=True)
+                p_fin = exps / sums
+                p_ok = np.isfinite(sums[:, 0]) & (sums[:, 0] > 0.0) & np.all(np.isfinite(p_fin), axis=1)
+                good_idx = np.flatnonzero(row_fin)[p_ok]
+                if len(good_idx) > 0:
+                    probs[good_idx] = p_fin[p_ok]
 
             sims: Optional[np.ndarray] = None
             if self.unsafe_bank is not None and len(self.unsafe_bank) > 0:
                 X_norm = _l2_normalize_rows(X_views)
                 sims = np.max(X_norm @ self.unsafe_bank.T, axis=1)
-
-            x_nonfin = ~np.all(np.isfinite(X_views), axis=1)
-            if bool(np.any(x_nonfin)):
-                scaled_logits = np.array(scaled_logits, copy=True)
-                probs = np.array(probs, copy=True)
-                scaled_logits[x_nonfin] = np.nan
-                probs[x_nonfin] = np.nan
-                if sims is not None:
+                if bool(np.any(~x_fin)):
                     sims = np.array(sims, copy=True)
-                    sims[x_nonfin] = np.nan
+                    sims[~x_fin] = np.nan
 
         elapsed_us = (time.perf_counter_ns() - t0) / 1000.0
         canon_us = (t1 - t0) / 1000.0
@@ -445,11 +591,25 @@ class GuardShield:
         window_margin_threshold: float,
         sim_threshold: Optional[float],
     ) -> ShieldDecision:
+        from system1.explain import _boolean_threshold_logit_shift
+
         t_dec0 = time.perf_counter_ns()
-        with np.errstate(over="ignore", invalid="ignore"):
-            unsafe_logits = np.max(scaled_logits[:, self.unsafe_idxs], axis=1)
-            max_other_logits = np.max(scaled_logits[:, self.safe_idxs], axis=1)
-            unsafe_margins = unsafe_logits - max_other_logits
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if self.is_boolean:
+                logit_shift = 0.0 if self.bool_threshold == 0.5 else _boolean_threshold_logit_shift(self.bool_threshold)
+                d_raw = (scaled_logits[:, 1] - scaled_logits[:, 0]) - logit_shift
+                b_pred = probs[:, 1] >= self.bool_threshold
+                rows_ok = np.all(np.isfinite(scaled_logits), axis=1) & np.all(np.isfinite(probs), axis=1)
+                d_true = np.where(rows_ok & b_pred & (d_raw < 0.0), 0.0, d_raw)
+                d_true = np.where(rows_ok & (~b_pred) & (d_true >= 0.0), -1e-15, d_true)
+                if self.unsafe_idxs == [1]:
+                    unsafe_margins = d_true
+                else:
+                    unsafe_margins = np.where(rows_ok & b_pred & (d_true == 0.0), -1e-15, -d_true)
+            else:
+                unsafe_logits = np.max(scaled_logits[:, self.unsafe_idxs], axis=1)
+                max_other_logits = np.max(scaled_logits[:, self.safe_idxs], axis=1)
+                unsafe_margins = unsafe_logits - max_other_logits
             unsafe_probs = np.sum(probs[:, self.unsafe_idxs], axis=1)
 
             nonfinite_eval = (
@@ -516,7 +676,9 @@ class GuardShield:
                     max_margin = float(unsafe_margins[best_win])
                     max_prob = float(unsafe_probs[best_win])
 
-                if is_unsafe:
+                if self.is_boolean:
+                    pred = self.unsafe_label if is_unsafe else self.options[self.safe_idxs[0]]
+                elif is_unsafe:
                     best_u = max(self.unsafe_idxs, key=lambda idx: float(scaled_logits[best_win, idx]))
                     pred = self.options[best_u]
                 else:

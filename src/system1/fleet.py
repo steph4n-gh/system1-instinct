@@ -15,7 +15,13 @@ import zlib
 
 import numpy as np
 
+from system1.core.model import (
+    _accepts_recency_weighted,
+    _encode_projector_batch,
+    _encode_projector_one,
+)
 from system1.core.schema import BooleanField, ChoiceField
+from system1.core.text import PragmaticCompositeProjector, TfidfProjector
 
 _TOK_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?")
 _DEFAULT_TOK_CACHE: OrderedDict[str, Tuple[int, ...]] = OrderedDict()
@@ -167,10 +173,24 @@ def tokenize_hashes(
 
 
 def _softmax_temp(logits: np.ndarray, temp: float = 0.25) -> np.ndarray:
-    arr = np.asarray(logits, dtype=np.float64)
-    z = (arr - np.max(arr)) / float(temp)
-    e = np.exp(np.clip(z, -50.0, 50.0))
-    return e / np.sum(e)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        arr = np.asarray(logits, dtype=np.float64)
+        if arr.size == 0:
+            return arr
+        t = float(temp)
+        if not math.isfinite(t) or t <= 0.0 or not bool(np.all(np.isfinite(arr))):
+            return np.full(arr.shape, np.nan, dtype=np.float64)
+        z = (arr - np.max(arr)) / t
+        if bool(np.any(np.isnan(z))) or bool(np.any(z > 0.0)):
+            return np.full(arr.shape, np.nan, dtype=np.float64)
+        e = np.exp(z)
+        s = float(np.sum(e))
+        if not math.isfinite(s) or s <= 0.0:
+            return np.full(arr.shape, np.nan, dtype=np.float64)
+        out = e / s
+        if not bool(np.all(np.isfinite(out))):
+            return np.full(arr.shape, np.nan, dtype=np.float64)
+        return out
 
 
 def _round_up_16(val: int) -> int:
@@ -265,6 +285,9 @@ class MultiTenantSkillFleet:
         *,
         token_cache_limit: int = 4096,
         is_boolean: Optional[bool] = None,
+        bool_threshold: float = 0.5,
+        recency_weighted: bool = False,
+        _raw_source_head: Optional[Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]] = None,
     ) -> None:
         self.projector = projector
         self.classes = [str(c) for c in classes]
@@ -272,7 +295,37 @@ class MultiTenantSkillFleet:
             raise ValueError("classes must be non-empty")
         self.num_classes = len(self.classes)
         self.c2i = {c: i for i, c in enumerate(self.classes)}
-        self.is_boolean = (tuple(self.classes) == ("False", "True")) if is_boolean is None else bool(is_boolean)
+        if is_boolean is None:
+            self.is_boolean = tuple(self.classes) == ("False", "True")
+        elif isinstance(is_boolean, (bool, np.bool_)):
+            self.is_boolean = bool(is_boolean)
+        else:
+            raise ValueError(f"is_boolean must be a bool or None, got {is_boolean!r}")
+        if self.is_boolean and self.num_classes != 2:
+            raise ValueError(f"is_boolean=True requires 2 classes, got {self.num_classes}")
+
+        if isinstance(bool_threshold, (bool, np.bool_)) or not isinstance(
+            bool_threshold, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(f"bool_threshold must be finite in [0.0, 1.0], got {bool_threshold!r}")
+        bt_val = float(bool_threshold)
+        if not math.isfinite(bt_val) or not (0.0 <= bt_val <= 1.0):
+            raise ValueError(f"bool_threshold must be finite in [0.0, 1.0], got {bool_threshold!r}")
+        if not self.is_boolean and bt_val != 0.5:
+            raise ValueError("Non-default bool_threshold requires is_boolean=True")
+        self.bool_threshold = bt_val
+
+        if not isinstance(recency_weighted, (bool, np.bool_)):
+            raise ValueError(f"recency_weighted must be a bool, got {recency_weighted!r}")
+        self.recency_weighted = bool(recency_weighted)
+        self._zero_unit0 = not isinstance(
+            self.projector, (TfidfProjector, PragmaticCompositeProjector)
+        )
+        self._accepts_recency = _accepts_recency_weighted(getattr(self.projector, "project", None))
+        self._batch_accepts_recency = _accepts_recency_weighted(
+            getattr(self.projector, "project_batch", None)
+        )
+        self._raw_source_head = _raw_source_head
         with np.errstate(over="ignore", invalid="ignore"):
             self.W_base = np.asarray(W_base, dtype=np.float32)
             self.b_base = np.asarray(b_base, dtype=np.float32).reshape(-1)
@@ -403,15 +456,26 @@ class MultiTenantSkillFleet:
             raise ValueError(f"Class index {idx} out of range [0, {self.num_classes})")
         return idx
 
+    def _encode_one(self, text: str) -> np.ndarray:
+        return _encode_projector_one(
+            self.projector,
+            text,
+            int(self.W_base.shape[1]),
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self._zero_unit0,
+            accepts_recency=self._accepts_recency,
+        )
+
     def _project_batch(self, texts: Sequence[str]) -> np.ndarray:
-        text_list = list(texts)
-        project_batch = getattr(self.projector, "project_batch", None)
-        if callable(project_batch):
-            out = project_batch(text_list)
-            if isinstance(out, tuple):
-                out = out[0]
-            return np.asarray(out, dtype=np.float32)
-        return np.vstack([np.asarray(self.projector.project(t), dtype=np.float32) for t in text_list])
+        return _encode_projector_batch(
+            self.projector,
+            texts,
+            int(self.W_base.shape[1]),
+            recency_weighted=self.recency_weighted,
+            zero_unit0=self._zero_unit0,
+            accepts_recency=self._accepts_recency,
+            batch_accepts_recency=self._batch_accepts_recency,
+        )
 
     def _bind_views(self, tid: int) -> Tuple[Any, ...]:
         return (
@@ -502,8 +566,6 @@ class MultiTenantSkillFleet:
         token_cache_limit: int = 4096,
     ) -> MultiTenantSkillFleet:
         """Create a fleet from an existing CompiledSystemOneModel or SystemOneEngine."""
-        from system1.explain import _boolean_threshold_logit_shift
-
         resolved = getattr(model, "model", model)
         schema = getattr(model, "schema", None) or resolved.schema
         if field_name is None:
@@ -517,6 +579,10 @@ class MultiTenantSkillFleet:
             raise ValueError(f"Unknown field {field_name!r}")
 
         f_def = schema.fields[field_name]
+        if not isinstance(f_def, (ChoiceField, BooleanField)):
+            raise ValueError(
+                f"MultiTenantSkillFleet supports ChoiceField and BooleanField, got {type(f_def).__name__}"
+            )
         field_heads = getattr(resolved, "_field_heads", None)
         compiled_heads = getattr(resolved, "heads", None)
         ch = compiled_heads.get(field_name) if isinstance(compiled_heads, Mapping) else None
@@ -548,19 +614,28 @@ class MultiTenantSkillFleet:
         if adj is not None and not bool(np.all(np.isfinite(adj))):
             raise ValueError(f"Calibration logit_adjustments for {field_name!r} contain non-finite values")
 
-        raw_w64 = np.asarray(head.weights, dtype=np.float64)
-        raw_b64 = np.asarray(head.biases, dtype=np.float64).reshape(-1)
+        raw_w_in = np.asarray(head.weights)
+        raw_b_in = np.asarray(head.biases).reshape(-1)
+        w_dtype = np.float64 if (raw_w_in.dtype == np.float64 or raw_b_in.dtype == np.float64) else np.float32
+        raw_w_auth = np.array(raw_w_in, dtype=w_dtype, copy=True)
+        raw_b_auth = np.array(raw_b_in, dtype=w_dtype, copy=True).reshape(-1)
+        raw_w_auth.setflags(write=False)
+        raw_b_auth.setflags(write=False)
+        raw_w64 = np.asarray(raw_w_auth, dtype=np.float64)
+        raw_b64 = np.asarray(raw_b_auth, dtype=np.float64).reshape(-1)
         if not (np.all(np.isfinite(raw_w64)) and np.all(np.isfinite(raw_b64))):
             raise ValueError(f"Field head {field_name!r} contains non-finite weights or biases")
 
         is_bool_head = bool(isinstance(f_def, BooleanField) or raw_w64.shape[0] == 1)
+        bool_threshold = float(getattr(f_def, "threshold", 0.5)) if is_bool_head else 0.5
+        if not math.isfinite(bool_threshold) or not (0.0 <= bool_threshold <= 1.0):
+            raise ValueError(f"BooleanField threshold for {field_name!r} must be in [0.0, 1.0], got {bool_threshold!r}")
         with np.errstate(over="ignore", invalid="ignore"):
             if is_bool_head:
                 classes = ["False", "True"]
                 delta_adj = float(adj[1] - adj[0]) if (adj is not None and adj.size == 2) else 0.0
-                logit_shift = _boolean_threshold_logit_shift(float(getattr(f_def, "threshold", 0.5)))
                 w_diff_eff = raw_w64[0] / temp
-                b_diff_eff = (float(raw_b64[0]) + 0.25 * delta_adj) / temp - 0.25 * logit_shift
+                b_diff_eff = (float(raw_b64[0]) + 0.25 * delta_adj) / temp
                 W_base = np.vstack([-0.5 * w_diff_eff, 0.5 * w_diff_eff]).astype(np.float32)
                 b_base = np.array([-0.5 * b_diff_eff, 0.5 * b_diff_eff], dtype=np.float32)
             elif isinstance(f_def, ChoiceField):
@@ -600,19 +675,27 @@ class MultiTenantSkillFleet:
         score_src = cp if (cp is not None and (getattr(cp, "is_calibrated", False) or len(getattr(cp, "calibration_scores", ())) > 0)) else ch
         if score_src is not None:
             cls_scores = getattr(score_src, "class_calibration_scores", {}) or {}
-            fallback_q = float(getattr(score_src, "conformal_quantile", getattr(score_src, "quantile", 0.0)) or 0.0)
+            raw_q = getattr(score_src, "conformal_quantile", getattr(score_src, "quantile", None))
             cal_scores = getattr(score_src, "calibration_scores", ())
-            if fallback_q <= 0.0 and len(cal_scores) > 0:
+            has_fallback_q = False
+            fallback_q = 0.0
+            if raw_q is not None:
+                fq = float(raw_q)
+                if math.isfinite(fq) and (fq > 0.0 or (bool(getattr(score_src, "is_calibrated", False)) and fq >= 0.0)):
+                    fallback_q = fq
+                    has_fallback_q = True
+            if (not has_fallback_q) and len(cal_scores) > 0:
                 n_s = len(cal_scores)
                 k = min(n_s, max(1, int(math.ceil((n_s + 1) * (1.0 - alpha))))) - 1
                 fallback_q = float(sorted(cal_scores)[k])
+                has_fallback_q = True
             for idx, c_name in enumerate(classes):
                 c_vals = cls_scores.get(c_name)
                 if c_vals is not None and len(c_vals) > 0:
                     n_c = len(c_vals)
                     k = min(n_c, max(1, int(math.ceil((n_c + 1) * (1.0 - alpha))))) - 1
                     q_init[idx] = float(sorted(c_vals)[k])
-                elif fallback_q > 0.0:
+                elif has_fallback_q:
                     q_init[idx] = fallback_q
 
         return cls(
@@ -630,6 +713,9 @@ class MultiTenantSkillFleet:
             alpha=alpha,
             token_cache_limit=token_cache_limit,
             is_boolean=is_bool_head,
+            bool_threshold=bool_threshold,
+            recency_weighted=bool(getattr(resolved, "recency_weighted", False)),
+            _raw_source_head=(raw_w_auth, raw_b_auth, temp, None if adj is None else adj.copy()),
         )
 
     def adapt_tenant_batch(
@@ -835,118 +921,194 @@ class MultiTenantSkillFleet:
             if tid == self._active_tid:
                 self._active_views = self._bind_views(tid)
 
+    def _eval_base_and_check_raw(self, x: np.ndarray) -> Tuple[np.ndarray, bool]:
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            x_f32 = np.asarray(x, dtype=np.float32).reshape(-1)
+            if x_f32.shape != (self.W_base.shape[1],) or not bool(np.all(np.isfinite(x_f32))):
+                return np.full(self.num_classes, np.nan, dtype=np.float64), False
+            if self._raw_source_head is not None:
+                raw_w_auth, raw_b_auth, cal_t, cal_adj = self._raw_source_head
+                x_in = x_f32.astype(raw_w_auth.dtype, copy=False)
+                raw_lin = x_in @ raw_w_auth.T + raw_b_auth
+                z_col = raw_lin.astype(np.float64) / 0.25
+                if not bool(np.all(np.isfinite(raw_lin))) or not bool(np.all(np.isfinite(z_col))):
+                    return np.full(self.num_classes, np.nan, dtype=np.float64), False
+                if self.is_boolean:
+                    two = np.array([-0.5 * float(z_col[0]), 0.5 * float(z_col[0])], dtype=np.float64)
+                    if cal_adj is not None and cal_adj.shape == (2,):
+                        two = two + cal_adj
+                    cal_scaled = two / cal_t
+                else:
+                    arr = z_col.reshape(-1)
+                    if cal_adj is not None and cal_adj.shape == (arr.shape[0],):
+                        arr = arr + cal_adj
+                    cal_scaled = arr / cal_t
+                if not bool(np.all(np.isfinite(cal_scaled))):
+                    return np.full(self.num_classes, np.nan, dtype=np.float64), False
+                return 0.25 * cal_scaled, True
+            base_log = (self.W_base @ x_f32 + self.b_base).astype(np.float64)
+            if not bool(np.all(np.isfinite(base_log))):
+                return np.full(self.num_classes, np.nan, dtype=np.float64), False
+            return base_log, True
+
     def compute_component_logits(
         self, tid: int, text: str, x: Optional[np.ndarray] = None
     ) -> Dict[str, np.ndarray]:
         """Decompose base, subspace RLS, sparse lexical, and exemplar logits for tenant `tid`."""
         tid = self._validate_tid(tid)
-        if x is None:
-            with np.errstate(over="ignore", invalid="ignore"):
-                x = np.asarray(self.projector.project(text), dtype=np.float32)
-        dW_qt, dW_st, sp_ht, sp_ct, sp_wt, n_sp, ex_vt, ex_st, ex_ct, n_ex, _ = (
-            self._snapshot_views(tid)
-        )
-
-        base_log = self.W_base @ x + self.b_base
-        z = x @ self.U_shared
-        sub_log = (dW_qt.astype(np.float32) @ z) * dW_st.reshape(-1).astype(np.float32)
-
-        sp_log = np.zeros(self.num_classes, dtype=np.float32)
-        if n_sp > 0:
-            th = set(
-                tokenize_hashes(
-                    text,
-                    cache=self._tok_cache,
-                    cache_limit=self.token_cache_limit,
-                    cache_lock=self._lock,
-                )
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if x is None:
+                x_in = self._encode_one(text)
+            else:
+                x_in = np.asarray(x, dtype=np.float32).reshape(-1)
+            dW_qt, dW_st, sp_ht, sp_ct, sp_wt, n_sp, ex_vt, ex_st, ex_ct, n_ex, _ = (
+                self._snapshot_views(tid)
             )
-            for i in range(n_sp):
-                if int(sp_ht[i]) in th:
-                    sp_log[int(sp_ct[i])] += float(sp_wt[i])
+            base_log64, base_ok = self._eval_base_and_check_raw(x_in)
+            if not base_ok:
+                nan_arr = np.full(self.num_classes, np.nan, dtype=np.float32)
+                return {
+                    "base": nan_arr.copy(),
+                    "lowrank_rls": nan_arr.copy(),
+                    "sparse_only": nan_arr.copy(),
+                    "exemplar_only": nan_arr.copy(),
+                    "hybrid_full": nan_arr.copy(),
+                }
+            z = x_in @ self.U_shared
+            sub_log = (dW_qt.astype(np.float32) @ z) * dW_st.reshape(-1).astype(np.float32)
 
-        ex_log = np.zeros(self.num_classes, dtype=np.float32)
-        if n_ex > 0:
-            z_norm = z / (float(np.linalg.norm(z)) + 1e-8)
-            vecs = ex_vt[:n_ex].astype(np.float32) * ex_st[:n_ex, None].astype(np.float32)
-            sims = vecs @ z_norm
-            for i in range(n_ex):
-                ms = float(sims[i])
-                if ms > 0.62:
-                    ci = int(ex_ct[i])
-                    bonus = 0.70 * ((ms - 0.62) / 0.38)
-                    if bonus > ex_log[ci]:
-                        ex_log[ci] = bonus
+            sp_log = np.zeros(self.num_classes, dtype=np.float32)
+            if n_sp > 0:
+                th = set(
+                    tokenize_hashes(
+                        text,
+                        cache=self._tok_cache,
+                        cache_limit=self.token_cache_limit,
+                        cache_lock=self._lock,
+                    )
+                )
+                for i in range(n_sp):
+                    if int(sp_ht[i]) in th:
+                        sp_log[int(sp_ct[i])] += float(sp_wt[i])
 
-        return {
-            "base": base_log,
-            "lowrank_rls": base_log + sub_log,
-            "sparse_only": base_log + sp_log,
-            "exemplar_only": base_log + ex_log,
-            "hybrid_full": base_log + sub_log + sp_log + ex_log,
-        }
+            ex_log = np.zeros(self.num_classes, dtype=np.float32)
+            if n_ex > 0:
+                z_norm = z / (float(np.linalg.norm(z)) + 1e-8)
+                vecs = ex_vt[:n_ex].astype(np.float32) * ex_st[:n_ex, None].astype(np.float32)
+                sims = vecs @ z_norm
+                for i in range(n_ex):
+                    ms = float(sims[i])
+                    if ms > 0.62:
+                        ci = int(ex_ct[i])
+                        bonus = 0.70 * ((ms - 0.62) / 0.38)
+                        if bonus > ex_log[ci]:
+                            ex_log[ci] = bonus
+
+            def _checked_f32(arr64: np.ndarray) -> np.ndarray:
+                out = np.asarray(arr64, dtype=np.float32)
+                if not bool(np.all(np.isfinite(arr64))) or not bool(np.all(np.isfinite(out))):
+                    return np.full(self.num_classes, np.nan, dtype=np.float32)
+                return out
+
+            return {
+                "base": _checked_f32(base_log64),
+                "lowrank_rls": _checked_f32(base_log64 + sub_log),
+                "sparse_only": _checked_f32(base_log64 + sp_log),
+                "exemplar_only": _checked_f32(base_log64 + ex_log),
+                "hybrid_full": _checked_f32(base_log64 + sub_log + sp_log + ex_log),
+            }
+
+    def _eval_live(self, tid: int, text: str) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray]:
+        tid = self._validate_tid(tid)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            x = self._encode_one(text)
+            dW_qt, dW_st, sp_ht, sp_ct, sp_wt, n_sp, ex_vt, ex_st, ex_ct, n_ex, q_ct = (
+                self._snapshot_views(tid)
+            )
+            base_log64, base_ok = self._eval_base_and_check_raw(x)
+            if not base_ok:
+                return (
+                    0,
+                    np.full(self.num_classes, np.nan, dtype=np.float32),
+                    np.zeros(self.num_classes, dtype=bool),
+                    np.full(self.num_classes, np.nan, dtype=np.float64),
+                )
+            z = x @ self.U_shared
+            sub_log = (dW_qt.astype(np.float32) @ z) * dW_st.reshape(-1).astype(np.float32)
+            logits64 = base_log64 + sub_log.astype(np.float64)
+            if n_sp > 0:
+                th = set(
+                    tokenize_hashes(
+                        text,
+                        cache=self._tok_cache,
+                        cache_limit=self.token_cache_limit,
+                        cache_lock=self._lock,
+                    )
+                )
+                for i in range(n_sp):
+                    if int(sp_ht[i]) in th:
+                        logits64[int(sp_ct[i])] += float(sp_wt[i])
+            if n_ex > 0:
+                z_norm = z / (float(np.linalg.norm(z)) + 1e-8)
+                vecs = ex_vt[:n_ex].astype(np.float32) * ex_st[:n_ex, None].astype(np.float32)
+                sims = vecs @ z_norm
+                ex_bonus: Dict[int, float] = {}
+                for i in range(n_ex):
+                    ms = float(sims[i])
+                    if ms > 0.62:
+                        ci = int(ex_ct[i])
+                        b = 0.70 * ((ms - 0.62) / 0.38)
+                        if b > ex_bonus.get(ci, 0.0):
+                            ex_bonus[ci] = b
+                for ci, b in ex_bonus.items():
+                    logits64[ci] += b
+            logits_f32 = logits64.astype(np.float32)
+            if (
+                not bool(np.all(np.isfinite(z)))
+                or not bool(np.all(np.isfinite(logits64)))
+                or not bool(np.all(np.isfinite(logits_f32)))
+            ):
+                return (
+                    0,
+                    np.full(self.num_classes, np.nan, dtype=np.float32),
+                    np.zeros(self.num_classes, dtype=bool),
+                    np.full(self.num_classes, np.nan, dtype=np.float64),
+                )
+            probs = _softmax_temp(logits64, temp=0.25)
+            if not bool(np.all(np.isfinite(probs))):
+                return (
+                    0,
+                    np.full(self.num_classes, np.nan, dtype=np.float32),
+                    np.zeros(self.num_classes, dtype=bool),
+                    np.full(self.num_classes, np.nan, dtype=np.float64),
+                )
+            scores = 1.0 - probs
+            pred_set = scores <= (q_ct.astype(np.float64) + 1e-12)
+            if self.is_boolean and len(probs) == 2:
+                pred_idx = 1 if float(probs[1]) >= self.bool_threshold else 0
+            else:
+                pred_idx = int(np.argmax(logits64))
+            return pred_idx, logits_f32, pred_set, probs
 
     def decide_live(self, tid: int, text: str) -> Tuple[int, np.ndarray, np.ndarray]:
         """Evaluate `text` for tenant `tid` and return `(pred_idx, logits, conformal_mask)`."""
-        tid = self._validate_tid(tid)
-        with np.errstate(over="ignore", invalid="ignore"):
-            x = np.asarray(self.projector.project(text), dtype=np.float32)
-        dW_qt, dW_st, sp_ht, sp_ct, sp_wt, n_sp, ex_vt, ex_st, ex_ct, n_ex, q_ct = (
-            self._snapshot_views(tid)
-        )
-        base_log = self.W_base @ x + self.b_base
-        z = x @ self.U_shared
-        sub_log = (dW_qt.astype(np.float32) @ z) * dW_st.reshape(-1).astype(np.float32)
-        logits = base_log + sub_log
-        if n_sp > 0:
-            th = set(
-                tokenize_hashes(
-                    text,
-                    cache=self._tok_cache,
-                    cache_limit=self.token_cache_limit,
-                    cache_lock=self._lock,
-                )
-            )
-            for i in range(n_sp):
-                if int(sp_ht[i]) in th:
-                    logits[int(sp_ct[i])] += float(sp_wt[i])
-        if n_ex > 0:
-            z_norm = z / (float(np.linalg.norm(z)) + 1e-8)
-            vecs = ex_vt[:n_ex].astype(np.float32) * ex_st[:n_ex, None].astype(np.float32)
-            sims = vecs @ z_norm
-            ex_bonus: Dict[int, float] = {}
-            for i in range(n_ex):
-                ms = float(sims[i])
-                if ms > 0.62:
-                    ci = int(ex_ct[i])
-                    b = 0.70 * ((ms - 0.62) / 0.38)
-                    if b > ex_bonus.get(ci, 0.0):
-                        ex_bonus[ci] = b
-            for ci, b in ex_bonus.items():
-                logits[ci] += b
-        probs = _softmax_temp(logits, temp=0.25)
-        scores = 1.0 - probs
-        pred_set = scores <= (q_ct.astype(np.float64) + 1e-12)
-        pred_idx = (
-            1
-            if (self.is_boolean and len(logits) == 2 and float(logits[1]) >= float(logits[0]))
-            else int(np.argmax(logits))
-        )
-        return pred_idx, logits, pred_set
+        pred_idx, logits_f32, pred_set, _ = self._eval_live(tid, text)
+        return pred_idx, logits_f32, pred_set
 
     def decide(self, tid: int, text: str) -> TenantDecisionResult:
         """Evaluate `text` for tenant `tid` and return structured `TenantDecisionResult`."""
-        pred_idx, logits, pred_set = self.decide_live(tid, text)
-        probs = _softmax_temp(logits, temp=0.25)
-        cset = tuple(self.classes[int(i)] for i in np.flatnonzero(pred_set))
+        pred_idx, logits_f32, pred_set, probs = self._eval_live(tid, text)
+        probs_ok = bool(np.all(np.isfinite(probs)))
+        cset = tuple(self.classes[int(i)] for i in np.flatnonzero(pred_set)) if probs_ok else ()
+        conf = float(probs[pred_idx]) if probs_ok else float("nan")
         return TenantDecisionResult(
             tenant_id=int(tid),
             predicted_index=pred_idx,
             predicted_label=self.classes[pred_idx],
-            confidence=float(probs[pred_idx]),
+            confidence=conf,
             conformal_set=cset,
-            is_ambiguous=(len(cset) != 1),
-            logits=logits,
+            is_ambiguous=(not probs_ok) or (len(cset) != 1),
+            logits=logits_f32,
         )
 
     @staticmethod
@@ -1142,11 +1304,11 @@ class MultiTenantSkillFleet:
 
         if "meta_ints" in headers:
             mi_dtype, mi_shape = headers["meta_ints"]
-            if mi_dtype != np.dtype(np.int64) or mi_shape != (4,):
+            if mi_dtype != np.dtype(np.int64) or mi_shape not in ((4,), (6,)):
                 raise ValueError(f"Invalid meta_ints spec: dtype={mi_dtype}, shape={mi_shape}")
         if "meta_floats" in headers:
             mf_dtype, mf_shape = headers["meta_floats"]
-            if mf_dtype != np.dtype(np.float64) or mf_shape != (2,):
+            if mf_dtype != np.dtype(np.float64) or mf_shape not in ((2,), (3,)):
                 raise ValueError(f"Invalid meta_floats spec: dtype={mf_dtype}, shape={mf_shape}")
         if "classes_utf8" in headers:
             c_dtype, c_shape = headers["classes_utf8"]
@@ -1316,8 +1478,18 @@ class MultiTenantSkillFleet:
 
             buf = io.BytesIO()
             classes_bytes = np.frombuffer(json.dumps(self.classes).encode("utf-8"), dtype=np.uint8)
-            meta_ints = np.array([self.num_tenants, self.r_sub, self.m_sparse, self.m_exemplars], dtype=np.int64)
-            meta_floats = np.array([self.lam_rls, self.alpha], dtype=np.float64)
+            meta_ints = np.array(
+                [
+                    self.num_tenants,
+                    self.r_sub,
+                    self.m_sparse,
+                    self.m_exemplars,
+                    int(self.is_boolean),
+                    int(self.recency_weighted),
+                ],
+                dtype=np.int64,
+            )
+            meta_floats = np.array([self.lam_rls, self.alpha, self.bool_threshold], dtype=np.float64)
             np.savez_compressed(
                 buf,
                 meta_ints=meta_ints,
@@ -1379,6 +1551,8 @@ class MultiTenantSkillFleet:
             if len(resolved_classes) != K:
                 raise ValueError(f"Snapshot classes length {len(resolved_classes)} != W_base rows {K}")
 
+            is_boolean_meta: Optional[bool] = None
+            recency_meta = False
             if "meta_ints" in zf:
                 m_int = zf["meta_ints"]
                 num_tenants, r_sub, m_sparse, m_exemplars = (
@@ -1399,20 +1573,38 @@ class MultiTenantSkillFleet:
                     raise ValueError(
                         f"Snapshot meta_ints m_exemplars {m_exemplars} incompatible with capacity [0, {min(M_ex, MAX_FLEET_EXEMPLAR_CAP)}]"
                     )
+                if len(m_int) == 6:
+                    raw_bool_flag = int(m_int[4])
+                    raw_rec_flag = int(m_int[5])
+                    if raw_bool_flag not in (0, 1) or raw_rec_flag not in (0, 1):
+                        raise ValueError(
+                            f"Invalid snapshot meta_ints boolean flags: ({raw_bool_flag}, {raw_rec_flag})"
+                        )
+                    is_boolean_meta = bool(raw_bool_flag)
+                    if is_boolean_meta and K != 2:
+                        raise ValueError(f"Snapshot is_boolean=True requires 2 classes, got {K}")
+                    recency_meta = bool(raw_rec_flag)
             else:
                 num_tenants, r_sub, m_sparse, m_exemplars = T, R, M_sp, M_ex
                 if m_sparse > MAX_FLEET_SPARSE_CAP or m_exemplars > MAX_FLEET_EXEMPLAR_CAP:
                     raise ValueError("Snapshot array capacities exceed uint8 limit 255")
 
+            bool_thr_meta = 0.5
             if "meta_floats" in zf:
                 m_flt = zf["meta_floats"]
                 lam_rls, alpha = float(m_flt[0]), float(m_flt[1])
+                if len(m_flt) == 3:
+                    bool_thr_meta = float(m_flt[2])
             else:
                 lam_rls, alpha = 1.5, 0.10
             if not math.isfinite(lam_rls) or not (1e-12 <= lam_rls <= 1e12):
                 raise ValueError(f"Invalid snapshot lam_rls: {lam_rls!r}")
             if not math.isfinite(alpha) or not (0.0 < alpha < 1.0):
                 raise ValueError(f"Invalid snapshot alpha: {alpha!r}")
+            if not math.isfinite(bool_thr_meta) or not (0.0 <= bool_thr_meta <= 1.0):
+                raise ValueError(f"Invalid snapshot bool_threshold: {bool_thr_meta!r}")
+            if is_boolean_meta is False and bool_thr_meta != 0.5:
+                raise ValueError("Snapshot bool_threshold requires is_boolean=True")
 
             sp_len_arr = zf["sp_len"]
             ex_len_arr = zf["ex_len"]
@@ -1552,6 +1744,9 @@ class MultiTenantSkillFleet:
                 lam_rls=lam_rls,
                 alpha=alpha,
                 token_cache_limit=token_cache_limit,
+                is_boolean=is_boolean_meta,
+                bool_threshold=bool_thr_meta,
+                recency_weighted=recency_meta,
             )
             fleet.dW_q[:] = dW_q_arr
             fleet.dW_scale[:] = dW_scale_arr

@@ -192,6 +192,13 @@ def parse_finite_float(value: Any, *, field_name: str = "value") -> float:
     return 0.0 if num == 0.0 else num
 
 
+def _parse_unit_interval_float(val: Any, *, field_name: str) -> float:
+    f = parse_finite_float(val, field_name=field_name)
+    if f < -1e-6 or f > 1.0 + 1e-6:
+        raise InteropError(f"Out-of-range unit interval value for {field_name}: {f!r}", status_code=422)
+    return float(min(1.0, max(0.0, f)))
+
+
 def coerce_probability_dict(raw_probs: Mapping[Any, Any], keys: Sequence[str]) -> Dict[str, float]:
     """Coerce stringified/numeric probability mapping onto target keys and normalize to 1.0."""
     if not isinstance(raw_probs, Mapping):
@@ -933,7 +940,10 @@ class SoftDistillingLifecycle:
             train_prompts = [p for p, _ in train_pairs]
             train_vals = [vals for _, vals in train_pairs]
             model = target_engine.model
-            X_all = np.stack([model.encode(p) for p in train_prompts], axis=0).astype(np.float32)
+            with np.errstate(over="ignore", invalid="ignore"):
+                X_all = np.stack([model.encode(p) for p in train_prompts], axis=0).astype(np.float32)
+            if not bool(np.all(np.isfinite(X_all))):
+                return False
 
             from system1.compiler import SystemOneCompiler
 
@@ -981,18 +991,21 @@ class SoftDistillingLifecycle:
                             y_hard[opt_idx[hard_label]] = 1.0
                         Y_hard[i] = y_hard
                         soft_entry = self._soft_records_by_prompt.get(prompt, {}).get(c.internal_name)
-                        if soft_entry and "probs" in soft_entry:
-                            p_vec = np.array(
-                                [float(soft_entry["probs"].get(opt, 0.0)) for opt in head_options],
-                                dtype=np.float32,
-                            )
-                            s = float(np.sum(p_vec))
-                            if s > 0.0:
-                                p_vec = p_vec / s
-                                if float(np.max(np.abs(p_vec - y_hard))) > 1e-6:
-                                    has_soft = True
-                                Y_soft[i] = p_vec
-                                continue
+                        if soft_entry and "probs" in soft_entry and isinstance(soft_entry["probs"], Mapping):
+                            with np.errstate(over="ignore", invalid="ignore"):
+                                p_vec = np.array(
+                                    [float(soft_entry["probs"].get(opt, 0.0)) for opt in head_options],
+                                    dtype=np.float32,
+                                )
+                                s = float(np.sum(p_vec))
+                            if bool(np.all(np.isfinite(p_vec))) and math.isfinite(s) and s > 0.0:
+                                with np.errstate(over="ignore", invalid="ignore"):
+                                    p_vec = p_vec / s
+                                if bool(np.all(np.isfinite(p_vec))):
+                                    if float(np.max(np.abs(p_vec - y_hard))) > 1e-6:
+                                        has_soft = True
+                                    Y_soft[i] = p_vec
+                                    continue
                         Y_soft[i] = y_hard
 
                     if has_soft and not getattr(ref_head, "hierarchical", False):
@@ -1031,12 +1044,13 @@ class SoftDistillingLifecycle:
                         soft_entry = self._soft_records_by_prompt.get(prompt, {}).get(c.internal_name)
                         if soft_entry and "p_true" in soft_entry:
                             p_true = float(soft_entry["p_true"])
-                            y_soft = 2.0 * p_true - 1.0
-                            if abs(y_soft - y_hard) > 1e-6:
-                                has_soft = True
-                            Y_soft[i, 0] = y_soft
-                        else:
-                            Y_soft[i, 0] = y_hard
+                            if math.isfinite(p_true) and 0.0 <= p_true <= 1.0:
+                                y_soft = 2.0 * p_true - 1.0
+                                if abs(y_soft - y_hard) > 1e-6:
+                                    has_soft = True
+                                Y_soft[i, 0] = y_soft
+                                continue
+                        Y_soft[i, 0] = y_hard
                     if has_soft:
                         Y_bool_oh = np.column_stack(
                             [(Y_hard[:, 0] < 0).astype(np.float32), (Y_hard[:, 0] > 0).astype(np.float32)]
@@ -1081,21 +1095,22 @@ class SoftDistillingLifecycle:
                 self._soft_records_by_prompt[prompt] = soft_targets
             return self.lifecycle.observe_teacher(prompt, lifecycle_values)
 
-    def _evaluate_frozen_local_locked(self, prompt: str) -> Tuple[Optional[Dict[str, Any]], Optional[Any]]:
+    def _evaluate_frozen_local_locked(
+        self, prompt: str
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Any], bool]:
         """Read-only fast-path check mirroring AutoCutoverLifecycle without mutating state."""
         lc = self.lifecycle
         engine = lc.engine
         if not lc.compiled_active or lc.active_tau is None or engine is None:
-            return None, None
+            return None, None, False
         canary_period = max(1, int(round(1.0 / lc.config.canary_rate)))
         key = _normalize_cache_key(prompt)
         if key in lc.clean_cache:
             self._frozen_eligible_counter += 1
             if ((lc.local_accept_eligible + self._frozen_eligible_counter) % canary_period) == 0:
-                return None, None
+                return None, None, False
             cached_vals = dict(lc.clean_cache[key])
-            res = engine.decide(prompt, strict=False, record_receipt=False, use_cache=False)
-            return cached_vals, res
+            return cached_vals, None, True
 
         res = engine.decide(prompt, strict=False, record_receipt=False, use_cache=False)
         vals = dict(res.values)
@@ -1114,44 +1129,142 @@ class SoftDistillingLifecycle:
             ):
                 self._frozen_eligible_counter += 1
                 if ((lc.local_accept_eligible + self._frozen_eligible_counter) % canary_period) == 0:
-                    return None, None
-                return vals, res
-        return None, None
+                    return None, None, False
+                return vals, res, False
+        return None, None, False
 
-    def _format_local_answers(self, local_vals: Dict[str, Any], res: Any) -> Dict[str, Any]:
+    def _format_local_answers(
+        self,
+        local_vals: Dict[str, Any],
+        res: Any,
+        *,
+        from_cache: bool = False,
+    ) -> Dict[str, Any]:
         """Build external wire answers dict from local System 1 decision outputs."""
+        if not from_cache and res is None:
+            raise InteropError("Missing student decision result", status_code=422)
         answers_out: Dict[str, Any] = {}
         for c in self.contract.contracts:
             iname = c.internal_name
+            if from_cache:
+                if iname not in local_vals:
+                    raise InteropError(f"Missing cached value for field {iname!r}", status_code=422)
+                raw_cached = local_vals[iname]
+                if c.q_type == "choice":
+                    if not isinstance(raw_cached, str) or raw_cached not in c.options:
+                        raise InteropError(f"Invalid cached choice value for {iname!r}: {raw_cached!r}", status_code=422)
+                    choice = raw_cached
+                    probs = {o: (1.0 if o == choice else 0.0) for o in c.options}
+                    answers_out[c.external_name] = {
+                        "type": "choice",
+                        "choice": choice,
+                        "value": choice,
+                        "confidence": 1.0,
+                        "probabilities": probs,
+                        "conformal_set": [choice],
+                    }
+                elif c.q_type == "noul":
+                    if not isinstance(raw_cached, (bool, np.bool_)):
+                        raise InteropError(f"Invalid cached noul value for {iname!r}: {raw_cached!r}", status_code=422)
+                    val_b = bool(raw_cached)
+                    p_true = 1.0 if val_b else 0.0
+                    answers_out[c.external_name] = {
+                        "type": "noul",
+                        "noul": p_true,
+                        "value": val_b,
+                        "confidence": 1.0,
+                        "conformal_set": [val_b],
+                    }
+                elif c.q_type == "score":
+                    if c.criteria_legend:
+                        lbl = raw_cached if isinstance(raw_cached, str) else str(raw_cached)
+                        if isinstance(raw_cached, (bool, np.bool_)) or lbl not in c.options:
+                            raise InteropError(f"Invalid cached score option for {iname!r}: {raw_cached!r}", status_code=422)
+                        probs = {o: (1.0 if o == lbl else 0.0) for o in c.options}
+                        exp_score = float(int(lbl))
+                        legend = {str(i): txt for i, txt in enumerate(c.criteria_legend)}
+                        answers_out[c.external_name] = {
+                            "type": "score",
+                            "score": exp_score,
+                            "value": exp_score,
+                            "confidence": 1.0,
+                            "probabilities": probs,
+                            "legend": legend,
+                            "conformal_set": [lbl],
+                        }
+                    else:
+                        val_s = parse_finite_float(raw_cached, field_name=f"{iname}.score")
+                        answers_out[c.external_name] = {
+                            "type": "score",
+                            "score": val_s,
+                            "value": val_s,
+                            "confidence": 1.0,
+                            "conformal_set": [],
+                        }
+                elif c.q_type == "multichoice":
+                    if not isinstance(raw_cached, (list, tuple)) or not all(
+                        isinstance(ch, str) and ch in c.options for ch in raw_cached
+                    ):
+                        raise InteropError(f"Invalid cached multichoice value for {iname!r}: {raw_cached!r}", status_code=422)
+                    chosen = [str(ch) for ch in raw_cached]
+                    answers_out[c.external_name] = {
+                        "type": "multichoice",
+                        "choices": chosen,
+                        "value": chosen,
+                        "confidence": 1.0,
+                    }
+                continue
+
             if c.q_type == "choice":
                 probs_raw = res.probabilities.get(iname) or {}
+                raw_choice = local_vals.get(iname, res.values.get(iname))
+                if not isinstance(raw_choice, str) or raw_choice not in c.options:
+                    raise InteropError(f"Invalid choice value for {iname!r}: {raw_choice!r}", status_code=422)
+                choice = raw_choice
                 probs = coerce_probability_dict(
                     probs_raw
                     if probs_raw
-                    else {o: (1.0 if o == local_vals[iname] else 0.0) for o in c.options},
+                    else {o: (1.0 if o == choice else 0.0) for o in c.options},
                     c.options,
                 )
-                choice = str(local_vals.get(iname, res.values[iname]))
-                conf = float(res.confidences.get(iname, probs.get(choice, 1.0)))
+                conf = _parse_unit_interval_float(
+                    res.confidences.get(iname, probs.get(choice, 1.0)),
+                    field_name=f"{iname}.confidence",
+                )
                 cset = res.conformal_sets.get(iname)
                 answers_out[c.external_name] = {
                     "type": "choice",
                     "choice": choice,
                     "value": choice,
-                    "confidence": float(min(1.0, max(0.0, conf))),
+                    "confidence": conf,
                     "probabilities": probs,
                     "conformal_set": list(cset) if cset else [choice],
                 }
             elif c.q_type == "noul":
                 probs_raw = res.probabilities.get(iname) or {}
-                if "True" in probs_raw:
-                    p_true = float(probs_raw["True"])
+                if probs_raw:
+                    if not isinstance(probs_raw, Mapping):
+                        raise InteropError(f"Invalid noul probabilities for {iname!r}", status_code=422)
+                    if "False" in probs_raw or len(probs_raw) > 1:
+                        p_true = coerce_probability_dict(probs_raw, ("False", "True"))["True"]
+                    elif "True" in probs_raw:
+                        p_true = _parse_unit_interval_float(
+                            probs_raw["True"],
+                            field_name=f"{iname}.probabilities['True']",
+                        )
+                    else:
+                        raise InteropError(f"Noul probabilities missing 'True'/'False' for {iname!r}", status_code=422)
                 else:
-                    val_b = bool(local_vals.get(iname, res.values[iname]))
-                    c_val = float(res.confidences.get(iname, 0.9))
-                    p_true = c_val if val_b else (1.0 - c_val)
-                p_true = float(min(1.0, max(0.0, p_true)))
-                val_b = p_true >= c.threshold
+                    raw_vb = local_vals.get(iname, res.values.get(iname))
+                    if not isinstance(raw_vb, (bool, np.bool_)):
+                        raise InteropError(f"Invalid noul value for {iname!r}: {raw_vb!r}", status_code=422)
+                    val_b = bool(raw_vb)
+                    c_val = _parse_unit_interval_float(
+                        res.confidences.get(iname, 0.9),
+                        field_name=f"{iname}.confidence",
+                    )
+                    p_true = float(c_val if val_b else (1.0 - c_val))
+                val_b = bool(p_true >= c.threshold)
                 conf = float(max(p_true, 1.0 - p_true))
                 cset = res.conformal_sets.get(iname)
                 answers_out[c.external_name] = {
@@ -1164,42 +1277,71 @@ class SoftDistillingLifecycle:
             elif c.q_type == "score":
                 if c.criteria_legend:
                     probs_raw = res.probabilities.get(iname) or {}
+                    raw_fallback = local_vals.get(iname, res.values.get(iname))
+                    fallback_str = str(raw_fallback) if raw_fallback is not None else ""
+                    if not probs_raw and (
+                        isinstance(raw_fallback, (bool, np.bool_)) or fallback_str not in c.options
+                    ):
+                        raise InteropError(
+                            f"Invalid ordinal score option for {iname!r}: {raw_fallback!r}",
+                            status_code=422,
+                        )
                     probs = coerce_probability_dict(
                         probs_raw
                         if probs_raw
-                        else {o: (1.0 if o == str(local_vals[iname]) else 0.0) for o in c.options},
+                        else {o: (1.0 if o == fallback_str else 0.0) for o in c.options},
                         c.options,
                     )
-                    exp_score = float(sum(int(k) * probs[k] for k in c.options))
-                    conf = float(max(probs.values()))
+                    exp_score = parse_finite_float(
+                        sum(int(k) * probs[k] for k in c.options),
+                        field_name=f"{iname}.score",
+                    )
+                    conf = _parse_unit_interval_float(
+                        max(probs.values()),
+                        field_name=f"{iname}.confidence",
+                    )
                     legend = {str(i): txt for i, txt in enumerate(c.criteria_legend)}
+                    raw_cset = res.conformal_sets.get(iname)
+                    cset_fallback = fallback_str if fallback_str in c.options else max(c.options, key=lambda o: probs[o])
                     answers_out[c.external_name] = {
                         "type": "score",
                         "score": exp_score,
                         "value": exp_score,
-                        "confidence": float(min(1.0, max(0.0, conf))),
+                        "confidence": conf,
                         "probabilities": probs,
                         "legend": legend,
-                        "conformal_set": list(
-                            res.conformal_sets.get(iname) or [str(local_vals.get(iname, res.values[iname]))]
-                        ),
+                        "conformal_set": list(raw_cset) if raw_cset else [cset_fallback],
                     }
                 else:
-                    val_s = float(local_vals.get(iname, res.values[iname]))
+                    raw_s = local_vals.get(iname, res.values.get(iname))
+                    val_s = parse_finite_float(raw_s, field_name=f"{iname}.score")
+                    conf = _parse_unit_interval_float(
+                        res.confidences.get(iname, 1.0),
+                        field_name=f"{iname}.confidence",
+                    )
                     answers_out[c.external_name] = {
                         "type": "score",
                         "score": val_s,
                         "value": val_s,
-                        "confidence": float(res.confidences.get(iname, 1.0)),
+                        "confidence": conf,
                         "conformal_set": list(res.conformal_sets.get(iname) or ()),
                     }
             elif c.q_type == "multichoice":
-                chosen = list(local_vals.get(iname, res.values[iname]))
+                raw_mc = local_vals.get(iname, res.values.get(iname))
+                if not isinstance(raw_mc, (list, tuple)) or not all(
+                    isinstance(ch, str) and ch in c.options for ch in raw_mc
+                ):
+                    raise InteropError(f"Invalid multichoice value for {iname!r}: {raw_mc!r}", status_code=422)
+                chosen = [str(ch) for ch in raw_mc]
+                conf = _parse_unit_interval_float(
+                    res.confidences.get(iname, 1.0),
+                    field_name=f"{iname}.confidence",
+                )
                 answers_out[c.external_name] = {
                     "type": "multichoice",
                     "choices": chosen,
                     "value": chosen,
-                    "confidence": float(res.confidences.get(iname, 1.0)),
+                    "confidence": conf,
                 }
         return answers_out
 
@@ -1209,18 +1351,31 @@ class SoftDistillingLifecycle:
             if not self.is_cutover:
                 return None
             if freeze:
-                local_vals, res = self._evaluate_frozen_local_locked(prompt)
-                if local_vals is None or res is None:
+                local_vals, res, from_cache = self._evaluate_frozen_local_locked(prompt)
+                if local_vals is None or (not from_cache and res is None):
                     return None
-                return self._format_local_answers(local_vals, res)
+                try:
+                    return self._format_local_answers(local_vals, res, from_cache=from_cache)
+                except InteropError:
+                    return None
 
             local_vals = self.lifecycle.decide_local(prompt)
             if local_vals is None:
                 return None
-            engine = self.lifecycle.engine
-            assert engine is not None
-            res = engine.decide(prompt, record_receipt=False)
-            return self._format_local_answers(local_vals, res)
+            from_cache = _normalize_cache_key(prompt) in self.lifecycle.clean_cache
+            if from_cache:
+                res = None
+            else:
+                engine = self.lifecycle.engine
+                if engine is None:
+                    self.lifecycle.local_hits = max(0, self.lifecycle.local_hits - 1)
+                    return None
+                res = engine.decide(prompt, record_receipt=False)
+            try:
+                return self._format_local_answers(local_vals, res, from_cache=from_cache)
+            except InteropError:
+                self.lifecycle.local_hits = max(0, self.lifecycle.local_hits - 1)
+                return None
 
 
 def format_provider_response(

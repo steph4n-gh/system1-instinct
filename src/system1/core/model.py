@@ -11,6 +11,7 @@ Zero cryptography, SQLite, or disk I/O dependencies.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import re
 import struct
@@ -772,6 +773,106 @@ def _normalize_raw_projection_batch(
             for pos, row_raw in zip(good_idx[overflow_mask], good_raw[overflow_mask]):
                 out[pos] = _normalize_raw_projection(row_raw, dimension, zero_unit0=zero_unit0)
         return out
+
+
+def _accepts_recency_weighted(fn: Any) -> bool:
+    """Return True when a projector callable accepts a `recency_weighted` keyword argument."""
+    if not callable(fn):
+        return False
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if "recency_weighted" in params:
+        p = params["recency_weighted"]
+        return p.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _encode_projector_one(
+    projector: Any,
+    text: str,
+    dimension: int,
+    *,
+    recency_weighted: bool = False,
+    zero_unit0: bool = False,
+    accepts_recency: Optional[bool] = None,
+) -> np.ndarray:
+    """Project one string using model encoding normalization and recency semantics."""
+    proj_fn = getattr(projector, "project", None)
+    use_rw = (
+        _accepts_recency_weighted(proj_fn)
+        if accepts_recency is None
+        else bool(accepts_recency)
+    )
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        if callable(proj_fn):
+            raw = proj_fn(text, recency_weighted=bool(recency_weighted)) if use_rw else proj_fn(text)
+        else:
+            raw = projector(text)
+        if isinstance(raw, tuple):
+            raw = raw[0]
+        return _normalize_raw_projection(raw, dimension, zero_unit0=zero_unit0)
+
+
+def _encode_projector_batch(
+    projector: Any,
+    texts: Sequence[str],
+    dimension: int,
+    *,
+    recency_weighted: bool = False,
+    zero_unit0: bool = False,
+    accepts_recency: Optional[bool] = None,
+    batch_accepts_recency: Optional[bool] = None,
+) -> np.ndarray:
+    """Batch-project strings using model encoding normalization and recency semantics."""
+    text_list = list(texts)
+    if not text_list:
+        return np.empty((0, dimension), dtype=np.float32)
+    proj_fn = getattr(projector, "project", None)
+    batch_fn = getattr(projector, "project_batch", None)
+    one_rw = (
+        _accepts_recency_weighted(proj_fn)
+        if accepts_recency is None
+        else bool(accepts_recency)
+    )
+    batch_rw = (
+        _accepts_recency_weighted(batch_fn)
+        if batch_accepts_recency is None
+        else bool(batch_accepts_recency)
+    )
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        if callable(batch_fn) and (batch_rw or not (recency_weighted and one_rw)):
+            out = (
+                batch_fn(text_list, recency_weighted=bool(recency_weighted))
+                if batch_rw
+                else batch_fn(text_list)
+            )
+            if isinstance(out, tuple):
+                out = out[0]
+            return _normalize_raw_projection_batch(
+                out,
+                len(text_list),
+                dimension,
+                zero_unit0=zero_unit0,
+            )
+        return np.vstack(
+            [
+                _encode_projector_one(
+                    projector,
+                    t,
+                    dimension,
+                    recency_weighted=recency_weighted,
+                    zero_unit0=zero_unit0,
+                    accepts_recency=one_rw,
+                )
+                for t in text_list
+            ]
+        )
 
 
 def _resolve_authoritative_head(model: Any, fname: str) -> Tuple[Any, Optional[Any]]:
