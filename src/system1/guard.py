@@ -44,6 +44,7 @@ from system1.core.model import (
     _compute_hierarchical_logits_np,
     _encode_projector_batch,
     _model_zero_unit0,
+    _owned_readonly_array,
 )
 from system1.core.text import PragmaticCompositeProjector, TfidfProjector
 
@@ -351,16 +352,14 @@ class GuardShield:
         raw_b_in = np.asarray(self.head.biases).reshape(-1)
         w_dtype = np.float64 if raw_w_in.dtype == np.float64 else np.float32
         b_dtype = np.float64 if raw_b_in.dtype == np.float64 else np.float32
-        self.raw_W = np.array(raw_w_in, dtype=w_dtype, copy=True)
-        self.raw_b = np.array(raw_b_in, dtype=b_dtype, copy=True).reshape(-1)
+        self.raw_W = _owned_readonly_array(raw_w_in, dtype=w_dtype)
+        self.raw_b = _owned_readonly_array(raw_b_in, dtype=b_dtype)
         if (
             self.raw_W.ndim != 2
             or self.raw_b.shape != (self.raw_W.shape[0],)
             or not (np.all(np.isfinite(self.raw_W)) and np.all(np.isfinite(self.raw_b)))
         ):
             raise ValueError(f"Field head {self.field_name!r} contains invalid or non-finite weights or biases")
-        self.raw_W.setflags(write=False)
-        self.raw_b.setflags(write=False)
         self.W = self.raw_W
         self.b = self.raw_b
 
@@ -453,8 +452,8 @@ class GuardShield:
                 raise ValueError(f"Field head {self.field_name!r} has invalid hierarchical cluster configuration")
             cw_dtype = np.float64 if cw_in.dtype == np.float64 else np.float32
             cb_dtype = np.float64 if cb_in.dtype == np.float64 else np.float32
-            self._raw_coarse_w = np.array(cw_in, dtype=cw_dtype, copy=True)
-            self._raw_coarse_b = np.array(cb_in, dtype=cb_dtype, copy=True).reshape(-1)
+            self._raw_coarse_w = _owned_readonly_array(cw_in, dtype=cw_dtype)
+            self._raw_coarse_b = _owned_readonly_array(cb_in, dtype=cb_dtype)
             self._cluster_assign = c_assign
             has_f64_h = (
                 (w_dtype == np.float64)
@@ -474,8 +473,8 @@ class GuardShield:
                     raise ValueError(f"Field head {self.field_name!r} hierarchical fine tensor shape mismatch")
                 fw_dtype = np.float64 if fw_in.dtype == np.float64 else np.float32
                 fb_dtype = np.float64 if fb_in.dtype == np.float64 else np.float32
-                self._raw_fine_w = np.array(fw_in, dtype=fw_dtype, copy=True)
-                self._raw_fine_b = np.array(fb_in, dtype=fb_dtype, copy=True).reshape(-1)
+                self._raw_fine_w = _owned_readonly_array(fw_in, dtype=fw_dtype)
+                self._raw_fine_b = _owned_readonly_array(fb_in, dtype=fb_dtype)
                 has_f64_h = has_f64_h or (fw_dtype == np.float64) or (fb_dtype == np.float64)
             self._hier_dtype = np.float64 if has_f64_h else np.float32
 
@@ -644,7 +643,8 @@ class GuardShield:
                         raw_logits[r_i] = ov_row
                         continue
                     x_in = X[r_i : r_i + 1].astype(self.raw_W.dtype, copy=False)
-                    raw_logits[r_i] = (x_in @ self.raw_W.T + self.raw_b)[0]
+                    lin_row = (x_in @ self.raw_W.T + self.raw_b)[0]
+                    raw_logits[r_i] = lin_row[:1] if self.is_boolean else lin_row
 
             z_col = raw_logits.astype(np.float64) / 0.25
             raw_ok = (

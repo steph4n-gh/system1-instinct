@@ -254,6 +254,7 @@ class AutoCutoverLifecycle:
         self.class_sim_floors: Dict[str, float] = {}
         self.teacher_key_labels: Dict[str, Dict[str, Tuple[int, Dict[str, Any]]]] = {}
         self.clean_cache: Dict[str, Dict[str, Any]] = {}
+        self._conflicted_cache_keys: Set[str] = set()
         self.recent_unseen_window: Deque[int] = collections.deque(maxlen=40)
 
         self.step_count: int = 0
@@ -410,9 +411,21 @@ class AutoCutoverLifecycle:
         self.recent_unseen_window.append(0 if label_key in self.active_classes else 1)
         key = _resolve_cache_key(prompt, cache_key)
         k_cnts = self.teacher_key_labels.setdefault(key, {})
+        has_conflict = any(
+            lbl_prev != label_key or not self._values_match(vals_prev, values)
+            for lbl_prev, (_, vals_prev) in k_cnts.items()
+        )
         prev_cnt, _ = k_cnts.get(label_key, (0, values))
         k_cnts[label_key] = (prev_cnt + 1, dict(values))
-        if len(k_cnts) == 1 and (prev_cnt + 1) >= 2 and label_key in self.mature_classes:
+        if has_conflict:
+            self._conflicted_cache_keys.add(key)
+            self.clean_cache.pop(key, None)
+        elif (
+            key not in self._conflicted_cache_keys
+            and len(k_cnts) == 1
+            and (prev_cnt + 1) >= 2
+            and label_key in self.mature_classes
+        ):
             self.clean_cache[key] = dict(values)
         if key in self.admitted_keys:
             return False
@@ -825,7 +838,7 @@ class AutoCutoverLifecycle:
         )
 
         for k_c, vals_c in high_conf_cache:
-            if k_c not in self.clean_cache:
+            if k_c not in self.clean_cache and k_c not in self._conflicted_cache_keys:
                 self.clean_cache[k_c] = dict(vals_c)
 
         if tau is not None and len(self.mature_classes) >= 2:
@@ -894,6 +907,7 @@ class AutoCutoverLifecycle:
         prompt: str,
         *,
         cache_key: Optional[str] = None,
+        accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]], float, bool, bool]:
         """Return (accepted_fastpath, candidate_values, margin, is_canary, from_cache)."""
         key = _resolve_cache_key(prompt, cache_key)
@@ -904,6 +918,9 @@ class AutoCutoverLifecycle:
             self.local_accept_eligible += 1
             is_canary = (self.local_accept_eligible % canary_period) == 0
             return (not is_canary), cached_vals, 1.0, is_canary, True
+
+        if key in self._conflicted_cache_keys:
+            return False, None, 0.0, False, False
 
         if not self.compiled_active or self.active_tau is None:
             return False, None, 0.0, False, False
@@ -924,13 +941,21 @@ class AutoCutoverLifecycle:
             if cent is None or float(np.dot(self.subword.encode(prompt), cent)) >= max(
                 self.config.cls_min_abs, floor * 0.90
             ):
+                if accept_predicate is not None and not accept_predicate(vals):
+                    return False, None, margin, False, False
                 self.local_accept_eligible += 1
                 is_canary = (self.local_accept_eligible % canary_period) == 0
                 return (not is_canary), vals, margin, is_canary, False
 
         return False, None, margin, False, False
 
-    def decide_local(self, prompt: str, *, cache_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def decide_local(
+        self,
+        prompt: str,
+        *,
+        cache_key: Optional[str] = None,
+        accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Return validated local decision values when safe, or None to escalate/canary."""
         with self._lock:
             self._maybe_micro_compile_locked()
@@ -938,6 +963,7 @@ class AutoCutoverLifecycle:
             accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(
                 prompt,
                 cache_key=key,
+                accept_predicate=accept_predicate,
             )
             if accepted and vals is not None:
                 self.step_count += 1

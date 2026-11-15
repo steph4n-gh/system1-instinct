@@ -10212,9 +10212,9 @@ def test_astra_30_round17_regressions() -> None:
         strict_mode=False,
     )
     eng_exp_b2.model.heads["b"].weights = np.zeros((2, 8), dtype=np.float64)
-    eng_exp_b2.model.heads["b"].biases = np.array([-2.5e307, 2.5e307], dtype=np.float64)
+    eng_exp_b2.model.heads["b"].biases = np.array([2.5e307, -2.5e307], dtype=np.float64)
     eng_exp_b2.calibrators["b"].temperature = 1e-5
-    eng_exp_b2.calibrators["b"].logit_adjustments = np.array([1.0e308, -1.0e308], dtype=np.float64)
+    eng_exp_b2.calibrators["b"].logit_adjustments = np.array([5.0e307, -5.0e307], dtype=np.float64)
 
     for exp_obj in (
         FastExplainer.from_engine(eng_exp_c, "c"),
@@ -11258,6 +11258,17 @@ def test_astra_32_round19_regressions() -> None:
     assert b_ts["local_execution"] is False
     assert t_calls_r19_1 == calls_pre_hit + 3
 
+    req_key_spoof = json.dumps({"input": state_1, "questions": q_r19, "slot": "r19_delim"}).encode("utf-8")
+    st_ks, b_ks = svc_delim.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_key_spoof,
+    )
+    assert st_ks == 200
+    assert b_ks["answers"]["act"]["choice"] == "deny"
+    assert b_ks["local_execution"] is False
+    assert t_calls_r19_1 == calls_pre_hit + 4
+
     # Envelope extra_context cache separation + direct AutoCutoverLifecycle cache_key separation.
     def _extra_teacher(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
         ch = "allow" if raw_payload.get("channel") == "vip" else "deny"
@@ -11325,6 +11336,21 @@ def test_astra_32_round19_regressions() -> None:
     assert st_es == 200
     assert b_es["answers"]["act"]["choice"] == "deny"
     assert b_es["local_execution"] is False
+    for idx_col in (0, 1000):
+        st_col, b_col = svc_extra.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": f"vip priority channel request {idx_col}",
+                    "channel": "standard",
+                    "questions": q_r19,
+                    "slot": "ext",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_col == 200
+        assert b_col["answers"]["act"]["choice"] == "deny"
 
     class _LcKeySchema(DecisionSchema):
         act = ChoiceField(options=("allow", "deny"))
@@ -11434,6 +11460,34 @@ def test_astra_32_round19_regressions() -> None:
     res_bf_call = eng_bf.compile_callable(storage_mode="float32")("fortran bool layout check")
     assert res_bf_call.values["flag"] == dec_bf_eng.values["flag"]
     assert bool(pk_bf.decide_prompt("fortran bool layout check")["b_val"][0, 0]) == dec_bf_eng.values["flag"]
+    from system1 import FastExplainer as _R19Explainer, GuardShield as _R19Shield
+    assert eng_bf.decide_batch(["fortran bool layout check"])[0].values["flag"] == dec_bf_eng.values["flag"]
+    assert _R19Explainer.from_engine(eng_bf, "flag").explain("fortran bool layout check").predicted_label == str(
+        bool(dec_bf_eng.values["flag"])
+    )
+    assert _R19Shield(eng_bf, field_name="flag", unsafe_label="True").evaluate_single(
+        "fortran bool layout check"
+    ).predicted_label == str(bool(dec_bf_eng.values["flag"]))
+
+    zs_bf = float((emb_bf.reshape(1, -1) @ w_bf_2row[:1].T).ravel()[0])
+    assert zf_bf != zs_bf
+    eng_bf.calibrators["flag"].logit_adjustments = np.array(
+        [0.0, -0.5 * (zf_bf + zs_bf) / 0.25], dtype=np.float64
+    )
+    dec_bf_s = eng_bf.decide("fortran bool layout check", record_receipt=False)
+    assert eng_bf.decide_batch(["fortran bool layout check"])[0].values["flag"] == dec_bf_s.values["flag"]
+    assert (
+        bool(
+            eng_bf.compile_packed_kernel(storage_mode="float32").decide_prompt("fortran bool layout check")[
+                "b_val"
+            ][0, 0]
+        )
+        == dec_bf_s.values["flag"]
+    )
+    assert (
+        eng_bf.compile_callable(storage_mode="float32")("fortran bool layout check").values["flag"]
+        == dec_bf_s.values["flag"]
+    )
 
     sig_bf_f = _pack_array_sig(w_bf_2row)
     sig_bf_c = _pack_array_sig(np.ascontiguousarray(w_bf_2row.copy()))
@@ -11701,5 +11755,1022 @@ def test_astra_32_round19_regressions() -> None:
     assert not any(issubclass(w.category, RuntimeWarning) for w in caught_p)
 
 
+def test_astra_33_round20_regressions() -> None:
+    """Verify Round-20 GPT-6-Astra findings R20-1 through R20-9 and sister paths in memory."""
+    import email.message
+    from system1 import GuardShield, ScoreField
+    from system1.calibration import ConformalPredictor, CumulativeLogitOrdinalHead, SoftOrdinalHead
+    from system1.compat.universal import SchemaValidationError, UnsupportedMediaError, _is_json_media_type
+    from system1.compiler import CompiledHeadWeights
+    from system1.core.model import _pack_array_sig
+    from system1.cutover import AutoCutoverLifecycle
+    from system1.integrations.inbox_zero import InboxZeroApp
+    from system1.integrations.mcp_http import MCPGuardRuntime, MCPStreamableHTTPConfig, _MCPStreamableHTTPHandler
 
+    # ------------------------------------------------------------------
+    # R20-1: Extra envelope fields bind into semantic_text, req_struct_sig,
+    # and per-(structure, field, value) support gating; primary input must
+    # remain non-empty even when extra keys exist.
+    # ------------------------------------------------------------------
+    q_r20 = {"act": {"type": "choice", "options": ["allow", "deny"]}}
+    teacher_calls_r20 = 0
 
+    def _teacher_r20(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        nonlocal teacher_calls_r20
+        teacher_calls_r20 += 1
+        chan = raw_payload.get("channel") if isinstance(raw_payload, dict) else None
+        choice = "allow" if chan == "vip" else "deny"
+        probs = {"allow": 0.99, "deny": 0.01} if choice == "allow" else {"allow": 0.01, "deny": 0.99}
+        return {"answers": {"act": {"choice": choice, "probabilities": probs}}, "usage": {"input_tokens": 3}}
+
+    svc_r20 = UniversalDecisionService(
+        upstream_handlers={"gemini": _teacher_r20},
+        require_auth=False,
+        cutover_config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            alpha_target=0.15,
+            canary_rate=1e-9,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    for idx_w in range(160):
+        ch_w = "vip" if idx_w % 2 == 0 else "standard"
+        st_w, b_w = svc_r20.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": f"{'vip priority' if ch_w == 'vip' else 'standard normal'} channel request {idx_w}",
+                    "channel": ch_w,
+                    "questions": q_r20,
+                    "slot": "r20",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_w == 200 and b_w["answers"]["act"]["choice"] == ("allow" if ch_w == "vip" else "deny")
+
+    lc_r20 = list(svc_r20._lifecycles.values())[0]
+    assert str(getattr(lc_r20.lifecycle.state, "value", lc_r20.lifecycle.state)) == "SELECTIVE_HOT_SWAP"
+
+    # Neutral unseen state with seen channel="vip": cache-hit fast-path works cleanly.
+    req_neutral_vip = json.dumps(
+        {"state": "neutral unseen status 1", "channel": "vip", "questions": q_r20, "slot": "r20"}
+    ).encode("utf-8")
+    for _ in range(2):
+        st_nv, b_nv = svc_r20.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=req_neutral_vip,
+        )
+        assert st_nv == 200 and b_nv["answers"]["act"]["choice"] == "allow"
+    st_nv_hit, b_nv_hit = svc_r20.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_neutral_vip,
+    )
+    assert st_nv_hit == 200
+    assert b_nv_hit["local_execution"] is True
+    assert b_nv_hit["answers"]["act"]["choice"] == "allow"
+
+    # Same unseen text under channel="standard" must not hit VIP cache entry.
+    st_ns, b_ns = svc_r20.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=json.dumps(
+            {"state": "neutral unseen status 1", "channel": "standard", "questions": q_r20, "slot": "r20"}
+        ).encode("utf-8"),
+    )
+    assert st_ns == 200 and b_ns["answers"]["act"]["choice"] == "deny"
+    assert b_ns["local_execution"] is False
+
+    # Unseen channel="guest" must escalate in both normal and frozen modes.
+    guest_body = json.dumps(
+        {"state": "neutral unseen status 2", "channel": "guest", "questions": q_r20, "slot": "r20"}
+    ).encode("utf-8")
+    calls_before_guest = teacher_calls_r20
+    st_gn, b_gn = svc_r20.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=guest_body,
+    )
+    assert st_gn == 200 and b_gn["local_execution"] is False and b_gn["answers"]["act"]["choice"] == "deny"
+    assert teacher_calls_r20 == calls_before_guest + 1
+
+    svc_r20.set_freeze_learning(True)
+    calls_before_guest_frozen = teacher_calls_r20
+    st_gf, b_gf = svc_r20.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=guest_body,
+    )
+    assert st_gf == 200 and b_gf["local_execution"] is False and b_gf["answers"]["act"]["choice"] == "deny"
+    assert teacher_calls_r20 == calls_before_guest_frozen + 1
+
+    # Whitespace-only primary input must fail validation even when extra fields are non-empty.
+    with pytest.raises(SchemaValidationError):
+        svc_r20.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {"state": "   \t\n", "channel": "vip", "questions": q_r20, "slot": "r20"}
+            ).encode("utf-8"),
+        )
+
+    # Extra-envelope semantic distinction + req_struct_sig extra binding + per-(structure, field, value) counts.
+    q_r20_m96 = {"act": {"type": "choice", "options": ["allow", "deny", "escalate"]}}
+
+    def _teacher_r20_m96(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        st_v = raw_payload.get("state") if isinstance(raw_payload, dict) else None
+        routing_v = str(raw_payload.get("routing", "")) if isinstance(raw_payload, dict) else ""
+        if isinstance(st_v, dict) or "escalate_signal" in routing_v or "escalate_signal" in str(st_v):
+            ch_v = "escalate"
+        elif "vip_signal" in routing_v:
+            ch_v = "allow"
+        else:
+            ch_v = "deny"
+        probs_v = {o: (0.98 if o == ch_v else 0.01) for o in ("allow", "deny", "escalate")}
+        return {"answers": {"act": {"choice": ch_v, "probabilities": probs_v}}, "usage": {"input_tokens": 3}}
+
+    svc_r20_m96 = UniversalDecisionService(
+        upstream_handlers={"gemini": _teacher_r20_m96},
+        require_auth=False,
+        cutover_config=CutoverConfig(
+            milestones=(40, 80, 120, 160),
+            k_min=2,
+            alpha_target=0.20,
+            canary_rate=1e-9,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    words_m96 = (
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "foxtrot",
+        "golf",
+        "hotel",
+        "india",
+        "juliet",
+        "kilo",
+        "lima",
+    )
+    for idx_m in range(120):
+        pair_m = idx_m // 2
+        w1 = words_m96[pair_m % 12]
+        w2 = words_m96[(pair_m * 3 + 1) % 12]
+        routing_m = (
+            "vip_signal allow priority fastlane" if idx_m % 2 == 0 else "std_signal deny normal queue"
+        )
+        st_m, _ = svc_r20_m96.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": f"envelope ticket {w1} {w2} ref_{pair_m}",
+                    "routing": routing_m,
+                    "questions": q_r20_m96,
+                    "slot": "r20_m96",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_m == 200
+    for idx_e in range(60):
+        w1 = words_m96[idx_e % 12]
+        w2 = words_m96[(idx_e * 5 + 2) % 12]
+        st_e, _ = svc_r20_m96.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": {"ticket": f"escalate_signal urgent critical outage {w1} {w2} ref_{idx_e}"},
+                    "routing": "vip_signal allow priority fastlane",
+                    "questions": q_r20_m96,
+                    "slot": "r20_m96",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_e == 200
+
+    lc_m96 = list(svc_r20_m96._lifecycles.values())[0]
+    assert str(getattr(lc_m96.lifecycle.state, "value", lc_m96.lifecycle.state)) == "SELECTIVE_HOT_SWAP"
+    st_m96_ok, b_m96_ok = svc_r20_m96.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=json.dumps(
+            {
+                "state": "envelope ticket alpha bravo ref_unseen",
+                "routing": "vip_signal allow priority fastlane",
+                "questions": q_r20_m96,
+                "slot": "r20_m96",
+            }
+        ).encode("utf-8"),
+    )
+    assert st_m96_ok == 200
+    assert b_m96_ok["local_execution"] is True and b_m96_ok["answers"]["act"]["choice"] == "allow"
+
+    st_m96_b1, b_m96_b1 = svc_r20_m96.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=json.dumps(
+            {
+                "state": "envelope ticket alpha charlie ref_unseen2",
+                "routing": "vip_signal allow priority fastlane",
+                "tag": "g",
+                "questions": q_r20_m96,
+                "slot": "r20_m96",
+            }
+        ).encode("utf-8"),
+    )
+    assert st_m96_b1 == 200
+    assert b_m96_b1["local_execution"] is False and b_m96_b1["answers"]["act"]["choice"] == "allow"
+
+    st_m96_c1, b_m96_c1 = svc_r20_m96.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=json.dumps(
+            {
+                "state": "ticket escalate_signal urgent critical outage alpha bravo ref_unseen3",
+                "routing": "vip_signal allow priority fastlane",
+                "questions": q_r20_m96,
+                "slot": "r20_m96",
+            }
+        ).encode("utf-8"),
+    )
+    assert st_m96_c1 == 200
+    assert b_m96_c1["local_execution"] is False and b_m96_c1["answers"]["act"]["choice"] == "escalate"
+
+    svc_r20_m96.set_freeze_learning(True)
+    st_m96_b2, b_m96_b2 = svc_r20_m96.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=json.dumps(
+            {
+                "state": "envelope ticket alpha charlie ref_unseen2_frozen",
+                "routing": "vip_signal allow priority fastlane",
+                "tag": "g2",
+                "questions": q_r20_m96,
+                "slot": "r20_m96",
+            }
+        ).encode("utf-8"),
+    )
+    assert st_m96_b2 == 200
+    assert b_m96_b2["local_execution"] is False and b_m96_b2["answers"]["act"]["choice"] == "allow"
+
+    st_m96_c2, b_m96_c2 = svc_r20_m96.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=json.dumps(
+            {
+                "state": "ticket escalate_signal urgent critical outage alpha bravo ref_unseen4",
+                "routing": "vip_signal allow priority fastlane",
+                "questions": q_r20_m96,
+                "slot": "r20_m96",
+            }
+        ).encode("utf-8"),
+    )
+    assert st_m96_c2 == 200
+    assert b_m96_c2["local_execution"] is False and b_m96_c2["answers"]["act"]["choice"] == "escalate"
+
+    # ------------------------------------------------------------------
+    # R20-2: Non-C, non-F 2D strided arrays preserve exact strides across
+    # Engine, PackedKernel, FastCallable (and live rebind), FastExplainer,
+    # GuardShield, and MultiTenantSkillFleet (+ delta roundtrip).
+    # ------------------------------------------------------------------
+    class _R20StridedSchema(DecisionSchema):
+        c = ChoiceField(options=("a", "b"), description="Strided choice head")
+
+    base_wide = np.arange(2 * 64, dtype=np.float32).reshape(2, 64) * np.float32(0.01)
+    w_strided = base_wide[:, ::2]
+    assert not w_strided.flags["C_CONTIGUOUS"] and not w_strided.flags["F_CONTIGUOUS"]
+    w_contig = np.ascontiguousarray(w_strided)
+    b_strided = np.array([0.05, -0.05], dtype=np.float32)
+
+    sig_strided = _pack_array_sig(w_strided)
+    sig_contig = _pack_array_sig(w_contig)
+    assert sig_strided is not None and sig_contig is not None
+    assert sig_strided != sig_contig
+
+    eng_str = SystemOneEngine(
+        _R20StridedSchema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    eng_str.model.heads["c"].set_weights(w_strided, b_strided)
+    assert eng_str.model.heads["c"].weights.strides == w_strided.strides
+
+    pk_str = eng_str.compile_packed_kernel(storage_mode="float32")
+    assert pk_str.c_raw_w[0].strides == w_strided.strides
+    assert not np.shares_memory(pk_str.c_raw_w[0], base_wide) and not pk_str.c_raw_w[0].flags["WRITEABLE"]
+
+    call_str = eng_str.compile_callable(storage_mode="float32")
+    dec_eng_s = eng_str.decide("strided layout probe", record_receipt=False)
+    dec_call_s = call_str("strided layout probe")
+    emb_s = eng_str.model.encode("strided layout probe")
+    pk_res_s = pk_str.forward_embeddings(emb_s)
+    assert dec_call_s.values["c"] == dec_eng_s.values["c"]
+    assert dec_call_s.confidences["c"] == pytest.approx(dec_eng_s.confidences["c"], abs=1e-7)
+    assert pk_str.c_options[0][int(pk_res_s["best_idx"][0, 0])] == dec_eng_s.values["c"]
+
+    expl_str = FastExplainer.from_engine(eng_str, field_name="c")
+    assert expl_str._choice_raw_w.strides == w_strided.strides
+    assert expl_str.explain("strided layout probe").predicted_label == dec_eng_s.values["c"]
+
+    shield_str = GuardShield(eng_str, field_name="c", unsafe_label="b")
+    assert shield_str.raw_W.strides == w_strided.strides
+    assert shield_str.evaluate_single("strided layout probe").predicted_label == dec_eng_s.values["c"]
+
+    fleet_str = MultiTenantSkillFleet.from_compiled_model(eng_str, "c", num_tenants=1)
+    assert fleet_str._raw_source_head is not None
+    assert fleet_str._raw_source_head[0].strides == w_strided.strides
+    assert fleet_str.decide(0, "strided layout probe").predicted_label == dec_eng_s.values["c"]
+    fleet_snap_str = MultiTenantSkillFleet.fleet_delta_from_bytes(
+        fleet_str.fleet_delta_to_bytes(),
+        projector=eng_str.model.projector,
+    )
+    assert fleet_snap_str._raw_source_head is not None
+    assert fleet_snap_str._raw_source_head[0].strides == w_strided.strides
+    assert fleet_snap_str.decide(0, "strided layout probe").predicted_label == dec_eng_s.values["c"]
+
+    # Mutating layout from strided -> contiguous triggers FastDecisionCallable re-pack.
+    kernel_before_rebind = call_str._state.kernel
+    eng_str.model.heads["c"].set_weights(w_contig, b_strided)
+    dec_rebound = call_str("strided layout probe")
+    assert call_str._state.kernel is not kernel_before_rebind
+    assert call_str._state.kernel.c_raw_w[0].strides == w_contig.strides
+    assert dec_rebound.values["c"] == eng_str.decide("strided layout probe", record_receipt=False).values["c"]
+
+    # ------------------------------------------------------------------
+    # R20-3: ScoreField with 2-row Fortran raw weights and row-1 NaN
+    # preserves exact row-0 output across Engine, PackedKernel, FastCallable.
+    # ------------------------------------------------------------------
+    class _R20ScoreSchema(DecisionSchema):
+        score = ScoreField(min_value=0.0, max_value=100.0)
+
+    eng_sc = SystemOneEngine(
+        _R20ScoreSchema,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    w_sc_2row = np.asfortranarray(
+        np.vstack([np.ones(16, dtype=np.float32), np.full(16, np.nan, dtype=np.float32)])
+    )
+    b_sc_2row = np.array([0.0, np.nan], dtype=np.float32)
+    eng_sc.model.heads["score"].weights = w_sc_2row
+    eng_sc.model.heads["score"].biases = b_sc_2row
+
+    with warnings.catch_warnings(record=True) as caught_sc:
+        warnings.simplefilter("always", RuntimeWarning)
+        pk_sc = eng_sc.compile_packed_kernel(storage_mode="float32")
+        call_sc = eng_sc.compile_callable(storage_mode="float32")
+        dec_sc_eng = eng_sc.decide("zero logit score probe", record_receipt=False)
+        dec_sc_call = call_sc("zero logit score probe")
+        emb_sc = eng_sc.model.encode("zero logit score probe")
+        pk_sc_res = pk_sc.forward_embeddings(emb_sc)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_sc)
+    assert pk_sc.s_raw_w[0].shape == (2, 16) and pk_sc.s_raw_w[0].flags["F_CONTIGUOUS"]
+    assert dec_sc_eng.values["score"] == pytest.approx(dec_sc_call.values["score"], abs=1e-6)
+    assert float(pk_sc_res["s_val"][0, 0]) == pytest.approx(dec_sc_eng.values["score"], abs=1e-6)
+
+    # Zero-input -> exact midpoint 50.0 even when row-1 is NaN.
+    eng_sc.model.heads["score"].weights = np.asfortranarray(
+        np.vstack([np.zeros(16, dtype=np.float32), np.full(16, np.nan, dtype=np.float32)])
+    )
+    pk_sc0 = eng_sc.compile_packed_kernel(storage_mode="float32")
+    call_sc0 = eng_sc.compile_callable(storage_mode="float32")
+    assert eng_sc.decide("zero score exact", record_receipt=False).values["score"] == pytest.approx(50.0, abs=1e-7)
+    assert call_sc0("zero score exact").values["score"] == pytest.approx(50.0, abs=1e-7)
+    assert float(pk_sc0.forward_embeddings(eng_sc.model.encode("zero score exact"))["s_val"][0, 0]) == pytest.approx(50.0, abs=1e-7)
+
+    # ------------------------------------------------------------------
+    # R20-4: 2-row Fortran BooleanField parity across GuardShield, FastExplainer,
+    # and MultiTenantSkillFleet (live + snapshot roundtrip).
+    # ------------------------------------------------------------------
+    class _R20BoolSchema(DecisionSchema):
+        flag = BooleanField(threshold=0.5)
+
+    eng_b2 = SystemOneEngine(
+        _R20BoolSchema,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    emb_b2 = eng_b2.model.encode("boolean two row probe").astype(np.float32)
+    row0_b2 = (np.arange(16, dtype=np.float32) + np.float32(0.5)) * np.float32(0.1)
+    bias0_b2 = np.float32(-float((emb_b2.reshape(1, -1) @ row0_b2.reshape(16, 1)).item()))
+    w_b2_f = np.asfortranarray(np.vstack([row0_b2, np.full(16, 1e10, dtype=np.float32)]))
+    b_b2_f = np.array([bias0_b2, 1e10], dtype=np.float32)
+    eng_b2.model.heads["flag"].set_weights(w_b2_f, b_b2_f)
+
+    dec_b2 = eng_b2.decide("boolean two row probe", record_receipt=False)
+    sh_b2 = GuardShield(eng_b2, field_name="flag", unsafe_label="True")
+    sdec_b2 = sh_b2.evaluate_single("boolean two row probe")
+    assert sdec_b2.predicted_label == str(bool(dec_b2.values["flag"]))
+
+    exp_b2 = FastExplainer.from_engine(eng_b2, field_name="flag")
+    assert exp_b2._bool_raw_w.shape == (2, 16) and exp_b2._bool_raw_w.flags["F_CONTIGUOUS"]
+    edec_b2 = exp_b2.explain("boolean two row probe")
+    assert edec_b2.predicted_label == str(bool(dec_b2.values["flag"]))
+
+    fl_b2 = MultiTenantSkillFleet.from_compiled_model(eng_b2, "flag", num_tenants=1)
+    assert fl_b2._raw_source_head is not None
+    assert fl_b2._raw_source_head[0].shape == (2, 16) and fl_b2._raw_source_head[0].flags["F_CONTIGUOUS"]
+    fdec_b2 = fl_b2.decide(0, "boolean two row probe")
+    assert fdec_b2.predicted_label == str(bool(dec_b2.values["flag"]))
+    fl_b2_snap = MultiTenantSkillFleet.fleet_delta_from_bytes(
+        fl_b2.fleet_delta_to_bytes(),
+        projector=eng_b2.model.projector,
+    )
+    assert fl_b2_snap._raw_source_head is not None
+    assert fl_b2_snap._raw_source_head[0].shape == (2, 16) and fl_b2_snap._raw_source_head[0].flags["F_CONTIGUOUS"]
+    assert fl_b2_snap.decide(0, "boolean two row probe").predicted_label == str(bool(dec_b2.values["flag"]))
+
+    # GuardShield & FastExplainer also tolerate float32-overflowing row 1 (1e38) when row 0 is finite.
+    w_b2_huge = np.asfortranarray(np.vstack([row0_b2, np.full(16, 1e38, dtype=np.float32)]))
+    b_b2_huge = np.array([bias0_b2, 1e38], dtype=np.float32)
+    eng_b2.model.heads["flag"].set_weights(w_b2_huge, b_b2_huge)
+    with warnings.catch_warnings(record=True) as caught_b2:
+        warnings.simplefilter("always", RuntimeWarning)
+        assert GuardShield(eng_b2, field_name="flag", unsafe_label="True").evaluate_single(
+            "boolean two row probe"
+        ).predicted_label == str(bool(dec_b2.values["flag"]))
+        assert FastExplainer.from_engine(eng_b2, field_name="flag").explain(
+            "boolean two row probe"
+        ).predicted_label == str(bool(dec_b2.values["flag"]))
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_b2)
+
+    # ------------------------------------------------------------------
+    # R20-5: Overflow-safe prototype mean reduction on extreme 1e308 / 3e38 inputs.
+    # ------------------------------------------------------------------
+    with warnings.catch_warnings(record=True) as caught_proto:
+        warnings.simplefilter("always", RuntimeWarning)
+        cp_ext = ConformalPredictor("c", ("a", "b"))
+        thr_ext = cp_ext.calibrate_prototypes(
+            [[1e308, 1e308], [1e308, 1e308], [1e308, 0.0], [1e308, 0.0]],
+            ["a", "a", "b", "b"],
+            alpha=0.2,
+        )
+        assert math.isfinite(thr_ext) and cp_ext.prototypes is not None
+        assert np.all(np.isfinite(cp_ext.prototypes))
+        assert np.linalg.norm(cp_ext.prototypes, axis=1) == pytest.approx([1.0, 1.0], rel=1e-5)
+
+        p_f32 = SystemOneCompiler._compute_class_prototypes(
+            np.array([[3e38, 0.0], [3e38, 0.0], [0.0, 3e38], [0.0, 3e38]], dtype=np.float32),
+            np.array([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]], dtype=np.float32),
+            sample_weights=np.array([1e300, 1e300, 1e300, 1e300], dtype=np.float64),
+        )
+        p_f64_bool = SystemOneCompiler._compute_class_prototypes(
+            np.array([[1e308, 0.0], [1e308, 0.0], [0.0, 1e308], [0.0, 1e308]], dtype=np.float64),
+            np.array([-1.0, -1.0, 1.0, 1.0], dtype=np.float32),
+            is_boolean=True,
+        )
+        assert np.linalg.norm(p_f32, axis=1) == pytest.approx([1.0, 1.0], rel=1e-2)
+        assert np.linalg.norm(p_f64_bool, axis=1) == pytest.approx([1.0, 1.0], rel=1e-2)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_proto)
+
+    # ------------------------------------------------------------------
+    # R20-6: Negative prototype similarities clamp prototype_threshold >= 0.0
+    # and roundtrip cleanly through v2 and v3 .s1m artifacts; < -1 or > 1 fail.
+    # ------------------------------------------------------------------
+    protos_pos = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    cp_neg = ConformalPredictor("c", ("a", "b"), prototypes=protos_pos)
+    for alpha_neg, exp_len in ((0.1, 4), (0.5, 4)):
+        t_neg = cp_neg.calibrate_prototypes(
+            np.array([[-1.0, -1.0]] * 4, dtype=np.float64),
+            alpha=alpha_neg,
+            prototypes=protos_pos,
+        )
+        assert t_neg == 0.0
+        assert len(cp_neg.prototype_scores) == exp_len and float(np.min(cp_neg.prototype_scores)) < 0.0
+
+    X_conf_neg = np.array([[-1.0, -1.0]] * 4, dtype=np.float64)
+    for alpha_neg in (0.1, 0.5):
+        thr_neg, scores_neg = SystemOneCompiler._calibrate_prototype_scores(X_conf_neg, protos_pos, alpha_neg)
+        assert thr_neg == 0.0 and len(scores_neg) == 4 and all(s < 0.0 for s in scores_neg)
+        cm_neg = CompiledSystemOneModel(
+            _R20StridedSchema(),
+            heads={
+                "c": CompiledHeadWeights(
+                    "c",
+                    "choice",
+                    np.eye(2, dtype=np.float32),
+                    np.zeros(2, dtype=np.float32),
+                    options=("a", "b"),
+                    prototypes=protos_pos,
+                    prototype_threshold=thr_neg,
+                    prototype_scores=scores_neg,
+                )
+            },
+            dimension=2,
+        )
+        for fmt_v in (2, 3):
+            cm_neg_re = CompiledSystemOneModel.from_bytes(cm_neg.to_bytes(format_version=fmt_v), backend="numpy")
+            assert cm_neg_re.heads["c"].prototype_threshold == 0.0
+            assert cm_neg_re.heads["c"].prototype_scores == pytest.approx(scores_neg, abs=1e-7)
+
+    for bad_score in (-1.01, 1.01, float("nan"), float("inf")):
+        cm_bad_ps = CompiledSystemOneModel(
+            _R20StridedSchema(),
+            heads={
+                "c": CompiledHeadWeights(
+                    "c",
+                    "choice",
+                    np.eye(2, dtype=np.float32),
+                    np.zeros(2, dtype=np.float32),
+                    options=("a", "b"),
+                    prototypes=protos_pos,
+                    prototype_threshold=0.0,
+                    prototype_scores=(bad_score,),
+                )
+            },
+            dimension=2,
+        )
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(cm_bad_ps.to_bytes(format_version=3), backend="numpy")
+
+    # ------------------------------------------------------------------
+    # R20-7: SoftOrdinalHead extreme sigma & ordinal hyperparameter validation.
+    # ------------------------------------------------------------------
+    X_ord_r20 = np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]], dtype=np.float64)
+    y_ord_r20 = np.array([0, 1, 2, 1], dtype=np.int64)
+    with warnings.catch_warnings(record=True) as caught_ord:
+        warnings.simplefilter("always", RuntimeWarning)
+        for sig_ext in (0.0, 5e-324, 1e-200, 1e200):
+            q_ext = SoftOrdinalHead.build_soft_targets(y_ord_r20, 3, sig_ext)
+            assert q_ext.shape == (4, 3) and bool(np.all(np.isfinite(q_ext)))
+            assert np.allclose(np.sum(q_ext, axis=1), 1.0, atol=1e-12)
+            h_ext = SoftOrdinalHead(n_classes=3, sigma=sig_ext, l2=1e-2).fit(X_ord_r20, y_ord_r20)
+            assert bool(np.all(np.isfinite(h_ext.predict_proba(X_ord_r20))))
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_ord)
+
+    for bad_val in (-0.5, float("nan"), float("inf"), True):
+        with pytest.raises(ValueError):
+            SoftOrdinalHead(n_classes=3, sigma=bad_val)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            SoftOrdinalHead(n_classes=3, l2=bad_val)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            CumulativeLogitOrdinalHead(n_classes=3, l2=bad_val)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            SoftOrdinalHead.build_soft_targets(y_ord_r20, 3, bad_val)  # type: ignore[arg-type]
+    for bad_int in (0, -1, True, 2.5, float("nan")):
+        with pytest.raises(ValueError):
+            SoftOrdinalHead(n_classes=3, max_iter=bad_int)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            CumulativeLogitOrdinalHead(n_classes=3, max_iter=bad_int)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        SoftOrdinalHead(n_classes=1)
+    with pytest.raises(ValueError):
+        CumulativeLogitOrdinalHead(n_classes=1)
+
+    # ------------------------------------------------------------------
+    # R20-8: Contradictory teacher feedback evicts clean_cache and quarantines
+    # cache key permanently (even through micro-compile & gateway replay).
+    # ------------------------------------------------------------------
+    class _CutoverSchemaR20(DecisionSchema):
+        act = ChoiceField(options=("allow", "deny"))
+
+    lc_cut_r20 = AutoCutoverLifecycle(
+        _CutoverSchemaR20(),
+        config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            alpha_target=0.15,
+            canary_rate=1e-9,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    for i_m in range(60):
+        lbl_m = "allow" if i_m % 2 == 0 else "deny"
+        lc_cut_r20.observe_teacher(f"{lbl_m} sample {i_m}", {"act": lbl_m}, cache_key=f"k_warm_{i_m}")
+    assert lc_cut_r20.compiled_active is True
+
+    lc_cut_r20.observe_teacher("ambiguous item", {"act": "allow"}, cache_key="k_conflict")
+    lc_cut_r20.observe_teacher("ambiguous item", {"act": "allow"}, cache_key="k_conflict")
+    assert lc_cut_r20.decide_local("ambiguous item", cache_key="k_conflict") == {"act": "allow"}
+
+    # Conflicting label evicts clean_cache immediately and marks key conflicted.
+    lc_cut_r20.observe_teacher("ambiguous item", {"act": "deny"}, cache_key="k_conflict")
+    assert "k_conflict" not in lc_cut_r20.clean_cache
+    assert "k_conflict" in lc_cut_r20._conflicted_cache_keys
+    assert lc_cut_r20.decide_local("ambiguous item", cache_key="k_conflict") is None
+
+    # Repeated teacher votes across next micro-compile milestone must never re-admit conflicted key.
+    for i_m in range(60, 110):
+        lbl_m = "allow" if i_m % 2 == 0 else "deny"
+        lc_cut_r20.observe_teacher(f"{lbl_m} sample {i_m}", {"act": lbl_m}, cache_key=f"k_warm_{i_m}")
+    for _ in range(3):
+        lc_cut_r20.observe_teacher("ambiguous item", {"act": "allow"}, cache_key="k_conflict")
+    assert "k_conflict" not in lc_cut_r20.clean_cache
+    assert lc_cut_r20.decide_local("ambiguous item", cache_key="k_conflict") is None
+
+    # Gateway end-to-end check on contradictory teacher answers for identical request.
+    gw_mode = "allow"
+
+    def _flip_teacher(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        req_mode = raw_payload.get("mode") if isinstance(raw_payload, dict) else None
+        out_choice = req_mode if req_mode in ("allow", "deny") else gw_mode
+        probs = {"allow": 0.99, "deny": 0.01} if out_choice == "allow" else {"allow": 0.01, "deny": 0.99}
+        return {"answers": {"act": {"choice": out_choice, "probabilities": probs}}, "usage": {"input_tokens": 3}}
+
+    svc_conflict = UniversalDecisionService(
+        upstream_handlers={"gemini": _flip_teacher},
+        require_auth=False,
+        cutover_config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            canary_rate=1e-9,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    for i_gw in range(120):
+        m_gw = "allow" if i_gw % 2 == 0 else "deny"
+        svc_conflict.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {"state": f"{m_gw} warmup item {i_gw}", "mode": m_gw, "questions": q_r20, "slot": "flip"}
+            ).encode("utf-8"),
+        )
+    conflict_body = json.dumps({"state": "flipping request", "questions": q_r20, "slot": "flip"}).encode("utf-8")
+    for _ in range(2):
+        st_f, b_f = svc_conflict.handle_request(
+            path="/v1beta/decisions", headers={"Content-Type": "application/json"}, raw_body=conflict_body
+        )
+        assert st_f == 200 and b_f["answers"]["act"]["choice"] == "allow"
+    _, b_hit_allow = svc_conflict.handle_request(
+        path="/v1beta/decisions", headers={"Content-Type": "application/json"}, raw_body=conflict_body
+    )
+    assert b_hit_allow["local_execution"] is True and b_hit_allow["answers"]["act"]["choice"] == "allow"
+
+    gw_mode = "deny"
+    _, b_force_deny = svc_conflict.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=json.dumps(
+            {"state": "flipping request", "questions": q_r20, "slot": "flip", "force_teacher": True}
+        ).encode("utf-8"),
+    )
+    assert b_force_deny["answers"]["act"]["choice"] == "deny"
+    # Immediately after conflict, next call must abstain locally and reach teacher (not stale cached allow).
+    st_after, b_after = svc_conflict.handle_request(
+        path="/v1beta/decisions", headers={"Content-Type": "application/json"}, raw_body=conflict_body
+    )
+    assert st_after == 200 and b_after["local_execution"] is False and b_after["answers"]["act"]["choice"] == "deny"
+
+    # ------------------------------------------------------------------
+    # R20-9: RFC 9110 media-type parameter parity across Universal Gateway,
+    # MCP HTTP handler, and InboxZeroApp.
+    # ------------------------------------------------------------------
+    fake_clf = types.SimpleNamespace(
+        classify=lambda payload: {
+            "model": "test",
+            "inputTokens": 0,
+            "needsReview": False,
+            "answers": {},
+            "predictionSet": [],
+            "teacherCalls": 0,
+        }
+    )
+    inbox_tok = "r20-inbox-zero-token-0123456789"
+    inbox_app = InboxZeroApp(fake_clf, inbox_tok)
+
+    def _call_inbox_asgi(ctype_val: str) -> int:
+        async def _run() -> int:
+            sent: List[Dict[str, Any]] = []
+            payload_b = json.dumps({"state": {"email": {}}, "questions": {}}).encode("utf-8")
+            events = [{"type": "http.request", "body": payload_b, "more_body": False}]
+            idx_ev = 0
+
+            async def _recv() -> Dict[str, Any]:
+                nonlocal idx_ev
+                ev = events[idx_ev]
+                idx_ev += 1
+                return ev
+
+            async def _send(msg: Dict[str, Any]) -> None:
+                sent.append(msg)
+
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/classify",
+                "headers": [
+                    (b"authorization", f"Bearer {inbox_tok}".encode("utf-8")),
+                    (b"content-type", ctype_val.encode("latin-1")),
+                ],
+            }
+            await inbox_app(scope, _recv, _send)
+            return int(sent[0]["status"])
+
+        return asyncio.run(_run())
+
+    mcp_rt = MCPGuardRuntime(MCPStreamableHTTPConfig())
+    mcp_init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).encode("utf-8")
+
+    def _call_mcp_post(ctype_val: str) -> int:
+        statuses: List[int] = []
+        h = _MCPStreamableHTTPHandler.__new__(_MCPStreamableHTTPHandler)
+        h.path = "/mcp"
+        h.request_version = "HTTP/1.1"
+        h.close_connection = False
+        msg = email.message.Message()
+        msg["Content-Type"] = ctype_val
+        msg["Content-Length"] = str(len(mcp_init))
+        h.headers = msg
+        h.rfile = io.BytesIO(mcp_init)
+        h.wfile = io.BytesIO()
+        h.server = types.SimpleNamespace(runtime=mcp_rt)
+        h.send_response = lambda code, message=None: statuses.append(int(code))  # type: ignore[method-assign]
+        h.send_header = lambda k, v: None  # type: ignore[method-assign]
+        h.end_headers = lambda: None  # type: ignore[method-assign]
+        h.do_POST()
+        return statuses[0]
+
+    for ok_ct in (
+        'application/json; x=""',
+        "application/json;",
+        "application/json;;charset=utf-8",
+    ):
+        assert _is_json_media_type(ok_ct) is True
+        st_u, _ = svc_conflict.handle_request(
+            path="/v1beta/decisions", headers={"Content-Type": ok_ct}, raw_body=conflict_body
+        )
+        assert st_u == 200
+        assert _call_mcp_post(ok_ct) == 200
+        assert _call_inbox_asgi(ok_ct) == 200
+
+    for bad_ct in (
+        'application/json; charset=""',
+        "application/json; x=",
+        "application/json; charset=latin-1",
+    ):
+        assert _is_json_media_type(bad_ct) is False
+        with pytest.raises(UnsupportedMediaError):
+            svc_conflict.handle_request(
+                path="/v1beta/decisions", headers={"Content-Type": bad_ct}, raw_body=conflict_body
+            )
+        assert _call_mcp_post(bad_ct) == 415
+        assert _call_inbox_asgi(bad_ct) == 415
+
+    # ------------------------------------------------------------------
+    # R20 sister fixes & layout/budget/override parity regressions
+    # ------------------------------------------------------------------
+    # 1. to_compiled_model() & unaligned (mod16 != 0) 2D strided parity across all surfaces.
+    cm_str = eng_str.to_compiled_model()
+    assert cm_str.heads["c"].weights.strides == w_contig.strides
+    eng_str.model.heads["c"].set_weights(w_strided, b_strided)
+    cm_str_live = eng_str.to_compiled_model()
+    assert cm_str_live.heads["c"].weights.strides == w_strided.strides
+    assert cm_str_live.forward_single("strided layout probe").fields["c"].selected_value == eng_str.decide(
+        "strided layout probe", record_receipt=False
+    ).values["c"]
+    assert eng_str.decide_batch(["strided layout probe"])[0].values["c"] == eng_str.decide(
+        "strided layout probe", record_receipt=False
+    ).values["c"]
+
+    # Deterministic strided vs contiguous midpoint split across Engine, to_compiled_model, Kernel, Callable, Guard, Explainer, Fleet.
+    eng_t20 = SystemOneEngine(
+        _R20StridedSchema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    emb_t20 = eng_t20.model.encode("strided midpoint check")
+    base_t20 = np.random.default_rng(7).normal(size=(4, 64)).astype(np.float32)
+    w_t20 = base_t20[::2, ::2]
+    w_t20[1, :] = 0.0
+    zs_t20 = float((emb_t20.reshape(1, -1) @ w_t20.T)[0, 0])
+    zc_t20 = float((emb_t20.reshape(1, -1) @ np.ascontiguousarray(w_t20).T)[0, 0])
+    assert zs_t20 != zc_t20
+    eng_t20.model.heads["c"].set_weights(w_t20, np.zeros(2, dtype=np.float32))
+    eng_t20.calibrators["c"].logit_adjustments = np.array([0.0, 0.5 * (zs_t20 + zc_t20) / 0.25], dtype=np.float64)
+    cm_t20 = eng_t20.to_compiled_model()
+    assert cm_t20.heads["c"].weights.strides == w_t20.strides
+    eng_cm_t20 = SystemOneEngine(
+        _R20StridedSchema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    eng_cm_t20.model = cm_t20
+    eng_cm_t20.calibrators = eng_t20.calibrators
+    dec_t20_eng = eng_t20.decide("strided midpoint check", record_receipt=False)
+    assert dec_t20_eng.values["c"] == "a"
+    assert eng_cm_t20.decide("strided midpoint check", record_receipt=False).values["c"] == "a"
+    assert eng_t20.decide_batch(["strided midpoint check"])[0].values["c"] == "a"
+    assert eng_t20.compile_callable(storage_mode="float32")("strided midpoint check").values["c"] == "a"
+    assert GuardShield(eng_t20, field_name="c", unsafe_label="b").evaluate_single("strided midpoint check").predicted_label == "a"
+    assert FastExplainer.from_engine(eng_t20, "c").explain("strided midpoint check").predicted_label == "a"
+    assert MultiTenantSkillFleet.from_compiled_model(eng_t20, "c", num_tenants=1).decide(0, "strided midpoint check").predicted_label == "a"
+
+    # Explicit 16-byte-unaligned (ctypes.data % 16 != 0) 2D weight matrix preserves mod64 alignment.
+    import ctypes
+    unalign_buf = bytearray(2 * 32 * 4 + 64)
+    base_ptr = ctypes.addressof((ctypes.c_char * len(unalign_buf)).from_buffer(unalign_buf))
+    unalign_off = (4 - (base_ptr % 16)) % 16
+    if (unalign_off % 16) == 0:
+        unalign_off += 4
+    w_unalign = np.frombuffer(memoryview(unalign_buf)[unalign_off : unalign_off + 2 * 32 * 4], dtype=np.float32).reshape(2, 32)
+    w_unalign[:] = np.arange(64, dtype=np.float32).reshape(2, 32) * np.float32(0.02)
+    assert int(w_unalign.ctypes.data % 16) != 0
+    eng_str.model.heads["c"].set_weights(w_unalign, b_strided)
+    assert int(eng_str.model.heads["c"].weights.ctypes.data % 64) == int(w_unalign.ctypes.data % 64)
+    pk_unalign = eng_str.compile_packed_kernel(storage_mode="float32")
+    assert int(pk_unalign.c_raw_w[0].ctypes.data % 64) == int(w_unalign.ctypes.data % 64)
+
+    # 2. 2-row BooleanField (overflowing row 1 = 1e38) & ScoreField parity + _build_override_eval sign.
+    eng_b2_ov = SystemOneEngine(
+        _R20BoolSchema,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    emb_ov2 = eng_b2_ov.model.encode("boolean two row probe").astype(np.float32)
+    row0_ov2 = (np.arange(16, dtype=np.float32) + np.float32(0.5)) * np.float32(0.1)
+    bias0_ov2 = np.float32(-float((emb_ov2.reshape(1, -1) @ row0_ov2.reshape(16, 1)).item()))
+    w_ov2 = np.asfortranarray(np.vstack([row0_ov2, np.full(16, 1e38, dtype=np.float32)]))
+    b_ov2 = np.array([bias0_ov2, 1e38], dtype=np.float32)
+    eng_b2_ov.model.heads["flag"].set_weights(w_ov2, b_ov2)
+    with warnings.catch_warnings(record=True) as caught_b2_all:
+        warnings.simplefilter("always", RuntimeWarning)
+        dec_ov2 = eng_b2_ov.decide("boolean two row probe", record_receipt=False)
+        db_ov2 = eng_b2_ov.decide_batch(["boolean two row probe"])[0]
+        pk_ov2 = eng_b2_ov.compile_packed_kernel(storage_mode="float32")
+        call_ov2 = eng_b2_ov.compile_callable(storage_mode="float32")
+        cm_ov2 = eng_b2_ov.to_compiled_model()
+        assert db_ov2.values["flag"] == dec_ov2.values["flag"]
+        assert call_ov2("boolean two row probe").values["flag"] == dec_ov2.values["flag"]
+        assert bool(pk_ov2.decide_prompt("boolean two row probe")["b_val"][0, 0]) == dec_ov2.values["flag"]
+        assert bool(cm_ov2.forward_single("boolean two row probe").fields["flag"].selected_value) == dec_ov2.values["flag"]
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_b2_all)
+
+    # _build_override_eval must put +z in logits[0] so True->True and False->False for 2-row BooleanField.
+    raw_ov_t = CompiledSystemOneModel._build_override_eval(cm_ov2._field_heads["flag"], True)
+    raw_ov_f = CompiledSystemOneModel._build_override_eval(cm_ov2._field_heads["flag"], False)
+    assert float(raw_ov_t.raw_probabilities[1]) > 0.99 and float(raw_ov_f.raw_probabilities[1]) < 0.01
+
+    # PackedKernel rejects mismatched bias vector lengths (e.g. weights (2, D) with biases (3,)).
+    eng_b2_ov.model.heads["flag"].weights = np.zeros((2, 16), dtype=np.float32)
+    eng_b2_ov.model.heads["flag"].biases = np.zeros(3, dtype=np.float32)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        eng_b2_ov.compile_packed_kernel(storage_mode="float32")
+
+    eng_sc.model.heads["score"].weights = np.zeros((2, 16), dtype=np.float32)
+    eng_sc.model.heads["score"].biases = np.zeros(3, dtype=np.float32)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        eng_sc.compile_packed_kernel(storage_mode="float32")
+
+    # Astra R20-3 finite 2-row Fortran ScoreField check (temperature=0.0001).
+    eng_sc_f32 = SystemOneEngine(
+        _R20ScoreSchema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    w_sc_f32 = np.asfortranarray(np.random.default_rng(0).normal(size=(2, 32)).astype(np.float32))
+    emb_sc_f32 = eng_sc_f32.model.encode("fortran score layout check")
+    b0_sc_f32 = -float((emb_sc_f32.reshape(1, -1) @ w_sc_f32.T)[0, 0])
+    eng_sc_f32.model.heads["score"].set_weights(w_sc_f32, np.array([b0_sc_f32, 0.0], dtype=np.float32))
+    eng_sc_f32.calibrators["score"].temperature = 0.0001
+    assert eng_sc_f32.decide("fortran score layout check", record_receipt=False).values["score"] == pytest.approx(50.0, abs=1e-5)
+    assert eng_sc_f32.decide_batch(["fortran score layout check"])[0].values["score"] == pytest.approx(50.0, abs=1e-5)
+    assert float(eng_sc_f32.compile_packed_kernel(storage_mode="float32").decide_prompt("fortran score layout check")["s_val"][0, 0]) == pytest.approx(50.0, abs=1e-5)
+    assert eng_sc_f32.compile_callable(storage_mode="float32")("fortran score layout check").values["score"] == pytest.approx(50.0, abs=1e-5)
+
+    # 3. SystemOneCompiler.compile end-to-end negative prototype_scores + v2/v3 reload.
+    class _NegProtoProj:
+        dimension = 32
+        def project(self, text: str) -> np.ndarray:
+            v = np.zeros(32, dtype=np.float32)
+            if "negcal" in text:
+                v[0] = np.float32(-1.0 / np.sqrt(2.0))
+                v[1] = np.float32(-1.0 / np.sqrt(2.0))
+            elif "alpha" in text:
+                v[0] = np.float32(1.0)
+            else:
+                v[1] = np.float32(1.0)
+            return v
+        def encode(self, text: str) -> np.ndarray:
+            return self.project(text)
+
+    proj_neg = _NegProtoProj()
+    comp_neg = SystemOneCompiler(_R20StridedSchema, projector=proj_neg, dimension=32, prototype_alpha=0.1)
+    cm_comp_neg = comp_neg.compile(
+        exemplars={
+            "c": [
+                ("alpha one", "a"),
+                ("alpha two", "a"),
+                ("beta one", "b"),
+                ("beta two", "b"),
+            ]
+        },
+        calibration_exemplars={
+            "c": [
+                ("negcal 1", "a"),
+                ("negcal 2", "b"),
+                ("negcal 3", "a"),
+                ("negcal 4", "b"),
+            ]
+        },
+        augment=False,
+    )
+    assert cm_comp_neg.heads["c"].prototype_threshold == 0.0
+    assert len(cm_comp_neg.heads["c"].prototype_scores) >= 1
+    assert min(cm_comp_neg.heads["c"].prototype_scores) < -0.5
+    for fmt_v in (2, 3):
+        cm_comp_re = CompiledSystemOneModel.from_bytes(
+            cm_comp_neg.to_bytes(format_version=fmt_v),
+            projector=proj_neg,
+            backend="numpy",
+        )
+        assert cm_comp_re.heads["c"].prototype_threshold == 0.0
+        assert cm_comp_re.heads["c"].prototype_scores == pytest.approx(cm_comp_neg.heads["c"].prototype_scores, abs=1e-6)
+
+    # 4. Fleet strided snapshot tamper (aliasing even with duplicate values) & budget enforcement.
+    def _tamper_npz_bytes(blob: bytes, overrides: Dict[str, np.ndarray]) -> bytes:
+        with zipfile.ZipFile(io.BytesIO(blob), "r") as zin:
+            items = {name: zin.read(name) for name in zin.namelist()}
+        for k_over, arr_over in overrides.items():
+            abuf = io.BytesIO()
+            np.save(abuf, arr_over, allow_pickle=False)
+            items[f"{k_over}.npy"] = abuf.getvalue()
+        zout_buf = io.BytesIO()
+        with zipfile.ZipFile(zout_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for k_item, v_item in items.items():
+                zout.writestr(k_item, v_item)
+        return zout_buf.getvalue()
+
+    eng_gap = SystemOneEngine(
+        _R20StridedSchema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    w_gap_src = np.zeros((2, 512), dtype=np.float32)[:, ::16]
+    eng_gap.model.heads["c"].set_weights(w_gap_src, np.zeros(2, dtype=np.float32))
+    fleet_gap_str = MultiTenantSkillFleet.from_compiled_model(eng_gap, "c", num_tenants=1)
+    eng_gap.model.heads["c"].set_weights(np.ascontiguousarray(w_gap_src.copy()), np.zeros(2, dtype=np.float32))
+    fleet_gap_con = MultiTenantSkillFleet.from_compiled_model(eng_gap, "c", num_tenants=1)
+    assert fleet_gap_str.base_nbytes() > fleet_gap_con.base_nbytes()
+    blob_gap_str = fleet_gap_str.fleet_delta_to_bytes()
+
+    # Duplicate-element aliasing (all-zero raw_W_auth with s0=0, s0=4, s0=256/s1=16, or huge s0) must fail closed.
+    for bad_layout in (
+        np.array([0, 0, 4], dtype=np.int64),
+        np.array([0, 4, 4], dtype=np.int64),
+        np.array([0, 256, 16], dtype=np.int64),
+        np.array([0, 1048576, 4], dtype=np.int64),
+    ):
+        tampered_alias = _tamper_npz_bytes(blob_gap_str, {"raw_W_layout": bad_layout})
+        with pytest.raises(ValueError):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(tampered_alias, projector=eng_gap.model.projector)
+    tampered_gcd_alias = _tamper_npz_bytes(blob_gap_str, {"raw_W_layout": np.array([0, 256, 16], dtype=np.int64)})
+    with pytest.raises(ValueError, match="aliases"):
+        MultiTenantSkillFleet.fleet_delta_from_bytes(tampered_gcd_alias, projector=eng_gap.model.projector)
+
+    # Budget excluding strided span extra fails closed; budget including strided span passes.
+    blob_gap_con = fleet_gap_con.fleet_delta_to_bytes()
+    min_con_budget = fleet_gap_con.base_nbytes() + fleet_gap_con.arena_nbytes() + 512
+    assert (
+        MultiTenantSkillFleet.fleet_delta_from_bytes(
+            blob_gap_con, projector=eng_gap.model.projector, max_runtime_bytes=min_con_budget
+        ).base_nbytes()
+        == fleet_gap_con.base_nbytes()
+    )
+    with pytest.raises(ValueError, match="extra span"):
+        MultiTenantSkillFleet.fleet_delta_from_bytes(
+            blob_gap_str, projector=eng_gap.model.projector, max_runtime_bytes=min_con_budget
+        )
+    str_budget = fleet_gap_str.base_nbytes() + fleet_gap_str.arena_nbytes() + 512
+    loaded_gap_str = MultiTenantSkillFleet.fleet_delta_from_bytes(
+        blob_gap_str, projector=eng_gap.model.projector, max_runtime_bytes=str_budget
+    )
+    assert loaded_gap_str.base_nbytes() == fleet_gap_str.base_nbytes()

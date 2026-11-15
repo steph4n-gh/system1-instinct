@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from system1.compat.universal import _is_json_media_type
 from system1.compiler import CompiledSystemOneModel
 from system1.engine import System1Engine
 
@@ -168,7 +169,7 @@ class InboxZeroApp:
         if scope.get("method") != "POST":
             await self._respond(send, 405, {"error": "method_not_allowed"})
             return
-        if headers.get(b"content-type", b"").split(b";", 1)[0].strip().lower() != b"application/json":
+        if not _is_json_media_type(headers.get(b"content-type", b"").decode("latin-1")):
             await self._respond(send, 415, {"error": "expected_json"})
             return
         body = bytearray()

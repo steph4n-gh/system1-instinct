@@ -623,9 +623,63 @@ def _pack_f64_scalar(val: Any) -> Optional[bytes]:
     return struct.pack("<d", f)
 
 
+_MAX_STRIDED_CLONE_SPAN_BYTES = 64 * 1024 * 1024
+
+
+def _2d_matmul_layout_sig(a: np.ndarray) -> Optional[Tuple[int, int, int]]:
+    """Return canonical 2D base-alignment and byte-stride signature affecting matmul order."""
+    if a.ndim != 2 or a.size == 0:
+        return None
+    K, D = int(a.shape[0]), int(a.shape[1])
+    s0 = 0 if K == 1 else int(a.strides[0])
+    s1 = 0 if D == 1 else int(a.strides[1])
+    return (int(a.ctypes.data % 64), s0, s1)
+
+
 def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
-    """Return an owned read-only copy preserving 2D Fortran contiguity when present."""
+    """Return an owned read-only copy preserving 2D strides, base alignment, and Fortran contiguity."""
     raw_in = np.asarray(arr)
+    target = np.dtype(raw_in.dtype if dtype is None else dtype)
+    if (
+        raw_in.ndim == 2
+        and raw_in.size > 0
+        and target.kind in ("b", "i", "u", "f", "c")
+        and (
+            (not raw_in.flags["C_CONTIGUOUS"] and not raw_in.flags["F_CONTIGUOUS"])
+            or int(raw_in.ctypes.data % 16) != 0
+        )
+    ):
+        src = raw_in if raw_in.dtype == target else raw_in.astype(target, order="K", copy=False)
+        K, D = int(src.shape[0]), int(src.shape[1])
+        itemsize = int(target.itemsize)
+        s0 = 0 if K == 1 else int(src.strides[0])
+        s1 = 0 if D == 1 else int(src.strides[1])
+        min_off = min(0, (K - 1) * s0) + min(0, (D - 1) * s1)
+        max_off = max(0, (K - 1) * s0) + max(0, (D - 1) * s1)
+        span_bytes = (max_off - min_off) + itemsize
+        max_allowed_span = min(_MAX_STRIDED_CLONE_SPAN_BYTES, max(1 << 20, 64 * int(src.nbytes)))
+        if (
+            itemsize > 0
+            and span_bytes <= max_allowed_span
+            and (s0 % itemsize == 0)
+            and (s1 % itemsize == 0)
+        ):
+            target_mod = int(src.ctypes.data % 64)
+            raw_buf = np.zeros(span_bytes + 128, dtype=np.uint8)
+            base_start = -min_off
+            cur_mod = (int(raw_buf.ctypes.data) + base_start) % 64
+            origin = base_start + ((target_mod - cur_mod) % 64)
+            anchor = raw_buf[origin : origin + itemsize].view(target)
+            out = np.lib.stride_tricks.as_strided(
+                anchor,
+                shape=(K, D),
+                strides=(s0, s1),
+                writeable=True,
+            )
+            np.copyto(out, src)
+            out.setflags(write=False)
+            return out
+
     is_f_2d = (
         raw_in.ndim == 2
         and raw_in.size > 0
@@ -633,19 +687,16 @@ def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
         and not raw_in.flags["C_CONTIGUOUS"]
     )
     order = "F" if is_f_2d else "C"
-    if dtype is None:
-        raw = raw_in
-        target = raw_in.dtype
-    else:
-        raw = arr
-        target = dtype
+    raw = raw_in if dtype is None else arr
     out = np.array(raw, dtype=target, order=order, copy=True)
     out.setflags(write=False)
     return out
 
 
-def _pack_array_sig(arr: Any) -> Optional[Tuple[Tuple[int, ...], str, bool, bytes]]:
-    """Serialize an array's shape, dtype, 2D Fortran layout flag, and raw bytes."""
+def _pack_array_sig(
+    arr: Any,
+) -> Optional[Tuple[Tuple[int, ...], str, bool, bytes, Optional[Tuple[int, int, int]]]]:
+    """Serialize an array's shape, dtype, 2D Fortran flag, raw bytes, and 2D stride/alignment layout."""
     if arr is None:
         return None
     a = np.asarray(arr)
@@ -656,7 +707,8 @@ def _pack_array_sig(arr: Any) -> Optional[Tuple[Tuple[int, ...], str, bool, byte
         and not a.flags["C_CONTIGUOUS"]
     )
     raw_bytes = a.tobytes(order="F") if is_f_2d else np.ascontiguousarray(a).tobytes()
-    return (a.shape, str(a.dtype), is_f_2d, raw_bytes)
+    layout_2d = _2d_matmul_layout_sig(a)
+    return (a.shape, str(a.dtype), is_f_2d, raw_bytes, layout_2d)
 
 
 def _exact_choice_probs_row(
@@ -702,7 +754,7 @@ def _exact_bool_probs_row(
         s0_ex = (-0.5 * sz_ex + adj0) / temp
         s1_ex = (0.5 * sz_ex + adj1) / temp
         if (
-            bool(np.all(np.isfinite(lin_ex)))
+            math.isfinite(float(lin_ex.ravel()[0]))
             and math.isfinite(zv_ex)
             and math.isfinite(s0_ex)
             and math.isfinite(s1_ex)
@@ -3532,10 +3584,10 @@ class PackedMultiQuestionKernel:
                     raw_w_full.ndim != 2
                     or raw_w_full.shape[0] < 1
                     or raw_w_full.shape[1] != dim
-                    or raw_b_full.shape[0] < 1
+                    or raw_b_full.shape[0] not in (1, raw_w_full.shape[0])
                 ):
                     raise ValueError(
-                        f"Boolean head {fname!r} shape mismatch: expected (>=1, {dim}) and (>=1,), got {raw_w_full.shape} and {raw_b_full.shape}"
+                        f"Boolean head {fname!r} shape mismatch: expected (>=1, {dim}) and (1|K,), got {raw_w_full.shape} and {raw_b_full.shape}"
                     )
                 raw_w_arr = raw_w_full[:1]
                 raw_b_arr = raw_b_full[:1]
@@ -3610,10 +3662,10 @@ class PackedMultiQuestionKernel:
                     raw_w_full.ndim != 2
                     or raw_w_full.shape[0] < 1
                     or raw_w_full.shape[1] != dim
-                    or raw_b_full.shape[0] < 1
+                    or raw_b_full.shape[0] not in (1, raw_w_full.shape[0])
                 ):
                     raise ValueError(
-                        f"Score head {fname!r} shape mismatch: expected (>=1, {dim}) and (>=1,), got {raw_w_full.shape} and {raw_b_full.shape}"
+                        f"Score head {fname!r} shape mismatch: expected (>=1, {dim}) and (1|K,), got {raw_w_full.shape} and {raw_b_full.shape}"
                     )
                 raw_w_arr = raw_w_full[:1]
                 raw_b_arr = raw_b_full[:1]
@@ -3623,14 +3675,14 @@ class PackedMultiQuestionKernel:
                 b = np.asarray(raw_b_arr, dtype=np.float64)
                 s_raw_w.append(
                     _owned_readonly_array(
-                        raw_w_arr,
-                        dtype=raw_w_arr.dtype if raw_w_arr.dtype in (np.float32, np.float64) else np.float32,
+                        raw_w_full,
+                        dtype=raw_w_full.dtype if raw_w_full.dtype in (np.float32, np.float64) else np.float32,
                     )
                 )
                 s_raw_b.append(
                     _owned_readonly_array(
-                        raw_b_arr,
-                        dtype=raw_b_arr.dtype if raw_b_arr.dtype in (np.float32, np.float64) else np.float32,
+                        raw_b_full,
+                        dtype=raw_b_full.dtype if raw_b_full.dtype in (np.float32, np.float64) else np.float32,
                     )
                 )
                 W_cols.append(W.T)
@@ -4344,7 +4396,12 @@ class PackedMultiQuestionKernel:
                             w_s = self.s_raw_w[si]
                             b_s = self.s_raw_b[si]
                             for r_pos in np.flatnonzero(valid_s).tolist():
-                                zs[r_pos, si] = float((Xm_2d[r_pos : r_pos + 1] @ w_s.T + b_s)[0, 0])
+                                lin_s = Xm_2d[r_pos : r_pos + 1] @ w_s.T
+                                zs[r_pos, si] = (
+                                    float((lin_s + b_s)[0, 0])
+                                    if math.isfinite(float(lin_s.ravel()[0]))
+                                    else float("nan")
+                                )
             with np.errstate(over="ignore", invalid="ignore"):
                 scaled_zs = zs / 0.25
                 zs_cal = scaled_zs / self.s_raw_scale[None, :]
@@ -5384,7 +5441,12 @@ class FastDecisionCallable:
                     zv = 0.0
                 else:
                     with np.errstate(over="ignore", invalid="ignore"):
-                        zv = float((emb.reshape(1, -1) @ st.s_raw_w[si].T + st.s_raw_b[si])[0, 0])
+                        lin_s = emb.reshape(1, -1) @ st.s_raw_w[si].T
+                        zv = (
+                            float((lin_s + st.s_raw_b[si])[0, 0])
+                            if math.isfinite(float(lin_s.ravel()[0]))
+                            else float("nan")
+                        )
             else:
                 zv = float(z_list[st.s_offset + si])
             scaled_zs = zv / 0.25

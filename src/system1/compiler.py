@@ -1041,7 +1041,7 @@ class CompiledSystemOneModel:
             logits = (
                 np.array([z], dtype=np.float32)
                 if head.weights.shape[0] == 1
-                else np.array([-z, z], dtype=np.float32)
+                else np.array([z, -z], dtype=np.float32)
             )
             return head.evaluate_logits(logits)
         if isinstance(f_def, MultiChoiceField):
@@ -3090,7 +3090,7 @@ class CompiledSystemOneModel:
                     proto_mat = np.vstack([-w_u, w_u]).astype(np.float32)
             proto_scores_arr = array_map[_hk("proto_scores")] if _hk("proto_scores") in array_map else None
             proto_scores = tuple(float(s) for s in proto_scores_arr) if proto_scores_arr is not None else ()
-            if any(not math.isfinite(score) or score < 0 for score in proto_scores):
+            if any(not math.isfinite(score) or score < -1.0 - 1e-4 or score > 1.0 + 1e-4 for score in proto_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid prototype calibration scores")
             is_hier = _strict_header_bool(h_info, "hierarchical", False, ctx)
             raw_assign = h_info.get("cluster_assignments", ())
@@ -4272,26 +4272,45 @@ class SystemOneCompiler:
         sample_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Compute unit-normalized class feature centroids (shape (K, D))."""
-        X_mat = np.asarray(X_train, dtype=np.float32)
+        X_mat = np.asarray(X_train, dtype=np.float64)
         N, D = X_mat.shape
         sw = (
             np.maximum(1e-6, np.asarray(sample_weights, dtype=np.float64).flatten())
             if sample_weights is not None
             else None
         )
+
+        def _safe_weighted_mean(rows: np.ndarray, weights: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            fin_rows = np.all(np.isfinite(rows), axis=1)
+            if not np.any(fin_rows):
+                return None
+            sub = rows[fin_rows]
+            max_abs = float(np.max(np.abs(sub)))
+            if not math.isfinite(max_abs) or max_abs <= 0.0:
+                return None
+            scaled = sub / max_abs
+            if weights is not None:
+                w_sub = weights[fin_rows]
+                w_ok = np.isfinite(w_sub) & (w_sub > 0.0)
+                if not np.any(w_ok):
+                    return None
+                w_pos = w_sub[w_ok]
+                w_max = float(np.max(w_pos))
+                if not math.isfinite(w_max) or w_max <= 0.0:
+                    return None
+                return np.average(scaled[w_ok], axis=0, weights=w_pos / w_max)
+            return np.mean(scaled, axis=0, dtype=np.float64)
+
         if is_boolean:
             y_flat = np.asarray(Y_train, dtype=np.float32).flatten()
             protos = np.zeros((2, D), dtype=np.float32)
             for idx, mask in enumerate((y_flat < 0.0, y_flat > 0.0)):
                 if np.any(mask):
-                    vec = (
-                        np.average(X_mat[mask], axis=0, weights=sw[mask])
-                        if sw is not None
-                        else np.mean(X_mat[mask], axis=0)
-                    )
-                    unit_v, _, ok = _normalize_vec_f32_safe(vec)
-                    if ok:
-                        protos[idx] = unit_v
+                    vec = _safe_weighted_mean(X_mat[mask], sw[mask] if sw is not None else None)
+                    if vec is not None:
+                        unit_v, _, ok = _normalize_vec_f32_safe(vec)
+                        if ok:
+                            protos[idx] = unit_v
             res = _roundtrip_unit_f16(protos)
             assert res is not None
             return res
@@ -4303,14 +4322,11 @@ class SystemOneCompiler:
         for k in range(K):
             mask = Y_mat[:, k] > 0.5
             if np.any(mask):
-                vec = (
-                    np.average(X_mat[mask], axis=0, weights=sw[mask])
-                    if sw is not None
-                    else np.mean(X_mat[mask], axis=0)
-                )
-                unit_v, _, ok = _normalize_vec_f32_safe(vec)
-                if ok:
-                    protos[k] = unit_v
+                vec = _safe_weighted_mean(X_mat[mask], sw[mask] if sw is not None else None)
+                if vec is not None:
+                    unit_v, _, ok = _normalize_vec_f32_safe(vec)
+                    if ok:
+                        protos[k] = unit_v
         res = _roundtrip_unit_f16(protos)
         assert res is not None
         return res
@@ -4610,7 +4626,7 @@ class SystemOneCompiler:
         m = len(sorted_sims)
         rank = int(math.floor((m + 1) * prototype_alpha))
         if rank >= 1:
-            thresh = float(sorted_sims[rank - 1])
+            thresh = float(max(0.0, float(sorted_sims[rank - 1])))
         else:
             min_sim = float(sorted_sims[0])
             thresh = float(max(0.0, min_sim * 0.90)) if min_sim > 0.0 else 0.0

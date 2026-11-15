@@ -89,6 +89,10 @@ def _is_json_media_type(ctype: str) -> bool:
         pos += 1
         while pos < n and s[pos] in (" ", "\t"):
             pos += 1
+        if pos >= n:
+            break
+        if s[pos] == ";":
+            continue
 
         k_start = pos
         while pos < n and s[pos] in _HTTP_TOKEN_CHARS:
@@ -150,8 +154,6 @@ def _is_json_media_type(ctype: str) -> bool:
         while pos < n and s[pos] in (" ", "\t"):
             pos += 1
         if pos < n and s[pos] != ";":
-            return False
-        if not p_val:
             return False
         if p_key == "charset":
             if seen_charset is not None:
@@ -513,29 +515,49 @@ def _canonicalize_for_semantic_json(node: Any, depth: int = 0) -> Tuple[Any, boo
     return s, bool(s.strip())
 
 
+_PRIMARY_SEMANTIC_KEYS: Tuple[str, ...] = ("input", "state", "contents", "prompt")
+_GATEWAY_ENVELOPE_CONTROL_KEYS: FrozenSet[str] = frozenset({"questions", "slot", "force_teacher", "model"})
+
+
 def extract_semantic_text(payload: Mapping[str, Any]) -> Tuple[str, Any]:
     """Extract canonical semantic representation and original structured input from any provider payload."""
     present_env: List[Tuple[str, Any]] = [
         (key, payload[key])
-        for key in ("input", "state", "contents", "prompt")
+        for key in _PRIMARY_SEMANTIC_KEYS
         if key in payload and payload[key] is not None
     ]
     if not present_env:
         raise SchemaValidationError("Request must include non-empty 'input', 'state', or 'contents'")
+    extra_env: Dict[str, Any] = {
+        k: v
+        for k, v in payload.items()
+        if k not in _PRIMARY_SEMANTIC_KEYS and k not in _GATEWAY_ENVELOPE_CONTROL_KEYS
+    }
     for _, env_val in present_env:
         _validate_payload_tree(env_val)
+    for ext_val in extra_env.values():
+        _validate_payload_tree(ext_val)
     raw_input = present_env[0][1]
     if len(present_env) == 1 and isinstance(raw_input, str):
-        text = raw_input.strip()
-        if not text:
+        primary_text = raw_input.strip()
+        if not primary_text:
             raise SchemaValidationError("Extracted input/state text cannot be empty")
-        return text, raw_input
+        if not extra_env:
+            return primary_text, raw_input
+    else:
+        primary_target = raw_input if len(present_env) == 1 else {k: v for k, v in present_env}
+        canon_primary, has_nonempty = _canonicalize_for_semantic_json(primary_target)
+        if not has_nonempty:
+            raise SchemaValidationError("Extracted input/state text cannot be empty")
+        if not extra_env:
+            text = json.dumps(canon_primary, ensure_ascii=False, sort_keys=True, separators=(", ", ": "))
+            if not text:
+                raise SchemaValidationError("Extracted input/state text cannot be empty")
+            return text, raw_input
 
-    target = raw_input if len(present_env) == 1 else {k: v for k, v in present_env}
-    canon_obj, has_nonempty = _canonicalize_for_semantic_json(target)
-    if not has_nonempty:
-        raise SchemaValidationError("Extracted input/state text cannot be empty")
-    text = json.dumps(canon_obj, ensure_ascii=False, sort_keys=True, separators=(", ", ": "))
+    combined_env: Dict[str, Any] = {**{k: v for k, v in present_env}, **extra_env}
+    canon_combined, _ = _canonicalize_for_semantic_json(combined_env)
+    text = json.dumps(canon_combined, ensure_ascii=False, sort_keys=True, separators=(", ", ": "))
     if not text:
         raise SchemaValidationError("Extracted input/state text cannot be empty")
     return text, raw_input
@@ -1134,6 +1156,7 @@ class SoftDistillingLifecycle:
         )
         self._soft_records_by_prompt: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._structure_counts: Dict[str, int] = {}
+        self._structure_field_counts: Dict[Tuple[str, str, Any], int] = {}
         self._distilled_compile_count: int = 0
         self._soft_distill_applied_count: int = 0
         self._frozen_eligible_counter: int = 0
@@ -1310,6 +1333,36 @@ class SoftDistillingLifecycle:
                 self._soft_distill_applied_count += 1
             return updated_any
 
+    def _canonical_discrete_field_val(self, f_def: Any, val: Any) -> Tuple[bool, Any]:
+        if isinstance(f_def, BooleanField):
+            return True, bool(val)
+        if isinstance(f_def, ChoiceField):
+            return True, str(val)
+        if isinstance(f_def, MultiChoiceField):
+            if isinstance(val, (list, tuple)):
+                return True, tuple(str(x) for x in val)
+            return True, (str(val),)
+        return False, None
+
+    def _has_structure_support_locked(
+        self,
+        structure_sig: Optional[str],
+        vals: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
+        if structure_sig is None:
+            return True
+        req_min = max(2, int(self.lifecycle.config.k_min))
+        if self._structure_counts.get(structure_sig, 0) < req_min:
+            return False
+        if vals is not None:
+            for fname, f_def in self.lifecycle.schema.fields.items():
+                if fname not in vals:
+                    return False
+                is_disc, canon_v = self._canonical_discrete_field_val(f_def, vals[fname])
+                if is_disc and self._structure_field_counts.get((structure_sig, fname, canon_v), 0) < req_min:
+                    return False
+        return True
+
     def observe_teacher(
         self,
         prompt: str,
@@ -1324,6 +1377,12 @@ class SoftDistillingLifecycle:
                 self._soft_records_by_prompt[prompt] = soft_targets
             if structure_sig is not None:
                 self._structure_counts[structure_sig] = self._structure_counts.get(structure_sig, 0) + 1
+                for fname, f_def in self.lifecycle.schema.fields.items():
+                    if fname in lifecycle_values:
+                        is_disc, canon_v = self._canonical_discrete_field_val(f_def, lifecycle_values[fname])
+                        if is_disc:
+                            fk = (structure_sig, fname, canon_v)
+                            self._structure_field_counts[fk] = self._structure_field_counts.get(fk, 0) + 1
             return self.lifecycle.observe_teacher(prompt, lifecycle_values, cache_key=cache_key)
 
     def _evaluate_frozen_local_locked(
@@ -1346,9 +1405,9 @@ class SoftDistillingLifecycle:
                 return None, None, False
             cached_vals = dict(lc.clean_cache[key])
             return cached_vals, None, True
-        if structure_sig is not None and self._structure_counts.get(structure_sig, 0) < max(
-            2, int(lc.config.k_min)
-        ):
+        if key in lc._conflicted_cache_keys:
+            return None, None, False
+        if not self._has_structure_support_locked(structure_sig):
             return None, None, False
 
         res = engine.decide(prompt, strict=False, record_receipt=False, use_cache=False)
@@ -1366,6 +1425,8 @@ class SoftDistillingLifecycle:
             if cent is None or float(np.dot(lc.subword.encode(prompt), cent)) >= max(
                 lc.config.cls_min_abs, floor * 0.90
             ):
+                if not self._has_structure_support_locked(structure_sig, vals):
+                    return None, None, False
                 self._frozen_eligible_counter += 1
                 if ((lc.local_accept_eligible + self._frozen_eligible_counter) % canary_period) == 0:
                     return None, None, False
@@ -1616,12 +1677,19 @@ class SoftDistillingLifecycle:
 
             if (
                 eff_key not in self.lifecycle.clean_cache
-                and structure_sig is not None
-                and self._structure_counts.get(structure_sig, 0) < max(2, int(self.lifecycle.config.k_min))
+                and not self._has_structure_support_locked(structure_sig)
             ):
                 return None
 
-            local_vals = self.lifecycle.decide_local(prompt, cache_key=eff_key)
+            local_vals = self.lifecycle.decide_local(
+                prompt,
+                cache_key=eff_key,
+                accept_predicate=(
+                    (lambda cand_vals: self._has_structure_support_locked(structure_sig, cand_vals))
+                    if structure_sig is not None
+                    else None
+                ),
+            )
             if local_vals is None:
                 return None
             from_cache = eff_key in self.lifecycle.clean_cache
@@ -1944,7 +2012,21 @@ class UniversalDecisionService:
             if k not in ("questions", "slot", "force_teacher", "model")
         }
         req_cache_key = _canonical_structured_key(context_view)
-        req_struct_sig = _input_structure_signature(context_view)
+        primary_view = {
+            k: v
+            for k, v in context_view.items()
+            if k in _PRIMARY_SEMANTIC_KEYS and v is not None
+        }
+        extra_view = {
+            k: v
+            for k, v in context_view.items()
+            if k not in _PRIMARY_SEMANTIC_KEYS
+        }
+        req_struct_sig = (
+            _input_structure_signature(primary_view)
+            if not extra_view
+            else f"{_input_structure_signature(primary_view)}|extra:{_canonical_structured_key(extra_view)}"
+        )
         contract = compile_questions_contract(payload.get("questions"))
         slot_key = str(slot_hint or payload.get("slot") or wire_format)
         is_frozen = self.freeze_learning if freeze_learning is None else bool(freeze_learning)

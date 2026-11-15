@@ -266,17 +266,18 @@ def _extract_calibrated_head_params(
 
     if not (bool(np.all(np.isfinite(w))) and bool(np.all(np.isfinite(b)))):
         raise ValueError(f"Head weights or biases for {fname!r} contain non-finite values")
+    if is_boolean and w.shape[0] > 1:
+        w = w[:1]
+        b = b[:1].copy()
 
     is_zero_head = bool(not np.any(w) and not np.any(b))
     raw_w_src = np.asarray(head.weights)
     raw_w_dt = raw_w_src.dtype if raw_w_src.dtype in (np.float32, np.float64) else np.float32
-    raw_w_slice = raw_w_src[:1] if (is_boolean and raw_w_src.shape[0] == 1) else raw_w_src
-    raw_w = _owned_readonly_array(raw_w_slice, dtype=raw_w_dt)
+    raw_w = _owned_readonly_array(raw_w_src, dtype=raw_w_dt)
 
     raw_b_src = np.asarray(head.biases).reshape(-1)
     raw_b_dt = raw_b_src.dtype if raw_b_src.dtype in (np.float32, np.float64) else np.float32
-    raw_b_slice = raw_b_src[:1] if (is_boolean and raw_w_src.shape[0] == 1) else raw_b_src
-    raw_b = _owned_readonly_array(raw_b_slice, dtype=raw_b_dt)
+    raw_b = _owned_readonly_array(raw_b_src, dtype=raw_b_dt)
 
     delta_adj = 0.0
     cal_adj_2: Optional[np.ndarray] = None
@@ -569,10 +570,10 @@ class FastExplainer:
                 rw_src = np.asarray(_bool_raw_meta["raw_w"])
                 rb_src = np.asarray(_bool_raw_meta["raw_b"]).reshape(-1)
                 self._bool_raw_w = _owned_readonly_array(
-                    rw_src[:1], dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
+                    rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
                 )
                 self._bool_raw_b = _owned_readonly_array(
-                    rb_src[:1], dtype=rb_src.dtype if rb_src.dtype in (np.float32, np.float64) else np.float32
+                    rb_src, dtype=rb_src.dtype if rb_src.dtype in (np.float32, np.float64) else np.float32
                 )
                 self._bool_raw_base_scale = float(_bool_raw_meta["base_scale"])
                 self._bool_cal_temp = float(_bool_raw_meta["cal_temp"])
@@ -593,9 +594,9 @@ class FastExplainer:
                 self._bool_has_scalar_raw = True
                 rw_dt = w_in.dtype if w_in.dtype in (np.float32, np.float64) else np.float32
                 rb_dt = b_in.dtype if b_in.dtype in (np.float32, np.float64) else np.float32
-                self._bool_raw_w = _owned_readonly_array(w_in[:1], dtype=rw_dt)
+                self._bool_raw_w = _owned_readonly_array(w_in, dtype=rw_dt)
                 self._bool_raw_b = _owned_readonly_array(
-                    b_in[:1] if b_in.size >= 1 else np.zeros(1, dtype=rb_dt),
+                    b_in if b_in.size >= 1 else np.zeros(1, dtype=rb_dt),
                     dtype=rb_dt,
                 )
                 self._bool_raw_base_scale = float(self.scale)

@@ -3461,7 +3461,20 @@ class SystemOneEngine:
 
         def _checked_f32_copy(arr: Any, label: str) -> np.ndarray:
             with np.errstate(over="ignore", invalid="ignore"):
-                out = np.array(arr, dtype=np.float32, copy=True, order="K")
+                arr_in = np.asarray(arr)
+                if (
+                    arr_in.ndim == 2
+                    and arr_in.size > 0
+                    and (
+                        (not arr_in.flags["C_CONTIGUOUS"] and not arr_in.flags["F_CONTIGUOUS"])
+                        or int(arr_in.ctypes.data % 16) != 0
+                    )
+                ):
+                    from system1.core.model import _owned_readonly_array
+
+                    out = _owned_readonly_array(arr_in, dtype=np.float32)
+                else:
+                    out = np.array(arr, dtype=np.float32, copy=True, order="K")
             if not bool(np.all(np.isfinite(out))):
                 raise ValueError(f"{label} must be finite in float32 for compiled export")
             return out
@@ -4021,18 +4034,17 @@ class SystemOneEngine:
 
                 raw_w_arr = np.asarray(head.weights)
                 raw_b_arr = np.asarray(head.biases).reshape(-1)
-                if is_bool:
-                    raw_w_arr = raw_w_arr[:1]
-                    raw_b_arr = raw_b_arr[:1]
-                if not (np.all(np.isfinite(raw_w_arr)) and np.all(np.isfinite(raw_b_arr))):
+                raw_w_val = raw_w_arr[:1] if is_bool else raw_w_arr
+                raw_b_val = raw_b_arr[:1] if is_bool else raw_b_arr
+                if not (np.all(np.isfinite(raw_w_val)) and np.all(np.isfinite(raw_b_val))):
                     raise ValueError(f"Field head {fname!r} contains non-finite weights or biases")
                 with np.errstate(over="ignore", invalid="ignore"):
                     if raw_w_arr.dtype not in (np.float32, np.float64):
                         raw_w_arr = raw_w_arr.astype(np.float32)
                     if raw_b_arr.dtype not in (np.float32, np.float64):
                         raw_b_arr = raw_b_arr.astype(np.float32)
-                    w_mat = np.asarray(raw_w_arr, dtype=np.float32)
-                    b_vec = np.asarray(raw_b_arr, dtype=np.float32)
+                    w_mat = np.asarray(raw_w_arr[:1] if is_bool else raw_w_arr, dtype=np.float32)
+                    b_vec = np.asarray(raw_b_arr[:1] if is_bool else raw_b_arr, dtype=np.float32)
 
                 cluster_assign_raw = getattr(head, "cluster_assignments", ()) or ()
                 is_hier = bool(
@@ -4338,7 +4350,11 @@ class SystemOneEngine:
                                 if spec["is_bool"]
                                 else (float(np.max(np.sum(np.abs(raw_w_s), axis=1))) if raw_w_s.size else 0.0)
                             )
-                            b_abs = float(np.max(np.abs(raw_b_s))) if raw_b_s.size else 0.0
+                            b_abs = (
+                                abs(float(raw_b_s.ravel()[0]))
+                                if (spec["is_bool"] and raw_b_s.size)
+                                else (float(np.max(np.abs(raw_b_s))) if raw_b_s.size else 0.0)
+                            )
                             l1_mag = x_inf_chunk * w_l1 + b_abs
                             pot_ovf_rows = (~np.isfinite(l1_mag)) | (l1_mag >= 1e37)
                             dz_bound = (
@@ -4429,22 +4445,23 @@ class SystemOneEngine:
                                     probs = np.array(probs, dtype=np.float64, copy=True)
                                     raw_w_b = spec["raw_w"]
                                     raw_b_b = spec["raw_b"]
-                                    for r_i in np.flatnonzero(near_rows).tolist():
-                                        x_ex = X[r_i : r_i + 1]
-                                        lin_ex = x_ex @ raw_w_b.T
-                                        raw_sum_ex = lin_ex + raw_b_b
-                                        z_ex = float(raw_sum_ex[0, 0]) / 0.25
-                                        raw_logits_nonfin[r_i] = not (
-                                            bool(np.all(np.isfinite(lin_ex)))
-                                            and bool(np.all(np.isfinite(raw_sum_ex)))
-                                            and math.isfinite(z_ex)
-                                        )
-                                        if raw_logits_nonfin[r_i]:
-                                            probs[r_i] = np.nan
-                                        else:
-                                            probs[r_i] = calibrator.calibrate_logits(
-                                                np.array([-0.5 * z_ex, 0.5 * z_ex], dtype=np.float64)
-                                            ).reshape(-1)
+                                    with np.errstate(over="ignore", invalid="ignore"):
+                                        for r_i in np.flatnonzero(near_rows).tolist():
+                                            x_ex = X[r_i : r_i + 1]
+                                            lin_ex = x_ex @ raw_w_b.T
+                                            raw_sum_ex = lin_ex[:, :1] + raw_b_b[:1]
+                                            z_ex = float(raw_sum_ex[0, 0]) / 0.25
+                                            raw_logits_nonfin[r_i] = not (
+                                                math.isfinite(float(lin_ex.ravel()[0]))
+                                                and math.isfinite(float(raw_sum_ex.ravel()[0]))
+                                                and math.isfinite(z_ex)
+                                            )
+                                            if raw_logits_nonfin[r_i]:
+                                                probs[r_i] = np.nan
+                                            else:
+                                                probs[r_i] = calibrator.calibrate_logits(
+                                                    np.array([-0.5 * z_ex, 0.5 * z_ex], dtype=np.float64)
+                                                ).reshape(-1)
                             p_true = probs[:, 1]
                             b_vals = p_true >= spec["bool_threshold"]
                             confs = np.where(b_vals, p_true, 1.0 - p_true)

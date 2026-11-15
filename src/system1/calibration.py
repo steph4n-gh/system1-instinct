@@ -776,10 +776,16 @@ class ConformalPredictor:
                 for c_idx, opt in enumerate(self.options):
                     mask = [i for i, lbl in enumerate(labels) if str(lbl) == str(opt)]
                     if mask:
-                        c_mean = np.mean(arr[mask], axis=0)
-                        u_vec, _, ok = _normalize_vec_f32_safe(c_mean)
-                        if ok:
-                            protos[c_idx] = u_vec
+                        sub = arr[mask]
+                        fin = np.all(np.isfinite(sub), axis=1)
+                        if np.any(fin):
+                            sub_fin = sub[fin]
+                            max_abs = float(np.max(np.abs(sub_fin)))
+                            if math.isfinite(max_abs) and max_abs > 0.0:
+                                c_mean = np.mean(sub_fin / max_abs, axis=0, dtype=np.float64)
+                                u_vec, _, ok = _normalize_vec_f32_safe(c_mean)
+                                if ok:
+                                    protos[c_idx] = u_vec
                 self.prototypes = protos
             if self.prototypes is not None and self.prototypes.size > 0 and len(arr) > 0:
                 sims = [self.compute_prototype_similarity(row) for row in arr]
@@ -797,7 +803,7 @@ class ConformalPredictor:
         m = len(self.prototype_scores)
         rank = int(math.floor((m + 1) * eff_alpha))
         if rank >= 1:
-            self.prototype_threshold = float(self.prototype_scores[rank - 1])
+            self.prototype_threshold = float(max(0.0, float(self.prototype_scores[rank - 1])))
         else:
             # For small calibration cohorts where (m + 1) * alpha < 1, use a conservative
             # margin below the minimum observed in-distribution prototype similarity.
@@ -3342,6 +3348,36 @@ def _validate_ordinal_class_indices(y: Any, *, name: str) -> np.ndarray:
     raise ValueError(f"{name} must have integer or exact-integral dtype, got {raw.dtype}")
 
 
+def _validate_nonneg_finite_scalar(value: Any, *, name: str) -> float:
+    """Validate a finite non-negative real scalar parameter (rejecting booleans)."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a finite non-negative number, got bool")
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{name} must be a finite non-negative number, got {type(value).__name__}")
+    val = float(value)
+    if not math.isfinite(val) or val < 0.0:
+        raise ValueError(f"{name} must be finite and >= 0, got {value!r}")
+    return val
+
+
+def _validate_int_scalar(value: Any, *, name: str, min_val: int) -> int:
+    """Validate a finite integer scalar parameter (rejecting booleans and non-integral floats)."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be an integer, got bool")
+    if isinstance(value, (int, np.integer)):
+        ival = int(value)
+    elif isinstance(value, (float, np.floating)):
+        fv = float(value)
+        if not math.isfinite(fv) or fv != math.floor(fv):
+            raise ValueError(f"{name} must be a finite integer, got {value!r}")
+        ival = int(fv)
+    else:
+        raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
+    if ival < min_val:
+        raise ValueError(f"{name} must be >= {min_val}, got {ival}")
+    return ival
+
+
 class CumulativeLogitOrdinalHead:
     """Proportional-odds cumulative logit model trained with pure-NumPy L-BFGS."""
 
@@ -3352,9 +3388,9 @@ class CumulativeLogitOrdinalHead:
         l2: float = 1e-2,
         max_iter: int = 300,
     ) -> None:
-        self.n_classes = int(n_classes) if n_classes is not None else None
-        self.l2 = max(0.0, float(l2))
-        self.max_iter = max(10, int(max_iter))
+        self.n_classes = _validate_int_scalar(n_classes, name="n_classes", min_val=2) if n_classes is not None else None
+        self.l2 = _validate_nonneg_finite_scalar(l2, name="l2")
+        self.max_iter = max(10, _validate_int_scalar(max_iter, name="max_iter", min_val=1))
         self.weights_: Optional[np.ndarray] = None
         self.thresholds_: Optional[np.ndarray] = None
 
@@ -3534,24 +3570,41 @@ class SoftOrdinalHead:
         l2: float = 1e-2,
         max_iter: int = 300,
     ) -> None:
-        self.n_classes = int(n_classes) if n_classes is not None else None
-        self.sigma = max(0.0, float(sigma))
-        self.l2 = max(0.0, float(l2))
-        self.max_iter = max(10, int(max_iter))
+        self.n_classes = _validate_int_scalar(n_classes, name="n_classes", min_val=2) if n_classes is not None else None
+        self.sigma = _validate_nonneg_finite_scalar(sigma, name="sigma")
+        self.l2 = _validate_nonneg_finite_scalar(l2, name="l2")
+        self.max_iter = max(10, _validate_int_scalar(max_iter, name="max_iter", min_val=1))
         self.weights_: Optional[np.ndarray] = None
         self.bias_: Optional[np.ndarray] = None
 
     @staticmethod
     def build_soft_targets(y: np.ndarray, n_classes: int, sigma: float) -> np.ndarray:
-        n = y.shape[0]
-        if sigma <= 0.0:
-            q = np.zeros((n, n_classes), dtype=np.float64)
-            q[np.arange(n), y] = 1.0
+        k = _validate_int_scalar(n_classes, name="n_classes", min_val=2)
+        sig_f = _validate_nonneg_finite_scalar(sigma, name="sigma")
+        y_idx = _validate_ordinal_class_indices(y, name="y")
+        n = y_idx.shape[0]
+        if n == 0:
+            raise ValueError("y must be non-empty")
+        if int(np.min(y_idx)) < 0 or int(np.max(y_idx)) >= k:
+            raise ValueError(f"Labels must lie in [0, {k - 1}]")
+        if sig_f <= 0.0:
+            q = np.zeros((n, k), dtype=np.float64)
+            q[np.arange(n), y_idx] = 1.0
             return q
-        ks = np.arange(n_classes, dtype=np.float64)[None, :]
-        dist2 = (ks - y[:, None].astype(np.float64)) ** 2
-        logits = -0.5 * dist2 / (sigma ** 2)
-        return _softmax_np(logits, axis=1)
+        ks = np.arange(k, dtype=np.float64)[None, :]
+        diff = ks - y_idx[:, None].astype(np.float64)
+        with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
+            scaled = diff / sig_f
+            logits = -0.5 * (scaled * scaled)
+            logits[np.arange(n), y_idx] = 0.0
+            exps = np.exp(logits)
+            denom = np.sum(exps, axis=1, keepdims=True)
+            out = exps / denom
+        if not bool(np.all(np.isfinite(out))):
+            q = np.zeros((n, k), dtype=np.float64)
+            q[np.arange(n), y_idx] = 1.0
+            return q
+        return out
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "SoftOrdinalHead":
         X_arr = _coerce_real_numeric_array(X, name="X")
