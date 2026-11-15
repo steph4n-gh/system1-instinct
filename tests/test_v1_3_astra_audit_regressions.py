@@ -5727,3 +5727,538 @@ def test_astra_23_round10_regressions() -> None:
         assert exc_ord.value.status_code == 502
 
 
+def test_astra_24_round11_regressions() -> None:
+    """R11-1..R11-9 + R10 carry-overs: hierarchical parity, HybridProjector strictness,
+    full-tree payload validation, fleet/shield calibration+threshold parity, smarts boolean threshold,
+    GuardShield fail-closed overflow, multichoice 422 mapping, 0D extreme temperature, float64 batch warnings.
+    """
+    from fastapi import FastAPI
+    from starlette.requests import Request as StarletteRequest
+    from system1 import ActionProposal, GuardShield, InteropError, MultiChoiceField
+    from system1.calibration import DecisionCalibrator
+    from system1.compat.universal import (
+        SchemaValidationError,
+        coerce_probability_dict,
+        extract_semantic_text,
+    )
+
+    class _E0Proj:
+        def __init__(self, dimension: int = 16, *, out_dtype: Any = np.float32) -> None:
+            self.dimension = int(dimension)
+            self._out_dtype = out_dtype
+
+        def project(self, text: str, recency_weighted: bool = False) -> np.ndarray:
+            v = np.zeros(self.dimension, dtype=self._out_dtype)
+            v[0] = 1.0
+            return v
+
+        def project_batch(self, texts: Sequence[str], recency_weighted: bool = False) -> np.ndarray:
+            out = np.zeros((len(texts), self.dimension), dtype=self._out_dtype)
+            out[:, 0] = 1.0
+            return out
+
+        def projector_digest(self) -> str:
+            return f"r11-e0-{self.dimension}-{np.dtype(self._out_dtype).name}"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+
+        proj16 = _E0Proj(16)
+
+        # ------------------------------------------------------------------
+        # R11-1: Hierarchical head scalar/batch parity, float64 softmax widening,
+        # intermediate overflow poisoning, cluster validation, and Boolean guard.
+        # ------------------------------------------------------------------
+        class _R11HierChoice(DecisionSchema):
+            c = ChoiceField(options=("a", "b"))
+
+        mdl_h = SystemOneCompiler(_R11HierChoice, dimension=16, projector=proj16).compile(
+            {"c": [("alpha", "a"), ("beta", "b")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        h_live = mdl_h._field_heads["c"]
+        h_live.set_weights(np.zeros((2, 16), dtype=np.float32), np.zeros(2, dtype=np.float32))
+        h_live.hierarchical = True
+        h_live.coarse_weights = np.zeros((2, 16), dtype=np.float32)
+        h_live.coarse_biases = np.array([np.float32(1e38), np.float32(0.0)], dtype=np.float32)
+        h_live.fine_weights = np.zeros((2, 16), dtype=np.float32)
+        h_live.fine_biases = np.array([np.float32(1.0), np.float32(1.0)], dtype=np.float32)
+        h_live.cluster_assignments = (0, 1)
+
+        eng_h = SystemOneEngine(_R11HierChoice, compiled_model=mdl_h, strict_mode=False, use_cache=False)
+        dec_hs = eng_h.decide("probe", record_receipt=False)
+        dec_hb = eng_h.decide_batch(["probe"], record_receipt=False)[0]
+        assert dec_hs.values["c"] == "a"
+        assert dec_hb.values["c"] == "a"
+        assert dec_hs.is_ambiguous is False and dec_hb.is_ambiguous is False
+        assert dec_hs.probabilities["c"]["a"] == pytest.approx(1.0)
+        assert dec_hs.probabilities["c"]["b"] == pytest.approx(0.0)
+        assert dec_hb.probabilities["c"]["a"] == pytest.approx(1.0)
+        assert dec_hb.probabilities["c"]["b"] == pytest.approx(0.0)
+
+        # Overflowed spec_logits on low-weight cluster must poison the row across compute_logits, decide, and batch
+        h_live.coarse_biases = np.array([100.0, -100.0], dtype=np.float32)
+        h_live.fine_weights = np.zeros((2, 16), dtype=np.float32)
+        h_live.fine_weights[1, 0] = np.float32(3e38)
+        h_live.fine_biases = np.array([np.float32(0.0), np.float32(3e38)], dtype=np.float32)
+        assert bool(np.all(np.isnan(h_live.compute_logits(proj16.project("probe")))))
+        eng_h2 = SystemOneEngine(_R11HierChoice, compiled_model=mdl_h, strict_mode=False, use_cache=False)
+        ovf_hs = eng_h2.decide("probe", record_receipt=False)
+        ovf_hb = eng_h2.decide_batch(["probe"], record_receipt=False)[0]
+        for ovf_res in (ovf_hs, ovf_hb):
+            assert ovf_res.is_ambiguous is True
+            assert ovf_res.abstention_reasons["c"] == "non_finite_input"
+            assert ovf_res.conformal_sets["c"] == []
+
+        # Out-of-bounds cluster_assignments rejected in both scalar compute_logits and batch setup
+        h_live.fine_weights = np.zeros((2, 16), dtype=np.float32)
+        h_live.fine_biases = np.zeros(2, dtype=np.float32)
+        h_live.cluster_assignments = (0, 5)
+        with pytest.raises(ValueError):
+            h_live.compute_logits(proj16.project("probe"))
+        with pytest.raises(ValueError):
+            eng_h.decide_batch(["probe"], record_receipt=False)
+
+        # BooleanField ignores hierarchical attributes identically in scalar and batch
+        class _R11HierBool(DecisionSchema):
+            f = BooleanField()
+
+        mdl_hb = SystemOneCompiler(_R11HierBool, dimension=16, projector=proj16).compile(
+            {"f": [("yes", True), ("no", False)] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        mdl_hb._field_heads["f"].set_weights(np.zeros((1, 16), dtype=np.float32), np.array([1.0], dtype=np.float32))
+        mdl_hb._field_heads["f"].hierarchical = True
+        mdl_hb._field_heads["f"].coarse_weights = np.full((1, 16), -50.0, dtype=np.float32)
+        mdl_hb._field_heads["f"].coarse_biases = np.array([-50.0], dtype=np.float32)
+        mdl_hb._field_heads["f"].cluster_assignments = (0,)
+        eng_hb = SystemOneEngine(_R11HierBool, compiled_model=mdl_hb, strict_mode=False, use_cache=False)
+        assert eng_hb.decide("probe", record_receipt=False).values["f"] is True
+        assert eng_hb.decide_batch(["probe"], record_receipt=False)[0].values["f"] is True
+
+        # ------------------------------------------------------------------
+        # R11-2: HybridProjector.__init__ and from_config strict scalar/type/range validation.
+        # ------------------------------------------------------------------
+        bad_hyb_cfg = {
+            "type": "hybrid",
+            "sparse_dim": 16,
+            "dense_dim": 16,
+            "fitted": True,
+            "direct_spectral": True,
+            "direct_spectral_dim": 1,
+            "spectral_terms": ["hello"],
+            "spectral_weights": [1.0],
+            "spectral_vectors": [[1.0]],
+            "spectral_blend": float("nan"),
+        }
+        with pytest.raises(ValueError):
+            HybridProjector.from_config(bad_hyb_cfg)
+
+        for bad_kw in (
+            {"sparse_dim": 0},
+            {"sparse_dim": True},
+            {"dense_dim": True},
+            {"alpha": float("inf")},
+            {"svd_power": True},
+            {"spectral_blend": float("nan")},
+            {"seed": True},
+        ):
+            with pytest.raises(ValueError):
+                HybridProjector(**bad_kw)
+
+        for key, bad_val in (
+            ("fitted", "yes"),
+            ("direct_spectral_dim", True),
+            ("subspace_weight", 1.5),
+            ("context_smooth", -0.1),
+            ("rbf_gamma", 0.0),
+            ("rbf_weight", 1.0),
+        ):
+            cfg = {"type": "hybrid", "sparse_dim": 16, "dense_dim": 16, key: bad_val}
+            with pytest.raises(ValueError):
+                HybridProjector.from_config(cfg)
+
+        # ------------------------------------------------------------------
+        # R11-3: Structured Python requests validate full container tree prior to side effects.
+        # ------------------------------------------------------------------
+        teacher_calls = 0
+
+        def _counting_teacher(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+            nonlocal teacher_calls
+            teacher_calls += 1
+            return _mock_universal_handler(semantic_text, raw_payload, contract)
+
+        svc_r11_3 = UniversalDecisionService(
+            upstream_handlers={"gemini": _counting_teacher},
+            bearer_token="tok-r11-3",
+        )
+        deep_100: Any = 1
+        for _ in range(100):
+            deep_100 = [deep_100]
+
+        for bad_payload in (
+            {
+                "input": [{"text": "valid", "price": float("inf")}],
+                "force_teacher": True,
+                "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+            },
+            {
+                "input": [{"text": "valid", "nested": deep_100}],
+                "force_teacher": True,
+                "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+            },
+            {
+                "input": "valid",
+                "meta": {"x": float("nan")},
+                "force_teacher": True,
+                "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+            },
+            {
+                "input": "valid",
+                "tags": {float("-inf")},
+                "force_teacher": True,
+                "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+            },
+        ):
+            with pytest.raises(InteropError) as exc_tree:
+                svc_r11_3.process_payload(path="/v1beta/decisions", payload=bad_payload)
+            assert exc_tree.value.status_code == 400
+        assert teacher_calls == 0
+        assert len(svc_r11_3._lifecycles) == 0
+
+        with pytest.raises(InteropError) as exc_ex_nan:
+            extract_semantic_text({"input": [{"text": "valid", "price": float("nan")}]})
+        assert exc_ex_nan.value.status_code == 400
+        with pytest.raises(InteropError) as exc_ex_deep:
+            extract_semantic_text({"input": [{"text": "valid", "nested": deep_100}]})
+        assert exc_ex_deep.value.status_code == 400
+
+        # ------------------------------------------------------------------
+        # R11-4: Fleet & GuardShield calibration, logit_adjustments, Boolean threshold parity,
+        # and hierarchical rejection in MultiTenantSkillFleet.
+        # ------------------------------------------------------------------
+        class _R11CalBoolSchema(DecisionSchema):
+            f = BooleanField(threshold=0.7)
+
+        mdl_cb = SystemOneCompiler(_R11CalBoolSchema, dimension=16, projector=proj16).compile(
+            {"f": [("yes", True), ("no", False)] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        mdl_cb._field_heads["f"].set_weights(np.zeros((1, 16), dtype=np.float32), np.array([0.3], dtype=np.float32))
+        mdl_cb.heads["f"].weights = np.zeros((1, 16), dtype=np.float32)
+        mdl_cb.heads["f"].biases = np.array([0.3], dtype=np.float32)
+        mdl_cb.heads["f"].temperature = 2.0
+        eng_cb = SystemOneEngine(_R11CalBoolSchema, compiled_model=mdl_cb, strict_mode=False, use_cache=False)
+        eng_cb.calibrators["f"].temperature = 2.0
+        dec_cb = eng_cb.decide("probe", record_receipt=False)
+        assert dec_cb.values["f"] is False
+        assert dec_cb.probabilities["f"]["True"] == pytest.approx(0.6456563, abs=1e-5)
+
+        fleet_cb = MultiTenantSkillFleet.from_compiled_model(eng_cb, num_tenants=1)
+        fdec_cb = fleet_cb.decide(0, "probe")
+        assert fdec_cb.predicted_label == "False"
+        assert fdec_cb.conformal_set == ("False",)
+
+        shield_cb = GuardShield(eng_cb, field_name="f", unsafe_label="False")
+        sdec_cb = shield_cb.evaluate_single("probe")
+        assert sdec_cb.is_unsafe is True
+        assert sdec_cb.predicted_label == "False"
+
+        # ChoiceField calibration (temperature + logit_adjustments) parity across Engine, Fleet, GuardShield
+        class _R11CalChoiceSchema(DecisionSchema):
+            c = ChoiceField(options=("safe", "unsafe"))
+
+        mdl_cc = SystemOneCompiler(_R11CalChoiceSchema, dimension=16, projector=proj16).compile(
+            {"c": [("good", "safe"), ("bad", "unsafe")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        mdl_cc._field_heads["c"].set_weights(np.zeros((2, 16), dtype=np.float32), np.array([0.5, 0.0], dtype=np.float32))
+        mdl_cc.heads["c"].weights = np.zeros((2, 16), dtype=np.float32)
+        mdl_cc.heads["c"].biases = np.array([0.5, 0.0], dtype=np.float32)
+        adj_cc = np.array([0.0, 3.0], dtype=np.float64)
+        mdl_cc.heads["c"].temperature = 2.0
+        mdl_cc.heads["c"].logit_adjustments = (0.0, 3.0)
+        eng_cc = SystemOneEngine(_R11CalChoiceSchema, compiled_model=mdl_cc, strict_mode=False, use_cache=False)
+        eng_cc.calibrators["c"].temperature = 2.0
+        eng_cc.calibrators["c"].logit_adjustments = adj_cc.copy()
+        assert eng_cc.decide("probe", record_receipt=False).values["c"] == "unsafe"
+        assert MultiTenantSkillFleet.from_compiled_model(eng_cc, num_tenants=1).decide(0, "probe").predicted_label == "unsafe"
+        sdec_cc = GuardShield(eng_cc, field_name="c", unsafe_label="unsafe").evaluate_single("probe")
+        assert sdec_cc.is_unsafe is True and sdec_cc.predicted_label == "unsafe"
+
+        # Exact Boolean threshold=0.5 tie (zero logits -> True) in Engine and Fleet
+        class _R11TieBoolSchema(DecisionSchema):
+            f = BooleanField(threshold=0.5)
+
+        mdl_tie = SystemOneCompiler(_R11TieBoolSchema, dimension=16, projector=proj16).compile(
+            {"f": [("yes", True), ("no", False)] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        mdl_tie._field_heads["f"].set_weights(np.zeros((1, 16), dtype=np.float32), np.zeros(1, dtype=np.float32))
+        eng_tie = SystemOneEngine(_R11TieBoolSchema, compiled_model=mdl_tie, strict_mode=False, use_cache=False)
+        assert eng_tie.decide("probe", record_receipt=False).values["f"] is True
+        assert MultiTenantSkillFleet.from_compiled_model(eng_tie, num_tenants=1).decide(0, "probe").predicted_label == "True"
+
+        with pytest.raises(ValueError, match="hierarchical"):
+            MultiTenantSkillFleet.from_compiled_model(mdl_h, field_name="c", num_tenants=1)
+
+        # ------------------------------------------------------------------
+        # R11-5: SmartsCrossZeroFewRouter honors BooleanField.threshold.
+        # ------------------------------------------------------------------
+        class _R11SmartsMaxThr(DecisionSchema):
+            allow = BooleanField(
+                threshold=1.0,
+                true_description="allow yes approved safe permitted",
+                false_description="deny no rejected unsafe forbidden",
+            )
+
+        class _R11SmartsMinThr(DecisionSchema):
+            allow = BooleanField(
+                threshold=0.0,
+                true_description="allow yes approved safe permitted",
+                false_description="deny no rejected unsafe forbidden",
+            )
+
+        r_max = SmartsCrossZeroFewRouter(_R11SmartsMaxThr, disable_concept_gate=True)
+        assert r_max.predict("allow yes approved safe permitted") is False
+        assert r_max.predict_batch(["allow yes approved safe permitted"]) == [False]
+        dec_rmax = r_max.decide("allow yes approved safe permitted")
+        assert dec_rmax.values["allow"] is False
+        assert dec_rmax.conformal_sets["allow"] == (False,)
+        r_max.fit_few_shot(["allow yes approved safe", "deny no rejected unsafe"], [True, False])
+        assert r_max.predict("allow yes approved safe permitted") is False
+
+        r_min = SmartsCrossZeroFewRouter(_R11SmartsMinThr, disable_concept_gate=True)
+        assert r_min.predict("deny no rejected unsafe forbidden") is True
+        assert r_min.decide("deny no rejected unsafe forbidden").values["allow"] is True
+        r_min.fit_few_shot(["allow yes approved safe", "deny no rejected unsafe"], [True, False])
+        assert r_min.predict("deny no rejected unsafe forbidden") is True
+
+        # ------------------------------------------------------------------
+        # R11-6: GuardShield & SystemOneGuardHook fail closed on non-finite overflow without warnings.
+        # ------------------------------------------------------------------
+        class _R11ShieldSchema(DecisionSchema):
+            c = ChoiceField(options=("safe", "unsafe"))
+
+        mdl_g = SystemOneCompiler(_R11ShieldSchema, dimension=16, projector=proj16).compile(
+            {"c": [("benign", "safe"), ("attack", "unsafe")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        w_ov_g = np.zeros((2, 16), dtype=np.float32)
+        w_ov_g[:, 0] = np.float32(3e38)
+        b_ov_g = np.array([np.float32(3e38), np.float32(3e38)], dtype=np.float32)
+        mdl_g._field_heads["c"].set_weights(w_ov_g, b_ov_g)
+        mdl_g.heads["c"].weights = w_ov_g.copy()
+        mdl_g.heads["c"].biases = b_ov_g.copy()
+
+        shield_ov = GuardShield(
+            mdl_g,
+            field_name="c",
+            unsafe_label="unsafe",
+            use_windows=True,
+            unsafe_exemplars=["attack payload"],
+            sim_threshold=0.5,
+        )
+        s_ov_dec = shield_ov.evaluate_single("probe")
+        assert s_ov_dec.is_unsafe is True
+        assert s_ov_dec.predicted_label == "unsafe"
+        assert s_ov_dec.max_window_unsafe_prob == 1.0
+
+        s_gated, s_naive = shield_ov.evaluate_with_naive_ablation("probe")
+        assert s_gated.is_unsafe is True and s_naive.is_unsafe is True
+        assert s_gated.predicted_label == "unsafe" and s_naive.predicted_label == "unsafe"
+
+        eng_g = SystemOneEngine(_R11ShieldSchema, compiled_model=mdl_g, strict_mode=False, use_cache=False)
+        hook_ov = SystemOneGuardHook(engine=eng_g, shield=shield_ov)
+        prop_ov = ActionProposal.create(
+            tool="bash",
+            canonical_target="/bin/echo",
+            arguments={"cmd": "echo probe"},
+            purpose="test",
+            tenant_id="t-r11",
+            principal_id="u-r11",
+            scope="tools:exec",
+        )
+        auth_ov = hook_ov.evaluate_proposal(prop_ov, context_prompt="probe")
+        assert auth_ov.outcome == DecisionOutcome.DENY
+        assert auth_ov.policy_decision is not None
+        assert auth_ov.policy_decision.rule_id == "system1_shield_deny"
+        assert "non-finite" in auth_ov.policy_decision.reason
+
+        # Float64 large-weight safe GuardShield head runs cleanly without warnings
+        mdl_g64 = SystemOneCompiler(_R11ShieldSchema, dimension=16, projector=proj16).compile(
+            {"c": [("benign", "safe"), ("attack", "unsafe")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        w64_g = np.zeros((2, 16), dtype=np.float64)
+        w64_g[0, 0] = 1e40
+        b64_g = np.zeros(2, dtype=np.float64)
+        mdl_g64._field_heads["c"].weights = w64_g
+        mdl_g64._field_heads["c"].biases = b64_g
+        mdl_g64.heads["c"].weights = w64_g.copy()
+        mdl_g64.heads["c"].biases = b64_g.copy()
+        s_g64 = GuardShield(mdl_g64, field_name="c", unsafe_label="unsafe").evaluate_single("probe")
+        assert s_g64.is_unsafe is False and s_g64.predicted_label == "safe"
+
+        # ------------------------------------------------------------------
+        # R11-7: Multichoice & option-strip/duplicate schema validation returns 422 via HTTP and ASGI.
+        # ------------------------------------------------------------------
+        svc_r11_7 = UniversalDecisionService(upstream_handlers={"gemini": _mock_universal_handler}, bearer_token="tok-r11")
+        app_r11_7 = FastAPI()
+        add_universal_decisions_gateway(app_r11_7, svc_r11_7)
+        endpoint_r11_7 = next(
+            r.endpoint for r in app_r11_7.routes if getattr(r, "path", None) == "/v1beta/decisions"
+        )
+
+        def _asgi_post(payload_obj: Dict[str, Any]) -> Any:
+            raw = json.dumps(payload_obj).encode("utf-8")
+            sent = False
+
+            async def _recv() -> Dict[str, Any]:
+                nonlocal sent
+                if sent:
+                    return {"type": "http.disconnect"}
+                sent = True
+                return {"type": "http.request", "body": raw, "more_body": False}
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/v1beta/decisions",
+                "raw_path": b"/v1beta/decisions",
+                "query_string": b"",
+                "headers": [
+                    (b"authorization", b"Bearer tok-r11"),
+                    (b"content-type", b"application/json"),
+                ],
+            }
+            return asyncio.run(endpoint_r11_7(StarletteRequest(scope, _recv)))
+
+        for bad_q in (
+            {"type": "multichoice", "options": []},
+            {"type": "multichoice", "options": ["a", "b"], "threshold": 1.1},
+            {"type": "multichoice", "options": ["a", "b"], "threshold": -0.1},
+            {"type": "multichoice", "options": [f"o{i}" for i in range(256)]},
+            {"type": "choice", "options": ["a", " a "]},
+            {"type": "choice", "options": ["   ", "b"]},
+            {"type": "choice", "options": [True, "b"]},
+        ):
+            with pytest.raises(SchemaValidationError) as exc_sc:
+                compile_questions_contract({"q": bad_q})
+            assert exc_sc.value.status_code == 422
+
+            with pytest.raises(SchemaValidationError) as exc_http:
+                svc_r11_7.handle_request(
+                    path="/v1beta/decisions",
+                    headers={"Authorization": "Bearer tok-r11", "Content-Type": "application/json"},
+                    raw_body=json.dumps({"input": "test", "questions": {"q": bad_q}}).encode(),
+                )
+            assert exc_http.value.status_code == 422
+
+            resp_asgi = _asgi_post({"input": "test", "questions": {"q": bad_q}})
+            assert resp_asgi.status_code == 422
+
+        # ------------------------------------------------------------------
+        # R11-8: Extreme large finite temperatures consistent across 0D, 1D, and 2D logits.
+        # ------------------------------------------------------------------
+        expected_r11_8 = np.array([1.0 / (1.0 + math.e), math.e / (1.0 + math.e)], dtype=np.float64)
+        for is_bin_flag in (True, False):
+            cal_big = DecisionCalibrator(1e308)
+            cal_big.is_binary = is_bin_flag
+            p0 = cal_big.calibrate_logits(np.asarray(1e308))
+            p1 = cal_big.calibrate_logits(np.array([1e308]))
+            assert p0.shape == (2,)
+            assert p0 == pytest.approx(expected_r11_8, abs=1e-7)
+            assert p1.reshape(-1) == pytest.approx(expected_r11_8, abs=1e-7)
+
+        # ------------------------------------------------------------------
+        # R11-9: Float64 authoritative heads & float64 projectors emit zero overflow cast warnings in batch.
+        # ------------------------------------------------------------------
+        class _R11F64Choice(DecisionSchema):
+            c = ChoiceField(options=("a", "b"))
+
+        mdl_f64 = SystemOneCompiler(_R11F64Choice, dimension=16, projector=proj16).compile(
+            {"c": [("alpha", "a"), ("beta", "b")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        w_f64 = np.zeros((2, 16), dtype=np.float64)
+        w_f64[0, 0] = 1e40
+        b_f64 = np.zeros(2, dtype=np.float64)
+        mdl_f64._field_heads["c"].weights = w_f64
+        mdl_f64._field_heads["c"].biases = b_f64
+        eng_f64 = SystemOneEngine(_R11F64Choice, compiled_model=mdl_f64, strict_mode=False, use_cache=False)
+        res_f64_s = eng_f64.decide("probe", record_receipt=False)
+        res_f64_b = eng_f64.decide_batch(["probe", "probe2"], record_receipt=False)
+        assert res_f64_s.values["c"] == "a"
+        assert all(r.values["c"] == "a" and r.is_ambiguous is False for r in res_f64_b)
+        assert res_f64_b[0].probabilities["c"] == {"a": pytest.approx(1.0), "b": pytest.approx(0.0)}
+
+        # Zero embedding + huge weight must still recompute exact float64 boundary without suppressing dp_bound NaN
+        class _EZeroWithF64:
+            dimension = 16
+
+            def project(self, text: str, recency_weighted: bool = False) -> np.ndarray:
+                if text == "zero":
+                    return np.zeros(16, dtype=np.float64)
+                v = np.zeros(16, dtype=np.float64)
+                v[0] = 1e300
+                return v
+
+            def projector_digest(self) -> str:
+                return "r11-f64-edge"
+
+        mdl_f64_edge = SystemOneCompiler(_R11F64Choice, dimension=16, projector=_EZeroWithF64()).compile(
+            {"c": [("alpha", "a"), ("beta", "b")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        mdl_f64_edge._field_heads["c"].weights = w_f64.copy()
+        mdl_f64_edge._field_heads["c"].biases = b_f64.copy()
+        eng_f64_edge = SystemOneEngine(_R11F64Choice, compiled_model=mdl_f64_edge, strict_mode=False, use_cache=False)
+        batch_edge = eng_f64_edge.decide_batch(["zero", "huge"], record_receipt=False)
+        assert batch_edge[0].values["c"] == "a"
+        assert batch_edge[1].abstention_reasons["c"] == "non_finite_input"
+
+        # ------------------------------------------------------------------
+        # Round-10 carry-over dedicated assertions (R10-5 collision, R10-6 malformed multichoice)
+        # ------------------------------------------------------------------
+        with pytest.raises(InteropError) as exc_dup_num:
+            coerce_probability_dict({1: 0.5, "1": 0.5}, ("1",))
+        assert exc_dup_num.value.status_code == 422
+
+        mc_questions = {"m": {"type": "multichoice", "options": ["x", "y"]}}
+        for bad_mc_ans in (
+            "x",
+            ["bogus"],
+            [True],
+            {"choices": "x"},
+            {"choices": ["bogus"]},
+            {"choices": [True]},
+        ):
+            def _mc_factory(ans: Any) -> Callable[..., Dict[str, Any]]:
+                def _h(_txt: str, _raw: Dict[str, Any], _c: Any) -> Dict[str, Any]:
+                    return {"answers": {"m": ans}}
+                return _h
+
+            svc_mc = UniversalDecisionService(upstream_handlers={"gemini": _mc_factory(bad_mc_ans)}, bearer_token="tok-mc")
+            with pytest.raises(InteropError) as exc_mc:
+                svc_mc.handle_request(
+                    path="/v1beta/decisions",
+                    headers={"Authorization": "Bearer tok-mc", "Content-Type": "application/json"},
+                    raw_body=json.dumps({"input": "mc check", "force_teacher": True, "questions": mc_questions}).encode(),
+                )
+            assert exc_mc.value.status_code == 502
+
+
+

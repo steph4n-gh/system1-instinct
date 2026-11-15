@@ -264,6 +264,7 @@ class MultiTenantSkillFleet:
         alpha: float = 0.10,
         *,
         token_cache_limit: int = 4096,
+        is_boolean: Optional[bool] = None,
     ) -> None:
         self.projector = projector
         self.classes = [str(c) for c in classes]
@@ -271,6 +272,7 @@ class MultiTenantSkillFleet:
             raise ValueError("classes must be non-empty")
         self.num_classes = len(self.classes)
         self.c2i = {c: i for i, c in enumerate(self.classes)}
+        self.is_boolean = (tuple(self.classes) == ("False", "True")) if is_boolean is None else bool(is_boolean)
         with np.errstate(over="ignore", invalid="ignore"):
             self.W_base = np.asarray(W_base, dtype=np.float32)
             self.b_base = np.asarray(b_base, dtype=np.float32).reshape(-1)
@@ -500,8 +502,10 @@ class MultiTenantSkillFleet:
         token_cache_limit: int = 4096,
     ) -> MultiTenantSkillFleet:
         """Create a fleet from an existing CompiledSystemOneModel or SystemOneEngine."""
+        from system1.explain import _boolean_threshold_logit_shift
+
         resolved = getattr(model, "model", model)
-        schema = resolved.schema
+        schema = getattr(model, "schema", None) or resolved.schema
         if field_name is None:
             cand = [
                 name for name, f_def in schema.fields.items() if isinstance(f_def, (ChoiceField, BooleanField))
@@ -513,24 +517,65 @@ class MultiTenantSkillFleet:
             raise ValueError(f"Unknown field {field_name!r}")
 
         f_def = schema.fields[field_name]
-        heads_map = getattr(resolved, "_field_heads", None)
-        if heads_map is None:
-            heads_map = getattr(resolved, "heads", {})
-        head = heads_map[field_name]
-        raw_w = np.asarray(head.weights, dtype=np.float32)
-        raw_b = np.asarray(head.biases, dtype=np.float32).reshape(-1)
-        if isinstance(f_def, BooleanField) or raw_w.shape[0] == 1:
-            classes = ["False", "True"]
-            t_clamped = min(max(float(getattr(f_def, "threshold", 0.5)), 1e-6), 1.0 - 1e-6)
-            b_adj = float(raw_b[0]) - 0.25 * math.log(t_clamped / (1.0 - t_clamped))
-            W_base = np.vstack([-0.5 * raw_w[0], 0.5 * raw_w[0]]).astype(np.float32)
-            b_base = np.array([-0.5 * b_adj, 0.5 * b_adj], dtype=np.float32)
-        elif isinstance(f_def, ChoiceField):
-            classes = [str(o) for o in f_def.options]
-            W_base = raw_w
-            b_base = raw_b
+        field_heads = getattr(resolved, "_field_heads", None)
+        compiled_heads = getattr(resolved, "heads", None)
+        ch = compiled_heads.get(field_name) if isinstance(compiled_heads, Mapping) else None
+        live_h = field_heads.get(field_name) if isinstance(field_heads, Mapping) else None
+        head = live_h if live_h is not None else ch
+        if head is None:
+            raise ValueError(f"Model has no head for field {field_name!r}")
+        if (
+            not isinstance(f_def, BooleanField)
+            and getattr(head, "hierarchical", False)
+            and getattr(head, "coarse_weights", None) is not None
+            and getattr(head, "coarse_biases", None) is not None
+            and len(getattr(head, "cluster_assignments", ()) or ()) == np.asarray(head.weights).shape[0]
+        ):
+            raise ValueError(f"MultiTenantSkillFleet does not support hierarchical head {field_name!r}")
+
+        calibrators = getattr(model, "calibrators", None)
+        cal_obj = calibrators.get(field_name) if isinstance(calibrators, Mapping) else None
+        if cal_obj is not None:
+            temp = float(getattr(cal_obj, "temperature", 1.0))
+            raw_adj = getattr(cal_obj, "logit_adjustments", None)
         else:
-            raise ValueError(f"MultiTenantSkillFleet supports ChoiceField and BooleanField, got {type(f_def).__name__}")
+            src_meta = ch if ch is not None else head
+            temp = float(getattr(src_meta, "temperature", 1.0) or 1.0)
+            raw_adj = getattr(src_meta, "logit_adjustments", None)
+        if not math.isfinite(temp) or temp <= 0.0:
+            raise ValueError(f"Calibration temperature for {field_name!r} must be positive and finite, got {temp!r}")
+        adj = None if raw_adj is None else np.asarray(raw_adj, dtype=np.float64).reshape(-1)
+        if adj is not None and not bool(np.all(np.isfinite(adj))):
+            raise ValueError(f"Calibration logit_adjustments for {field_name!r} contain non-finite values")
+
+        raw_w64 = np.asarray(head.weights, dtype=np.float64)
+        raw_b64 = np.asarray(head.biases, dtype=np.float64).reshape(-1)
+        if not (np.all(np.isfinite(raw_w64)) and np.all(np.isfinite(raw_b64))):
+            raise ValueError(f"Field head {field_name!r} contains non-finite weights or biases")
+
+        is_bool_head = bool(isinstance(f_def, BooleanField) or raw_w64.shape[0] == 1)
+        with np.errstate(over="ignore", invalid="ignore"):
+            if is_bool_head:
+                classes = ["False", "True"]
+                delta_adj = float(adj[1] - adj[0]) if (adj is not None and adj.size == 2) else 0.0
+                logit_shift = _boolean_threshold_logit_shift(float(getattr(f_def, "threshold", 0.5)))
+                w_diff_eff = raw_w64[0] / temp
+                b_diff_eff = (float(raw_b64[0]) + 0.25 * delta_adj) / temp - 0.25 * logit_shift
+                W_base = np.vstack([-0.5 * w_diff_eff, 0.5 * w_diff_eff]).astype(np.float32)
+                b_base = np.array([-0.5 * b_diff_eff, 0.5 * b_diff_eff], dtype=np.float32)
+            elif isinstance(f_def, ChoiceField):
+                classes = [str(o) for o in f_def.options]
+                adj_vec = (
+                    adj
+                    if (adj is not None and adj.size == len(classes))
+                    else np.zeros(len(classes), dtype=np.float64)
+                )
+                W_base = (raw_w64 / temp).astype(np.float32)
+                b_base = ((raw_b64 + 0.25 * adj_vec) / temp).astype(np.float32)
+            else:
+                raise ValueError(f"MultiTenantSkillFleet supports ChoiceField and BooleanField, got {type(f_def).__name__}")
+        if not (bool(np.all(np.isfinite(W_base))) and bool(np.all(np.isfinite(b_base)))):
+            raise ValueError(f"Calibrated base head {field_name!r} overflowed float32 bounds")
 
         base_tok_df = np.zeros(cls.BASE_HASH_SIZE, dtype=np.uint16)
         if base_texts:
@@ -550,19 +595,20 @@ class MultiTenantSkillFleet:
                             base_tok_df[bucket] += 1
 
         q_init = np.full(len(classes), 0.5, dtype=np.float32)
-        compiled_heads = getattr(resolved, "heads", None)
-        ch = compiled_heads.get(field_name) if isinstance(compiled_heads, dict) else None
-        if ch is not None:
-            cls_scores = getattr(ch, "class_calibration_scores", {}) or {}
-            fallback_q = float(getattr(ch, "conformal_quantile", 0.0) or 0.0)
-            cal_scores = getattr(ch, "calibration_scores", ()) or ()
-            if fallback_q <= 0.0 and cal_scores:
+        cp_map = getattr(model, "conformal_predictors", None)
+        cp = cp_map.get(field_name) if isinstance(cp_map, Mapping) else None
+        score_src = cp if (cp is not None and (getattr(cp, "is_calibrated", False) or len(getattr(cp, "calibration_scores", ())) > 0)) else ch
+        if score_src is not None:
+            cls_scores = getattr(score_src, "class_calibration_scores", {}) or {}
+            fallback_q = float(getattr(score_src, "conformal_quantile", getattr(score_src, "quantile", 0.0)) or 0.0)
+            cal_scores = getattr(score_src, "calibration_scores", ())
+            if fallback_q <= 0.0 and len(cal_scores) > 0:
                 n_s = len(cal_scores)
                 k = min(n_s, max(1, int(math.ceil((n_s + 1) * (1.0 - alpha))))) - 1
                 fallback_q = float(sorted(cal_scores)[k])
             for idx, c_name in enumerate(classes):
                 c_vals = cls_scores.get(c_name)
-                if c_vals:
+                if c_vals is not None and len(c_vals) > 0:
                     n_c = len(c_vals)
                     k = min(n_c, max(1, int(math.ceil((n_c + 1) * (1.0 - alpha))))) - 1
                     q_init[idx] = float(sorted(c_vals)[k])
@@ -583,6 +629,7 @@ class MultiTenantSkillFleet:
             lam_rls=lam_rls,
             alpha=alpha,
             token_cache_limit=token_cache_limit,
+            is_boolean=is_bool_head,
         )
 
     def adapt_tenant_batch(
@@ -794,7 +841,8 @@ class MultiTenantSkillFleet:
         """Decompose base, subspace RLS, sparse lexical, and exemplar logits for tenant `tid`."""
         tid = self._validate_tid(tid)
         if x is None:
-            x = np.asarray(self.projector.project(text), dtype=np.float32)
+            with np.errstate(over="ignore", invalid="ignore"):
+                x = np.asarray(self.projector.project(text), dtype=np.float32)
         dW_qt, dW_st, sp_ht, sp_ct, sp_wt, n_sp, ex_vt, ex_st, ex_ct, n_ex, _ = (
             self._snapshot_views(tid)
         )
@@ -841,7 +889,8 @@ class MultiTenantSkillFleet:
     def decide_live(self, tid: int, text: str) -> Tuple[int, np.ndarray, np.ndarray]:
         """Evaluate `text` for tenant `tid` and return `(pred_idx, logits, conformal_mask)`."""
         tid = self._validate_tid(tid)
-        x = np.asarray(self.projector.project(text), dtype=np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            x = np.asarray(self.projector.project(text), dtype=np.float32)
         dW_qt, dW_st, sp_ht, sp_ct, sp_wt, n_sp, ex_vt, ex_st, ex_ct, n_ex, q_ct = (
             self._snapshot_views(tid)
         )
@@ -878,7 +927,12 @@ class MultiTenantSkillFleet:
         probs = _softmax_temp(logits, temp=0.25)
         scores = 1.0 - probs
         pred_set = scores <= (q_ct.astype(np.float64) + 1e-12)
-        return int(np.argmax(logits)), logits, pred_set
+        pred_idx = (
+            1
+            if (self.is_boolean and len(logits) == 2 and float(logits[1]) >= float(logits[0]))
+            else int(np.argmax(logits))
+        )
+        return pred_idx, logits, pred_set
 
     def decide(self, tid: int, text: str) -> TenantDecisionResult:
         """Evaluate `text` for tenant `tid` and return structured `TenantDecisionResult`."""

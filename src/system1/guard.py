@@ -210,8 +210,9 @@ def make_sliding_windows(
 
 
 def _l2_normalize_rows(X: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    return X / np.maximum(norms, 1e-12)
+    with np.errstate(over="ignore", invalid="ignore"):
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        return X / np.maximum(norms, 1e-12)
 
 
 def _normalize_unsafe_label_arg(
@@ -251,28 +252,68 @@ class GuardShield:
         unsafe_exemplars: Optional[Sequence[str]] = None,
         sim_threshold: Optional[float] = None,
     ) -> None:
+        from system1.explain import _boolean_threshold_logit_shift
+
         resolved = getattr(model, "model", model)
+        schema = getattr(model, "schema", None) or resolved.schema
         self.model = resolved
         self.field_name = str(field_name)
-        if self.field_name not in resolved.schema.fields:
+        if self.field_name not in schema.fields:
             raise ValueError(f"Unknown field {field_name!r} in model schema")
-        heads_map = getattr(resolved, "_field_heads", None)
-        if heads_map is None:
-            heads_map = getattr(resolved, "heads", {})
-        self.head = heads_map[self.field_name]
-        f_def = resolved.schema.fields[self.field_name]
-        raw_w = np.asarray(self.head.weights, dtype=np.float32)
-        raw_b = np.asarray(self.head.biases, dtype=np.float32).reshape(-1)
-        if isinstance(f_def, BooleanField) or raw_w.shape[0] == 1:
-            self.options: Tuple[str, ...] = ("False", "True")
-            t_clamped = min(max(float(getattr(f_def, "threshold", 0.5)), 1e-6), 1.0 - 1e-6)
-            b_adj = float(raw_b[0]) - 0.25 * math.log(t_clamped / (1.0 - t_clamped))
-            self.W = np.vstack([-0.5 * raw_w[0], 0.5 * raw_w[0]]).astype(np.float32)
-            self.b = np.array([-0.5 * b_adj, 0.5 * b_adj], dtype=np.float32)
+        field_heads = getattr(resolved, "_field_heads", None)
+        compiled_heads = getattr(resolved, "heads", None)
+        ch = compiled_heads.get(self.field_name) if isinstance(compiled_heads, Mapping) else None
+        live_h = field_heads.get(self.field_name) if isinstance(field_heads, Mapping) else None
+        self.head = live_h if live_h is not None else ch
+        if self.head is None:
+            raise ValueError(f"Model has no head for field {field_name!r}")
+        f_def = schema.fields[self.field_name]
+
+        calibrators = getattr(model, "calibrators", None)
+        cal_obj = calibrators.get(self.field_name) if isinstance(calibrators, Mapping) else None
+        if cal_obj is not None:
+            temp = float(getattr(cal_obj, "temperature", 1.0))
+            raw_adj = getattr(cal_obj, "logit_adjustments", None)
         else:
-            self.options = tuple(str(o) for o in f_def.options)
-            self.W = raw_w
-            self.b = raw_b
+            src_meta = ch if ch is not None else self.head
+            temp = float(getattr(src_meta, "temperature", 1.0) or 1.0)
+            raw_adj = getattr(src_meta, "logit_adjustments", None)
+        if not math.isfinite(temp) or temp <= 0.0:
+            raise ValueError(
+                f"Calibration temperature for {self.field_name!r} must be positive and finite, got {temp!r}"
+            )
+        adj = None if raw_adj is None else np.asarray(raw_adj, dtype=np.float64).reshape(-1)
+        if adj is not None and not bool(np.all(np.isfinite(adj))):
+            raise ValueError(f"Calibration logit_adjustments for {self.field_name!r} contain non-finite values")
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            raw_w_in = np.asarray(self.head.weights)
+            raw_b_in = np.asarray(self.head.biases).reshape(-1)
+            w_dtype = np.float64 if (raw_w_in.dtype == np.float64 or raw_b_in.dtype == np.float64) else np.float32
+            raw_w = np.asarray(raw_w_in, dtype=w_dtype)
+            raw_b = np.asarray(raw_b_in, dtype=w_dtype).reshape(-1)
+            if isinstance(f_def, BooleanField) or raw_w.shape[0] == 1:
+                self.options: Tuple[str, ...] = ("False", "True")
+                raw_w64 = np.asarray(raw_w_in, dtype=np.float64)
+                raw_b64 = np.asarray(raw_b_in, dtype=np.float64).reshape(-1)
+                delta_adj = float(adj[1] - adj[0]) if (adj is not None and adj.size == 2) else 0.0
+                logit_shift = _boolean_threshold_logit_shift(float(getattr(f_def, "threshold", 0.5)))
+                w_diff_eff = raw_w64[0] / temp
+                b_diff_eff = (float(raw_b64[0]) + 0.25 * delta_adj) / temp - 0.25 * logit_shift
+                self.W = np.vstack([-0.5 * w_diff_eff, 0.5 * w_diff_eff]).astype(w_dtype)
+                self.b = np.array([-0.5 * b_diff_eff, 0.5 * b_diff_eff], dtype=w_dtype)
+            else:
+                self.options = tuple(str(o) for o in f_def.options)
+                has_adj = adj is not None and adj.size == len(self.options) and bool(np.any(adj != 0.0))
+                if temp != 1.0 or has_adj:
+                    raw_w64 = np.asarray(raw_w_in, dtype=np.float64)
+                    raw_b64 = np.asarray(raw_b_in, dtype=np.float64).reshape(-1)
+                    adj_vec = adj if has_adj else np.zeros(len(self.options), dtype=np.float64)
+                    self.W = (raw_w64 / temp).astype(w_dtype)
+                    self.b = ((raw_b64 + 0.25 * adj_vec) / temp).astype(w_dtype)
+                else:
+                    self.W = raw_w
+                    self.b = raw_b
 
         resolved_unsafe = _normalize_unsafe_label_arg(unsafe_label, unsafe_labels)
         self.unsafe_idxs: List[int] = [self.options.index(lbl) for lbl in resolved_unsafe]
@@ -303,16 +344,20 @@ class GuardShield:
     def _project_batch(self, texts: Sequence[str]) -> np.ndarray:
         text_list = list(texts)
         project_batch = getattr(self.projector, "project_batch", None)
-        if callable(project_batch):
-            out = project_batch(text_list)
-            if isinstance(out, tuple):
-                out = out[0]
-            return np.asarray(out, dtype=np.float32)
-        return np.vstack([np.asarray(self.projector.project(t), dtype=np.float32) for t in text_list])
+        with np.errstate(over="ignore", invalid="ignore"):
+            if callable(project_batch):
+                out = project_batch(text_list)
+                if isinstance(out, tuple):
+                    out = out[0]
+                return np.asarray(out, dtype=np.float32)
+            return np.vstack([np.asarray(self.projector.project(t), dtype=np.float32) for t in text_list])
 
     def _batch_eval_logits_and_emb(self, texts: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
         X = self._project_batch(texts)
-        return ((X @ self.W.T) + self.b) / 0.25, X
+        with np.errstate(over="ignore", invalid="ignore"):
+            X_in = X.astype(self.W.dtype, copy=False)
+            scaled = ((X_in @ self.W.T) + self.b) / 0.25
+        return scaled, X
 
     def _score_views(
         self, text: str
@@ -352,14 +397,25 @@ class GuardShield:
             )
 
         scaled_logits, X_views = self._batch_eval_logits_and_emb(all_views)
-        shifted = scaled_logits - np.max(scaled_logits, axis=1, keepdims=True)
-        exps = np.exp(np.clip(shifted, -50.0, 50.0))
-        probs = exps / np.sum(exps, axis=1, keepdims=True)
+        with np.errstate(over="ignore", invalid="ignore"):
+            shifted = scaled_logits - np.max(scaled_logits, axis=1, keepdims=True)
+            exps = np.exp(np.clip(shifted, -50.0, 50.0))
+            probs = exps / np.sum(exps, axis=1, keepdims=True)
 
-        sims: Optional[np.ndarray] = None
-        if self.unsafe_bank is not None and len(self.unsafe_bank) > 0:
-            X_norm = _l2_normalize_rows(X_views)
-            sims = np.max(X_norm @ self.unsafe_bank.T, axis=1)
+            sims: Optional[np.ndarray] = None
+            if self.unsafe_bank is not None and len(self.unsafe_bank) > 0:
+                X_norm = _l2_normalize_rows(X_views)
+                sims = np.max(X_norm @ self.unsafe_bank.T, axis=1)
+
+            x_nonfin = ~np.all(np.isfinite(X_views), axis=1)
+            if bool(np.any(x_nonfin)):
+                scaled_logits = np.array(scaled_logits, copy=True)
+                probs = np.array(probs, copy=True)
+                scaled_logits[x_nonfin] = np.nan
+                probs[x_nonfin] = np.nan
+                if sims is not None:
+                    sims = np.array(sims, copy=True)
+                    sims[x_nonfin] = np.nan
 
         elapsed_us = (time.perf_counter_ns() - t0) / 1000.0
         canon_us = (t1 - t0) / 1000.0
@@ -390,58 +446,86 @@ class GuardShield:
         sim_threshold: Optional[float],
     ) -> ShieldDecision:
         t_dec0 = time.perf_counter_ns()
-        unsafe_logits = np.max(scaled_logits[:, self.unsafe_idxs], axis=1)
-        max_other_logits = np.max(scaled_logits[:, self.safe_idxs], axis=1)
-        unsafe_margins = unsafe_logits - max_other_logits
-        unsafe_probs = np.sum(probs[:, self.unsafe_idxs], axis=1)
+        with np.errstate(over="ignore", invalid="ignore"):
+            unsafe_logits = np.max(scaled_logits[:, self.unsafe_idxs], axis=1)
+            max_other_logits = np.max(scaled_logits[:, self.safe_idxs], axis=1)
+            unsafe_margins = unsafe_logits - max_other_logits
+            unsafe_probs = np.sum(probs[:, self.unsafe_idxs], axis=1)
 
-        full_margin = float(unsafe_margins[0])
-        if (not self.use_windows) or (short_doc_passthrough and is_short_doc and n_frags == 0):
-            best_win = 0
-            max_margin = full_margin
-            max_prob = float(unsafe_probs[0])
-            max_sim = float(sims[0]) if sims is not None else None
-            is_unsafe = max_margin >= 0.0
-        elif short_doc_passthrough and is_short_doc and n_frags > 0:
-            base_hit = full_margin >= 0.0
-            frag_margins = unsafe_margins[1:]
-            if sim_threshold is not None and sims is not None and len(frag_margins) > 0:
-                frag_hits = (frag_margins >= window_margin_threshold) & (sims[1:] >= sim_threshold)
-                hit_any = base_hit or bool(np.any(frag_hits))
+            nonfinite_eval = (
+                not bool(np.all(np.isfinite(scaled_logits)))
+                or not bool(np.all(np.isfinite(probs)))
+                or not bool(np.all(np.isfinite(unsafe_margins)))
+                or (
+                    sim_threshold is not None
+                    and sims is not None
+                    and not bool(np.all(np.isfinite(sims)))
+                )
+            )
+
+            full_margin = float(unsafe_margins[0])
+            if nonfinite_eval:
+                # Fail closed when logits/embeddings overflow or become non-finite.
+                is_unsafe = True
+                pred = self.unsafe_label
+                max_prob = 1.0
+                max_margin = (
+                    float(np.nanmax(unsafe_margins))
+                    if bool(np.any(np.isfinite(unsafe_margins)))
+                    else full_margin
+                )
+                max_sim = (
+                    (float(np.nanmax(sims)) if bool(np.any(np.isfinite(sims))) else None)
+                    if sims is not None
+                    else None
+                )
             else:
-                frag_hits = frag_margins >= 0.0
-                hit_any = base_hit or bool(np.any(frag_hits))
-            best_win = int(np.argmax(unsafe_margins))
-            max_margin = float(unsafe_margins[best_win])
-            max_prob = float(unsafe_probs[best_win])
-            max_sim = float(np.max(sims)) if sims is not None else None
-            is_unsafe = hit_any
-        else:
-            if sim_threshold is not None and sims is not None:
-                win_hits = (unsafe_margins >= window_margin_threshold) & (sims >= sim_threshold)
-                is_unsafe = bool(np.any(win_hits))
-                if is_unsafe:
-                    best_win = int(np.argmax(np.where(win_hits, unsafe_margins, -1e9)))
-                else:
+                if (not self.use_windows) or (short_doc_passthrough and is_short_doc and n_frags == 0):
+                    best_win = 0
+                    max_margin = full_margin
+                    max_prob = float(unsafe_probs[0])
+                    max_sim = float(sims[0]) if sims is not None else None
+                    is_unsafe = max_margin >= 0.0
+                elif short_doc_passthrough and is_short_doc and n_frags > 0:
+                    base_hit = full_margin >= 0.0
+                    frag_margins = unsafe_margins[1:]
+                    if sim_threshold is not None and sims is not None and len(frag_margins) > 0:
+                        frag_hits = (frag_margins >= window_margin_threshold) & (sims[1:] >= sim_threshold)
+                        hit_any = base_hit or bool(np.any(frag_hits))
+                    else:
+                        frag_hits = frag_margins >= 0.0
+                        hit_any = base_hit or bool(np.any(frag_hits))
                     best_win = int(np.argmax(unsafe_margins))
-                max_sim = float(sims[best_win])
-            else:
-                best_win = int(np.argmax(unsafe_margins))
-                is_unsafe = bool(unsafe_margins[best_win] >= window_margin_threshold)
-                max_sim = float(sims[best_win]) if sims is not None else None
-            max_margin = float(unsafe_margins[best_win])
-            max_prob = float(unsafe_probs[best_win])
+                    max_margin = float(unsafe_margins[best_win])
+                    max_prob = float(unsafe_probs[best_win])
+                    max_sim = float(np.max(sims)) if sims is not None else None
+                    is_unsafe = hit_any
+                else:
+                    if sim_threshold is not None and sims is not None:
+                        win_hits = (unsafe_margins >= window_margin_threshold) & (sims >= sim_threshold)
+                        is_unsafe = bool(np.any(win_hits))
+                        if is_unsafe:
+                            best_win = int(np.argmax(np.where(win_hits, unsafe_margins, -1e9)))
+                        else:
+                            best_win = int(np.argmax(unsafe_margins))
+                        max_sim = float(sims[best_win])
+                    else:
+                        best_win = int(np.argmax(unsafe_margins))
+                        is_unsafe = bool(unsafe_margins[best_win] >= window_margin_threshold)
+                        max_sim = float(sims[best_win]) if sims is not None else None
+                    max_margin = float(unsafe_margins[best_win])
+                    max_prob = float(unsafe_probs[best_win])
 
-        if is_unsafe:
-            best_u = max(self.unsafe_idxs, key=lambda idx: float(scaled_logits[best_win, idx]))
-            pred = self.options[best_u]
-        else:
-            best_c = int(np.argmax(scaled_logits[0]))
-            if best_c in self._unsafe_idx_set:
-                best_safe = max(self.safe_idxs, key=lambda idx: float(scaled_logits[0, idx]))
-                pred = self.options[best_safe]
-            else:
-                pred = self.options[best_c]
+                if is_unsafe:
+                    best_u = max(self.unsafe_idxs, key=lambda idx: float(scaled_logits[best_win, idx]))
+                    pred = self.options[best_u]
+                else:
+                    best_c = int(np.argmax(scaled_logits[0]))
+                    if best_c in self._unsafe_idx_set:
+                        best_safe = max(self.safe_idxs, key=lambda idx: float(scaled_logits[0, idx]))
+                        pred = self.options[best_safe]
+                    else:
+                        pred = self.options[best_c]
 
         dec_us = (time.perf_counter_ns() - t_dec0) / 1000.0
         return ShieldDecision(
@@ -1666,10 +1750,12 @@ class SystemOneGuardHook:
         if active_shield is not None:
             shield_dec = active_shield.evaluate_single(raw_prompt)
             if shield_dec.is_unsafe:
-                reason = (
-                    f"System 1 GuardShield blocked unsafe window "
-                    f"(margin: {shield_dec.max_window_unsafe_margin:.3f})"
+                margin_str = (
+                    f"{shield_dec.max_window_unsafe_margin:.3f}"
+                    if math.isfinite(shield_dec.max_window_unsafe_margin)
+                    else "non-finite"
                 )
+                reason = f"System 1 GuardShield blocked unsafe window (margin: {margin_str})"
                 return _finish(DecisionOutcome.DENY, RiskLevel.IRREVERSIBLE, "system1_shield_deny", reason)
 
         # 1. Check safety boolean if present

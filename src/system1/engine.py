@@ -56,6 +56,7 @@ from system1.core.model import (
     FastDecisionCallable,
     PackedMultiQuestionKernel,
     _compute_engine_inference_signature,
+    _compute_hierarchical_logits_np,
     _has_custom_validate_decision,
     _normalize_raw_projection,
     _normalize_raw_projection_batch,
@@ -3863,12 +3864,13 @@ class SystemOneEngine:
                     raw_b_arr = raw_b_arr[:1]
                 if not (np.all(np.isfinite(raw_w_arr)) and np.all(np.isfinite(raw_b_arr))):
                     raise ValueError(f"Field head {fname!r} contains non-finite weights or biases")
-                if raw_w_arr.dtype not in (np.float32, np.float64):
-                    raw_w_arr = raw_w_arr.astype(np.float32)
-                if raw_b_arr.dtype not in (np.float32, np.float64):
-                    raw_b_arr = raw_b_arr.astype(np.float32)
-                w_mat = np.asarray(raw_w_arr, dtype=np.float32)
-                b_vec = np.asarray(raw_b_arr, dtype=np.float32)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    if raw_w_arr.dtype not in (np.float32, np.float64):
+                        raw_w_arr = raw_w_arr.astype(np.float32)
+                    if raw_b_arr.dtype not in (np.float32, np.float64):
+                        raw_b_arr = raw_b_arr.astype(np.float32)
+                    w_mat = np.asarray(raw_w_arr, dtype=np.float32)
+                    b_vec = np.asarray(raw_b_arr, dtype=np.float32)
 
                 cluster_assign_raw = getattr(head, "cluster_assignments", ()) or ()
                 is_hier = bool(
@@ -3878,19 +3880,51 @@ class SystemOneEngine:
                     and getattr(head, "coarse_biases", None) is not None
                     and len(cluster_assign_raw) == w_mat.shape[0]
                 )
-                coarse_w = np.asarray(head.coarse_weights, dtype=np.float32) if is_hier else None
-                coarse_b = np.asarray(head.coarse_biases, dtype=np.float32).reshape(-1) if is_hier else None
-                fine_w = (
-                    np.asarray(head.fine_weights, dtype=np.float32)
-                    if is_hier and getattr(head, "fine_weights", None) is not None
-                    else None
-                )
-                fine_b = (
-                    np.asarray(head.fine_biases, dtype=np.float32).reshape(-1)
-                    if is_hier and getattr(head, "fine_biases", None) is not None
-                    else None
-                )
-                cluster_assign = np.asarray(cluster_assign_raw, dtype=np.int64) if is_hier else None
+                raw_coarse_w: Optional[np.ndarray] = None
+                raw_coarse_b: Optional[np.ndarray] = None
+                raw_fine_w: Optional[np.ndarray] = None
+                raw_fine_b: Optional[np.ndarray] = None
+                coarse_w: Optional[np.ndarray] = None
+                coarse_b: Optional[np.ndarray] = None
+                fine_w: Optional[np.ndarray] = None
+                fine_b: Optional[np.ndarray] = None
+                cluster_assign: Optional[np.ndarray] = None
+                if is_hier:
+                    raw_coarse_w = np.asarray(head.coarse_weights)
+                    raw_coarse_b = np.asarray(head.coarse_biases).reshape(-1)
+                    if not (np.all(np.isfinite(raw_coarse_w)) and np.all(np.isfinite(raw_coarse_b))):
+                        raise ValueError(f"Field head {fname!r} contains non-finite hierarchical coarse weights")
+                    cluster_assign = np.asarray(cluster_assign_raw, dtype=np.int64)
+                    if (
+                        raw_coarse_w.ndim != 2
+                        or raw_coarse_b.shape[0] != raw_coarse_w.shape[0]
+                        or cluster_assign.ndim != 1
+                        or cluster_assign.size != raw_w_arr.shape[0]
+                        or (
+                            cluster_assign.size > 0
+                            and np.any((cluster_assign < 0) | (cluster_assign >= raw_coarse_w.shape[0]))
+                        )
+                    ):
+                        raise ValueError(f"Field head {fname!r} has invalid hierarchical cluster configuration")
+                    if getattr(head, "fine_weights", None) is not None and getattr(head, "fine_biases", None) is not None:
+                        raw_fine_w = np.asarray(head.fine_weights)
+                        raw_fine_b = np.asarray(head.fine_biases).reshape(-1)
+                        if not (np.all(np.isfinite(raw_fine_w)) and np.all(np.isfinite(raw_fine_b))):
+                            raise ValueError(f"Field head {fname!r} contains non-finite hierarchical fine weights")
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        if raw_coarse_w.dtype not in (np.float32, np.float64):
+                            raw_coarse_w = raw_coarse_w.astype(np.float32)
+                        if raw_coarse_b.dtype not in (np.float32, np.float64):
+                            raw_coarse_b = raw_coarse_b.astype(np.float32)
+                        coarse_w = np.asarray(raw_coarse_w, dtype=np.float32)
+                        coarse_b = np.asarray(raw_coarse_b, dtype=np.float32)
+                        if raw_fine_w is not None and raw_fine_b is not None:
+                            if raw_fine_w.dtype not in (np.float32, np.float64):
+                                raw_fine_w = raw_fine_w.astype(np.float32)
+                            if raw_fine_b.dtype not in (np.float32, np.float64):
+                                raw_fine_b = raw_fine_b.astype(np.float32)
+                            fine_w = np.asarray(raw_fine_w, dtype=np.float32)
+                            fine_b = np.asarray(raw_fine_b, dtype=np.float32)
 
                 fam_t = max(
                     float(getattr(head, "familiarity_threshold", 0.0)),
@@ -3907,43 +3941,44 @@ class SystemOneEngine:
                 head_protos = getattr(head, "prototypes", None)
                 if head_protos is None and meta_head is not None:
                     head_protos = getattr(meta_head, "prototypes", None)
-                if head_protos is not None and np.ndim(head_protos) == 2 and head_protos.shape[1] == self.dimension:
-                    hp = np.asarray(head_protos, dtype=np.float32)
-                    hnorms = np.linalg.norm(hp, axis=1, keepdims=True)
-                    hvalid = (hnorms[:, 0] > 1e-12) & np.isfinite(hnorms[:, 0])
-                    if np.any(hvalid):
-                        proto_chunks.append((hp[hvalid] / hnorms[hvalid]).astype(np.float32))
-                if not proto_chunks and conformal is not None and getattr(conformal, "prototypes", None) is not None:
-                    cp_p = np.asarray(conformal.prototypes, dtype=np.float32)
-                    if cp_p.ndim == 2 and cp_p.shape[1] == self.dimension:
-                        cnorms = np.linalg.norm(cp_p, axis=1, keepdims=True)
-                        cvalid = (cnorms[:, 0] > 1e-12) & np.isfinite(cnorms[:, 0])
-                        if np.any(cvalid):
-                            proto_chunks.append((cp_p[cvalid] / cnorms[cvalid]).astype(np.float32))
-                if head_protos is not None and online_bank_map:
-                    bank = online_bank_map.get(fname)
-                    if bank:
-                        bank_arr = [
-                            np.asarray(s, dtype=np.float32).flatten()
-                            for s in bank
-                            if np.asarray(s).size == self.dimension
-                        ]
-                        if bank_arr:
-                            proto_chunks.append(np.stack(bank_arr, axis=0))
-                if head_protos is not None and model_field_heads:
-                    mfh = model_field_heads.get(fname)
-                    shots_p = getattr(mfh, "_online_shots_p", None) if mfh is not None else None
-                    if shots_p:
-                        shot_vecs: List[np.ndarray] = []
-                        for grp in shots_p:
-                            for s in grp:
-                                s_arr = np.asarray(s, dtype=np.float32).flatten()
-                                if s_arr.shape[0] == self.dimension:
-                                    sn = float(np.linalg.norm(s_arr))
-                                    if sn > 1e-12:
-                                        shot_vecs.append((s_arr / sn).astype(np.float32))
-                        if shot_vecs:
-                            proto_chunks.append(np.stack(shot_vecs, axis=0))
+                with np.errstate(over="ignore", invalid="ignore"):
+                    if head_protos is not None and np.ndim(head_protos) == 2 and head_protos.shape[1] == self.dimension:
+                        hp = np.asarray(head_protos, dtype=np.float32)
+                        hnorms = np.linalg.norm(hp, axis=1, keepdims=True)
+                        hvalid = (hnorms[:, 0] > 1e-12) & np.isfinite(hnorms[:, 0])
+                        if np.any(hvalid):
+                            proto_chunks.append((hp[hvalid] / hnorms[hvalid]).astype(np.float32))
+                    if not proto_chunks and conformal is not None and getattr(conformal, "prototypes", None) is not None:
+                        cp_p = np.asarray(conformal.prototypes, dtype=np.float32)
+                        if cp_p.ndim == 2 and cp_p.shape[1] == self.dimension:
+                            cnorms = np.linalg.norm(cp_p, axis=1, keepdims=True)
+                            cvalid = (cnorms[:, 0] > 1e-12) & np.isfinite(cnorms[:, 0])
+                            if np.any(cvalid):
+                                proto_chunks.append((cp_p[cvalid] / cnorms[cvalid]).astype(np.float32))
+                    if head_protos is not None and online_bank_map:
+                        bank = online_bank_map.get(fname)
+                        if bank:
+                            bank_arr = [
+                                np.asarray(s, dtype=np.float32).flatten()
+                                for s in bank
+                                if np.asarray(s).size == self.dimension
+                            ]
+                            if bank_arr:
+                                proto_chunks.append(np.stack(bank_arr, axis=0))
+                    if head_protos is not None and model_field_heads:
+                        mfh = model_field_heads.get(fname)
+                        shots_p = getattr(mfh, "_online_shots_p", None) if mfh is not None else None
+                        if shots_p:
+                            shot_vecs: List[np.ndarray] = []
+                            for grp in shots_p:
+                                for s in grp:
+                                    s_arr = np.asarray(s, dtype=np.float32).flatten()
+                                    if s_arr.shape[0] == self.dimension:
+                                        sn = float(np.linalg.norm(s_arr))
+                                        if sn > 1e-12:
+                                            shot_vecs.append((s_arr / sn).astype(np.float32))
+                            if shot_vecs:
+                                proto_chunks.append(np.stack(shot_vecs, axis=0))
                 protos_unit = np.concatenate(proto_chunks, axis=0) if proto_chunks else None
 
                 cp_fam_t = float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0
@@ -4006,6 +4041,10 @@ class SystemOneEngine:
                         "coarse_b": coarse_b,
                         "fine_w": fine_w,
                         "fine_b": fine_b,
+                        "raw_coarse_w": raw_coarse_w,
+                        "raw_coarse_b": raw_coarse_b,
+                        "raw_fine_w": raw_fine_w,
+                        "raw_fine_b": raw_fine_b,
                         "cluster_assign": cluster_assign,
                         "calibrator": calibrator,
                         "conformal": conformal,
@@ -4043,7 +4082,8 @@ class SystemOneEngine:
                     else:
                         emb_p = self.model.encode(p, recency_weighted=recency_flag)
                         rn_p = None
-                    enc_rows.append(np.asarray(emb_p, dtype=np.float32).ravel())
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        enc_rows.append(np.asarray(emb_p, dtype=np.float32).ravel())
                     if rn_list is not None:
                         if rn_p is None and hasattr(proj_obj, "raw_norm"):
                             try:
@@ -4093,29 +4133,44 @@ class SystemOneEngine:
                     conformal = spec["conformal"]
 
                     with np.errstate(over="ignore", invalid="ignore"):
-                        logits = X @ spec["w"].T + spec["b"]
                         if spec["is_hier"]:
-                            coarse_logits = X @ spec["coarse_w"].T + spec["coarse_b"]
-                            c_scaled = coarse_logits.astype(np.float64) / 0.25
-                            c_scaled -= np.max(c_scaled, axis=1, keepdims=True)
-                            c_exp = np.exp(c_scaled)
-                            coarse_probs = c_exp / np.sum(c_exp, axis=1, keepdims=True)
-                            assign = spec["cluster_assign"]
-                            mapped_coarse = coarse_logits[:, assign]
-                            if spec["fine_w"] is not None and spec["fine_b"] is not None:
-                                spec_logits = X @ spec["fine_w"].T + spec["fine_b"]
-                                mapped_probs = coarse_probs[:, assign]
-                                logits = (
-                                    0.65 * logits
-                                    + (0.20 + 0.30 * mapped_probs) * spec_logits
-                                    + 0.20 * mapped_coarse
-                                ).astype(np.float32)
-                            else:
-                                logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
+                            has_f64_h = any(
+                                arr is not None and arr.dtype == np.float64
+                                for arr in (
+                                    spec["raw_w"],
+                                    spec["raw_b"],
+                                    spec["raw_coarse_w"],
+                                    spec["raw_coarse_b"],
+                                    spec["raw_fine_w"],
+                                    spec["raw_fine_b"],
+                                )
+                            )
+                            logits = np.full(
+                                (m_docs, k_opts),
+                                np.nan,
+                                dtype=np.float64 if has_f64_h else np.float32,
+                            )
+                            for r_i in range(m_docs):
+                                if nonfin_rows[r_i]:
+                                    continue
+                                x_ex = X[r_i : r_i + 1]
+                                base_ex = x_ex @ spec["raw_w"].T + spec["raw_b"]
+                                hier_ex = _compute_hierarchical_logits_np(
+                                    x_ex,
+                                    base_ex,
+                                    spec["raw_coarse_w"],
+                                    spec["raw_coarse_b"],
+                                    spec["cluster_assign"],
+                                    spec["raw_fine_w"],
+                                    spec["raw_fine_b"],
+                                )
+                                logits[r_i] = hier_ex[0]
+                        else:
+                            logits = X @ spec["w"].T + spec["b"]
 
                         if not spec["is_hier"]:
-                            raw_w_s = spec["raw_w"]
-                            raw_b_s = spec["raw_b"]
+                            raw_w_s = np.asarray(spec["raw_w"], dtype=np.float64)
+                            raw_b_s = np.asarray(spec["raw_b"], dtype=np.float64)
                             w_l1 = (
                                 float(np.sum(np.abs(raw_w_s[0])))
                                 if spec["is_bool"]
@@ -4148,6 +4203,7 @@ class SystemOneEngine:
                                 near_rows = (
                                     (np.abs(probs[:, 1] - spec["bool_threshold"]) <= dp_bound)
                                     | (np.abs(z_col) <= 2.0 * (dz_bound / 0.25))
+                                    | (~np.isfinite(dp_bound))
                                 )
                                 if conformal is not None:
                                     near_rows |= (
@@ -4216,9 +4272,12 @@ class SystemOneEngine:
                                 z_s = -np.sort(-logits.astype(np.float64), axis=1)
                                 p_s = -np.sort(-probs, axis=1)
                                 near_rows = (
-                                    ((z_s[:, 0] - z_s[:, 1]) <= 2.0 * dz_bound + 1e-9)
-                                    if k_opts >= 2
-                                    else np.zeros(m_docs, dtype=bool)
+                                    (
+                                        ((z_s[:, 0] - z_s[:, 1]) <= 2.0 * dz_bound + 1e-9)
+                                        if k_opts >= 2
+                                        else np.zeros(m_docs, dtype=bool)
+                                    )
+                                    | (~np.isfinite(dp_bound))
                                 )
                                 if conformal is not None:
                                     near_rows |= np.any(

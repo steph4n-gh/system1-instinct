@@ -397,22 +397,22 @@ class DecisionCalibrator:
         arr = np.asarray(logits, dtype=np.float64)
         temp = self.temperature
         adj = self.logit_adjustments
+
+        def _single_binary_logit(z: float) -> np.ndarray:
+            if not math.isfinite(z):
+                return np.array([np.nan, np.nan], dtype=np.float64)
+            two = np.array([-0.5 * z, 0.5 * z], dtype=np.float64)
+            if adj is not None and adj.shape == (2,):
+                two = two + adj
+            scaled_two = two / temp
+            if not bool(np.all(np.isfinite(scaled_two))):
+                return np.array([np.nan, np.nan], dtype=np.float64)
+            return _stable_softmax(scaled_two, temperature=1.0)
+
         with np.errstate(over="ignore", invalid="ignore"):
+            if arr.ndim == 0:
+                return _single_binary_logit(float(arr))
             if self.is_binary:
-                if arr.ndim == 0:
-                    z = float(arr)
-                    if not math.isfinite(z):
-                        return np.array([np.nan, np.nan], dtype=np.float64)
-                    if adj is not None and adj.shape == (2,):
-                        z += float(adj[1] - adj[0])
-                    half_z = z / (2.0 * temp)
-                    if not (math.isfinite(z) and math.isfinite(half_z)):
-                        return np.array([np.nan, np.nan], dtype=np.float64)
-                    s_max = half_z if half_z >= -half_z else -half_z
-                    e0 = math.exp(-half_z - s_max)
-                    e1 = math.exp(half_z - s_max)
-                    inv = 1.0 / (e0 + e1)
-                    return np.array([e0 * inv, e1 * inv], dtype=np.float64)
                 if arr.ndim == 1:
                     finite_1d = np.isfinite(arr)
                     two = np.column_stack([-arr / 2.0, arr / 2.0])
@@ -427,19 +427,7 @@ class DecisionCalibrator:
 
             if arr.ndim == 1:
                 if len(arr) == 1:
-                    z = float(arr[0])
-                    if not math.isfinite(z):
-                        return np.array([np.nan, np.nan], dtype=np.float64)
-                    if adj is not None and adj.shape == (2,):
-                        z += float(adj[1] - adj[0])
-                    half_z = z / (2.0 * temp)
-                    if not (math.isfinite(z) and math.isfinite(half_z)):
-                        return np.array([np.nan, np.nan], dtype=np.float64)
-                    s_max = half_z if half_z >= -half_z else -half_z
-                    e0 = math.exp(-half_z - s_max)
-                    e1 = math.exp(half_z - s_max)
-                    inv = 1.0 / (e0 + e1)
-                    return np.array([e0 * inv, e1 * inv], dtype=np.float64)
+                    return _single_binary_logit(float(arr[0]))
                 if not bool(np.all(np.isfinite(arr))):
                     return np.full(arr.shape, np.nan, dtype=np.float64)
                 if adj is not None and adj.shape == (len(arr),):

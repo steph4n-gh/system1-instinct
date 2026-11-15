@@ -521,6 +521,59 @@ def _stable_softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
         return exp / np.sum(exp, axis=-1, keepdims=True)
 
 
+def _compute_hierarchical_logits_np(
+    emb: np.ndarray,
+    base_logits: np.ndarray,
+    coarse_weights: np.ndarray,
+    coarse_biases: np.ndarray,
+    cluster_assignments: Any,
+    fine_weights: Optional[np.ndarray] = None,
+    fine_biases: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Compute hierarchical coarse-to-fine logits with float64 softmax scaling and finiteness propagation."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        assign = np.asarray(cluster_assignments, dtype=np.int64)
+        coarse_logits = emb @ coarse_weights.T + coarse_biases
+        if assign.ndim != 1 or assign.size != base_logits.shape[1] or (
+            assign.size > 0 and np.any((assign < 0) | (assign >= coarse_logits.shape[1]))
+        ):
+            raise ValueError("Invalid hierarchical cluster_assignments")
+        c_scaled = np.asarray(coarse_logits, dtype=np.float64) / 0.25
+        hier_ok = (
+            np.all(np.isfinite(base_logits), axis=1)
+            & np.all(np.isfinite(coarse_logits), axis=1)
+            & np.all(np.isfinite(c_scaled), axis=1)
+        )
+        coarse_probs = _stable_softmax(c_scaled, temperature=1.0)
+        hier_ok &= np.all(np.isfinite(coarse_probs), axis=1)
+        mapped_coarse = np.asarray(coarse_logits, dtype=np.float64)[:, assign]
+        if fine_weights is not None and fine_biases is not None:
+            spec_logits = emb @ fine_weights.T + fine_biases
+            hier_ok &= np.all(np.isfinite(spec_logits), axis=1)
+            mapped_probs = coarse_probs[:, assign]
+            blended64 = (
+                0.65 * np.asarray(base_logits, dtype=np.float64)
+                + (0.20 + 0.30 * mapped_probs) * np.asarray(spec_logits, dtype=np.float64)
+                + 0.20 * mapped_coarse
+            )
+        else:
+            blended64 = (
+                0.80 * np.asarray(base_logits, dtype=np.float64)
+                + 0.20 * mapped_coarse
+            )
+        has_f64 = any(
+            arr is not None and getattr(arr, "dtype", None) == np.float64
+            for arr in (base_logits, coarse_weights, coarse_biases, fine_weights, fine_biases)
+        )
+        out_dtype = np.float64 if has_f64 else np.float32
+        blended = blended64.astype(out_dtype)
+        hier_ok &= np.all(np.isfinite(blended), axis=1)
+        if not bool(np.all(hier_ok)):
+            blended = np.array(blended, dtype=out_dtype, copy=True)
+            blended[~hier_ok] = np.nan
+        return blended
+
+
 def _stable_sigmoid(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     """Numerically stable sigmoid with temperature."""
     temp = max(1e-4, float(temperature))
@@ -2153,25 +2206,21 @@ class DecisionFieldHead:
                             base_logits = ((1.0 - alpha) * base_logits + alpha * shot_logits).astype(np.float32)
                     logits = base_logits
                 elif (
-                    self.hierarchical
+                    not isinstance(self.field_def, BooleanField)
+                    and self.hierarchical
                     and self.coarse_weights is not None
                     and self.coarse_biases is not None
                     and len(self.cluster_assignments) == self.weights.shape[0]
                 ):
-                    coarse_logits = emb @ self.coarse_weights.T + self.coarse_biases
-                    coarse_probs = _stable_softmax(coarse_logits / 0.25, temperature=1.0)
-                    assign = np.asarray(self.cluster_assignments, dtype=np.int64)
-                    mapped_coarse = coarse_logits[:, assign]
-                    mapped_probs = coarse_probs[:, assign]
-                    if self.fine_weights is not None and self.fine_biases is not None:
-                        spec_logits = emb @ self.fine_weights.T + self.fine_biases
-                        logits = (
-                            0.65 * logits
-                            + (0.20 + 0.30 * mapped_probs) * spec_logits
-                            + 0.20 * mapped_coarse
-                        ).astype(np.float32)
-                    else:
-                        logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
+                    logits = _compute_hierarchical_logits_np(
+                        emb,
+                        logits,
+                        self.coarse_weights,
+                        self.coarse_biases,
+                        self.cluster_assignments,
+                        self.fine_weights,
+                        self.fine_biases,
+                    )
 
         return logits.flatten() if single else logits
 

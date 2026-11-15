@@ -115,7 +115,7 @@ def _reject_duplicate_json_keys(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, A
 _MAX_JSON_NESTING_DEPTH = 64
 
 
-def _validate_container_depth(root: Any, *, max_depth: int = _MAX_JSON_NESTING_DEPTH) -> None:
+def _validate_payload_tree(root: Any, *, max_depth: int = _MAX_JSON_NESTING_DEPTH) -> None:
     stack: List[Tuple[Any, int]] = [(root, 0)]
     while stack:
         node, depth = stack.pop()
@@ -125,18 +125,23 @@ def _validate_container_depth(root: Any, *, max_depth: int = _MAX_JSON_NESTING_D
                     f"JSON nesting depth exceeds maximum allowed limit ({max_depth})",
                     status_code=400,
                 )
-            for v in node.values():
-                if isinstance(v, (Mapping, list, tuple)):
-                    stack.append((v, depth + 1))
-        elif isinstance(node, (list, tuple)):
+            for k, v in node.items():
+                stack.append((k, depth + 1))
+                stack.append((v, depth + 1))
+        elif isinstance(node, (list, tuple, set, frozenset)):
             if depth >= max_depth:
                 raise InteropError(
                     f"JSON nesting depth exceeds maximum allowed limit ({max_depth})",
                     status_code=400,
                 )
             for v in node:
-                if isinstance(v, (Mapping, list, tuple)):
-                    stack.append((v, depth + 1))
+                stack.append((v, depth + 1))
+        elif isinstance(node, (float, np.floating)) and not isinstance(node, bool):
+            if not math.isfinite(float(node)):
+                raise InteropError(f"Non-finite numeric value in payload: {node!r}", status_code=400)
+
+
+_validate_container_depth = _validate_payload_tree
 
 
 def strict_json_loads(raw: bytes | str) -> Any:
@@ -248,6 +253,7 @@ def extract_semantic_text(payload: Mapping[str, Any]) -> Tuple[str, Any]:
             break
     if raw_input is None:
         raise SchemaValidationError("Request must include non-empty 'input', 'state', or 'contents'")
+    _validate_payload_tree(raw_input)
 
     parts: List[str] = []
 
@@ -418,38 +424,60 @@ def compile_questions_contract(questions: Any) -> CompiledContractSchema:
         if q_type in ("choice", "multichoice"):
             raw_criteria = spec.get("criteria")
             raw_options = spec.get("options")
+            raw_desc_map: Dict[str, str] = {}
             if isinstance(raw_criteria, Mapping):
-                options = tuple(str(k) for k in raw_criteria.keys())
-                descriptions = {str(k): str(v) for k, v in raw_criteria.items()}
+                raw_opt_list = list(raw_criteria.keys())
+                for k, v in raw_criteria.items():
+                    if not isinstance(k, bool):
+                        raw_desc_map[str(k).strip()] = str(v)
             elif isinstance(raw_criteria, (list, tuple)):
-                options = tuple(str(x) for x in raw_criteria)
-                descriptions = (
-                    {str(k): str(v) for k, v in spec.get("descriptions", {}).items()}
-                    if isinstance(spec.get("descriptions"), Mapping)
-                    else {o: o for o in options}
-                )
+                raw_opt_list = list(raw_criteria)
+                if isinstance(spec.get("descriptions"), Mapping):
+                    for k, v in spec.get("descriptions", {}).items():
+                        if not isinstance(k, bool):
+                            raw_desc_map[str(k).strip()] = str(v)
             elif isinstance(raw_options, Mapping):
-                options = tuple(str(k) for k in raw_options.keys())
-                descriptions = {str(k): str(v) for k, v in raw_options.items()}
+                raw_opt_list = list(raw_options.keys())
+                for k, v in raw_options.items():
+                    if not isinstance(k, bool):
+                        raw_desc_map[str(k).strip()] = str(v)
             elif isinstance(raw_options, (list, tuple)):
-                options = tuple(str(x) for x in raw_options)
-                descriptions = (
-                    {str(k): str(v) for k, v in spec.get("descriptions", {}).items()}
-                    if isinstance(spec.get("descriptions"), Mapping)
-                    else {o: o for o in options}
-                )
+                raw_opt_list = list(raw_options)
+                if isinstance(spec.get("descriptions"), Mapping):
+                    for k, v in spec.get("descriptions", {}).items():
+                        if not isinstance(k, bool):
+                            raw_desc_map[str(k).strip()] = str(v)
             else:
                 raise SchemaValidationError(f"Choice question {ext_name!r} requires 'criteria' or 'options'")
+
+            cleaned_opts: List[str] = []
+            for raw_opt in raw_opt_list:
+                if isinstance(raw_opt, bool):
+                    raise SchemaValidationError(f"Option in question {ext_name!r} cannot be boolean")
+                opt_s = str(raw_opt).strip()
+                if not opt_s:
+                    raise SchemaValidationError(f"Empty option in question {ext_name!r}")
+                cleaned_opts.append(opt_s)
+            options = tuple(cleaned_opts)
+            descriptions = {opt: raw_desc_map.get(opt, opt if isinstance(raw_criteria or raw_options, (list, tuple)) else "") for opt in options}
 
             if q_type == "choice" and not (2 <= len(options) <= 255):
                 raise SchemaValidationError(
                     f"Choice question {ext_name!r} requires between 2 and 255 options, got {len(options)}"
+                )
+            if q_type == "multichoice" and not (1 <= len(options) <= 255):
+                raise SchemaValidationError(
+                    f"Multichoice question {ext_name!r} requires between 1 and 255 options, got {len(options)}"
                 )
             if len(set(options)) != len(options):
                 raise SchemaValidationError(f"Duplicate options in question {ext_name!r}")
 
             norm_descriptions = {opt: descriptions.get(opt, "") for opt in options}
             thresh = parse_finite_float(spec.get("threshold", 0.5), field_name="threshold")
+            if q_type == "multichoice" and not (0.0 <= thresh <= 1.0):
+                raise SchemaValidationError(
+                    f"Multichoice question {ext_name!r} threshold must be in [0, 1], got {thresh}"
+                )
             contract = QuestionContract(
                 external_name=ext_name,
                 internal_name=internal_name,
@@ -551,12 +579,22 @@ def compile_questions_contract(questions: Any) -> CompiledContractSchema:
             raise SchemaValidationError(f"Unsupported question type {q_type!r} for {ext_name!r}")
 
         contracts.append(contract)
-        fields[internal_name] = contract.to_decision_field()
+        try:
+            fields[internal_name] = contract.to_decision_field()
+        except SchemaValidationError:
+            raise
+        except (ValueError, TypeError) as exc:
+            raise SchemaValidationError(str(exc)) from exc
         ext_to_int[ext_name] = internal_name
         int_to_ext[internal_name] = ext_name
 
     fp = hashlib.sha256(json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
-    schema = DecisionSchema(fields=fields, schema_name=f"universal_{fp}")
+    try:
+        schema = DecisionSchema(fields=fields, schema_name=f"universal_{fp}")
+    except SchemaValidationError:
+        raise
+    except (ValueError, TypeError) as exc:
+        raise SchemaValidationError(str(exc)) from exc
     return CompiledContractSchema(
         schema=schema,
         contracts=tuple(contracts),
@@ -1478,6 +1516,9 @@ class UniversalDecisionService:
         slot_hint: Optional[str] = None,
         freeze_learning: Optional[bool] = None,
     ) -> Tuple[int, Dict[str, Any]]:
+        if not isinstance(payload, Mapping):
+            raise SchemaValidationError("Request payload must be a JSON object")
+        _validate_payload_tree(payload)
         wire_format = detect_wire_format(path, payload)
         semantic_text, _ = extract_semantic_text(payload)
         contract = compile_questions_contract(payload.get("questions"))

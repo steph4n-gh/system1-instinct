@@ -1421,6 +1421,30 @@ class HybridProjector:
 
     extract_schema_anchor_texts = staticmethod(extract_schema_anchor_texts)
 
+    @staticmethod
+    def _require_finite_scalar(val: Any, name: str) -> float:
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"HybridProjector {name} must be a finite number, got {val!r}")
+        fval = float(val)
+        if not math.isfinite(fval):
+            raise ValueError(f"HybridProjector {name} must be finite, got {val!r}")
+        return fval
+
+    @staticmethod
+    def _require_strict_int(val: Any, name: str) -> int:
+        if type(val) is not int:
+            raise ValueError(f"HybridProjector {name} must be an integer, got {val!r}")
+        return val
+
+    @staticmethod
+    def _require_strict_bool(mapping: Mapping[str, Any], key: str, default: bool = False) -> bool:
+        if key not in mapping:
+            return default
+        val = mapping[key]
+        if type(val) is not bool:
+            raise ValueError(f"Saved hybrid projector {key} must be a boolean")
+        return val
+
     def __init__(
         self,
         dimension: Optional[int] = None,
@@ -1434,11 +1458,12 @@ class HybridProjector:
         spectral_blend: float = 0.35,
     ) -> None:
         self._explicit_alpha = alpha is not None
-        eff_alpha = 0.5 if alpha is None else float(alpha)
+        eff_alpha = 0.5 if alpha is None else self._require_finite_scalar(alpha, "alpha")
         if not (0.0 < eff_alpha < 1.0):
             raise ValueError(f"alpha must be in (0.0, 1.0), got {eff_alpha}")
 
         if dimension is not None:
+            dimension = self._require_strict_int(dimension, "dimension")
             if dimension <= 0:
                 raise ValueError(f"dimension must be positive, got {dimension}")
             # Divide dimension between sparse and dense
@@ -1446,18 +1471,28 @@ class HybridProjector:
             dense_dim = max(1, dimension - sparse_dim)
             self.dimension = sparse_dim + dense_dim
         else:
+            sparse_dim = self._require_strict_int(sparse_dim, "sparse_dim")
+            dense_dim = self._require_strict_int(dense_dim, "dense_dim")
             if sparse_dim <= 0:
                 raise ValueError(f"sparse_dim must be positive, got {sparse_dim}")
             if dense_dim <= 0:
                 raise ValueError(f"dense_dim must be positive, got {dense_dim}")
             self.dimension = sparse_dim + dense_dim
 
+        seed = self._require_strict_int(seed, "seed")
+        eff_svd_power = self._require_finite_scalar(svd_power, "svd_power")
+        if eff_svd_power < 0.0:
+            raise ValueError(f"svd_power must be nonnegative, got {eff_svd_power}")
+        eff_spectral_blend = self._require_finite_scalar(spectral_blend, "spectral_blend")
+        if not (0.0 <= eff_spectral_blend <= 1.0):
+            raise ValueError(f"spectral_blend must be in [0.0, 1.0], got {eff_spectral_blend}")
+
         self.sparse_dim = sparse_dim
         self.dense_dim = dense_dim
         self.alpha = eff_alpha
         self.seed = seed
-        self.svd_power = float(svd_power)
-        self.spectral_blend = float(spectral_blend)
+        self.svd_power = eff_svd_power
+        self.spectral_blend = eff_spectral_blend
         self.backend = self._resolve_backend(backend)
 
         # Dense subword semantic engine
@@ -2589,11 +2624,35 @@ class HybridProjector:
         dense = config.get("dense_dim")
         if type(sparse) is not int or type(dense) is not int or sparse <= 0 or dense <= 0:
             raise ValueError("Saved hybrid projector dimensions do not match the skill")
-        alpha = float(config.get("alpha", 0.5))
-        seed = int(config.get("seed", 42))
-        svd_power = float(config.get("svd_power", 0.5))
-        spectral_blend = float(config.get("spectral_blend", 0.35))
-        terms = tuple(config.get("spectral_terms", ()))
+        fitted_flag = cls._require_strict_bool(config, "fitted", False)
+        use_subspace_flag = cls._require_strict_bool(config, "use_subspace", False)
+        direct_spectral_flag = cls._require_strict_bool(config, "direct_spectral", False)
+        raw_ds_dim = cls._require_strict_int(config.get("direct_spectral_dim", 0), "direct_spectral_dim")
+        if not (0 <= raw_ds_dim <= 1024):
+            raise ValueError("Saved hybrid projector direct_spectral_dim is invalid")
+        alpha = cls._require_finite_scalar(config.get("alpha", 0.5), "alpha")
+        seed = cls._require_strict_int(config.get("seed", 42), "seed")
+        svd_power = cls._require_finite_scalar(config.get("svd_power", 0.5), "svd_power")
+        spectral_blend = cls._require_finite_scalar(config.get("spectral_blend", 0.35), "spectral_blend")
+        subspace_weight = cls._require_finite_scalar(
+            config.get("subspace_weight", 0.20 if fitted_flag else 0.0),
+            "subspace_weight",
+        )
+        if not (0.0 <= subspace_weight <= 1.0):
+            raise ValueError("Saved hybrid projector subspace_weight must be in [0, 1]")
+        context_smooth = cls._require_finite_scalar(config.get("context_smooth", 1.0), "context_smooth")
+        if context_smooth < 0.0:
+            raise ValueError("Saved hybrid projector context_smooth must be nonnegative")
+        rbf_gamma = cls._require_finite_scalar(config.get("rbf_gamma", 3.0), "rbf_gamma")
+        if rbf_gamma <= 0.0:
+            raise ValueError("Saved hybrid projector rbf_gamma must be positive")
+        rbf_weight = cls._require_finite_scalar(config.get("rbf_weight", 0.0), "rbf_weight")
+        if not (0.0 <= rbf_weight < 1.0):
+            raise ValueError("Saved hybrid projector rbf_weight must be in [0, 1)")
+        raw_terms = config.get("spectral_terms", ())
+        if not isinstance(raw_terms, (list, tuple)):
+            raise ValueError("Saved hybrid spectral terms must be a sequence")
+        terms = tuple(raw_terms)
         if any(not isinstance(term, str) or not term.strip() for term in terms) or len(set(terms)) != len(terms):
             raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
         proj = cls(
@@ -2605,10 +2664,10 @@ class HybridProjector:
             svd_power=svd_power,
             spectral_blend=spectral_blend,
         )
-        proj._use_subspace = bool(config.get("use_subspace", False))
-        proj._direct_spectral = bool(config.get("direct_spectral", False))
-        proj._direct_spectral_dim = int(config.get("direct_spectral_dim", 0)) if proj._direct_spectral else 0
-        proj._context_smooth = float(config.get("context_smooth", 1.0))
+        proj._use_subspace = use_subspace_flag
+        proj._direct_spectral = direct_spectral_flag
+        proj._direct_spectral_dim = raw_ds_dim if proj._direct_spectral else 0
+        proj._context_smooth = context_smooth
 
         _hybrid_tfidf_key_map = (
             ("tfidf_use_stems", "use_stems"),
@@ -2626,7 +2685,7 @@ class HybridProjector:
         }
         has_any_tfidf_cfg = bool(set(config.keys()) & _hybrid_all_tfidf_keys)
 
-        if config.get("fitted"):
+        if fitted_flag:
             if "tfidf_terms" not in config:
                 if has_any_tfidf_cfg or tfidf_idf_array is not None:
                     raise ValueError("Saved hybrid projector has incomplete TF-IDF configuration")
@@ -2673,8 +2732,8 @@ class HybridProjector:
             raw_weights = config.get("spectral_weights", ())
             if not isinstance(raw_weights, (list, tuple)):
                 raise ValueError("Saved hybrid projector spectral weights must be a sequence")
-            weights = tuple(float(w) for w in raw_weights)
-            if len(terms) != len(weights) or any(not math.isfinite(w) for w in weights):
+            weights = tuple(cls._require_finite_scalar(w, "spectral_weights") for w in raw_weights)
+            if len(terms) != len(weights):
                 raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
             with np.errstate(over="ignore", invalid="ignore"):
                 weights_arr = (
@@ -2774,37 +2833,21 @@ class HybridProjector:
                 ):
                     raise ValueError("Saved hybrid projector subspace_components have invalid shape")
                 proj._subspace_components = sub_arr
-            sub_w = float(config.get("subspace_weight", 0.20))
-            if not math.isfinite(sub_w):
-                raise ValueError("Saved hybrid projector subspace_weight must be finite")
-            proj._subspace_weight = sub_w
+            proj._subspace_weight = subspace_weight
 
             rbf_arr = _resolve_hybrid_matrix("rbf_landmarks", rbf_landmarks)
             if rbf_arr is not None and len(rbf_arr) > 0:
                 base_dim = proj._base_dimension
                 if rbf_arr.ndim != 2 or rbf_arr.shape[0] < 1 or rbf_arr.shape[1] != base_dim or not np.all(np.isfinite(rbf_arr)):
                     raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
-                raw_gamma = config.get("rbf_gamma", 3.0)
-                raw_rw = config.get("rbf_weight", 0.14)
-                if (
-                    isinstance(raw_gamma, bool)
-                    or not isinstance(raw_gamma, (int, float))
-                    or not math.isfinite(float(raw_gamma))
-                    or float(raw_gamma) <= 0.0
-                ):
-                    raise ValueError("Saved hybrid projector rbf_gamma must be positive")
-                if (
-                    isinstance(raw_rw, bool)
-                    or not isinstance(raw_rw, (int, float))
-                    or not math.isfinite(float(raw_rw))
-                    or not (0.0 < float(raw_rw) < 1.0)
-                ):
+                eff_rw = cls._require_finite_scalar(config.get("rbf_weight", 0.14), "rbf_weight")
+                if not (0.0 < eff_rw < 1.0):
                     raise ValueError(
                         "Saved hybrid projector rbf_weight must be in (0, 1) when rbf_landmarks are present"
                     )
                 proj._rbf_landmarks = rbf_arr
-                proj._rbf_gamma = float(raw_gamma)
-                proj._rbf_weight = float(raw_rw)
+                proj._rbf_gamma = rbf_gamma
+                proj._rbf_weight = eff_rw
 
             proj._update_dimension()
             proj._fitted = True
@@ -2997,6 +3040,7 @@ class SmartsCrossZeroFewRouter:
 
         f_def = s_inst.fields[field_name]
         self.is_boolean = isinstance(f_def, BooleanField)
+        self.bool_threshold: Optional[float] = float(f_def.threshold) if self.is_boolean else None
         if options is None:
             if self.is_boolean:
                 options = ("False", "True")
@@ -3062,6 +3106,16 @@ class SmartsCrossZeroFewRouter:
             if label_str == "False":
                 return False
         return label_str
+
+    def _select_predicted_label(self, scores: np.ndarray, probs: np.ndarray) -> Any:
+        if (
+            self.is_boolean
+            and self.bool_threshold is not None
+            and "True" in self.opt_to_idx
+            and "False" in self.opt_to_idx
+        ):
+            return bool(float(probs[self.opt_to_idx["True"]]) >= self.bool_threshold)
+        return self._public_value(self.options[int(np.argmax(scores))])
 
     def _compile_bm25f_and_concepts(self) -> None:
         K = self.K
@@ -3441,7 +3495,7 @@ class SmartsCrossZeroFewRouter:
         if not self.fewshot_active or self.few_W is None or self.few_b is None:
             probs = np.exp((zs - np.max(zs)) * 4.0)
             probs /= probs.sum()
-            return self._public_value(self.options[int(np.argmax(zs))]), probs
+            return self._select_predicted_label(zs, probs), probs
 
         assert self.few_protos is not None and self.few_X is not None and self.few_y is not None
         if self.few_proj is not None:
@@ -3478,7 +3532,7 @@ class SmartsCrossZeroFewRouter:
         comb = w_zs * zs_scaled + (1.0 - w_zs) * fs_comb
         probs = np.exp((comb - np.max(comb)) * 4.0)
         probs /= probs.sum()
-        return self._public_value(self.options[int(np.argmax(comb))]), probs
+        return self._select_predicted_label(comb, probs), probs
 
     def predict(self, prompt: str) -> Any:
         pred, _ = self.score_and_predict(prompt)
