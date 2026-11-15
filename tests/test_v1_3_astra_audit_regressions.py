@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import io
 import json
 import math
@@ -6432,8 +6433,8 @@ def test_astra_25_round12_regressions() -> None:
         )
         dec_q0 = eng_nb.decide("probe", record_receipt=False)
         fleet_q0 = MultiTenantSkillFleet.from_compiled_model(eng_nb, num_tenants=1)
-        assert float(fleet_q0.q_init[0]) == pytest.approx(1e-4, abs=1e-7)
-        assert float(fleet_q0.q_init[1]) == pytest.approx(1e-4, abs=1e-7)
+        assert float(fleet_q0.q_init[0]) == 0.0
+        assert float(fleet_q0.q_init[1]) == 0.0
         assert list(fleet_q0.decide(0, "probe").conformal_set) == dec_q0.conformal_sets["f"] == []
 
         eng_nb.conformal_predictors["f"].calibrate(
@@ -6441,8 +6442,19 @@ def test_astra_25_round12_regressions() -> None:
             ["False"] * 20,
         )
         fleet_q0_fallback = MultiTenantSkillFleet.from_compiled_model(eng_nb, num_tenants=1)
-        assert float(fleet_q0_fallback.q_init[1]) == pytest.approx(1e-4, abs=1e-7)
+        assert float(fleet_q0_fallback.q_init[1]) == 0.0
         assert list(fleet_q0_fallback.decide(0, "probe").conformal_set) == []
+
+        # High-confidence bias (sigmoid(12.0) > 0.99999) must produce empty set when q_init == 0.0
+        mdl_nb._field_heads["f"].set_weights(np.zeros((1, 16), dtype=np.float32), np.array([np.float32(3.0)], dtype=np.float32))
+        mdl_nb.heads["f"].biases = np.array([np.float32(3.0)], dtype=np.float32)
+        eng_nb.calibrators["f"].temperature = 1.0
+        mdl_nb.heads["f"].temperature = 1.0
+        dec_q0_high = eng_nb.decide("probe", record_receipt=False)
+        fleet_q0_high = MultiTenantSkillFleet.from_compiled_model(eng_nb, num_tenants=1)
+        assert dec_q0_high.conformal_sets["f"] == [] and dec_q0_high.is_ambiguous is True
+        dec_fl_q0_high = fleet_q0_high.decide(0, "probe")
+        assert dec_fl_q0_high.conformal_set == () and dec_fl_q0_high.is_ambiguous is True
 
         cp_q0_direct = eng_nb.conformal_predictors["f"]
         cp_q0_direct.is_calibrated = True
@@ -6450,8 +6462,8 @@ def test_astra_25_round12_regressions() -> None:
         cp_q0_direct.calibration_scores = np.array([], dtype=np.float64)
         cp_q0_direct.class_calibration_scores = {}
         fleet_q0_direct = MultiTenantSkillFleet.from_compiled_model(eng_nb, num_tenants=1)
-        assert float(fleet_q0_direct.q_init[0]) == pytest.approx(1e-4, abs=1e-7)
-        assert float(fleet_q0_direct.q_init[1]) == pytest.approx(1e-4, abs=1e-7)
+        assert float(fleet_q0_direct.q_init[0]) == 0.0
+        assert float(fleet_q0_direct.q_init[1]) == 0.0
         assert list(fleet_q0_direct.decide(0, "probe").conformal_set) == []
 
         # Extreme thresholds 0.0 and 1.0 parity
@@ -9614,5 +9626,877 @@ def test_astra_29_round16_regressions() -> None:
         assert rc_ok.confidence == pytest.approx(0.5, abs=1e-6)
         assert bool(np.all(np.isfinite(chk_cancel.compute_component_logits(0, "p")["base"])))
 
+
+def test_astra_30_round17_regressions() -> None:
+    """Round-17 adversarial audit regressions R17-1 through R17-8 and sister paths (100% in-memory)."""
+    from decimal import Decimal
+    from system1 import (
+        ConformalPredictor,
+        CumulativeLogitOrdinalHead,
+        GuardShield,
+        ScoreField,
+        cqr_ordinal_intervals,
+    )
+
+    class _ConstUnitProj:
+        def __init__(self, dim: int = 8) -> None:
+            self.dimension = dim
+            self.recency_weighted = False
+
+        def project(self, text: str) -> np.ndarray:
+            vec = np.zeros(self.dimension, dtype=np.float32)
+            vec[0] = 1.0
+            return vec
+
+        def to_config(self) -> Dict[str, Any]:
+            return {"type": "test_const", "dimension": self.dimension}
+
+    class _ConstChoiceSchema(DecisionSchema):
+        c = ChoiceField(("a", "b"), escalate_on_ambiguity=True)
+
+    const_proj = _ConstUnitProj(8)
+
+    def _build_strict_const_engine() -> SystemOneEngine:
+        eng = SystemOneEngine(
+            _ConstChoiceSchema,
+            dimension=8,
+            backend="numpy",
+            projector=const_proj,
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=True,
+            enable_margin_gating=False,
+        )
+        eng.default_alpha = 0.1
+        eng.model.heads["c"].set_weights(
+            np.zeros((2, 8), dtype=np.float32),
+            np.array([1.0, 0.0], dtype=np.float32),
+        )
+        return eng
+
+    # ------------------------------------------------------------------
+    # R17-1: Uncalibrated sources remain ambiguous (full set + is_ambiguous=True)
+    # ------------------------------------------------------------------
+    eng_u = _build_strict_const_engine()
+    dec_eu = eng_u.decide("probe", alpha=0.1, record_receipt=False)
+    assert dec_eu.conformal_sets["c"] == ["a", "b"]
+    assert dec_eu.is_ambiguous is True
+
+    cm_u = eng_u.to_compiled_model()
+    cm_u_v2 = CompiledSystemOneModel.from_bytes(cm_u.to_bytes(format_version=2), projector=const_proj)
+    cm_u_v3 = CompiledSystemOneModel.from_bytes(cm_u.to_bytes(format_version=3), projector=const_proj)
+    cm_split0 = SystemOneCompiler(_ConstChoiceSchema, dimension=8, projector=const_proj).compile(
+        {"c": [("pos", "a"), ("neg", "b")] * 4},
+        calibration_split=0.0,
+        augment=False,
+    )
+    for src_u in (eng_u, cm_u, cm_u_v2, cm_u_v3, cm_split0):
+        fl_u = MultiTenantSkillFleet.from_compiled_model(src_u, "c", num_tenants=2, alpha=0.1)
+        assert list(fl_u.q_init) == [1.0, 1.0]
+        assert bool(fl_u._tenant_uncal[0]) is True and bool(fl_u._tenant_uncal[1]) is True
+        dec_fu = fl_u.decide(0, "probe")
+        assert dec_fu.conformal_set == ("a", "b")
+        assert dec_fu.is_ambiguous is True
+        fl_u_snap = MultiTenantSkillFleet.fleet_delta_from_bytes(fl_u.fleet_delta_to_bytes(), projector=const_proj)
+        assert fl_u_snap.decide(0, "probe").is_ambiguous is True
+        assert fl_u_snap.decide(0, "probe").conformal_set == ("a", "b")
+
+    # K == 1 uncalibrated fleet stays is_ambiguous=True until tenant calibrates via update_conformal
+    fl_k1 = MultiTenantSkillFleet(
+        const_proj,
+        classes=("only",),
+        W_base=np.zeros((1, 8), dtype=np.float32),
+        b_base=np.zeros(1, dtype=np.float32),
+        q_init=np.array([1.0], dtype=np.float64),
+        num_tenants=2,
+        alpha=0.1,
+        _tenant_uncal=True,
+    )
+    assert fl_k1.decide(0, "probe").conformal_set == ("only",)
+    assert fl_k1.decide(0, "probe").is_ambiguous is True
+    assert fl_k1.decide(1, "probe").is_ambiguous is True
+
+    fl_k1.update_conformal(0, "only", np.array([1.0], dtype=np.float64))
+    assert fl_k1.decide(0, "probe").is_ambiguous is False
+    assert fl_k1.decide(1, "probe").is_ambiguous is True
+
+    fl_k1_snap = MultiTenantSkillFleet.fleet_delta_from_bytes(fl_k1.fleet_delta_to_bytes(), projector=const_proj)
+    assert fl_k1_snap.decide(0, "probe").is_ambiguous is False
+    assert fl_k1_snap.decide(1, "probe").is_ambiguous is True
+
+    # Resetting live cp to uncalibrated overrides stale calibrated CompiledHeadWeights
+    eng_cal_then_uncal = _build_strict_const_engine()
+    eng_cal_then_uncal.conformal_predictors["c"] = ConformalPredictor("c", ("a", "b"), score_method="lac", mondrian=False)
+    eng_cal_then_uncal.conformal_predictors["c"].calibrate(np.tile([0.9, 0.1], (50, 1)), ["a"] * 50)
+    cm_calibrated = eng_cal_then_uncal.to_compiled_model()
+    eng_wrapped = SystemOneEngine(
+        _ConstChoiceSchema,
+        compiled_model=cm_calibrated,
+        backend="numpy",
+        projector=const_proj,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+    )
+    eng_wrapped.conformal_predictors["c"].is_calibrated = False
+    eng_wrapped.conformal_predictors["c"].calibration_scores = np.array([], dtype=np.float64)
+    eng_wrapped.conformal_predictors["c"].quantile = None
+    fl_reset_uncal = MultiTenantSkillFleet.from_compiled_model(eng_wrapped, "c", num_tenants=1, alpha=0.1)
+    assert fl_reset_uncal.decide(0, "probe").is_ambiguous is True
+    assert fl_reset_uncal.decide(0, "probe").conformal_set == ("a", "b")
+
+    # Tampered tenant_uncal snapshot entries fail closed
+    blob_k1 = fl_k1.fleet_delta_to_bytes()
+    for bad_arr in (
+        np.array([0, 2], dtype=np.uint8),
+        np.array([0], dtype=np.uint8),
+        np.array([0.0, 1.0], dtype=np.float32),
+    ):
+        tampered_u = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(blob_k1), "r") as zin, zipfile.ZipFile(tampered_u, "w") as zout:
+            for info in zin.infolist():
+                payload_b = zin.read(info.filename)
+                if info.filename == "tenant_uncal.npy":
+                    bout = io.BytesIO()
+                    np.save(bout, bad_arr, allow_pickle=False)
+                    payload_b = bout.getvalue()
+                zout.writestr(info.filename, payload_b)
+        with pytest.raises(ValueError):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(tampered_u.getvalue(), projector=const_proj)
+
+    # ------------------------------------------------------------------
+    # R17-2: Float64 q_init precision preserved before conservative float16 ceiling
+    # ------------------------------------------------------------------
+    eng_p = _build_strict_const_engine()
+    eng_p.model.heads["c"].set_weights(
+        np.zeros((2, 8), dtype=np.float32),
+        np.array([2.5e-9, -2.5e-9], dtype=np.float64),
+    )
+    cp_p = ConformalPredictor("c", ("a", "b"), score_method="lac", mondrian=False)
+    cp_p.calibrate(np.tile([0.5 - 1e-8, 0.5 + 1e-8], (100, 1)), ["a"] * 100)
+    eng_p.conformal_predictors["c"] = cp_p
+    dec_ep = eng_p.decide("probe", alpha=0.1, record_receipt=False)
+    assert dec_ep.conformal_sets["c"] == ["a", "b"] and dec_ep.is_ambiguous is True
+
+    cm_p = eng_p.to_compiled_model()
+    for src_p in (eng_p, cm_p):
+        fl_p = MultiTenantSkillFleet.from_compiled_model(src_p, "c", num_tenants=1, alpha=0.1)
+        assert float(fl_p.q_c[0, 0]) > 0.5
+        dec_fp = fl_p.decide(0, "probe")
+        assert dec_fp.conformal_set == ("a", "b")
+        assert dec_fp.is_ambiguous is True
+        fl_p_snap = MultiTenantSkillFleet.fleet_delta_from_bytes(fl_p.fleet_delta_to_bytes(), projector=const_proj)
+        assert fl_p_snap.decide(0, "probe").conformal_set == ("a", "b")
+        assert fl_p_snap.decide(0, "probe").is_ambiguous is True
+
+    # Mondrian empirical (k_c <= n_c) and shrunk (k_c > n_c) sub-float32 cutoff parity
+    cp_pm = ConformalPredictor("c", ("a", "b"), score_method="lac", mondrian=True)
+    cp_pm.calibrate(
+        np.vstack([np.tile([0.5 - 1e-8, 0.5 + 1e-8], (100, 1)), np.tile([0.4, 0.6], (5, 1))]),
+        ["a"] * 100 + ["b"] * 5,
+    )
+    eng_p.conformal_predictors["c"] = cp_pm
+    fl_pm = MultiTenantSkillFleet.from_compiled_model(eng_p, "c", num_tenants=1, alpha=0.1)
+    assert float(fl_pm.q_c[0, 0]) > 0.5
+    assert fl_pm.decide(0, "probe").conformal_set == ("a", "b")
+
+    cp_pm_shrunk = ConformalPredictor("c", ("a", "b"), score_method="lac", mondrian=True)
+    cp_pm_shrunk.calibration_scores = np.array([0.5 + 1e-8] * 100, dtype=np.float64)
+    cp_pm_shrunk.class_calibration_scores = {"a": np.array([0.5 + 1e-8], dtype=np.float64)}
+    cp_pm_shrunk.is_calibrated = True
+    eng_p.conformal_predictors["c"] = cp_pm_shrunk
+    fl_pms = MultiTenantSkillFleet.from_compiled_model(eng_p, "c", num_tenants=1, alpha=0.1)
+    assert float(fl_pms.q_c[0, 1]) > 0.5
+    assert fl_pms.decide(0, "probe").conformal_set == ("a", "b")
+
+    # ------------------------------------------------------------------
+    # R17-3: Projector with recency-aware project() + project_with_norm() & no raw_norm()
+    # ------------------------------------------------------------------
+    class _DualProj:
+        def __init__(self, dim: int = 8) -> None:
+            self.dimension = dim
+            self.recency_weighted = False
+            self.last_rw: List[Any] = []
+
+        def project(self, text: str, recency_weighted: bool = False) -> np.ndarray:
+            self.last_rw.append(recency_weighted)
+            vec = np.zeros(self.dimension, dtype=np.float32)
+            vec[1 if recency_weighted else 0] = 1.0
+            return vec
+
+        def project_with_norm(self, text: str) -> tuple[np.ndarray, float]:
+            vec = np.zeros(self.dimension, dtype=np.float32)
+            vec[1] = 1.0
+            return vec, 0.01
+
+        def to_config(self) -> Dict[str, Any]:
+            return {"type": "test_dual", "dimension": self.dimension}
+
+    dual_proj = _DualProj(8)
+    eng_dual = SystemOneEngine(
+        _ConstChoiceSchema,
+        dimension=8,
+        backend="numpy",
+        projector=dual_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+        recency_weighted=False,
+    )
+    eng_dual.default_alpha = 0.1
+    eng_dual.model.heads["c"].set_weights(
+        np.array(
+            [
+                [1.0, -5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        np.array([0.0, 0.0], dtype=np.float32),
+    )
+    cp_dual = ConformalPredictor("c", ("a", "b"), score_method="lac", mondrian=False, familiarity_threshold=0.5)
+    cp_dual.calibrate(np.tile([0.8, 0.2], (100, 1)), ["a"] * 100)
+    eng_dual.conformal_predictors["c"] = cp_dual
+
+    dec_dual_eng = eng_dual.decide("probe", alpha=0.1, record_receipt=False)
+    assert dec_dual_eng.values["c"] == "a"
+    assert dec_dual_eng.conformal_sets["c"] == []
+    assert dec_dual_eng.is_ambiguous is True
+    assert dec_dual_eng.familiarity_score == pytest.approx(0.01, abs=1e-12)
+
+    cm_dual = eng_dual.to_compiled_model()
+    eng_dual_comp = SystemOneEngine(
+        _ConstChoiceSchema,
+        compiled_model=cm_dual,
+        backend="numpy",
+        projector=dual_proj,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+    )
+    dec_dual_comp = eng_dual_comp.decide("probe", alpha=0.1, record_receipt=False)
+    assert dec_dual_comp.values["c"] == "a" and dec_dual_comp.conformal_sets["c"] == [] and dec_dual_comp.is_ambiguous is True
+
+    # Verify engine.decide fallback when model.forward_single returns raw_norm=None
+    class _RawNormOmittedWrapper:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def forward_single(self, prompt: str, **kwargs: Any) -> Any:
+            kwargs.pop("use_cache", None)
+            res = self._inner.forward_single(prompt, **kwargs)
+            return dataclasses.replace(res, raw_norm=None)
+
+    eng_dual_wrap = SystemOneEngine(
+        _ConstChoiceSchema,
+        compiled_model=cm_dual,
+        backend="numpy",
+        projector=dual_proj,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+    )
+    eng_dual_wrap.model = _RawNormOmittedWrapper(cm_dual)
+    dec_wrap = eng_dual_wrap.decide("probe", alpha=0.1, record_receipt=False)
+    assert dec_wrap.conformal_sets["c"] == [] and dec_wrap.is_ambiguous is True
+    assert dec_wrap.familiarity_score == pytest.approx(0.01, abs=1e-12)
+
+    fl_dual = MultiTenantSkillFleet.from_compiled_model(eng_dual, "c", num_tenants=1, alpha=0.1)
+    assert fl_dual.familiarity_threshold == pytest.approx(0.5, abs=1e-12)
+    dual_proj.last_rw.clear()
+    dec_dual_fl = fl_dual.decide(0, "probe")
+    assert dec_dual_fl.predicted_label == "a"
+    assert dec_dual_fl.conformal_set == ()
+    assert dec_dual_fl.is_ambiguous is True
+    assert dual_proj.last_rw[-1] is False
+
+    fl_dual_snap = MultiTenantSkillFleet.fleet_delta_from_bytes(fl_dual.fleet_delta_to_bytes(), projector=dual_proj)
+    dec_dual_snap = fl_dual_snap.decide(0, "probe")
+    assert dec_dual_snap.predicted_label == "a"
+    assert dec_dual_snap.conformal_set == ()
+    assert dec_dual_snap.is_ambiguous is True
+
+    # compile(..., familiarity_alpha=...) & engine.calibrate(..., familiarity_alpha=...) support project_with_norm without raw_norm
+    cm_dual_fam = SystemOneCompiler(_ConstChoiceSchema, dimension=8, projector=dual_proj).compile(
+        {"c": [(f"dual_sample_{i}", "a" if i % 2 == 0 else "b") for i in range(20)]},
+        calibration_split=0.5,
+        augment=False,
+        familiarity_alpha=0.2,
+    )
+    assert cm_dual_fam.heads["c"].familiarity_threshold == pytest.approx(0.01, abs=1e-12)
+    eng_dual_cal = SystemOneEngine(
+        _ConstChoiceSchema,
+        dimension=8,
+        backend="numpy",
+        projector=dual_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+    )
+    eng_dual_cal.calibrate(
+        [(f"cal_dual_{i}", {"c": "a" if i % 2 == 0 else "b"}) for i in range(12)],
+        familiarity_alpha=0.2,
+    )
+    assert eng_dual_cal.conformal_predictors["c"].familiarity_threshold == pytest.approx(0.01, abs=1e-12)
+
+    # ------------------------------------------------------------------
+    # R17-4: Valid zero cutoff q_hat == 0.0 remains 0.0 and produces empty set
+    # ------------------------------------------------------------------
+    eng_z = _build_strict_const_engine()
+    eng_z.model.heads["c"].set_weights(
+        np.zeros((2, 8), dtype=np.float32),
+        np.array([3.0, 0.0], dtype=np.float32),
+    )
+    cp_z = ConformalPredictor("c", ("a", "b"), score_method="lac", mondrian=False)
+    cp_z.calibrate(np.tile([1.0, 0.0], (100, 1)), ["a"] * 100)
+    eng_z.conformal_predictors["c"] = cp_z
+    dec_ez = eng_z.decide("probe", alpha=0.1, record_receipt=False)
+    assert dec_ez.conformal_sets["c"] == [] and dec_ez.is_ambiguous is True
+
+    cm_z = eng_z.to_compiled_model()
+    for src_z in (eng_z, cm_z):
+        fl_z = MultiTenantSkillFleet.from_compiled_model(src_z, "c", num_tenants=1, alpha=0.1)
+        assert list(fl_z.q_init) == [0.0, 0.0]
+        dec_fz = fl_z.decide(0, "probe")
+        assert dec_fz.conformal_set == () and dec_fz.is_ambiguous is True
+        fl_z_snap = MultiTenantSkillFleet.fleet_delta_from_bytes(fl_z.fleet_delta_to_bytes(), projector=const_proj)
+        assert list(fl_z_snap.q_init) == [0.0, 0.0]
+        assert fl_z_snap.decide(0, "probe").conformal_set == ()
+        assert fl_z_snap.decide(0, "probe").is_ambiguous is True
+
+    # ------------------------------------------------------------------
+    # R17-5: Batch inference detects post-calibration ties for Choice and Boolean
+    # ------------------------------------------------------------------
+    class _Tie3Schema(DecisionSchema):
+        c = ChoiceField(("a", "b", "c"))
+
+    eng_t3 = SystemOneEngine(
+        _Tie3Schema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    eng_t3.model.heads["c"].set_weights(
+        np.random.default_rng(1).normal(size=(3, 32)).astype(np.float32),
+        np.array([0, 3, -2], dtype=np.float32),
+    )
+    prompt_t3 = "probe parity"
+    raw_t3 = eng_t3.model.heads["c"].compute_logits(eng_t3.model.encode(prompt_t3))
+    eng_t3.calibrators["c"].logit_adjustments = (
+        -raw_t3.astype(np.float64) / 0.25 + np.array([0.0, 0.0, -np.log(2.0)], dtype=np.float64)
+    )
+    eng_t3.conformal_predictors["c"].calibrate(np.tile([0.34, 0.33, 0.33], (30, 1)), ["a"] * 30)
+
+    d_t3_s = eng_t3.decide(prompt_t3, record_receipt=False)
+    d_t3_b = eng_t3.decide_batch([prompt_t3] * 16, record_receipt=False)[0]
+    d_t3_p = eng_t3.compile_packed_kernel().decide_prompt(prompt_t3)
+    d_t3_c = eng_t3.compile_callable()(prompt_t3)
+    assert d_t3_s.values["c"] == "a" and d_t3_s.conformal_sets["c"] == ["a"]
+    assert d_t3_b.values["c"] == "a" and d_t3_b.conformal_sets["c"] == ["a"]
+    assert int(d_t3_p["best_idx"][0, 0]) == 0
+    assert d_t3_c.values["c"] == "a"
+
+    # APS 2nd/3rd-place post-calibration tie parity between decide and decide_batch
+    for seed_aps in range(6):
+        eng_aps = SystemOneEngine(
+            _Tie3Schema,
+            dimension=32,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=True,
+            enable_margin_gating=False,
+        )
+        eng_aps.model.heads["c"].set_weights(
+            np.random.default_rng(seed_aps).normal(size=(3, 32)).astype(np.float32),
+            np.array([0, 3, -2], dtype=np.float32),
+        )
+        raw_aps = eng_aps.model.heads["c"].compute_logits(eng_aps.model.encode(prompt_t3))
+        eng_aps.calibrators["c"].logit_adjustments = (
+            -raw_aps.astype(np.float64) / 0.25 + np.array([math.log(3.0), 0.0, 0.0], dtype=np.float64)
+        )
+        eng_aps.conformal_predictors["c"] = ConformalPredictor("c", ("a", "b", "c"), score_method="aps", mondrian=False)
+        eng_aps.conformal_predictors["c"].calibration_scores = np.array([0.85] * 30, dtype=np.float64)
+        eng_aps.conformal_predictors["c"].quantile = 0.85
+        eng_aps.conformal_predictors["c"].is_calibrated = True
+        d_aps_s = eng_aps.decide(prompt_t3, record_receipt=False)
+        d_aps_b = eng_aps.decide_batch([prompt_t3] * 16, record_receipt=False)[0]
+        assert d_aps_b.values["c"] == d_aps_s.values["c"] == "a"
+        assert d_aps_b.conformal_sets["c"] == d_aps_s.conformal_sets["c"]
+
+    # Boolean post-calibration logit_adjustments near-tie parity with decide_batch
+    for thr_b in (0.35, 0.5):
+        class _TieBoolAdjSchema(DecisionSchema):
+            b = BooleanField(threshold=thr_b)
+
+        eng_tb_adj = SystemOneEngine(
+            _TieBoolAdjSchema,
+            dimension=32,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        eng_tb_adj.model.heads["b"].set_weights(
+            np.random.default_rng(7).normal(size=(1, 32)).astype(np.float32),
+            np.array([1.75], dtype=np.float32),
+        )
+        raw_tb = float(eng_tb_adj.model.heads["b"].compute_logits(eng_tb_adj.model.encode(prompt_t3))[0])
+        shift_tb = math.log(thr_b / (1.0 - thr_b))
+        z_half = 0.5 * (raw_tb / 0.25)
+        eng_tb_adj.calibrators["b"].logit_adjustments = np.array([z_half, -z_half + shift_tb], dtype=np.float64)
+        eng_tb_adj.conformal_predictors["b"].calibrate(np.tile([0.5, 0.5], (30, 1)), ["True"] * 30)
+
+        ds_b = eng_tb_adj.decide(prompt_t3, record_receipt=False)
+        db_b = eng_tb_adj.decide_batch([prompt_t3] * 16, record_receipt=False)[0]
+        assert db_b.values["b"] is ds_b.values["b"]
+        assert db_b.conformal_sets["b"] == ds_b.conformal_sets["b"]
+
+    # ------------------------------------------------------------------
+    # R17-6: Ordinal integer validation rejects object/float truncation, bools, and overflow
+    # ------------------------------------------------------------------
+    with pytest.raises(ValueError):
+        cqr_ordinal_intervals(
+            np.tile([1.0, 0.0], (20, 1)),
+            np.full(20, -0.9, dtype=object),
+            np.array([[1.0, 0.0]]),
+            alpha=0.1,
+        )
+    X_ord_ok = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+    for bad_ord_y in (
+        np.full(4, -0.9, dtype=object),
+        np.array([0.0, 0.5, 1.0, 1.0], dtype=object),
+        np.array([0, np.nan, 1, 1], dtype=object),
+        np.array([True, False, True, False], dtype=object),
+        np.array(["0", "1", "0", "1"], dtype=object),
+        np.array([None, 1, 0, 1], dtype=object),
+        np.array([Decimal("0.5"), Decimal("1"), Decimal("0"), Decimal("1")], dtype=object),
+        np.array([0, 2**70, 1, 0], dtype=object),
+        np.array([0, 1, 0, 1], dtype=np.uint64) + np.uint64(np.iinfo(np.int64).max),
+        np.array(0),
+        np.array([[0, 1], [0, 1]]),
+    ):
+        with pytest.raises(ValueError):
+            CumulativeLogitOrdinalHead(n_classes=2).fit(X_ord_ok, bad_ord_y)
+        with pytest.raises(ValueError):
+            cqr_ordinal_intervals(np.tile([0.7, 0.3], (4, 1)), bad_ord_y, np.array([[0.7, 0.3]]), alpha=0.1)
+
+    with pytest.raises(ValueError):
+        CumulativeLogitOrdinalHead(n_classes=2).fit(np.array([[True, False], [False, True]]), np.array([0, 1]))
+    with pytest.raises(ValueError):
+        CumulativeLogitOrdinalHead(n_classes=2).fit(np.array([[np.nan, 0.0], [0.0, 1.0]]), np.array([0, 1]))
+
+    # Valid exact-integer object and int arrays succeed
+    head_ord = CumulativeLogitOrdinalHead(n_classes=2).fit(X_ord_ok, np.array([0, 1.0, 0, 1.0], dtype=object))
+    assert head_ord.predict(X_ord_ok).tolist() == [0, 1, 0, 1]
+    lo_ok, hi_ok = cqr_ordinal_intervals(
+        np.tile([0.8, 0.2], (20, 1)),
+        np.array([0, 0.0] * 10, dtype=object),
+        np.array([[0.8, 0.2]]),
+        alpha=0.1,
+    )
+    assert lo_ok.tolist() == [0] and hi_ok.tolist() == [1]
+
+    # ------------------------------------------------------------------
+    # R17-7: FastExplainer supports valid large cancelling bias + adj under tiny temp
+    # ------------------------------------------------------------------
+    class _OvChoiceSchema(DecisionSchema):
+        c = ChoiceField(("a", "b"))
+
+    class _OvBoolSchema(DecisionSchema):
+        b = BooleanField(threshold=0.5)
+
+    eng_exp_c = SystemOneEngine(
+        _OvChoiceSchema,
+        dimension=8,
+        backend="numpy",
+        projector=const_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    eng_exp_c.model.heads["c"].weights = np.zeros((2, 8), dtype=np.float64)
+    eng_exp_c.model.heads["c"].biases = np.array([-2.5e307, 2.5e307], dtype=np.float64)
+    eng_exp_c.calibrators["c"].temperature = 1e-5
+    eng_exp_c.calibrators["c"].logit_adjustments = np.array([1.0e308, -1.0e308], dtype=np.float64)
+
+    eng_exp_b = SystemOneEngine(
+        _OvBoolSchema,
+        dimension=8,
+        backend="numpy",
+        projector=const_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    eng_exp_b.model.heads["b"].weights = np.zeros((1, 8), dtype=np.float64)
+    eng_exp_b.model.heads["b"].biases = np.array([2.5e307], dtype=np.float64)
+    eng_exp_b.calibrators["b"].temperature = 1e-5
+    eng_exp_b.calibrators["b"].logit_adjustments = np.array([5.0e307, -5.0e307], dtype=np.float64)
+
+    with pytest.raises(ValueError):
+        eng_exp_c.to_compiled_model()
+    with pytest.raises(ValueError):
+        eng_exp_b.to_compiled_model()
+
+    # Float32-representable large cancelling bias + float64 adj under tiny temp survives to_compiled_model and v2/v3 bytes
+    eng_exp_cm_c = SystemOneEngine(
+        _OvChoiceSchema,
+        dimension=8,
+        backend="numpy",
+        projector=const_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    eng_exp_cm_c.model.heads["c"].set_weights(
+        np.zeros((2, 8), dtype=np.float32),
+        np.array([-(2.0**100), 2.0**100], dtype=np.float32),
+    )
+    eng_exp_cm_c.calibrators["c"].temperature = 2.0**-950
+    eng_exp_cm_c.calibrators["c"].logit_adjustments = np.array(
+        [2.0**102, -(2.0**102)], dtype=np.float64
+    )
+
+    eng_exp_cm_b = SystemOneEngine(
+        _OvBoolSchema,
+        dimension=8,
+        backend="numpy",
+        projector=const_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    eng_exp_cm_b.model.heads["b"].set_weights(
+        np.zeros((1, 8), dtype=np.float32),
+        np.array([2.0**100], dtype=np.float32),
+    )
+    eng_exp_cm_b.calibrators["b"].temperature = 2.0**-950
+    eng_exp_cm_b.calibrators["b"].logit_adjustments = np.array(
+        [2.0**101, -(2.0**101)], dtype=np.float64
+    )
+
+    cm_exp_c = eng_exp_cm_c.to_compiled_model()
+    cm_exp_b = eng_exp_cm_b.to_compiled_model()
+    cm_exp_c_v2 = CompiledSystemOneModel.from_bytes(cm_exp_c.to_bytes(format_version=2), projector=const_proj)
+    cm_exp_c_v3 = CompiledSystemOneModel.from_bytes(cm_exp_c.to_bytes(format_version=3), projector=const_proj)
+    cm_exp_b_v2 = CompiledSystemOneModel.from_bytes(cm_exp_b.to_bytes(format_version=2), projector=const_proj)
+    cm_exp_b_v3 = CompiledSystemOneModel.from_bytes(cm_exp_b.to_bytes(format_version=3), projector=const_proj)
+
+    # 2-row Boolean cancelling representation also succeeds
+    eng_exp_b2 = SystemOneEngine(
+        _OvBoolSchema,
+        dimension=8,
+        backend="numpy",
+        projector=const_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    eng_exp_b2.model.heads["b"].weights = np.zeros((2, 8), dtype=np.float64)
+    eng_exp_b2.model.heads["b"].biases = np.array([-2.5e307, 2.5e307], dtype=np.float64)
+    eng_exp_b2.calibrators["b"].temperature = 1e-5
+    eng_exp_b2.calibrators["b"].logit_adjustments = np.array([1.0e308, -1.0e308], dtype=np.float64)
+
+    for exp_obj in (
+        FastExplainer.from_engine(eng_exp_c, "c"),
+        FastExplainer.from_engine(eng_exp_cm_c, "c"),
+        FastExplainer.from_compiled_model(cm_exp_c, "c"),
+        FastExplainer.from_compiled_model(cm_exp_c_v2, "c"),
+        FastExplainer.from_compiled_model(cm_exp_c_v3, "c"),
+        FastExplainer.from_engine(eng_exp_b, "b"),
+        FastExplainer.from_engine(eng_exp_cm_b, "b"),
+        FastExplainer.from_compiled_model(cm_exp_b, "b"),
+        FastExplainer.from_compiled_model(cm_exp_b_v2, "b"),
+        FastExplainer.from_compiled_model(cm_exp_b_v3, "b"),
+        FastExplainer.from_engine(eng_exp_b2, "b"),
+    ):
+        ex_res = exp_obj.explain("hello world")
+        assert math.isfinite(ex_res.predicted_logit) and ex_res.predicted_logit == pytest.approx(0.0, abs=1e-12)
+        assert math.isfinite(ex_res.margin) and ex_res.margin == pytest.approx(0.0, abs=1e-12)
+        assert all(s.target_logit_attr == 0.0 and s.margin_attr == 0.0 for s in ex_res.spans)
+
+    # Non-canceling overflow and direct overflowed adj_eff*cal_temp still fail closed
+    eng_exp_c.model.heads["c"].biases = np.array([-5.0e307, 2.5e307], dtype=np.float64)
+    with pytest.raises(ValueError):
+        FastExplainer.from_engine(eng_exp_c, "c")
+    with pytest.raises(ValueError):
+        FastExplainer(
+            projector=const_proj,
+            weights=np.zeros((2, 8), dtype=np.float64),
+            biases=np.zeros(2, dtype=np.float64),
+            options=("a", "b"),
+            adj_eff=np.array([1.0e308, -1.0e308], dtype=np.float64),
+            calibrator_temperature=1e20,
+        )
+
+    # ------------------------------------------------------------------
+    # R17-8: Export & serialization preserve logit_adjustments end-to-end
+    # ------------------------------------------------------------------
+    eng_r8 = _build_strict_const_engine()
+    eng_r8.model.heads["c"].set_weights(
+        np.zeros((2, 8), dtype=np.float32),
+        np.array([0.0, 0.2], dtype=np.float32),
+    )
+    eng_r8.calibrators["c"].logit_adjustments = np.array([2.0, 0.0], dtype=np.float64)
+    eng_r8.conformal_predictors["c"].score_method = "lac"
+    eng_r8.conformal_predictors["c"].calibrate(np.tile([0.6, 0.4], (30, 1)), ["a"] * 30)
+    dec_r8_orig = eng_r8.decide("probe", record_receipt=False)
+    assert dec_r8_orig.values["c"] == "a" and dec_r8_orig.conformal_sets["c"] == ["a"]
+
+    cm_r8 = eng_r8.to_compiled_model()
+    cm_r8_v2 = CompiledSystemOneModel.from_bytes(cm_r8.to_bytes(format_version=2), projector=const_proj)
+    cm_r8_v3 = CompiledSystemOneModel.from_bytes(cm_r8.to_bytes(format_version=3), projector=const_proj)
+    # CompiledSystemOneModel -> SystemOneEngine -> to_compiled_model preserves adjustments too
+    eng_r8_from_cm = SystemOneEngine(
+        _ConstChoiceSchema,
+        compiled_model=cm_r8_v2,
+        backend="numpy",
+        projector=const_proj,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+    )
+    cm_r8_re = eng_r8_from_cm.to_compiled_model()
+
+    for cm_chk in (cm_r8, cm_r8_v2, cm_r8_v3, cm_r8_re):
+        assert cm_chk.heads["c"].logit_adjustments is not None
+        assert np.allclose(cm_chk.heads["c"].logit_adjustments, np.array([2.0, 0.0]), atol=1e-12)
+        eng_chk = SystemOneEngine(
+            _ConstChoiceSchema,
+            compiled_model=cm_chk,
+            backend="numpy",
+            projector=const_proj,
+            use_cache=False,
+            strict_mode=True,
+            enable_margin_gating=False,
+        )
+        assert eng_chk.calibrators["c"].logit_adjustments is not None
+        dec_chk = eng_chk.decide("probe", record_receipt=False)
+        assert dec_chk.values["c"] == "a" and dec_chk.conformal_sets["c"] == ["a"] and dec_chk.is_ambiguous is False
+        fl_chk = MultiTenantSkillFleet.from_compiled_model(cm_chk, "c", num_tenants=1)
+        dec_fl_chk = fl_chk.decide(0, "probe")
+        assert dec_fl_chk.predicted_label == "a" and dec_fl_chk.conformal_set == ("a",) and dec_fl_chk.is_ambiguous is False
+        assert FastExplainer.from_compiled_model(cm_chk, "c").explain("probe").predicted_label == "a"
+        assert GuardShield(cm_chk, field_name="c", unsafe_label="a").evaluate_single("probe").is_unsafe is True
+
+    # Boolean logit_adjustments round-trip & preserve_calibration=False clearing
+    class _BoolR8Schema(DecisionSchema):
+        b = BooleanField(threshold=0.5)
+        s = ScoreField()
+
+    eng_br8 = SystemOneEngine(
+        _BoolR8Schema,
+        dimension=8,
+        backend="numpy",
+        projector=const_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+    )
+    eng_br8.model.heads["b"].set_weights(np.zeros((1, 8), dtype=np.float32), np.array([0.0], dtype=np.float32))
+    eng_br8.calibrators["b"].logit_adjustments = np.array([-1.5, 1.5], dtype=np.float64)
+    eng_br8.conformal_predictors["b"].calibrate(np.tile([0.1, 0.9], (30, 1)), ["True"] * 30)
+    cm_br8 = eng_br8.to_compiled_model()
+    cm_br8_v2 = CompiledSystemOneModel.from_bytes(cm_br8.to_bytes(format_version=2), projector=const_proj)
+    cm_br8_v3 = CompiledSystemOneModel.from_bytes(cm_br8.to_bytes(format_version=3), projector=const_proj)
+    for chk_b in (cm_br8, cm_br8_v2, cm_br8_v3):
+        assert chk_b.heads["b"].logit_adjustments is not None
+        assert np.allclose(chk_b.heads["b"].logit_adjustments, np.array([-1.5, 1.5]), atol=1e-12)
+        eng_b_chk = SystemOneEngine(
+            _BoolR8Schema,
+            compiled_model=chk_b,
+            backend="numpy",
+            projector=const_proj,
+            use_cache=False,
+            strict_mode=True,
+            enable_margin_gating=False,
+        )
+        assert eng_b_chk.decide("probe", record_receipt=False).values["b"] is True
+
+    eng_br8_clear = SystemOneEngine(
+        _BoolR8Schema,
+        compiled_model=cm_br8_v2,
+        backend="numpy",
+        projector=const_proj,
+        use_cache=False,
+        strict_mode=False,
+    )
+    eng_br8_clear.learn_from_tier2("probe", {"b": False, "s": 0.5}, preserve_calibration=False)
+    assert eng_br8_clear.calibrators["b"].logit_adjustments is None
+    assert eng_br8_clear.model.heads["b"].logit_adjustments is None
+
+    # .s1m v2 and v3 tamper guards on {name}_logit_adj (ScoreField, wrong shape, non-finite)
+    raw_br8_v2 = cm_br8.to_bytes(format_version=2)
+    raw_br8_v3 = cm_br8.to_bytes(format_version=3)
+    hl_v2 = struct.unpack_from(">I", raw_br8_v2, 4)[0]
+    hdr_v2 = raw_br8_v2[8 : 8 + hl_v2]
+    npz_v2 = raw_br8_v2[8 + hl_v2 :]
+
+    def _tamper_v2_adj(tname: str, arr: np.ndarray) -> bytes:
+        buf_t = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(npz_v2), "r") as zin, zipfile.ZipFile(buf_t, "w") as zout:
+            wrote = False
+            for info in zin.infolist():
+                data_i = zin.read(info.filename)
+                if info.filename == f"{tname}.npy":
+                    bout = io.BytesIO()
+                    np.save(bout, arr, allow_pickle=False)
+                    data_i = bout.getvalue()
+                    wrote = True
+                zout.writestr(info.filename, data_i)
+            if not wrote:
+                bout = io.BytesIO()
+                np.save(bout, arr, allow_pickle=False)
+                zout.writestr(f"{tname}.npy", bout.getvalue())
+        return b"S1M\x02" + struct.pack(">I", hl_v2) + hdr_v2 + buf_t.getvalue()
+
+    def _tamper_v3_adj(src: bytes, tname: str, arr: np.ndarray) -> bytes:
+        old_hl = struct.unpack_from("<Q", src, 8)[0]
+        meta_obj = json.loads(src[16 : 16 + old_hl].decode("utf-8"))
+        payload = bytearray(src[16 + old_hl :])
+        raw_bytes = np.ascontiguousarray(arr).tobytes()
+        base_off = 16 + old_hl
+        pad = (-(base_off + len(payload))) % 64
+        if pad:
+            payload.extend(b"\x00" * pad)
+        new_abs = base_off + len(payload)
+        payload.extend(raw_bytes)
+        meta_obj["tensors"][tname] = {
+            "offset": int(new_abs),
+            "shape": list(arr.shape),
+            "dtype": arr.dtype.name,
+            "nbytes": len(raw_bytes),
+        }
+        enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(enc) <= old_hl:
+            new_hl = old_hl
+        else:
+            extra_pages = (len(enc) - old_hl + 4095) // 4096
+            new_hl = old_hl + extra_pages * 4096
+            delta = new_hl - old_hl
+            for sp in meta_obj["tensors"].values():
+                sp["offset"] += delta
+            enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return b"S1M\x03\x00\x00\x00\x00" + struct.pack("<Q", new_hl) + enc + b" " * (new_hl - len(enc)) + bytes(payload)
+
+    for tname, bad_adj in (
+        ("s_logit_adj", np.array([1.0], dtype=np.float64)),
+        ("b_logit_adj", np.array([1.0, 2.0, 3.0], dtype=np.float64)),
+        ("b_logit_adj", np.array([np.nan, 0.0], dtype=np.float64)),
+    ):
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(_tamper_v2_adj(tname, bad_adj), projector=const_proj)
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(_tamper_v3_adj(raw_br8_v3, tname, bad_adj), projector=const_proj)
+
+    # MultiChoiceField logit_adj tamper rejection on .s1m v2 and v3
+    from system1 import MultiChoiceField
+
+    class _McAdjSchema(DecisionSchema):
+        mc = MultiChoiceField(("x", "y"))
+
+    cm_mc = SystemOneCompiler(_McAdjSchema, dimension=8, projector=const_proj).compile(
+        {"mc": [("p0", ["x"]), ("p1", ["y"])] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    raw_mc_v2 = cm_mc.to_bytes(format_version=2)
+    raw_mc_v3 = cm_mc.to_bytes(format_version=3)
+    hl_mc_v2 = struct.unpack_from(">I", raw_mc_v2, 4)[0]
+    hdr_mc_v2 = raw_mc_v2[8 : 8 + hl_mc_v2]
+    npz_mc_v2 = raw_mc_v2[8 + hl_mc_v2 :]
+    mc_bad_adj = np.array([1.0, 2.0], dtype=np.float64)
+    buf_mc = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(npz_mc_v2), "r") as zin, zipfile.ZipFile(buf_mc, "w") as zout:
+        for info in zin.infolist():
+            zout.writestr(info.filename, zin.read(info.filename))
+        bout_mc = io.BytesIO()
+        np.save(bout_mc, mc_bad_adj, allow_pickle=False)
+        zout.writestr("mc_logit_adj.npy", bout_mc.getvalue())
+    tampered_mc_v2 = b"S1M\x02" + struct.pack(">I", hl_mc_v2) + hdr_mc_v2 + buf_mc.getvalue()
+    tampered_mc_v3 = _tamper_v3_adj(raw_mc_v3, "mc_logit_adj", mc_bad_adj)
+    with pytest.raises(ValueError):
+        CompiledSystemOneModel.from_bytes(tampered_mc_v2, projector=const_proj)
+    with pytest.raises(ValueError):
+        CompiledSystemOneModel.from_bytes(tampered_mc_v3, projector=const_proj)
+
+    from system1.compiler import CompiledHeadWeights
+
+    with pytest.raises(ValueError):
+        CompiledSystemOneModel(
+            _McAdjSchema(),
+            heads={
+                "mc": CompiledHeadWeights(
+                    field_name="mc",
+                    field_type="multi_choice",
+                    weights=np.zeros((2, 8), dtype=np.float32),
+                    biases=np.zeros(2, dtype=np.float32),
+                    options=("x", "y"),
+                    logit_adjustments=mc_bad_adj,
+                )
+            },
+            dimension=8,
+            projector=const_proj,
+        )
+    eng_mc_bad = SystemOneEngine(
+        _McAdjSchema,
+        dimension=8,
+        backend="numpy",
+        projector=const_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+    )
+    eng_mc_bad.calibrators["mc"].logit_adjustments = mc_bad_adj
+    with pytest.raises(ValueError):
+        eng_mc_bad.to_compiled_model()
+
+    eng_mc_bad_cm = SystemOneEngine(
+        _McAdjSchema,
+        compiled_model=cm_mc,
+        backend="numpy",
+        projector=const_proj,
+        use_cache=False,
+    )
+    eng_mc_bad_cm.calibrators["mc"].logit_adjustments = mc_bad_adj
+    with pytest.raises(ValueError):
+        eng_mc_bad_cm.to_compiled_model()
+
+    # F-contiguous head weights preserve layout and bit-exact confidences across v2 save/load
+    eng_fort = SystemOneEngine(
+        _Tie3Schema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+    )
+    w_fort = np.asfortranarray(np.random.default_rng(7).normal(size=(3, 32)).astype(np.float32))
+    eng_fort.model.heads["c"].set_weights(w_fort, np.array([0.1, -0.2, 0.05], dtype=np.float32))
+    eng_fort_cm = SystemOneEngine(
+        _Tie3Schema,
+        compiled_model=eng_fort.to_compiled_model(),
+        backend="numpy",
+        use_cache=False,
+    )
+    assert eng_fort_cm.model.heads["c"].weights.flags["F_CONTIGUOUS"]
+    eng_fort_re = SystemOneEngine.from_bytes(
+        eng_fort_cm.to_bytes(format_version=2),
+        schema=_Tie3Schema,
+        backend="numpy",
+        use_cache=False,
+    )
+    assert eng_fort_re.model._field_heads["c"].weights.flags["F_CONTIGUOUS"]
+    assert (
+        eng_fort_cm.decide("fortran layout check", record_receipt=False).confidences
+        == eng_fort_re.decide("fortran layout check", record_receipt=False).confidences
+    )
 
 

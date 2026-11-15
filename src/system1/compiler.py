@@ -108,6 +108,85 @@ def _strict_header_bool(
     return raw
 
 
+def _call_raw_norm_if_callable(
+    projector: Any,
+    prompt: str,
+    *,
+    recency_weighted: bool = False,
+) -> Optional[float]:
+    """Call `projector.raw_norm` when callable, returning None on missing or invalid values."""
+    rn_fn = getattr(projector, "raw_norm", None) if projector is not None else None
+    if not callable(rn_fn):
+        return None
+    try:
+        rn_val = (
+            rn_fn(prompt, recency_weighted=recency_weighted)
+            if _accepts_recency_weighted(rn_fn)
+            else rn_fn(prompt)
+        )
+        if rn_val is not None and not isinstance(rn_val, (bool, np.bool_)):
+            return float(rn_val)
+    except Exception:
+        pass
+    return None
+
+
+def _extract_projector_raw_norm(
+    projector: Any,
+    prompt: str,
+    *,
+    recency_weighted: bool = False,
+) -> Optional[float]:
+    """Retrieve a prompt's raw norm from `raw_norm` or `project_with_norm`."""
+    rn_val = _call_raw_norm_if_callable(projector, prompt, recency_weighted=recency_weighted)
+    if rn_val is not None:
+        return rn_val
+    pwn_fn = getattr(projector, "project_with_norm", None) if projector is not None else None
+    if callable(pwn_fn):
+        try:
+            raw_pwn = (
+                pwn_fn(prompt, recency_weighted=recency_weighted)
+                if _accepts_recency_weighted(pwn_fn)
+                else pwn_fn(prompt)
+            )
+            if (
+                isinstance(raw_pwn, tuple)
+                and len(raw_pwn) >= 2
+                and raw_pwn[1] is not None
+                and not isinstance(raw_pwn[1], (bool, np.bool_))
+            ):
+                return float(raw_pwn[1])
+        except Exception:
+            pass
+    return None
+
+
+def _validate_compiled_logit_adj(raw_adj: Any, definition: Any, name: str) -> Optional[np.ndarray]:
+    """Validate and freeze optional per-class logit_adjustments for a compiled head."""
+    if raw_adj is None:
+        return None
+    if isinstance(definition, BooleanField):
+        exp_len = 2
+    elif isinstance(definition, ChoiceField):
+        exp_len = len(definition.options)
+    else:
+        raise ValueError(
+            f"Saved head {name!r} of type {type(definition).__name__} does not support logit_adj"
+        )
+    arr = np.asarray(raw_adj)
+    if arr.dtype == np.dtype(np.bool_) or arr.dtype.kind not in ("i", "u", "f"):
+        raise ValueError(f"Saved head {name!r} logit_adj must have numeric dtype, got {arr.dtype}")
+    if arr.ndim != 1 or arr.shape != (exp_len,):
+        raise ValueError(
+            f"Saved head {name!r} has incompatible logit_adj dimensions {arr.shape} != ({exp_len},)"
+        )
+    out = np.ascontiguousarray(arr, dtype=np.float64).copy()
+    if not bool(np.all(np.isfinite(out))):
+        raise ValueError(f"Saved head {name!r} logit_adj contains non-finite values")
+    out.setflags(write=False)
+    return out
+
+
 def _strict_header_float(
     mapping: Mapping[str, Any],
     key: str,
@@ -460,6 +539,19 @@ def _validate_skill_shapes_and_runtime_delta(
             actual = shapes.get(f"{name}_{suffix}")
             if (suffix == "b" or actual is not None) and actual != shape:
                 raise ValueError(f"Saved head {name!r} has incompatible {suffix} dimensions")
+        logit_adj_shape = shapes.get(f"{name}_logit_adj")
+        if logit_adj_shape is not None:
+            if isinstance(definition, BooleanField):
+                exp_adj_len = 2
+            elif isinstance(definition, ChoiceField):
+                exp_adj_len = len(definition.options)
+            else:
+                raise ValueError(
+                    f"Saved head {name!r} of type {type(definition).__name__} does not support logit_adj"
+                )
+            if logit_adj_shape != (exp_adj_len,):
+                raise ValueError(f"Saved head {name!r} has incompatible logit_adj dimensions")
+            runtime_delta += 8 * exp_adj_len
         calibration = shapes.get(f"{name}_calib_scores")
         if calibration is not None and (len(calibration) != 1 or calibration[0] > MAX_SKILL_CALIBRATION_SCORES):
             raise ValueError("Saved skill calibration exceeds limits")
@@ -545,7 +637,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
         or data[directory_offset : directory_offset + 4] != b"PK\x01\x02"
     ):
         raise ValueError("Saved skill NPZ directory is malformed")
-    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS)) + 7
+    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (12 + len(EXEMPLAR_ARRAYS)) + 7
             or directory_size > MAX_SKILL_HEADER_BYTES or directory_offset + directory_size != end
             or end + 22 + comment_size != len(data)):
         raise ValueError("Saved skill NPZ directory exceeds limits or is malformed")
@@ -558,6 +650,7 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
             "P",
             "B",
             "calib_scores",
+            "logit_adj",
             "prototypes",
             "proto_scores",
             "coarse_w",
@@ -675,6 +768,7 @@ class CompiledHeadWeights:
     weights: np.ndarray  # shape: (K, D) or (1, D)
     biases: np.ndarray   # shape: (K,) or (1,)
     temperature: float = 1.0
+    logit_adjustments: Optional[np.ndarray] = None
     conformal_quantile: float = 0.0
     options: Tuple[str, ...] = ()
     P: Optional[np.ndarray] = None  # Inverted regularized covariance matrix (D+1, D+1)
@@ -787,6 +881,11 @@ class CompiledSystemOneModel:
             )
             if name in self.heads:
                 ch = self.heads[name]
+                ch.logit_adjustments = _validate_compiled_logit_adj(
+                    getattr(ch, "logit_adjustments", None),
+                    f_def,
+                    name,
+                )
                 head.set_weights(ch.weights, ch.biases)
                 if ch.exemplar_state is not None:
                     head.restore_exemplar_state(ch.exemplar_state)
@@ -1452,16 +1551,18 @@ class CompiledSystemOneModel:
                             preserve_calibration
                             and eff_reward_scale >= 0.5
                             and ch.familiarity_threshold > 0.0
-                            and hasattr(self.projector, "raw_norm")
                             and isinstance(prompt, str)
                             and prompt.strip()
                         ):
-                            try:
-                                p_raw_norm = float(self.projector.raw_norm(prompt))
-                                if p_raw_norm > 0.0 and p_raw_norm < ch.familiarity_threshold:
-                                    ch.familiarity_threshold = max(0.0, p_raw_norm - 1e-4)
-                            except Exception:
-                                pass
+                            p_raw_norm = _extract_projector_raw_norm(
+                                self.projector, prompt, recency_weighted=use_recency
+                            )
+                            if (
+                                p_raw_norm is not None
+                                and math.isfinite(p_raw_norm)
+                                and 0.0 < p_raw_norm < ch.familiarity_threshold
+                            ):
+                                ch.familiarity_threshold = max(0.0, p_raw_norm - 1e-4)
                         if preserve_calibration and not ch.calibration_scores:
                             if ch.field_type in ("choice", "boolean", "multi_choice", "multichoice"):
                                 k_opts = max(2, len(ch.options))
@@ -1488,6 +1589,7 @@ class CompiledSystemOneModel:
                             ch.prototype_scores = ()
                             ch.conformal_quantile = 0.0
                             ch.temperature = 1.0
+                            ch.logit_adjustments = None
                     updated_fields.append(f_name)
 
             rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
@@ -1864,21 +1966,33 @@ class CompiledSystemOneModel:
             header_meta["embed_vocab"] = bool(embed_vocab)
 
         def _pack_array(arr: np.ndarray) -> np.ndarray:
-            a32 = np.asarray(arr, dtype=np.float32)
+            with np.errstate(over="ignore", invalid="ignore"):
+                a32 = np.asarray(arr, dtype=np.float32)
+            if not bool(np.all(np.isfinite(a32))):
+                raise ValueError("Compiled model array must be finite in float32")
             if a32.ndim == 2 and a32.size > 0:
                 if format_version == 3:
                     if compact is True:
-                        a16 = a32.astype(np.float16)
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            a16 = a32.astype(np.float16)
                         if np.all(np.isfinite(a16)):
                             return np.ascontiguousarray(a16)
                     return np.ascontiguousarray(a32)
-                a16 = a32.astype(np.float16)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    a16 = a32.astype(np.float16)
                 if np.all(np.isfinite(a16)) and (
                     compact is True
                     or (compact is None and np.array_equal(a32, a16.astype(np.float32)))
                 ):
                     return a16
             return np.ascontiguousarray(a32) if format_version == 3 else a32
+
+        def _pack_f32_vec(arr: np.ndarray, label: str) -> np.ndarray:
+            with np.errstate(over="ignore", invalid="ignore"):
+                out = np.asarray(arr, dtype=np.float32)
+            if not bool(np.all(np.isfinite(out))):
+                raise ValueError(f"{label} must be finite in float32")
+            return out
 
         arrays_to_save: Dict[str, np.ndarray] = {}
         from system1.core.embeddings import HybridProjector
@@ -1938,7 +2052,7 @@ class CompiledSystemOneModel:
 
         for name, ch in sorted(self.heads.items()):
             arrays_to_save[f"{name}_w"] = _pack_array(ch.weights)
-            arrays_to_save[f"{name}_b"] = np.asarray(ch.biases, dtype=np.float32)
+            arrays_to_save[f"{name}_b"] = _pack_f32_vec(ch.biases, f"Head {name!r} biases")
             state = exemplar_states.get(name)
             if state is not None:
                 for suffix, arr in state["arrays"].items():
@@ -1948,9 +2062,16 @@ class CompiledSystemOneModel:
                     )
             if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
                 arrays_to_save[f"{name}_calib_scores"] = np.asarray(ch.calibration_scores, dtype=np.float64)
+            if getattr(ch, "logit_adjustments", None) is not None:
+                adj_valid = _validate_compiled_logit_adj(
+                    ch.logit_adjustments, self.schema.fields[name], name
+                )
+                if adj_valid is not None:
+                    arrays_to_save[f"{name}_logit_adj"] = np.ascontiguousarray(adj_valid, dtype=np.float64)
             if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
-                proto_32 = np.asarray(ch.prototypes, dtype=np.float32)
-                proto_16 = proto_32.astype(np.float16)
+                proto_32 = _pack_f32_vec(ch.prototypes, f"Head {name!r} prototypes")
+                with np.errstate(over="ignore", invalid="ignore"):
+                    proto_16 = proto_32.astype(np.float16)
                 if (
                     compact is not False
                     and (format_version == 2 or compact is True)
@@ -1967,10 +2088,14 @@ class CompiledSystemOneModel:
                 and ch.coarse_biases is not None
             ):
                 arrays_to_save[f"{name}_coarse_w"] = _pack_array(ch.coarse_weights)
-                arrays_to_save[f"{name}_coarse_b"] = np.asarray(ch.coarse_biases, dtype=np.float32)
+                arrays_to_save[f"{name}_coarse_b"] = _pack_f32_vec(
+                    ch.coarse_biases, f"Head {name!r} coarse biases"
+                )
                 if ch.fine_weights is not None and ch.fine_biases is not None:
                     arrays_to_save[f"{name}_fine_w"] = _pack_array(ch.fine_weights)
-                    arrays_to_save[f"{name}_fine_b"] = np.asarray(ch.fine_biases, dtype=np.float32)
+                    arrays_to_save[f"{name}_fine_b"] = _pack_f32_vec(
+                        ch.fine_biases, f"Head {name!r} fine biases"
+                    )
             if include_covariance:
                 if ch.P is not None:
                     arrays_to_save[f"{name}_P"] = _pack_array(ch.P)
@@ -2804,6 +2929,11 @@ class CompiledSystemOneModel:
             calib_scores = tuple(float(s) for s in calib_scores_arr) if calib_scores_arr is not None else ()
             if any(not math.isfinite(score) or score < 0 for score in calib_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid calibration scores")
+            logit_adj_arr = _validate_compiled_logit_adj(
+                array_map.get(f"{name}_logit_adj"),
+                definition,
+                name,
+            )
             raw_class_scores = h_info.get("class_calibration_scores", {})
             parsed_class_scores: Dict[str, Tuple[float, ...]] = {}
             if raw_class_scores is not None:
@@ -2944,6 +3074,7 @@ class CompiledSystemOneModel:
                 weights=w,
                 biases=b,
                 temperature=temperature,
+                logit_adjustments=logit_adj_arr,
                 conformal_quantile=conformal_q,
                 score_method=h_info.get("score_method", "aps"),
                 options=tuple(h_info.get("options", [])),
@@ -3157,7 +3288,7 @@ class CompiledSystemOneModel:
             raise ValueError("Saved skill heads must exactly match its schema")
 
         raw_tensors = meta.get("tensors")
-        if not isinstance(raw_tensors, dict) or len(raw_tensors) > 16 * MAX_SKILL_FIELDS_V3 + 32:
+        if not isinstance(raw_tensors, dict) or len(raw_tensors) > 17 * MAX_SKILL_FIELDS_V3 + 32:
             raise ValueError("Saved v3 skill tensor manifest is invalid or exceeds limit")
 
         allowed_names = {
@@ -3177,6 +3308,7 @@ class CompiledSystemOneModel:
             "P",
             "B",
             "calib_scores",
+            "logit_adj",
             "prototypes",
             "proto_scores",
             "coarse_w",
@@ -3257,6 +3389,9 @@ class CompiledSystemOneModel:
             dt_bytes = np.dtype(spec["dtype"]).itemsize
             cnt = int(math.prod(shapes_v3[tname]))
             if tname in idf_tensor_names:
+                if dt_bytes != 8:
+                    upcast_bytes_v3 += 8 * cnt
+            elif tname.endswith("_logit_adj"):
                 if dt_bytes != 8:
                     upcast_bytes_v3 += 8 * cnt
             elif not tname.endswith(("_calib_scores", "_proto_scores")) and dt_bytes != 4:
@@ -5228,7 +5363,14 @@ class SystemOneCompiler:
             conf_start_idx = (num_train + num_temperature) if isinstance(f_def, ChoiceField) else num_train
             if conf_start_idx >= len(prompts):
                 conf_start_idx = num_train
-            need_fam = eff_familiarity_alpha > 0.0 and hasattr(self.projector, "raw_norm") and conf_start_idx < len(prompts)
+            need_fam = (
+                eff_familiarity_alpha > 0.0
+                and (
+                    callable(getattr(self.projector, "raw_norm", None))
+                    or callable(getattr(self.projector, "project_with_norm", None))
+                )
+                and conf_start_idx < len(prompts)
+            )
 
             # Encode all prompts (and optional continuous telemetry) to embedding matrix X
             X_list = []
@@ -5291,11 +5433,13 @@ class SystemOneCompiler:
                     if raw_norms_batch is not None and p in need_norm_set:
                         rn_val_b: Optional[float] = float(raw_norms_batch[u_idx])
                     elif p in need_norm_set:
+                        rn_val_b = None
                         if callable(pwn_fn):
                             _, pwn_n_b = pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
-                            rn_val_b = float(pwn_n_b) if pwn_n_b is not None else float(self.projector.raw_norm(p))
-                        else:
-                            rn_val_b = float(self.projector.raw_norm(p))
+                            if pwn_n_b is not None:
+                                rn_val_b = float(pwn_n_b)
+                        if rn_val_b is None:
+                            rn_val_b = _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw)
                     else:
                         rn_val_b = None
                     proj_cache[p] = (normed_mat[u_idx], rn_val_b)
@@ -5310,9 +5454,13 @@ class SystemOneCompiler:
                     if want_raw and rn_val is None:
                         if callable(pwn_fn):
                             _, pwn_n_c = pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
-                            rn_val = float(pwn_n_c) if pwn_n_c is not None else float(self.projector.raw_norm(p))
+                            rn_val = (
+                                float(pwn_n_c)
+                                if pwn_n_c is not None
+                                else _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw)
+                            )
                         else:
-                            rn_val = float(self.projector.raw_norm(p))
+                            rn_val = _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw)
                         proj_cache[p] = (emb_base, rn_val)
                     emb = emb_base
                 else:
@@ -5323,7 +5471,7 @@ class SystemOneCompiler:
                         rn_val = (
                             float(pwn_norm)
                             if (want_raw and pwn_norm is not None)
-                            else (float(self.projector.raw_norm(p)) if want_raw else None)
+                            else (_call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw) if want_raw else None)
                         )
                     elif callable(proj_fn):
                         raw_emb = proj_fn(p, recency_weighted=eff_rw) if one_rw else proj_fn(p)
@@ -5332,13 +5480,13 @@ class SystemOneCompiler:
                             rn_val = (
                                 float(pwn_norm)
                                 if pwn_norm is not None
-                                else float(self.projector.raw_norm(p))
+                                else _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw)
                             )
                         else:
-                            rn_val = float(self.projector.raw_norm(p)) if want_raw else None
+                            rn_val = _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw) if want_raw else None
                     else:
                         raw_emb = self.projector(p)
-                        rn_val = float(self.projector.raw_norm(p)) if want_raw else None
+                        rn_val = _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw) if want_raw else None
                     emb_base = _normalize_raw_projection(raw_emb, self.dimension, zero_unit0=False)
                     if isinstance(p, str):
                         proj_cache[p] = (emb_base, rn_val)

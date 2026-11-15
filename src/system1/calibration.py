@@ -3123,6 +3123,57 @@ class UtilityCalibrator:
         return out[:1] if single else out
 
 
+def _validate_ordinal_class_indices(y: Any, *, name: str) -> np.ndarray:
+    """Validate 1D ordinal class labels strictly without lossy float/object truncation."""
+    raw = np.asarray(y)
+    if raw.ndim == 0 or (raw.ndim > 1 and raw.size != raw.shape[0]):
+        raise ValueError(f"{name} must be a 1D array of integer class indices")
+    if raw.dtype == np.dtype(np.object_):
+        out_vals: List[int] = []
+        for v in raw.flat:
+            if isinstance(v, (bool, np.bool_)):
+                raise ValueError(f"{name} must contain integer class indices, not booleans")
+            if isinstance(v, (int, np.integer)):
+                iv = int(v)
+                if iv < -9223372036854775808 or iv > 9223372036854775807:
+                    raise ValueError(f"{name} integer index out of int64 bounds: {iv}")
+                out_vals.append(iv)
+            elif isinstance(v, (float, np.floating)):
+                fv = float(v)
+                if (
+                    not math.isfinite(fv)
+                    or fv != math.floor(fv)
+                    or fv < -9223372036854775808.0
+                    or fv >= 9223372036854775808.0
+                ):
+                    raise ValueError(f"{name} must contain exact integer class indices, got {v!r}")
+                out_vals.append(int(fv))
+            else:
+                raise ValueError(
+                    f"{name} must contain integer class indices, got {type(v).__name__}"
+                )
+        return np.asarray(out_vals, dtype=np.int64).ravel()
+    if np.issubdtype(raw.dtype, np.floating):
+        if raw.size > 0 and (
+            not bool(np.all(np.isfinite(raw)))
+            or not bool(np.all(raw == np.floor(raw)))
+            or not bool(
+                np.all((raw >= -9223372036854775808.0) & (raw < 9223372036854775808.0))
+            )
+        ):
+            raise ValueError(f"{name} must contain exact integer class indices within int64 bounds")
+        return np.asarray(raw, dtype=np.int64).ravel()
+    if raw.dtype.kind in ("i", "u"):
+        if (
+            raw.dtype == np.dtype(np.uint64)
+            and raw.size > 0
+            and bool(np.any(raw > np.uint64(np.iinfo(np.int64).max)))
+        ):
+            raise ValueError(f"{name} integer indices exceed int64 bounds")
+        return np.asarray(raw, dtype=np.int64).ravel()
+    raise ValueError(f"{name} must have integer or exact-integral dtype, got {raw.dtype}")
+
+
 class CumulativeLogitOrdinalHead:
     """Proportional-odds cumulative logit model trained with pure-NumPy L-BFGS."""
 
@@ -3153,10 +3204,18 @@ class CumulativeLogitOrdinalHead:
         return thetas, slopes
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "CumulativeLogitOrdinalHead":
-        X_arr = np.asarray(X, dtype=np.float64)
-        y_arr = np.asarray(y, dtype=np.int64).ravel()
-        if X_arr.ndim != 2 or X_arr.shape[0] != y_arr.shape[0] or y_arr.size == 0:
-            raise ValueError("X must be 2D and match non-empty 1D y")
+        X_raw = np.asarray(X)
+        if X_raw.dtype == np.dtype(np.bool_) or X_raw.dtype.kind not in ("i", "u", "f"):
+            raise ValueError(f"X must have real numeric dtype, got {X_raw.dtype}")
+        X_arr = np.asarray(X_raw, dtype=np.float64)
+        y_arr = _validate_ordinal_class_indices(y, name="y")
+        if (
+            X_arr.ndim != 2
+            or X_arr.shape[0] != y_arr.shape[0]
+            or y_arr.size == 0
+            or not bool(np.all(np.isfinite(X_arr)))
+        ):
+            raise ValueError("X must be finite 2D and match non-empty 1D y")
         n, d = X_arr.shape
         k = int(self.n_classes) if self.n_classes is not None else int(np.max(y_arr)) + 1
         if k < 2:
@@ -3474,20 +3533,7 @@ def cqr_ordinal_intervals(
     coverage ``>= 1 - alpha`` under exchangeability.
     """
     p_cal = _validate_ordinal_prob_matrix(cal_probs, name="cal_probs", allow_1d=False)
-    raw_y = np.asarray(cal_y)
-    if raw_y.dtype == np.bool_ or (
-        raw_y.dtype == np.object_ and any(isinstance(v, (bool, np.bool_)) for v in raw_y.flat)
-    ):
-        raise ValueError("cal_y must contain integer class indices, not booleans")
-    if np.issubdtype(raw_y.dtype, np.floating):
-        if raw_y.size > 0 and (
-            not bool(np.all(np.isfinite(raw_y))) or not bool(np.all(raw_y == np.floor(raw_y)))
-        ):
-            raise ValueError("cal_y must contain exact integer class indices")
-    try:
-        y_cal = np.asarray(raw_y, dtype=np.int64).ravel()
-    except (TypeError, ValueError) as exc:
-        raise ValueError("cal_y must contain integer class indices") from exc
+    y_cal = _validate_ordinal_class_indices(cal_y, name="cal_y")
     p_test = _validate_ordinal_prob_matrix(test_probs, name="test_probs", allow_1d=False)
     if p_cal.shape[1] != p_test.shape[1]:
         raise ValueError("cal_probs and test_probs must be 2D arrays with matching n_classes")

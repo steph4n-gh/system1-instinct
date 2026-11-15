@@ -67,11 +67,18 @@ _FLEET_ALLOWED_ARCHIVE_MEMBERS = _FLEET_REQUIRED_ARRAYS | frozenset(
         "meta_ints",
         "meta_floats",
         "classes_utf8",
+        "tenant_uncal",
         "raw_W_auth",
         "raw_b_auth",
         "raw_cal_temp",
         "raw_cal_adj",
     }
+)
+_U_CAP_F16 = float(
+    np.nextafter(
+        np.float16(-math.log(1.0 - float(np.nextafter(np.float16(1.0), np.float16(0.0))))),
+        np.float16(np.inf),
+    )
 )
 
 
@@ -301,6 +308,7 @@ class MultiTenantSkillFleet:
         score_method: str = "lac",
         familiarity_threshold: float = 0.0,
         _raw_source_head: Optional[Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]] = None,
+        _tenant_uncal: Optional[Union[bool, Sequence[bool], np.ndarray]] = None,
     ) -> None:
         self.projector = projector
         self.classes = [str(c) for c in classes]
@@ -474,15 +482,28 @@ class MultiTenantSkillFleet:
             raise ValueError(f"q_init length {q0_f64.shape[0]} != num_classes {K}")
         if not bool(np.all(np.isfinite(q0_f64))):
             raise ValueError("q_init must contain only finite values")
-        q_init_f64 = np.clip(q0_f64, 1e-4, 1.0)
+        q_init_f64 = np.clip(q0_f64, 0.0, 1.0)
         self.q_init = q_init_f64.astype(np.float32)
         u_init = np.where(
-            self.q_init >= 1.0 - math.exp(-(16.0 - 1e-6)),
-            16.0,
-            -np.log(np.clip(1.0 - self.q_init.astype(np.float64), 1e-12, 1.0)),
+            q_init_f64 >= 1.0 - math.exp(-(_U_CAP_F16 - 1e-6)),
+            _U_CAP_F16,
+            -np.log(np.clip(1.0 - q_init_f64, 1e-12, 1.0)),
         )
         self.q_c = np.broadcast_to(_ceil_float16_unit(q_init_f64), (N, K)).copy()
         self.u_c = np.broadcast_to(u_init.astype(np.float16), (N, K)).copy()
+        if _tenant_uncal is None:
+            self._tenant_uncal = bytearray(N)
+        elif isinstance(_tenant_uncal, (bool, np.bool_)):
+            self._tenant_uncal = bytearray([1 if bool(_tenant_uncal) else 0] * N)
+        else:
+            tu_arr = np.asarray(_tenant_uncal)
+            if tu_arr.ndim != 1 or tu_arr.shape[0] != N:
+                raise ValueError(f"_tenant_uncal length must match num_tenants={N}, got shape={tu_arr.shape}")
+            if tu_arr.dtype != np.dtype(np.bool_) and (
+                tu_arr.dtype.kind not in ("i", "u") or bool(np.any((tu_arr != 0) & (tu_arr != 1)))
+            ):
+                raise ValueError("_tenant_uncal entries must be booleans or 0/1 integers")
+            self._tenant_uncal = bytearray(int(v) for v in tu_arr.tolist())
         self.alpha_c = np.full((N, K), self.alpha, dtype=np.float64)
         self.err_ewma = np.full((N, K), self.alpha, dtype=np.float16)
 
@@ -523,30 +544,55 @@ class MultiTenantSkillFleet:
 
     def _encode_one_with_familiarity(self, text: str) -> Tuple[np.ndarray, Optional[float]]:
         dim = int(self.W_base.shape[1])
-        if self.familiarity_threshold > 0.0:
-            pwn_fn = getattr(self.projector, "project_with_norm", None)
-            if callable(pwn_fn) and (self._pwn_accepts_recency or not self._accepts_recency):
+        pwn_fn = getattr(self.projector, "project_with_norm", None) if self.familiarity_threshold > 0.0 else None
+        if callable(pwn_fn) and (self._pwn_accepts_recency or not self._accepts_recency):
+            try:
                 with np.errstate(over="ignore", under="ignore", invalid="ignore"):
                     raw = (
                         pwn_fn(text, recency_weighted=bool(self.recency_weighted))
                         if self._pwn_accepts_recency
                         else pwn_fn(text)
                     )
-                if isinstance(raw, tuple) and len(raw) >= 2:
+                if (
+                    isinstance(raw, tuple)
+                    and len(raw) >= 2
+                    and raw[1] is not None
+                    and not isinstance(raw[1], (bool, np.bool_))
+                ):
+                    raw_val = float(raw[1])
                     vec = _normalize_raw_projection(raw[0], dim, zero_unit0=self._zero_unit0)
-                    try:
-                        return vec, float(raw[1])
-                    except (TypeError, ValueError):
-                        pass
+                    return vec, raw_val
+            except Exception:
+                pass
         x = self._encode_one(text)
         raw_norm: Optional[float] = None
         if self.familiarity_threshold > 0.0:
-            raw_norm_fn = getattr(self.projector, "raw_norm", None)
-            if callable(raw_norm_fn):
+            if callable(pwn_fn):
                 try:
-                    raw_norm = float(raw_norm_fn(text))
+                    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                        raw = (
+                            pwn_fn(text, recency_weighted=bool(self.recency_weighted))
+                            if self._pwn_accepts_recency
+                            else pwn_fn(text)
+                        )
+                    if (
+                        isinstance(raw, tuple)
+                        and len(raw) >= 2
+                        and raw[1] is not None
+                        and not isinstance(raw[1], (bool, np.bool_))
+                    ):
+                        raw_norm = float(raw[1])
                 except Exception:
                     raw_norm = None
+            if raw_norm is None:
+                raw_norm_fn = getattr(self.projector, "raw_norm", None)
+                if callable(raw_norm_fn):
+                    try:
+                        rn_val = raw_norm_fn(text)
+                        if rn_val is not None and not isinstance(rn_val, (bool, np.bool_)):
+                            raw_norm = float(rn_val)
+                    except Exception:
+                        raw_norm = None
         return x, raw_norm
 
     def _project_batch(self, texts: Sequence[str]) -> np.ndarray:
@@ -878,7 +924,7 @@ class MultiTenantSkillFleet:
                         if base_tok_df[bucket] < 65535:
                             base_tok_df[bucket] += 1
 
-        q_init = np.full(len(classes), 0.5, dtype=np.float32)
+        q_init = np.full(len(classes), 1.0, dtype=np.float64)
         score_method = "lac"
         cp_map = getattr(model, "conformal_predictors", None)
         cp = cp_map.get(field_name) if isinstance(cp_map, Mapping) else None
@@ -903,7 +949,9 @@ class MultiTenantSkillFleet:
 
         ch_cal_scores = getattr(ch, "calibration_scores", ()) if ch is not None else ()
         cp_cal_scores = getattr(cp, "calibration_scores", ()) if cp is not None else ()
-        cp_is_cal = bool(cp is not None and (getattr(cp, "is_calibrated", False) or len(cp_cal_scores) > 0))
+        cp_is_cal = (
+            bool(cp.is_calibrated) if hasattr(cp, "is_calibrated") else (len(cp_cal_scores) > 0)
+        ) if cp is not None else False
         ch_raw_q = getattr(ch, "conformal_quantile", None) if ch is not None else None
         ch_is_cal = bool(
             ch is not None
@@ -912,16 +960,19 @@ class MultiTenantSkillFleet:
                 or (ch_raw_q is not None and math.isfinite(float(ch_raw_q)) and float(ch_raw_q) > 0.0)
             )
         )
-        score_src = cp if cp_is_cal else (ch if ch_is_cal else None)
-        if score_src is not None:
-            raw_method = str(getattr(score_src, "score_method", "lac")).strip().lower()
+        score_src = (cp if cp_is_cal else None) if cp is not None else (ch if ch_is_cal else None)
+        method_src = score_src if score_src is not None else cp
+        if method_src is not None:
+            raw_method = str(getattr(method_src, "score_method", "lac")).strip().lower()
             if raw_method not in ("lac", "aps"):
                 raise ValueError(f"Unsupported conformal score_method on {field_name!r}: {raw_method!r}")
             score_method = raw_method
+        is_uncalibrated = score_src is None
+        if score_src is not None:
             cal_scores = getattr(score_src, "calibration_scores", ())
             raw_q = getattr(score_src, "conformal_quantile", getattr(score_src, "quantile", None))
             has_fallback_q = False
-            fallback_q = 0.0
+            fallback_q = 1.0
             if len(cal_scores) > 0:
                 cal_sorted = sorted(float(v) for v in cal_scores)
                 n_s = len(cal_sorted)
@@ -940,6 +991,12 @@ class MultiTenantSkillFleet:
             is_mondrian = bool(getattr(score_src, "mondrian", False))
             cls_scores = (getattr(score_src, "class_calibration_scores", {}) or {}) if is_mondrian else {}
             shrink = max(1.0, float(getattr(score_src, "mondrian_shrinkage", 10.0)))
+            has_any_cls_scores = any(
+                (cls_scores.get(c_name) is not None and len(cls_scores.get(c_name)) > 0)
+                for c_name in classes
+            )
+            if len(cal_scores) == 0 and raw_q is None and not has_any_cls_scores:
+                is_uncalibrated = True
             for idx, c_name in enumerate(classes):
                 c_vals = cls_scores.get(c_name)
                 if c_vals is not None and len(c_vals) > 0:
@@ -991,6 +1048,7 @@ class MultiTenantSkillFleet:
                 temp,
                 None if (adj is None or adj.size != len(classes)) else adj.copy(),
             ),
+            _tenant_uncal=is_uncalibrated,
         )
 
     def adapt_tenant_batch(
@@ -1411,18 +1469,21 @@ class MultiTenantSkillFleet:
 
     def decide(self, tid: int, text: str) -> TenantDecisionResult:
         """Evaluate `text` for tenant `tid` and return structured `TenantDecisionResult`."""
-        pred_idx, logits_f32, pred_set, probs = self._eval_live(tid, text)
+        tid_i = self._validate_tid(tid)
+        with self._lock:
+            tenant_uncal = bool(self._tenant_uncal[tid_i])
+        pred_idx, logits_f32, pred_set, probs = self._eval_live(tid_i, text)
         probs_ok = bool(np.all(np.isfinite(probs)))
         cset = tuple(self.classes[int(i)] for i in np.flatnonzero(pred_set)) if probs_ok else ()
         conf = float(probs[pred_idx]) if probs_ok else float("nan")
         pred_in_cset = probs_ok and (0 <= pred_idx < len(pred_set)) and bool(pred_set[pred_idx])
         return TenantDecisionResult(
-            tenant_id=int(tid),
+            tenant_id=int(tid_i),
             predicted_index=pred_idx,
             predicted_label=self.classes[pred_idx],
             confidence=conf,
             conformal_set=cset,
-            is_ambiguous=(not probs_ok) or (len(cset) != 1) or (not pred_in_cset),
+            is_ambiguous=(not probs_ok) or tenant_uncal or (len(cset) != 1) or (not pred_in_cset),
             logits=logits_f32,
         )
 
@@ -1666,6 +1727,12 @@ class MultiTenantSkillFleet:
                 raw_runtime += 8 * K
         elif "raw_cal_adj" in headers:
             raise ValueError("Snapshot contains raw_cal_adj without raw_W_auth/raw_b_auth/raw_cal_temp")
+        if "tenant_uncal" in headers:
+            tu_dtype, tu_shape = headers["tenant_uncal"]
+            if tu_dtype not in (np.dtype(np.uint8), np.dtype(np.bool_)) or tu_shape != (T,):
+                raise ValueError(
+                    f"Invalid tenant_uncal spec: dtype={tu_dtype}, shape={tu_shape}, expected (uint8|bool, ({T},))"
+                )
 
         # Runtime allocation footprint across float32 base/P_blk + float64 alpha_c + int8/float16/uint16 arenas.
         base_runtime = 4 * (K * D + K + D * R + K) + 2 * cls.BASE_HASH_SIZE
@@ -1798,6 +1865,7 @@ class MultiTenantSkillFleet:
             self.alpha_c[tid, yi] = float(a_next)
             self.u_c[tid, yi] = np.float16(u_next)
             self.q_c[tid, yi] = q_f16
+            self._tenant_uncal[tid] = 0
             if tid == self._active_tid:
                 self._active_views = self._bind_views(tid)
             return float(q_f16)
@@ -1885,6 +1953,8 @@ class MultiTenantSkillFleet:
                 snapshot_arrays["raw_cal_temp"] = np.array([cal_t], dtype=np.float64)
                 if cal_adj is not None:
                     snapshot_arrays["raw_cal_adj"] = cal_adj
+            if any(self._tenant_uncal):
+                snapshot_arrays["tenant_uncal"] = np.frombuffer(bytes(self._tenant_uncal), dtype=np.uint8).copy()
             np.savez_compressed(buf, **snapshot_arrays)
             return buf.getvalue()
 
@@ -2137,6 +2207,20 @@ class MultiTenantSkillFleet:
                 raw_adj_meta = zf["raw_cal_adj"] if "raw_cal_adj" in zf else None
                 raw_head_meta = (raw_w_meta, raw_b_meta, cal_t_meta, raw_adj_meta)
 
+            tenant_uncal_arg: Optional[np.ndarray] = None
+            if "tenant_uncal" in zf:
+                tu_raw = np.asarray(zf["tenant_uncal"])
+                if tu_raw.dtype == np.dtype(np.bool_):
+                    tenant_uncal_arg = tu_raw.astype(np.uint8)
+                elif tu_raw.dtype == np.dtype(np.uint8):
+                    if tu_raw.size > 0 and int(np.max(tu_raw)) > 1:
+                        raise ValueError("Snapshot tenant_uncal entries must be 0 or 1")
+                    tenant_uncal_arg = tu_raw
+                else:
+                    raise ValueError(f"Invalid snapshot tenant_uncal dtype {tu_raw.dtype}")
+                if tenant_uncal_arg.shape != (T,):
+                    raise ValueError(f"Snapshot tenant_uncal shape {tenant_uncal_arg.shape} != ({T},)")
+
             fleet = cls(
                 projector=projector,
                 classes=resolved_classes,
@@ -2159,6 +2243,7 @@ class MultiTenantSkillFleet:
                 score_method=score_method_meta,
                 familiarity_threshold=fam_thr_meta,
                 _raw_source_head=raw_head_meta,
+                _tenant_uncal=tenant_uncal_arg,
             )
             fleet.dW_q[:] = dW_q_arr
             fleet.dW_scale[:] = dW_scale_arr

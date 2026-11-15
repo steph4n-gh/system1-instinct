@@ -532,7 +532,7 @@ class FastExplainer:
         if not (
             bool(np.all(np.isfinite(self.W_eff)))
             and bool(np.all(np.isfinite(self.b_eff)))
-            and bool(np.all(np.isfinite(adj_eff_vec)))
+            and (_bool_raw_meta is not None or bool(np.all(np.isfinite(adj_eff_vec))))
         ):
             raise ValueError("Derived effective attribution parameters overflowed float64")
         self.dimension = int(self.W_eff.shape[1])
@@ -564,6 +564,13 @@ class FastExplainer:
                 )
                 self._bool_raw_base_scale = float(_bool_raw_meta["base_scale"])
                 self._bool_cal_temp = float(_bool_raw_meta["cal_temp"])
+                raw_c_adj = _bool_raw_meta.get("cal_adj_2")
+                self._bool_cal_adj_2 = (
+                    None
+                    if raw_c_adj is None
+                    else _owned_readonly_array(np.asarray(raw_c_adj, dtype=np.float64).reshape(2), dtype=np.float64)
+                )
+            elif _bool_raw_meta is not None:
                 raw_c_adj = _bool_raw_meta.get("cal_adj_2")
                 self._bool_cal_adj_2 = (
                     None
@@ -616,14 +623,14 @@ class FastExplainer:
                 self._choice_raw_b = _owned_readonly_array(b_in, dtype=rb_dt)
                 self._choice_raw_base_scale = float(self.scale)
                 self._choice_cal_temp = float(self.cal_temp)
-                self._choice_cal_adj = (
-                    _owned_readonly_array(
-                        (self._adj_eff * self.cal_temp).reshape(-1),
-                        dtype=np.float64,
-                    )
-                    if (self._adj_eff.size == self.num_classes and np.any(self._adj_eff))
-                    else None
-                )
+                if self._adj_eff.size == self.num_classes and np.any(self._adj_eff):
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        raw_choice_adj = (self._adj_eff * self.cal_temp).reshape(-1)
+                    if not bool(np.all(np.isfinite(raw_choice_adj))):
+                        raise ValueError("Derived effective attribution parameters overflowed float64")
+                    self._choice_cal_adj = _owned_readonly_array(raw_choice_adj, dtype=np.float64)
+                else:
+                    self._choice_cal_adj = None
 
         if train_texts and train_labels:
             if len(train_texts) != len(train_labels):

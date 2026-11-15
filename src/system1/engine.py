@@ -55,6 +55,7 @@ from system1.core import (
 from system1.core.model import (
     FastDecisionCallable,
     PackedMultiQuestionKernel,
+    _accepts_recency_weighted,
     _compute_engine_inference_signature,
     _compute_hierarchical_logits_np,
     _encode_projector_one,
@@ -346,6 +347,83 @@ def _parse_jsonl_rows(raw_text: str, *, source: str = "input") -> List[Any]:
         except json.JSONDecodeError as ex:
             raise ValueError(f"Invalid JSON in {source} line {line_no}: {ex.msg}") from ex
     return rows
+
+
+def _validated_head_logit_adjustments(
+    raw_adj: Any,
+    definition: Any,
+    field_name: str,
+) -> Optional[np.ndarray]:
+    """Validate optional per-class logit adjustments against field definition."""
+    if raw_adj is None:
+        return None
+    if isinstance(definition, BooleanField):
+        exp_len = 2
+    elif isinstance(definition, ChoiceField):
+        exp_len = len(definition.options)
+    else:
+        raise ValueError(
+            f"Field {field_name!r} of type {type(definition).__name__} does not support logit_adjustments"
+        )
+    arr = np.asarray(raw_adj)
+    if arr.dtype == np.dtype(np.bool_) or arr.dtype.kind not in ("i", "u", "f"):
+        raise ValueError(f"logit_adjustments for {field_name!r} must have numeric dtype, got {arr.dtype}")
+    if arr.ndim != 1 or arr.shape != (exp_len,):
+        raise ValueError(
+            f"logit_adjustments for {field_name!r} shape {arr.shape} != expected ({exp_len},)"
+        )
+    arr64 = np.asarray(arr, dtype=np.float64)
+    if not bool(np.all(np.isfinite(arr64))):
+        raise ValueError(f"logit_adjustments for {field_name!r} contains non-finite values")
+    return np.array(arr64, dtype=np.float64, copy=True)
+
+
+def _extract_prompt_raw_norm(
+    result_obj: Any,
+    prompt_str: str,
+    proj_obj: Any,
+    *,
+    recency_flag: bool = False,
+) -> Optional[float]:
+    """Retrieve a prompt's pre-normalization norm from an inference result or projector."""
+    rn_attr = getattr(result_obj, "raw_norm", None) if result_obj is not None else None
+    if rn_attr is not None and not isinstance(rn_attr, (bool, np.bool_)):
+        try:
+            return float(rn_attr)
+        except Exception:
+            pass
+    if proj_obj is None:
+        return None
+    raw_norm_fn = getattr(proj_obj, "raw_norm", None)
+    if callable(raw_norm_fn):
+        try:
+            rn_val = (
+                raw_norm_fn(prompt_str, recency_weighted=recency_flag)
+                if _accepts_recency_weighted(raw_norm_fn)
+                else raw_norm_fn(prompt_str)
+            )
+            if rn_val is not None and not isinstance(rn_val, (bool, np.bool_)):
+                return float(rn_val)
+        except Exception:
+            pass
+    pwn_fn = getattr(proj_obj, "project_with_norm", None)
+    if callable(pwn_fn):
+        try:
+            raw_pwn = (
+                pwn_fn(prompt_str, recency_weighted=recency_flag)
+                if _accepts_recency_weighted(pwn_fn)
+                else pwn_fn(prompt_str)
+            )
+            if (
+                isinstance(raw_pwn, tuple)
+                and len(raw_pwn) >= 2
+                and raw_pwn[1] is not None
+                and not isinstance(raw_pwn[1], (bool, np.bool_))
+            ):
+                return float(raw_pwn[1])
+        except Exception:
+            pass
+    return None
 
 
 def _normalize_eval_rows(
@@ -786,6 +864,11 @@ class SystemOneEngine:
             for name, ch in model.heads.items():
                 if name in self.calibrators:
                     self.calibrators[name].temperature = getattr(ch, "temperature", 1.0)
+                    self.calibrators[name].logit_adjustments = _validated_head_logit_adjustments(
+                        getattr(ch, "logit_adjustments", None),
+                        self.schema.fields[name],
+                        name,
+                    )
                 if name in self.conformal_predictors:
                     self.conformal_predictors[name].score_method = getattr(ch, "score_method", "aps")
                     calib_scores = getattr(ch, "calibration_scores", ())
@@ -1040,10 +1123,16 @@ class SystemOneEngine:
                 fam_vals: Optional[List[float]] = None
                 if familiarity_alpha > 0.0 and conf_indices:
                     proj = getattr(self.model, "projector", self.projector)
-                    if proj is not None and hasattr(proj, "raw_norm"):
-                        fam_vals = [float(proj.raw_norm(rows[i][0])) for i in conf_indices]
-                    else:
-                        fam_vals = [float(np.linalg.norm(e)) for e in conf_embeddings]
+                    eff_rec_cal = bool(getattr(self, "recency_weighted", False))
+                    fam_vals = []
+                    for i, emb_c in zip(conf_indices, conf_embeddings):
+                        rn_c = _extract_prompt_raw_norm(
+                            results[i],
+                            rows[i][0],
+                            proj,
+                            recency_flag=eff_rec_cal,
+                        )
+                        fam_vals.append(float(np.linalg.norm(emb_c)) if rn_c is None else rn_c)
                 compiled = getattr(self.model, "heads", {}).get(name)
                 proto_mat = (
                     getattr(compiled, "prototypes", None)
@@ -1083,6 +1172,11 @@ class SystemOneEngine:
 
                 if compiled is not None and hasattr(compiled, "calibration_scores"):
                     compiled.temperature = calibrator.temperature
+                    compiled.logit_adjustments = _validated_head_logit_adjustments(
+                        getattr(calibrator, "logit_adjustments", None),
+                        definition,
+                        name,
+                    )
                     compiled.calibration_scores = tuple(float(score) for score in scores)
                     compiled.score_method = getattr(predictor, "score_method", "aps")
                     if isinstance(definition, (ChoiceField, BooleanField)):
@@ -1337,10 +1431,16 @@ class SystemOneEngine:
                 fam_vals: Optional[List[float]] = None
                 if eff_fam_alpha > 0.0 and conf_indices:
                     proj = getattr(self.model, "projector", self.projector)
-                    if proj is not None and hasattr(proj, "raw_norm"):
-                        fam_vals = [float(proj.raw_norm(rows[i][0])) for i in conf_indices]
-                    else:
-                        fam_vals = [float(np.linalg.norm(e)) for e in conf_embeddings]
+                    eff_rec_rcal = bool(getattr(self, "recency_weighted", False))
+                    fam_vals = []
+                    for i, emb_c in zip(conf_indices, conf_embeddings):
+                        rn_c = _extract_prompt_raw_norm(
+                            results[i],
+                            rows[i][0],
+                            proj,
+                            recency_flag=eff_rec_rcal,
+                        )
+                        fam_vals.append(float(np.linalg.norm(emb_c)) if rn_c is None else rn_c)
                 proto_mat = (
                     getattr(compiled, "prototypes", None)
                     if compiled is not None
@@ -1411,6 +1511,11 @@ class SystemOneEngine:
                 scores_tuple = tuple(float(score) for score in scores)
                 if compiled is not None and hasattr(compiled, "calibration_scores"):
                     compiled.temperature = float(calibrator.temperature)
+                    compiled.logit_adjustments = _validated_head_logit_adjustments(
+                        getattr(calibrator, "logit_adjustments", None),
+                        definition,
+                        name,
+                    )
                     compiled.calibration_scores = scores_tuple
                     compiled.score_method = getattr(predictor, "score_method", "aps")
                     compiled.conformal_quantile = float(new_q)
@@ -2159,11 +2264,15 @@ class SystemOneEngine:
                     for ch in getattr(self.model, "_field_heads", {}).values()
                 )
             )
-            if prompt_raw_norm is None and embedding is None and needs_raw_norm and hasattr(self.projector, "raw_norm"):
-                try:
-                    prompt_raw_norm = float(self.projector.raw_norm(prompt))
-                except Exception:
-                    prompt_raw_norm = None
+            if prompt_raw_norm is None and embedding is None and needs_raw_norm:
+                eff_rec = (
+                    bool(self.recency_weighted)
+                    if recency_weighted is None
+                    else bool(recency_weighted)
+                )
+                prompt_raw_norm = _extract_prompt_raw_norm(
+                    None, prompt, self.projector, recency_flag=eff_rec
+                )
 
             emb_finite = bool(np.all(np.isfinite(raw_result.embedding)))
             learned_overrides: Dict[str, Any] = {}
@@ -2224,7 +2333,11 @@ class SystemOneEngine:
 
                 ood_blocked = False
                 if enforce_calibrated_ood:
-                    if fam_thresh > 0.0 and prompt_raw_norm is not None and prompt_raw_norm < fam_thresh - 1e-12:
+                    if (
+                        fam_thresh > 0.0
+                        and prompt_raw_norm is not None
+                        and (not math.isfinite(prompt_raw_norm) or prompt_raw_norm < fam_thresh - 1e-12)
+                    ):
                         ood_blocked = True
                     if proto_thresh > 0.0 and proto_sim is not None and proto_sim < proto_thresh - 1e-6:
                         ood_blocked = True
@@ -2530,7 +2643,7 @@ class SystemOneEngine:
                     )
                     if name in learned_overrides and fam_t <= 0.0:
                         continue
-                    if fam_t > 0.0 and prompt_raw_norm < fam_t - 1e-12:
+                    if fam_t > 0.0 and (not math.isfinite(prompt_raw_norm) or prompt_raw_norm < fam_t - 1e-12):
                         familiarity_triggered = True
                         conformal_sets[name] = []
                         abstention_reasons.setdefault(name, "low_feature_familiarity")
@@ -3033,6 +3146,12 @@ class SystemOneEngine:
                                     self._learned_prompt_override_recency.pop(norm_key_clear, None)
                     if f_name in self.calibrators:
                         self.calibrators[f_name] = DecisionCalibrator()
+                    if (
+                        hasattr(self.model, "heads")
+                        and isinstance(self.model.heads, Mapping)
+                        and f_name in self.model.heads
+                    ):
+                        self.model.heads[f_name].logit_adjustments = None
                     if f_name in self.conformal_predictors:
                         cp_reset = self.conformal_predictors[f_name]
                         cp_reset.is_calibrated = False
@@ -3338,18 +3457,30 @@ class SystemOneEngine:
         """Exports the active engine state (weights, calibration, prototypes, overrides) as a CompiledSystemOneModel."""
         from system1.compiler import CompiledHeadWeights, CompiledSystemOneModel
 
+        def _checked_f32_copy(arr: Any, label: str) -> np.ndarray:
+            with np.errstate(over="ignore", invalid="ignore"):
+                out = np.array(arr, dtype=np.float32, copy=True, order="K")
+            if not bool(np.all(np.isfinite(out))):
+                raise ValueError(f"{label} must be finite in float32 for compiled export")
+            return out
+
         with self._lock, getattr(self.model, "_lock", nullcontext()):
             if isinstance(self.model, CompiledSystemOneModel):
                 for name, ch in self.model.heads.items():
                     if name in self.model._field_heads:
                         live_head = self.model._field_heads[name]
-                        ch.weights = live_head.weights
-                        ch.biases = live_head.biases
+                        ch.weights = _checked_f32_copy(live_head.weights, f"Head {name!r} weights")
+                        ch.biases = _checked_f32_copy(live_head.biases, f"Head {name!r} biases")
                         ch.P = live_head.covariance_inv
                         ch.B = live_head.cross_covariance
                         ch.exemplar_state = live_head.export_exemplar_state()
                     if name in self.calibrators:
                         ch.temperature = float(self.calibrators[name].temperature)
+                        ch.logit_adjustments = _validated_head_logit_adjustments(
+                            getattr(self.calibrators[name], "logit_adjustments", None),
+                            self.schema.fields.get(name),
+                            name,
+                        )
                     if name in self.conformal_predictors:
                         cp = self.conformal_predictors[name]
                         ch.score_method = cp.score_method
@@ -3360,7 +3491,7 @@ class SystemOneEngine:
                         ch.prototypes = (
                             None
                             if getattr(cp, "prototypes", None) is None
-                            else np.asarray(cp.prototypes, dtype=np.float32).copy()
+                            else _checked_f32_copy(cp.prototypes, f"Head {name!r} prototypes")
                         )
                         ch.prototype_scores = (
                             tuple(float(s) for s in cp.prototype_scores)
@@ -3411,6 +3542,15 @@ class SystemOneEngine:
                 rcp = self.regression_conformal_predictors.get(name)
 
                 temp = float(calibrator.temperature) if calibrator is not None else 1.0
+                logit_adj = (
+                    _validated_head_logit_adjustments(
+                        getattr(calibrator, "logit_adjustments", None),
+                        f_def,
+                        name,
+                    )
+                    if calibrator is not None
+                    else None
+                )
                 calib_scores: Tuple[float, ...] = ()
                 conf_q = 0.0
                 score_method = "aps"
@@ -3429,7 +3569,7 @@ class SystemOneEngine:
                     fam_thresh = float(cp.familiarity_threshold)
                     proto_thresh = float(cp.prototype_threshold)
                     if getattr(cp, "prototypes", None) is not None:
-                        proto_mat = np.asarray(cp.prototypes, dtype=np.float32).copy()
+                        proto_mat = _checked_f32_copy(cp.prototypes, f"Head {name!r} prototypes")
                     if getattr(cp, "prototype_scores", None) is not None and len(cp.prototype_scores) > 0:
                         proto_scores = tuple(float(s) for s in cp.prototype_scores)
                     if cp.is_calibrated and len(cp.calibration_scores) > 0:
@@ -3462,9 +3602,10 @@ class SystemOneEngine:
                 compiled_heads[name] = CompiledHeadWeights(
                     field_name=name,
                     field_type=f_def.field_type,
-                    weights=np.asarray(head.weights, dtype=np.float32).copy(),
-                    biases=np.asarray(head.biases, dtype=np.float32).copy(),
+                    weights=_checked_f32_copy(head.weights, f"Head {name!r} weights"),
+                    biases=_checked_f32_copy(head.biases, f"Head {name!r} biases"),
                     temperature=temp,
+                    logit_adjustments=logit_adj,
                     conformal_quantile=conf_q,
                     options=opts,
                     P=getattr(head, "covariance_inv", None),
@@ -4088,6 +4229,7 @@ class SystemOneEngine:
                 enc_rows: List[np.ndarray] = []
                 rn_list: Optional[List[float]] = [] if needs_raw_norm else None
                 has_model_encode_with_norm = hasattr(self.model, "_encode_with_norm")
+                any_rn_observed = False
                 for p in chunk_prompts:
                     if has_model_encode_with_norm:
                         emb_p, rn_p = self.model._encode_with_norm(p, recency_weighted=recency_flag)
@@ -4097,15 +4239,18 @@ class SystemOneEngine:
                     with np.errstate(over="ignore", invalid="ignore"):
                         enc_rows.append(np.asarray(emb_p, dtype=np.float32).ravel())
                     if rn_list is not None:
-                        if rn_p is None and hasattr(proj_obj, "raw_norm"):
-                            try:
-                                rn_p = float(proj_obj.raw_norm(p, recency_weighted=recency_flag))
-                            except TypeError:
-                                rn_p = float(proj_obj.raw_norm(p))
+                        if rn_p is None:
+                            rn_p = _extract_prompt_raw_norm(
+                                None, p, proj_obj, recency_flag=recency_flag
+                            )
+                        if rn_p is not None:
+                            any_rn_observed = True
                         rn_list.append(float(rn_p) if rn_p is not None else float("nan"))
                 X = np.stack(enc_rows, axis=0).astype(np.float32, copy=False)
                 if rn_list is not None and (
-                    hasattr(proj_obj, "raw_norm") or any(math.isfinite(v) for v in rn_list)
+                    callable(getattr(proj_obj, "raw_norm", None))
+                    or callable(getattr(proj_obj, "project_with_norm", None))
+                    or any_rn_observed
                 ):
                     raw_norms_arr = np.asarray(rn_list, dtype=np.float64)
                 nonfin_rows = ~np.all(np.isfinite(X), axis=1)
@@ -4213,44 +4358,63 @@ class SystemOneEngine:
                                 probs = probs.reshape(1, -1)
                             if not spec["is_hier"]:
                                 p_nonfin = ~np.all(np.isfinite(probs), axis=1)
-                                row_finite = (~nonfin_rows) & (~raw_logits_nonfin) & (~p_nonfin)
-                                near_rows = (
-                                    (np.abs(probs[:, 1] - spec["bool_threshold"]) <= dp_bound)
-                                    | (np.abs(probs[:, 1] - 0.5) <= dp_bound)
-                                    | (np.abs(z_col) <= 2.0 * (dz_bound / 0.25))
-                                    | (~np.isfinite(dp_bound))
-                                    | raw_logits_nonfin
-                                    | p_nonfin
-                                    | pot_ovf_rows
-                                )
-                                if conformal is not None:
-                                    near_rows |= (
-                                        np.any(
-                                            np.abs((1.0 - probs) - spec["q_hat"]) <= dp_bound[:, None] + 1e-6,
-                                            axis=1,
-                                        )
-                                        | (
-                                            np.abs(np.abs(2.0 * probs[:, 1] - 1.0) - spec["eff_m"])
-                                            <= 2.0 * dp_bound + 1e-6
-                                        )
-                                        | (
-                                            np.abs(np.maximum(probs[:, 1], probs[:, 0]) - spec["conf_floor"])
-                                            <= dp_bound + 1e-6
-                                        )
-                                        | (
-                                            np.abs(
-                                                np.maximum(probs[:, 1], probs[:, 0])
-                                                - spec["eff_g"] * np.maximum(1e-6, np.minimum(probs[:, 1], probs[:, 0]))
-                                            )
-                                            <= (1.0 + spec["eff_g"]) * dp_bound + 1e-6
-                                        )
+                                cal_adj_b = getattr(calibrator, "logit_adjustments", None)
+                                cal_nonfin = np.zeros(m_docs, dtype=bool)
+                                z_cal_col = z_col
+                                adj_ulp_b = 0.0
+                                with np.errstate(over="ignore", invalid="ignore"):
+                                    if cal_adj_b is not None:
+                                        adj_b_arr = np.asarray(cal_adj_b, dtype=np.float64).reshape(-1)
+                                        if adj_b_arr.size == 2:
+                                            two_cal = two_logits + adj_b_arr.reshape(1, 2)
+                                            z_cal_col = two_cal[:, 1] - two_cal[:, 0]
+                                            cal_nonfin = ~np.all(np.isfinite(two_cal), axis=1)
+                                            if bool(np.all(np.isfinite(adj_b_arr))):
+                                                adj_ulp_b = 8.0 * float(np.finfo(np.float64).eps) * float(np.max(np.abs(adj_b_arr)))
+                                    dp_bound_eff = np.minimum(1.0, dp_bound + adj_ulp_b / temp_est)
+                                    row_finite = (~nonfin_rows) & (~raw_logits_nonfin) & (~p_nonfin) & (~cal_nonfin)
+                                    near_rows = (
+                                        (np.abs(probs[:, 1] - spec["bool_threshold"]) <= dp_bound_eff)
+                                        | (np.abs(probs[:, 1] - 0.5) <= dp_bound_eff)
+                                        | (np.abs(z_cal_col) <= 2.0 * (dz_bound / 0.25) + adj_ulp_b + 1e-9)
+                                        | (~np.isfinite(dp_bound_eff))
+                                        | raw_logits_nonfin
+                                        | p_nonfin
+                                        | cal_nonfin
+                                        | pot_ovf_rows
                                     )
-                                    if spec["q_per_cls"] is not None:
-                                        near_rows |= np.any(
-                                            np.abs((1.0 - probs) - spec["q_per_cls"][None, :])
-                                            <= dp_bound[:, None] + 1e-6,
-                                            axis=1,
+                                    if 0.0 < spec["bool_threshold"] < 1.0:
+                                        thr_b = float(spec["bool_threshold"])
+                                        z_thr = temp_est * math.log(thr_b / (1.0 - thr_b))
+                                        near_rows |= np.abs(z_cal_col - z_thr) <= 2.0 * (dz_bound / 0.25) + adj_ulp_b + 1e-9
+                                    if conformal is not None:
+                                        near_rows |= (
+                                            np.any(
+                                                np.abs((1.0 - probs) - spec["q_hat"]) <= dp_bound_eff[:, None] + 1e-6,
+                                                axis=1,
+                                            )
+                                            | (
+                                                np.abs(np.abs(2.0 * probs[:, 1] - 1.0) - spec["eff_m"])
+                                                <= 2.0 * dp_bound_eff + 1e-6
+                                            )
+                                            | (
+                                                np.abs(np.maximum(probs[:, 1], probs[:, 0]) - spec["conf_floor"])
+                                                <= dp_bound_eff + 1e-6
+                                            )
+                                            | (
+                                                np.abs(
+                                                    np.maximum(probs[:, 1], probs[:, 0])
+                                                    - spec["eff_g"] * np.maximum(1e-6, np.minimum(probs[:, 1], probs[:, 0]))
+                                                )
+                                                <= (1.0 + spec["eff_g"]) * dp_bound_eff + 1e-6
+                                            )
                                         )
+                                        if spec["q_per_cls"] is not None:
+                                            near_rows |= np.any(
+                                                np.abs((1.0 - probs) - spec["q_per_cls"][None, :])
+                                                <= dp_bound_eff[:, None] + 1e-6,
+                                                axis=1,
+                                            )
                                 if spec["sel_cal"] is not None or aci_has_floor:
                                     near_rows |= row_finite
                                 if spec["raw_w"].dtype == np.float64 or spec["raw_b"].dtype == np.float64:
@@ -4292,53 +4456,75 @@ class SystemOneEngine:
                                 probs = probs.reshape(1, -1)
                             if not spec["is_hier"]:
                                 p_nonfin = ~np.all(np.isfinite(probs), axis=1)
-                                row_finite = (~nonfin_rows) & (~raw_logits_nonfin) & (~p_nonfin)
-                                z_s = -np.sort(-logits.astype(np.float64), axis=1)
-                                p_s = -np.sort(-probs, axis=1)
-                                near_rows = (
-                                    (
-                                        ((z_s[:, 0] - z_s[:, 1]) <= 2.0 * dz_bound + 1e-9)
-                                        if k_opts >= 2
-                                        else np.zeros(m_docs, dtype=bool)
+                                cal_adj_c = getattr(calibrator, "logit_adjustments", None)
+                                cal_nonfin = np.zeros(m_docs, dtype=bool)
+                                z_cal_mat = z_mat
+                                adj_ulp_c = 0.0
+                                with np.errstate(over="ignore", invalid="ignore"):
+                                    if cal_adj_c is not None:
+                                        adj_c_arr = np.asarray(cal_adj_c, dtype=np.float64).reshape(-1)
+                                        if adj_c_arr.size == k_opts:
+                                            z_cal_mat = z_mat + adj_c_arr.reshape(1, k_opts)
+                                            cal_nonfin = ~np.all(np.isfinite(z_cal_mat), axis=1)
+                                            if bool(np.all(np.isfinite(adj_c_arr))):
+                                                adj_ulp_c = 8.0 * float(np.finfo(np.float64).eps) * float(np.max(np.abs(adj_c_arr)))
+                                    dp_bound_eff = np.minimum(1.0, dp_bound + adj_ulp_c / temp_est)
+                                    row_finite = (~nonfin_rows) & (~raw_logits_nonfin) & (~p_nonfin) & (~cal_nonfin)
+                                    z_s = -np.sort(-logits.astype(np.float64), axis=1)
+                                    z_cal_s = -np.sort(-z_cal_mat, axis=1)
+                                    p_s = -np.sort(-probs, axis=1)
+                                    near_rows = (
+                                        (
+                                            (
+                                                np.any((z_s[:, :-1] - z_s[:, 1:]) <= 2.0 * dz_bound[:, None] + 1e-9, axis=1)
+                                                | np.any(
+                                                    (z_cal_s[:, :-1] - z_cal_s[:, 1:])
+                                                    <= 2.0 * (dz_bound[:, None] / 0.25) + adj_ulp_c + 1e-9,
+                                                    axis=1,
+                                                )
+                                            )
+                                            if k_opts >= 2
+                                            else np.zeros(m_docs, dtype=bool)
+                                        )
+                                        | (~np.isfinite(dp_bound_eff))
+                                        | raw_logits_nonfin
+                                        | p_nonfin
+                                        | cal_nonfin
+                                        | pot_ovf_rows
                                     )
-                                    | (~np.isfinite(dp_bound))
-                                    | raw_logits_nonfin
-                                    | p_nonfin
-                                    | pot_ovf_rows
-                                )
-                                if conformal is not None:
-                                    near_rows |= np.any(
-                                        np.abs((1.0 - probs) - spec["q_hat"]) <= dp_bound[:, None] + 1e-6,
-                                        axis=1,
-                                    )
-                                    near_rows |= np.any(
-                                        np.abs(np.cumsum(np.maximum(p_s, 0.0), axis=1) - spec["q_hat"])
-                                        <= (float(k_opts) + 1.0) * dp_bound[:, None] + 1e-6,
-                                        axis=1,
-                                    )
-                                    if spec["q_per_cls"] is not None:
+                                    if conformal is not None:
                                         near_rows |= np.any(
-                                            np.abs((1.0 - probs) - spec["q_per_cls"][None, :])
-                                            <= dp_bound[:, None] + 1e-6,
+                                            np.abs((1.0 - probs) - spec["q_hat"]) <= dp_bound_eff[:, None] + 1e-6,
                                             axis=1,
                                         )
-                                    if k_opts >= 2:
-                                        top_chk = p_s[:, 0]
-                                        run_chk = p_s[:, 1]
-                                        near_rows |= (
-                                            (np.abs((top_chk - run_chk) - spec["eff_m"]) <= 2.0 * dp_bound + 1e-6)
-                                            | (np.abs(top_chk - spec["conf_floor"]) <= dp_bound + 1e-6)
-                                            | (
-                                                np.abs(top_chk - spec["eff_g"] * np.maximum(1e-6, run_chk))
-                                                <= (1.0 + spec["eff_g"]) * dp_bound + 1e-6
+                                        near_rows |= np.any(
+                                            np.abs(np.cumsum(np.maximum(p_s, 0.0), axis=1) - spec["q_hat"])
+                                            <= (float(k_opts) + 1.0) * dp_bound_eff[:, None] + 1e-6,
+                                            axis=1,
+                                        )
+                                        if spec["q_per_cls"] is not None:
+                                            near_rows |= np.any(
+                                                np.abs((1.0 - probs) - spec["q_per_cls"][None, :])
+                                                <= dp_bound_eff[:, None] + 1e-6,
+                                                axis=1,
                                             )
-                                            | (np.abs(run_chk - 1e-6) <= dp_bound + 1e-6)
-                                        )
-                                    else:
-                                        near_rows |= (
-                                            (np.abs(p_s[:, 0] - spec["conf_floor"]) <= dp_bound + 1e-6)
-                                            | (np.abs(1.0 - spec["eff_m"]) <= 2.0 * dp_bound + 1e-6)
-                                        )
+                                        if k_opts >= 2:
+                                            top_chk = p_s[:, 0]
+                                            run_chk = p_s[:, 1]
+                                            near_rows |= (
+                                                (np.abs((top_chk - run_chk) - spec["eff_m"]) <= 2.0 * dp_bound_eff + 1e-6)
+                                                | (np.abs(top_chk - spec["conf_floor"]) <= dp_bound_eff + 1e-6)
+                                                | (
+                                                    np.abs(top_chk - spec["eff_g"] * np.maximum(1e-6, run_chk))
+                                                    <= (1.0 + spec["eff_g"]) * dp_bound_eff + 1e-6
+                                                )
+                                                | (np.abs(run_chk - 1e-6) <= dp_bound_eff + 1e-6)
+                                            )
+                                        else:
+                                            near_rows |= (
+                                                (np.abs(p_s[:, 0] - spec["conf_floor"]) <= dp_bound_eff + 1e-6)
+                                                | (np.abs(1.0 - spec["eff_m"]) <= 2.0 * dp_bound_eff + 1e-6)
+                                            )
                                 if spec["sel_cal"] is not None or aci_has_floor:
                                     near_rows |= row_finite
                                 if spec["raw_w"].dtype == np.float64 or spec["raw_b"].dtype == np.float64:
@@ -4612,7 +4798,9 @@ class SystemOneEngine:
                     fam_t = spec["fam_t"]
                     proto_t = spec["proto_t"]
                     if raw_norms_arr is not None and fam_t > 0.0:
-                        low_f_idxs = np.flatnonzero(raw_norms_arr < (fam_t - 1e-12))
+                        low_f_idxs = np.flatnonzero(
+                            (raw_norms_arr < (fam_t - 1e-12)) | (~np.isfinite(raw_norms_arr))
+                        )
                         for i in low_f_idxs:
                             row_fam_trig[i] = True
                             row_csets[i][fname] = []
