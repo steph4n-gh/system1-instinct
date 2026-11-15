@@ -46,24 +46,120 @@ _GATEWAY_POST_ROUTES = frozenset(
 )
 
 
+_HTTP_TOKEN_CHARS = frozenset(
+    "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
+
+
 def _is_json_media_type(ctype: str) -> bool:
-    """Return True iff Content-Type parses as application/json without invalid parameters."""
-    if not isinstance(ctype, str) or not ctype.strip() or "," in ctype:
+    """Return True iff Content-Type parses strictly as application/json with valid RFC 9110 parameters."""
+    if not isinstance(ctype, str):
         return False
-    parts = ctype.split(";")
-    if parts[0].strip().lower() != "application/json":
+    if any((ord(ch) < 0x20 and ch != "\t") or ord(ch) == 0x7F or ord(ch) > 0xFF for ch in ctype):
         return False
-    for raw_param in parts[1:]:
-        param = raw_param.strip()
-        if not param or "=" not in param:
+    s = ctype.strip(" \t")
+    n = len(s)
+    if n == 0:
+        return False
+
+    pos = 0
+    t_start = pos
+    while pos < n and s[pos] in _HTTP_TOKEN_CHARS:
+        pos += 1
+    media_type = s[t_start:pos].lower()
+    if pos >= n or s[pos] != "/":
+        return False
+    pos += 1
+    s_start = pos
+    while pos < n and s[pos] in _HTTP_TOKEN_CHARS:
+        pos += 1
+    media_subtype = s[s_start:pos].lower()
+    if media_type != "application" or media_subtype != "json":
+        return False
+
+    while pos < n and s[pos] in (" ", "\t"):
+        pos += 1
+    if pos < n and s[pos] != ";":
+        return False
+
+    seen_charset: Optional[str] = None
+    while pos < n:
+        if s[pos] != ";":
             return False
-        p_name, p_val = param.split("=", 1)
-        p_key = p_name.strip().lower()
-        p_clean = p_val.strip().strip('"')
-        if not p_key or not p_clean or not all(ch.isalnum() or ch in "-_." for ch in p_key):
+        pos += 1
+        while pos < n and s[pos] in (" ", "\t"):
+            pos += 1
+
+        k_start = pos
+        while pos < n and s[pos] in _HTTP_TOKEN_CHARS:
+            pos += 1
+        p_key = s[k_start:pos].lower()
+        if not p_key or pos >= n or s[pos] != "=":
             return False
-        if p_key == "charset" and p_clean.lower() not in ("utf-8", "utf8"):
+        pos += 1
+        if pos >= n:
             return False
+
+        if s[pos] == '"':
+            pos += 1
+            q_chars: List[str] = []
+            closed = False
+            while pos < n:
+                ch = s[pos]
+                if ch == '"':
+                    pos += 1
+                    closed = True
+                    break
+                if ch == "\\":
+                    pos += 1
+                    if pos >= n:
+                        return False
+                    esc = s[pos]
+                    esc_ord = ord(esc)
+                    if not (
+                        esc in (" ", "\t")
+                        or (0x21 <= esc_ord <= 0x7E)
+                        or (0x80 <= esc_ord <= 0xFF)
+                    ):
+                        return False
+                    q_chars.append(esc)
+                    pos += 1
+                else:
+                    ch_ord = ord(ch)
+                    if not (
+                        ch in (" ", "\t")
+                        or ch_ord == 0x21
+                        or (0x23 <= ch_ord <= 0x5B)
+                        or (0x5D <= ch_ord <= 0x7E)
+                        or (0x80 <= ch_ord <= 0xFF)
+                    ):
+                        return False
+                    q_chars.append(ch)
+                    pos += 1
+            if not closed:
+                return False
+            p_val = "".join(q_chars)
+        else:
+            v_start = pos
+            while pos < n and s[pos] in _HTTP_TOKEN_CHARS:
+                pos += 1
+            p_val = s[v_start:pos]
+            if not p_val:
+                return False
+
+        while pos < n and s[pos] in (" ", "\t"):
+            pos += 1
+        if pos < n and s[pos] != ";":
+            return False
+        if not p_val:
+            return False
+        if p_key == "charset":
+            if seen_charset is not None:
+                return False
+            p_val_low = p_val.lower()
+            if p_val_low not in ("utf-8", "utf8"):
+                return False
+            seen_charset = p_val_low
     return True
 
 
@@ -272,72 +368,174 @@ def detect_wire_format(path: str, payload: Mapping[str, Any]) -> str:
     return "jev"
 
 
-def extract_semantic_text(payload: Mapping[str, Any]) -> Tuple[str, Any]:
-    """Extract canonical semantic text and original structured input from any provider payload."""
-    raw_input = None
-    for key in ("input", "state", "contents", "prompt"):
-        if key in payload and payload[key] is not None:
-            raw_input = payload[key]
-            break
-    if raw_input is None:
-        raise SchemaValidationError("Request must include non-empty 'input', 'state', or 'contents'")
-    _validate_payload_tree(raw_input)
-
-    parts: List[str] = []
-
-    def _collect(node: Any, prefix: str = "", depth: int = 0) -> None:
-        if depth > _MAX_JSON_NESTING_DEPTH:
-            raise InteropError(
-                f"Input structure nesting depth exceeds maximum allowed limit ({_MAX_JSON_NESTING_DEPTH})",
-                status_code=400,
-            )
-        if isinstance(node, str):
-            s = node.strip()
-            if s:
-                parts.append(f"{prefix}: {s}" if prefix else s)
-            return
-        if isinstance(node, (int, float, np.integer, np.floating)) and not isinstance(node, bool):
-            if isinstance(node, (float, np.floating)) and not math.isfinite(float(node)):
-                raise InteropError(f"Non-finite numeric value in input: {node!r}", status_code=400)
-            parts.append(f"{prefix}: {node}" if prefix else str(node))
-            return
-        if isinstance(node, bool):
-            parts.append(f"{prefix}: {str(node).lower()}" if prefix else str(node).lower())
-            return
-        if isinstance(node, list):
-            for item in node:
-                _collect(item, prefix, depth + 1)
-            return
-        if isinstance(node, Mapping):
-            if (
-                "text" in node
-                and isinstance(node["text"], str)
-                and (
-                    set(node.keys()) == {"text"}
-                    or (
-                        set(node.keys()) == {"type", "text"}
-                        and node.get("type") in ("text", "input_text", "output_text")
-                    )
+def _canonical_structured_key(node: Any, depth: int = 0) -> str:
+    """Return a bijective, type-tagged, length-prefixed cache key for structured inputs."""
+    if depth >= _MAX_JSON_NESTING_DEPTH:
+        raise InteropError(
+            f"Input structure nesting depth exceeds maximum allowed limit ({_MAX_JSON_NESTING_DEPTH})",
+            status_code=400,
+        )
+    if node is None:
+        return "N;"
+    if isinstance(node, (bool, np.bool_)):
+        return "B1;" if bool(node) else "B0;"
+    if isinstance(node, (int, np.integer)):
+        return f"I{int(node)};"
+    if isinstance(node, (float, np.floating)):
+        fv = float(node)
+        if not math.isfinite(fv):
+            raise InteropError(f"Non-finite numeric value in input: {node!r}", status_code=400)
+        if fv == 0.0:
+            fv = 0.0
+        return f"F{fv.hex()};"
+    if isinstance(node, str):
+        return f"S{len(node)}:{node};"
+    if isinstance(node, list):
+        inner = "".join(_canonical_structured_key(item, depth + 1) for item in node)
+        return f"L{len(node)}:{inner};"
+    if isinstance(node, tuple):
+        inner = "".join(_canonical_structured_key(item, depth + 1) for item in node)
+        return f"Q{len(node)}:{inner};"
+    if isinstance(node, (set, frozenset)):
+        items = sorted(_canonical_structured_key(item, depth + 1) for item in node)
+        return f"T{len(items)}:{''.join(items)};"
+    if isinstance(node, Mapping):
+        kv_pairs = sorted(
+            (
+                (
+                    _canonical_structured_key(k, depth + 1),
+                    _canonical_structured_key(v, depth + 1),
                 )
-            ):
-                _collect(node["text"], prefix, depth + 1)
-                return
-            if (
-                set(node.keys()) == {"parts"}
-                and isinstance(node.get("parts"), list)
-            ):
-                _collect(node["parts"], prefix, depth + 1)
-                return
-            for k in sorted(node.keys(), key=lambda x: str(x)):
-                sub_prefix = f"{prefix}.{k}" if prefix else str(k)
-                _collect(node[k], sub_prefix, depth + 1)
-            return
-        s = str(node).strip()
-        if s:
-            parts.append(f"{prefix}: {s}" if prefix else s)
+                for k, v in node.items()
+            ),
+            key=lambda kv: kv[0],
+        )
+        inner = "".join(f"{k_s}{v_s}" for k_s, v_s in kv_pairs)
+        return f"M{len(kv_pairs)}:{inner};"
+    tname = type(node).__qualname__
+    sval = str(node)
+    return f"O{len(tname)}:{tname}:{len(sval)}:{sval};"
 
-    _collect(raw_input)
-    text = " | ".join(parts).strip()
+
+def _input_structure_signature(node: Any, depth: int = 0) -> str:
+    """Return a canonical shape+key+type skeleton signature for schema-support gating."""
+    if depth >= _MAX_JSON_NESTING_DEPTH:
+        raise InteropError(
+            f"Input structure nesting depth exceeds maximum allowed limit ({_MAX_JSON_NESTING_DEPTH})",
+            status_code=400,
+        )
+    if node is None:
+        return "null"
+    if isinstance(node, (bool, np.bool_)):
+        return "bool"
+    if isinstance(node, (int, float, np.integer, np.floating)):
+        return "num"
+    if isinstance(node, str):
+        return "str"
+    if isinstance(node, (list, tuple)):
+        elem_sigs = sorted({_input_structure_signature(item, depth + 1) for item in node})
+        tag = "L" if isinstance(node, list) else "Q"
+        return f"{tag}[{','.join(elem_sigs)}]"
+    if isinstance(node, (set, frozenset)):
+        elem_sigs = sorted({_input_structure_signature(item, depth + 1) for item in node})
+        return f"T[{','.join(elem_sigs)}]"
+    if isinstance(node, Mapping):
+        items = sorted(
+            (
+                (
+                    _canonical_structured_key(k, depth + 1),
+                    json.dumps(str(k), ensure_ascii=False),
+                    _input_structure_signature(v, depth + 1),
+                )
+                for k, v in node.items()
+            ),
+            key=lambda item: item[0],
+        )
+        return "M{" + ",".join(f"{k_json}:{v_sig}" for _, k_json, v_sig in items) + "}"
+    return f"O({type(node).__qualname__})"
+
+
+def _canonicalize_for_semantic_json(node: Any, depth: int = 0) -> Tuple[Any, bool]:
+    """Convert structured Python/JSON values into canonical JSON types and track non-empty leaves."""
+    if depth >= _MAX_JSON_NESTING_DEPTH:
+        raise InteropError(
+            f"Input structure nesting depth exceeds maximum allowed limit ({_MAX_JSON_NESTING_DEPTH})",
+            status_code=400,
+        )
+    if node is None:
+        return None, False
+    if isinstance(node, (bool, np.bool_)):
+        return bool(node), True
+    if isinstance(node, (int, np.integer)):
+        return int(node), True
+    if isinstance(node, (float, np.floating)):
+        fv = float(node)
+        if not math.isfinite(fv):
+            raise InteropError(f"Non-finite numeric value in input: {node!r}", status_code=400)
+        if fv == 0.0:
+            fv = 0.0
+        return fv, True
+    if isinstance(node, str):
+        return node, bool(node.strip())
+    if isinstance(node, (list, tuple)):
+        out_list: List[Any] = []
+        any_nonempty = False
+        for item in node:
+            c_item, item_nonempty = _canonicalize_for_semantic_json(item, depth + 1)
+            out_list.append(c_item)
+            if item_nonempty:
+                any_nonempty = True
+        return out_list, any_nonempty
+    if isinstance(node, (set, frozenset)):
+        ordered = sorted(node, key=lambda x: _canonical_structured_key(x, depth + 1))
+        out_set: List[Any] = []
+        any_nonempty = False
+        for item in ordered:
+            c_item, item_nonempty = _canonicalize_for_semantic_json(item, depth + 1)
+            out_set.append(c_item)
+            if item_nonempty:
+                any_nonempty = True
+        return out_set, any_nonempty
+    if isinstance(node, Mapping):
+        items = sorted(
+            node.items(),
+            key=lambda kv: _canonical_structured_key(kv[0], depth + 1),
+        )
+        out_map: Dict[str, Any] = {}
+        any_nonempty = False
+        for k, v in items:
+            c_val, val_nonempty = _canonicalize_for_semantic_json(v, depth + 1)
+            out_map[str(k)] = c_val
+            if val_nonempty:
+                any_nonempty = True
+        return out_map, any_nonempty
+    s = str(node)
+    return s, bool(s.strip())
+
+
+def extract_semantic_text(payload: Mapping[str, Any]) -> Tuple[str, Any]:
+    """Extract canonical semantic representation and original structured input from any provider payload."""
+    present_env: List[Tuple[str, Any]] = [
+        (key, payload[key])
+        for key in ("input", "state", "contents", "prompt")
+        if key in payload and payload[key] is not None
+    ]
+    if not present_env:
+        raise SchemaValidationError("Request must include non-empty 'input', 'state', or 'contents'")
+    for _, env_val in present_env:
+        _validate_payload_tree(env_val)
+    raw_input = present_env[0][1]
+    if len(present_env) == 1 and isinstance(raw_input, str):
+        text = raw_input.strip()
+        if not text:
+            raise SchemaValidationError("Extracted input/state text cannot be empty")
+        return text, raw_input
+
+    target = raw_input if len(present_env) == 1 else {k: v for k, v in present_env}
+    canon_obj, has_nonempty = _canonicalize_for_semantic_json(target)
+    if not has_nonempty:
+        raise SchemaValidationError("Extracted input/state text cannot be empty")
+    text = json.dumps(canon_obj, ensure_ascii=False, sort_keys=True, separators=(", ", ": "))
     if not text:
         raise SchemaValidationError("Extracted input/state text cannot be empty")
     return text, raw_input
@@ -935,6 +1133,7 @@ class SoftDistillingLifecycle:
             post_compile_hook=self._distill_sub_engine_before_qualification,
         )
         self._soft_records_by_prompt: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._structure_counts: Dict[str, int] = {}
         self._distilled_compile_count: int = 0
         self._soft_distill_applied_count: int = 0
         self._frozen_eligible_counter: int = 0
@@ -1116,14 +1315,23 @@ class SoftDistillingLifecycle:
         prompt: str,
         lifecycle_values: Dict[str, Any],
         soft_targets: Optional[Dict[str, Dict[str, Any]]] = None,
+        *,
+        cache_key: Optional[str] = None,
+        structure_sig: Optional[str] = None,
     ) -> bool:
         with self._lock:
             if soft_targets:
                 self._soft_records_by_prompt[prompt] = soft_targets
-            return self.lifecycle.observe_teacher(prompt, lifecycle_values)
+            if structure_sig is not None:
+                self._structure_counts[structure_sig] = self._structure_counts.get(structure_sig, 0) + 1
+            return self.lifecycle.observe_teacher(prompt, lifecycle_values, cache_key=cache_key)
 
     def _evaluate_frozen_local_locked(
-        self, prompt: str
+        self,
+        prompt: str,
+        *,
+        cache_key: Optional[str] = None,
+        structure_sig: Optional[str] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[Any], bool]:
         """Read-only fast-path check mirroring AutoCutoverLifecycle without mutating state."""
         lc = self.lifecycle
@@ -1131,13 +1339,17 @@ class SoftDistillingLifecycle:
         if not lc.compiled_active or lc.active_tau is None or engine is None:
             return None, None, False
         canary_period = max(1, int(round(1.0 / lc.config.canary_rate)))
-        key = _normalize_cache_key(prompt)
+        key = cache_key if (isinstance(cache_key, str) and cache_key) else _normalize_cache_key(prompt)
         if key in lc.clean_cache:
             self._frozen_eligible_counter += 1
             if ((lc.local_accept_eligible + self._frozen_eligible_counter) % canary_period) == 0:
                 return None, None, False
             cached_vals = dict(lc.clean_cache[key])
             return cached_vals, None, True
+        if structure_sig is not None and self._structure_counts.get(structure_sig, 0) < max(
+            2, int(lc.config.k_min)
+        ):
+            return None, None, False
 
         res = engine.decide(prompt, strict=False, record_receipt=False, use_cache=False)
         vals = dict(res.values)
@@ -1372,13 +1584,29 @@ class SoftDistillingLifecycle:
                 }
         return answers_out
 
-    def decide_local(self, prompt: str, *, freeze: bool = False) -> Optional[Dict[str, Any]]:
+    def decide_local(
+        self,
+        prompt: str,
+        *,
+        freeze: bool = False,
+        cache_key: Optional[str] = None,
+        structure_sig: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Attempt autonomous local execution when in SELECTIVE_HOT_SWAP."""
         with self._lock:
             if not self.is_cutover:
                 return None
+            eff_key = (
+                cache_key
+                if (isinstance(cache_key, str) and cache_key)
+                else _normalize_cache_key(prompt)
+            )
             if freeze:
-                local_vals, res, from_cache = self._evaluate_frozen_local_locked(prompt)
+                local_vals, res, from_cache = self._evaluate_frozen_local_locked(
+                    prompt,
+                    cache_key=eff_key,
+                    structure_sig=structure_sig,
+                )
                 if local_vals is None or (not from_cache and res is None):
                     return None
                 try:
@@ -1386,10 +1614,17 @@ class SoftDistillingLifecycle:
                 except InteropError:
                     return None
 
-            local_vals = self.lifecycle.decide_local(prompt)
+            if (
+                eff_key not in self.lifecycle.clean_cache
+                and structure_sig is not None
+                and self._structure_counts.get(structure_sig, 0) < max(2, int(self.lifecycle.config.k_min))
+            ):
+                return None
+
+            local_vals = self.lifecycle.decide_local(prompt, cache_key=eff_key)
             if local_vals is None:
                 return None
-            from_cache = _normalize_cache_key(prompt) in self.lifecycle.clean_cache
+            from_cache = eff_key in self.lifecycle.clean_cache
             if from_cache:
                 res = None
             else:
@@ -1703,6 +1938,13 @@ class UniversalDecisionService:
         _validate_payload_tree(payload)
         wire_format = detect_wire_format(path, payload)
         semantic_text, _ = extract_semantic_text(payload)
+        context_view = {
+            k: v
+            for k, v in payload.items()
+            if k not in ("questions", "slot", "force_teacher", "model")
+        }
+        req_cache_key = _canonical_structured_key(context_view)
+        req_struct_sig = _input_structure_signature(context_view)
         contract = compile_questions_contract(payload.get("questions"))
         slot_key = str(slot_hint or payload.get("slot") or wire_format)
         is_frozen = self.freeze_learning if freeze_learning is None else bool(freeze_learning)
@@ -1715,7 +1957,12 @@ class UniversalDecisionService:
 
         force_teacher = bool(payload.get("force_teacher", False))
         if not force_teacher:
-            local_answers = lc.decide_local(semantic_text, freeze=is_frozen)
+            local_answers = lc.decide_local(
+                semantic_text,
+                freeze=is_frozen,
+                cache_key=req_cache_key,
+                structure_sig=req_struct_sig,
+            )
             if local_answers is not None:
                 with self._lock:
                     self.stats["local_fastpath_requests"] += 1
@@ -1733,7 +1980,13 @@ class UniversalDecisionService:
         upstream_raw = self._call_upstream(wire_format, payload, semantic_text, contract)
         lifecycle_vals, soft_targets, clean_answers = parse_teacher_answers(upstream_raw, contract)
         if not is_frozen:
-            lc.observe_teacher(semantic_text, lifecycle_vals, soft_targets=soft_targets)
+            lc.observe_teacher(
+                semantic_text,
+                lifecycle_vals,
+                soft_targets=soft_targets,
+                cache_key=req_cache_key,
+                structure_sig=req_struct_sig,
+            )
 
         upstream_usage = upstream_raw.get("usage") if isinstance(upstream_raw, Mapping) else None
         in_tok = (

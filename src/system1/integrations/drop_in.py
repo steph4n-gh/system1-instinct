@@ -39,6 +39,7 @@ from system1.calibration import (
     BinaryPlattBetaCalibrator,
     SoftOrdinalHead,
     UtilityCalibrator,
+    _coerce_real_numeric_array,
     should_use_soft_ordinal,
 )
 
@@ -464,10 +465,7 @@ class UtilityCascadeRouter:
                 dtype=np.float64,
             )
         else:
-            raw_cm = np.asarray(cost_matrix)
-            if raw_cm.dtype == np.dtype(np.bool_) or raw_cm.dtype.kind not in ("i", "u", "f"):
-                raise ValueError(f"cost_matrix must have real numeric dtype, got {raw_cm.dtype}")
-            self.cost_matrix = np.asarray(raw_cm, dtype=np.float64)
+            self.cost_matrix = _coerce_real_numeric_array(cost_matrix, name="cost_matrix")
             if self.cost_matrix.shape != (len(CASCADE_TIERS), len(CASCADE_TIERS)):
                 raise ValueError(
                     f"cost_matrix must have shape ({len(CASCADE_TIERS)}, {len(CASCADE_TIERS)}), got {self.cost_matrix.shape}"
@@ -528,16 +526,19 @@ class UtilityCascadeRouter:
     def _parse_tiers(self, tiers: Sequence[Union[int, str]]) -> np.ndarray:
         indices: List[int] = []
         for item in tiers:
-            if isinstance(item, (int, np.integer)) and not isinstance(item, bool):
+            if isinstance(item, (bool, np.bool_)):
+                raise ValueError(f"Tier index/label cannot be boolean, got {item!r}")
+            if isinstance(item, (int, np.integer)):
                 idx = int(item)
                 if not (0 <= idx < len(CASCADE_TIERS)):
                     raise ValueError(f"Tier index out of range [0, 2]: {idx}")
                 indices.append(idx)
-            else:
-                key = str(item)
-                if key not in self._tier_to_index:
+            elif isinstance(item, str):
+                if item not in self._tier_to_index:
                     raise ValueError(f"Unknown cascade tier {item!r}")
-                indices.append(self._tier_to_index[key])
+                indices.append(self._tier_to_index[item])
+            else:
+                raise ValueError(f"Unknown cascade tier {item!r}")
         return np.asarray(indices, dtype=np.int64)
 
     def _raw_probs(self, prompt: str) -> np.ndarray:
@@ -639,7 +640,7 @@ class UtilityCascadeRouter:
             raise ValueError("prompts and true_tiers must be non-empty and match in length")
         if (cal_prompts is None) != (cal_tiers is None):
             raise ValueError("cal_prompts and cal_tiers must both be provided or both be None")
-        if isinstance(cal_fraction, bool) or not isinstance(cal_fraction, (int, float, np.integer, np.floating)):
+        if isinstance(cal_fraction, (bool, np.bool_)) or not isinstance(cal_fraction, (int, float, np.integer, np.floating)):
             raise ValueError(f"cal_fraction must be a finite float in [0.0, 1.0), got {cal_fraction!r}")
         cal_frac = float(cal_fraction)
         if not np.isfinite(cal_frac) or not (0.0 <= cal_frac < 1.0):

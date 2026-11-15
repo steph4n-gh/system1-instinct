@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from system1.compat.universal import _is_json_media_type
 from system1.guard import (
     DecisionOutcome,
     GuardInterceptionResult,
@@ -820,8 +821,8 @@ class _MCPStreamableHTTPHandler(http.server.BaseHTTPRequestHandler):
         if not self._check_origin_and_auth():
             return
 
-        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-        if ctype and ctype != "application/json":
+        raw_ctype = self.headers.get("Content-Type")
+        if raw_ctype is not None and raw_ctype.strip() and not _is_json_media_type(raw_ctype):
             self._send_json(415, {"error": "Unsupported Media Type; expected application/json"})
             return
 

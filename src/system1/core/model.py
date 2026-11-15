@@ -624,24 +624,39 @@ def _pack_f64_scalar(val: Any) -> Optional[bytes]:
 
 
 def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
-    """Return an owned C-contiguous read-only copy without mutating caller array flags."""
+    """Return an owned read-only copy preserving 2D Fortran contiguity when present."""
+    raw_in = np.asarray(arr)
+    is_f_2d = (
+        raw_in.ndim == 2
+        and raw_in.size > 0
+        and raw_in.flags["F_CONTIGUOUS"]
+        and not raw_in.flags["C_CONTIGUOUS"]
+    )
+    order = "F" if is_f_2d else "C"
     if dtype is None:
-        raw = np.asarray(arr)
-        target = raw.dtype
+        raw = raw_in
+        target = raw_in.dtype
     else:
         raw = arr
         target = dtype
-    out = np.array(raw, dtype=target, order="C", copy=True)
+    out = np.array(raw, dtype=target, order=order, copy=True)
     out.setflags(write=False)
     return out
 
 
-def _pack_array_sig(arr: Any) -> Optional[Tuple[Tuple[int, ...], str, bytes]]:
-    """Serialize an array's shape, dtype, and contiguous raw bytes for signature comparisons."""
+def _pack_array_sig(arr: Any) -> Optional[Tuple[Tuple[int, ...], str, bool, bytes]]:
+    """Serialize an array's shape, dtype, 2D Fortran layout flag, and raw bytes."""
     if arr is None:
         return None
     a = np.asarray(arr)
-    return (a.shape, str(a.dtype), np.ascontiguousarray(a).tobytes())
+    is_f_2d = (
+        a.ndim == 2
+        and a.size > 0
+        and a.flags["F_CONTIGUOUS"]
+        and not a.flags["C_CONTIGUOUS"]
+    )
+    raw_bytes = a.tobytes(order="F") if is_f_2d else np.ascontiguousarray(a).tobytes()
+    return (a.shape, str(a.dtype), is_f_2d, raw_bytes)
 
 
 def _exact_choice_probs_row(
@@ -682,7 +697,7 @@ def _exact_bool_probs_row(
     """Recompute single-row Boolean probabilities matching DecisionFieldHead dot order."""
     with np.errstate(over="ignore", invalid="ignore"):
         lin_ex = emb_row @ w_raw.T
-        zv_ex = float((lin_ex + b_raw)[0, 0])
+        zv_ex = float((lin_ex + b_raw).ravel()[0])
         sz_ex = zv_ex / 0.25
         s0_ex = (-0.5 * sz_ex + adj0) / temp
         s1_ex = (0.5 * sz_ex + adj1) / temp
@@ -3530,14 +3545,14 @@ class PackedMultiQuestionKernel:
                 b = np.asarray(raw_b_arr, dtype=np.float64)
                 b_raw_w.append(
                     _owned_readonly_array(
-                        raw_w_arr,
-                        dtype=raw_w_arr.dtype if raw_w_arr.dtype in (np.float32, np.float64) else np.float32,
+                        raw_w_full,
+                        dtype=raw_w_full.dtype if raw_w_full.dtype in (np.float32, np.float64) else np.float32,
                     )
                 )
                 b_raw_b.append(
                     _owned_readonly_array(
-                        raw_b_arr,
-                        dtype=raw_b_arr.dtype if raw_b_arr.dtype in (np.float32, np.float64) else np.float32,
+                        raw_b_full,
+                        dtype=raw_b_full.dtype if raw_b_full.dtype in (np.float32, np.float64) else np.float32,
                     )
                 )
                 adj = getattr(cal, "logit_adjustments", None)

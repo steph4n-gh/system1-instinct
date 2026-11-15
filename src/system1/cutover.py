@@ -45,6 +45,12 @@ def _normalize_cache_key(prompt: str) -> str:
     return " ".join(prompt.casefold().split())
 
 
+def _resolve_cache_key(prompt: str, cache_key: Optional[str] = None) -> str:
+    if isinstance(cache_key, str) and cache_key:
+        return cache_key
+    return _normalize_cache_key(prompt)
+
+
 def _tokenize_words(text: str) -> List[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
@@ -228,8 +234,9 @@ class AutoCutoverLifecycle:
 
         self.train_by_class: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
         self.calib_by_class: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+        self._calib_cache_keys: Dict[str, List[str]] = {}
         self.class_counts: Dict[str, int] = {}
-        self.quarantine: List[Tuple[str, str, Dict[str, Any], np.ndarray, List[str], Set[str]]] = []
+        self.quarantine: List[Tuple[str, str, Dict[str, Any], np.ndarray, List[str], Set[str], str]] = []
 
         self.state: str = CutoverState.COLD_START_ABSTAIN.value
         self.compiled_active: bool = False
@@ -363,8 +370,10 @@ class AutoCutoverLifecycle:
         vec: np.ndarray,
         words: List[str],
         ngs: Set[str],
+        *,
+        cache_key: Optional[str] = None,
     ) -> None:
-        key = _normalize_cache_key(prompt)
+        key = _resolve_cache_key(prompt, cache_key)
         if key in self.admitted_keys:
             return
         idx = len(self.admitted_vecs)
@@ -387,12 +396,19 @@ class AutoCutoverLifecycle:
             self.train_by_class.setdefault(label_key, []).append((prompt, dict(values)))
         else:
             self.calib_by_class.setdefault(label_key, []).append((prompt, dict(values)))
+            self._calib_cache_keys.setdefault(label_key, []).append(key)
 
-    def _try_admit_or_quarantine_locked(self, prompt: str, values: Dict[str, Any]) -> bool:
+    def _try_admit_or_quarantine_locked(
+        self,
+        prompt: str,
+        values: Dict[str, Any],
+        *,
+        cache_key: Optional[str] = None,
+    ) -> bool:
         """Return True if quarantined, False if admitted or already known."""
         label_key = self._primary_label_key(values)
         self.recent_unseen_window.append(0 if label_key in self.active_classes else 1)
-        key = _normalize_cache_key(prompt)
+        key = _resolve_cache_key(prompt, cache_key)
         k_cnts = self.teacher_key_labels.setdefault(key, {})
         prev_cnt, _ = k_cnts.get(label_key, (0, values))
         k_cnts[label_key] = (prev_cnt + 1, dict(values))
@@ -406,18 +422,18 @@ class AutoCutoverLifecycle:
         vec = self.subword.encode(prompt)
 
         if not self.config.enable_quarantine:
-            self._admit_record_locked(prompt, label_key, values, vec, words, ngs)
+            self._admit_record_locked(prompt, label_key, values, vec, words, ngs, cache_key=key)
             return False
 
         n_adm = len(self.admitted_vecs)
         if n_adm < 20:
-            self._admit_record_locked(prompt, label_key, values, vec, words, ngs)
+            self._admit_record_locked(prompt, label_key, values, vec, words, ngs, cache_key=key)
             return False
 
         p90_len = float(np.percentile(self.admitted_lengths, 90))
         if len(words) > max(26, 2.3 * p90_len):
             self.quarantined_total += 1
-            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs))
+            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs, key))
             return True
 
         ng_cov = sum(1 for g in ngs if self.ng_df.get(g, 0) >= 1) / max(1, len(ngs))
@@ -426,7 +442,7 @@ class AutoCutoverLifecycle:
 
         if ng_cov < 0.42 and max_sim < 0.30:
             self.quarantined_total += 1
-            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs))
+            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs, key))
             return True
 
         cls_cnt = self.class_counts.get(label_key, 0)
@@ -440,10 +456,10 @@ class AutoCutoverLifecycle:
             if (max_sim >= 0.28 or ng_cov >= 0.58) and (
                 same_max >= 0.20 or knn_agree >= 1 or ng_cov >= 0.65
             ):
-                self._admit_record_locked(prompt, label_key, values, vec, words, ngs)
+                self._admit_record_locked(prompt, label_key, values, vec, words, ngs, cache_key=key)
                 return False
             self.quarantined_total += 1
-            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs))
+            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs, key))
             return True
 
         if ng_cov >= 0.38 or max_sim >= 0.28:
@@ -457,12 +473,13 @@ class AutoCutoverLifecycle:
             if peers:
                 for q in peers:
                     self.quarantine.remove(q)
-                    self._admit_record_locked(q[0], q[1], q[2], q[3], q[4], q[5])
-                self._admit_record_locked(prompt, label_key, values, vec, words, ngs)
+                    q_key = q[6] if len(q) > 6 else None
+                    self._admit_record_locked(q[0], q[1], q[2], q[3], q[4], q[5], cache_key=q_key)
+                self._admit_record_locked(prompt, label_key, values, vec, words, ngs, cache_key=key)
                 return False
 
         self.quarantined_total += 1
-        self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs))
+        self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs, key))
         return True
 
     def _estimate_noise_rate(
@@ -617,6 +634,14 @@ class AutoCutoverLifecycle:
 
         tr_pairs = [x for c in active_list for x in self.train_by_class[c]]
         cal_pairs = [x for c in active_list for x in self.calib_by_class[c]]
+        cal_keys: List[str] = []
+        for c in active_list:
+            cls_pairs = self.calib_by_class[c]
+            cls_keys = self._calib_cache_keys.get(c, ())
+            if len(cls_keys) == len(cls_pairs):
+                cal_keys.extend(cls_keys)
+            else:
+                cal_keys.extend(_normalize_cache_key(p_c) for p_c, _ in cls_pairs)
         if len(tr_pairs) < 24 or len(cal_pairs) < 12:
             return False
 
@@ -732,7 +757,7 @@ class AutoCutoverLifecycle:
         margins_cal: List[float] = []
         correct_cal: List[bool] = []
         high_conf_cache: List[Tuple[str, Dict[str, Any]]] = []
-        for (p_c, vals_c), d_c in zip(cal_pairs, cal_decs):
+        for (p_c, vals_c), k_c, d_c in zip(cal_pairs, cal_keys, cal_decs):
             if d_c.abstention_reason in ("low_feature_familiarity", "low_semantic_familiarity"):
                 continue
             min_margin = self._decision_min_margin(d_c, sub_eng, active_schema.fields)
@@ -740,7 +765,7 @@ class AutoCutoverLifecycle:
             margins_cal.append(min_margin)
             correct_cal.append(is_ok)
             if d_c.abstention_reason is None and is_ok and min_margin >= 0.85:
-                high_conf_cache.append((p_c, dict(vals_c)))
+                high_conf_cache.append((k_c, dict(vals_c)))
 
         k_act = len(active_list)
         alpha_calib = min(
@@ -799,10 +824,9 @@ class AutoCutoverLifecycle:
             mode="capital_ons",
         )
 
-        for p_c, vals_c in high_conf_cache:
-            k = _normalize_cache_key(p_c)
-            if k not in self.clean_cache:
-                self.clean_cache[k] = dict(vals_c)
+        for k_c, vals_c in high_conf_cache:
+            if k_c not in self.clean_cache:
+                self.clean_cache[k_c] = dict(vals_c)
 
         if tau is not None and len(self.mature_classes) >= 2:
             self.state = CutoverState.SELECTIVE_HOT_SWAP.value
@@ -866,10 +890,13 @@ class AutoCutoverLifecycle:
             self.drift_monitor.reset()
 
     def _evaluate_local_candidate_locked(
-        self, prompt: str
+        self,
+        prompt: str,
+        *,
+        cache_key: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]], float, bool, bool]:
         """Return (accepted_fastpath, candidate_values, margin, is_canary, from_cache)."""
-        key = _normalize_cache_key(prompt)
+        key = _resolve_cache_key(prompt, cache_key)
         canary_period = max(1, int(round(1.0 / self.config.canary_rate)))
 
         if key in self.clean_cache:
@@ -903,24 +930,34 @@ class AutoCutoverLifecycle:
 
         return False, None, margin, False, False
 
-    def decide_local(self, prompt: str) -> Optional[Dict[str, Any]]:
+    def decide_local(self, prompt: str, *, cache_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Return validated local decision values when safe, or None to escalate/canary."""
         with self._lock:
             self._maybe_micro_compile_locked()
-            accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(prompt)
+            key = _resolve_cache_key(prompt, cache_key)
+            accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(
+                prompt,
+                cache_key=key,
+            )
             if accepted and vals is not None:
                 self.step_count += 1
                 self.local_hits += 1
                 return vals
             if is_canary and vals is not None:
-                self._pending_canaries[_normalize_cache_key(prompt)] = (vals, margin, from_cache)
+                self._pending_canaries[key] = (vals, margin, from_cache)
             return None
 
-    def observe_teacher(self, prompt: str, teacher_values: Any) -> bool:
+    def observe_teacher(
+        self,
+        prompt: str,
+        teacher_values: Any,
+        *,
+        cache_key: Optional[str] = None,
+    ) -> bool:
         """Ingest a validated teacher answer, update canary drift state, and admit/compile."""
         validated = self._coerce_teacher_values(teacher_values)
         with self._lock:
-            key = _normalize_cache_key(prompt)
+            key = _resolve_cache_key(prompt, cache_key)
             pending = self._pending_canaries.pop(key, None)
             if pending is not None:
                 pred_vals, margin, from_cache = pending
@@ -930,7 +967,7 @@ class AutoCutoverLifecycle:
                     margin=margin,
                     from_cache=from_cache,
                 )
-            quarantined = self._try_admit_or_quarantine_locked(prompt, validated)
+            quarantined = self._try_admit_or_quarantine_locked(prompt, validated, cache_key=key)
             self._maybe_micro_compile_locked()
             self.step_count += 1
             return not quarantined

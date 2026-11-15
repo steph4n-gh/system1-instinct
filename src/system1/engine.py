@@ -38,6 +38,8 @@ from system1.calibration import (
     RecalibrationReport,
     RegressionConformalInterval,
     RegressionConformalPredictor,
+    _normalize_rows_f32_safe,
+    _normalize_vec_f32_safe,
     compute_brier_decomposition,
     compute_ece_and_bins,
     compute_nll,
@@ -3464,6 +3466,13 @@ class SystemOneEngine:
                 raise ValueError(f"{label} must be finite in float32 for compiled export")
             return out
 
+        def _checked_unit_prototypes(arr: Any, label: str) -> np.ndarray:
+            raw_p = np.asarray(arr, dtype=np.float64)
+            if raw_p.ndim != 2 or not bool(np.all(np.isfinite(raw_p))):
+                raise ValueError(f"{label} must be finite 2D array for compiled export")
+            unit_p, _ = _normalize_rows_f32_safe(raw_p)
+            return unit_p
+
         with self._lock, getattr(self.model, "_lock", nullcontext()):
             if isinstance(self.model, CompiledSystemOneModel):
                 for name, ch in self.model.heads.items():
@@ -3491,7 +3500,7 @@ class SystemOneEngine:
                         ch.prototypes = (
                             None
                             if getattr(cp, "prototypes", None) is None
-                            else _checked_f32_copy(cp.prototypes, f"Head {name!r} prototypes")
+                            else _checked_unit_prototypes(cp.prototypes, f"Head {name!r} prototypes")
                         )
                         ch.prototype_scores = (
                             tuple(float(s) for s in cp.prototype_scores)
@@ -3569,7 +3578,7 @@ class SystemOneEngine:
                     fam_thresh = float(cp.familiarity_threshold)
                     proto_thresh = float(cp.prototype_threshold)
                     if getattr(cp, "prototypes", None) is not None:
-                        proto_mat = _checked_f32_copy(cp.prototypes, f"Head {name!r} prototypes")
+                        proto_mat = _checked_unit_prototypes(cp.prototypes, f"Head {name!r} prototypes")
                     if getattr(cp, "prototype_scores", None) is not None and len(cp.prototype_scores) > 0:
                         proto_scores = tuple(float(s) for s in cp.prototype_scores)
                     if cp.is_calibrated and len(cp.calibration_scores) > 0:
@@ -4096,18 +4105,14 @@ class SystemOneEngine:
                     head_protos = getattr(meta_head, "prototypes", None)
                 with np.errstate(over="ignore", invalid="ignore"):
                     if head_protos is not None and np.ndim(head_protos) == 2 and head_protos.shape[1] == self.dimension:
-                        hp = np.asarray(head_protos, dtype=np.float32)
-                        hnorms = np.linalg.norm(hp, axis=1, keepdims=True)
-                        hvalid = (hnorms[:, 0] > 1e-12) & np.isfinite(hnorms[:, 0])
+                        hp_unit, hvalid = _normalize_rows_f32_safe(head_protos)
                         if np.any(hvalid):
-                            proto_chunks.append((hp[hvalid] / hnorms[hvalid]).astype(np.float32))
+                            proto_chunks.append(hp_unit[hvalid])
                     if not proto_chunks and conformal is not None and getattr(conformal, "prototypes", None) is not None:
-                        cp_p = np.asarray(conformal.prototypes, dtype=np.float32)
-                        if cp_p.ndim == 2 and cp_p.shape[1] == self.dimension:
-                            cnorms = np.linalg.norm(cp_p, axis=1, keepdims=True)
-                            cvalid = (cnorms[:, 0] > 1e-12) & np.isfinite(cnorms[:, 0])
+                        if np.ndim(conformal.prototypes) == 2 and conformal.prototypes.shape[1] == self.dimension:
+                            cp_unit, cvalid = _normalize_rows_f32_safe(conformal.prototypes)
                             if np.any(cvalid):
-                                proto_chunks.append((cp_p[cvalid] / cnorms[cvalid]).astype(np.float32))
+                                proto_chunks.append(cp_unit[cvalid])
                     if head_protos is not None and online_bank_map:
                         bank = online_bank_map.get(fname)
                         if bank:
@@ -4125,11 +4130,11 @@ class SystemOneEngine:
                             shot_vecs: List[np.ndarray] = []
                             for grp in shots_p:
                                 for s in grp:
-                                    s_arr = np.asarray(s, dtype=np.float32).flatten()
-                                    if s_arr.shape[0] == self.dimension:
-                                        sn = float(np.linalg.norm(s_arr))
-                                        if sn > 1e-12:
-                                            shot_vecs.append((s_arr / sn).astype(np.float32))
+                                    s_raw = np.asarray(s).ravel()
+                                    if s_raw.shape[0] == self.dimension:
+                                        s_unit, _, s_valid = _normalize_vec_f32_safe(s_raw)
+                                        if s_valid:
+                                            shot_vecs.append(s_unit)
                             if shot_vecs:
                                 proto_chunks.append(np.stack(shot_vecs, axis=0))
                 protos_unit = np.concatenate(proto_chunks, axis=0) if proto_chunks else None

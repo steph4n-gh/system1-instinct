@@ -62,7 +62,12 @@ from system1.core.schema import (
     MultiChoiceField,
     ScoreField,
 )
-from system1.calibration import ConformalPredictor, DecisionCalibrator
+from system1.calibration import (
+    ConformalPredictor,
+    DecisionCalibrator,
+    _normalize_rows_f32_safe,
+    _normalize_vec_f32_safe,
+)
 from system1.core.embeddings import compute_strict_loo_weights
 from system1.core.telemetry import TelemetryProjector
 from system1.core.text import (
@@ -228,6 +233,63 @@ MAX_SKILL_CALIBRATION_SCORES = 1_000_000
 MAX_SKILL_COMPRESSION_RATIO = 1024
 EXEMPLAR_ARRAYS = ("exemplar_centroids", "exemplar_vectors", "exemplar_mean", "initial_w", "shots_p", "shots_c")
 VALID_SEMANTIC_MODES = ("default", "v1_1", "v1_2_fisher", "v1_2_rbf")
+HEAD_TENSOR_SUFFIXES = (
+    "w",
+    "b",
+    "P",
+    "B",
+    "calib_scores",
+    "logit_adj",
+    "prototypes",
+    "proto_scores",
+    "coarse_w",
+    "coarse_b",
+    "fine_w",
+    "fine_b",
+    *EXEMPLAR_ARRAYS,
+)
+PROJECTOR_TENSOR_NAMES = frozenset((
+    "_projector_tfidf_idf",
+    "_projector_prag_base_idf",
+    "_projector_prag_idf",
+    "_projector_spectral_vectors",
+    "_projector_spectral_basis",
+    "_projector_subspace_components",
+    "_projector_rbf_landmarks",
+    "_projector_hybrid_tfidf_idf",
+    "_projector_dense_table",
+))
+
+
+def _head_tensor_name(field_name: str, suffix: str, *, namespaced: bool = False) -> str:
+    """Return canonical serialized tensor key for (field_name, suffix)."""
+    if namespaced:
+        return f"0h{len(field_name)}_{field_name}_{suffix}"
+    return f"{field_name}_{suffix}"
+
+
+def _schema_needs_namespaced_head_tensors(schema: DecisionSchema) -> bool:
+    """Return True if un-namespaced head tensor keys could collide."""
+    seen: set[str] = set(PROJECTOR_TENSOR_NAMES)
+    for fname in schema.fields:
+        if fname.startswith("0h"):
+            return True
+        for suffix in HEAD_TENSOR_SUFFIXES:
+            legacy_key = f"{fname}_{suffix}"
+            if legacy_key in seen:
+                return True
+            seen.add(legacy_key)
+    return False
+
+
+def _resolve_tensor_namespaced_flag(schema: DecisionSchema, meta: Mapping[str, Any]) -> bool:
+    """Validate and resolve the serialized head tensor namespace mode from header metadata."""
+    ns_val = meta.get("tensor_namespace")
+    if ns_val is None:
+        return False
+    if type(ns_val) is str and ns_val == "len_v1":
+        return True
+    raise ValueError(f"Saved skill uses unsupported tensor_namespace: {ns_val!r}")
 
 
 def _snap_f16(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -459,6 +521,7 @@ def _validate_skill_shapes_and_runtime_delta(
     shapes: Mapping[str, Tuple[int, ...]],
     *,
     heads_meta: Optional[Mapping[str, Any]] = None,
+    namespaced: bool = False,
 ) -> int:
     """Validate saved projector and head array shapes and return extra Python/covariance runtime bytes."""
     runtime_delta = 0
@@ -519,6 +582,9 @@ def _validate_skill_shapes_and_runtime_delta(
         raise ValueError("Saved hybrid projector dense_table has invalid shape")
 
     for name, definition in schema.fields.items():
+        def _k(suffix: str, _fn: str = name) -> str:
+            return _head_tensor_name(_fn, suffix, namespaced=namespaced)
+
         widths = (
             (1, 2)
             if isinstance(definition, BooleanField)
@@ -526,7 +592,7 @@ def _validate_skill_shapes_and_runtime_delta(
             if hasattr(definition, "options")
             else (1,)
         )
-        weight_shape = shapes.get(f"{name}_w", ())
+        weight_shape = shapes.get(_k("w"), ())
         if weight_shape not in tuple((width, dimension) for width in widths):
             raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
         width = weight_shape[0]
@@ -536,10 +602,10 @@ def _validate_skill_shapes_and_runtime_delta(
             "B": (dimension + 1, width),
         }
         for suffix, shape in required_shapes.items():
-            actual = shapes.get(f"{name}_{suffix}")
+            actual = shapes.get(_k(suffix))
             if (suffix == "b" or actual is not None) and actual != shape:
                 raise ValueError(f"Saved head {name!r} has incompatible {suffix} dimensions")
-        logit_adj_shape = shapes.get(f"{name}_logit_adj")
+        logit_adj_shape = shapes.get(_k("logit_adj"))
         if logit_adj_shape is not None:
             if isinstance(definition, BooleanField):
                 exp_adj_len = 2
@@ -552,21 +618,21 @@ def _validate_skill_shapes_and_runtime_delta(
             if logit_adj_shape != (exp_adj_len,):
                 raise ValueError(f"Saved head {name!r} has incompatible logit_adj dimensions")
             runtime_delta += 8 * exp_adj_len
-        calibration = shapes.get(f"{name}_calib_scores")
+        calibration = shapes.get(_k("calib_scores"))
         if calibration is not None and (len(calibration) != 1 or calibration[0] > MAX_SKILL_CALIBRATION_SCORES):
             raise ValueError("Saved skill calibration exceeds limits")
-        proto_shape = shapes.get(f"{name}_prototypes")
+        proto_shape = shapes.get(_k("prototypes"))
         if proto_shape is not None:
             valid_proto_rows = (1, 2) if isinstance(definition, BooleanField) else (width,)
             if len(proto_shape) != 2 or proto_shape[0] not in valid_proto_rows or proto_shape[1] != dimension:
                 raise ValueError(f"Saved head {name!r} has incompatible prototypes dimensions")
-        proto_scores_shape = shapes.get(f"{name}_proto_scores")
+        proto_scores_shape = shapes.get(_k("proto_scores"))
         if proto_scores_shape is not None and (
             len(proto_scores_shape) != 1 or proto_scores_shape[0] > MAX_SKILL_CALIBRATION_SCORES
         ):
             raise ValueError("Saved skill prototype calibration exceeds limits")
-        coarse_w_shape = shapes.get(f"{name}_coarse_w")
-        coarse_b_shape = shapes.get(f"{name}_coarse_b")
+        coarse_w_shape = shapes.get(_k("coarse_w"))
+        coarse_b_shape = shapes.get(_k("coarse_b"))
         if (coarse_w_shape is None) != (coarse_b_shape is None):
             raise ValueError(f"Saved head {name!r} has incomplete coarse hierarchical arrays")
         if coarse_w_shape is not None:
@@ -577,17 +643,17 @@ def _validate_skill_shapes_and_runtime_delta(
                 or coarse_b_shape != (coarse_w_shape[0],)
             ):
                 raise ValueError(f"Saved head {name!r} has incompatible coarse hierarchical dimensions")
-        fine_w_shape = shapes.get(f"{name}_fine_w")
-        fine_b_shape = shapes.get(f"{name}_fine_b")
+        fine_w_shape = shapes.get(_k("fine_w"))
+        fine_b_shape = shapes.get(_k("fine_b"))
         if (fine_w_shape is None) != (fine_b_shape is None):
             raise ValueError(f"Saved head {name!r} has incomplete fine hierarchical arrays")
         if fine_w_shape is not None:
             if fine_w_shape != (width, dimension) or fine_b_shape != (width,):
                 raise ValueError(f"Saved head {name!r} has incompatible fine hierarchical dimensions")
-        if f"{name}_B" in shapes and f"{name}_P" not in shapes:
+        if _k("B") in shapes and _k("P") not in shapes:
             runtime_delta += 8 * (dimension + 1) ** 2
         for suffix in ("calib_scores", "proto_scores"):
-            runtime_delta += 32 * shapes.get(f"{name}_{suffix}", (0,))[0]
+            runtime_delta += 32 * shapes.get(_k(suffix), (0,))[0]
         if isinstance(heads_meta, Mapping):
             h_info = heads_meta.get(name)
             if isinstance(h_info, Mapping):
@@ -604,7 +670,7 @@ def _validate_skill_shapes_and_runtime_delta(
                             raise ValueError(f"Saved head {name!r} class_calibration_scores exceeds limit")
                     runtime_delta += 32 * total_cls_scores
         for suffix in EXEMPLAR_ARRAYS:
-            shape = shapes.get(f"{name}_{suffix}")
+            shape = shapes.get(_k(suffix))
             if shape is None:
                 continue
             valid = (shape == (dimension,)) if suffix == "exemplar_mean" else (
@@ -618,7 +684,14 @@ def _validate_skill_shapes_and_runtime_delta(
     return runtime_delta
 
 
-def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runtime_bytes: int) -> Dict[str, np.ndarray]:
+def _read_skill_arrays(
+    data: bytes,
+    schema: DecisionSchema,
+    dimension: int,
+    runtime_bytes: int,
+    *,
+    namespaced: bool = False,
+) -> Dict[str, np.ndarray]:
     """Validate and deserialize `.s1m` v1/v2 NPZ arrays within strict bounds."""
     if not data.startswith(b"PK\x03\x04"):
         raise ValueError("Saved skill does not contain a valid NPZ array archive")
@@ -642,22 +715,9 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
             or end + 22 + comment_size != len(data)):
         raise ValueError("Saved skill NPZ directory exceeds limits or is malformed")
     expected = {
-        f"{name}_{suffix}.npy"
+        f"{_head_tensor_name(name, suffix, namespaced=namespaced)}.npy"
         for name in schema.fields
-        for suffix in (
-            "w",
-            "b",
-            "P",
-            "B",
-            "calib_scores",
-            "logit_adj",
-            "prototypes",
-            "proto_scores",
-            "coarse_w",
-            "coarse_b",
-            "fine_w",
-            "fine_b",
-        ) + EXEMPLAR_ARRAYS
+        for suffix in HEAD_TENSOR_SUFFIXES
     } | {
         "_projector_spectral_vectors.npy",
         "_projector_subspace_components.npy",
@@ -698,7 +758,12 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
                 shapes[info.filename[:-4]] = shape
         if effective_array_bytes > MAX_SKILL_ARRAY_BYTES:
             raise ValueError("Saved skill arrays exceed upcast array budget")
-        runtime_bytes += _validate_skill_shapes_and_runtime_delta(schema, dimension, shapes)
+        runtime_bytes += _validate_skill_shapes_and_runtime_delta(
+            schema,
+            dimension,
+            shapes,
+            namespaced=namespaced,
+        )
         runtime_bytes += 2 * effective_array_bytes
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
@@ -1007,27 +1072,25 @@ class CompiledSystemOneModel:
         ch = self.heads.get(field_name)
         if ch is None or ch.prototypes is None or ch.prototypes.size == 0:
             return None
-        emb = np.asarray(embedding, dtype=np.float32).flatten()
-        if emb.ndim != 1 or ch.prototypes.ndim != 2 or ch.prototypes.shape[1] != emb.shape[0]:
+        emb_raw = np.asarray(embedding)
+        emb_flat = emb_raw.ravel()
+        if emb_flat.ndim != 1 or ch.prototypes.ndim != 2 or ch.prototypes.shape[1] != emb_flat.shape[0]:
             return None
-        e_norm = float(np.linalg.norm(emb))
-        if e_norm < 1e-12 or not math.isfinite(e_norm):
+        emb_unit, _, emb_valid = _normalize_vec_f32_safe(emb_flat)
+        if not emb_valid:
             return 0.0
-        emb_unit = emb / e_norm
-        p_norms = np.linalg.norm(ch.prototypes, axis=1, keepdims=True)
-        valid_rows = p_norms.flatten() > 1e-12
+        proto_all, valid_rows = _normalize_rows_f32_safe(ch.prototypes)
         if not np.any(valid_rows):
             return None
-        proto_unit = ch.prototypes[valid_rows] / np.where(
-            p_norms[valid_rows] < 1e-12, 1.0, p_norms[valid_rows]
-        )
+        proto_unit = proto_all[valid_rows]
         best_sim = float(np.max(proto_unit @ emb_unit))
         online_bank = getattr(self, "_online_prototype_bank", {}).get(field_name)
         if online_bank:
             for shot in online_bank:
-                s_arr = np.asarray(shot, dtype=np.float32).flatten()
-                if s_arr.shape[0] == emb_unit.shape[0]:
-                    sim_s = float(np.dot(s_arr, emb_unit))
+                s_raw = np.asarray(shot).ravel()
+                if s_raw.shape[0] == emb_unit.shape[0]:
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        sim_s = float(np.dot(s_raw.astype(np.float32), emb_unit))
                     if sim_s > best_sim:
                         best_sim = sim_s
         head = self._field_heads.get(field_name)
@@ -1035,11 +1098,11 @@ class CompiledSystemOneModel:
         if online_shots:
             for group in online_shots:
                 for shot in group:
-                    s_arr = np.asarray(shot, dtype=np.float32).flatten()
-                    if s_arr.shape[0] == emb_unit.shape[0]:
-                        s_norm = float(np.linalg.norm(s_arr))
-                        if s_norm > 1e-12:
-                            sim_s = float(np.dot(s_arr / s_norm, emb_unit))
+                    s_raw = np.asarray(shot).ravel()
+                    if s_raw.shape[0] == emb_unit.shape[0]:
+                        s_unit, _, s_valid = _normalize_vec_f32_safe(s_raw)
+                        if s_valid:
+                            sim_s = float(np.dot(s_unit, emb_unit))
                             if sim_s > best_sim:
                                 best_sim = sim_s
         return best_sim
@@ -1964,6 +2027,9 @@ class CompiledSystemOneModel:
         }
         if format_version == 3:
             header_meta["embed_vocab"] = bool(embed_vocab)
+        namespaced_tensors = _schema_needs_namespaced_head_tensors(self.schema)
+        if namespaced_tensors:
+            header_meta["tensor_namespace"] = "len_v1"
 
         def _is_f_2d_tensor(arr: np.ndarray) -> bool:
             return bool(
@@ -2063,23 +2129,26 @@ class CompiledSystemOneModel:
             }
 
         for name, ch in sorted(self.heads.items()):
-            arrays_to_save[f"{name}_w"] = _pack_array(ch.weights)
-            arrays_to_save[f"{name}_b"] = _pack_f32_vec(ch.biases, f"Head {name!r} biases")
+            def _hk(suffix: str, _fn: str = name) -> str:
+                return _head_tensor_name(_fn, suffix, namespaced=namespaced_tensors)
+
+            arrays_to_save[_hk("w")] = _pack_array(ch.weights)
+            arrays_to_save[_hk("b")] = _pack_f32_vec(ch.biases, f"Head {name!r} biases")
             state = exemplar_states.get(name)
             if state is not None:
                 for suffix, arr in state["arrays"].items():
                     arr_np = np.asarray(arr)
-                    arrays_to_save[f"{name}_{suffix}"] = (
+                    arrays_to_save[_hk(suffix)] = (
                         _pack_array(arr_np) if arr_np.ndim == 2 else arr_np
                     )
             if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
-                arrays_to_save[f"{name}_calib_scores"] = np.asarray(ch.calibration_scores, dtype=np.float64)
+                arrays_to_save[_hk("calib_scores")] = np.asarray(ch.calibration_scores, dtype=np.float64)
             if getattr(ch, "logit_adjustments", None) is not None:
                 adj_valid = _validate_compiled_logit_adj(
                     ch.logit_adjustments, self.schema.fields[name], name
                 )
                 if adj_valid is not None:
-                    arrays_to_save[f"{name}_logit_adj"] = np.ascontiguousarray(adj_valid, dtype=np.float64)
+                    arrays_to_save[_hk("logit_adj")] = np.ascontiguousarray(adj_valid, dtype=np.float64)
             if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
                 proto_32 = _pack_f32_vec(ch.prototypes, f"Head {name!r} prototypes")
                 with np.errstate(over="ignore", invalid="ignore"):
@@ -2089,30 +2158,30 @@ class CompiledSystemOneModel:
                     and (format_version == 2 or compact is True)
                     and np.all(np.isfinite(proto_16))
                 ):
-                    arrays_to_save[f"{name}_prototypes"] = proto_16
+                    arrays_to_save[_hk("prototypes")] = proto_16
                 else:
-                    arrays_to_save[f"{name}_prototypes"] = _pack_array(proto_32)
+                    arrays_to_save[_hk("prototypes")] = _pack_array(proto_32)
             if getattr(ch, "prototype_scores", ()) and len(ch.prototype_scores) > 0:
-                arrays_to_save[f"{name}_proto_scores"] = np.asarray(ch.prototype_scores, dtype=np.float64)
+                arrays_to_save[_hk("proto_scores")] = np.asarray(ch.prototype_scores, dtype=np.float64)
             if (
                 getattr(ch, "hierarchical", False)
                 and ch.coarse_weights is not None
                 and ch.coarse_biases is not None
             ):
-                arrays_to_save[f"{name}_coarse_w"] = _pack_array(ch.coarse_weights)
-                arrays_to_save[f"{name}_coarse_b"] = _pack_f32_vec(
+                arrays_to_save[_hk("coarse_w")] = _pack_array(ch.coarse_weights)
+                arrays_to_save[_hk("coarse_b")] = _pack_f32_vec(
                     ch.coarse_biases, f"Head {name!r} coarse biases"
                 )
                 if ch.fine_weights is not None and ch.fine_biases is not None:
-                    arrays_to_save[f"{name}_fine_w"] = _pack_array(ch.fine_weights)
-                    arrays_to_save[f"{name}_fine_b"] = _pack_f32_vec(
+                    arrays_to_save[_hk("fine_w")] = _pack_array(ch.fine_weights)
+                    arrays_to_save[_hk("fine_b")] = _pack_f32_vec(
                         ch.fine_biases, f"Head {name!r} fine biases"
                     )
             if include_covariance:
                 if ch.P is not None:
-                    arrays_to_save[f"{name}_P"] = _pack_array(ch.P)
+                    arrays_to_save[_hk("P")] = _pack_array(ch.P)
                 if ch.B is not None:
-                    arrays_to_save[f"{name}_B"] = _pack_array(ch.B)
+                    arrays_to_save[_hk("B")] = _pack_array(ch.B)
 
         if format_version == 3:
             for tname, arr in list(arrays_to_save.items()):
@@ -2917,18 +2986,22 @@ class CompiledSystemOneModel:
         )
 
         heads: Dict[str, CompiledHeadWeights] = {}
+        namespaced_tensors = _resolve_tensor_namespaced_flag(schema, meta)
         for name, h_info in meta["heads"].items():
+            def _hk(suffix: str, _fn: str = name) -> str:
+                return _head_tensor_name(_fn, suffix, namespaced=namespaced_tensors)
+
             if not isinstance(h_info, Mapping):
                 raise ValueError(f"Saved head {name!r} metadata must be a mapping")
             ctx = f"Saved head {name!r}"
             if name not in schema.fields or h_info.get("field_type") != schema.fields[name].field_type:
                 raise ValueError(f"Saved head {name!r} does not match the schema")
             definition = schema.fields[name]
-            if f"{name}_w" not in array_map or f"{name}_b" not in array_map:
+            if _hk("w") not in array_map or _hk("b") not in array_map:
                 raise ValueError(f"Saved head {name!r} is missing required weights")
-            w = _as_f32(array_map[f"{name}_w"])
+            w = _as_f32(array_map[_hk("w")])
             assert w is not None
-            b = _as_f32(array_map[f"{name}_b"])
+            b = _as_f32(array_map[_hk("b")])
             assert b is not None
             widths = (
                 (1, 2)
@@ -2948,16 +3021,16 @@ class CompiledSystemOneModel:
                 raise ValueError(f"Saved head {name!r} uses an unsupported conformal score")
             if isinstance(definition, (ChoiceField, MultiChoiceField)) and tuple(h_info.get("options", ())) != definition.options:
                 raise ValueError(f"Saved head {name!r} options do not match the schema")
-            p_mat = _as_f32(array_map[f"{name}_P"]) if f"{name}_P" in array_map else None
-            b_mat = _as_f32(array_map[f"{name}_B"]) if f"{name}_B" in array_map else None
+            p_mat = _as_f32(array_map[_hk("P")]) if _hk("P") in array_map else None
+            b_mat = _as_f32(array_map[_hk("B")]) if _hk("B") in array_map else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (p_mat, b_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite covariance")
-            calib_scores_arr = array_map[f"{name}_calib_scores"] if f"{name}_calib_scores" in array_map else None
+            calib_scores_arr = array_map[_hk("calib_scores")] if _hk("calib_scores") in array_map else None
             calib_scores = tuple(float(s) for s in calib_scores_arr) if calib_scores_arr is not None else ()
             if any(not math.isfinite(score) or score < 0 for score in calib_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid calibration scores")
             logit_adj_arr = _validate_compiled_logit_adj(
-                array_map.get(f"{name}_logit_adj"),
+                array_map.get(_hk("logit_adj")),
                 definition,
                 name,
             )
@@ -2993,13 +3066,12 @@ class CompiledSystemOneModel:
             proto_thresh = _strict_header_float(
                 h_info, "prototype_threshold", 0.0, ctx, min_val=0.0, min_inclusive=True
             )
-            raw_proto_arr = array_map[f"{name}_prototypes"] if f"{name}_prototypes" in array_map else None
+            raw_proto_arr = array_map[_hk("prototypes")] if _hk("prototypes") in array_map else None
             proto_mat = _as_f32(raw_proto_arr)
             if proto_mat is not None and not np.all(np.isfinite(proto_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite prototypes")
-            if raw_proto_arr is not None and raw_proto_arr.dtype == np.float16 and proto_mat is not None and proto_mat.ndim == 2:
-                proto_norms = np.linalg.norm(proto_mat, axis=1, keepdims=True)
-                proto_mat = (proto_mat / np.where(proto_norms < 1e-12, 1.0, proto_norms)).astype(np.float32)
+            if proto_mat is not None and proto_mat.ndim == 2:
+                proto_mat, _ = _normalize_rows_f32_safe(proto_mat)
             if (
                 proto_mat is None
                 and not is_cold_skill
@@ -3008,14 +3080,15 @@ class CompiledSystemOneModel:
                 and np.any(w)
             ):
                 if w.shape[0] >= 2:
-                    w_norms = np.linalg.norm(w, axis=1, keepdims=True)
-                    w_norms = np.where(w_norms < 1e-12, 1.0, w_norms)
-                    proto_mat = (w / w_norms).astype(np.float32)
+                    proto_mat, _ = _normalize_rows_f32_safe(w)
                 elif isinstance(definition, BooleanField) and w.shape[0] == 1:
-                    w_norm = max(1e-12, float(np.linalg.norm(w[0])))
-                    w_u = (w[0] / w_norm).astype(np.float32)
+                    w_u, _, w_ok = _normalize_vec_f32_safe(w[0])
+                    if not w_ok and np.any(w[0]):
+                        w64 = np.asarray(w[0], dtype=np.float64)
+                        w_norm = max(1e-12, float(np.linalg.norm(w64)))
+                        w_u = (w64 / w_norm).astype(np.float32)
                     proto_mat = np.vstack([-w_u, w_u]).astype(np.float32)
-            proto_scores_arr = array_map[f"{name}_proto_scores"] if f"{name}_proto_scores" in array_map else None
+            proto_scores_arr = array_map[_hk("proto_scores")] if _hk("proto_scores") in array_map else None
             proto_scores = tuple(float(s) for s in proto_scores_arr) if proto_scores_arr is not None else ()
             if any(not math.isfinite(score) or score < 0 for score in proto_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid prototype calibration scores")
@@ -3027,10 +3100,10 @@ class CompiledSystemOneModel:
             ):
                 raise ValueError(f"Saved head {name!r} has invalid cluster_assignments")
             cluster_assign = tuple(int(c) for c in raw_assign) if isinstance(raw_assign, (list, tuple)) else ()
-            coarse_w = _as_f32(array_map[f"{name}_coarse_w"]) if f"{name}_coarse_w" in array_map else None
-            coarse_b = _as_f32(array_map[f"{name}_coarse_b"]) if f"{name}_coarse_b" in array_map else None
-            fine_w = _as_f32(array_map[f"{name}_fine_w"]) if f"{name}_fine_w" in array_map else None
-            fine_b = _as_f32(array_map[f"{name}_fine_b"]) if f"{name}_fine_b" in array_map else None
+            coarse_w = _as_f32(array_map[_hk("coarse_w")]) if _hk("coarse_w") in array_map else None
+            coarse_b = _as_f32(array_map[_hk("coarse_b")]) if _hk("coarse_b") in array_map else None
+            fine_w = _as_f32(array_map[_hk("fine_w")]) if _hk("fine_w") in array_map else None
+            fine_b = _as_f32(array_map[_hk("fine_b")]) if _hk("fine_b") in array_map else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (coarse_w, coarse_b, fine_w, fine_b)):
                 raise ValueError(f"Saved head {name!r} contains non-finite hierarchical weights")
             if is_hier:
@@ -3040,9 +3113,9 @@ class CompiledSystemOneModel:
                     raise ValueError(f"Saved head {name!r} has out-of-range cluster_assignments")
 
             exemplar_arrays = {
-                suffix: _as_f32(array_map[f"{name}_{suffix}"])
+                suffix: _as_f32(array_map[_hk(suffix)])
                 for suffix in EXEMPLAR_ARRAYS
-                if f"{name}_{suffix}" in array_map
+                if _hk(suffix) in array_map
             }
             for ex_arr in exemplar_arrays.values():
                 if ex_arr is None or not np.all(np.isfinite(ex_arr)):
@@ -3318,35 +3391,11 @@ class CompiledSystemOneModel:
         if not isinstance(raw_tensors, dict) or len(raw_tensors) > 17 * MAX_SKILL_FIELDS_V3 + 32:
             raise ValueError("Saved v3 skill tensor manifest is invalid or exceeds limit")
 
-        allowed_names = {
-            "_projector_tfidf_idf",
-            "_projector_prag_base_idf",
-            "_projector_prag_idf",
-            "_projector_spectral_vectors",
-            "_projector_spectral_basis",
-            "_projector_subspace_components",
-            "_projector_rbf_landmarks",
-            "_projector_hybrid_tfidf_idf",
-            "_projector_dense_table",
-        }
-        head_suffixes = (
-            "w",
-            "b",
-            "P",
-            "B",
-            "calib_scores",
-            "logit_adj",
-            "prototypes",
-            "proto_scores",
-            "coarse_w",
-            "coarse_b",
-            "fine_w",
-            "fine_b",
-            *EXEMPLAR_ARRAYS,
-        )
+        namespaced = _resolve_tensor_namespaced_flag(schema, meta)
+        allowed_names = set(PROJECTOR_TENSOR_NAMES)
         for fname in schema.fields:
-            for suf in head_suffixes:
-                allowed_names.add(f"{fname}_{suf}")
+            for suf in HEAD_TENSOR_SUFFIXES:
+                allowed_names.add(_head_tensor_name(fname, suf, namespaced=namespaced))
 
         max_dim_bound = max(MAX_SKILL_CALIBRATION_SCORES, 250_000)
         total_array_bytes = 0
@@ -3416,30 +3465,40 @@ class CompiledSystemOneModel:
             "_projector_prag_idf",
             "_projector_hybrid_tfidf_idf",
         ))
+        logit_adj_names = frozenset(
+            _head_tensor_name(fname, "logit_adj", namespaced=namespaced)
+            for fname in schema.fields
+        )
+        score_f64_names = frozenset(
+            _head_tensor_name(fname, sfx, namespaced=namespaced)
+            for fname in schema.fields
+            for sfx in ("calib_scores", "proto_scores")
+        )
         upcast_bytes_v3 = 0
         for tname, spec in raw_tensors.items():
             dt_bytes = np.dtype(spec["dtype"]).itemsize
             cnt = int(math.prod(shapes_v3[tname]))
-            if tname in idf_tensor_names:
+            if tname in idf_tensor_names or tname in logit_adj_names:
                 if dt_bytes != 8:
                     upcast_bytes_v3 += 8 * cnt
-            elif tname.endswith("_logit_adj"):
-                if dt_bytes != 8:
-                    upcast_bytes_v3 += 8 * cnt
-            elif not tname.endswith(("_calib_scores", "_proto_scores")) and dt_bytes != 4:
+            elif tname not in score_f64_names and dt_bytes != 4:
                 upcast_bytes_v3 += 4 * cnt
         extra_runtime_bytes = _validate_skill_shapes_and_runtime_delta(
             schema,
             dimension,
             shapes_v3,
             heads_meta=meta.get("heads"),
+            namespaced=namespaced,
         )
         extra_runtime_bytes += upcast_bytes_v3
 
         cov_fields = sum(
             1
             for fname in schema.fields
-            if f"{fname}_P" in raw_tensors or f"{fname}_B" in raw_tensors
+            if (
+                _head_tensor_name(fname, "P", namespaced=namespaced) in raw_tensors
+                or _head_tensor_name(fname, "B", namespaced=namespaced) in raw_tensors
+            )
         )
         projector_config = meta.get("projector")
         saved_tfidf, saved_prag, _ = cls._validate_projector_and_budget(
@@ -3574,7 +3633,14 @@ class CompiledSystemOneModel:
             cov_fields=cov_fields,
             max_runtime_bytes=MAX_SKILL_RUNTIME_BYTES,
         )
-        npz_file = _read_skill_arrays(raw_bytes[header_end:], schema, dimension, runtime_bytes)
+        namespaced = _resolve_tensor_namespaced_flag(schema, meta)
+        npz_file = _read_skill_arrays(
+            raw_bytes[header_end:],
+            schema,
+            dimension,
+            runtime_bytes,
+            namespaced=namespaced,
+        )
         return cls._reconstruct_model_from_parts(
             meta,
             npz_file,
@@ -4223,9 +4289,9 @@ class SystemOneCompiler:
                         if sw is not None
                         else np.mean(X_mat[mask], axis=0)
                     )
-                    norm = float(np.linalg.norm(vec))
-                    if norm > 1e-12:
-                        protos[idx] = (vec / norm).astype(np.float32)
+                    unit_v, _, ok = _normalize_vec_f32_safe(vec)
+                    if ok:
+                        protos[idx] = unit_v
             res = _roundtrip_unit_f16(protos)
             assert res is not None
             return res
@@ -4242,9 +4308,9 @@ class SystemOneCompiler:
                     if sw is not None
                     else np.mean(X_mat[mask], axis=0)
                 )
-                norm = float(np.linalg.norm(vec))
-                if norm > 1e-12:
-                    protos[k] = (vec / norm).astype(np.float32)
+                unit_v, _, ok = _normalize_vec_f32_safe(vec)
+                if ok:
+                    protos[k] = unit_v
         res = _roundtrip_unit_f16(protos)
         assert res is not None
         return res
@@ -4358,9 +4424,8 @@ class SystemOneCompiler:
         if M >= K:
             return tuple(range(K))
 
-        norms = np.linalg.norm(protos, axis=1, keepdims=True)
-        norms = np.where(norms < 1e-12, 1.0, norms)
-        unit_protos = protos / norms
+        unit_f32, _ = _normalize_rows_f32_safe(protos)
+        unit_protos = unit_f32.astype(np.float64)
 
         # Deterministic farthest-first traversal (k-means++ on cosine similarity)
         sim_matrix = unit_protos @ unit_protos.T
@@ -4525,16 +4590,17 @@ class SystemOneCompiler:
         """Compute sorted calibration prototype similarities and empirical alpha quantile."""
         if prototype_alpha <= 0.0 or prototypes is None or prototypes.size == 0 or len(X_conf) == 0:
             return 0.0, ()
-        protos = np.asarray(prototypes, dtype=np.float32)
-        p_norms = np.linalg.norm(protos, axis=1, keepdims=True)
-        valid_rows = (p_norms.flatten() > 1e-12)
+        protos_all, valid_rows = _normalize_rows_f32_safe(prototypes)
         if not np.any(valid_rows):
             return 0.0, ()
-        protos_valid = (protos[valid_rows] / p_norms[valid_rows]).astype(np.float32)
-        X_mat = np.asarray(X_conf, dtype=np.float32)
-        x_norms = np.linalg.norm(X_mat, axis=1, keepdims=True)
-        x_norms = np.where(x_norms < 1e-12, 1.0, x_norms)
-        X_unit = (X_mat / x_norms).astype(np.float32)
+        protos_valid = protos_all[valid_rows]
+        x64 = np.asarray(X_conf, dtype=np.float64)
+        if x64.ndim != 2 or len(x64) == 0:
+            return 0.0, ()
+        fin_rows = np.all(np.isfinite(x64), axis=1)
+        if not np.any(fin_rows):
+            return 0.0, ()
+        X_unit, _ = _normalize_rows_f32_safe(x64[fin_rows])
         max_sims = np.max(X_unit @ protos_valid.T, axis=1).astype(np.float64)
         finite_sims = max_sims[np.isfinite(max_sims)]
         if len(finite_sims) == 0:

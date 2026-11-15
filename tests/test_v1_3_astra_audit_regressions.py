@@ -5922,6 +5922,17 @@ def test_astra_24_round11_regressions() -> None:
                 "force_teacher": True,
                 "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
             },
+            {
+                "input": "valid",
+                "force_teacher": float("nan"),
+                "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+            },
+            {
+                "input": "valid",
+                "model": [float("inf")],
+                "force_teacher": True,
+                "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+            },
         ):
             with pytest.raises(InteropError) as exc_tree:
                 svc_r11_3.process_payload(path="/v1beta/decisions", payload=bad_payload)
@@ -10546,17 +10557,17 @@ def test_astra_31_round18_regressions() -> None:
         upstream_handlers={"gemini": _approval_teacher},
         require_auth=False,
         cutover_config=CutoverConfig(
-            milestones=(20, 40),
+            milestones=(50, 100),
             k_min=2,
             alpha_target=0.15,
-            canary_rate=0.001,
+            canary_rate=1e-9,
             sparse_dim=64,
             dense_dim=16,
             enable_quarantine=False,
         ),
     )
     q_act = {"act": {"type": "choice", "options": ("allow", "deny")}}
-    for idx_s in range(44):
+    for idx_s in range(160):
         is_ok = idx_s % 2 == 0
         req_s = {
             "state": [{"text": f"transfer request {idx_s}", "approved": is_ok}],
@@ -10571,16 +10582,32 @@ def test_astra_31_round18_regressions() -> None:
         assert st_s == 200
         assert body_s["answers"]["act"]["choice"] == ("allow" if is_ok else "deny")
 
-    # Repeat an exact approved payload then flip only sibling "approved" to False: must never leak cached "allow".
+    sib_lifecycles = list(svc_sib._lifecycles.values())
+    assert len(sib_lifecycles) == 1
+    assert str(getattr(sib_lifecycles[0].lifecycle.state, "value", sib_lifecycles[0].lifecycle.state)) == "SELECTIVE_HOT_SWAP"
+
+    # Repeat an exact approved payload to populate/verify cache hit, then flip sibling "approved" to False: must return "deny".
     req_ok = json.dumps({"state": [{"text": "transfer", "approved": True}], "questions": q_act, "slot": "r18_sibling"}).encode("utf-8")
     req_deny = json.dumps({"state": [{"text": "transfer", "approved": False}], "questions": q_act, "slot": "r18_sibling"}).encode("utf-8")
-    for _ in range(3):
+    for _ in range(2):
         st_ok, body_ok = svc_sib.handle_request(
             path="/v1beta/decisions",
             headers={"Content-Type": "application/json"},
             raw_body=req_ok,
         )
         assert st_ok == 200 and body_ok["answers"]["act"]["choice"] == "allow"
+    calls_before_hit = teacher_calls
+    fast_before_hit = int(svc_sib.stats["local_fastpath_requests"])
+    st_hit, body_hit = svc_sib.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_ok,
+    )
+    assert st_hit == 200 and body_hit["answers"]["act"]["choice"] == "allow"
+    assert body_hit["local_execution"] is True
+    assert teacher_calls == calls_before_hit
+    assert int(svc_sib.stats["local_fastpath_requests"]) >= fast_before_hit + 1
+
     st_deny, body_deny = svc_sib.handle_request(
         path="/v1beta/decisions",
         headers={"Content-Type": "application/json"},
@@ -11088,6 +11115,591 @@ def test_astra_31_round18_regressions() -> None:
     bad_test_p[0] = [False, 0.5, 0.5]
     with pytest.raises(ValueError):
         cqr_ordinal_intervals(cal_p, np.arange(20) % 3, bad_test_p, alpha=0.2)
+
+
+def test_astra_32_round19_regressions() -> None:
+    """Round-19 regressions R19-1..R19-8 covering cache keys, F-layout, s1m namespaces, validation, and overflow."""
+    import email
+    from system1.calibration import (
+        ConformalPredictor,
+        CumulativeLogitOrdinalHead,
+        SoftOrdinalHead,
+        _minimize_lbfgs_np,
+        _ordinal_expected_value,
+        _predict_ordinal_class,
+        cqr_ordinal_intervals,
+    )
+    from system1.compat.universal import UnsupportedMediaError, extract_semantic_text
+    from system1.compiler import CompiledHeadWeights
+    from system1.core.model import PackedMultiQuestionKernel, _pack_array_sig
+    from system1.cutover import AutoCutoverLifecycle
+    from system1.integrations.drop_in import UtilityCascadeRouter
+    from system1.integrations.mcp_http import (
+        MCPGuardRuntime,
+        MCPStreamableHTTPConfig,
+        _MCPStreamableHTTPHandler,
+    )
+
+    # R19-1: Unambiguous structured cache key + schema support gate prevent delimiter injection and local leaks.
+    t_calls_r19_1 = 0
+
+    def _r19_teacher(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        nonlocal t_calls_r19_1
+        t_calls_r19_1 += 1
+        items = raw_payload.get("state", [])
+        approved = bool(
+            isinstance(items, list)
+            and len(items) == 1
+            and isinstance(items[0], dict)
+            and items[0].get("approved") is True
+        )
+        choice = "allow" if approved else "deny"
+        probs = {"allow": 0.99, "deny": 0.01} if approved else {"allow": 0.01, "deny": 0.99}
+        return {"answers": {"act": {"choice": choice, "probabilities": probs}}, "usage": {"input_tokens": 4}}
+
+    svc_delim = UniversalDecisionService(
+        upstream_handlers={"gemini": _r19_teacher},
+        require_auth=False,
+        cutover_config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            alpha_target=0.15,
+            canary_rate=1e-9,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    q_r19 = {"act": {"type": "choice", "options": ("allow", "deny")}}
+    for idx_d in range(160):
+        ok_flag = idx_d % 2 == 0
+        kw_d = "approved_kw" if ok_flag else "denied_kw"
+        payload_w = {
+            "state": [{"text": f"{kw_d} routine transfer item {idx_d}", "approved": ok_flag}],
+            "questions": q_r19,
+            "slot": "r19_delim",
+        }
+        st_w, body_w = svc_delim.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=json.dumps(payload_w).encode("utf-8"),
+        )
+        assert st_w == 200
+        assert body_w["answers"]["act"]["choice"] == ("allow" if ok_flag else "deny")
+
+    lc_delim = list(svc_delim._lifecycles.values())[0]
+    assert str(getattr(lc_delim.lifecycle.state, "value", lc_delim.lifecycle.state)) == "SELECTIVE_HOT_SWAP"
+
+    state_1 = [{"text": "safe routine normal approved transfer", "approved": True}]
+    state_2 = [{"text": "approved: true | text: safe routine normal approved transfer"}]
+    state_unseen = [{"text": "safe routine normal approved transfer"}]
+    txt_s1, _ = extract_semantic_text({"state": state_1})
+    txt_s2, _ = extract_semantic_text({"state": state_2})
+    assert txt_s1 != txt_s2
+
+    req_s1 = json.dumps({"state": state_1, "questions": q_r19, "slot": "r19_delim"}).encode("utf-8")
+    req_s2 = json.dumps({"state": state_2, "questions": q_r19, "slot": "r19_delim"}).encode("utf-8")
+    req_unseen = json.dumps({"state": state_unseen, "questions": q_r19, "slot": "r19_delim"}).encode("utf-8")
+
+    for _ in range(2):
+        st1, b1 = svc_delim.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=req_s1,
+        )
+        assert st1 == 200 and b1["answers"]["act"]["choice"] == "allow"
+
+    calls_pre_hit = t_calls_r19_1
+    fast_pre_hit = int(svc_delim.stats["local_fastpath_requests"])
+    st_s1_hit, b_s1_hit = svc_delim.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_s1,
+    )
+    assert st_s1_hit == 200 and b_s1_hit["answers"]["act"]["choice"] == "allow"
+    assert b_s1_hit["local_execution"] is True
+    assert t_calls_r19_1 == calls_pre_hit
+    assert int(svc_delim.stats["local_fastpath_requests"]) >= fast_pre_hit + 1
+
+    st_s2, b_s2 = svc_delim.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_s2,
+    )
+    assert st_s2 == 200
+    assert b_s2["answers"]["act"]["choice"] == "deny"
+    assert b_s2["local_execution"] is False
+    assert t_calls_r19_1 == calls_pre_hit + 1
+
+    st_u1, b_u1 = svc_delim.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_unseen,
+    )
+    assert st_u1 == 200
+    assert b_u1["answers"]["act"]["choice"] == "deny"
+    assert b_u1["local_execution"] is False
+    assert t_calls_r19_1 == calls_pre_hit + 2
+
+    req_type_spoof = json.dumps(
+        {
+            "state": [{"text": "approved_kw routine transfer item 0", "approved": "true"}],
+            "questions": q_r19,
+            "slot": "r19_delim",
+        }
+    ).encode("utf-8")
+    st_ts, b_ts = svc_delim.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_type_spoof,
+    )
+    assert st_ts == 200
+    assert b_ts["answers"]["act"]["choice"] == "deny"
+    assert b_ts["local_execution"] is False
+    assert t_calls_r19_1 == calls_pre_hit + 3
+
+    # Envelope extra_context cache separation + direct AutoCutoverLifecycle cache_key separation.
+    def _extra_teacher(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        ch = "allow" if raw_payload.get("channel") == "vip" else "deny"
+        probs = {"allow": 0.99, "deny": 0.01} if ch == "allow" else {"allow": 0.01, "deny": 0.99}
+        return {"answers": {"act": {"choice": ch, "probabilities": probs}}, "usage": {"input_tokens": 3}}
+
+    svc_extra = UniversalDecisionService(
+        upstream_handlers={"gemini": _extra_teacher},
+        require_auth=False,
+        cutover_config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            alpha_target=0.15,
+            canary_rate=1e-9,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    for idx_e in range(160):
+        chan_e = "vip" if idx_e % 2 == 0 else "standard"
+        st_ew, b_ew = svc_extra.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": f"{'vip priority' if chan_e == 'vip' else 'standard normal'} channel request {idx_e}",
+                    "channel": chan_e,
+                    "questions": q_r19,
+                    "slot": "ext",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_ew == 200 and b_ew["answers"]["act"]["choice"] == ("allow" if chan_e == "vip" else "deny")
+
+    lc_ext = list(svc_extra._lifecycles.values())[0]
+    assert str(getattr(lc_ext.lifecycle.state, "value", lc_ext.lifecycle.state)) == "SELECTIVE_HOT_SWAP"
+
+    req_vip_same = json.dumps(
+        {"state": "same status text", "channel": "vip", "questions": q_r19, "slot": "ext"}
+    ).encode("utf-8")
+    req_std_same = json.dumps(
+        {"state": "same status text", "channel": "standard", "questions": q_r19, "slot": "ext"}
+    ).encode("utf-8")
+    for _ in range(2):
+        st_ev, b_ev = svc_extra.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=req_vip_same,
+        )
+        assert st_ev == 200 and b_ev["answers"]["act"]["choice"] == "allow"
+    st_ev_hit, b_ev_hit = svc_extra.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_vip_same,
+    )
+    assert st_ev_hit == 200
+    assert b_ev_hit["local_execution"] is True
+    assert b_ev_hit["answers"]["act"]["choice"] == "allow"
+    st_es, b_es = svc_extra.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_std_same,
+    )
+    assert st_es == 200
+    assert b_es["answers"]["act"]["choice"] == "deny"
+    assert b_es["local_execution"] is False
+
+    class _LcKeySchema(DecisionSchema):
+        act = ChoiceField(options=("allow", "deny"))
+
+    lc_direct = AutoCutoverLifecycle(
+        _LcKeySchema(),
+        config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            canary_rate=1e-9,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    for idx_ld in range(60):
+        lbl_ld = "allow" if idx_ld % 2 == 0 else "deny"
+        lc_direct.observe_teacher(
+            f"{lbl_ld} warm direct {idx_ld}",
+            {"act": lbl_ld},
+        )
+    assert lc_direct.mature_classes == {"allow", "deny"}
+    for _ in range(2):
+        lc_direct.observe_teacher(
+            "identical prompt",
+            {"act": "allow"},
+            cache_key="key_alpha",
+        )
+    assert lc_direct.decide_local("identical prompt", cache_key="key_alpha") == {"act": "allow"}
+    assert lc_direct.decide_local("identical prompt", cache_key="key_beta") is None
+    for _ in range(2):
+        lc_direct.observe_teacher(
+            "identical prompt",
+            {"act": "deny"},
+            cache_key="key_beta",
+        )
+    assert lc_direct.decide_local("identical prompt", cache_key="key_beta") == {"act": "deny"}
+    assert lc_direct.decide_local("identical prompt", cache_key="key_alpha") == {"act": "allow"}
+
+    # R19-2: Packed kernel, callable, and FastExplainer preserve 2D Fortran layout & raw Boolean matrices.
+    class _R19Tie3Schema(DecisionSchema):
+        c = ChoiceField(options=("a", "b", "c"), description="Choice field")
+
+    eng_f3_tie = SystemOneEngine(
+        _R19Tie3Schema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+    )
+    eng_f3_tie.model.heads["c"].set_weights(
+        np.asfortranarray(np.random.default_rng(1).normal(size=(3, 32)).astype(np.float32)),
+        np.zeros(3, dtype=np.float32),
+    )
+    raw_f3 = eng_f3_tie.model.heads["c"].compute_logits(eng_f3_tie.model.encode("fortran layout check"))
+    eng_f3_tie.calibrators["c"].logit_adjustments = -raw_f3.astype(np.float64) / 0.25
+    eng_f3_tie.conformal_predictors["c"] = ConformalPredictor("c", ("a", "b", "c"), score_method="lac", mondrian=False)
+    eng_f3_tie.conformal_predictors["c"].calibrate(
+        np.tile([1.0 / 3.0 + 1.5e-7, 1.0 / 3.0 - 0.75e-7, 1.0 / 3.0 - 0.75e-7], (100, 1)),
+        ["a"] * 100,
+    )
+    dec_eng = eng_f3_tie.decide("fortran layout check", record_receipt=False)
+    pk_f3 = eng_f3_tie.compile_packed_kernel(storage_mode="float32")
+    call_f3 = eng_f3_tie.compile_callable(storage_mode="float32")
+    emb_f3 = pk_f3.encode_batch(["fortran layout check"])
+    res_pk = pk_f3.forward_embeddings(emb_f3)
+    res_call = call_f3("fortran layout check")
+    exp_f3 = FastExplainer.from_engine(eng_f3_tie, field_name="c")
+    ex_f3 = exp_f3.explain("fortran layout check")
+
+    assert dec_eng.values["c"] == "a"
+    assert dec_eng.conformal_sets["c"] == []
+    assert dec_eng.is_ambiguous is True
+    assert pk_f3.c_options[0][int(res_pk["best_idx"][0, 0])] == "a"
+    assert bool(np.any(res_pk["in_c"][0] > 0)) is False
+    assert bool(res_pk["is_ambiguous"][0]) is True
+    assert res_call.values["c"] == "a" and res_call.is_ambiguous is True
+    assert ex_f3.predicted_label == "a"
+    assert ex_f3.margin == pytest.approx(0.0, abs=1e-12)
+
+    # Boolean 2-row Fortran layout preservation and live C->F rebind check.
+    class _R19BoolFSchema(DecisionSchema):
+        flag = BooleanField(description="Bool flag", threshold=0.5)
+
+    eng_bf = SystemOneEngine(
+        _R19BoolFSchema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    w_bf_2row = np.asfortranarray(np.random.default_rng(0).normal(size=(2, 32)).astype(np.float32))
+    emb_bf = eng_bf.model.encode("fortran bool layout check")
+    zf_bf = float((emb_bf.reshape(1, -1) @ w_bf_2row.T).ravel()[0])
+    zc_bf = float((emb_bf.reshape(1, -1) @ np.ascontiguousarray(w_bf_2row[:1]).T).ravel()[0])
+    assert zf_bf != zc_bf
+    eng_bf.model.heads["flag"].set_weights(w_bf_2row, np.zeros(2, dtype=np.float32))
+    eng_bf.calibrators["flag"].logit_adjustments = np.array(
+        [0.0, -0.5 * (zf_bf + zc_bf) / 0.25], dtype=np.float64
+    )
+    dec_bf_eng = eng_bf.decide("fortran bool layout check", record_receipt=False)
+    pk_bf = eng_bf.compile_packed_kernel(storage_mode="float32")
+    assert pk_bf.b_raw_w[0].shape == (2, 32) and pk_bf.b_raw_w[0].flags["F_CONTIGUOUS"]
+    res_bf_call = eng_bf.compile_callable(storage_mode="float32")("fortran bool layout check")
+    assert res_bf_call.values["flag"] == dec_bf_eng.values["flag"]
+    assert bool(pk_bf.decide_prompt("fortran bool layout check")["b_val"][0, 0]) == dec_bf_eng.values["flag"]
+
+    sig_bf_f = _pack_array_sig(w_bf_2row)
+    sig_bf_c = _pack_array_sig(np.ascontiguousarray(w_bf_2row.copy()))
+    assert sig_bf_f is not None and sig_bf_c is not None
+    assert sig_bf_f != sig_bf_c
+    assert sig_bf_f[2] is True and sig_bf_f[3] == w_bf_2row.tobytes(order="F")
+
+    call_rebind = eng_f3_tie.compile_callable(storage_mode="float32")
+    assert call_rebind("fortran layout check").values["c"] == "a"
+    w_c_copy = np.ascontiguousarray(eng_f3_tie.model.heads["c"].weights.copy())
+    eng_f3_tie.model.heads["c"].set_weights(w_c_copy, np.zeros(3, dtype=np.float32))
+    res_rebind_c = call_rebind("fortran layout check")
+    dec_eng_c = eng_f3_tie.decide("fortran layout check", record_receipt=False)
+    assert dec_eng_c.values["c"] == "b"
+    assert res_rebind_c.values["c"] == dec_eng_c.values["c"]
+
+    # R19-3: Collision-proof .s1m v2 & v3 head tensor namespaces when field names contain suffix patterns.
+    class _R19CollideHierSchema(DecisionSchema):
+        a = ChoiceField(options=("x0", "x1", "x2"), description="Hier field")
+        a_coarse = ChoiceField(options=("y0", "y1"), description="Coarse suffix collider")
+
+    dim_c = 8
+    schema_ch = _R19CollideHierSchema()
+    hw_a = CompiledHeadWeights(
+        field_name="a",
+        field_type="choice",
+        weights=np.zeros((3, dim_c), dtype=np.float32),
+        biases=np.zeros(3, dtype=np.float32),
+        options=("x0", "x1", "x2"),
+        hierarchical=True,
+        cluster_assignments=(0, 1, 1),
+        coarse_weights=np.zeros((2, dim_c), dtype=np.float32),
+        coarse_biases=np.array([5.0, -5.0], dtype=np.float32),
+        fine_weights=np.zeros((3, dim_c), dtype=np.float32),
+        fine_biases=np.zeros(3, dtype=np.float32),
+    )
+    hw_ac = CompiledHeadWeights(
+        field_name="a_coarse",
+        field_type="choice",
+        weights=np.zeros((2, dim_c), dtype=np.float32),
+        biases=np.array([-5.0, 5.0], dtype=np.float32),
+        options=("y0", "y1"),
+    )
+    cm_ch = CompiledSystemOneModel(schema_ch, heads={"a": hw_a, "a_coarse": hw_ac}, dimension=dim_c)
+    for fmt_v in (2, 3):
+        blob_ch = cm_ch.to_bytes(format_version=fmt_v)
+        hdr_json_ch = json.loads(blob_ch[8 : 8 + struct.unpack(">I", blob_ch[4:8])[0]].decode("utf-8")) if fmt_v == 2 else json.loads(blob_ch[16 : 16 + struct.unpack("<Q", blob_ch[8:16])[0]].decode("utf-8"))
+        assert hdr_json_ch.get("tensor_namespace") == "len_v1"
+        cm_ch_re = CompiledSystemOneModel.from_bytes(blob_ch, backend="numpy")
+        eng_ch_re = SystemOneEngine(schema_ch, compiled_model=cm_ch_re, backend="numpy", use_cache=False, strict_mode=False)
+        dec_ch = eng_ch_re.decide("probe hierarchical collider", record_receipt=False)
+        assert dec_ch.values["a"] == "x0"
+        assert dec_ch.values["a_coarse"] == "y1"
+
+    class _R19CollideInitSchema(DecisionSchema):
+        a = ChoiceField(options=("p0", "p1"), description="Base field")
+        a_initial = ChoiceField(options=("q0", "q1"), description="Initial suffix collider")
+
+    cm_ci = CompiledSystemOneModel(
+        _R19CollideInitSchema(),
+        heads={
+            "a": CompiledHeadWeights("a", "choice", np.zeros((2, 4), dtype=np.float32), np.zeros(2, dtype=np.float32), options=("p0", "p1")),
+            "a_initial": CompiledHeadWeights("a_initial", "choice", np.zeros((2, 4), dtype=np.float32), np.zeros(2, dtype=np.float32), options=("q0", "q1")),
+        },
+        dimension=4,
+    )
+    for fmt_v in (2, 3):
+        cm_ci_re = CompiledSystemOneModel.from_bytes(cm_ci.to_bytes(format_version=fmt_v), backend="numpy")
+        assert set(cm_ci_re.heads) == {"a", "a_initial"}
+
+    # Non-colliding schema keeps legacy header without tensor_namespace; unsupported tensor_namespace raises ValueError.
+    cm_clean = CompiledSystemOneModel(
+        _R19Tie3Schema(),
+        heads={"c": CompiledHeadWeights("c", "choice", np.zeros((3, 4), dtype=np.float32), np.zeros(3, dtype=np.float32), options=("a", "b", "c"))},
+        dimension=4,
+    )
+    b_clean_v3 = cm_clean.to_bytes(format_version=3)
+    hl_clean = struct.unpack("<Q", b_clean_v3[8:16])[0]
+    hdr_clean = json.loads(b_clean_v3[16 : 16 + hl_clean].decode("utf-8"))
+    assert "tensor_namespace" not in hdr_clean
+    hdr_clean_bad = copy.deepcopy(hdr_clean)
+    hdr_clean_bad["tensor_namespace"] = "unknown_v99"
+    bad_ns_b = json.dumps(hdr_clean_bad, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    tampered_ns_v3 = b_clean_v3[:8] + struct.pack("<Q", len(bad_ns_b)) + bad_ns_b + b_clean_v3[16 + hl_clean :]
+    with pytest.raises(ValueError):
+        CompiledSystemOneModel.from_bytes(tampered_ns_v3, backend="numpy")
+
+    # R19-4: Strict RFC 9110 Content-Type parameter validation across gateway and MCP HTTP handler.
+    r19_ct_calls = 0
+
+    def _ct_teacher(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        nonlocal r19_ct_calls
+        r19_ct_calls += 1
+        return _mock_universal_handler(semantic_text, raw_payload, contract)
+
+    svc_rfc = UniversalDecisionService(upstream_handlers={"gemini": _ct_teacher}, require_auth=False)
+    ct_body = json.dumps({"state": "ct check", "questions": {"ok": {"type": "noul"}}}).encode("utf-8")
+    malformed_cts = (
+        'application/json; charset="utf-8',
+        'application/json; charset=utf-8"',
+        'application/json; charset=""utf-8""',
+        "application/json; x=one two",
+        "application/json; x=a=b",
+        'application/json; x="abc\\',
+        "application/json; charset = utf-8",
+        "application/json; charset=utf-8; charset=utf-8",
+        "application/json; x=",
+        "application/json; =utf-8",
+        "application/json; foo bar",
+    )
+    mcp_runtime = MCPGuardRuntime(MCPStreamableHTTPConfig())
+    mcp_body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).encode("utf-8")
+
+    def _invoke_mcp_post_in_memory(ctype_hdr: str) -> int:
+        status_seen: List[int] = []
+        handler = _MCPStreamableHTTPHandler.__new__(_MCPStreamableHTTPHandler)
+        handler.path = "/mcp"
+        handler.request_version = "HTTP/1.1"
+        handler.close_connection = False
+        msg = email.message.Message()
+        msg["Content-Type"] = ctype_hdr
+        msg["Content-Length"] = str(len(mcp_body))
+        handler.headers = msg
+        handler.rfile = io.BytesIO(mcp_body)
+        handler.wfile = io.BytesIO()
+        handler.server = types.SimpleNamespace(runtime=mcp_runtime)
+        handler.send_response = lambda code, message=None: status_seen.append(int(code))  # type: ignore[method-assign]
+        handler.send_header = lambda k, v: None  # type: ignore[method-assign]
+        handler.end_headers = lambda: None  # type: ignore[method-assign]
+        handler.do_POST()
+        return status_seen[0]
+
+    for bad_hdr in malformed_cts:
+        with pytest.raises(UnsupportedMediaError):
+            svc_rfc.handle_request(path="/v1beta/decisions", headers={"Content-Type": bad_hdr}, raw_body=ct_body)
+        assert _invoke_mcp_post_in_memory(bad_hdr) == 415
+    assert r19_ct_calls == 0
+
+    for valid_hdr in (
+        'application/json; charset="utf-8"',
+        'application/json; profile="a\\"b"; charset=UTF-8',
+    ):
+        st_v, _ = svc_rfc.handle_request(path="/v1beta/decisions", headers={"Content-Type": valid_hdr}, raw_body=ct_body)
+        assert st_v == 200
+        assert _invoke_mcp_post_in_memory(valid_hdr) == 200
+
+    # R19-5: Ordinal probability validation rejects object arrays containing strings or bytes.
+    p_obj_str = np.array([["0.2", "0.8"]], dtype=object)
+    p_obj_bytes = np.array([[b"0.2", b"0.8"]], dtype=object)
+    for bad_obj in (p_obj_str, p_obj_bytes):
+        with pytest.raises(ValueError):
+            cqr_ordinal_intervals(np.repeat(bad_obj, 20, axis=0), [1] * 20, bad_obj)
+        with pytest.raises(ValueError):
+            cqr_ordinal_intervals(np.full((20, 2), 0.5), [1] * 20, bad_obj)
+        with pytest.raises(ValueError):
+            _predict_ordinal_class(bad_obj)
+        with pytest.raises(ValueError):
+            _ordinal_expected_value(bad_obj, 2)
+
+    # R19-6: UtilityCalibrator, BinaryPlattBetaCalibrator, and UtilityCascadeRouter reject booleans & object strings.
+    cm_u = np.array([[0.0, 1.0], [0.1, 0.1]], dtype=np.float64)
+    u_cal = UtilityCalibrator(cm_u, safe_action=1, alpha=0.15)
+    with pytest.raises(ValueError):
+        u_cal.fit_crc(np.tile([True, False], (20, 1)), [0] * 20)
+    with pytest.raises(ValueError):
+        u_cal.fit_crc(np.tile([0.9, 0.1], (20, 1)), [0, True] * 10)
+    with pytest.raises(ValueError):
+        u_cal.fit_crc(np.full((19, 2), 0.5), [99] * 20)
+    with pytest.raises(ValueError):
+        u_cal.fit(np.tile([True, False], (20, 1)), [0] * 20)
+    with pytest.raises(ValueError):
+        u_cal.fit(np.full((20, 2), 0.5), [0] * 20, cal_probs=np.full((20, 2), 0.5))
+    with pytest.raises(ValueError):
+        u_cal.transform_probs([True, False])  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        u_cal.expected_costs([[False, True]], apply_temperature=False)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        u_cal.predict([False, True])  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        UtilityCalibrator([[False, True], [0.1, 0.1]], safe_action=1, alpha=0.15)
+    with pytest.raises(ValueError):
+        BinaryPlattBetaCalibrator().fit([True, False] * 5, [0, 1] * 5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        BinaryPlattBetaCalibrator().fit([0.9, 0.1] * 5, [False, True] * 5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        UtilityCascadeRouter(cost_matrix=[[True, 0.0, 1.0], [0.1, 0.1, 0.5], [5.0, 5.0, 5.0]])
+
+    # R19-7: Ordinal fitting raises ValueError with zero RuntimeWarnings on overflow instead of zero-weight fits.
+    for x_big in (np.array([[1e200], [-1e200]]), np.array([[1e308], [-1e308]])):
+        for head_cls in (CumulativeLogitOrdinalHead, SoftOrdinalHead):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", RuntimeWarning)
+                with pytest.raises(ValueError):
+                    head_cls(n_classes=2).fit(x_big, [0, 1])
+            assert not any(issubclass(w.category, RuntimeWarning) for w in caught)
+
+    # Balanced stationary X = 0 continues to fit cleanly.
+    X_stat = np.zeros((10, 2), dtype=np.float64)
+    y_stat = np.array([0] * 5 + [1] * 5, dtype=np.int64)
+    for head_cls in (CumulativeLogitOrdinalHead, SoftOrdinalHead):
+        h_stat = head_cls(n_classes=2).fit(X_stat, y_stat)
+        assert np.allclose(h_stat.predict_proba(np.array([[0.0, 0.0]])), [[0.5, 0.5]], atol=1e-4)
+
+    a_pow2 = float(2.0**536)
+
+    def _pow2_quad(x_in: np.ndarray) -> Tuple[float, np.ndarray]:
+        xv = float(x_in[0])
+        return 0.5 * a_pow2 * (xv * xv), np.array([a_pow2 * xv], dtype=np.float64)
+
+    x_lbfgs, f_lbfgs, _ = _minimize_lbfgs_np(
+        _pow2_quad,
+        np.array([-3.0 * (2.0**-22)], dtype=np.float64),
+        bounds=[(-1.0, 2.0**-22)],
+    )
+    assert f_lbfgs == 0.0 and float(x_lbfgs[0]) == 0.0
+
+    # R19-8: Overflow-safe float32/float64 prototype reconstruction and similarity with zero RuntimeWarnings.
+    class _R19ProtoSchema(DecisionSchema):
+        c = ChoiceField(options=("a", "b"), description="Large weight proto test")
+
+    w_large = np.full((2, 4), np.float32(1e30), dtype=np.float32)
+    b_zero = np.zeros(2, dtype=np.float32)
+    cm_large = CompiledSystemOneModel(
+        _R19ProtoSchema(),
+        heads={"c": CompiledHeadWeights("c", "choice", w_large, b_zero, options=("a", "b"), prototypes=None)},
+        dimension=4,
+    )
+    with warnings.catch_warnings(record=True) as caught_p:
+        warnings.simplefilter("always", RuntimeWarning)
+        for fmt_v in (2, 3):
+            cm_l_re = CompiledSystemOneModel.from_bytes(cm_large.to_bytes(format_version=fmt_v), backend="numpy")
+            proto_re = cm_l_re.heads["c"].prototypes
+            assert proto_re is not None and np.all(np.isfinite(proto_re))
+            assert np.linalg.norm(proto_re, axis=1) == pytest.approx([1.0, 1.0], rel=1e-5)
+            sim_re = cm_l_re.compute_prototype_similarity("c", np.full(4, 1e30, dtype=np.float32))
+            assert sim_re == pytest.approx(1.0, rel=1e-5)
+            sim_re64 = cm_l_re.compute_prototype_similarity("c", np.full(4, 1e200, dtype=np.float64))
+            assert sim_re64 == pytest.approx(1.0, rel=1e-5)
+
+        cp_large = ConformalPredictor("c", ("a", "b"), prototypes=w_large)
+        assert cp_large.compute_prototype_similarity(np.full(4, 1e30, dtype=np.float32)) == pytest.approx(1.0, rel=1e-5)
+        cp_cal_ovf = ConformalPredictor("c", ("a", "b"))
+        thr_ovf = cp_cal_ovf.calibrate_prototypes(
+            np.full((6, 4), 1e200, dtype=np.float64),
+            ["a", "b"] * 3,
+            alpha=0.2,
+        )
+        assert math.isfinite(thr_ovf) and cp_cal_ovf.prototypes is not None
+        assert np.linalg.norm(cp_cal_ovf.prototypes, axis=1) == pytest.approx([1.0, 1.0], rel=1e-5)
+
+        sc_thr, sc_tup = SystemOneCompiler._calibrate_prototype_scores(
+            np.full((6, 4), 1e30, dtype=np.float32),
+            w_large,
+            0.2,
+        )
+        assert sc_thr == pytest.approx(1.0, rel=1e-5) and len(sc_tup) == 6
+
+        eng_large = SystemOneEngine(_R19ProtoSchema, dimension=4, backend="numpy", contrastive_whitening=False, use_cache=False)
+        eng_large.model.heads["c"].set_weights(w_large, b_zero)
+        eng_large.conformal_predictors["c"].prototypes = w_large
+        cm_from_eng = eng_large.to_compiled_model()
+        assert cm_from_eng.heads["c"].prototypes is not None
+        assert np.linalg.norm(cm_from_eng.heads["c"].prototypes.astype(np.float64), axis=1) == pytest.approx([1.0, 1.0], rel=1e-5)
+        assert np.linalg.norm(cm_from_eng.heads["c"].prototypes, axis=1) == pytest.approx([1.0, 1.0], rel=1e-5)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_p)
+
 
 
 
