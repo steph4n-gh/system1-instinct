@@ -826,7 +826,7 @@ class ConformalPredictor:
             true_idx = self.option_to_idx[label]
             row = probs[i]
 
-            sorted_indices = np.argsort(-row)
+            sorted_indices = np.argsort(-row, kind="mergesort")
             top_idx = int(sorted_indices[0])
             runner_up_idx = int(sorted_indices[1]) if len(sorted_indices) > 1 else top_idx
             margin_i = float(row[top_idx] - row[runner_up_idx])
@@ -919,7 +919,7 @@ class ConformalPredictor:
             prototype_similarity = self.compute_prototype_similarity(embedding)
 
         n = len(self.calibration_scores)
-        sorted_indices = np.argsort(-probs)
+        sorted_indices = np.argsort(-probs, kind="mergesort")
         top_prob = float(probs[sorted_indices[0]]) if len(sorted_indices) > 0 else 0.0
         runner_up_prob = float(probs[sorted_indices[1]]) if len(sorted_indices) > 1 else 0.0
         margin = float(top_prob - runner_up_prob) if len(sorted_indices) > 1 else 1.0
@@ -3390,8 +3390,19 @@ class SoftOrdinalHead:
 def _validate_ordinal_prob_matrix(
     probs: np.ndarray, *, name: str = "probs", allow_1d: bool = False
 ) -> np.ndarray:
-    arr = np.asarray(probs, dtype=np.float64)
-    if allow_1d and arr.ndim == 1:
+    raw = np.asarray(probs)
+    if raw.dtype == np.bool_ or (
+        raw.dtype == np.object_ and any(isinstance(v, (bool, np.bool_)) for v in raw.flat)
+    ):
+        raise ValueError(f"{name} must be numeric, not boolean")
+    if np.issubdtype(raw.dtype, np.complexfloating) or np.issubdtype(raw.dtype, np.character):
+        raise ValueError(f"{name} must contain real numeric probabilities")
+    try:
+        arr = np.array(raw, dtype=np.float64, copy=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain finite numeric probabilities") from exc
+    was_1d = bool(allow_1d and arr.ndim == 1)
+    if was_1d:
         check = arr.reshape(1, -1)
     elif arr.ndim == 2:
         check = arr
@@ -3403,12 +3414,17 @@ def _validate_ordinal_prob_matrix(
     if check.shape[0] > 0:
         if not bool(np.all(np.isfinite(check))):
             raise ValueError(f"{name} contains non-finite values")
-        if bool(np.any(check < -1e-12)):
-            raise ValueError(f"{name} contains negative probabilities")
+        if bool(np.any((check < -1e-12) | (check > 1.0 + 1e-12))):
+            raise ValueError(f"{name} entries must lie in [0.0, 1.0]")
         row_sums = np.sum(check, axis=1)
         if not bool(np.all(np.isfinite(row_sums))) or bool(np.any(np.abs(row_sums - 1.0) > 1e-4)):
             raise ValueError(f"{name} rows must sum to 1.0")
-    return arr
+        check = np.clip(check, 0.0, 1.0)
+        norm_sums = np.sum(check, axis=1, keepdims=True)
+        if bool(np.any(norm_sums <= 0.0)):
+            raise ValueError(f"{name} rows must have positive sum")
+        check = check / norm_sums
+    return check[0] if was_1d else check
 
 
 def _predict_ordinal_class(proba: np.ndarray) -> np.ndarray:
@@ -3424,15 +3440,25 @@ def _ordinal_expected_value(proba: np.ndarray, n_classes: Optional[int]) -> np.n
     return p @ classes
 
 
-def _cdf_ordinal_quantiles(probs: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
-    if not (0.0 < float(alpha) < 1.0):
+def _cdf_quantiles_from_validated(p: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    if isinstance(alpha, (bool, np.bool_)) or not (0.0 < float(alpha) < 1.0):
         raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
-    p = _validate_ordinal_prob_matrix(probs, name="probs", allow_1d=False)
     cdf = np.cumsum(p, axis=1)
-    lo = np.argmax(cdf >= (0.5 * float(alpha)) - 1e-12, axis=1).astype(np.int64)
-    hi = np.argmax(cdf >= (1.0 - 0.5 * float(alpha)) - 1e-12, axis=1).astype(np.int64)
+    mask_lo = cdf >= (0.5 * float(alpha)) - 1e-12
+    mask_hi = cdf >= (1.0 - 0.5 * float(alpha)) - 1e-12
+    has_lo = np.any(mask_lo, axis=1)
+    has_hi = np.any(mask_hi, axis=1)
+    lo = np.where(has_lo, np.argmax(mask_lo, axis=1), 0).astype(np.int64)
+    hi = np.where(has_hi, np.argmax(mask_hi, axis=1), p.shape[1] - 1).astype(np.int64)
     hi = np.maximum(hi, lo)
     return lo, hi
+
+
+def _cdf_ordinal_quantiles(probs: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    if isinstance(alpha, (bool, np.bool_)) or not (0.0 < float(alpha) < 1.0):
+        raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+    p = _validate_ordinal_prob_matrix(probs, name="probs", allow_1d=False)
+    return _cdf_quantiles_from_validated(p, float(alpha))
 
 
 def cqr_ordinal_intervals(
@@ -3448,20 +3474,33 @@ def cqr_ordinal_intervals(
     coverage ``>= 1 - alpha`` under exchangeability.
     """
     p_cal = _validate_ordinal_prob_matrix(cal_probs, name="cal_probs", allow_1d=False)
-    y_cal = np.asarray(cal_y, dtype=np.int64).ravel()
+    raw_y = np.asarray(cal_y)
+    if raw_y.dtype == np.bool_ or (
+        raw_y.dtype == np.object_ and any(isinstance(v, (bool, np.bool_)) for v in raw_y.flat)
+    ):
+        raise ValueError("cal_y must contain integer class indices, not booleans")
+    if np.issubdtype(raw_y.dtype, np.floating):
+        if raw_y.size > 0 and (
+            not bool(np.all(np.isfinite(raw_y))) or not bool(np.all(raw_y == np.floor(raw_y)))
+        ):
+            raise ValueError("cal_y must contain exact integer class indices")
+    try:
+        y_cal = np.asarray(raw_y, dtype=np.int64).ravel()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cal_y must contain integer class indices") from exc
     p_test = _validate_ordinal_prob_matrix(test_probs, name="test_probs", allow_1d=False)
     if p_cal.shape[1] != p_test.shape[1]:
         raise ValueError("cal_probs and test_probs must be 2D arrays with matching n_classes")
     if p_cal.shape[0] != y_cal.shape[0] or y_cal.size == 0:
         raise ValueError("cal_probs and cal_y must be non-empty and match in length")
-    if not (0.0 < float(alpha) < 1.0):
+    if bool(np.any((y_cal < 0) | (y_cal >= p_cal.shape[1]))):
+        raise ValueError(f"cal_y indices must lie in [0, {p_cal.shape[1] - 1}]")
+    if isinstance(alpha, (bool, np.bool_)) or not (0.0 < float(alpha) < 1.0):
         raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
 
     k = p_cal.shape[1]
-    if bool(np.any((y_cal < 0) | (y_cal >= k))):
-        raise ValueError(f"cal_y labels must lie in [0, {k - 1}]")
     n = y_cal.shape[0]
-    cal_lo, cal_hi = _cdf_ordinal_quantiles(p_cal, float(alpha))
+    cal_lo, cal_hi = _cdf_quantiles_from_validated(p_cal, float(alpha))
     scores = np.maximum(cal_lo - y_cal, y_cal - cal_hi).astype(np.float64)
 
     level = math.ceil((n + 1) * (1.0 - float(alpha))) / float(n)
@@ -3473,7 +3512,7 @@ def cqr_ordinal_intervals(
     q_idx = min(n, max(1, int(math.ceil((n + 1) * (1.0 - float(alpha)))))) - 1
     q_hat = int(round(float(np.sort(scores)[q_idx])))
 
-    test_lo, test_hi = _cdf_ordinal_quantiles(p_test, float(alpha))
+    test_lo, test_hi = _cdf_quantiles_from_validated(p_test, float(alpha))
     lo_out = np.clip(test_lo - q_hat, 0, k - 1).astype(np.int64)
     hi_out = np.clip(test_hi + q_hat, 0, k - 1).astype(np.int64)
     mid = np.clip(np.round(0.5 * (test_lo + test_hi)).astype(np.int64), 0, k - 1)

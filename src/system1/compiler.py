@@ -306,7 +306,7 @@ def _oof_conservative_soft_conformal(
     )
     scores_arg = 1.0 - p_oof[np.arange(N), y_target]
     w_arg = np.ones(N, dtype=np.float64) if y_true_idx is not None else np.maximum(1e-6, np.max(P_T, axis=1))
-    order = np.argsort(scores_arg)
+    order = np.argsort(scores_arg, kind="mergesort")
     v_s = scores_arg[order]
     w_s = w_arg[order]
     w_sum = float(np.sum(w_s))
@@ -5630,7 +5630,7 @@ class SystemOneCompiler:
                 per_class_scores: Dict[str, List[float]] = {opt: [] for opt in f_def.options}
                 for i in range(len(labels_conf)):
                     p_row = probs_calib[i]
-                    s_idx = np.argsort(-p_row)
+                    s_idx = np.argsort(-p_row, kind="mergesort")
                     top_i = int(s_idx[0])
                     runner_i = int(s_idx[1]) if len(s_idx) > 1 else top_i
                     true_c = int(labels_conf[i])
@@ -5754,7 +5754,7 @@ class SystemOneCompiler:
                         error_margins_bool.append(abs(p_true - p_false))
 
                     # APS score
-                    s_idx = np.argsort(-np.array(p_row))
+                    s_idx = np.argsort(-np.array(p_row), kind="mergesort")
                     cum_s = 0.0
                     score_val = 1.0
                     for c_i in s_idx:

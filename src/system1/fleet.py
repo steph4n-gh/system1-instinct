@@ -20,6 +20,7 @@ from system1.core.model import (
     _encode_projector_batch,
     _encode_projector_one,
     _model_zero_unit0,
+    _normalize_raw_projection,
 )
 from system1.core.schema import BooleanField, ChoiceField
 from system1.core.text import PragmaticCompositeProjector, TfidfProjector
@@ -297,6 +298,8 @@ class MultiTenantSkillFleet:
         bool_threshold: float = 0.5,
         recency_weighted: bool = False,
         zero_unit0: Optional[bool] = None,
+        score_method: str = "lac",
+        familiarity_threshold: float = 0.0,
         _raw_source_head: Optional[Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]] = None,
     ) -> None:
         self.projector = projector
@@ -324,6 +327,25 @@ class MultiTenantSkillFleet:
         if not self.is_boolean and bt_val != 0.5:
             raise ValueError("Non-default bool_threshold requires is_boolean=True")
         self.bool_threshold = bt_val
+
+        if not isinstance(score_method, str) or score_method not in ("lac", "aps"):
+            raise ValueError(f"score_method must be 'lac' or 'aps', got {score_method!r}")
+        self.score_method = score_method
+
+        if (
+            isinstance(familiarity_threshold, (bool, np.bool_))
+            or not isinstance(familiarity_threshold, (int, float, np.integer, np.floating))
+        ):
+            raise ValueError(
+                f"familiarity_threshold must be non-negative and finite, got {familiarity_threshold!r}"
+            )
+        fam_thr_f = float(familiarity_threshold)
+        if not math.isfinite(fam_thr_f) or fam_thr_f < 0.0:
+            raise ValueError(
+                f"familiarity_threshold must be non-negative and finite, got {familiarity_threshold!r}"
+            )
+        self.familiarity_threshold = fam_thr_f
+        self._is_tfidf_projector = isinstance(self.projector, TfidfProjector)
 
         if not isinstance(recency_weighted, (bool, np.bool_)):
             raise ValueError(f"recency_weighted must be a bool, got {recency_weighted!r}")
@@ -499,6 +521,34 @@ class MultiTenantSkillFleet:
             pwn_accepts_recency=self._pwn_accepts_recency,
         )
 
+    def _encode_one_with_familiarity(self, text: str) -> Tuple[np.ndarray, Optional[float]]:
+        dim = int(self.W_base.shape[1])
+        if self.familiarity_threshold > 0.0:
+            pwn_fn = getattr(self.projector, "project_with_norm", None)
+            if callable(pwn_fn) and (self._pwn_accepts_recency or not self._accepts_recency):
+                with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                    raw = (
+                        pwn_fn(text, recency_weighted=bool(self.recency_weighted))
+                        if self._pwn_accepts_recency
+                        else pwn_fn(text)
+                    )
+                if isinstance(raw, tuple) and len(raw) >= 2:
+                    vec = _normalize_raw_projection(raw[0], dim, zero_unit0=self._zero_unit0)
+                    try:
+                        return vec, float(raw[1])
+                    except (TypeError, ValueError):
+                        pass
+        x = self._encode_one(text)
+        raw_norm: Optional[float] = None
+        if self.familiarity_threshold > 0.0:
+            raw_norm_fn = getattr(self.projector, "raw_norm", None)
+            if callable(raw_norm_fn):
+                try:
+                    raw_norm = float(raw_norm_fn(text))
+                except Exception:
+                    raw_norm = None
+        return x, raw_norm
+
     def _project_batch(self, texts: Sequence[str]) -> np.ndarray:
         return _encode_projector_batch(
             self.projector,
@@ -641,15 +691,24 @@ class MultiTenantSkillFleet:
         raw_b64 = np.asarray(b_auth, dtype=np.float64)
         with np.errstate(over="ignore", invalid="ignore"):
             if is_boolean:
-                delta_adj = float(adj_frozen[1] - adj_frozen[0]) if adj_frozen is not None else 0.0
+                a0 = float(adj_frozen[0]) if adj_frozen is not None else 0.0
+                a1 = float(adj_frozen[1]) if adj_frozen is not None else 0.0
+                b0 = float(raw_b64[0])
+                s0 = (-0.5 * b0 + 0.25 * a0) / cal_t
+                s1 = (0.5 * b0 + 0.25 * a1) / cal_t
+                b_half = 0.5 * s1 - 0.5 * s0
                 w_bool_fold = raw_w64[0] / cal_t
-                b_bool_fold = (float(raw_b64[0]) + 0.25 * delta_adj) / cal_t
                 w_fold = np.vstack([-0.5 * w_bool_fold, 0.5 * w_bool_fold]).astype(np.float32)
-                b_fold = np.array([-0.5 * b_bool_fold, 0.5 * b_bool_fold], dtype=np.float32)
+                b_fold = np.array([-b_half, b_half], dtype=np.float32)
             else:
-                adj_vec = adj_frozen if adj_frozen is not None else np.zeros(int(num_classes), dtype=np.float64)
+                adj_q = (
+                    (0.0625 * adj_frozen)
+                    if adj_frozen is not None
+                    else np.zeros(int(num_classes), dtype=np.float64)
+                )
+                u_fold = (0.25 * raw_b64) + adj_q
                 w_fold = (raw_w64 / cal_t).astype(np.float32)
-                b_fold = ((raw_b64 + 0.25 * adj_vec) / cal_t).astype(np.float32)
+                b_fold = (4.0 * (u_fold / cal_t)).astype(np.float32)
         if not (bool(np.all(np.isfinite(w_fold))) and bool(np.all(np.isfinite(b_fold)))):
             raise ValueError("_raw_source_head overflowed float32 bounds after folding calibration")
         if float(np.max(np.abs(w_fold))) > 1e12 or float(np.max(np.abs(b_fold))) > 1e12:
@@ -732,6 +791,15 @@ class MultiTenantSkillFleet:
                 raise ValueError(f"MultiTenantSkillFleet does not support hierarchical head {field_name!r}")
             if getattr(cand, "_exemplar_bank", None) is not None:
                 raise ValueError(f"MultiTenantSkillFleet does not support exemplar-bank head {field_name!r}")
+            if getattr(cand, "selective_calibrator", None) is not None:
+                raise ValueError(f"MultiTenantSkillFleet does not support selective_calibrator on {field_name!r}")
+            proto_cand = float(getattr(cand, "prototype_threshold", 0.0))
+            if not math.isfinite(proto_cand) or proto_cand > 0.0:
+                raise ValueError(f"MultiTenantSkillFleet does not support prototype_threshold on {field_name!r}")
+        for container in (model, resolved):
+            sel_map = getattr(container, "selective_calibrators", None)
+            if isinstance(sel_map, Mapping) and sel_map.get(field_name) is not None:
+                raise ValueError(f"MultiTenantSkillFleet does not support selective_calibrator on {field_name!r}")
 
         calibrators = getattr(model, "calibrators", None)
         cal_obj = calibrators.get(field_name) if isinstance(calibrators, Mapping) else None
@@ -768,20 +836,26 @@ class MultiTenantSkillFleet:
         with np.errstate(over="ignore", invalid="ignore"):
             if is_bool_head:
                 classes = ["False", "True"]
-                delta_adj = float(adj[1] - adj[0]) if (adj is not None and adj.size == 2) else 0.0
+                has_adj2 = adj is not None and adj.size == 2
+                a0 = float(adj[0]) if has_adj2 else 0.0
+                a1 = float(adj[1]) if has_adj2 else 0.0
+                b0 = float(raw_b64[0])
+                s0 = (-0.5 * b0 + 0.25 * a0) / temp
+                s1 = (0.5 * b0 + 0.25 * a1) / temp
+                b_half = 0.5 * s1 - 0.5 * s0
                 w_diff_eff = raw_w64[0] / temp
-                b_diff_eff = (float(raw_b64[0]) + 0.25 * delta_adj) / temp
                 W_base = np.vstack([-0.5 * w_diff_eff, 0.5 * w_diff_eff]).astype(np.float32)
-                b_base = np.array([-0.5 * b_diff_eff, 0.5 * b_diff_eff], dtype=np.float32)
+                b_base = np.array([-b_half, b_half], dtype=np.float32)
             elif isinstance(f_def, ChoiceField):
                 classes = [str(o) for o in f_def.options]
-                adj_vec = (
-                    adj
+                adj_q = (
+                    (0.0625 * adj)
                     if (adj is not None and adj.size == len(classes))
                     else np.zeros(len(classes), dtype=np.float64)
                 )
+                u_fold = (0.25 * raw_b64) + adj_q
                 W_base = (raw_w64 / temp).astype(np.float32)
-                b_base = ((raw_b64 + 0.25 * adj_vec) / temp).astype(np.float32)
+                b_base = (4.0 * (u_fold / temp)).astype(np.float32)
             else:
                 raise ValueError(f"MultiTenantSkillFleet supports ChoiceField and BooleanField, got {type(f_def).__name__}")
         if not (bool(np.all(np.isfinite(W_base))) and bool(np.all(np.isfinite(b_base)))):
@@ -805,31 +879,89 @@ class MultiTenantSkillFleet:
                             base_tok_df[bucket] += 1
 
         q_init = np.full(len(classes), 0.5, dtype=np.float32)
+        score_method = "lac"
         cp_map = getattr(model, "conformal_predictors", None)
         cp = cp_map.get(field_name) if isinstance(cp_map, Mapping) else None
-        score_src = cp if (cp is not None and (getattr(cp, "is_calibrated", False) or len(getattr(cp, "calibration_scores", ())) > 0)) else ch
+        if cp is not None:
+            if getattr(cp, "selective_calibrator", None) is not None:
+                raise ValueError(f"MultiTenantSkillFleet does not support selective_calibrator on {field_name!r}")
+            proto_cp = float(getattr(cp, "prototype_threshold", 0.0))
+            if not math.isfinite(proto_cp) or proto_cp > 0.0:
+                raise ValueError(f"MultiTenantSkillFleet does not support prototype_threshold on {field_name!r}")
+
+        fam_candidates: List[float] = []
+        for fam_src in (*candidates, cp):
+            if fam_src is None:
+                continue
+            fam_val = float(getattr(fam_src, "familiarity_threshold", 0.0))
+            if not math.isfinite(fam_val) or fam_val < 0.0:
+                raise ValueError(
+                    f"familiarity_threshold for {field_name!r} must be non-negative and finite, got {fam_val!r}"
+                )
+            fam_candidates.append(fam_val)
+        familiarity_threshold = max(fam_candidates) if fam_candidates else 0.0
+
+        ch_cal_scores = getattr(ch, "calibration_scores", ()) if ch is not None else ()
+        cp_cal_scores = getattr(cp, "calibration_scores", ()) if cp is not None else ()
+        cp_is_cal = bool(cp is not None and (getattr(cp, "is_calibrated", False) or len(cp_cal_scores) > 0))
+        ch_raw_q = getattr(ch, "conformal_quantile", None) if ch is not None else None
+        ch_is_cal = bool(
+            ch is not None
+            and (
+                len(ch_cal_scores) > 0
+                or (ch_raw_q is not None and math.isfinite(float(ch_raw_q)) and float(ch_raw_q) > 0.0)
+            )
+        )
+        score_src = cp if cp_is_cal else (ch if ch_is_cal else None)
         if score_src is not None:
-            cls_scores = getattr(score_src, "class_calibration_scores", {}) or {}
-            raw_q = getattr(score_src, "conformal_quantile", getattr(score_src, "quantile", None))
+            raw_method = str(getattr(score_src, "score_method", "lac")).strip().lower()
+            if raw_method not in ("lac", "aps"):
+                raise ValueError(f"Unsupported conformal score_method on {field_name!r}: {raw_method!r}")
+            score_method = raw_method
             cal_scores = getattr(score_src, "calibration_scores", ())
+            raw_q = getattr(score_src, "conformal_quantile", getattr(score_src, "quantile", None))
             has_fallback_q = False
             fallback_q = 0.0
-            if raw_q is not None:
+            if len(cal_scores) > 0:
+                cal_sorted = sorted(float(v) for v in cal_scores)
+                n_s = len(cal_sorted)
+                k_global = int(math.ceil((n_s + 1) * (1.0 - alpha)))
+                fallback_q = 1.0 if k_global > n_s else float(cal_sorted[k_global - 1])
+                has_fallback_q = True
+            elif raw_q is not None:
                 fq = float(raw_q)
                 if math.isfinite(fq) and (fq > 0.0 or (bool(getattr(score_src, "is_calibrated", False)) and fq >= 0.0)):
                     fallback_q = fq
                     has_fallback_q = True
-            if (not has_fallback_q) and len(cal_scores) > 0:
-                n_s = len(cal_scores)
-                k = min(n_s, max(1, int(math.ceil((n_s + 1) * (1.0 - alpha))))) - 1
-                fallback_q = float(sorted(cal_scores)[k])
+            elif bool(getattr(score_src, "is_calibrated", False)):
+                fallback_q = 1.0
                 has_fallback_q = True
+
+            is_mondrian = bool(getattr(score_src, "mondrian", False))
+            cls_scores = (getattr(score_src, "class_calibration_scores", {}) or {}) if is_mondrian else {}
+            shrink = max(1.0, float(getattr(score_src, "mondrian_shrinkage", 10.0)))
             for idx, c_name in enumerate(classes):
                 c_vals = cls_scores.get(c_name)
                 if c_vals is not None and len(c_vals) > 0:
-                    n_c = len(c_vals)
-                    k = min(n_c, max(1, int(math.ceil((n_c + 1) * (1.0 - alpha))))) - 1
-                    q_init[idx] = float(sorted(c_vals)[k])
+                    c_sorted = sorted(float(v) for v in c_vals)
+                    n_c = len(c_sorted)
+                    k_c = int(math.ceil((n_c + 1) * (1.0 - alpha)))
+                    if k_c <= n_c:
+                        q_init[idx] = float(c_sorted[k_c - 1])
+                    elif not has_fallback_q or fallback_q >= 1.0:
+                        q_init[idx] = 1.0
+                    else:
+                        if n_c == 1:
+                            q_emp = float(c_sorted[0])
+                        else:
+                            pos = (n_c - 1) * (1.0 - alpha)
+                            lo = int(math.floor(pos))
+                            hi = min(n_c - 1, lo + 1)
+                            frac = pos - lo
+                            c_lo = float(c_sorted[lo])
+                            q_emp = c_lo + frac * (float(c_sorted[hi]) - c_lo)
+                        w = float(n_c) / (float(n_c) + shrink)
+                        q_init[idx] = float(max(fallback_q, w * q_emp + (1.0 - w) * fallback_q))
                 elif has_fallback_q:
                     q_init[idx] = fallback_q
 
@@ -851,6 +983,8 @@ class MultiTenantSkillFleet:
             bool_threshold=bool_threshold,
             recency_weighted=bool(getattr(resolved, "recency_weighted", False)),
             zero_unit0=_model_zero_unit0(resolved, resolved.projector),
+            score_method=score_method,
+            familiarity_threshold=familiarity_threshold,
             _raw_source_head=(
                 raw_w_auth,
                 raw_b_auth,
@@ -1088,12 +1222,16 @@ class MultiTenantSkillFleet:
                     two = np.array([-0.5 * float(z_col[0]), 0.5 * float(z_col[0])], dtype=np.float64)
                     if cal_adj is not None and cal_adj.shape == (2,):
                         two = two + cal_adj
+                    if not bool(np.all(np.isfinite(two))):
+                        return np.full(self.num_classes, np.nan, dtype=np.float64), False
                     cal_scaled = two / cal_t
                 else:
-                    arr = z_col.reshape(-1)
-                    if cal_adj is not None and cal_adj.shape == (arr.shape[0],):
-                        arr = arr + cal_adj
-                    cal_scaled = arr / cal_t
+                    arr_z = z_col.reshape(-1)
+                    if cal_adj is not None and cal_adj.shape == (arr_z.shape[0],):
+                        arr_z = arr_z + cal_adj
+                    if not bool(np.all(np.isfinite(arr_z))):
+                        return np.full(self.num_classes, np.nan, dtype=np.float64), False
+                    cal_scaled = arr_z / cal_t
                 if not bool(np.all(np.isfinite(cal_scaled))):
                     return np.full(self.num_classes, np.nan, dtype=np.float64), False
                 return 0.25 * cal_scaled, True
@@ -1172,7 +1310,7 @@ class MultiTenantSkillFleet:
     def _eval_live(self, tid: int, text: str) -> Tuple[int, np.ndarray, np.ndarray, np.ndarray]:
         tid = self._validate_tid(tid)
         with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            x = self._encode_one(text)
+            x, raw_norm = self._encode_one_with_familiarity(text)
             dW_qt, dW_st, sp_ht, sp_ct, sp_wt, n_sp, ex_vt, ex_st, ex_ct, n_ex, q_ct = (
                 self._snapshot_views(tid)
             )
@@ -1187,6 +1325,7 @@ class MultiTenantSkillFleet:
             z = x @ self.U_shared
             sub_log = (dW_qt.astype(np.float32) @ z) * dW_st.reshape(-1).astype(np.float32)
             logits64 = base_log64 + sub_log.astype(np.float64)
+            sp_matched = False
             if n_sp > 0:
                 th = set(
                     tokenize_hashes(
@@ -1198,7 +1337,10 @@ class MultiTenantSkillFleet:
                 )
                 for i in range(n_sp):
                     if int(sp_ht[i]) in th:
-                        logits64[int(sp_ct[i])] += float(sp_wt[i])
+                        w_sp_i = float(sp_wt[i])
+                        logits64[int(sp_ct[i])] += w_sp_i
+                        if w_sp_i != 0.0:
+                            sp_matched = True
             if n_ex > 0:
                 z_norm = z / (float(np.linalg.norm(z)) + 1e-8)
                 vecs = ex_vt[:n_ex].astype(np.float32) * ex_st[:n_ex, None].astype(np.float32)
@@ -1233,8 +1375,29 @@ class MultiTenantSkillFleet:
                     np.zeros(self.num_classes, dtype=bool),
                     np.full(self.num_classes, np.nan, dtype=np.float64),
                 )
-            scores = 1.0 - probs
-            pred_set = scores <= (q_ct.astype(np.float64) + 1e-12)
+            low_familiarity = (not sp_matched) and (
+                (self._is_tfidf_projector and not bool(np.any(x)))
+                or (
+                    self.familiarity_threshold > 0.0
+                    and raw_norm is not None
+                    and (not math.isfinite(raw_norm) or raw_norm < self.familiarity_threshold - 1e-12)
+                )
+            )
+            if low_familiarity:
+                pred_set = np.zeros(self.num_classes, dtype=bool)
+            elif self.score_method == "aps":
+                order = np.argsort(-probs, kind="mergesort")
+                cum_mass = 0.0
+                pred_set = np.zeros(self.num_classes, dtype=bool)
+                q_arr = q_ct.astype(np.float64)
+                for idx in order:
+                    ci = int(idx)
+                    cum_mass += float(probs[ci])
+                    if cum_mass <= float(q_arr[ci]) + 1e-7:
+                        pred_set[ci] = True
+            else:
+                scores = 1.0 - probs
+                pred_set = scores <= (q_ct.astype(np.float64) + 1e-12)
             if self.is_boolean and len(probs) == 2:
                 pred_idx = 1 if float(probs[1]) >= self.bool_threshold else 0
             else:
@@ -1456,11 +1619,11 @@ class MultiTenantSkillFleet:
 
         if "meta_ints" in headers:
             mi_dtype, mi_shape = headers["meta_ints"]
-            if mi_dtype != np.dtype(np.int64) or mi_shape not in ((4,), (6,), (7,)):
+            if mi_dtype != np.dtype(np.int64) or mi_shape not in ((4,), (6,), (7,), (8,)):
                 raise ValueError(f"Invalid meta_ints spec: dtype={mi_dtype}, shape={mi_shape}")
         if "meta_floats" in headers:
             mf_dtype, mf_shape = headers["meta_floats"]
-            if mf_dtype != np.dtype(np.float64) or mf_shape not in ((2,), (3,)):
+            if mf_dtype != np.dtype(np.float64) or mf_shape not in ((2,), (3,), (4,)):
                 raise ValueError(f"Invalid meta_floats spec: dtype={mf_dtype}, shape={mf_shape}")
         if "classes_utf8" in headers:
             c_dtype, c_shape = headers["classes_utf8"]
@@ -1595,7 +1758,13 @@ class MultiTenantSkillFleet:
         probs = _softmax_temp(arr, temp=0.25) if is_logits else arr
         if not bool(np.all(np.isfinite(probs))):
             raise ValueError("Computed probabilities from probs_or_logits contain non-finite values")
-        score_y = 1.0 - float(np.clip(probs[yi], 0.0, 1.0))
+        if self.score_method == "aps":
+            p_clip = np.clip(probs, 0.0, 1.0)
+            order = np.argsort(-p_clip, kind="mergesort")
+            pos_arr = np.flatnonzero(order == yi)
+            score_y = float(min(1.0, np.sum(p_clip[order[: int(pos_arr[0]) + 1]])))
+        else:
+            score_y = 1.0 - float(np.clip(probs[yi], 0.0, 1.0))
 
         with self._lock:
             q_cur = float(self.q_c[tid, yi])
@@ -1676,10 +1845,14 @@ class MultiTenantSkillFleet:
                     int(self.is_boolean),
                     int(self.recency_weighted),
                     int(self._zero_unit0),
+                    1 if self.score_method == "aps" else 0,
                 ],
                 dtype=np.int64,
             )
-            meta_floats = np.array([self.lam_rls, self.alpha, self.bool_threshold], dtype=np.float64)
+            meta_floats = np.array(
+                [self.lam_rls, self.alpha, self.bool_threshold, self.familiarity_threshold],
+                dtype=np.float64,
+            )
             snapshot_arrays: Dict[str, Any] = {
                 "meta_ints": meta_ints,
                 "meta_floats": meta_floats,
@@ -1751,6 +1924,7 @@ class MultiTenantSkillFleet:
             is_boolean_meta: Optional[bool] = None
             recency_meta = False
             zero_unit0_meta: Optional[bool] = None
+            score_method_meta = "lac"
             if "meta_ints" in zf:
                 m_int = zf["meta_ints"]
                 num_tenants, r_sub, m_sparse, m_exemplars = (
@@ -1782,24 +1956,34 @@ class MultiTenantSkillFleet:
                     if is_boolean_meta and K != 2:
                         raise ValueError(f"Snapshot is_boolean=True requires 2 classes, got {K}")
                     recency_meta = bool(raw_rec_flag)
-                    if len(m_int) == 7:
+                    if len(m_int) >= 7:
                         raw_z0_flag = int(m_int[6])
                         if raw_z0_flag not in (0, 1):
                             raise ValueError(
                                 f"Invalid snapshot meta_ints zero_unit0 flag: {raw_z0_flag}"
                             )
                         zero_unit0_meta = bool(raw_z0_flag)
+                    if len(m_int) >= 8:
+                        raw_sm_flag = int(m_int[7])
+                        if raw_sm_flag not in (0, 1):
+                            raise ValueError(
+                                f"Invalid snapshot meta_ints score_method flag: {raw_sm_flag}"
+                            )
+                        score_method_meta = "aps" if raw_sm_flag == 1 else "lac"
             else:
                 num_tenants, r_sub, m_sparse, m_exemplars = T, R, M_sp, M_ex
                 if m_sparse > MAX_FLEET_SPARSE_CAP or m_exemplars > MAX_FLEET_EXEMPLAR_CAP:
                     raise ValueError("Snapshot array capacities exceed uint8 limit 255")
 
             bool_thr_meta = 0.5
+            fam_thr_meta = 0.0
             if "meta_floats" in zf:
                 m_flt = zf["meta_floats"]
                 lam_rls, alpha = float(m_flt[0]), float(m_flt[1])
-                if len(m_flt) == 3:
+                if len(m_flt) >= 3:
                     bool_thr_meta = float(m_flt[2])
+                if len(m_flt) >= 4:
+                    fam_thr_meta = float(m_flt[3])
             else:
                 lam_rls, alpha = 1.5, 0.10
             if not math.isfinite(lam_rls) or not (1e-12 <= lam_rls <= 1e12):
@@ -1808,6 +1992,8 @@ class MultiTenantSkillFleet:
                 raise ValueError(f"Invalid snapshot alpha: {alpha!r}")
             if not math.isfinite(bool_thr_meta) or not (0.0 <= bool_thr_meta <= 1.0):
                 raise ValueError(f"Invalid snapshot bool_threshold: {bool_thr_meta!r}")
+            if not math.isfinite(fam_thr_meta) or fam_thr_meta < 0.0:
+                raise ValueError(f"Invalid snapshot familiarity_threshold: {fam_thr_meta!r}")
             if is_boolean_meta is False and bool_thr_meta != 0.5:
                 raise ValueError("Snapshot bool_threshold requires is_boolean=True")
 
@@ -1970,6 +2156,8 @@ class MultiTenantSkillFleet:
                 bool_threshold=bool_thr_meta,
                 recency_weighted=recency_meta,
                 zero_unit0=zero_unit0_meta,
+                score_method=score_method_meta,
+                familiarity_threshold=fam_thr_meta,
                 _raw_source_head=raw_head_meta,
             )
             fleet.dW_q[:] = dW_q_arr

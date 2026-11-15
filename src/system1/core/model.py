@@ -2929,6 +2929,8 @@ class PackedMultiQuestionKernel:
         s_raw_b: Optional[Tuple[np.ndarray, ...]] = None,
         s_default: Optional[np.ndarray] = None,
         zero_emb_unit0: bool = False,
+        c_k_gt_n: Optional[np.ndarray] = None,
+        b_k_gt_n: Optional[np.ndarray] = None,
     ) -> None:
         self.projector = projector
         self.dimension = dimension
@@ -2953,6 +2955,10 @@ class PackedMultiQuestionKernel:
         self.c_qhat = _owned_readonly_array(c_qhat, dtype=np.float64)
         self.c_is_cal = _owned_readonly_array(c_is_cal, dtype=bool)
         self.c_is_lac = _owned_readonly_array(c_is_lac, dtype=bool)
+        self.c_k_gt_n = _owned_readonly_array(
+            c_k_gt_n if c_k_gt_n is not None else np.zeros(self.Q_c, dtype=bool),
+            dtype=bool,
+        )
         self.c_eff_m = _owned_readonly_array(c_eff_m, dtype=np.float64)
         self.c_gamma = _owned_readonly_array(c_gamma, dtype=np.float64)
         self.c_tau0 = _owned_readonly_array(c_tau0, dtype=np.float64)
@@ -2984,6 +2990,10 @@ class PackedMultiQuestionKernel:
         self.b_qhat = _owned_readonly_array(b_qhat, dtype=np.float64)
         self.b_is_cal = _owned_readonly_array(b_is_cal, dtype=bool)
         self.b_is_lac = _owned_readonly_array(b_is_lac, dtype=bool)
+        self.b_k_gt_n = _owned_readonly_array(
+            b_k_gt_n if b_k_gt_n is not None else np.zeros(self.Q_b, dtype=bool),
+            dtype=bool,
+        )
         self.b_eff_m = _owned_readonly_array(b_eff_m, dtype=np.float64)
         self.b_gamma = _owned_readonly_array(b_gamma, dtype=np.float64)
         self.b_tau0 = _owned_readonly_array(b_tau0, dtype=np.float64)
@@ -3350,6 +3360,7 @@ class PackedMultiQuestionKernel:
         c_qhat: List[float] = []
         c_is_cal: List[bool] = []
         c_is_lac: List[bool] = []
+        c_k_gt_n: List[bool] = []
         c_eff_m: List[float] = []
         c_gamma: List[float] = []
         c_tau0: List[float] = []
@@ -3365,6 +3376,7 @@ class PackedMultiQuestionKernel:
         b_qhat: List[float] = []
         b_is_cal: List[bool] = []
         b_is_lac: List[bool] = []
+        b_k_gt_n: List[bool] = []
         b_eff_m: List[float] = []
         b_gamma: List[float] = []
         b_tau0: List[float] = []
@@ -3479,8 +3491,10 @@ class PackedMultiQuestionKernel:
                 c_is_lac.append(cp.score_method == "lac")
                 if cal_ok:
                     k_idx = math.ceil((n_cal + 1) * (1.0 - eff_alpha))
+                    c_k_gt_n.append(k_idx > n_cal)
                     c_qhat.append(1.0 if k_idx > n_cal else float(cp.calibration_scores[k_idx - 1]))
                 else:
+                    c_k_gt_n.append(False)
                     c_qhat.append(1.0 - eff_alpha)
                 gm, gg, gt = _resolve_gate_params(cp)
                 c_eff_m.append(gm)
@@ -3555,8 +3569,10 @@ class PackedMultiQuestionKernel:
                 b_is_lac.append(cp.score_method == "lac")
                 if cal_ok:
                     k_idx = math.ceil((n_cal + 1) * (1.0 - eff_alpha))
+                    b_k_gt_n.append(k_idx > n_cal)
                     b_qhat.append(1.0 if k_idx > n_cal else float(cp.calibration_scores[k_idx - 1]))
                 else:
+                    b_k_gt_n.append(False)
                     b_qhat.append(1.0 - eff_alpha)
                 gm, gg, gt = _resolve_gate_params(cp)
                 b_eff_m.append(gm)
@@ -3694,6 +3710,8 @@ class PackedMultiQuestionKernel:
             s_raw_b=tuple(s_raw_b),
             s_default=np.asarray(s_default, dtype=np.float64),
             zero_emb_unit0=zero_emb_unit0,
+            c_k_gt_n=np.asarray(c_k_gt_n, dtype=bool),
+            b_k_gt_n=np.asarray(b_k_gt_n, dtype=bool),
         )
         kernel._inference_sig = _compute_engine_inference_signature(
             eng, storage_mode, effective_alpha=eff_alpha
@@ -3801,7 +3819,8 @@ class PackedMultiQuestionKernel:
             p_pad = np.full((B, self.Q_c, self.K_max), -1.0, dtype=np.float64)
             p_pad[:, self.c_pad_rows, self.c_pad_cols] = p_c
             best_idx = np.argmax(p_pad, axis=2)
-            p_sorted = -np.sort(-p_pad, axis=2)
+            c_order = np.argsort(-p_pad, axis=2, kind="mergesort")
+            p_sorted = np.take_along_axis(p_pad, c_order, axis=2)
             c_conf = p_sorted[:, :, 0]
             bad_c_col = (~np.isfinite(zc)) | (~np.isfinite(zc_cal)) | (~np.isfinite(p_c))
             bad_c_pad = np.zeros((B, self.Q_c, self.K_max), dtype=bool)
@@ -3909,7 +3928,9 @@ class PackedMultiQuestionKernel:
                             best_i_ex = int(np.argmax(p_ex))
                             best_idx[r_pos, ci_pos] = best_i_ex
                             c_conf[r_pos, ci_pos] = float(p_ex[best_i_ex])
-                            p_sorted[r_pos, ci_pos] = -np.sort(-p_pad[r_pos, ci_pos])
+                            ord_ex = np.argsort(-p_pad[r_pos, ci_pos], kind="mergesort")
+                            c_order[r_pos, ci_pos] = ord_ex
+                            p_sorted[r_pos, ci_pos] = p_pad[r_pos, ci_pos, ord_ex]
                             c_nonfin[r_pos, ci_pos] = False
                         else:
                             p_c[r_pos, s0 : s0 + K] = np.nan
@@ -3918,60 +3939,112 @@ class PackedMultiQuestionKernel:
                             c_conf[r_pos, ci_pos] = np.nan
                             c_nonfin[r_pos, ci_pos] = True
 
+            valid_mask = (
+                np.arange(self.K_max, dtype=np.int32)[None, None, :] < self.c_K[None, :, None]
+            )
+            total_mass_c = np.sum(np.where(valid_mask, p_pad, 0.0), axis=2)
+            c_unit_mass = np.all(
+                np.where(valid_mask, np.isfinite(p_pad) & (p_pad >= 0.0), True),
+                axis=2,
+            ) & (np.abs(total_mass_c - 1.0) <= (1e-8 + 1e-5))
+            sorted_valid = c_order < self.c_K[None, :, None]
+
             if self.c_all_lac:
-                in_c = np.sum(
-                    (p_pad >= 0.0) & ((1.0 - p_pad) <= self.c_qhat[None, :, None] + 1e-7),
-                    axis=2,
-                )
-            elif self.c_all_aps_cal:
-                csum = np.cumsum(np.maximum(p_sorted, 0.0), axis=2)
-                if self.strict:
-                    in_c = np.sum(
-                        (p_sorted >= 0.0) & (csum <= self.c_qhat[None, :, None] + 1e-7),
+                in_lac = np.where(
+                    c_unit_mass,
+                    np.sum(
+                        valid_mask & ((1.0 - p_pad) <= self.c_qhat[None, :, None] + 1e-7),
                         axis=2,
+                    ),
+                    0,
+                )
+                in_c = np.where(self.c_k_gt_n[None, :], self.c_K[None, :], in_lac)
+            elif self.c_all_aps_cal:
+                csum = np.cumsum(np.where(sorted_valid, p_sorted, 0.0), axis=2)
+                if self.strict:
+                    in_aps = np.where(
+                        c_unit_mass,
+                        np.sum(
+                            sorted_valid & (csum <= self.c_qhat[None, :, None] + 1e-7),
+                            axis=2,
+                        ),
+                        0,
                     )
+                    in_c = np.where(self.c_k_gt_n[None, :], self.c_K[None, :], in_aps)
                 else:
                     prev_csum = np.concatenate(
                         [np.zeros((B, self.Q_c, 1), dtype=np.float64), csum[:, :, :-1]],
                         axis=2,
                     )
-                    in_c = np.maximum(
+                    raw_cnt = np.maximum(
                         1,
                         np.sum(
-                            (p_sorted >= 0.0) & (prev_csum < self.c_qhat[None, :, None] - 1e-7),
+                            sorted_valid & (prev_csum < self.c_qhat[None, :, None] - 1e-7),
                             axis=2,
                         ),
                     )
+                    in_c = np.where(
+                        (total_mass_c >= self.c_qhat[None, :] - 1e-7) & (total_mass_c >= 0.5),
+                        raw_cnt,
+                        0,
+                    )
             else:
-                csum = np.cumsum(np.maximum(p_sorted, 0.0), axis=2)
+                csum = np.cumsum(np.where(sorted_valid, p_sorted, 0.0), axis=2)
                 prev_csum = np.concatenate(
                     [np.zeros((B, self.Q_c, 1), dtype=np.float64), csum[:, :, :-1]],
                     axis=2,
                 )
-                in_lac = np.sum(
-                    (p_pad >= 0.0) & ((1.0 - p_pad) <= self.c_qhat[None, :, None] + 1e-7),
-                    axis=2,
+                in_lac = np.where(
+                    self.c_k_gt_n[None, :],
+                    self.c_K[None, :],
+                    np.where(
+                        c_unit_mass,
+                        np.sum(
+                            valid_mask & ((1.0 - p_pad) <= self.c_qhat[None, :, None] + 1e-7),
+                            axis=2,
+                        ),
+                        0,
+                    ),
                 )
                 if self.strict:
-                    in_aps = np.sum(
-                        (p_sorted >= 0.0) & (csum <= self.c_qhat[None, :, None] + 1e-7),
-                        axis=2,
+                    in_aps = np.where(
+                        self.c_k_gt_n[None, :],
+                        self.c_K[None, :],
+                        np.where(
+                            c_unit_mass,
+                            np.sum(
+                                sorted_valid & (csum <= self.c_qhat[None, :, None] + 1e-7),
+                                axis=2,
+                            ),
+                            0,
+                        ),
                     )
                     in_uncal = np.broadcast_to(self.c_K[None, :], (B, self.Q_c))
                 else:
-                    in_aps = np.maximum(
+                    raw_aps = np.maximum(
                         1,
                         np.sum(
-                            (p_sorted >= 0.0) & (prev_csum < self.c_qhat[None, :, None] - 1e-7),
+                            sorted_valid & (prev_csum < self.c_qhat[None, :, None] - 1e-7),
                             axis=2,
                         ),
                     )
-                    in_uncal = np.maximum(
+                    in_aps = np.where(
+                        (total_mass_c >= self.c_qhat[None, :] - 1e-7) & (total_mass_c >= 0.5),
+                        raw_aps,
+                        0,
+                    )
+                    uncal_thr = 1.0 - self.alpha
+                    raw_uncal = np.maximum(
                         1,
                         np.sum(
-                            (p_sorted >= 0.0) & (prev_csum < (1.0 - self.alpha - 1e-7)),
+                            sorted_valid & (prev_csum < (uncal_thr - 1e-7)),
                             axis=2,
                         ),
+                    )
+                    in_uncal = np.where(
+                        (total_mass_c >= uncal_thr - 1e-7) & (total_mass_c >= 0.5),
+                        raw_uncal,
+                        0,
                     )
                 in_c = np.where(
                     self.c_is_cal[None, :],
@@ -3995,10 +4068,18 @@ class PackedMultiQuestionKernel:
                     & (odds >= self.c_gamma[None, :])
                 )
                 c_ambig = (in_c == 0) | ((in_c > 1) & (~mg))
+            pos_idx = np.arange(self.K_max, dtype=np.int32)[None, None, :]
+            pred_in_aps = np.any(
+                (c_order == best_idx[:, :, None]) & (pos_idx < in_c[:, :, None]),
+                axis=2,
+            )
+            pred_in_lac = self.c_k_gt_n[None, :] | (
+                c_unit_mass & ((1.0 - c_conf) <= self.c_qhat[None, :] + 1e-7)
+            )
             pred_in_c = np.where(
                 self.c_is_cal[None, :] & self.c_is_lac[None, :],
-                (1.0 - c_conf) <= self.c_qhat[None, :] + 1e-7,
-                in_c >= 1,
+                pred_in_lac,
+                pred_in_aps,
             )
             c_ambig |= ~pred_in_c
             if np.any(c_nonfin):
@@ -4125,32 +4206,71 @@ class PackedMultiQuestionKernel:
                             b_nonfin[r_pos, bi_pos] = True
 
             top_is_true_b = p_true > p_false
+            total_mass_b = p_false + p_true
+            b_unit_mass = (
+                np.isfinite(total_mass_b)
+                & (p_false >= 0.0)
+                & (p_true >= 0.0)
+                & (np.abs(total_mass_b - 1.0) <= (1e-8 + 1e-5))
+            )
             if self.b_all_lac:
-                true_in_b = (1.0 - p_true) <= self.b_qhat[None, :] + 1e-7
-                false_in_b = (1.0 - p_false) <= self.b_qhat[None, :] + 1e-7
+                true_in_b = self.b_k_gt_n[None, :] | (
+                    b_unit_mass & ((1.0 - p_true) <= self.b_qhat[None, :] + 1e-7)
+                )
+                false_in_b = self.b_k_gt_n[None, :] | (
+                    b_unit_mass & ((1.0 - p_false) <= self.b_qhat[None, :] + 1e-7)
+                )
                 in_b = true_in_b.astype(np.int32) + false_in_b.astype(np.int32)
                 pred_in_b = np.where(b_val, true_in_b, false_in_b)
             elif self.b_all_aps_cal:
                 if self.strict:
-                    in_b = (b_top <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
-                        1.0 <= self.b_qhat[None, :] + 1e-7
-                    ).astype(np.int32)
+                    b_in1 = b_unit_mass & (b_top <= self.b_qhat[None, :] + 1e-7)
+                    b_in2 = b_unit_mass & (total_mass_b <= self.b_qhat[None, :] + 1e-7)
+                    in_b = np.where(
+                        self.b_k_gt_n[None, :],
+                        2,
+                        b_in1.astype(np.int32) + b_in2.astype(np.int32),
+                    )
                 else:
-                    in_b = 1 + (b_top < self.b_qhat[None, :] - 1e-7).astype(np.int32)
+                    b_pass = (total_mass_b >= self.b_qhat[None, :] - 1e-7) & (total_mass_b >= 0.5)
+                    in_b = np.where(
+                        b_pass,
+                        1 + (b_top < self.b_qhat[None, :] - 1e-7).astype(np.int32),
+                        0,
+                    )
                 pred_in_b = (in_b >= 2) | ((in_b == 1) & (b_val == top_is_true_b))
             else:
-                true_in_lac = (1.0 - p_true) <= self.b_qhat[None, :] + 1e-7
-                false_in_lac = (1.0 - p_false) <= self.b_qhat[None, :] + 1e-7
+                true_in_lac = self.b_k_gt_n[None, :] | (
+                    b_unit_mass & ((1.0 - p_true) <= self.b_qhat[None, :] + 1e-7)
+                )
+                false_in_lac = self.b_k_gt_n[None, :] | (
+                    b_unit_mass & ((1.0 - p_false) <= self.b_qhat[None, :] + 1e-7)
+                )
                 in_lac_b = true_in_lac.astype(np.int32) + false_in_lac.astype(np.int32)
                 pred_in_lac_b = np.where(b_val, true_in_lac, false_in_lac)
                 if self.strict:
-                    in_aps_b = (b_top <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
-                        1.0 <= self.b_qhat[None, :] + 1e-7
-                    ).astype(np.int32)
+                    b_aps1 = b_unit_mass & (b_top <= self.b_qhat[None, :] + 1e-7)
+                    b_aps2 = b_unit_mass & (total_mass_b <= self.b_qhat[None, :] + 1e-7)
+                    in_aps_b = np.where(
+                        self.b_k_gt_n[None, :],
+                        2,
+                        b_aps1.astype(np.int32) + b_aps2.astype(np.int32),
+                    )
                     in_uncal_b = np.full((B, self.Q_b), 2, dtype=np.int32)
                 else:
-                    in_aps_b = 1 + (b_top < self.b_qhat[None, :] - 1e-7).astype(np.int32)
-                    in_uncal_b = 1 + (b_top < (1.0 - self.alpha - 1e-7)).astype(np.int32)
+                    b_aps_pass = (total_mass_b >= self.b_qhat[None, :] - 1e-7) & (total_mass_b >= 0.5)
+                    in_aps_b = np.where(
+                        b_aps_pass,
+                        1 + (b_top < self.b_qhat[None, :] - 1e-7).astype(np.int32),
+                        0,
+                    )
+                    b_unc_thr = 1.0 - self.alpha
+                    b_unc_pass = (total_mass_b >= b_unc_thr - 1e-7) & (total_mass_b >= 0.5)
+                    in_uncal_b = np.where(
+                        b_unc_pass,
+                        1 + (b_top < (b_unc_thr - 1e-7)).astype(np.int32),
+                        0,
+                    )
                 in_aps_or_uncal = np.where(self.b_is_cal[None, :], in_aps_b, in_uncal_b)
                 pred_in_aps_or_uncal = (in_aps_or_uncal >= 2) | (
                     (in_aps_or_uncal == 1) & (b_val == top_is_true_b)
@@ -4462,6 +4582,8 @@ class _BoundCallableState:
     b_w_l1: Tuple[float, ...] = ()
     b_b_abs: Tuple[float, ...] = ()
     s_default: Tuple[float, ...] = ()
+    c_k_gt_n: Tuple[bool, ...] = ()
+    b_k_gt_n: Tuple[bool, ...] = ()
 
 
 def _snapshot_engine_schema_state(eng: Any) -> Tuple[Any, Any, int, Optional[str], int, Optional[str]]:
@@ -4558,6 +4680,7 @@ class FastDecisionCallable:
             c_qhats=tuple(float(x) for x in kernel.c_qhat),
             c_cals=tuple(bool(x) for x in kernel.c_is_cal),
             c_lacs=tuple(bool(x) for x in kernel.c_is_lac),
+            c_k_gt_n=tuple(bool(x) for x in kernel.c_k_gt_n),
             c_eff_m=tuple(float(x) for x in kernel.c_eff_m),
             c_gamma=tuple(float(x) for x in kernel.c_gamma),
             c_conf_floor=tuple(float(x) for x in kernel.c_conf_floor),
@@ -4569,6 +4692,7 @@ class FastDecisionCallable:
             b_qhats=tuple(float(x) for x in kernel.b_qhat),
             b_cals=tuple(bool(x) for x in kernel.b_is_cal),
             b_lacs=tuple(bool(x) for x in kernel.b_is_lac),
+            b_k_gt_n=tuple(bool(x) for x in kernel.b_k_gt_n),
             b_eff_m=tuple(float(x) for x in kernel.b_eff_m),
             b_gamma=tuple(float(x) for x in kernel.b_gamma),
             b_conf_floor=tuple(float(x) for x in kernel.b_conf_floor),
@@ -4920,47 +5044,86 @@ class FastDecisionCallable:
             vals[fn] = st.c_options[ci][best_i]
             confs[fn] = best_p
 
+            total_mass_c = sum(probs)
+            unit_mass_ok = (
+                math.isfinite(total_mass_c)
+                and all(math.isfinite(pv) and pv >= 0.0 for pv in probs)
+                and abs(total_mass_c - 1.0) <= (1e-8 + 1e-5)
+            )
             ps: Optional[List[float]] = None
             if not st.c_cals[ci]:
                 if strict:
                     cnt = K
+                    pred_in = True
                 else:
-                    ps = sorted(probs, reverse=True)
-                    cs = 0.0
-                    cnt = 0
-                    thr = 1.0 - st.alpha - 1e-7
-                    for pv in ps:
-                        cs += pv
-                        cnt += 1
-                        if cs >= thr:
-                            break
-                pred_in = cnt >= 1
+                    thr = 1.0 - st.alpha
+                    if total_mass_c >= thr - 1e-7 and total_mass_c >= 0.5:
+                        order = sorted(range(K), key=lambda idx_j: -probs[idx_j])
+                        ps = [probs[idx_j] for idx_j in order]
+                        cs = 0.0
+                        cnt = 0
+                        pred_in = False
+                        for idx_j, pv in zip(order, ps):
+                            cs += pv
+                            cnt += 1
+                            if idx_j == best_i:
+                                pred_in = True
+                            if cs >= thr - 1e-7:
+                                break
+                    else:
+                        cnt = 0
+                        pred_in = False
             else:
                 qh = st.c_qhats[ci]
+                k_gt_n = ci < len(st.c_k_gt_n) and st.c_k_gt_n[ci]
                 if st.c_lacs[ci]:
-                    cnt = sum(1 for pv in probs if (1.0 - pv) <= qh + 1e-7)
-                    pred_in = (1.0 - best_p) <= qh + 1e-7
+                    if k_gt_n:
+                        cnt = K
+                        pred_in = True
+                    elif unit_mass_ok:
+                        cnt = sum(1 for pv in probs if (1.0 - pv) <= qh + 1e-7)
+                        pred_in = (1.0 - best_p) <= qh + 1e-7
+                    else:
+                        cnt = 0
+                        pred_in = False
                 elif strict:
-                    ps = sorted(probs, reverse=True)
-                    cs = 0.0
-                    cnt = 0
-                    for pv in ps:
-                        cs += pv
-                        if cs <= qh + 1e-7:
-                            cnt += 1
-                        else:
-                            break
-                    pred_in = cnt >= 1
+                    if k_gt_n:
+                        cnt = K
+                        pred_in = True
+                    elif unit_mass_ok:
+                        order = sorted(range(K), key=lambda idx_j: -probs[idx_j])
+                        ps = [probs[idx_j] for idx_j in order]
+                        cs = 0.0
+                        cnt = 0
+                        pred_in = False
+                        for idx_j, pv in zip(order, ps):
+                            cs += pv
+                            if cs <= qh + 1e-7:
+                                cnt += 1
+                                if idx_j == best_i:
+                                    pred_in = True
+                            else:
+                                break
+                    else:
+                        cnt = 0
+                        pred_in = False
                 else:
-                    ps = sorted(probs, reverse=True)
-                    cs = 0.0
-                    cnt = 0
-                    for pv in ps:
-                        cs += pv
-                        cnt += 1
-                        if cs >= qh - 1e-7:
-                            break
-                    pred_in = cnt >= 1
+                    if total_mass_c >= qh - 1e-7 and total_mass_c >= 0.5:
+                        order = sorted(range(K), key=lambda idx_j: -probs[idx_j])
+                        ps = [probs[idx_j] for idx_j in order]
+                        cs = 0.0
+                        cnt = 0
+                        pred_in = False
+                        for idx_j, pv in zip(order, ps):
+                            cs += pv
+                            cnt += 1
+                            if idx_j == best_i:
+                                pred_in = True
+                            if cs >= qh - 1e-7:
+                                break
+                    else:
+                        cnt = 0
+                        pred_in = False
 
             field_ambig = not pred_in
             if strict:
@@ -5115,26 +5278,60 @@ class FastDecisionCallable:
 
             top = pt if pt >= pf else pf
             top_is_true = pt > pf
+            total_mass_b = pf + pt
+            b_unit_mass = (
+                math.isfinite(pf)
+                and math.isfinite(pt)
+                and pf >= 0.0
+                and pt >= 0.0
+                and abs(total_mass_b - 1.0) <= (1e-8 + 1e-5)
+            )
             if not st.b_cals[bi]:
                 if strict:
                     cnt = 2
                     pred_in = True
                 else:
-                    cnt = 1 if top >= (1.0 - st.alpha - 1e-7) else 2
-                    pred_in = (cnt >= 2) or (bv == top_is_true)
+                    thr_u = 1.0 - st.alpha
+                    if total_mass_b >= thr_u - 1e-7 and total_mass_b >= 0.5:
+                        cnt = 1 if top >= thr_u - 1e-7 else 2
+                        pred_in = (cnt >= 2) or (bv == top_is_true)
+                    else:
+                        cnt = 0
+                        pred_in = False
             else:
                 qh = st.b_qhats[bi]
+                k_gt_n = bi < len(st.b_k_gt_n) and st.b_k_gt_n[bi]
                 if st.b_lacs[bi]:
-                    true_in = (1.0 - pt) <= qh + 1e-7
-                    false_in = (1.0 - pf) <= qh + 1e-7
-                    cnt = (1 if true_in else 0) + (1 if false_in else 0)
-                    pred_in = true_in if bv else false_in
+                    if k_gt_n:
+                        cnt = 2
+                        pred_in = True
+                    elif b_unit_mass:
+                        true_in = (1.0 - pt) <= qh + 1e-7
+                        false_in = (1.0 - pf) <= qh + 1e-7
+                        cnt = (1 if true_in else 0) + (1 if false_in else 0)
+                        pred_in = true_in if bv else false_in
+                    else:
+                        cnt = 0
+                        pred_in = False
                 elif strict:
-                    cnt = (1 if top <= qh + 1e-7 else 0) + (1 if 1.0 <= qh + 1e-7 else 0)
-                    pred_in = (cnt >= 2) or ((cnt == 1) and (bv == top_is_true))
+                    if k_gt_n:
+                        cnt = 2
+                        pred_in = True
+                    elif b_unit_mass:
+                        cnt = (1 if top <= qh + 1e-7 else 0) + (
+                            1 if total_mass_b <= qh + 1e-7 else 0
+                        )
+                        pred_in = (cnt >= 2) or ((cnt == 1) and (bv == top_is_true))
+                    else:
+                        cnt = 0
+                        pred_in = False
                 else:
-                    cnt = 1 if top >= qh - 1e-7 else 2
-                    pred_in = (cnt >= 2) or (bv == top_is_true)
+                    if total_mass_b >= qh - 1e-7 and total_mass_b >= 0.5:
+                        cnt = 1 if top >= qh - 1e-7 else 2
+                        pred_in = (cnt >= 2) or (bv == top_is_true)
+                    else:
+                        cnt = 0
+                        pred_in = False
 
             field_ambig = not pred_in
             if strict:
