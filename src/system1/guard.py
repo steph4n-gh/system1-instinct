@@ -43,8 +43,29 @@ from system1.core.model import (
     _accepts_recency_weighted,
     _compute_hierarchical_logits_np,
     _encode_projector_batch,
+    _model_zero_unit0,
 )
 from system1.core.text import PragmaticCompositeProjector, TfidfProjector
+
+
+def _require_finite_guard_float(name: str, value: Any) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(f"{name} must be a finite real number, got {value!r}")
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return out
+
+
+def _require_guard_int(name: str, value: Any, min_value: int = 0) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer >= {min_value}, got {value!r}")
+    out = int(value)
+    if out < int(min_value):
+        raise ValueError(f"{name} must be >= {min_value}, got {out!r}")
+    return out
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,254}$")
@@ -404,19 +425,23 @@ class GuardShield:
         if not self.safe_idxs:
             raise ValueError("GuardShield requires at least one non-unsafe option")
 
-        self.window_words = int(window_words)
-        self.stride_words = int(stride_words)
-        self.window_margin_threshold = float(window_margin_threshold)
+        self.window_words = _require_guard_int("window_words", window_words, 1)
+        self.stride_words = _require_guard_int("stride_words", stride_words, 1)
+        self.window_margin_threshold = _require_finite_guard_float(
+            "window_margin_threshold", window_margin_threshold
+        )
         self.canonicalize = bool(canonicalize)
         self.use_windows = bool(use_windows)
         self.short_doc_passthrough = bool(short_doc_passthrough)
-        self.short_doc_words = int(short_doc_words)
-        self.sim_threshold = float(sim_threshold) if sim_threshold is not None else None
+        self.short_doc_words = _require_guard_int("short_doc_words", short_doc_words, 0)
+        self.sim_threshold = (
+            _require_finite_guard_float("sim_threshold", sim_threshold)
+            if sim_threshold is not None
+            else None
+        )
         self.projector = resolved.projector
         self.recency_weighted = bool(getattr(resolved, "recency_weighted", False))
-        self._zero_unit0 = not isinstance(
-            self.projector, (TfidfProjector, PragmaticCompositeProjector)
-        )
+        self._zero_unit0 = _model_zero_unit0(resolved, self.projector)
         self._accepts_recency = _accepts_recency_weighted(getattr(self.projector, "project", None))
         self._batch_accepts_recency = _accepts_recency_weighted(
             getattr(self.projector, "project_batch", None)
@@ -426,6 +451,8 @@ class GuardShield:
         if unsafe_exemplars:
             U = self._project_batch(unsafe_exemplars)
             if len(U) > 0:
+                if not bool(np.all(np.isfinite(U))):
+                    raise ValueError("unsafe_exemplars produced non-finite embeddings")
                 self.unsafe_bank = _l2_normalize_rows(U)
                 if not bool(np.all(np.isfinite(self.unsafe_bank))):
                     raise ValueError("unsafe_exemplars produced non-finite embeddings")
@@ -616,6 +643,11 @@ class GuardShield:
                 not bool(np.all(np.isfinite(scaled_logits)))
                 or not bool(np.all(np.isfinite(probs)))
                 or not bool(np.all(np.isfinite(unsafe_margins)))
+                or not math.isfinite(float(window_margin_threshold))
+                or (
+                    sim_threshold is not None
+                    and not math.isfinite(float(sim_threshold))
+                )
                 or (
                     sim_threshold is not None
                     and sims is not None
@@ -768,6 +800,10 @@ class GuardShield:
         seed: int = 77,
     ) -> float:
         """Calibrate `sim_threshold` strictly on clean and benign-padded calibration texts."""
+        eff_fpr = _require_finite_guard_float("target_fpr", target_fpr)
+        if not (0.0 <= eff_fpr <= 1.0):
+            raise ValueError(f"target_fpr must lie in [0.0, 1.0], got {eff_fpr!r}")
+        eff_margin = _require_finite_guard_float("safety_margin", safety_margin)
         if not benign_texts or not unsafe_exemplars:
             return 0.0
         probe = cls(
@@ -784,6 +820,9 @@ class GuardShield:
         )
         if probe.unsafe_bank is None or len(probe.unsafe_bank) == 0:
             return 0.0
+        U_b = probe._project_batch([str(t) for t in benign_texts])
+        if not bool(np.all(np.isfinite(U_b))):
+            raise ValueError("benign_texts produced non-finite embeddings during sim_threshold calibration")
         cal_docs: List[str] = []
         for i, txt in enumerate(benign_texts):
             filler = _make_cal_filler_words(240, seed + i * 13)
@@ -793,12 +832,22 @@ class GuardShield:
         max_sims: List[float] = []
         for doc in cal_docs:
             canon, frags = canonicalize_guard_text(doc)
-            wins = make_sliding_windows(canon, frags, window_words=window_words, stride_words=stride_words)
-            X_w = _l2_normalize_rows(probe._project_batch(wins))
+            wins = make_sliding_windows(canon, frags, window_words=probe.window_words, stride_words=probe.stride_words)
+            raw_w = probe._project_batch(wins)
+            if not bool(np.all(np.isfinite(raw_w))):
+                raise ValueError("Window projection produced non-finite embeddings during sim_threshold calibration")
+            X_w = _l2_normalize_rows(raw_w)
+            if not bool(np.all(np.isfinite(X_w))):
+                raise ValueError("Normalized window embeddings contain non-finite values")
             sims = np.max(X_w @ probe.unsafe_bank.T, axis=1)
+            if not bool(np.all(np.isfinite(sims))):
+                raise ValueError("Prototype similarities contain non-finite values")
             max_sims.append(float(np.max(sims)))
-        q = float(np.quantile(max_sims, min(1.0, max(0.0, 1.0 - target_fpr))))
-        return float(q + safety_margin)
+        q = float(np.quantile(max_sims, min(1.0, max(0.0, 1.0 - eff_fpr))))
+        out_thr = float(q + eff_margin)
+        if not math.isfinite(out_thr):
+            raise ValueError("Calibrated sim_threshold is non-finite")
+        return out_thr
 
     @classmethod
     def calibrate_threshold_from_benign(
@@ -814,6 +863,9 @@ class GuardShield:
         target_fpr: float = 0.01,
     ) -> float:
         """Calibrate `window_margin_threshold` on benign texts strictly from calibration splits."""
+        eff_fpr = _require_finite_guard_float("target_fpr", target_fpr)
+        if not (0.0 <= eff_fpr <= 1.0):
+            raise ValueError(f"target_fpr must lie in [0.0, 1.0], got {eff_fpr!r}")
         if not benign_texts:
             return 0.0
         probe = cls(
@@ -826,9 +878,36 @@ class GuardShield:
             window_margin_threshold=0.0,
             short_doc_passthrough=False,
         )
-        margins = [probe.evaluate_single(t).max_window_unsafe_margin for t in benign_texts]
-        q = float(np.quantile(margins, min(1.0, max(0.0, 1.0 - target_fpr))))
-        return max(0.0, q + 1e-4)
+        U_b = probe._project_batch([str(t) for t in benign_texts])
+        if not bool(np.all(np.isfinite(U_b))):
+            raise ValueError("benign_texts produced non-finite embeddings during threshold calibration")
+        margins: List[float] = []
+        for t in benign_texts:
+            nv, nf, is_s, s_log, probs, sims, canon_us, base_us = probe._score_views(t)
+            if not (bool(np.all(np.isfinite(s_log))) and bool(np.all(np.isfinite(probs)))):
+                raise ValueError("benign_texts produced non-finite logits or probabilities during calibration")
+            dec = probe._decision_from_views(
+                n_views=nv,
+                n_frags=nf,
+                is_short_doc=bool(is_s),
+                scaled_logits=s_log,
+                probs=probs,
+                sims=sims,
+                canon_us=canon_us,
+                base_elapsed_us=base_us,
+                short_doc_passthrough=probe.short_doc_passthrough,
+                window_margin_threshold=probe.window_margin_threshold,
+                sim_threshold=probe.sim_threshold,
+            )
+            m_val = float(dec.max_window_unsafe_margin)
+            if not math.isfinite(m_val):
+                raise ValueError("Calibrated window margin is non-finite")
+            margins.append(m_val)
+        q = float(np.quantile(margins, min(1.0, max(0.0, 1.0 - eff_fpr))))
+        out_thr = max(0.0, float(q + 1e-4))
+        if not math.isfinite(out_thr):
+            raise ValueError("Calibrated window_margin_threshold is non-finite")
+        return out_thr
 
 
 def _required_identifier(name: str, value: str) -> str:
@@ -1896,29 +1975,37 @@ class SystemOneGuardHook:
 
         # 0. Check opt-in GuardShield window scanner when enabled
         active_shield = self.shield
-        if active_shield is None and self.shield_mode == "sliding_window" and native_engine:
-            model_obj = getattr(self.engine, "model", None)
-            heads = (
-                (getattr(model_obj, "_field_heads", None) or getattr(model_obj, "heads", {}))
-                if model_obj is not None
-                else {}
-            )
-            if "is_safe" in self.engine.schema.fields and "is_safe" in heads:
-                cur_ver = int(getattr(self.engine, "model_version", 1))
-                if self._lazy_shield is None or self._lazy_shield_version != cur_ver:
-                    self._lazy_shield = self._build_default_lazy_shield()
-                    self._lazy_shield_version = cur_ver
-                active_shield = self._lazy_shield
-        if active_shield is not None:
-            shield_dec = active_shield.evaluate_single(raw_prompt)
-            if shield_dec.is_unsafe:
-                margin_str = (
-                    f"{shield_dec.max_window_unsafe_margin:.3f}"
-                    if math.isfinite(shield_dec.max_window_unsafe_margin)
-                    else "non-finite"
+        try:
+            if active_shield is None and self.shield_mode == "sliding_window" and native_engine:
+                model_obj = getattr(self.engine, "model", None)
+                heads = (
+                    (getattr(model_obj, "_field_heads", None) or getattr(model_obj, "heads", {}))
+                    if model_obj is not None
+                    else {}
                 )
-                reason = f"System 1 GuardShield blocked unsafe window (margin: {margin_str})"
-                return _finish(DecisionOutcome.DENY, RiskLevel.IRREVERSIBLE, "system1_shield_deny", reason)
+                if "is_safe" in self.engine.schema.fields and "is_safe" in heads:
+                    cur_ver = int(getattr(self.engine, "model_version", 1))
+                    if self._lazy_shield is None or self._lazy_shield_version != cur_ver:
+                        self._lazy_shield = self._build_default_lazy_shield()
+                        self._lazy_shield_version = cur_ver
+                    active_shield = self._lazy_shield
+            if active_shield is not None:
+                shield_dec = active_shield.evaluate_single(raw_prompt)
+                if shield_dec.is_unsafe:
+                    margin_str = (
+                        f"{shield_dec.max_window_unsafe_margin:.3f}"
+                        if math.isfinite(shield_dec.max_window_unsafe_margin)
+                        else "non-finite"
+                    )
+                    reason = f"System 1 GuardShield blocked unsafe window (margin: {margin_str})"
+                    return _finish(DecisionOutcome.DENY, RiskLevel.IRREVERSIBLE, "system1_shield_deny", reason)
+        except Exception:
+            return _finish(
+                DecisionOutcome.DENY,
+                RiskLevel.IRREVERSIBLE,
+                "system1_shield_deny",
+                "System 1 GuardShield failed closed on invalid/non-finite shield state",
+            )
 
         # 1. Check safety boolean if present
         if "is_safe" in decision.values and not decision.values["is_safe"]:

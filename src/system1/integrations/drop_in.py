@@ -10,11 +10,30 @@ structured extraction, and prompt-injection scanning wrappers:
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
+
+
+def _round_finite_or_nan(value: float, digits: int) -> float:
+    f = float(value)
+    return round(f, digits) if math.isfinite(f) else float("nan")
+
+
+def _min_confidence_or_nan(conf_values: Any) -> float:
+    vals = list(conf_values)
+    if not vals:
+        return 1.0
+    out: List[float] = []
+    for v in vals:
+        f = float(v)
+        if not math.isfinite(f):
+            return float("nan")
+        out.append(f)
+    return min(out)
 
 from system1.calibration import (
     BinaryPlattBetaCalibrator,
@@ -159,7 +178,20 @@ class InstinctRouteLayer:
             conf = float(res.get("confidences", {}).get("route", 1.0))
             raw_route = res["values"].get("route")
             name: Optional[str] = str(raw_route) if raw_route is not None else None
-            if not res.used_fallback and self.confidence_threshold > 0.0 and conf < self.confidence_threshold:
+            reasons = getattr(res, "abstention_reasons", None)
+            if not isinstance(reasons, Mapping):
+                reasons = (
+                    getattr(res, "metadata", {}).get("abstention_reasons", {})
+                    if hasattr(res, "metadata")
+                    else {}
+                )
+            nonfinite_route = (not math.isfinite(conf)) or (
+                isinstance(reasons, Mapping) and "non_finite_input" in reasons.values()
+            )
+            if not res.used_fallback and (
+                nonfinite_route
+                or (self.confidence_threshold > 0.0 and conf < self.confidence_threshold)
+            ):
                 name = None
             return RouteMatchResult(
                 name=name,
@@ -171,7 +203,12 @@ class InstinctRouteLayer:
         dt_ms = (time.perf_counter() - t0) * 1000.0
         conf = float(dec.confidences["route"])
         name = str(dec.values["route"])
-        if (self.compiled_model is not None or self.engine.strict_mode) and (
+        nonfinite_route = (not math.isfinite(conf)) or (
+            "non_finite_input" in getattr(dec, "abstention_reasons", {}).values()
+        )
+        if nonfinite_route:
+            name = None
+        elif (self.compiled_model is not None or self.engine.strict_mode) and (
             dec.is_ambiguous or bool(dec.escalated_fields)
         ):
             name = None
@@ -323,9 +360,18 @@ class SystemOneRouteController:
         tier = str(decision.values["target_tier"])
         deep = bool(decision.values["requires_deep_reasoning"])
         complexity = float(decision.values["complexity_score"])
-        conf = float(min(decision.confidences.values())) if decision.confidences else 1.0
+        conf = _min_confidence_or_nan(decision.confidences.values())
 
-        if conf < self.confidence_threshold and tier == "system1_local":
+        has_nonfinite = (
+            "non_finite_input" in getattr(decision, "abstention_reasons", {}).values()
+            or not math.isfinite(conf)
+            or not math.isfinite(complexity)
+        )
+        if has_nonfinite:
+            tier = "frontier_reasoning_model"
+            deep = True
+            conf = float("nan")
+        elif conf < self.confidence_threshold and tier == "system1_local":
             tier = "fast_small_model"
 
         return RouteDecision(
@@ -333,8 +379,8 @@ class SystemOneRouteController:
             selected_tier=tier,
             selected_model=self._tier_to_model.get(tier, self.strong_model),
             requires_deep_reasoning=deep,
-            complexity_score=round(complexity, 4),
-            confidence=round(conf, 4),
+            complexity_score=_round_finite_or_nan(complexity, 4),
+            confidence=_round_finite_or_nan(conf, 4),
             latency_ms=round(latency_ms, 3),
         )
 
@@ -399,7 +445,14 @@ class UtilityCascadeRouter:
         self.strong_model = strong_model
         self.weak_model = weak_model
         self.local_model = local_model
-        self.error_multiplier = float(error_multiplier)
+        if isinstance(error_multiplier, (bool, np.bool_)) or not isinstance(
+            error_multiplier, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(f"error_multiplier must be finite and >= 0, got {error_multiplier!r}")
+        err_mult = float(error_multiplier)
+        if not math.isfinite(err_mult) or err_mult < 0.0:
+            raise ValueError(f"error_multiplier must be finite and >= 0, got {error_multiplier!r}")
+        self.error_multiplier = err_mult
         if cost_matrix is None:
             m = self.error_multiplier
             self.cost_matrix = np.array(
@@ -411,12 +464,39 @@ class UtilityCascadeRouter:
                 dtype=np.float64,
             )
         else:
-            self.cost_matrix = np.asarray(cost_matrix, dtype=np.float64)
+            raw_cm = np.asarray(cost_matrix)
+            if raw_cm.dtype == np.dtype(np.bool_) or raw_cm.dtype.kind not in ("i", "u", "f"):
+                raise ValueError(f"cost_matrix must have real numeric dtype, got {raw_cm.dtype}")
+            self.cost_matrix = np.asarray(raw_cm, dtype=np.float64)
+            if self.cost_matrix.shape != (len(CASCADE_TIERS), len(CASCADE_TIERS)):
+                raise ValueError(
+                    f"cost_matrix must have shape ({len(CASCADE_TIERS)}, {len(CASCADE_TIERS)}), got {self.cost_matrix.shape}"
+                )
+            if not bool(np.all(np.isfinite(self.cost_matrix))):
+                raise ValueError("cost_matrix must contain only finite values")
+        if isinstance(safe_action, (bool, np.bool_)) or not isinstance(safe_action, (int, np.integer)):
+            raise ValueError(f"safe_action must be an integer in [0, {len(CASCADE_TIERS) - 1}], got {safe_action!r}")
         self.safe_action = int(safe_action)
+        if not (0 <= self.safe_action < len(CASCADE_TIERS)):
+            raise ValueError(f"safe_action {self.safe_action} out of range [0, {len(CASCADE_TIERS) - 1}]")
+        if isinstance(alpha, (bool, np.bool_)) or not isinstance(alpha, (int, float, np.integer, np.floating)):
+            raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
         self.alpha = float(alpha)
+        if not math.isfinite(self.alpha) or not (0.0 < self.alpha < 1.0):
+            raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
         self.ladder_mode = bool(ladder_mode)
+        if isinstance(min_beta_samples, (bool, np.bool_)) or not isinstance(min_beta_samples, (int, np.integer)):
+            raise ValueError(f"min_beta_samples must be an integer >= 1, got {min_beta_samples!r}")
         self.min_beta_samples = int(min_beta_samples)
+        if self.min_beta_samples < 1:
+            raise ValueError(f"min_beta_samples must be >= 1, got {self.min_beta_samples!r}")
+        if isinstance(soft_ordinal_sigma, (bool, np.bool_)) or not isinstance(
+            soft_ordinal_sigma, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(f"soft_ordinal_sigma must be finite and positive, got {soft_ordinal_sigma!r}")
         self.soft_ordinal_sigma = float(soft_ordinal_sigma)
+        if not math.isfinite(self.soft_ordinal_sigma) or self.soft_ordinal_sigma <= 0.0:
+            raise ValueError(f"soft_ordinal_sigma must be finite and positive, got {soft_ordinal_sigma!r}")
 
         self.engine = SystemOneEngine(RouteLLMCascadeSchema, strict_mode=False, use_cache=True)
         self._tier_to_model = {
@@ -440,7 +520,10 @@ class UtilityCascadeRouter:
     def _encode_prompts(self, prompts: Sequence[str]) -> np.ndarray:
         if not prompts:
             raise ValueError("prompts must be non-empty")
-        return np.vstack([self.engine.encode(str(p)) for p in prompts]).astype(np.float64)
+        X = np.vstack([self.engine.encode(str(p)) for p in prompts]).astype(np.float64)
+        if not bool(np.all(np.isfinite(X))):
+            raise ValueError("Encoded prompts contain non-finite values")
+        return X
 
     def _parse_tiers(self, tiers: Sequence[Union[int, str]]) -> np.ndarray:
         indices: List[int] = []
@@ -459,20 +542,40 @@ class UtilityCascadeRouter:
 
     def _raw_probs(self, prompt: str) -> np.ndarray:
         decision = self.engine.decide(prompt, record_receipt=False)
-        engine_probs = np.array(
-            [float(decision.probabilities["target_tier"].get(t, 1e-6)) for t in CASCADE_TIERS],
-            dtype=np.float64,
-        )
-        engine_probs = engine_probs / max(float(np.sum(engine_probs)), 1e-12)
+        reasons = getattr(decision, "abstention_reasons", {})
+        tier_probs = decision.probabilities.get("target_tier", {})
+        with np.errstate(over="ignore", invalid="ignore"):
+            ep_raw = np.array(
+                [float(tier_probs.get(t, 1e-6)) for t in CASCADE_TIERS],
+                dtype=np.float64,
+            )
+        if (
+            (isinstance(reasons, Mapping) and "non_finite_input" in reasons.values())
+            or not bool(np.all(np.isfinite(ep_raw)))
+            or float(np.sum(ep_raw)) <= 0.0
+        ):
+            return np.full(len(CASCADE_TIERS), np.nan, dtype=np.float64)
+        engine_probs = ep_raw / float(np.sum(ep_raw))
+        if not bool(np.all(np.isfinite(engine_probs))):
+            return np.full(len(CASCADE_TIERS), np.nan, dtype=np.float64)
         if self.ordinal_head is None:
             return engine_probs
         vec = self.engine.encode(prompt).astype(np.float64)
+        if not bool(np.all(np.isfinite(vec))):
+            return np.full(len(CASCADE_TIERS), np.nan, dtype=np.float64)
         head_probs = np.asarray(self.ordinal_head.predict_proba(vec), dtype=np.float64)
+        if not bool(np.all(np.isfinite(head_probs))):
+            return np.full(len(CASCADE_TIERS), np.nan, dtype=np.float64)
         blended = 0.65 * head_probs + 0.35 * engine_probs
-        return blended / max(float(np.sum(blended)), 1e-12)
+        b_sum = float(np.sum(blended))
+        if not bool(np.all(np.isfinite(blended))) or not math.isfinite(b_sum) or b_sum <= 0.0:
+            return np.full(len(CASCADE_TIERS), np.nan, dtype=np.float64)
+        return blended / b_sum
 
     def _batch_raw_probs(self, prompts: Sequence[str], features: Optional[np.ndarray] = None) -> np.ndarray:
         x_arr = self._encode_prompts(prompts) if features is None else features
+        if not bool(np.all(np.isfinite(x_arr))):
+            return np.full((len(prompts), len(CASCADE_TIERS)), np.nan, dtype=np.float64)
         out = np.empty((len(prompts), len(CASCADE_TIERS)), dtype=np.float64)
         head_probs_all = (
             self.ordinal_head.predict_proba(x_arr)
@@ -481,14 +584,35 @@ class UtilityCascadeRouter:
         )
         for idx, prompt in enumerate(prompts):
             decision = self.engine.decide(str(prompt), record_receipt=False)
-            ep = np.array(
-                [float(decision.probabilities["target_tier"].get(t, 1e-6)) for t in CASCADE_TIERS],
-                dtype=np.float64,
-            )
-            ep /= max(float(np.sum(ep)), 1e-12)
+            reasons = getattr(decision, "abstention_reasons", {})
+            tier_probs = decision.probabilities.get("target_tier", {})
+            with np.errstate(over="ignore", invalid="ignore"):
+                ep_raw = np.array(
+                    [float(tier_probs.get(t, 1e-6)) for t in CASCADE_TIERS],
+                    dtype=np.float64,
+                )
+            if (
+                (isinstance(reasons, Mapping) and "non_finite_input" in reasons.values())
+                or not bool(np.all(np.isfinite(ep_raw)))
+                or float(np.sum(ep_raw)) <= 0.0
+            ):
+                out[idx] = np.nan
+                continue
+            ep = ep_raw / float(np.sum(ep_raw))
+            if not bool(np.all(np.isfinite(ep))):
+                out[idx] = np.nan
+                continue
             if head_probs_all is not None:
-                blended = 0.65 * head_probs_all[idx] + 0.35 * ep
-                out[idx] = blended / max(float(np.sum(blended)), 1e-12)
+                hp_i = np.asarray(head_probs_all[idx], dtype=np.float64)
+                if not bool(np.all(np.isfinite(hp_i))):
+                    out[idx] = np.nan
+                    continue
+                blended = 0.65 * hp_i + 0.35 * ep
+                b_sum = float(np.sum(blended))
+                if not bool(np.all(np.isfinite(blended))) or not math.isfinite(b_sum) or b_sum <= 0.0:
+                    out[idx] = np.nan
+                    continue
+                out[idx] = blended / b_sum
             else:
                 out[idx] = ep
         return out
@@ -609,6 +733,8 @@ class UtilityCascadeRouter:
             raise ValueError("prompts and true_tiers must be non-empty and match in length")
         y_cal = self._parse_tiers(true_tiers) if _y is None else _y
         probs = self._batch_raw_probs(prompts, features=_features)
+        if not bool(np.all(np.isfinite(probs))):
+            raise ValueError("Calibration prompts produced non-finite probability rows")
         self.utility_calibrator.fit(probs, y_cal)
         p_escalate = np.clip(1.0 - probs[:, 0], 1e-6, 1.0 - 1e-6)
         y_escalate = (y_cal > 0).astype(np.float64)
@@ -620,18 +746,38 @@ class UtilityCascadeRouter:
         """Route a prompt using expected utility and finite-sample CRC safety."""
         t0 = time.perf_counter()
         raw_p = self._raw_probs(str(prompt))
-        if self._is_calibrated:
+        nan_probs = np.full(len(CASCADE_TIERS), np.nan, dtype=np.float64)
+        nan_costs = np.full(len(CASCADE_TIERS), np.nan, dtype=np.float64)
+        if not bool(np.all(np.isfinite(raw_p))) or float(np.sum(raw_p)) <= 0.0:
+            action = self.safe_action
+            cal_p = nan_probs
+            costs_vec = nan_costs
+            used_crc_fallback = True
+            is_vacuous = self.utility_calibrator.is_vacuous if self._is_calibrated else True
+        elif self._is_calibrated:
             cal_p = self.utility_calibrator.transform_probs(raw_p)
             costs_vec = self.utility_calibrator.expected_costs(raw_p, apply_temperature=True)
-            action = int(self.utility_calibrator.predict(raw_p[None, :], use_crc=True)[0])
-            bayes_action = int(np.argmin(costs_vec))
-            used_crc_fallback = action != bayes_action
+            if not (bool(np.all(np.isfinite(cal_p))) and bool(np.all(np.isfinite(costs_vec)))):
+                action = self.safe_action
+                cal_p = nan_probs
+                costs_vec = nan_costs
+                used_crc_fallback = True
+            else:
+                action = int(self.utility_calibrator.predict(raw_p[None, :], use_crc=True)[0])
+                bayes_action = int(np.argmin(costs_vec))
+                used_crc_fallback = action != bayes_action
             is_vacuous = self.utility_calibrator.is_vacuous
         else:
             cal_p = raw_p
             costs_vec = self.utility_calibrator.expected_costs(raw_p, apply_temperature=False)
-            action = int(np.argmin(costs_vec))
-            used_crc_fallback = False
+            if not (bool(np.all(np.isfinite(cal_p))) and bool(np.all(np.isfinite(costs_vec)))):
+                action = self.safe_action
+                cal_p = nan_probs
+                costs_vec = nan_costs
+                used_crc_fallback = True
+            else:
+                action = int(np.argmin(costs_vec))
+                used_crc_fallback = False
             is_vacuous = True
 
         tier = CASCADE_TIERS[action]
@@ -642,13 +788,13 @@ class UtilityCascadeRouter:
             selected_model=self._tier_to_model.get(tier, self.strong_model),
             action_index=action,
             requires_deep_reasoning=(action == 2),
-            confidence=round(float(cal_p[action]), 4),
+            confidence=_round_finite_or_nan(float(cal_p[action]), 4),
             expected_costs={
-                CASCADE_TIERS[i]: round(float(costs_vec[i]), 6)
+                CASCADE_TIERS[i]: _round_finite_or_nan(float(costs_vec[i]), 6)
                 for i in range(len(CASCADE_TIERS))
             },
             probabilities={
-                CASCADE_TIERS[i]: round(float(cal_p[i]), 6)
+                CASCADE_TIERS[i]: _round_finite_or_nan(float(cal_p[i]), 6)
                 for i in range(len(CASCADE_TIERS))
             },
             used_crc_fallback=used_crc_fallback,
@@ -770,12 +916,16 @@ class SystemOneInstructorClient:
         target_engine = self._resolve_engine(response_model)
         decision = target_engine.decide(prompt, record_receipt=False)
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        conf = float(min(decision.confidences.values())) if decision.confidences else 1.0
+        conf = _min_confidence_or_nan(decision.confidences.values())
+        nonfinite_res = (
+            "non_finite_input" in getattr(decision, "abstention_reasons", {}).values()
+            or not math.isfinite(conf)
+        )
         return StructuredExtractionResult(
             values=dict(decision.values),
-            confidence=round(conf, 4),
+            confidence=_round_finite_or_nan(conf, 4),
             latency_ms=round(latency_ms, 3),
-            is_ambiguous=bool(decision.is_ambiguous),
+            is_ambiguous=bool(decision.is_ambiguous) or nonfinite_res,
             conformal_sets={k: tuple(v) for k, v in decision.conformal_sets.items()},
         )
 
@@ -959,6 +1109,7 @@ class SystemOnePromptGuard:
         self.shield_mode = shield_mode
         self._compiled = bool(compiled)
         self._shield: Optional[GuardShield] = None
+        self._shield_invalid = False
         self.training_rows: List[Tuple[str, Dict[str, Any]]] = list(self._TRAINING_ROWS)
         self.calibration_rows: List[Tuple[str, Dict[str, Any]]] = list(self._CALIBRATION_ROWS)
         if compiled:
@@ -969,6 +1120,7 @@ class SystemOnePromptGuard:
             self._rebuild_shield()
 
     def _rebuild_shield(self) -> None:
+        self._shield_invalid = True
         rows = self.training_rows + self.calibration_rows
         benign_texts = [t for t, r in rows if r["verdict"] == "benign"]
         unsafe_texts = [t for t, r in rows if r["verdict"] != "benign"]
@@ -996,6 +1148,7 @@ class SystemOnePromptGuard:
                 unsafe_labels=unsafe_labels,
                 use_windows=False,
             )
+        self._shield_invalid = False
 
     @classmethod
     def _build_compiled_guard(cls) -> SystemOneEngine:
@@ -1043,36 +1196,78 @@ class SystemOnePromptGuard:
         verdict = str(decision.values["verdict"])
         blocked = bool(decision.values["block_request"]) or (verdict != "benign")
         risk_score = float(decision.values["risk_score"])
-        conf = float(min(decision.confidences.values())) if decision.confidences else 1.0
+        conf = _min_confidence_or_nan(decision.confidences.values())
+        nonfinite_dec = (
+            "non_finite_input" in getattr(decision, "abstention_reasons", {}).values()
+            or not math.isfinite(conf)
+            or not math.isfinite(risk_score)
+        )
+        if nonfinite_dec:
+            if verdict == "benign":
+                verdict = "prompt_injection"
+            blocked = True
+            risk_score = 1.0
+            conf = float("nan")
 
         if self.shield_mode == "sliding_window":
-            if self._shield is not None:
-                s_dec = self._shield.evaluate_single(prompt)
-                if s_dec.is_unsafe:
+            if self._shield_invalid:
+                if verdict == "benign":
+                    verdict = "prompt_injection"
+                blocked = True
+                risk_score = 1.0
+                conf = float("nan")
+            elif self._shield is not None:
+                try:
+                    s_dec = self._shield.evaluate_single(prompt)
+                    if s_dec.is_unsafe:
+                        if verdict == "benign":
+                            verdict = s_dec.predicted_label
+                        blocked = True
+                        if math.isfinite(float(s_dec.max_window_unsafe_prob)):
+                            risk_score = max(risk_score, float(s_dec.max_window_unsafe_prob))
+                            if math.isfinite(conf):
+                                conf = max(conf, float(s_dec.max_window_unsafe_prob))
+                        else:
+                            risk_score = 1.0
+                            conf = float("nan")
+                except Exception:
                     if verdict == "benign":
-                        verdict = s_dec.predicted_label
+                        verdict = "prompt_injection"
                     blocked = True
-                    risk_score = max(risk_score, float(s_dec.max_window_unsafe_prob))
-                    conf = max(conf, float(s_dec.max_window_unsafe_prob))
+                    risk_score = 1.0
+                    conf = float("nan")
             else:
                 for win in make_sliding_windows(canon, frags):
                     w_dec = self.engine.decide(win, record_receipt=False)
                     w_verdict = str(w_dec.values["verdict"])
-                    if bool(w_dec.values["block_request"]) or (w_verdict != "benign"):
+                    w_risk = float(w_dec.values["risk_score"])
+                    w_conf = _min_confidence_or_nan(w_dec.confidences.values()) if w_dec.confidences else conf
+                    w_nonfin = (
+                        "non_finite_input" in getattr(w_dec, "abstention_reasons", {}).values()
+                        or not math.isfinite(w_risk)
+                        or not math.isfinite(w_conf)
+                    )
+                    if w_nonfin:
+                        if verdict == "benign":
+                            verdict = "prompt_injection" if w_verdict == "benign" else w_verdict
+                        blocked = True
+                        risk_score = 1.0
+                        conf = float("nan")
+                    elif bool(w_dec.values["block_request"]) or (w_verdict != "benign"):
                         if verdict == "benign":
                             verdict = w_verdict
                         blocked = True
-                        risk_score = max(risk_score, float(w_dec.values["risk_score"]))
-                        w_conf = float(min(w_dec.confidences.values())) if w_dec.confidences else conf
-                        conf = max(conf, w_conf)
+                        risk_score = max(risk_score, w_risk)
+                        if math.isfinite(conf):
+                            conf = max(conf, w_conf)
 
         latency_ms = (time.perf_counter() - t0) * 1000.0
         return PromptGuardResult(
             prompt=prompt,
             verdict=verdict,
             blocked=blocked,
-            risk_score=round(risk_score, 4),
-            confidence=round(conf, 4),
+            risk_score=_round_finite_or_nan(risk_score, 4),
+            confidence=_round_finite_or_nan(conf, 4),
             latency_ms=round(latency_ms, 3),
         )
 

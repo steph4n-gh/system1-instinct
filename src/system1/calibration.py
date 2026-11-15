@@ -2802,28 +2802,46 @@ class UtilityCalibrator:
         temperature: float = 1.0,
         ladder_mode: bool = False,
     ) -> None:
-        matrix = np.asarray(cost_matrix, dtype=np.float64)
+        raw_matrix = np.asarray(cost_matrix)
+        if raw_matrix.dtype == np.dtype(np.bool_) or raw_matrix.dtype.kind not in ("i", "u", "f"):
+            raise ValueError(f"cost_matrix must have real numeric dtype, got {raw_matrix.dtype}")
+        matrix = np.asarray(raw_matrix, dtype=np.float64)
         if matrix.ndim != 2 or matrix.shape[0] < 1 or matrix.shape[1] < 2:
             raise ValueError(
                 f"cost_matrix must be 2D (n_actions >= 1, n_classes >= 2), got shape {matrix.shape}"
             )
-        if not (0.0 < float(alpha) < 1.0):
+        if not bool(np.all(np.isfinite(matrix))):
+            raise ValueError("cost_matrix must contain only finite values")
+        if _is_bool_scalar(alpha) or not isinstance(alpha, (int, float, np.integer, np.floating)):
+            raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+        alpha_f = float(alpha)
+        if not math.isfinite(alpha_f) or not (0.0 < alpha_f < 1.0):
             raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
         if loss_mode not in {"normalized_excess", "indicator"}:
             raise ValueError(f"Unsupported loss_mode {loss_mode!r}")
+        if _is_bool_scalar(temperature) or not isinstance(
+            temperature, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(f"temperature must be finite and positive, got {temperature!r}")
+        temp_f = float(temperature)
+        if not math.isfinite(temp_f) or temp_f <= 0.0:
+            raise ValueError(f"temperature must be finite and positive, got {temperature!r}")
 
         self.cost_matrix = matrix
         self.n_actions, self.n_classes = matrix.shape
         if safe_action is None:
             self.safe_action = int(np.argmin(np.max(matrix, axis=1)))
         else:
-            if not (0 <= int(safe_action) < self.n_actions):
+            if _is_bool_scalar(safe_action) or not isinstance(safe_action, (int, np.integer)):
+                raise ValueError(f"safe_action must be an integer, got {safe_action!r}")
+            sa_i = int(safe_action)
+            if not (0 <= sa_i < self.n_actions):
                 raise ValueError(f"safe_action {safe_action} out of range [0, {self.n_actions})")
-            self.safe_action = int(safe_action)
-        self.alpha = float(alpha)
+            self.safe_action = sa_i
+        self.alpha = alpha_f
         self.loss_mode = loss_mode
         self.fit_temperature = bool(fit_temperature)
-        self.temperature = max(1e-3, float(temperature))
+        self.temperature = max(1e-3, temp_f)
         self.ladder_mode = bool(ladder_mode)
 
         self.c_esc = float(np.max(self.cost_matrix[self.safe_action]))
@@ -2833,6 +2851,27 @@ class UtilityCalibrator:
 
         self.lam_crc: float = -1.0
         self._is_fitted: bool = False
+
+    @staticmethod
+    def _valid_prob_rows(p2: np.ndarray) -> np.ndarray:
+        if p2.size == 0:
+            return np.zeros(p2.shape[0], dtype=bool)
+        with np.errstate(over="ignore", invalid="ignore"):
+            fin = np.all(np.isfinite(p2), axis=1)
+            nonneg = np.all(p2 >= -1e-9, axis=1)
+            pos_sum = np.sum(p2, axis=1) > 0.0
+        return fin & nonneg & pos_sum
+
+    def _validate_cal_labels(self, y_raw: Any, n_rows: int) -> np.ndarray:
+        y_np = np.asarray(y_raw)
+        if y_np.dtype == np.dtype(np.bool_) or y_np.dtype.kind not in ("i", "u"):
+            raise ValueError(f"Labels must have integer dtype, got {y_np.dtype}")
+        y_arr = y_np.astype(np.int64, copy=False).ravel()
+        if y_arr.shape[0] != n_rows:
+            return y_arr
+        if y_arr.size > 0 and (int(np.min(y_arr)) < 0 or int(np.max(y_arr)) >= self.n_classes):
+            raise ValueError(f"Labels must lie in [0, {self.n_classes}), got [{int(np.min(y_arr))}, {int(np.max(y_arr))}]")
+        return y_arr
 
     @property
     def is_vacuous(self) -> bool:
@@ -2873,13 +2912,22 @@ class UtilityCalibrator:
         p = np.asarray(probs, dtype=np.float64)
         single = p.ndim == 1
         p2 = p.reshape(1, -1) if single else p
-        if p2.shape[1] != self.n_classes:
-            raise ValueError(f"Expected {self.n_classes} classes, got {p2.shape[1]}")
-        if abs(self.temperature - 1.0) <= 1e-12:
-            scaled = p2
-        else:
-            logits = np.log(np.clip(p2, 1e-12, 1.0))
-            scaled = _softmax_np(logits / max(self.temperature, 1e-3), axis=1)
+        if p2.ndim != 2 or p2.shape[1] != self.n_classes:
+            raise ValueError(f"Expected {self.n_classes} classes, got shape {p.shape}")
+        valid = self._valid_prob_rows(p2)
+        scaled = np.full(p2.shape, np.nan, dtype=np.float64)
+        if bool(np.any(valid)):
+            p_ok = p2[valid]
+            if abs(self.temperature - 1.0) <= 1e-12:
+                scaled[valid] = p_ok
+            else:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    logits = np.log(np.clip(p_ok, 1e-12, 1.0))
+                    s_ok = _softmax_np(logits / max(self.temperature, 1e-3), axis=1)
+                s_fin = np.all(np.isfinite(s_ok), axis=1)
+                if bool(np.any(s_fin)):
+                    v_idx = np.flatnonzero(valid)[s_fin]
+                    scaled[v_idx] = s_ok[s_fin]
         return scaled[0] if single else scaled
 
     def expected_costs(self, probs: np.ndarray, *, apply_temperature: bool = True) -> np.ndarray:
@@ -2887,31 +2935,54 @@ class UtilityCalibrator:
         p = self.transform_probs(probs) if apply_temperature else np.asarray(probs, dtype=np.float64)
         single = p.ndim == 1
         p2 = p.reshape(1, -1) if single else p
-        costs = p2 @ self.cost_matrix.T
+        if p2.ndim != 2 or p2.shape[1] != self.n_classes:
+            raise ValueError(f"Expected {self.n_classes} classes, got shape {p.shape}")
+        valid = self._valid_prob_rows(p2)
+        costs = np.full((p2.shape[0], self.n_actions), np.nan, dtype=np.float64)
+        if bool(np.any(valid)):
+            with np.errstate(over="ignore", invalid="ignore"):
+                c_ok = p2[valid] @ self.cost_matrix.T
+            c_fin = np.all(np.isfinite(c_ok), axis=1)
+            if bool(np.any(c_fin)):
+                v_idx = np.flatnonzero(valid)[c_fin]
+                costs[v_idx] = c_ok[c_fin]
         return costs[0] if single else costs
 
     def _apply_policy(self, probs_2d: np.ndarray, lam: float) -> np.ndarray:
         n = probs_2d.shape[0]
-        if lam < 0.0:
-            return np.full(n, self.safe_action, dtype=np.int64)
-        a_bayes = np.argmin(probs_2d @ self.cost_matrix.T, axis=1).astype(np.int64)
-        eh_all = probs_2d @ self.L.T
+        acts = np.full(n, self.safe_action, dtype=np.int64)
+        if not math.isfinite(float(lam)) or lam < 0.0 or n == 0:
+            return acts
+        valid = self._valid_prob_rows(probs_2d)
+        if not bool(np.any(valid)):
+            return acts
+        v_idx = np.flatnonzero(valid)
+        with np.errstate(over="ignore", invalid="ignore"):
+            costs_v = probs_2d[v_idx] @ self.cost_matrix.T
+            eh_v = probs_2d[v_idx] @ self.L.T
+        row_fin = np.all(np.isfinite(costs_v), axis=1) & np.all(np.isfinite(eh_v), axis=1)
+        if not bool(np.any(row_fin)):
+            return acts
+        v_idx = v_idx[row_fin]
+        costs_v = costs_v[row_fin]
+        eh_v = eh_v[row_fin]
+        a_bayes = np.argmin(costs_v, axis=1).astype(np.int64)
         if self.ladder_mode:
-            acts = np.full(n, self.safe_action, dtype=np.int64)
-            for i in range(n):
-                ab = int(a_bayes[i])
+            for pos, orig_i in enumerate(v_idx):
+                ab = int(a_bayes[pos])
                 if ab <= self.safe_action:
                     chosen = self.safe_action
                     for cand in range(ab, self.safe_action + 1):
-                        if cand == self.safe_action or float(eh_all[i, cand]) <= lam + 1e-12:
+                        if cand == self.safe_action or float(eh_v[pos, cand]) <= lam + 1e-12:
                             chosen = cand
                             break
-                    acts[i] = chosen
+                    acts[orig_i] = chosen
                 else:
-                    acts[i] = ab if float(eh_all[i, ab]) <= lam + 1e-12 else self.safe_action
+                    acts[orig_i] = ab if float(eh_v[pos, ab]) <= lam + 1e-12 else self.safe_action
             return acts
-        eh_best = eh_all[np.arange(n), a_bayes]
-        return np.where(eh_best <= lam + 1e-12, a_bayes, self.safe_action).astype(np.int64)
+        eh_best = eh_v[np.arange(len(v_idx)), a_bayes]
+        acts[v_idx] = np.where(eh_best <= lam + 1e-12, a_bayes, self.safe_action).astype(np.int64)
+        return acts
 
     def fit_crc(
         self,
@@ -2920,13 +2991,23 @@ class UtilityCalibrator:
         alpha: Optional[float] = None,
     ) -> float:
         """Select largest threshold ``lam`` in ``[0, 1]`` satisfying CRC bound ``<= alpha``."""
-        eff_alpha = self.alpha if alpha is None else float(alpha)
-        if not (0.0 < eff_alpha < 1.0):
+        if alpha is None:
+            eff_alpha = self.alpha
+        elif _is_bool_scalar(alpha) or not isinstance(alpha, (int, float, np.integer, np.floating)):
+            raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+        else:
+            eff_alpha = float(alpha)
+        if not math.isfinite(eff_alpha) or not (0.0 < eff_alpha < 1.0):
             raise ValueError(f"alpha must lie in (0, 1), got {eff_alpha!r}")
-        p_cal = self.transform_probs(np.asarray(probs_cal, dtype=np.float64))
-        y_arr = np.asarray(y_cal, dtype=np.int64).ravel()
-        if p_cal.ndim != 2 or p_cal.shape[1] != self.n_classes:
-            raise ValueError(f"probs_cal must have shape (N, {self.n_classes}), got {p_cal.shape}")
+        p_in = np.asarray(probs_cal, dtype=np.float64)
+        if p_in.ndim != 2 or p_in.shape[1] != self.n_classes:
+            raise ValueError(f"probs_cal must have shape (N, {self.n_classes}), got {p_in.shape}")
+        if p_in.shape[0] > 0 and not bool(np.all(self._valid_prob_rows(p_in))):
+            raise ValueError("probs_cal contains non-finite or invalid probability rows")
+        y_arr = self._validate_cal_labels(y_cal, p_in.shape[0])
+        p_cal = self.transform_probs(p_in)
+        if p_cal.shape[0] > 0 and not bool(np.all(np.isfinite(p_cal))):
+            raise ValueError("probs_cal produced non-finite values after temperature scaling")
         n = y_arr.shape[0]
         if p_cal.shape[0] != n or n == 0 or (1.0 / float(n + 1) > eff_alpha + 1e-12):
             self.lam_crc = -1.0
@@ -2962,17 +3043,23 @@ class UtilityCalibrator:
     ) -> "UtilityCalibrator":
         """Fit optional temperature scaling and finite-sample CRC risk threshold."""
         p_train = np.asarray(probs, dtype=np.float64)
-        y_train = np.asarray(y_true, dtype=np.int64).ravel()
         if p_train.ndim != 2 or p_train.shape[1] != self.n_classes:
             raise ValueError(f"probs must have shape (N, {self.n_classes}), got {p_train.shape}")
+        y_train = self._validate_cal_labels(y_true, p_train.shape[0])
         if p_train.shape[0] != y_train.shape[0] or y_train.size == 0:
             raise ValueError("probs and y_true must be non-empty and match in length")
+        if not bool(np.all(self._valid_prob_rows(p_train))):
+            raise ValueError("probs contains non-finite or invalid probability rows")
 
         if cal_probs is not None and cal_y is not None:
+            p_crc = np.asarray(cal_probs, dtype=np.float64)
+            if p_crc.ndim != 2 or p_crc.shape[1] != self.n_classes:
+                raise ValueError(f"cal_probs must have shape (N, {self.n_classes}), got {p_crc.shape}")
+            y_crc = self._validate_cal_labels(cal_y, p_crc.shape[0])
+            if p_crc.shape[0] > 0 and not bool(np.all(self._valid_prob_rows(p_crc))):
+                raise ValueError("cal_probs contains non-finite or invalid probability rows")
             if self.fit_temperature and y_train.size >= 8:
                 self.temperature = self._fit_temperature(p_train, y_train)
-            p_crc = np.asarray(cal_probs, dtype=np.float64)
-            y_crc = np.asarray(cal_y, dtype=np.int64).ravel()
         elif self.fit_temperature and y_train.size >= 24:
             # Keep temperature scaling and CRC holdout samples strictly disjoint.
             n_temp = max(8, min(y_train.size // 3, 128))
@@ -3009,7 +3096,16 @@ class UtilityCalibrator:
         single = p.ndim == 1
         p2 = self.transform_probs(p.reshape(1, -1) if single else p)
         if not use_crc:
-            out = np.argmin(p2 @ self.cost_matrix.T, axis=1).astype(np.int64)
+            n = p2.shape[0]
+            out = np.full(n, self.safe_action, dtype=np.int64)
+            valid = self._valid_prob_rows(p2)
+            if bool(np.any(valid)):
+                v_idx = np.flatnonzero(valid)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    costs_v = p2[v_idx] @ self.cost_matrix.T
+                c_fin = np.all(np.isfinite(costs_v), axis=1)
+                if bool(np.any(c_fin)):
+                    out[v_idx[c_fin]] = np.argmin(costs_v[c_fin], axis=1).astype(np.int64)
             return out[:1] if single else out
         lam = -1.0 if self.is_vacuous else self.lam_crc
         out = self._apply_policy(p2, lam)

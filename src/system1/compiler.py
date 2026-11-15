@@ -7,6 +7,7 @@ Schema-derived synthetic examples remain available for bootstrapping demos.
 from __future__ import annotations
 
 import gc
+import inspect
 import io
 import json
 import math
@@ -28,11 +29,31 @@ from system1.core.model import (
     ModelInferenceResult,
     RawFieldEvaluation,
     SystemOneModel,
+    _accepts_recency_weighted,
+    _is_native_scalar_projector,
     _normalize_raw_projection,
     _normalize_raw_projection_batch,
     _stable_sigmoid,
     _stable_softmax,
 )
+
+
+def _accepts_return_norms(fn: Any) -> bool:
+    """Return True when a projector batch callable accepts a `return_norms` keyword argument."""
+    if not callable(fn):
+        return False
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if "return_norms" in params:
+        p = params["return_norms"]
+        return p.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 from system1.core.schema import (
     BooleanField,
     ChoiceField,
@@ -934,16 +955,18 @@ class CompiledSystemOneModel:
             raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         raw_norm: Optional[float] = None
-        if hasattr(self.projector, "project_with_norm") and telemetry is None:
-            try:
-                emb, raw_norm = self.projector.project_with_norm(prompt, recency_weighted=use_recency)
-            except TypeError:
-                emb, raw_norm = self.projector.project_with_norm(prompt)
-        elif hasattr(self.projector, "project"):
-            try:
-                emb = self.projector.project(prompt, recency_weighted=use_recency)
-            except TypeError:
-                emb = self.projector.project(prompt)
+        pwn_fn = getattr(self.projector, "project_with_norm", None)
+        proj_fn = getattr(self.projector, "project", None)
+        pwn_rw = _accepts_recency_weighted(pwn_fn)
+        proj_rw = _accepts_recency_weighted(proj_fn)
+        if callable(pwn_fn) and telemetry is None and (pwn_rw or not proj_rw):
+            emb, raw_norm = (
+                pwn_fn(prompt, recency_weighted=use_recency) if pwn_rw else pwn_fn(prompt)
+            )
+        elif callable(proj_fn):
+            emb = proj_fn(prompt, recency_weighted=use_recency) if proj_rw else proj_fn(prompt)
+            if callable(pwn_fn) and telemetry is None:
+                _, raw_norm = pwn_fn(prompt)
         else:
             emb = self.projector(prompt)
         emb = _normalize_raw_projection(
@@ -4398,26 +4421,35 @@ class SystemOneCompiler:
         recency_weighted: bool = False,
     ) -> np.ndarray:
         text_list = [str(t) for t in texts]
-        use_rw = bool(recency_weighted) and not isinstance(projector, (TfidfProjector, PragmaticCompositeProjector))
-        if hasattr(projector, "project_batch"):
-            try:
-                raw_mat = (
-                    projector.project_batch(text_list, recency_weighted=True)
-                    if use_rw
-                    else projector.project_batch(text_list)
-                )
-            except TypeError:
-                raw_mat = projector.project_batch(text_list)
+        if not text_list:
+            dim = int(getattr(projector, "dimension", 0) or 0)
+            return np.empty((0, dim), dtype=np.float32)
+        eff_rw = bool(recency_weighted) and not isinstance(projector, (TfidfProjector, PragmaticCompositeProjector))
+        proj_fn = getattr(projector, "project", None)
+        pwn_fn = getattr(projector, "project_with_norm", None)
+        batch_fn = getattr(projector, "project_batch", None)
+        one_rw = _accepts_recency_weighted(proj_fn)
+        pwn_rw = _accepts_recency_weighted(pwn_fn)
+        batch_rw = _accepts_recency_weighted(batch_fn)
+        if (
+            (not _is_native_scalar_projector(projector))
+            and callable(batch_fn)
+            and (batch_rw or not (one_rw or pwn_rw))
+        ):
+            raw_mat = (
+                batch_fn(text_list, recency_weighted=eff_rw)
+                if batch_rw
+                else batch_fn(text_list)
+            )
             raw_mat_arr = np.asarray(raw_mat)
             dim_out = int(raw_mat_arr.shape[1]) if raw_mat_arr.ndim == 2 else 0
             return _normalize_raw_projection_batch(raw_mat_arr, len(text_list), dim_out, zero_unit0=False)
         rows = []
         for p in text_list:
-            if hasattr(projector, "project"):
-                try:
-                    v = projector.project(p, recency_weighted=True) if use_rw else projector.project(p)
-                except TypeError:
-                    v = projector.project(p)
+            if callable(pwn_fn) and (pwn_rw or not one_rw):
+                v, _ = pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
+            elif callable(proj_fn):
+                v = proj_fn(p, recency_weighted=eff_rw) if one_rw else proj_fn(p)
             else:
                 v = projector(p)
             v_arr = np.asarray(v).ravel()
@@ -5214,41 +5246,41 @@ class SystemOneCompiler:
                     if need_fam and idx_s >= conf_start_idx:
                         need_norm_set.add(p)
 
-            if unique_prompts and hasattr(self.projector, "project_batch"):
-                use_rw = self.recency_weighted and not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector))
+            eff_rw = bool(self.recency_weighted) and not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector))
+            proj_fn = getattr(self.projector, "project", None)
+            pwn_fn = getattr(self.projector, "project_with_norm", None)
+            batch_fn = getattr(self.projector, "project_batch", None)
+            one_rw = _accepts_recency_weighted(proj_fn)
+            pwn_rw = _accepts_recency_weighted(pwn_fn)
+            batch_rw = _accepts_recency_weighted(batch_fn)
+            batch_rn = _accepts_return_norms(batch_fn)
+            if (
+                unique_prompts
+                and (not _is_native_scalar_projector(self.projector))
+                and callable(batch_fn)
+                and (batch_rw or not (one_rw or pwn_rw))
+            ):
                 want_any_norm = bool(need_norm_set)
                 raw_norms_batch: Optional[np.ndarray] = None
-                try:
-                    if want_any_norm:
-                        if use_rw:
-                            raw_mat, raw_norms_batch = self.projector.project_batch(
-                                unique_prompts,
-                                recency_weighted=self.recency_weighted,
-                                return_norms=True,
-                            )
-                        else:
-                            raw_mat, raw_norms_batch = self.projector.project_batch(
-                                unique_prompts,
-                                return_norms=True,
-                            )
-                    elif use_rw:
-                        raw_mat = self.projector.project_batch(
+                if want_any_norm and batch_rn:
+                    if batch_rw:
+                        raw_mat, raw_norms_batch = batch_fn(
                             unique_prompts,
-                            recency_weighted=self.recency_weighted,
+                            recency_weighted=eff_rw,
+                            return_norms=True,
                         )
                     else:
-                        raw_mat = self.projector.project_batch(unique_prompts)
-                except TypeError:
-                    if use_rw:
-                        try:
-                            raw_mat = self.projector.project_batch(
-                                unique_prompts,
-                                recency_weighted=self.recency_weighted,
-                            )
-                        except TypeError:
-                            raw_mat = self.projector.project_batch(unique_prompts)
-                    else:
-                        raw_mat = self.projector.project_batch(unique_prompts)
+                        raw_mat, raw_norms_batch = batch_fn(
+                            unique_prompts,
+                            return_norms=True,
+                        )
+                elif batch_rw:
+                    raw_mat = batch_fn(
+                        unique_prompts,
+                        recency_weighted=eff_rw,
+                    )
+                else:
+                    raw_mat = batch_fn(unique_prompts)
                 normed_mat = _normalize_raw_projection_batch(
                     raw_mat,
                     len(unique_prompts),
@@ -5259,7 +5291,11 @@ class SystemOneCompiler:
                     if raw_norms_batch is not None and p in need_norm_set:
                         rn_val_b: Optional[float] = float(raw_norms_batch[u_idx])
                     elif p in need_norm_set:
-                        rn_val_b = float(self.projector.raw_norm(p))
+                        if callable(pwn_fn):
+                            _, pwn_n_b = pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
+                            rn_val_b = float(pwn_n_b) if pwn_n_b is not None else float(self.projector.raw_norm(p))
+                        else:
+                            rn_val_b = float(self.projector.raw_norm(p))
                     else:
                         rn_val_b = None
                     proj_cache[p] = (normed_mat[u_idx], rn_val_b)
@@ -5272,21 +5308,37 @@ class SystemOneCompiler:
                 if cached is not None:
                     emb_base, rn_val = cached
                     if want_raw and rn_val is None:
-                        rn_val = float(self.projector.raw_norm(p))
+                        if callable(pwn_fn):
+                            _, pwn_n_c = pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
+                            rn_val = float(pwn_n_c) if pwn_n_c is not None else float(self.projector.raw_norm(p))
+                        else:
+                            rn_val = float(self.projector.raw_norm(p))
                         proj_cache[p] = (emb_base, rn_val)
                     emb = emb_base
                 else:
-                    if hasattr(self.projector, "project"):
-                        if self.recency_weighted and not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector)):
-                            try:
-                                raw_emb = self.projector.project(p, recency_weighted=self.recency_weighted)
-                            except TypeError:
-                                raw_emb = self.projector.project(p)
+                    if callable(pwn_fn) and t is None and (pwn_rw or not one_rw):
+                        raw_emb, pwn_norm = (
+                            pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
+                        )
+                        rn_val = (
+                            float(pwn_norm)
+                            if (want_raw and pwn_norm is not None)
+                            else (float(self.projector.raw_norm(p)) if want_raw else None)
+                        )
+                    elif callable(proj_fn):
+                        raw_emb = proj_fn(p, recency_weighted=eff_rw) if one_rw else proj_fn(p)
+                        if want_raw and callable(pwn_fn) and t is None:
+                            _, pwn_norm = pwn_fn(p)
+                            rn_val = (
+                                float(pwn_norm)
+                                if pwn_norm is not None
+                                else float(self.projector.raw_norm(p))
+                            )
                         else:
-                            raw_emb = self.projector.project(p)
+                            rn_val = float(self.projector.raw_norm(p)) if want_raw else None
                     else:
                         raw_emb = self.projector(p)
-                    rn_val = float(self.projector.raw_norm(p)) if want_raw else None
+                        rn_val = float(self.projector.raw_norm(p)) if want_raw else None
                     emb_base = _normalize_raw_projection(raw_emb, self.dimension, zero_unit0=False)
                     if isinstance(p, str):
                         proj_cache[p] = (emb_base, rn_val)

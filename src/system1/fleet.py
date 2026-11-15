@@ -19,6 +19,7 @@ from system1.core.model import (
     _accepts_recency_weighted,
     _encode_projector_batch,
     _encode_projector_one,
+    _model_zero_unit0,
 )
 from system1.core.schema import BooleanField, ChoiceField
 from system1.core.text import PragmaticCompositeProjector, TfidfProjector
@@ -61,7 +62,15 @@ _FLEET_REQUIRED_ARRAYS = frozenset(
     }
 )
 _FLEET_ALLOWED_ARCHIVE_MEMBERS = _FLEET_REQUIRED_ARRAYS | frozenset(
-    {"meta_ints", "meta_floats", "classes_utf8"}
+    {
+        "meta_ints",
+        "meta_floats",
+        "classes_utf8",
+        "raw_W_auth",
+        "raw_b_auth",
+        "raw_cal_temp",
+        "raw_cal_adj",
+    }
 )
 
 
@@ -287,6 +296,7 @@ class MultiTenantSkillFleet:
         is_boolean: Optional[bool] = None,
         bool_threshold: float = 0.5,
         recency_weighted: bool = False,
+        zero_unit0: Optional[bool] = None,
         _raw_source_head: Optional[Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]] = None,
     ) -> None:
         self.projector = projector
@@ -318,14 +328,20 @@ class MultiTenantSkillFleet:
         if not isinstance(recency_weighted, (bool, np.bool_)):
             raise ValueError(f"recency_weighted must be a bool, got {recency_weighted!r}")
         self.recency_weighted = bool(recency_weighted)
-        self._zero_unit0 = not isinstance(
-            self.projector, (TfidfProjector, PragmaticCompositeProjector)
-        )
+        if zero_unit0 is not None and not isinstance(zero_unit0, (bool, np.bool_)):
+            raise ValueError(f"zero_unit0 must be a bool or None, got {zero_unit0!r}")
+        if isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector)):
+            if zero_unit0 is True:
+                raise ValueError(
+                    "zero_unit0=True is incompatible with TfidfProjector and PragmaticCompositeProjector"
+                )
+            self._zero_unit0 = False
+        else:
+            self._zero_unit0 = True if zero_unit0 is None else bool(zero_unit0)
         self._accepts_recency = _accepts_recency_weighted(getattr(self.projector, "project", None))
         self._batch_accepts_recency = _accepts_recency_weighted(
             getattr(self.projector, "project_batch", None)
         )
-        self._raw_source_head = _raw_source_head
         with np.errstate(over="ignore", invalid="ignore"):
             self.W_base = np.asarray(W_base, dtype=np.float32)
             self.b_base = np.asarray(b_base, dtype=np.float32).reshape(-1)
@@ -337,6 +353,19 @@ class MultiTenantSkillFleet:
             raise ValueError("W_base must contain finite values within [-1e12, 1e12]")
         if not bool(np.all(np.isfinite(self.b_base))) or float(np.max(np.abs(self.b_base))) > 1e12:
             raise ValueError("b_base must contain finite values within [-1e12, 1e12]")
+        if _raw_source_head is not None:
+            self._raw_source_head: Optional[Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]] = (
+                self._validate_and_freeze_raw_source_head(
+                    _raw_source_head,
+                    num_classes=self.num_classes,
+                    dim=int(self.W_base.shape[1]),
+                    is_boolean=self.is_boolean,
+                    W_base=self.W_base,
+                    b_base=self.b_base,
+                )
+            )
+        else:
+            self._raw_source_head = None
 
         self.num_tenants = int(num_tenants)
         if self.num_tenants <= 0:
@@ -540,14 +569,112 @@ class MultiTenantSkillFleet:
         )
         return sum(int(a.nbytes) for a in arrays)
 
+    @staticmethod
+    def _validate_and_freeze_raw_source_head(
+        raw_head: Any,
+        *,
+        num_classes: int,
+        dim: int,
+        is_boolean: bool,
+        W_base: np.ndarray,
+        b_base: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]:
+        if not isinstance(raw_head, (tuple, list)) or len(raw_head) != 4:
+            raise ValueError("_raw_source_head must be a 4-tuple (W_raw, b_raw, cal_temp, cal_adj)")
+        raw_w_in, raw_b_in, raw_cal_t, raw_cal_adj = raw_head
+        if isinstance(raw_cal_t, (bool, np.bool_)) or not isinstance(
+            raw_cal_t, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(f"_raw_source_head cal_temp must be positive and finite, got {raw_cal_t!r}")
+        cal_t = float(raw_cal_t)
+        if not math.isfinite(cal_t) or cal_t <= 0.0:
+            raise ValueError(f"_raw_source_head cal_temp must be positive and finite, got {raw_cal_t!r}")
+
+        raw_w_arr = np.asarray(raw_w_in)
+        raw_b_arr = np.asarray(raw_b_in)
+        allowed_raw_dtypes = (np.dtype(np.float32), np.dtype(np.float64))
+        if raw_w_arr.dtype not in allowed_raw_dtypes or raw_b_arr.dtype not in allowed_raw_dtypes:
+            raise ValueError(
+                f"_raw_source_head weights/biases must be float32 or float64, got {raw_w_arr.dtype}/{raw_b_arr.dtype}"
+            )
+        exp_rows = 1 if is_boolean else int(num_classes)
+        if raw_w_arr.ndim != 2 or raw_w_arr.shape != (exp_rows, int(dim)):
+            raise ValueError(
+                f"_raw_source_head W shape {raw_w_arr.shape} != expected ({exp_rows}, {int(dim)})"
+            )
+        if raw_b_arr.ndim != 1 or raw_b_arr.shape != (exp_rows,):
+            raise ValueError(
+                f"_raw_source_head b shape {raw_b_arr.shape} != expected ({exp_rows},)"
+            )
+        if not (bool(np.all(np.isfinite(raw_w_arr))) and bool(np.all(np.isfinite(raw_b_arr)))):
+            raise ValueError("_raw_source_head contains non-finite weights or biases")
+
+        w_dtype = (
+            np.float64
+            if (raw_w_arr.dtype == np.dtype(np.float64) or raw_b_arr.dtype == np.dtype(np.float64))
+            else np.float32
+        )
+        w_auth = np.array(raw_w_arr, dtype=w_dtype, copy=True)
+        b_auth = np.array(raw_b_arr, dtype=w_dtype, copy=True)
+        w_auth.setflags(write=False)
+        b_auth.setflags(write=False)
+
+        adj_frozen: Optional[np.ndarray] = None
+        if raw_cal_adj is not None:
+            raw_adj_arr = np.asarray(raw_cal_adj)
+            if raw_adj_arr.dtype == np.dtype(np.bool_) or raw_adj_arr.dtype.kind not in ("i", "u", "f"):
+                raise ValueError(
+                    f"_raw_source_head cal_adj must have numeric dtype, got {raw_adj_arr.dtype}"
+                )
+            if raw_adj_arr.ndim != 1 or raw_adj_arr.shape != (int(num_classes),):
+                raise ValueError(
+                    f"_raw_source_head cal_adj shape {raw_adj_arr.shape} != expected ({int(num_classes)},)"
+                )
+            adj_frozen = np.array(raw_adj_arr, dtype=np.float64, copy=True)
+            if not bool(np.all(np.isfinite(adj_frozen))):
+                raise ValueError("_raw_source_head cal_adj contains non-finite values")
+            adj_frozen.setflags(write=False)
+
+        raw_w64 = np.asarray(w_auth, dtype=np.float64)
+        raw_b64 = np.asarray(b_auth, dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            if is_boolean:
+                delta_adj = float(adj_frozen[1] - adj_frozen[0]) if adj_frozen is not None else 0.0
+                w_bool_fold = raw_w64[0] / cal_t
+                b_bool_fold = (float(raw_b64[0]) + 0.25 * delta_adj) / cal_t
+                w_fold = np.vstack([-0.5 * w_bool_fold, 0.5 * w_bool_fold]).astype(np.float32)
+                b_fold = np.array([-0.5 * b_bool_fold, 0.5 * b_bool_fold], dtype=np.float32)
+            else:
+                adj_vec = adj_frozen if adj_frozen is not None else np.zeros(int(num_classes), dtype=np.float64)
+                w_fold = (raw_w64 / cal_t).astype(np.float32)
+                b_fold = ((raw_b64 + 0.25 * adj_vec) / cal_t).astype(np.float32)
+        if not (bool(np.all(np.isfinite(w_fold))) and bool(np.all(np.isfinite(b_fold)))):
+            raise ValueError("_raw_source_head overflowed float32 bounds after folding calibration")
+        if float(np.max(np.abs(w_fold))) > 1e12 or float(np.max(np.abs(b_fold))) > 1e12:
+            raise ValueError("_raw_source_head folded head exceeds [-1e12, 1e12] magnitude bound")
+        if not (
+            bool(np.allclose(w_fold, W_base, rtol=1e-5, atol=1e-5))
+            and bool(np.allclose(b_fold, b_base, rtol=1e-5, atol=1e-5))
+        ):
+            raise ValueError("_raw_source_head does not match folded W_base / b_base")
+        return w_auth, b_auth, cal_t, adj_frozen
+
     def base_nbytes(self) -> int:
         """Return byte footprint of shared trunk weights and subspace basis."""
+        raw_bytes = 0
+        if self._raw_source_head is not None:
+            raw_bytes = (
+                int(self._raw_source_head[0].nbytes)
+                + int(self._raw_source_head[1].nbytes)
+                + (0 if self._raw_source_head[3] is None else int(self._raw_source_head[3].nbytes))
+            )
         return int(
             self.W_base.nbytes
             + self.b_base.nbytes
             + self.U_shared.nbytes
             + self.base_tok_df.nbytes
             + self.q_init.nbytes
+            + raw_bytes
         )
 
     @classmethod
@@ -715,7 +842,13 @@ class MultiTenantSkillFleet:
             is_boolean=is_bool_head,
             bool_threshold=bool_threshold,
             recency_weighted=bool(getattr(resolved, "recency_weighted", False)),
-            _raw_source_head=(raw_w_auth, raw_b_auth, temp, None if adj is None else adj.copy()),
+            zero_unit0=_model_zero_unit0(resolved, resolved.projector),
+            _raw_source_head=(
+                raw_w_auth,
+                raw_b_auth,
+                temp,
+                None if (adj is None or adj.size != len(classes)) else adj.copy(),
+            ),
         )
 
     def adapt_tenant_batch(
@@ -776,7 +909,12 @@ class MultiTenantSkillFleet:
                 for idx, (txt, y) in enumerate(zip(texts, y_indices)):
                     x = X[idx]
                     z = x @ self.U_shared
-                    base_log = self.W_base @ x + self.b_base
+                    base_log64, base_ok = self._eval_base_and_check_raw(x)
+                    if not base_ok:
+                        raise ValueError("Non-finite or overflowing base head evaluation during adapt_tenant_batch")
+                    base_log = base_log64.astype(np.float32)
+                    if not bool(np.all(np.isfinite(base_log))):
+                        raise ValueError("Base logits overflowed float32 during adapt_tenant_batch")
                     pred_sub = base_log + dW @ z
                     tgt = pred_sub.copy()
                     if pred_sub[y] < 0.80:
@@ -1304,7 +1442,7 @@ class MultiTenantSkillFleet:
 
         if "meta_ints" in headers:
             mi_dtype, mi_shape = headers["meta_ints"]
-            if mi_dtype != np.dtype(np.int64) or mi_shape not in ((4,), (6,)):
+            if mi_dtype != np.dtype(np.int64) or mi_shape not in ((4,), (6,), (7,)):
                 raise ValueError(f"Invalid meta_ints spec: dtype={mi_dtype}, shape={mi_shape}")
         if "meta_floats" in headers:
             mf_dtype, mf_shape = headers["meta_floats"]
@@ -1314,6 +1452,43 @@ class MultiTenantSkillFleet:
             c_dtype, c_shape = headers["classes_utf8"]
             if c_dtype != np.dtype(np.uint8) or len(c_shape) != 1 or c_shape[0] > 1_048_576:
                 raise ValueError(f"Invalid classes_utf8 spec: dtype={c_dtype}, shape={c_shape}")
+
+        raw_req_keys = ("raw_W_auth", "raw_b_auth", "raw_cal_temp")
+        raw_present = [k for k in raw_req_keys if k in headers]
+        raw_runtime = 0
+        if raw_present:
+            if len(raw_present) != len(raw_req_keys):
+                missing_raw = [k for k in raw_req_keys if k not in headers]
+                raise ValueError(f"Incomplete raw source head members in snapshot: missing {missing_raw}")
+            rw_dtype, rw_shape = headers["raw_W_auth"]
+            rb_dtype, rb_shape = headers["raw_b_auth"]
+            rt_dtype, rt_shape = headers["raw_cal_temp"]
+            raw_head_dtypes = (np.dtype(np.float32), np.dtype(np.float64))
+            if (
+                rw_dtype not in raw_head_dtypes
+                or len(rw_shape) != 2
+                or rw_shape[1] != D
+                or rw_shape[0] not in (1, K)
+            ):
+                raise ValueError(
+                    f"Invalid raw_W_auth spec: dtype={rw_dtype}, shape={rw_shape}, expected ((1|{K}), {D})"
+                )
+            if rb_dtype not in raw_head_dtypes or rb_shape != (rw_shape[0],):
+                raise ValueError(
+                    f"Invalid raw_b_auth spec: dtype={rb_dtype}, shape={rb_shape}, expected ({rw_shape[0]},)"
+                )
+            if rt_dtype not in alpha_dtypes or rt_shape != (1,):
+                raise ValueError(f"Invalid raw_cal_temp spec: dtype={rt_dtype}, shape={rt_shape}")
+            raw_runtime += rw_dtype.itemsize * rw_shape[0] * D + rb_dtype.itemsize * rw_shape[0] + 8
+            if "raw_cal_adj" in headers:
+                ra_dtype, ra_shape = headers["raw_cal_adj"]
+                if ra_dtype not in alpha_dtypes or ra_shape != (K,):
+                    raise ValueError(
+                        f"Invalid raw_cal_adj spec: dtype={ra_dtype}, shape={ra_shape}, expected ({K},)"
+                    )
+                raw_runtime += 8 * K
+        elif "raw_cal_adj" in headers:
+            raise ValueError("Snapshot contains raw_cal_adj without raw_W_auth/raw_b_auth/raw_cal_temp")
 
         # Runtime allocation footprint across float32 base/P_blk + float64 alpha_c + int8/float16/uint16 arenas.
         base_runtime = 4 * (K * D + K + D * R + K) + 2 * cls.BASE_HASH_SIZE
@@ -1326,7 +1501,7 @@ class MultiTenantSkillFleet:
             + T * (1 + 1)
             + T * K * (2 * 3 + 8)
         )
-        est_runtime = int(base_runtime + arena_runtime)
+        est_runtime = int(base_runtime + arena_runtime + raw_runtime)
         if est_runtime > int(max_runtime_bytes) or total_expanded > int(max_runtime_bytes) + 65536:
             raise ValueError(
                 f"Fleet snapshot runtime memory {est_runtime} (expanded {total_expanded}) exceeds budget {int(max_runtime_bytes)} bytes"
@@ -1486,36 +1661,44 @@ class MultiTenantSkillFleet:
                     self.m_exemplars,
                     int(self.is_boolean),
                     int(self.recency_weighted),
+                    int(self._zero_unit0),
                 ],
                 dtype=np.int64,
             )
             meta_floats = np.array([self.lam_rls, self.alpha, self.bool_threshold], dtype=np.float64)
-            np.savez_compressed(
-                buf,
-                meta_ints=meta_ints,
-                meta_floats=meta_floats,
-                classes_utf8=classes_bytes,
-                W_base=w_out,
-                b_base=b_out,
-                U_shared=u_out,
-                base_tok_df=self.base_tok_df,
-                q_init=q_init_f32,
-                dW_q=self.dW_q,
-                dW_scale=self.dW_scale,
-                P_blk=p_out,
-                sp_hash=self.sp_hash,
-                sp_cls=self.sp_cls,
-                sp_w=self.sp_w,
-                sp_len=self.sp_len,
-                ex_vecs_q=self.ex_vecs_q,
-                ex_scales=self.ex_scales,
-                ex_cls=self.ex_cls,
-                ex_len=self.ex_len,
-                q_c=self.q_c,
-                u_c=self.u_c,
-                alpha_c=self.alpha_c,
-                err_ewma=self.err_ewma,
-            )
+            snapshot_arrays: Dict[str, Any] = {
+                "meta_ints": meta_ints,
+                "meta_floats": meta_floats,
+                "classes_utf8": classes_bytes,
+                "W_base": w_out,
+                "b_base": b_out,
+                "U_shared": u_out,
+                "base_tok_df": self.base_tok_df,
+                "q_init": q_init_f32,
+                "dW_q": self.dW_q,
+                "dW_scale": self.dW_scale,
+                "P_blk": p_out,
+                "sp_hash": self.sp_hash,
+                "sp_cls": self.sp_cls,
+                "sp_w": self.sp_w,
+                "sp_len": self.sp_len,
+                "ex_vecs_q": self.ex_vecs_q,
+                "ex_scales": self.ex_scales,
+                "ex_cls": self.ex_cls,
+                "ex_len": self.ex_len,
+                "q_c": self.q_c,
+                "u_c": self.u_c,
+                "alpha_c": self.alpha_c,
+                "err_ewma": self.err_ewma,
+            }
+            if self._raw_source_head is not None:
+                raw_w_auth, raw_b_auth, cal_t, cal_adj = self._raw_source_head
+                snapshot_arrays["raw_W_auth"] = raw_w_auth
+                snapshot_arrays["raw_b_auth"] = raw_b_auth
+                snapshot_arrays["raw_cal_temp"] = np.array([cal_t], dtype=np.float64)
+                if cal_adj is not None:
+                    snapshot_arrays["raw_cal_adj"] = cal_adj
+            np.savez_compressed(buf, **snapshot_arrays)
             return buf.getvalue()
 
     @classmethod
@@ -1553,6 +1736,7 @@ class MultiTenantSkillFleet:
 
             is_boolean_meta: Optional[bool] = None
             recency_meta = False
+            zero_unit0_meta: Optional[bool] = None
             if "meta_ints" in zf:
                 m_int = zf["meta_ints"]
                 num_tenants, r_sub, m_sparse, m_exemplars = (
@@ -1573,7 +1757,7 @@ class MultiTenantSkillFleet:
                     raise ValueError(
                         f"Snapshot meta_ints m_exemplars {m_exemplars} incompatible with capacity [0, {min(M_ex, MAX_FLEET_EXEMPLAR_CAP)}]"
                     )
-                if len(m_int) == 6:
+                if len(m_int) >= 6:
                     raw_bool_flag = int(m_int[4])
                     raw_rec_flag = int(m_int[5])
                     if raw_bool_flag not in (0, 1) or raw_rec_flag not in (0, 1):
@@ -1584,6 +1768,13 @@ class MultiTenantSkillFleet:
                     if is_boolean_meta and K != 2:
                         raise ValueError(f"Snapshot is_boolean=True requires 2 classes, got {K}")
                     recency_meta = bool(raw_rec_flag)
+                    if len(m_int) == 7:
+                        raw_z0_flag = int(m_int[6])
+                        if raw_z0_flag not in (0, 1):
+                            raise ValueError(
+                                f"Invalid snapshot meta_ints zero_unit0 flag: {raw_z0_flag}"
+                            )
+                        zero_unit0_meta = bool(raw_z0_flag)
             else:
                 num_tenants, r_sub, m_sparse, m_exemplars = T, R, M_sp, M_ex
                 if m_sparse > MAX_FLEET_SPARSE_CAP or m_exemplars > MAX_FLEET_EXEMPLAR_CAP:
@@ -1729,6 +1920,23 @@ class MultiTenantSkillFleet:
             if float(np.min(err_ewma_arr)) < 0.0 or float(np.max(err_ewma_arr)) > 1.0:
                 raise ValueError("Snapshot err_ewma outside [0.0, 1.0]")
 
+            raw_head_meta: Optional[Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]] = None
+            if "raw_W_auth" in zf:
+                raw_w_meta = zf["raw_W_auth"]
+                raw_b_meta = zf["raw_b_auth"]
+                raw_t_arr = np.asarray(zf["raw_cal_temp"])
+                if (
+                    raw_t_arr.dtype == np.dtype(np.bool_)
+                    or raw_t_arr.dtype.kind not in ("i", "u", "f")
+                    or raw_t_arr.shape != (1,)
+                ):
+                    raise ValueError(
+                        f"Invalid snapshot raw_cal_temp spec: dtype={raw_t_arr.dtype}, shape={raw_t_arr.shape}"
+                    )
+                cal_t_meta = float(np.asarray(raw_t_arr, dtype=np.float64).reshape(-1)[0])
+                raw_adj_meta = zf["raw_cal_adj"] if "raw_cal_adj" in zf else None
+                raw_head_meta = (raw_w_meta, raw_b_meta, cal_t_meta, raw_adj_meta)
+
             fleet = cls(
                 projector=projector,
                 classes=resolved_classes,
@@ -1747,6 +1955,8 @@ class MultiTenantSkillFleet:
                 is_boolean=is_boolean_meta,
                 bool_threshold=bool_thr_meta,
                 recency_weighted=recency_meta,
+                zero_unit0=zero_unit0_meta,
+                _raw_source_head=raw_head_meta,
             )
             fleet.dW_q[:] = dW_q_arr
             fleet.dW_scale[:] = dW_scale_arr

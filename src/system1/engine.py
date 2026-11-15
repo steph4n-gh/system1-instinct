@@ -58,6 +58,7 @@ from system1.core.model import (
     _compute_engine_inference_signature,
     _compute_hierarchical_logits_np,
     _has_custom_validate_decision,
+    _model_zero_unit0,
     _normalize_raw_projection,
     _normalize_raw_projection_batch,
     _resolve_authoritative_head,
@@ -3818,10 +3819,7 @@ class SystemOneEngine:
 
             proj_obj = getattr(self.model, "projector", self.projector)
             is_tfidf_proj = isinstance(proj_obj, TfidfProjector)
-            zero_unit0 = (
-                type(self.model).__name__ == "CompiledSystemOneModel"
-                and not isinstance(proj_obj, (TfidfProjector, PragmaticCompositeProjector))
-            )
+            zero_unit0 = _model_zero_unit0(self.model, proj_obj)
             is_hybrid_proj = isinstance(proj_obj, HybridProjector)
             schema_name = self.schema.schema_name
             schema_digest = self.schema.schema_digest()

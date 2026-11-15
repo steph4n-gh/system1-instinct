@@ -745,33 +745,13 @@ def _normalize_raw_projection_batch(
             raise ValueError(
                 f"Projector batch output shape mismatch: expected ({n_rows}, {dimension}), got {raw_arr.shape}"
             )
-        out = np.full((n_rows, dimension), np.nan, dtype=np.float32)
-        if n_rows == 0:
-            return out
-        finite_rows = np.all(np.isfinite(raw_arr), axis=1)
-        if not bool(np.any(finite_rows)):
-            return out
-        good_raw = raw_arr[finite_rows]
-        good_f32 = good_raw.astype(np.float32, copy=False)
-        norms = np.linalg.norm(good_f32, axis=1)
-        finite_norms = np.all(np.isfinite(good_f32), axis=1) & np.isfinite(norms)
-        unit_mask = finite_norms & (norms > 1e-12)
-        zero_mask = finite_norms & (norms <= 1e-12)
-        good_idx = np.flatnonzero(finite_rows)
-        if bool(np.any(unit_mask)):
-            normed = (good_f32[unit_mask] / norms[unit_mask, None]).astype(np.float32, copy=False)
-            ok_u = np.all(np.isfinite(normed), axis=1)
-            if bool(np.any(ok_u)):
-                out[good_idx[unit_mask][ok_u]] = normed[ok_u]
-        if bool(np.any(zero_mask)):
-            z_rows = good_idx[zero_mask]
-            out[z_rows] = 0.0
-            if zero_unit0 and dimension > 0:
-                out[z_rows, 0] = 1.0
-        overflow_mask = ~finite_norms
-        if bool(np.any(overflow_mask)):
-            for pos, row_raw in zip(good_idx[overflow_mask], good_raw[overflow_mask]):
-                out[pos] = _normalize_raw_projection(row_raw, dimension, zero_unit0=zero_unit0)
+        out = np.empty((n_rows, dimension), dtype=np.float32)
+        for row_i in range(n_rows):
+            out[row_i] = _normalize_raw_projection(
+                raw_arr[row_i],
+                dimension,
+                zero_unit0=zero_unit0,
+            )
         return out
 
 
@@ -791,6 +771,35 @@ def _accepts_recency_weighted(fn: Any) -> bool:
             inspect.Parameter.KEYWORD_ONLY,
         )
     return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _model_zero_unit0(model: Any, projector: Any = None) -> bool:
+    """Return True iff `model` resolves to CompiledSystemOneModel with non-TFIDF/Pragmatic projector."""
+    from system1.core.text import PragmaticCompositeProjector, TfidfProjector
+
+    resolved = getattr(model, "model", model)
+    proj_obj = getattr(resolved, "projector", projector) if projector is None else projector
+    is_compiled = any(
+        cls_mro.__name__ == "CompiledSystemOneModel"
+        for cls_mro in type(resolved).__mro__
+    )
+    return bool(
+        is_compiled and not isinstance(proj_obj, (TfidfProjector, PragmaticCompositeProjector))
+    )
+
+
+def _is_native_scalar_projector(projector: Any) -> bool:
+    """Return True for built-in CPU projectors whose scalar `project()` is authoritative at boundaries."""
+    from system1.core.embeddings import HybridProjector, SubwordSemanticEmbeddings
+    from system1.core.text import PragmaticCompositeProjector, TfidfProjector
+
+    return type(projector) in (
+        DeterministicSemanticProjector,
+        HybridProjector,
+        SubwordSemanticEmbeddings,
+        TfidfProjector,
+        PragmaticCompositeProjector,
+    )
 
 
 def _encode_projector_one(
@@ -846,7 +855,7 @@ def _encode_projector_batch(
         else bool(batch_accepts_recency)
     )
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-        if callable(batch_fn) and (batch_rw or not (recency_weighted and one_rw)):
+        if (not _is_native_scalar_projector(projector)) and callable(batch_fn) and (batch_rw or not one_rw):
             out = (
                 batch_fn(text_list, recency_weighted=bool(recency_weighted))
                 if batch_rw
@@ -2419,16 +2428,18 @@ class SystemOneModel:
             raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         raw_norm: Optional[float] = None
-        if hasattr(self.projector, "project_with_norm") and telemetry is None:
-            try:
-                emb, raw_norm = self.projector.project_with_norm(prompt, recency_weighted=use_recency)
-            except TypeError:
-                emb, raw_norm = self.projector.project_with_norm(prompt)
-        elif hasattr(self.projector, "project"):
-            try:
-                emb = self.projector.project(prompt, recency_weighted=use_recency)
-            except TypeError:
-                emb = self.projector.project(prompt)
+        pwn_fn = getattr(self.projector, "project_with_norm", None)
+        proj_fn = getattr(self.projector, "project", None)
+        pwn_rw = _accepts_recency_weighted(pwn_fn)
+        proj_rw = _accepts_recency_weighted(proj_fn)
+        if callable(pwn_fn) and telemetry is None and (pwn_rw or not proj_rw):
+            emb, raw_norm = (
+                pwn_fn(prompt, recency_weighted=use_recency) if pwn_rw else pwn_fn(prompt)
+            )
+        elif callable(proj_fn):
+            emb = proj_fn(prompt, recency_weighted=use_recency) if proj_rw else proj_fn(prompt)
+            if callable(pwn_fn) and telemetry is None:
+                _, raw_norm = pwn_fn(prompt)
         else:
             emb = self.projector(prompt)
         emb = _normalize_raw_projection(emb, self.dimension, zero_unit0=False)
@@ -3709,13 +3720,8 @@ class PackedMultiQuestionKernel:
                 f"PackedMultiQuestionKernel weights/biases non-finite or overflowed {storage_mode}"
             )
 
-        from system1.core.text import PragmaticCompositeProjector, TfidfProjector
-
         proj_obj = getattr(model, "projector", eng.projector)
-        zero_emb_unit0 = bool(
-            type(model).__name__ == "CompiledSystemOneModel"
-            and not isinstance(proj_obj, (TfidfProjector, PragmaticCompositeProjector))
-        )
+        zero_emb_unit0 = _model_zero_unit0(model, proj_obj)
         kernel = cls(
             projector=proj_obj,
             dimension=int(eng.dimension),

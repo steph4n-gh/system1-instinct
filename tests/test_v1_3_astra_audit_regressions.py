@@ -7075,4 +7075,532 @@ def test_astra_25_round12_regressions() -> None:
             CompiledSystemOneModel._validate_hybrid_projector_config_and_tensors(cfg_2049, {}, 16)
 
 
+def test_astra_26_round13_regressions() -> None:
+    """R13-1..R13-6: Fleet snapshot raw inference state, GuardShield calibration/hook
+    finiteness, zero-vector parity across live Engine/Fleet/GuardShield, native Hybrid
+    batch scalar parity at Boolean boundaries, Compiler recency dispatch/fallback, and
+    UtilityCascadeRouter + UtilityCalibrator + drop_in non-finite fail-closed behavior.
+    """
+    from system1 import GuardShield
+    from system1.guard import ActionProposal
+    from system1.integrations.drop_in import (
+        InstinctRouteLayer,
+        SemanticRoute,
+        SystemOneInstructorClient,
+        SystemOnePromptGuard,
+        SystemOneRouteController,
+        UtilityCascadeRouter,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+
+        # ------------------------------------------------------------------
+        # R13-1: Fleet snapshots preserve _raw_source_head across overflow & Boolean precision
+        # ------------------------------------------------------------------
+        class _ConstQuarterProj:
+            dimension = 16
+
+            def project(self, text: str) -> np.ndarray:
+                return np.full(16, 0.25, dtype=np.float32)
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                return np.full((len(texts), 16), 0.25, dtype=np.float32)
+
+            def projector_digest(self) -> str:
+                return "r13-const-quarter-16"
+
+        const_proj = _ConstQuarterProj()
+
+        class _R13ChoiceSchema(DecisionSchema):
+            c = ChoiceField(options=("safe", "unsafe"))
+
+        mdl_ovf = SystemOneCompiler(_R13ChoiceSchema, dimension=16, projector=const_proj).compile(
+            {"c": [("good", "safe"), ("bad", "unsafe")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        w_ovf = np.zeros((2, 16), dtype=np.float32)
+        w_ovf[0, :] = np.float32(1e38)
+        b_ovf = np.zeros(2, dtype=np.float32)
+        mdl_ovf._field_heads["c"].weights = w_ovf.copy()
+        mdl_ovf._field_heads["c"].biases = b_ovf.copy()
+        mdl_ovf.heads["c"].weights = w_ovf.copy()
+        mdl_ovf.heads["c"].biases = b_ovf.copy()
+        mdl_ovf.heads["c"].temperature = 1e30
+
+        eng_ovf = SystemOneEngine(_R13ChoiceSchema, compiled_model=mdl_ovf, strict_mode=False, use_cache=False)
+        dec_ovf = eng_ovf.decide("probe", record_receipt=False)
+        assert dec_ovf.abstention_reasons["c"] == "non_finite_input"
+        assert math.isnan(dec_ovf.confidences["c"])
+        assert dec_ovf.conformal_sets["c"] == []
+
+        fleet_ovf = MultiTenantSkillFleet.from_compiled_model(eng_ovf, num_tenants=1, field_name="c")
+        fdec_ovf = fleet_ovf.decide(0, "probe")
+        assert math.isnan(fdec_ovf.confidence)
+        assert fdec_ovf.conformal_set == ()
+        assert fdec_ovf.is_ambiguous is True
+
+        snap_ovf = fleet_ovf.fleet_delta_to_bytes()
+        fleet_ovf_re = MultiTenantSkillFleet.fleet_delta_from_bytes(snap_ovf, projector=const_proj)
+        assert fleet_ovf_re._raw_source_head is not None
+        rdec_ovf = fleet_ovf_re.decide(0, "probe")
+        assert math.isnan(rdec_ovf.confidence)
+        assert rdec_ovf.conformal_set == ()
+        assert rdec_ovf.is_ambiguous is True
+        with pytest.raises(ValueError, match="adapt_tenant_batch"):
+            fleet_ovf_re.adapt_tenant_batch(0, ["probe"], ["safe"])
+
+        t_r13 = 0.5986876639312937
+
+        class _R13BoolSchema(DecisionSchema):
+            b = BooleanField(threshold=t_r13)
+
+        mdl_bool = SystemOneCompiler(_R13BoolSchema, dimension=16, projector=const_proj).compile(
+            {"b": [("yes", True), ("no", False)] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        mdl_bool._field_heads["b"].set_weights(
+            np.zeros((1, 16), dtype=np.float32),
+            np.array([np.float32(0.3)], dtype=np.float32),
+        )
+        mdl_bool.heads["b"].weights = np.zeros((1, 16), dtype=np.float32)
+        mdl_bool.heads["b"].biases = np.array([np.float32(0.3)], dtype=np.float32)
+        mdl_bool.heads["b"].temperature = 3.0
+
+        eng_bool = SystemOneEngine(_R13BoolSchema, compiled_model=mdl_bool, strict_mode=False, use_cache=False)
+        assert eng_bool.decide("probe", record_receipt=False).values["b"] is True
+
+        fleet_bool = MultiTenantSkillFleet.from_compiled_model(eng_bool, num_tenants=1, field_name="b")
+        assert fleet_bool.decide(0, "probe").predicted_label == "True"
+        snap_bool = fleet_bool.fleet_delta_to_bytes()
+        fleet_bool_re = MultiTenantSkillFleet.fleet_delta_from_bytes(snap_bool, projector=const_proj)
+        assert fleet_bool_re.decide(0, "probe").predicted_label == "True"
+
+        # Tamper & legacy compatibility checks on fleet snapshots
+        with zipfile.ZipFile(io.BytesIO(snap_bool), "r") as z_src:
+            raw_members = {name: z_src.read(name) for name in z_src.namelist()}
+
+        def _repack_zip(members: Dict[str, bytes]) -> bytes:
+            out_buf = io.BytesIO()
+            with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zw:
+                for k_m, v_m in members.items():
+                    zw.writestr(k_m, v_m)
+            return out_buf.getvalue()
+
+        def _npy_bytes(arr: np.ndarray) -> bytes:
+            b_io = io.BytesIO()
+            np.save(b_io, arr, allow_pickle=False)
+            return b_io.getvalue()
+
+        m_missing_t = dict(raw_members)
+        m_missing_t.pop("raw_cal_temp.npy")
+        with pytest.raises(ValueError, match="Incomplete raw source head"):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(_repack_zip(m_missing_t), projector=const_proj)
+
+        m_mismatch_w = dict(raw_members)
+        tamper_w = np.load(io.BytesIO(m_mismatch_w["raw_W_auth.npy"]), allow_pickle=False).copy()
+        tamper_w[0, 0] = np.float32(25.0)
+        m_mismatch_w["raw_W_auth.npy"] = _npy_bytes(tamper_w)
+        with pytest.raises(ValueError, match="does not match"):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(_repack_zip(m_mismatch_w), projector=const_proj)
+
+        m_bad_temp = dict(raw_members)
+        m_bad_temp["raw_cal_temp.npy"] = _npy_bytes(np.array([0.0], dtype=np.float64))
+        with pytest.raises(ValueError, match="positive and finite"):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(_repack_zip(m_bad_temp), projector=const_proj)
+
+        m_orphan_adj = dict(raw_members)
+        for rk in ("raw_W_auth.npy", "raw_b_auth.npy", "raw_cal_temp.npy"):
+            m_orphan_adj.pop(rk, None)
+        m_orphan_adj["raw_cal_adj.npy"] = _npy_bytes(np.zeros(2, dtype=np.float64))
+        with pytest.raises(ValueError, match="raw_cal_adj"):
+            MultiTenantSkillFleet.fleet_delta_from_bytes(_repack_zip(m_orphan_adj), projector=const_proj)
+
+        m_legacy = dict(raw_members)
+        for rk in ("raw_W_auth.npy", "raw_b_auth.npy", "raw_cal_temp.npy", "raw_cal_adj.npy"):
+            m_legacy.pop(rk, None)
+        mi_old = np.load(io.BytesIO(m_legacy["meta_ints.npy"]), allow_pickle=False)[:6]
+        m_legacy["meta_ints.npy"] = _npy_bytes(mi_old)
+        fleet_legacy = MultiTenantSkillFleet.fleet_delta_from_bytes(_repack_zip(m_legacy), projector=const_proj)
+        assert fleet_legacy._raw_source_head is None
+
+        # ------------------------------------------------------------------
+        # R13-2: Non-finite benign calibration rejected & lazy/runtime GuardShield fail-closed
+        # ------------------------------------------------------------------
+        hp_bad = HybridProjector.from_config(
+            {
+                "type": "hybrid",
+                "sparse_dim": 4,
+                "dense_dim": 4,
+                "spectral_blend": 0.5,
+                "fitted": True,
+                "spectral_terms": ["badprojection"],
+                "spectral_weights": [1e38],
+                "spectral_vectors": [[1e10, 0.0, 0.0, 0.0]],
+            }
+        )
+        assert bool(np.any(~np.isfinite(hp_bad.project("badprojection"))))
+
+        mdl_bad = SystemOneCompiler(_R13ChoiceSchema, dimension=hp_bad.dimension, projector=hp_bad).compile(
+            {"c": [("alpha benign", "safe"), ("omega hostile", "unsafe")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        w_z0 = np.zeros((2, hp_bad.dimension), dtype=np.float32)
+        b_z01 = np.array([0.0, 1.0], dtype=np.float32)
+        mdl_bad._field_heads["c"].weights = w_z0.copy()
+        mdl_bad._field_heads["c"].biases = b_z01.copy()
+        mdl_bad.heads["c"].weights = w_z0.copy()
+        mdl_bad.heads["c"].biases = b_z01.copy()
+        eng_bad = SystemOneEngine(_R13ChoiceSchema, compiled_model=mdl_bad, strict_mode=False, use_cache=False)
+
+        with pytest.raises(ValueError, match="non-finite"):
+            GuardShield.calibrate_sim_threshold_from_benign(
+                eng_bad.model,
+                field_name="c",
+                unsafe_label="unsafe",
+                benign_texts=["badprojection"],
+                unsafe_exemplars=["unsafe"],
+            )
+        with pytest.raises(ValueError, match="non-finite"):
+            GuardShield.calibrate_threshold_from_benign(
+                eng_bad.model,
+                field_name="c",
+                unsafe_label="unsafe",
+                benign_texts=["badprojection"],
+            )
+        with pytest.raises(ValueError):
+            GuardShield(eng_bad.model, field_name="c", unsafe_label="unsafe", sim_threshold=float("nan"))
+        with pytest.raises(ValueError):
+            GuardShield(
+                eng_bad.model,
+                field_name="c",
+                unsafe_label="unsafe",
+                window_margin_threshold=float("inf"),
+            )
+        with pytest.raises(ValueError):
+            GuardShield(eng_bad.model, field_name="c", unsafe_label="unsafe", window_words=0)
+
+        shield_mut = GuardShield(eng_bad.model, field_name="c", unsafe_label="unsafe", sim_threshold=0.1)
+        shield_mut.sim_threshold = float("nan")
+        dec_mut = shield_mut.evaluate_single("clean harmless message")
+        assert dec_mut.is_unsafe is True
+        assert dec_mut.predicted_label == "unsafe"
+
+        class _R13HookSchema(DecisionSchema):
+            is_safe = BooleanField(threshold=0.5)
+
+        eng_hook_bad = SystemOneEngine(
+            _R13HookSchema,
+            dimension=hp_bad.dimension,
+            backend="numpy",
+            projector=hp_bad,
+            contrastive_whitening=False,
+            use_cache=False,
+        )
+        eng_hook_bad._learned_prompt_overrides = {"badprojection": {"is_safe": True}}
+        hook_bad = SystemOneGuardHook(
+            engine=eng_hook_bad,
+            auto_calibrate=False,
+            shield_mode="sliding_window",
+            fail_closed_ledger=False,
+        )
+        prop_bad = ActionProposal.create(
+            tool="read",
+            canonical_target="/tmp/ok.txt",
+            arguments={"path": "/tmp/ok.txt"},
+            purpose="test lazy shield fail closed",
+            tenant_id="t-r13",
+            principal_id="u-r13",
+            scope="tools:read",
+        )
+        auth_bad = hook_bad.evaluate_proposal(prop_bad, context_prompt="normal read query")
+        assert auth_bad.outcome == DecisionOutcome.DENY
+        assert auth_bad.policy_decision is not None
+        assert auth_bad.policy_decision.rule_id == "system1_shield_deny"
+
+        # ------------------------------------------------------------------
+        # R13-3: Live Engine zero-vector semantics preserved by Fleet & GuardShield
+        # ------------------------------------------------------------------
+        class _ZeroProj16:
+            dimension = 16
+
+            def project(self, text: str) -> np.ndarray:
+                return np.zeros(16, dtype=np.float32)
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                return np.zeros((len(texts), 16), dtype=np.float32)
+
+            def projector_digest(self) -> str:
+                return "r13-zero-16"
+
+        zero_proj = _ZeroProj16()
+        eng_zero = SystemOneEngine(
+            _R13ChoiceSchema,
+            dimension=16,
+            backend="numpy",
+            projector=zero_proj,
+            contrastive_whitening=False,
+            use_cache=False,
+        )
+        w_e0 = np.zeros((2, 16), dtype=np.float32)
+        w_e0[0, 0] = 1.0
+        b_05 = np.array([0.0, 0.5], dtype=np.float32)
+        eng_zero.model.heads["c"].set_weights(w_e0, b_05)
+
+        assert eng_zero.decide("any input", record_receipt=False).values["c"] == "unsafe"
+        fleet_zero = MultiTenantSkillFleet.from_compiled_model(eng_zero, num_tenants=1, field_name="c")
+        assert fleet_zero._zero_unit0 is False
+        assert fleet_zero.decide(0, "any input").predicted_label == "unsafe"
+
+        fleet_zero_re = MultiTenantSkillFleet.fleet_delta_from_bytes(
+            fleet_zero.fleet_delta_to_bytes(),
+            projector=zero_proj,
+        )
+        assert fleet_zero_re._zero_unit0 is False
+        assert fleet_zero_re.decide(0, "any input").predicted_label == "unsafe"
+
+        shield_zero = GuardShield(eng_zero, field_name="c", unsafe_label="unsafe")
+        assert shield_zero._zero_unit0 is False
+        sdec_zero = shield_zero.evaluate_single("any input")
+        assert sdec_zero.predicted_label == "unsafe"
+        assert sdec_zero.is_unsafe is True
+
+        tf_small = TfidfProjector.fit(["safe text", "unsafe text"], max_features=8)
+        with pytest.raises(ValueError, match="zero_unit0=True"):
+            MultiTenantSkillFleet(
+                projector=tf_small,
+                classes=["safe", "unsafe"],
+                W_base=np.zeros((2, tf_small.dimension), dtype=np.float32),
+                b_base=np.zeros(2, dtype=np.float32),
+                zero_unit0=True,
+            )
+
+        # ------------------------------------------------------------------
+        # R13-4: Native Hybrid scalar vs batch parity at exact Boolean boundary
+        # ------------------------------------------------------------------
+        class _R13BoolBoundary(DecisionSchema):
+            flag = BooleanField(threshold=0.5)
+
+        hp_bnd = HybridProjector(sparse_dim=256, dense_dim=128, backend="numpy")
+        mdl_bnd = SystemOneCompiler(_R13BoolBoundary, dimension=hp_bnd.dimension, projector=hp_bnd).compile(
+            {"flag": [("yes", True), ("no", False)] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        x_bnd = mdl_bnd.encode("probe").reshape(1, -1)
+        w_bnd = np.random.default_rng(0).normal(size=(4, 384)).astype(np.float32)[3:4]
+        b_bnd = -(x_bnd @ w_bnd.T)[0]
+        mdl_bnd._field_heads["flag"].set_weights(w_bnd.copy(), b_bnd.copy())
+        mdl_bnd.heads["flag"].weights = w_bnd.copy()
+        mdl_bnd.heads["flag"].biases = b_bnd.copy()
+
+        eng_bnd = SystemOneEngine(_R13BoolBoundary, compiled_model=mdl_bnd, strict_mode=False, use_cache=False)
+        assert eng_bnd.decide("probe", record_receipt=False).values["flag"] is True
+        shield_bnd = GuardShield(eng_bnd, field_name="flag", unsafe_label="True", use_windows=False)
+        sdec_bnd = shield_bnd.evaluate_single("probe")
+        assert sdec_bnd.is_unsafe is True
+        assert sdec_bnd.predicted_label == "True"
+        assert sdec_bnd.max_window_unsafe_prob >= 0.5
+        fleet_bnd = MultiTenantSkillFleet.from_compiled_model(eng_bnd, num_tenants=1, field_name="flag")
+        np.testing.assert_array_equal(fleet_bnd._project_batch(["probe"])[0], x_bnd[0])
+
+        # ------------------------------------------------------------------
+        # R13-5: Compiler recency dispatch & explicit False forwarding
+        # ------------------------------------------------------------------
+        class _R13RecChoice(DecisionSchema):
+            c = ChoiceField(options=("a", "b"))
+
+        class _RecScalarOnlyProj:
+            dimension = 16
+
+            def _vec(self, text: str, rw: bool) -> np.ndarray:
+                v = np.zeros(16, dtype=np.float32)
+                is_alpha = "alpha" in text
+                if rw:
+                    v[1 if is_alpha else 0] = 1.0
+                else:
+                    v[0 if is_alpha else 1] = 1.0
+                return v
+
+            def project(self, text: str, recency_weighted: bool = False) -> np.ndarray:
+                return self._vec(text, bool(recency_weighted))
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                return np.stack([self._vec(t, False) for t in texts], axis=0)
+
+            def projector_digest(self) -> str:
+                return "r13-rec-scalar-only"
+
+        rec_pairs = {"c": ([("alpha", "a"), ("beta", "b")] * 10)}
+        mdl_rec_t = SystemOneCompiler(
+            _R13RecChoice,
+            dimension=16,
+            projector=_RecScalarOnlyProj(),
+            recency_weighted=True,
+        ).compile(rec_pairs, augment=False, calibration_split=0.0)
+        eng_rec_t = SystemOneEngine(_R13RecChoice, compiled_model=mdl_rec_t, strict_mode=False, use_cache=False)
+        assert eng_rec_t.decide("alpha", record_receipt=False).values["c"] == "a"
+        assert eng_rec_t.decide("beta", record_receipt=False).values["c"] == "b"
+
+        class _RecDefaultTrueProj:
+            dimension = 16
+
+            def _vec(self, text: str, rw: bool) -> np.ndarray:
+                v = np.zeros(16, dtype=np.float32)
+                is_alpha = "alpha" in text
+                if rw:
+                    v[1 if is_alpha else 0] = 1.0
+                else:
+                    v[0 if is_alpha else 1] = 1.0
+                return v
+
+            def project(self, text: str, recency_weighted: bool = True) -> np.ndarray:
+                return self._vec(text, bool(recency_weighted))
+
+            def project_batch(self, texts: Sequence[str], recency_weighted: bool = True) -> np.ndarray:
+                return np.stack([self._vec(t, bool(recency_weighted)) for t in texts], axis=0)
+
+            def projector_digest(self) -> str:
+                return "r13-rec-default-true"
+
+        mdl_rec_f = SystemOneCompiler(
+            _R13RecChoice,
+            dimension=16,
+            projector=_RecDefaultTrueProj(),
+            recency_weighted=False,
+        ).compile(rec_pairs, augment=False, calibration_split=0.0)
+        eng_rec_f = SystemOneEngine(_R13RecChoice, compiled_model=mdl_rec_f, strict_mode=False, use_cache=False)
+        assert eng_rec_f.decide("alpha", record_receipt=False).values["c"] == "a"
+        assert eng_rec_f.decide("beta", record_receipt=False).values["c"] == "b"
+
+        class _RecWithNormNoKwProj(_RecScalarOnlyProj):
+            def project_with_norm(self, text: str) -> tuple[np.ndarray, float]:
+                return self._vec(text, False), 1.0
+
+            def projector_digest(self) -> str:
+                return "r13-rec-pwn-nokw"
+
+        pwn_proj = _RecWithNormNoKwProj()
+        mdl_pwn = SystemOneCompiler(
+            _R13RecChoice,
+            dimension=16,
+            projector=pwn_proj,
+            recency_weighted=True,
+        ).compile(rec_pairs, augment=False, calibration_split=0.0)
+        eng_pwn = SystemOneEngine(_R13RecChoice, compiled_model=mdl_pwn, strict_mode=False, use_cache=False)
+        assert eng_pwn.decide("alpha", record_receipt=False).values["c"] == "a"
+        assert eng_pwn.decide("beta", record_receipt=False).values["c"] == "b"
+        enc_txt_rw = SystemOneCompiler._encode_texts_with_projector(
+            ["alpha", "beta"],
+            pwn_proj,
+            recency_weighted=True,
+        )
+        np.testing.assert_allclose(enc_txt_rw[0, :2], np.array([0.0, 1.0], dtype=np.float32), atol=1e-6)
+        np.testing.assert_allclose(enc_txt_rw[1, :2], np.array([1.0, 0.0], dtype=np.float32), atol=1e-6)
+
+        # ------------------------------------------------------------------
+        # R13-6: UtilityCascadeRouter, UtilityCalibrator, and sister drop-in wrappers fail closed
+        # ------------------------------------------------------------------
+        router_u = UtilityCascadeRouter()
+        x_ru = router_u.engine.encode("probe")
+        w_ru = np.tile(np.float32(3e38) * np.sign(x_ru), (3, 1)).astype(np.float32)
+        router_u.engine.model.heads["target_tier"].set_weights(w_ru, np.zeros(3, dtype=np.float32))
+        res_ru = router_u.route("probe")
+        assert res_ru.selected_tier == "frontier_reasoning_model"
+        assert res_ru.action_index == 2
+        assert res_ru.requires_deep_reasoning is True
+        assert res_ru.used_crc_fallback is True
+        assert math.isnan(res_ru.confidence)
+        assert math.isnan(res_ru.probabilities["system1_local"])
+        assert math.isnan(res_ru.expected_costs["system1_local"])
+
+        router_c = UtilityCascadeRouter()
+        fit_prompts = [
+            "what is 2 + 2?",
+            "capitalize hello world",
+            "summarize this short sentence",
+            "list the days of the week",
+            "compare two rest api pagination strategies",
+            "write a python helper to parse csv",
+            "explain sql left join vs inner join",
+            "refactor this medium function cleanly",
+            "prove soundness of distributed consensus safety invariants",
+            "design a formal security threat model for key rotation",
+            "derive optimal stochastic control policy under tail risk",
+            "debug complex race condition in lock-free ring buffer",
+        ]
+        fit_tiers = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2]
+        router_c.fit(fit_prompts, fit_tiers, cal_fraction=0.5)
+        x_rc = router_c.engine.encode("calibrated overflow probe")
+        w_rc = np.tile(np.float32(3e38) * np.sign(x_rc), (3, 1)).astype(np.float32)
+        router_c.engine.model.heads["target_tier"].set_weights(w_rc, np.zeros(3, dtype=np.float32))
+        res_rc = router_c.route("calibrated overflow probe")
+        assert res_rc.selected_tier == "frontier_reasoning_model"
+        assert res_rc.action_index == 2
+        assert res_rc.used_crc_fallback is True
+        assert math.isnan(res_rc.confidence)
+
+        uc = UtilityCalibrator(
+            [[0.0, 10.0, 25.0], [0.15, 0.15, 15.0], [5.0, 5.0, 5.0]],
+            safe_action=2,
+        )
+        assert uc.predict(np.array([np.nan, np.nan, np.nan]), use_crc=False).tolist() == [2]
+        assert uc.predict(np.array([[np.inf, 0.2, 0.8]]), use_crc=False).tolist() == [2]
+        with pytest.raises(ValueError, match="non-finite"):
+            uc.fit(np.array([[np.nan, 0.5, 0.5], [0.2, 0.3, 0.5]]), np.array([0, 1]))
+
+        ctrl = SystemOneRouteController()
+        x_ctrl = ctrl.engine.encode("probe")
+        ctrl.engine.model.heads["target_tier"].set_weights(
+            np.tile(np.float32(3e38) * np.sign(x_ctrl), (3, 1)).astype(np.float32),
+            np.zeros(3, dtype=np.float32),
+        )
+        cdec = ctrl.route("probe")
+        assert cdec.selected_tier == "frontier_reasoning_model"
+        assert cdec.requires_deep_reasoning is True
+        assert math.isnan(cdec.confidence)
+
+        layer = InstinctRouteLayer(
+            routes=[
+                SemanticRoute(name="billing", utterances=["refund invoice charge"]),
+                SemanticRoute(name="support", utterances=["reset password login"]),
+            ],
+            confidence_threshold=0.0,
+            strict_mode=False,
+        )
+        x_lyr = layer.engine.encode("probe")
+        layer.engine.model.heads["route"].set_weights(
+            np.tile(np.float32(3e38) * np.sign(x_lyr), (2, 1)).astype(np.float32),
+            np.zeros(2, dtype=np.float32),
+        )
+        ldec = layer("probe")
+        assert ldec.name is None
+        assert math.isnan(ldec.confidence)
+
+        inst = SystemOneInstructorClient()
+        x_ins = inst.engine.encode("probe")
+        inst.engine.model.heads["department"].set_weights(
+            np.tile(np.float32(3e38) * np.sign(x_ins), (4, 1)).astype(np.float32),
+            np.zeros(4, dtype=np.float32),
+        )
+        idec = inst.create("probe")
+        assert idec.is_ambiguous is True
+        assert math.isnan(idec.confidence)
+
+        pg = SystemOnePromptGuard(compiled=False)
+        x_pg = pg.engine.encode("probe")
+        pg.engine.model.heads["verdict"].set_weights(
+            np.tile(np.float32(3e38) * np.sign(x_pg), (3, 1)).astype(np.float32),
+            np.zeros(3, dtype=np.float32),
+        )
+        pdec = pg.scan("probe")
+        assert pdec.blocked is True
+        assert pdec.verdict != "benign"
+        assert math.isnan(pdec.confidence)
+
+
+
 
