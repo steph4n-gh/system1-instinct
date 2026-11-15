@@ -10,7 +10,7 @@ import math
 import re
 import struct
 import threading
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import zlib
 
 import numpy as np
@@ -1131,18 +1131,20 @@ class MultiTenantSkillFleet:
         """Perform an O(1) per-tenant, per-class Mondrian conformal quantile update."""
         tid = self._validate_tid(tid)
         yi = self._resolve_class_idx(y)
-        if isinstance(eta_u, bool) or not isinstance(eta_u, (int, float, np.integer, np.floating)):
+        if type(is_logits) is not bool:
+            raise ValueError(f"is_logits must be a bool, got {is_logits!r}")
+        if isinstance(eta_u, (bool, np.bool_)) or not isinstance(eta_u, (int, float, np.integer, np.floating)):
             raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
         eta_val = float(eta_u)
         if not math.isfinite(eta_val) or eta_val <= 0.0:
             raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
-        if isinstance(jump_w, bool) or not isinstance(jump_w, (int, float, np.integer, np.floating)):
+        if isinstance(jump_w, (bool, np.bool_)) or not isinstance(jump_w, (int, float, np.integer, np.floating)):
             raise ValueError(f"jump_w must be finite in [0.0, 1.0], got {jump_w!r}")
         jump_val = float(jump_w)
         if not math.isfinite(jump_val) or not (0.0 <= jump_val <= 1.0):
             raise ValueError(f"jump_w must be finite in [0.0, 1.0], got {jump_w!r}")
         if gamma_aci is not None:
-            if isinstance(gamma_aci, bool) or not isinstance(gamma_aci, (int, float, np.integer, np.floating)):
+            if isinstance(gamma_aci, (bool, np.bool_)) or not isinstance(gamma_aci, (int, float, np.integer, np.floating)):
                 raise ValueError(f"gamma_aci must be finite and positive, got {gamma_aci!r}")
             g_aci = float(gamma_aci)
             if not math.isfinite(g_aci) or g_aci <= 0.0:
@@ -1150,7 +1152,35 @@ class MultiTenantSkillFleet:
         else:
             g_aci = max(0.03, 0.4 * self.alpha)
 
-        arr = np.asarray(probs_or_logits, dtype=np.float64).reshape(-1)
+        def _materialize_real_sequence(obj: Any) -> Any:
+            if isinstance(obj, (str, bytes, bytearray, Mapping)):
+                raise ValueError("probs_or_logits must be a numeric sequence or array")
+            if isinstance(obj, np.ndarray):
+                if obj.dtype == np.bool_ or obj.dtype.kind not in ("i", "u", "f"):
+                    raise ValueError(f"probs_or_logits must have real numeric dtype, got {obj.dtype}")
+                return obj
+            if hasattr(obj, "__iter__"):
+                out_list: List[Any] = []
+                for el in obj:
+                    if isinstance(el, np.ndarray):
+                        if el.dtype == np.bool_ or el.dtype.kind not in ("i", "u", "f"):
+                            raise ValueError(f"probs_or_logits must have real numeric dtype, got {el.dtype}")
+                        out_list.append(el)
+                    elif hasattr(el, "__iter__") and not isinstance(el, (str, bytes, bytearray, Mapping)):
+                        out_list.append(_materialize_real_sequence(el))
+                    else:
+                        if (
+                            isinstance(el, (bool, np.bool_))
+                            or getattr(getattr(el, "dtype", None), "kind", None) == "b"
+                            or not isinstance(el, (int, float, np.integer, np.floating))
+                        ):
+                            raise ValueError(f"probs_or_logits entries must be real numbers, got {el!r}")
+                        out_list.append(el)
+                return out_list
+            raise ValueError(f"probs_or_logits must be a numeric sequence or array, got {type(obj).__name__}")
+
+        validated_input = _materialize_real_sequence(probs_or_logits)
+        arr = np.asarray(validated_input, dtype=np.float64).reshape(-1)
         if arr.shape[0] != self.num_classes:
             raise ValueError(f"Expected length {self.num_classes}, got {arr.shape[0]}")
         if not bool(np.all(np.isfinite(arr))):

@@ -1923,7 +1923,7 @@ def _ind_calibrated_logits(eng_obj: SystemOneEngine, fname: str, sample: str) ->
     return float(cal_l[c1]), float(cal_l[c1] - cal_l[c2])
 
 
-def test_astra_18_round5_regressions(tmp_path: Path) -> None:
+def test_astra_18_round5_regressions() -> None:
     """Round-5 GPT-6-Astra regression checks covering findings R5-1 through R5-13."""
     from system1.calibration import DecisionCalibrator
     from system1.compiler import MAGIC_HEADER_V3
@@ -2998,35 +2998,74 @@ def test_astra_19_round6_regressions() -> None:
     assert res_tf_t.additivity_error_target < 1e-6
     assert res_tf_t.additivity_error_margin < 1e-6
 
-    # Subnormal / near-min-normal temperature (1e-308, 5e-324) must not produce 0 * inf = nan on zero/tiny heads,
-    # and must raise ValueError cleanly when weights * scale / cal_temp overflows float64.
-    for tiny_t in (1e-308, 5e-324):
-        for w_tiny in (0.0, 1e-306):
-            eng_ut = _make_r6_engine(strict=False)
-            _set_head(
-                eng_ut.model,
-                "cat",
-                np.full((3, 32), w_tiny, dtype=np.float32),
-                np.zeros(3, dtype=np.float32),
-            )
-            _set_head(
-                eng_ut.model,
-                "flag",
-                np.full((1, 32), w_tiny, dtype=np.float32),
-                np.zeros(1, dtype=np.float32),
-            )
-            eng_ut.calibrators["cat"] = DecisionCalibrator()
-            eng_ut.calibrators["cat"].temperature = tiny_t
-            eng_ut.calibrators["flag"] = DecisionCalibrator()
-            eng_ut.calibrators["flag"].temperature = tiny_t
-            for f_nm in ("cat", "flag"):
-                exp_ut = FastExplainer.from_engine(eng_ut, f_nm)
-                res_ut = exp_ut.explain("alpha signal test")
-                dec_ut = eng_ut.decide("alpha signal test", record_receipt=False)
-                assert math.isfinite(res_ut.predicted_logit)
-                assert math.isfinite(res_ut.margin)
-                assert res_ut.predicted_label == str(dec_ut.values[f_nm])
-                assert res_ut.additivity_error_target <= 1e-4
+    # Subnormal / near-min-normal temperature (1e-308, np.nextafter(0.0, 1.0)): test zero heads
+    # separately from genuine authoritative float64 1e-306 nonzero heads without float32 narrowing.
+    tiny_temps = (1e-308, float(np.nextafter(0.0, 1.0)))
+    for tiny_t in tiny_temps:
+        eng_zero = _make_r6_engine(strict=False)
+        for f_nm, nrows in (("cat", 3), ("flag", 1)):
+            w_z = np.zeros((nrows, 32), dtype=np.float64)
+            b_z = np.zeros(nrows, dtype=np.float64)
+            eng_zero.model.heads[f_nm].weights = w_z.copy()
+            eng_zero.model.heads[f_nm].biases = b_z.copy()
+            if getattr(eng_zero.model, "_field_heads", None) and f_nm in eng_zero.model._field_heads:
+                eng_zero.model._field_heads[f_nm].weights = w_z.copy()
+                eng_zero.model._field_heads[f_nm].biases = b_z.copy()
+            cal_z = DecisionCalibrator()
+            cal_z.temperature = tiny_t
+            eng_zero.calibrators[f_nm] = cal_z
+        for f_nm in ("cat", "flag"):
+            exp_z = FastExplainer.from_engine(eng_zero, f_nm)
+            res_z = exp_z.explain("alpha signal test")
+            dec_z = eng_zero.decide("alpha signal test", record_receipt=False)
+            assert res_z.predicted_logit == 0.0
+            assert res_z.margin == 0.0
+            assert res_z.additivity_error_target == 0.0
+            assert res_z.predicted_label == str(dec_z.values[f_nm])
+
+        eng_ut = _make_r6_engine(strict=False)
+        x_ref = np.asarray(eng_ut.model.projector.project("alpha signal test"), dtype=np.float64)
+        x_norm = float(np.linalg.norm(x_ref))
+        if x_norm > 0.0:
+            x_ref = x_ref / x_norm
+        for f_nm, nrows in (("cat", 3), ("flag", 1)):
+            w_f64 = np.zeros((nrows, 32), dtype=np.float64)
+            w_f64[0] = 1e-306
+            if f_nm == "cat":
+                w_f64[1] = -1e-306
+            b_f64 = np.zeros(nrows, dtype=np.float64)
+            eng_ut.model.heads[f_nm].weights = w_f64.copy()
+            eng_ut.model.heads[f_nm].biases = b_f64.copy()
+            if getattr(eng_ut.model, "_field_heads", None) and f_nm in eng_ut.model._field_heads:
+                eng_ut.model._field_heads[f_nm].weights = w_f64.copy()
+                eng_ut.model._field_heads[f_nm].biases = b_f64.copy()
+            assert eng_ut.model.heads[f_nm].weights.dtype == np.float64
+            assert np.count_nonzero(eng_ut.model.heads[f_nm].weights) > 0
+            cal_ut = DecisionCalibrator()
+            cal_ut.temperature = tiny_t
+            eng_ut.calibrators[f_nm] = cal_ut
+
+        for f_nm in ("cat", "flag"):
+            exp_ut = FastExplainer.from_engine(eng_ut, f_nm)
+            res_ut = exp_ut.explain("alpha signal test")
+            dec_ut = eng_ut.decide("alpha signal test", record_receipt=False)
+            w_ref = eng_ut.model.heads[f_nm].weights
+            b_ref = eng_ut.model.heads[f_nm].biases
+            raw_ref = ((w_ref @ x_ref + b_ref) * 4.0) / tiny_t
+            if f_nm == "cat":
+                order_ref = np.argsort(-raw_ref, kind="stable")
+                ref_logit = float(raw_ref[int(order_ref[0])])
+                ref_margin = float(raw_ref[int(order_ref[0])] - raw_ref[int(order_ref[1])])
+            else:
+                ref_logit = 0.5 * float(raw_ref[0])
+                ref_margin = float(abs(raw_ref[0]))
+            assert math.isfinite(res_ut.predicted_logit)
+            assert math.isfinite(res_ut.margin)
+            assert abs(res_ut.predicted_logit) > 1.0
+            assert math.isclose(res_ut.predicted_logit, ref_logit, rel_tol=1e-5)
+            assert math.isclose(res_ut.margin, ref_margin, rel_tol=1e-5)
+            assert res_ut.predicted_label == str(dec_ut.values[f_nm])
+            assert res_ut.additivity_error_target <= max(1e-6, 1e-11 * abs(res_ut.predicted_logit))
 
     eng_ovf = _make_r6_engine(strict=False)
     _set_head(
@@ -3153,7 +3192,7 @@ def test_astra_19_round6_regressions() -> None:
     np.testing.assert_array_equal(fl_base.ex_len[0], snap_ex)
 
 
-def test_astra_20_round7_regressions(tmp_path: Path) -> None:
+def test_astra_20_round7_regressions() -> None:
     """Verify all Round-7 Astra audit fixes (R7-1 through R7-12) against independent truth."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -4001,3 +4040,517 @@ def test_astra_20_round7_regressions(tmp_path: Path) -> None:
     assert len(learned_18) + len(calibrated_18) == 18
     assert len(calibrated_18) >= 3
     assert set(learned_18).isdisjoint(set(calibrated_18))
+
+
+def test_astra_21_round8_regressions() -> None:
+    """Round-8 regressions (R8-1 through R8-9): strict verification, float64 precision, refit isolation, gateway preflight, and header/bool checks."""
+    import dataclasses
+    from http.client import parse_headers
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from system1 import DecisionCalibrator, ScoreField, UniversalDecisionsHTTPServer
+    from system1.integrations import drop_in as drop_in_mod
+    from system1.receipt import (
+        check_decision_receipt_integrity,
+        compute_receipt_digest,
+        create_decision_receipt,
+        verify_decision_witness_receipt,
+    )
+
+    # R8-1: Creation keeps ScoreField non-finite sanitization, while verification rejects any tampered non-finite/bool values.
+    sk = Ed25519PrivateKey.generate()
+    pk = sk.public_key()
+    rec_created = create_decision_receipt(
+        schema_name="R8ReceiptSchema",
+        schema_digest="digest_r8_1",
+        prompt="receipt check",
+        values={"cat": "a"},
+        confidences={"cat": float("nan")},
+        conformal_sets={"cat": ["a"]},
+        probabilities={"cat": {"a": float("inf"), "b": 0.0}},
+        latency_ms=1.5,
+        is_ambiguous=False,
+        signing_key=sk,
+    )
+    created_dict = dataclasses.asdict(rec_created)
+    assert created_dict["confidences"]["cat"] == 0.0
+    assert created_dict["probabilities"]["cat"]["a"] == 0.0
+    assert check_decision_receipt_integrity(created_dict) is True
+    assert verify_decision_witness_receipt(created_dict, pk) is True
+
+    rec_base = create_decision_receipt(
+        schema_name="R8ReceiptSchema",
+        schema_digest="digest_r8_2",
+        prompt="receipt base",
+        values={"cat": "a"},
+        confidences={"cat": 1.0},
+        conformal_sets={"cat": ["a"]},
+        probabilities={"cat": {"a": 1.0, "b": 0.0}},
+        latency_ms=1.0,
+        is_ambiguous=False,
+        signing_key=sk,
+    )
+    base_dict = dataclasses.asdict(rec_base)
+    assert check_decision_receipt_integrity(base_dict) is True
+    assert verify_decision_witness_receipt(base_dict, pk) is True
+
+    tamper_ops: List[Callable[[Dict[str, Any]], None]] = [
+        lambda m: m["probabilities"]["cat"].__setitem__("b", float("nan")),
+        lambda m: m["probabilities"]["cat"].__setitem__("b", float("inf")),
+        lambda m: m["probabilities"]["cat"].__setitem__("b", float("-inf")),
+        lambda m: m["probabilities"]["cat"].__setitem__("b", False),
+        lambda m: m["probabilities"]["cat"].__setitem__("b", np.bool_(False)),
+        lambda m: m["confidences"].__setitem__("cat", float("nan")),
+        lambda m: m["confidences"].__setitem__("cat", True),
+        lambda m: m["confidences"].__setitem__("cat", np.bool_(True)),
+        lambda m: m.__setitem__("latency_ms", float("nan")),
+        lambda m: m.__setitem__("effective_alpha", float("inf")),
+        lambda m: m["values"].__setitem__("extra", float("nan")),
+        lambda m: m.__setitem__("conformal_sets", {"cat": ["a", float("nan")]}),
+    ]
+    for mutate in tamper_ops:
+        tampered = json.loads(json.dumps(base_dict))
+        mutate(tampered)
+        assert check_decision_receipt_integrity(tampered) is False
+        assert verify_decision_witness_receipt(tampered, pk) is False
+        with pytest.raises((TypeError, ValueError)):
+            compute_receipt_digest(tampered)
+
+    # R8-2: Vectorized Choice-only batch path honors instance-level schema.validate_decision hooks.
+    class _R8ChoiceOnlySchema(DecisionSchema):
+        cat = ChoiceField(("a", "b"))
+
+    inst_schema = _R8ChoiceOnlySchema()
+    m_inst = SystemOneCompiler(inst_schema, dimension=16).compile(
+        {"cat": [("alpha one", "a"), ("beta two", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+
+    def _instance_validate(values: Dict[str, Any]) -> Dict[str, Any]:
+        if values["cat"] == "b":
+            raise ValueError("instance policy rejects b")
+        out = dict(values)
+        out["cat"] = "transformed_a"
+        return out
+
+    inst_schema.validate_decision = _instance_validate  # type: ignore[method-assign]
+    eng_inst = SystemOneEngine(inst_schema, compiled_model=m_inst, use_cache=False)
+    assert eng_inst.decide("alpha one", record_receipt=False).values["cat"] == "transformed_a"
+    with pytest.raises(ValueError, match="instance policy rejects b"):
+        eng_inst.decide("beta two", record_receipt=False)
+
+    batch_ok = eng_inst.decide_batch(["alpha one", "alpha one"], record_receipt=False)
+    assert [res.values["cat"] for res in batch_ok] == ["transformed_a", "transformed_a"]
+    with pytest.raises(ValueError, match="instance policy rejects b"):
+        eng_inst.decide_batch(["beta two"], record_receipt=False)
+
+    # R8-3: [0, 1] ScoreField preserves authoritative float64 precision across single, batch, packed, callable, and overrides.
+    class _R8ScoreSchema(DecisionSchema):
+        score = ScoreField(min_value=0.0, max_value=1.0)
+
+    class _CancelProj:
+        dimension = 16
+
+        def project(self, text: str) -> np.ndarray:
+            v = np.zeros(16, dtype=np.float32)
+            v[0] = 1.0
+            v[1] = 1.0
+            return v
+
+        def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+            arr = np.zeros((len(texts), 16), dtype=np.float32)
+            arr[:, 0] = 1.0
+            arr[:, 1] = 1.0
+            return arr
+
+    m_score = SystemOneCompiler(_R8ScoreSchema, projector=_CancelProj(), dimension=16).compile(
+        {"score": [("alpha", 0.2), ("beta", 0.8)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    w_score_64 = np.zeros((1, 16), dtype=np.float64)
+    w_score_64[0, 0] = 1e8 + 1.0
+    w_score_64[0, 1] = -1e8
+    b_score_64 = np.zeros(1, dtype=np.float64)
+    # Keep stale float32 zeros on heads while placing authoritative float64 in _field_heads.
+    m_score.heads["score"].weights = np.zeros((1, 16), dtype=np.float32)
+    m_score.heads["score"].biases = np.zeros(1, dtype=np.float32)
+    assert m_score._field_heads is not None
+    m_score._field_heads["score"].weights = w_score_64.copy()
+    m_score._field_heads["score"].biases = b_score_64.copy()
+
+    eng_score = SystemOneEngine(_R8ScoreSchema, compiled_model=m_score, strict_mode=False, use_cache=False)
+    kernel_score = eng_score.compile_packed_kernel()
+    callable_score = eng_score.compile_callable()
+    expected_score = 0.9441927782421592
+
+    val_single = eng_score.decide("hello world", record_receipt=False).values["score"]
+    val_batch = eng_score.decide_batch(["hello world"], record_receipt=False)[0].values["score"]
+    emb_probe = kernel_score.encode_batch(["hello world"])
+    val_packed = float(kernel_score.forward_embeddings(emb_probe)["s_val"][0, 0])
+    val_callable = callable_score("hello world").values["score"]
+    for val in (val_single, val_batch, val_packed, val_callable):
+        assert math.isclose(val, expected_score, rel_tol=1e-12, abs_tol=1e-12)
+
+    tf_score = TfidfProjector(["alpha", "beta"], [1.0, 1.0])
+    m_score_tf = SystemOneCompiler(_R8ScoreSchema, projector=tf_score, dimension=tf_score.dimension).compile(
+        {"score": [("alpha", 0.2), ("beta", 0.8)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_score_tf = SystemOneEngine(_R8ScoreSchema, compiled_model=m_score_tf, strict_mode=False, use_cache=False)
+    eng_score_tf.learn("oov override r8", {"score": 0.125})
+    assert "oov override r8" in m_score_tf._learned_prompt_overrides
+    callable_ov = eng_score_tf.compile_callable()
+    single_ov_val = eng_score_tf.decide("oov override r8", record_receipt=False).values["score"]
+    callable_ov_val = callable_ov("oov override r8").values["score"]
+    assert math.isclose(callable_ov_val, single_ov_val, rel_tol=1e-12, abs_tol=1e-12)
+    assert math.isclose(callable_ov_val, 0.125, abs_tol=1e-5)
+
+    # R8-4: Refitting UtilityCascadeRouter starts from fresh engine state and rejects invalid tiers atomically.
+    router_r8 = drop_in_mod.UtilityCascadeRouter(error_multiplier=20.0, alpha=0.10)
+    prompts_90: List[str] = []
+    tiers_90: List[str] = []
+    for idx in range(30):
+        prompts_90.append(f"simple faq lookup {idx}")
+        tiers_90.append("system1_local")
+        prompts_90.append(f"summarize paragraph notes {idx}")
+        tiers_90.append("fast_small_model")
+        prompts_90.append(f"prove distributed theorem invariant {idx}")
+        tiers_90.append("frontier_reasoning_model")
+
+    router_r8.fit(prompts_90, tiers_90, cal_fraction=0.0)
+    assert router_r8._is_calibrated is False
+    first_engine = router_r8.engine
+    first_head = router_r8.ordinal_head
+    assert len(first_engine._learned_prompt_overrides) > 0
+
+    stale_engine_calls: List[str] = []
+    first_engine.learn = lambda p, d, *a, **kw: stale_engine_calls.append(p)  # type: ignore[method-assign]
+    refit_learned: List[tuple[int, str]] = []
+    refit_cal_prompts: List[str] = []
+    orig_learn_cls = SystemOneEngine.learn
+    orig_batch_raw_cls = drop_in_mod.UtilityCascadeRouter._batch_raw_probs
+
+    def _spy_learn_cls(self_eng: SystemOneEngine, prompt: str, decision: Any, *args: Any, **kwargs: Any) -> Any:
+        refit_learned.append((id(self_eng), prompt))
+        return orig_learn_cls(self_eng, prompt, decision, *args, **kwargs)
+
+    def _spy_batch_raw_cls(self_r: Any, pr_seq: Sequence[str], **kwargs: Any) -> np.ndarray:
+        refit_cal_prompts.extend(list(pr_seq))
+        return orig_batch_raw_cls(self_r, pr_seq, **kwargs)
+
+    SystemOneEngine.learn = _spy_learn_cls  # type: ignore[method-assign]
+    drop_in_mod.UtilityCascadeRouter._batch_raw_probs = _spy_batch_raw_cls  # type: ignore[method-assign]
+    try:
+        router_r8.fit(prompts_90, tiers_90)
+    finally:
+        SystemOneEngine.learn = orig_learn_cls  # type: ignore[method-assign]
+        drop_in_mod.UtilityCascadeRouter._batch_raw_probs = orig_batch_raw_cls  # type: ignore[method-assign]
+
+    assert router_r8.engine is not first_engine
+    assert router_r8.ordinal_head is not first_head
+    assert stale_engine_calls == []
+    assert router_r8._is_calibrated is True
+    assert len(refit_cal_prompts) >= 20
+    assert all(eid == id(router_r8.engine) for eid, _ in refit_learned)
+    ov_norm = {k.strip().lower() for k in router_r8.engine._learned_prompt_overrides.keys()}
+    cal_norm = {p.strip().lower() for p in refit_cal_prompts}
+    assert ov_norm.isdisjoint(cal_norm)
+
+    snap_eng, snap_head, snap_cal = router_r8.engine, router_r8.ordinal_head, router_r8._is_calibrated
+    with pytest.raises(ValueError):
+        router_r8.fit(["bad input"], ["unknown_tier_name"])
+    with pytest.raises(ValueError):
+        router_r8.fit(prompts_90[:6], tiers_90[:6], cal_prompts=["bad"], cal_tiers=["unknown_tier_name"])
+    assert router_r8.engine is snap_eng
+    assert router_r8.ordinal_head is snap_head
+    assert router_r8._is_calibrated is snap_cal
+
+    # R8-5: Infinite margins / non-finite derived arithmetic at 1e-308 raise ValueError cleanly with 0 RuntimeWarnings.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        for proj_5 in (
+            DeterministicSemanticProjector(dimension=16),
+            TfidfProjector(["alpha", "beta", "gamma", "delta"], [1.0, 1.0, 1.0, 1.0]),
+            HybridProjector(dimension=64, sparse_dim=32, dense_dim=32),
+        ):
+            m_5 = SystemOneCompiler(_R8ChoiceOnlySchema, projector=proj_5, dimension=proj_5.dimension).compile(
+                {"cat": [("alpha test", "a"), ("beta run", "b")] * 3},
+                calibration_split=0.0,
+                augment=False,
+            )
+            eng_5 = SystemOneEngine(_R8ChoiceOnlySchema, compiled_model=m_5, strict_mode=False)
+            w_0 = np.zeros((2, proj_5.dimension), dtype=np.float64)
+            b_03 = np.array([0.3, -0.3], dtype=np.float64)
+            eng_5.model.heads["cat"].weights = w_0.copy()
+            eng_5.model.heads["cat"].biases = b_03.copy()
+            assert eng_5.model._field_heads is not None
+            eng_5.model._field_heads["cat"].weights = w_0.copy()
+            eng_5.model._field_heads["cat"].biases = b_03.copy()
+            cal_5 = DecisionCalibrator()
+            cal_5.temperature = 1e-308
+            eng_5.calibrators["cat"] = cal_5
+            exp_5 = FastExplainer.from_engine(eng_5, "cat")
+            for prompt_5 in ("alpha test", ""):
+                with pytest.raises(ValueError):
+                    exp_5.explain(prompt_5)
+
+    # R8-6: FastExplainer preserves float64 precision on huge finite generic projections while rejecting genuine non-finite vectors.
+    class _FiniteOrBadProj:
+        dimension = 8
+
+        def __init__(self, first_val: float) -> None:
+            self.first_val = first_val
+
+        def project(self, text: str) -> np.ndarray:
+            v = np.zeros(8, dtype=np.float64)
+            v[0] = self.first_val
+            return v
+
+    m_huge = SystemOneCompiler(_R8ChoiceOnlySchema, projector=_FiniteOrBadProj(1e40), dimension=8).compile(
+        {"cat": [("alpha", "a"), ("beta", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_huge = SystemOneEngine(_R8ChoiceOnlySchema, compiled_model=m_huge, strict_mode=False)
+    dec_huge = eng_huge.decide("alpha", record_receipt=False)
+    res_huge = FastExplainer.from_engine(eng_huge, "cat").explain("alpha")
+    assert math.isfinite(res_huge.predicted_logit)
+    assert math.isfinite(res_huge.margin)
+    assert res_huge.predicted_label == str(dec_huge.values["cat"])
+
+    for nonfinite_val in (float("nan"), float("inf"), float("-inf")):
+        exp_nf = FastExplainer(
+            projector=_FiniteOrBadProj(nonfinite_val),
+            weights=np.array(
+                [[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+                dtype=np.float64,
+            ),
+            biases=np.zeros(2, dtype=np.float64),
+            options=("a", "b"),
+            train_texts=("alpha", "beta"),
+            train_labels=("a", "b"),
+        )
+        with pytest.raises(ValueError):
+            exp_nf.explain("alpha")
+
+    # R8-7: Stdlib UniversalDecisionsHTTPServer runs preflight_http_headers before reading rfile and closes unconsumed rejected connections.
+    svc_http = UniversalDecisionService(
+        upstream_handlers={"gemini": _mock_universal_handler},
+        bearer_token="r8-http-secret",
+        allowed_origins=("https://app.system1.local",),
+        max_body_bytes=1024,
+    )
+    srv_http = UniversalDecisionsHTTPServer(svc_http, port=0)
+    try:
+        handler_cls = srv_http._httpd.RequestHandlerClass
+
+        def _call_do_post(headers_map: Dict[str, str], body: bytes) -> tuple[List[int], List[int], bool, bytes]:
+            raw_hdr = "".join(f"{k}: {v}\r\n" for k, v in headers_map.items()).encode("latin-1") + b"\r\n"
+            parsed_hdr = parse_headers(io.BytesIO(raw_hdr))
+            read_calls: List[int] = []
+
+            class _SpyRfile:
+                def __init__(self, data: bytes) -> None:
+                    self._bio = io.BytesIO(data)
+
+                def read(self, n: int = -1) -> bytes:
+                    read_calls.append(n)
+                    return self._bio.read(n)
+
+            wbuf = io.BytesIO()
+            codes: List[int] = []
+            h = handler_cls.__new__(handler_cls)
+            h.path = "/v1beta/decisions"
+            h.headers = parsed_hdr
+            h.rfile = _SpyRfile(body)
+            h.wfile = wbuf
+            h.close_connection = False
+            h.send_response = lambda code, msg=None: codes.append(code)  # type: ignore[method-assign]
+            h.send_header = lambda k, v: None  # type: ignore[method-assign]
+            h.end_headers = lambda: None  # type: ignore[method-assign]
+            h.do_POST()
+            return codes, read_calls, bool(h.close_connection), wbuf.getvalue()
+
+        sc_401, rc_401, cc_401, _ = _call_do_post({"Content-Type": "application/json", "Content-Length": "2"}, b"{}")
+        assert sc_401 == [401] and rc_401 == [] and cc_401 is True
+
+        sc_403, rc_403, cc_403, _ = _call_do_post(
+            {
+                "Authorization": "Bearer r8-http-secret",
+                "Origin": "https://evil.local",
+                "Content-Type": "application/json",
+                "Content-Length": "2",
+            },
+            b"{}",
+        )
+        assert sc_403 == [403] and rc_403 == [] and cc_403 is True
+
+        for bad_len in (None, "notanint", "-5"):
+            hdrs_400: Dict[str, str] = {"Authorization": "Bearer r8-http-secret", "Content-Type": "application/json"}
+            if bad_len is not None:
+                hdrs_400["Content-Length"] = bad_len
+            sc_400, rc_400, cc_400, _ = _call_do_post(hdrs_400, b"{}")
+            assert sc_400 == [400] and rc_400 == [] and cc_400 is True
+
+        valid_payload = json.dumps(
+            {
+                "provider": "gemini",
+                "input": "hello gateway",
+                "questions": {"cat": {"type": "choice", "options": ["a", "b"]}},
+            }
+        ).encode("utf-8")
+        sc_200, rc_200, cc_200, _ = _call_do_post(
+            {
+                "Authorization": "Bearer r8-http-secret",
+                "Origin": "https://app.system1.local",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(valid_payload)),
+            },
+            valid_payload,
+        )
+        assert sc_200 == [200] and rc_200 == [len(valid_payload)] and cc_200 is False
+    finally:
+        srv_http._httpd.server_close()
+
+    # R8-8: S1M v2/v3 enforces strict projector header field types even when projector= is explicitly supplied.
+    proj16 = DeterministicSemanticProjector(dimension=16)
+    cm16 = SystemOneCompiler(_R8ChoiceOnlySchema, projector=proj16, dimension=16).compile(
+        {"cat": [("alpha one", "a"), ("beta two", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    v2_16 = cm16.to_bytes(compact=False, format_version=2)
+    v3_16 = cm16.to_bytes(compact=False, format_version=3)
+
+    def _tamper_proj_v2(raw: bytes, mut: Callable[[Dict[str, Any]], None]) -> bytes:
+        hl = struct.unpack(">I", raw[4:8])[0]
+        meta = json.loads(raw[8 : 8 + hl].decode("utf-8"))
+        mut(meta)
+        enc = json.dumps(meta, sort_keys=True).encode("utf-8")
+        return b"S1M\x02" + struct.pack(">I", len(enc)) + enc + raw[8 + hl :]
+
+    def _tamper_proj_v3(raw: bytes, mut: Callable[[Dict[str, Any]], None]) -> bytes:
+        hl = struct.unpack_from("<Q", raw, 8)[0]
+        meta = json.loads(raw[16 : 16 + hl].decode("utf-8"))
+        mut(meta)
+        enc = json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        first_off = min(spec["offset"] for spec in meta["tensors"].values())
+        assert 16 + len(enc) <= first_off
+        out = bytearray(raw)
+        struct.pack_into("<Q", out, 8, len(enc))
+        out[16:first_off] = enc.ljust(first_off - 16, b" ")
+        return bytes(out)
+
+    bad_proj_headers: List[Dict[str, Any]] = [
+        {"type": "deterministic", "dimension": 16.0, "recency_weighted": 0},
+        {"type": "deterministic", "dimension": 16, "recency_weighted": False, "unknown": 1},
+        {"type": "external", "class": "Custom", "dimension": 16, "unknown": True},
+        {"type": "external", "class": "", "dimension": 16},
+        {"type": "external", "class": "Custom", "dimension": 16, "digest": 123},
+    ]
+    for cfg in bad_proj_headers:
+        for fn_t, raw_b in ((_tamper_proj_v2, v2_16), (_tamper_proj_v3, v3_16)):
+            tampered_b = fn_t(raw_b, lambda m, c=cfg: m.__setitem__("projector", dict(c)))
+            for ext_p in (None, proj16):
+                with pytest.raises(ValueError):
+                    CompiledSystemOneModel.from_bytes(tampered_b, projector=ext_p)
+
+    proj1 = DeterministicSemanticProjector(dimension=1)
+    cm1 = SystemOneCompiler(_R8ChoiceOnlySchema, projector=proj1, dimension=1).compile(
+        {"cat": [("alpha one", "a"), ("beta two", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    for fn_t, raw_b in (
+        (_tamper_proj_v2, cm1.to_bytes(compact=False, format_version=2)),
+        (_tamper_proj_v3, cm1.to_bytes(compact=False, format_version=3)),
+    ):
+        tampered_b1 = fn_t(raw_b, lambda m: m["projector"].__setitem__("dimension", True))
+        for ext_p in (None, proj1):
+            with pytest.raises(ValueError):
+                CompiledSystemOneModel.from_bytes(tampered_b1, projector=ext_p)
+
+    # R8-9: Mixed NumPy-bool and Python bool inputs are rejected across OnlineMondrianConformal & MultiTenantSkillFleet without mutating state.
+    for bad_omc_kw in (
+        {"alpha": True},
+        {"gamma_aci": np.bool_(False)},
+        {"eta_u": True},
+        {"jump_w": np.bool_(True)},
+        {"q_init": [True, np.bool_(False), 0.2]},
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            OnlineMondrianConformal(3, **bad_omc_kw)
+
+    omc_r8 = OnlineMondrianConformal(num_classes=3, alpha=0.1)
+    omc_r8.update(0, 0.2, probs=[0.7, 0.2, 0.1])
+    snap_q = omc_r8.q_c.copy()
+    snap_u = omc_r8.u_c.copy()
+    snap_alpha = omc_r8.alpha_c.copy()
+    snap_err = omc_r8.err_ewma.copy()
+    snap_steps = omc_r8.steps
+
+    for mixed_p in ([np.bool_(True), 0.0, 0.0], (True, np.bool_(False), 0.5), np.array([True, False, False])):
+        with pytest.raises((TypeError, ValueError)):
+            omc_r8.predict_set(mixed_p)
+        with pytest.raises((TypeError, ValueError)):
+            omc_r8.should_accept(mixed_p)
+        with pytest.raises((TypeError, ValueError)):
+            omc_r8.update(0, probs=mixed_p)
+
+    for bad_upd in (
+        lambda: omc_r8.update(np.bool_(False), 0.1),
+        lambda: omc_r8.update(0, True),
+        lambda: omc_r8.update(0, np.bool_(True)),
+        lambda: omc_r8.update(0, err_y=True),
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            bad_upd()
+
+    np.testing.assert_array_equal(omc_r8.q_c, snap_q)
+    np.testing.assert_array_equal(omc_r8.u_c, snap_u)
+    np.testing.assert_array_equal(omc_r8.alpha_c, snap_alpha)
+    np.testing.assert_array_equal(omc_r8.err_ewma, snap_err)
+    assert omc_r8.steps == snap_steps
+
+    sd_ok = omc_r8.state_dict()
+    for sd_key in ("q_c", "u_c", "alpha_c", "err_ewma"):
+        sd_bad = dict(sd_ok)
+        sd_bad[sd_key] = [np.bool_(True), 0.0, 0.0]
+        with pytest.raises((TypeError, ValueError)):
+            OnlineMondrianConformal.from_state_dict(sd_bad)
+    sd_bad_steps = dict(sd_ok)
+    sd_bad_steps["steps"] = np.bool_(True)
+    with pytest.raises((TypeError, ValueError)):
+        OnlineMondrianConformal.from_state_dict(sd_bad_steps)
+
+    fleet_r8 = MultiTenantSkillFleet(
+        DeterministicSemanticProjector(dimension=8),
+        ["a", "b", "c"],
+        np.zeros((3, 8), dtype=np.float32),
+        np.zeros(3, dtype=np.float32),
+    )
+    snap_fq = fleet_r8.q_c[0].copy()
+    snap_fu = fleet_r8.u_c[0].copy()
+    snap_fa = fleet_r8.alpha_c[0].copy()
+    snap_fe = fleet_r8.err_ewma[0].copy()
+    for bad_fleet_call in (
+        lambda: fleet_r8.update_conformal(0, "a", [np.bool_(True), 0.0, 0.0]),
+        lambda: fleet_r8.update_conformal(0, "a", (True, np.bool_(False), 0.5)),
+        lambda: fleet_r8.update_conformal(0, "a", np.array([True, False, False])),
+        lambda: fleet_r8.update_conformal(0, "a", [0.6, 0.2, 0.2], is_logits=1),  # type: ignore[arg-type]
+        lambda: fleet_r8.update_conformal(0, "a", [0.6, 0.2, 0.2], eta_u=True),  # type: ignore[arg-type]
+        lambda: fleet_r8.update_conformal(0, "a", [0.6, 0.2, 0.2], jump_w=np.bool_(False)),  # type: ignore[arg-type]
+        lambda: fleet_r8.update_conformal(0, "a", [0.6, 0.2, 0.2], gamma_aci=True),  # type: ignore[arg-type]
+        lambda: fleet_r8.update_conformal(0, np.bool_(False), [0.6, 0.2, 0.2]),  # type: ignore[arg-type]
+        lambda: fleet_r8.update_conformal(np.bool_(False), "a", [0.6, 0.2, 0.2]),  # type: ignore[arg-type]
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            bad_fleet_call()
+    np.testing.assert_array_equal(fleet_r8.q_c[0], snap_fq)
+    np.testing.assert_array_equal(fleet_r8.u_c[0], snap_fu)
+    np.testing.assert_array_equal(fleet_r8.alpha_c[0], snap_fa)
+    np.testing.assert_array_equal(fleet_r8.err_ewma[0], snap_fe)

@@ -150,18 +150,60 @@ def _finite_float_or_zero(value: Any) -> float:
     return f if math.isfinite(f) else 0.0
 
 
+def _is_bool_like(value: Any) -> bool:
+    return isinstance(value, bool) or getattr(getattr(value, "dtype", None), "kind", None) == "b"
+
+
+def _strict_finite_float(value: Any, label: str = "value") -> float:
+    if _is_bool_like(value) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError(f"Receipt {label} must be a finite real number, got {value!r}")
+    try:
+        f = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Receipt {label} must be a finite real number, got {value!r}") from exc
+    if not math.isfinite(f):
+        raise ValueError(f"Receipt {label} must be finite, got {value!r}")
+    return f
+
+
+def _contains_nonfinite_number(obj: Any) -> bool:
+    if _is_bool_like(obj):
+        return False
+    if isinstance(obj, float):
+        return not math.isfinite(obj)
+    if isinstance(obj, complex):
+        return not (math.isfinite(obj.real) and math.isfinite(obj.imag))
+    dtype = getattr(obj, "dtype", None)
+    if dtype is not None and getattr(dtype, "kind", None) in ("f", "c"):
+        if getattr(obj, "ndim", 0) == 0 and hasattr(obj, "item"):
+            return _contains_nonfinite_number(obj.item())
+        if hasattr(obj, "tolist"):
+            return _contains_nonfinite_number(obj.tolist())
+    if isinstance(obj, MappingABC):
+        return any(_contains_nonfinite_number(k) or _contains_nonfinite_number(v) for k, v in obj.items())
+    if isinstance(obj, (list, tuple, SetABC)):
+        return any(_contains_nonfinite_number(item) for item in obj)
+    return False
+
+
 def _canonical_probabilities(
     probs: Optional[Mapping[str, Any]]
 ) -> Dict[str, Dict[str, float]]:
     """Normalizes and canonicalizes probability distributions deterministically."""
-    if not probs or not isinstance(probs, MappingABC):
+    if probs is None:
+        return {}
+    if not isinstance(probs, MappingABC):
+        raise ValueError("Receipt probabilities must be a mapping")
+    if not probs:
         return {}
     result: Dict[str, Dict[str, float]] = {}
-    for field_name, p_dist in sorted(probs.items()):
-        if isinstance(p_dist, MappingABC):
-            result[str(field_name)] = {
-                str(opt): round(_finite_float_or_zero(p), 12) for opt, p in sorted(p_dist.items())
-            }
+    for field_name, p_dist in sorted(probs.items(), key=lambda kv: str(kv[0])):
+        if not isinstance(p_dist, MappingABC):
+            raise ValueError(f"Receipt probabilities for {field_name!r} must be a mapping")
+        result[str(field_name)] = {
+            str(opt): round(_strict_finite_float(p, f"probabilities[{field_name!r}][{opt!r}]"), 12)
+            for opt, p in sorted(p_dist.items(), key=lambda kv: str(kv[0]))
+        }
     return result
 
 
@@ -559,16 +601,37 @@ class DecisionWitnessReceipt:
 
 def compute_receipt_digest(receipt_data: Mapping[str, Any]) -> str:
     """Computes canonical SHA-256 digest from a receipt dictionary or unsigned payload."""
+    if _contains_nonfinite_number(receipt_data):
+        raise ValueError("Receipt contains non-finite numeric values")
+    raw_confs = receipt_data.get("confidences")
+    if raw_confs is None:
+        confidences_clean: Dict[str, float] = {}
+    elif not isinstance(raw_confs, MappingABC):
+        raise ValueError("Receipt confidences must be a mapping")
+    else:
+        confidences_clean = {
+            str(k): _strict_finite_float(v, f"confidences[{k!r}]")
+            for k, v in raw_confs.items()
+        }
+    raw_csets = receipt_data.get("conformal_sets")
+    if raw_csets is None:
+        conformal_clean: Dict[str, List[Any]] = {}
+    elif not isinstance(raw_csets, MappingABC):
+        raise ValueError("Receipt conformal_sets must be a mapping")
+    else:
+        conformal_clean = {str(k): list(v) for k, v in raw_csets.items()}
+    raw_lat = receipt_data["latency_ms"] if "latency_ms" in receipt_data else 0.0
+    lat_val = _strict_finite_float(raw_lat, "latency_ms")
     payload: Dict[str, Any] = {
         "decision_id": str(receipt_data.get("decision_id", "")),
         "schema_name": str(receipt_data.get("schema_name", "")),
         "schema_digest": str(receipt_data.get("schema_digest", "")),
         "prompt_digest": str(receipt_data.get("prompt_digest", "")),
         "values": receipt_data.get("values", {}),
-        "confidences": {k: _finite_float_or_zero(v) for k, v in (receipt_data.get("confidences") or {}).items()},
-        "conformal_sets": {k: list(v) for k, v in (receipt_data.get("conformal_sets") or {}).items()},
+        "confidences": confidences_clean,
+        "conformal_sets": conformal_clean,
         "probabilities": _canonical_probabilities(receipt_data.get("probabilities")),
-        "latency_ms": round(float(receipt_data.get("latency_ms", 0.0)), 4),
+        "latency_ms": round(lat_val, 4),
         "is_ambiguous": bool(receipt_data.get("is_ambiguous", False)),
         "timestamp": str(receipt_data.get("timestamp", "")),
         "truth_ledger_head": str(receipt_data.get("truth_ledger_head", "")),
@@ -582,9 +645,15 @@ def compute_receipt_digest(receipt_data: Mapping[str, Any]) -> str:
         if receipt_data.get(extra_k) is not None:
             payload[extra_k] = receipt_data[extra_k]
     if receipt_data.get("effective_alpha") is not None:
-        payload["effective_alpha"] = round(float(receipt_data["effective_alpha"]), 6)
+        payload["effective_alpha"] = round(_strict_finite_float(receipt_data["effective_alpha"], "effective_alpha"), 6)
 
-    canonical_bytes_val = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    canonical_bytes_val = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        default=str,
+    ).encode("utf-8")
     return hashlib.sha256(canonical_bytes_val).hexdigest()
 
 
@@ -864,6 +933,8 @@ def _check_decision_receipt(
     envelope_data = receipt_data.get("envelope")
     if not envelope_data:
         raise ValueError("Receipt contains no RunWitnessEnvelope")
+    if _contains_nonfinite_number(receipt_data):
+        return False
 
     envelope = RunWitnessEnvelope.from_dict(envelope_data)
 
@@ -977,14 +1048,29 @@ def _check_decision_receipt(
         return False
 
     guard = envelope.guard_receipt or {}
-    if "confidences" in guard and guard.get("confidences") != receipt_data.get("confidences"):
-        return False
+    if "confidences" in guard:
+        try:
+            g_confs_raw = guard.get("confidences")
+            r_confs_raw = receipt_data.get("confidences")
+            if not isinstance(g_confs_raw, MappingABC) or not isinstance(r_confs_raw, MappingABC):
+                return False
+            g_confs = {str(k): _strict_finite_float(v, f"guard.confidences[{k!r}]") for k, v in g_confs_raw.items()}
+            r_confs = {str(k): _strict_finite_float(v, f"confidences[{k!r}]") for k, v in r_confs_raw.items()}
+        except (TypeError, ValueError):
+            return False
+        if g_confs != r_confs:
+            return False
     if "conformal_sets" in guard and guard.get("conformal_sets") != receipt_data.get("conformal_sets"):
         return False
     if "is_ambiguous" in guard and bool(guard.get("is_ambiguous")) != bool(receipt_data.get("is_ambiguous")):
         return False
     if "probabilities" in guard:
-        if _canonical_probabilities(guard.get("probabilities")) != _canonical_probabilities(receipt_data.get("probabilities")):
+        try:
+            g_probs = _canonical_probabilities(guard.get("probabilities"))
+            r_probs = _canonical_probabilities(receipt_data.get("probabilities"))
+        except (TypeError, ValueError):
+            return False
+        if g_probs != r_probs:
             return False
 
     # 4. Verify prompt hash integrity if prompt text is present
@@ -994,7 +1080,10 @@ def _check_decision_receipt(
             return False
 
     # 5. Verify closure receipt fingerprint matches receipt payload
-    computed_receipt_digest = compute_receipt_digest(receipt_data)
+    try:
+        computed_receipt_digest = compute_receipt_digest(receipt_data)
+    except (TypeError, ValueError):
+        return False
     if envelope.closure_receipt_fingerprint is not None:
         if envelope.closure_receipt_fingerprint != computed_receipt_digest:
             return False

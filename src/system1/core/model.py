@@ -547,12 +547,13 @@ def _has_custom_validate_decision(schema: Any) -> bool:
     schema_cls = schema if isinstance(schema, type) else type(schema)
     if not isinstance(schema, type) and "validate_decision" in getattr(schema, "__dict__", {}):
         return True
-    if (
-        isinstance(schema_cls, type)
-        and issubclass(schema_cls, DecisionSchema)
-        and schema_cls.validate_decision is not DecisionSchema.validate_decision
-    ):
+    cls_method = getattr(schema_cls, "validate_decision", None)
+    if cls_method is not DecisionSchema.validate_decision:
         return True
+    if not isinstance(schema, type):
+        bound_method = getattr(schema, "validate_decision", None)
+        if getattr(bound_method, "__func__", None) is not DecisionSchema.validate_decision:
+            return True
     return False
 
 
@@ -2844,6 +2845,8 @@ class PackedMultiQuestionKernel:
         c_raw_b: Optional[Tuple[np.ndarray, ...]] = None,
         b_raw_w: Optional[Tuple[np.ndarray, ...]] = None,
         b_raw_b: Optional[Tuple[np.ndarray, ...]] = None,
+        s_raw_w: Optional[Tuple[np.ndarray, ...]] = None,
+        s_raw_b: Optional[Tuple[np.ndarray, ...]] = None,
         s_default: Optional[np.ndarray] = None,
         zero_emb_unit0: bool = False,
     ) -> None:
@@ -3067,6 +3070,13 @@ class PackedMultiQuestionKernel:
         self.c_raw_b = _freeze_raw_tuple(c_raw_b)
         self.b_raw_w = _freeze_raw_tuple(b_raw_w)
         self.b_raw_b = _freeze_raw_tuple(b_raw_b)
+        self.s_raw_w = _freeze_raw_tuple(s_raw_w)
+        self.s_raw_b = _freeze_raw_tuple(s_raw_b)
+        self.s_has_raw_f64 = tuple(
+            (i < len(self.s_raw_w) and self.s_raw_w[i].dtype == np.float64)
+            or (i < len(self.s_raw_b) and self.s_raw_b[i].dtype == np.float64)
+            for i in range(self.Q_s)
+        )
         self.c_w_l1_max = _owned_readonly_array(
             np.array(
                 [
@@ -3262,6 +3272,8 @@ class PackedMultiQuestionKernel:
         s_is_cal: List[bool] = []
         s_escalate: List[bool] = []
         s_zero_head: List[bool] = []
+        s_raw_w: List[np.ndarray] = []
+        s_raw_b: List[np.ndarray] = []
 
         def _validate_head(fname: str) -> Any:
             h = heads[fname]
@@ -3427,8 +3439,34 @@ class PackedMultiQuestionKernel:
                 if not math.isfinite(raw_t) or raw_t <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {raw_t!r}")
                 temp = max(1e-4, raw_t)
-                W = np.asarray(head.weights, dtype=np.float64)[:1]
-                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)[:1]
+                raw_w_arr = np.asarray(head.weights)
+                raw_b_arr = np.asarray(head.biases).reshape(-1)
+                field_heads = getattr(eng.model, "_field_heads", None)
+                if (
+                    isinstance(field_heads, dict)
+                    and fname in field_heads
+                    and raw_w_arr.dtype != np.float64
+                    and raw_b_arr.dtype != np.float64
+                ):
+                    fh = field_heads[fname]
+                    fw_attr = getattr(fh, "weights", getattr(fh, "_weights", None))
+                    fb_attr = getattr(fh, "biases", getattr(fh, "_biases", None))
+                    if fw_attr is not None and fb_attr is not None:
+                        fw_arr = np.asarray(fw_attr)
+                        fb_arr = np.asarray(fb_attr).reshape(-1)
+                        if (
+                            (fw_arr.dtype == np.float64 or fb_arr.dtype == np.float64)
+                            and fw_arr.shape == raw_w_arr.shape
+                            and fb_arr.shape == raw_b_arr.shape
+                        ):
+                            if not (np.all(np.isfinite(fw_arr)) and np.all(np.isfinite(fb_arr))):
+                                raise ValueError(f"Score head weights for {fname!r} contain non-finite values")
+                            raw_w_arr = fw_arr
+                            raw_b_arr = fb_arr
+                W = np.asarray(raw_w_arr, dtype=np.float64)[:1]
+                b = np.asarray(raw_b_arr, dtype=np.float64).reshape(-1)[:1]
+                s_raw_w.append(np.ascontiguousarray(raw_w_arr)[:1])
+                s_raw_b.append(np.ascontiguousarray(raw_b_arr).reshape(-1)[:1])
                 W_cols.append(W.T)
                 b_cols.append(b)
                 s_raw_scale.append(temp)
@@ -3451,7 +3489,7 @@ class PackedMultiQuestionKernel:
                     m = rng_val if strict_mode else rng_val * ((1.0 - eff_alpha) / 2.0)
                 s_norm_margin.append(m / max(1e-6, rng_val))
                 s_escalate.append(bool(getattr(f_def, "escalate_on_ambiguity", True)))
-                s_zero_head.append(bool(not np.any(head.weights) and not np.any(head.biases)))
+                s_zero_head.append(bool(not np.any(W) and not np.any(b)))
 
         arr_dtype = np.float32 if storage_mode == "float32" else np.float16
         with np.errstate(over="ignore", invalid="ignore"):
@@ -3522,6 +3560,8 @@ class PackedMultiQuestionKernel:
             c_raw_b=tuple(c_raw_b),
             b_raw_w=tuple(b_raw_w),
             b_raw_b=tuple(b_raw_b),
+            s_raw_w=tuple(s_raw_w),
+            s_raw_b=tuple(s_raw_b),
             s_default=np.asarray(s_default, dtype=np.float64),
             zero_emb_unit0=zero_emb_unit0,
         )
@@ -3577,6 +3617,7 @@ class PackedMultiQuestionKernel:
         Xm_2d = Xm.reshape(1, -1) if is_1d else Xm
         c_model_ov = np.zeros((B, self.Q_c), dtype=bool)
         b_model_ov = np.zeros((B, self.Q_b), dtype=bool)
+        s_model_ov = np.zeros((B, self.Q_s), dtype=bool)
 
         if prompts is not None and self.model_learned_overrides:
             if not logits.flags.writeable:
@@ -3613,6 +3654,7 @@ class PackedMultiQuestionKernel:
                         ratio = float(np.clip((val_f - float(self.s_min[si])) / rng_f, 1e-4, 1.0 - 1e-4))
                         logit_t = float(np.float32(0.25 * math.log(ratio / (1.0 - ratio))))
                         logits[r, self.M_c + self.Q_b + si] = logit_t
+                        s_model_ov[r, si] = True
 
         zc = logits[:, : self.M_c]
         zb = logits[:, self.M_c : self.M_c + self.Q_b]
@@ -3983,6 +4025,15 @@ class PackedMultiQuestionKernel:
             in_b = np.empty((B, 0), dtype=np.int32)
 
         if self.Q_s > 0:
+            zs = np.array(logits[:, self.M_c + self.Q_b :], dtype=np.float64, copy=True)
+            if self.storage_mode == "float32":
+                for si in range(self.Q_s):
+                    if si < len(self.s_has_raw_f64) and self.s_has_raw_f64[si]:
+                        mask_s = ~s_model_ov[:, si]
+                        if np.any(mask_s):
+                            w64 = np.asarray(self.s_raw_w[si], dtype=np.float64)[0]
+                            b64 = float(np.asarray(self.s_raw_b[si], dtype=np.float64).reshape(-1)[0])
+                            zs[mask_s, si] = np.asarray(Xm_2d[mask_s], dtype=np.float64) @ w64 + b64
             with np.errstate(over="ignore", invalid="ignore"):
                 scaled_zs = zs / 0.25
                 zs_cal = scaled_zs / self.s_raw_scale[None, :]
@@ -4227,6 +4278,9 @@ class _BoundCallableState:
     c_b_abs_max: Tuple[float, ...] = ()
     b_raw_w: Tuple[np.ndarray, ...] = ()
     b_raw_b: Tuple[np.ndarray, ...] = ()
+    s_raw_w: Tuple[np.ndarray, ...] = ()
+    s_raw_b: Tuple[np.ndarray, ...] = ()
+    s_has_raw_f64: Tuple[bool, ...] = ()
     b_w_l1: Tuple[float, ...] = ()
     b_b_abs: Tuple[float, ...] = ()
     s_default: Tuple[float, ...] = ()
@@ -4371,6 +4425,9 @@ class FastDecisionCallable:
             c_b_abs_max=tuple(float(x) for x in kernel.c_b_abs_max),
             b_raw_w=kernel.b_raw_w,
             b_raw_b=kernel.b_raw_b,
+            s_raw_w=kernel.s_raw_w,
+            s_raw_b=kernel.s_raw_b,
+            s_has_raw_f64=kernel.s_has_raw_f64,
             b_w_l1=tuple(float(x) for x in kernel.b_w_l1),
             b_b_abs=tuple(float(x) for x in kernel.b_b_abs),
             s_default=tuple(float(x) for x in kernel.s_default),
@@ -4494,13 +4551,13 @@ class FastDecisionCallable:
                     f"embedding dimension mismatch: expected {st.kernel.dimension}, got {emb.shape[0]}"
                 )
 
-        has_prompt_override = bool(
-            embedding is None
-            and st.learned_overrides
-            and isinstance(prompt, str)
-            and prompt.strip()
-            and (" ".join(prompt.strip().casefold().split()) in st.learned_overrides)
-        )
+        has_prompt_override = False
+        if embedding is None and isinstance(prompt, str) and prompt.strip():
+            norm_prompt_key = " ".join(prompt.strip().casefold().split())
+            has_prompt_override = bool(
+                (st.learned_overrides and norm_prompt_key in st.learned_overrides)
+                or (st.kernel.model_learned_overrides and norm_prompt_key in st.kernel.model_learned_overrides)
+            )
         if not st.small_q or has_prompt_override:
             out = st.kernel.forward_embeddings(
                 emb, prompts=(prompt,) if has_prompt_override else None
@@ -4845,9 +4902,17 @@ class FastDecisionCallable:
 
         for si in range(st.Q_s):
             fn = st.s_names[si]
-            zv = z_list[st.s_offset + si]
+            zv = float(z_list[st.s_offset + si])
+            if (
+                si < len(st.s_has_raw_f64)
+                and st.s_has_raw_f64[si]
+                and (np.any(st.s_raw_w[si] != 0.0) or np.any(st.s_raw_b[si] != 0.0))
+            ):
+                w64 = np.asarray(st.s_raw_w[si], dtype=np.float64)[0]
+                b64 = float(np.asarray(st.s_raw_b[si], dtype=np.float64).reshape(-1)[0])
+                zv = float(np.asarray(emb, dtype=np.float64) @ w64 + b64)
             scaled_zs = zv / 0.25
-            z_cal = scaled_zs / st.s_raw_scale[si]
+            z_cal = scaled_zs / float(st.s_raw_scale[si])
             if (not emb_ok) or not (isfinite(zv) and isfinite(scaled_zs) and isfinite(z_cal)):
                 vals[fn] = st.s_default[si]
                 confs[fn] = float("nan")

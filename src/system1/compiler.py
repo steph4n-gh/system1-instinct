@@ -607,6 +607,38 @@ def _projector_config(projector: Any, *, include_arrays: bool = True) -> Dict[st
     return config
 
 
+def _validate_projector_header_strict(projector_config: Any, dimension: int) -> None:
+    if not isinstance(projector_config, Mapping) or not isinstance(projector_config.get("type"), str):
+        raise ValueError("Saved projector config must be a mapping with a string type")
+    kind = projector_config["type"]
+    if kind == "deterministic":
+        unexpected = set(projector_config.keys()) - {"type", "dimension", "recency_weighted"}
+        if unexpected:
+            raise ValueError(f"Saved deterministic projector config contains unexpected keys: {sorted(unexpected)}")
+        dim_cfg = projector_config.get("dimension")
+        if type(dim_cfg) is not int or dim_cfg != dimension:
+            raise ValueError("Saved projector dimension does not match the skill")
+        _strict_header_bool(
+            projector_config, "recency_weighted", False, "Saved deterministic projector"
+        )
+    elif kind == "external":
+        unexpected = set(projector_config.keys()) - {"type", "class", "dimension", "digest"}
+        if unexpected:
+            raise ValueError(f"Saved external projector config contains unexpected keys: {sorted(unexpected)}")
+        cls_name = projector_config.get("class")
+        if not isinstance(cls_name, str) or not cls_name.strip():
+            raise ValueError("Saved external projector config must define a non-empty class string")
+        if "dimension" not in projector_config:
+            raise ValueError("Saved external projector config must define dimension")
+        ext_dim = projector_config.get("dimension")
+        if ext_dim is not None and (type(ext_dim) is not int or ext_dim != dimension):
+            raise ValueError("Saved external projector dimension does not match the skill")
+        if "digest" in projector_config:
+            dig = projector_config["digest"]
+            if not isinstance(dig, str) or not dig.strip():
+                raise ValueError("Saved external projector digest must be a non-empty string")
+
+
 @dataclass
 class CompiledHeadWeights:
     """Calibrated weight and bias matrices for a single schema field."""
@@ -2479,6 +2511,7 @@ class CompiledSystemOneModel:
                     saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
 
         if projector_config is not None:
+            _validate_projector_header_strict(projector_config, dimension)
             if projector is not None:
                 if projector_config["type"] == "hybrid" and saved_hybrid is not None:
                     if (
@@ -2792,8 +2825,7 @@ class CompiledSystemOneModel:
         saved_tfidf = None
         saved_prag = None
         if projector_config is not None:
-            if not isinstance(projector_config, Mapping) or not isinstance(projector_config.get("type"), str):
-                raise ValueError("Saved projector config must be a mapping with a string type")
+            _validate_projector_header_strict(projector_config, dimension)
             kind = projector_config["type"]
             if kind == "tfidf":
                 tfidf_terms, _ = TfidfProjector.validate_header_config(
@@ -2813,7 +2845,10 @@ class CompiledSystemOneModel:
                 base_cfg = projector_config.get("base_tfidf", {})
                 if "prag_idf" in projector_config and isinstance(base_cfg, dict) and "idf" in base_cfg:
                     saved_prag = PragmaticCompositeProjector.from_config(projector_config)
-            if kind == "deterministic" and projector_config.get("dimension") != dimension:
+            if kind == "deterministic" and (
+                type(projector_config.get("dimension")) is not int
+                or projector_config.get("dimension") != dimension
+            ):
                 raise ValueError("Saved projector dimension does not match the skill")
             if kind == "hybrid":
                 from system1.core.embeddings import HybridProjector

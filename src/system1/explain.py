@@ -112,9 +112,23 @@ def _project_one(
         out = projector(text)
     if isinstance(out, tuple):
         out = out[0]
-    raw_arr = np.asarray(out, dtype=np.float32).reshape(-1)
+    raw_arr = np.asarray(out).reshape(-1)
     dim = int(raw_arr.shape[0] if dimension is None else dimension)
     return _normalize_raw_projection(raw_arr, dim, zero_unit0=bool(zero_unit0))
+
+
+def _require_finite_scalar(value: float, label: str) -> float:
+    f = float(value)
+    if not math.isfinite(f):
+        raise ValueError(f"Non-finite {label} in FastExplainer: {f!r}")
+    return f
+
+
+def _require_finite_array(arr: Any, label: str) -> np.ndarray:
+    arr_np = np.asarray(arr)
+    if not bool(np.all(np.isfinite(arr_np))):
+        raise ValueError(f"Non-finite {label} in FastExplainer")
+    return arr_np
 
 
 def _project_texts(
@@ -1463,15 +1477,16 @@ class FastExplainer:
             cal_logits = scaled / self._choice_cal_temp
         if not bool(np.all(np.isfinite(cal_logits))):
             raise ValueError("Reference explanation logits are non-finite (input or temperature overflow)")
-        s = cal_logits - float(np.max(cal_logits))
-        exps = np.exp(s)
-        denom = float(np.sum(exps))
-        if not (math.isfinite(denom) and denom > 0.0):
-            order = np.argsort(-cal_logits, kind="stable")
-            c1 = int(order[0])
-            c2 = int(order[1]) if len(order) > 1 else c1
-            return cal_logits, c1, c2
-        probs = exps / denom
+        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+            s = cal_logits - float(np.max(cal_logits))
+            exps = np.exp(s)
+            denom = float(np.sum(exps))
+            if not (math.isfinite(denom) and denom > 0.0):
+                order = np.argsort(-cal_logits, kind="stable")
+                c1 = int(order[0])
+                c2 = int(order[1]) if len(order) > 1 else c1
+                return cal_logits, c1, c2
+            probs = exps / denom
         c1 = int(np.argmax(probs))
         if self.num_classes > 1:
             c2 = max(
@@ -1563,12 +1578,16 @@ class FastExplainer:
         return self._select_winner(logits)
 
     def _select_winner(self, logits: np.ndarray) -> int:
+        _require_finite_array(logits, "logits")
         if self._is_boolean and logits.size == 2:
             if self.threshold <= 0.0:
                 return 1
             if self.threshold > 1.0:
                 return 0
-            s_cal = float(logits[1] - logits[0]) + self._bool_logit_shift
+            s_cal = _require_finite_scalar(
+                float(logits[1]) - float(logits[0]) + self._bool_logit_shift,
+                "calibrated boolean logit",
+            )
             half_s = 0.5 * s_cal
             s_max = half_s if half_s >= -half_s else -half_s
             e0 = math.exp(-half_s - s_max)
@@ -1606,64 +1625,69 @@ class FastExplainer:
 
         act_idx, act_raw, norm_sp, _ = self._extract_tfidf_fast(text, spans, kept_mask=kept_mask, need_trace=False)
         if not self.is_hybrid:
-            if norm_sp > 1e-12:
-                v_sp = (act_raw / norm_sp).astype(np.float32).astype(np.float64)
-                logits = (v_sp @ self.W_sp_T[act_idx]) + self.b_eff
-            else:
-                logits = self.b_eff.copy()
+            with np.errstate(over="ignore", invalid="ignore"):
+                if norm_sp > 1e-12:
+                    v_sp = (act_raw / norm_sp).astype(np.float32).astype(np.float64)
+                    logits = (v_sp @ self.W_sp_T[act_idx]) + self.b_eff
+                else:
+                    logits = self.b_eff.copy()
+                _require_finite_array(logits, "counterfactual kept logits")
             return self._select_winner_kept(logits, spans, kept_mask), logits
 
         u_dn, norm_dn, u_sc, norm_sc, _ = self._extract_hybrid_dense_and_spec_fast(
             text, spans, kept_mask=kept_mask, need_trace=False
         )
-        sp_ok = norm_sp > 1e-12
-        dn_ok = norm_dn > 1e-12
-        sc_ok = self.spd > 0 and norm_sc > 1e-12
-        v_sp = (act_raw / norm_sp).astype(np.float32).astype(np.float64) if sp_ok else act_raw
+        with np.errstate(over="ignore", invalid="ignore"):
+            sp_ok = norm_sp > 1e-12
+            dn_ok = norm_dn > 1e-12
+            sc_ok = self.spd > 0 and norm_sc > 1e-12
+            v_sp = (act_raw / norm_sp).astype(np.float32).astype(np.float64) if sp_ok else act_raw
 
-        b_sq = (
-            (self.w_sparse ** 2 if sp_ok else 0.0)
-            + (self.w_dense ** 2 if dn_ok else 0.0)
-            + (self.w_spec ** 2 if sc_ok else 0.0)
-        )
-        base_norm = math.sqrt(b_sq)
-        if base_norm <= 1e-12:
-            base_logits = self.W_base[:, 0] + self.b_eff
-            if self.has_rbf and self.L_sp_T is not None and self.W_rbf is not None:
-                sims = self.L_sp_T[0]
-                phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
-                u_rbf = phi / float(np.linalg.norm(phi))
-                logits = base_logits + self.W_rbf @ u_rbf
-            else:
-                logits = base_logits
-            return self._select_winner_kept(logits, spans, kept_mask), logits
+            b_sq = (
+                (self.w_sparse ** 2 if sp_ok else 0.0)
+                + (self.w_dense ** 2 if dn_ok else 0.0)
+                + (self.w_spec ** 2 if sc_ok else 0.0)
+            )
+            base_norm = math.sqrt(b_sq)
+            if base_norm <= 1e-12:
+                base_logits = self.W_base[:, 0] + self.b_eff
+                if self.has_rbf and self.L_sp_T is not None and self.W_rbf is not None:
+                    sims = self.L_sp_T[0]
+                    phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
+                    u_rbf = phi / float(np.linalg.norm(phi))
+                    logits = base_logits + self.W_rbf @ u_rbf
+                else:
+                    logits = base_logits
+                _require_finite_array(logits, "counterfactual kept logits")
+                return self._select_winner_kept(logits, spans, kept_mask), logits
 
-        g_sp = (self.w_sparse / base_norm) if sp_ok else 0.0
-        g_dn = (self.w_dense / base_norm) if dn_ok else 0.0
-        g_sc = (self.w_spec / base_norm) if sc_ok else 0.0
+            g_sp = (self.w_sparse / base_norm) if sp_ok else 0.0
+            g_dn = (self.w_dense / base_norm) if dn_ok else 0.0
+            g_sc = (self.w_spec / base_norm) if sc_ok else 0.0
 
-        logits = self.b_eff.copy()
-        if sp_ok:
-            logits += g_sp * (v_sp @ self.W_sp_T[act_idx])
-        if dn_ok:
-            logits += g_dn * (self.W_dn @ u_dn)
-        if sc_ok:
-            logits += g_sc * (self.W_sc @ u_sc)
-
-        if self.has_rbf and self.L_sp_T is not None and self.L_dn is not None and self.L_sc is not None and self.W_rbf is not None:
-            sims = np.zeros(self.num_landmarks, dtype=np.float64)
+            logits = self.b_eff.copy()
             if sp_ok:
-                sims += g_sp * (v_sp @ self.L_sp_T[act_idx])
+                logits += g_sp * (v_sp @ self.W_sp_T[act_idx])
             if dn_ok:
-                sims += g_dn * (self.L_dn @ u_dn)
+                logits += g_dn * (self.W_dn @ u_dn)
             if sc_ok:
-                sims += g_sc * (self.L_sc @ u_sc)
-            phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
-            pnorm = float(np.linalg.norm(phi))
-            if pnorm > 1e-12:
-                logits += self.W_rbf @ (phi / pnorm)
+                logits += g_sc * (self.W_sc @ u_sc)
 
-        return self._select_winner_kept(logits, spans, kept_mask), logits
+            if self.has_rbf and self.L_sp_T is not None and self.L_dn is not None and self.L_sc is not None and self.W_rbf is not None:
+                sims = np.zeros(self.num_landmarks, dtype=np.float64)
+                if sp_ok:
+                    sims += g_sp * (v_sp @ self.L_sp_T[act_idx])
+                if dn_ok:
+                    sims += g_dn * (self.L_dn @ u_dn)
+                if sc_ok:
+                    sims += g_sc * (self.L_sc @ u_sc)
+                phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
+                pnorm = float(np.linalg.norm(phi))
+                if pnorm > 1e-12:
+                    logits += self.W_rbf @ (phi / pnorm)
+
+            _require_finite_array(logits, "counterfactual kept logits")
+            return self._select_winner_kept(logits, spans, kept_mask), logits
 
     def _accumulate_tfidf_span_attrs(
         self,
@@ -1734,11 +1758,12 @@ class FastExplainer:
         )
         x_full = x_f32.astype(np.float64)
         logits, c1, c2 = self._eval_reference_logits_and_top2_from_emb(x_f32)
-        margin = float(logits[c1] - logits[c2])
+        _require_finite_array(logits, "logits")
+        margin = _require_finite_scalar(float(logits[c1]) - float(logits[c2]), "margin")
         sims_all = (self.X_train_full @ x_full.astype(np.float32)).astype(np.float64)
 
         if n_spans == 0:
-            return logits, c1, c2, margin, [], [], float(logits[c1]), margin, sims_all
+            return logits, c1, c2, margin, [], [], _require_finite_scalar(logits[c1], "baseline target logit"), margin, sims_all
 
         x_base = _project_one(
             self.projector,
@@ -1748,8 +1773,9 @@ class FastExplainer:
             dimension=self.dimension,
         )
         base_logits, _, _ = self._eval_reference_logits_and_top2_from_emb(x_base)
-        b_target = float(base_logits[c1])
-        b_margin = float(base_logits[c1] - base_logits[c2])
+        _require_finite_array(base_logits, "baseline logits")
+        b_target = _require_finite_scalar(base_logits[c1], "baseline target logit")
+        b_margin = _require_finite_scalar(float(base_logits[c1]) - float(base_logits[c2]), "baseline margin")
 
         loo_texts = [" ".join(spans[k][2] for k in range(n_spans) if k != j) for j in range(n_spans)]
         X_loo = _project_texts(
@@ -1763,16 +1789,24 @@ class FastExplainer:
         for r_idx in range(len(loo_texts)):
             rl, _, _ = self._eval_reference_logits_and_top2_from_emb(X_loo[r_idx])
             logits_loo[r_idx] = rl
-        raw_t = logits[c1] - logits_loo[:, c1]
-        raw_m = margin - (logits_loo[:, c1] - logits_loo[:, c2])
+        with np.errstate(over="ignore", invalid="ignore"):
+            _require_finite_array(logits_loo, "LOO logits")
+            raw_t = _require_finite_array(logits[c1] - logits_loo[:, c1], "target LOO diff")
+            raw_m = _require_finite_array(margin - (logits_loo[:, c1] - logits_loo[:, c2]), "margin LOO diff")
 
-        res_t = (float(logits[c1]) - b_target) - float(np.sum(raw_t))
-        abs_t = float(np.sum(np.abs(raw_t)))
-        t_arr = raw_t + (res_t * (np.abs(raw_t) / abs_t) if abs_t > 1e-12 else (res_t / n_spans))
+            res_t = _require_finite_scalar((float(logits[c1]) - b_target) - float(np.sum(raw_t)), "target residual")
+            abs_t = _require_finite_scalar(float(np.sum(np.abs(raw_t))), "target LOO sum")
+            t_arr = _require_finite_array(
+                raw_t + (res_t * (np.abs(raw_t) / abs_t) if abs_t > 1e-12 else (res_t / n_spans)),
+                "target attributions",
+            )
 
-        res_m = (margin - b_margin) - float(np.sum(raw_m))
-        abs_m = float(np.sum(np.abs(raw_m)))
-        m_arr = raw_m + (res_m * (np.abs(raw_m) / abs_m) if abs_m > 1e-12 else (res_m / n_spans))
+            res_m = _require_finite_scalar((margin - b_margin) - float(np.sum(raw_m)), "margin residual")
+            abs_m = _require_finite_scalar(float(np.sum(np.abs(raw_m))), "margin LOO sum")
+            m_arr = _require_finite_array(
+                raw_m + (res_m * (np.abs(raw_m) / abs_m) if abs_m > 1e-12 else (res_m / n_spans)),
+                "margin attributions",
+            )
 
         return logits, c1, c2, margin, t_arr.tolist(), m_arr.tolist(), b_target, b_margin, sims_all
 
@@ -1823,7 +1857,8 @@ class FastExplainer:
                                 "Reference explanation logits are non-finite (input or temperature overflow)"
                             )
                         c1, c2 = self._select_top2(logits)
-                margin = float(logits[c1] - logits[c2])
+                _require_finite_array(logits, "logits")
+                margin = _require_finite_scalar(float(logits[c1]) - float(logits[c2]), "margin")
                 t_attrs = [0.0] * n_spans
                 m_attrs = [0.0] * n_spans
                 b_target = float(logits[c1])
@@ -1844,17 +1879,19 @@ class FastExplainer:
             v_sp = (act_raw / norm_sp).astype(np.float32).astype(np.float64) if sp_ok else act_raw
 
             logits, c1, c2 = self._eval_reference_logits_and_top2_text(text)
-            margin = float(logits[c1] - logits[c2])
+            _require_finite_array(logits, "logits")
+            margin = _require_finite_scalar(float(logits[c1]) - float(logits[c2]), "margin")
 
             t_attrs = [0.0] * n_spans
             m_attrs = [0.0] * n_spans
             if sp_ok:
-                w_sp_act = self.W_sp_T[act_idx]
-                w_c1 = w_sp_act[:, c1]
-                w_mg = w_c1 - w_sp_act[:, c2]
-                self._accumulate_tfidf_span_attrs(sp_trace, act_idx, w_c1, w_mg, 1.0 / norm_sp, t_attrs, m_attrs)
-                b_target = float(self.b_eff[c1])
-                b_margin = float(self.b_eff[c1] - self.b_eff[c2])
+                with np.errstate(over="ignore", invalid="ignore"):
+                    w_sp_act = self.W_sp_T[act_idx]
+                    w_c1 = w_sp_act[:, c1]
+                    w_mg = _require_finite_array(w_c1 - w_sp_act[:, c2], "sparse margin weights")
+                    self._accumulate_tfidf_span_attrs(sp_trace, act_idx, w_c1, w_mg, 1.0 / norm_sp, t_attrs, m_attrs)
+                b_target = _require_finite_scalar(self.b_eff[c1], "baseline target logit")
+                b_margin = _require_finite_scalar(float(self.b_eff[c1]) - float(self.b_eff[c2]), "baseline margin")
             else:
                 b_target = float(logits[c1])
                 b_margin = margin
@@ -1881,7 +1918,8 @@ class FastExplainer:
             base_norm = math.sqrt(b_sq)
 
             logits, c1, c2 = self._eval_reference_logits_and_top2_text(text)
-            margin = float(logits[c1] - logits[c2])
+            _require_finite_array(logits, "logits")
+            margin = _require_finite_scalar(float(logits[c1]) - float(logits[c2]), "margin")
 
             if base_norm <= 1e-12:
                 t_attrs = [0.0] * n_spans
@@ -1927,124 +1965,148 @@ class FastExplainer:
                     has_active_spans = True
                     if self.has_rbf and self.W_rbf is not None and self.L_sp_T is not None:
                         # 10-point Gauss-Legendre path integral for RBF + L2 normalization nonlinearity.
-                        W_pair_rbf = np.vstack([self.W_rbf[c1], self.W_rbf[c1] - self.W_rbf[c2]])
-                        Phi_q = np.exp(self.rbf_gamma * (_IG_T * sims.reshape(1, -1) - 1.0))
-                        r_q = np.linalg.norm(Phi_q, axis=1, keepdims=True)
-                        U_q = Phi_q / np.maximum(1e-12, r_q)
-                        Z_q = U_q @ W_pair_rbf.T
-                        scale_q = (_IG_W * (self.rbf_gamma / np.maximum(1e-12, r_q))) * Phi_q
-                        beta = np.sum(scale_q, axis=0)[None, :] * W_pair_rbf - Z_q.T @ (scale_q * U_q)
+                        with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+                            W_pair_rbf = np.vstack([self.W_rbf[c1], self.W_rbf[c1] - self.W_rbf[c2]])
+                            Phi_q = np.exp(self.rbf_gamma * (_IG_T * sims.reshape(1, -1) - 1.0))
+                            r_q = np.linalg.norm(Phi_q, axis=1, keepdims=True)
+                            U_q = Phi_q / np.maximum(1e-12, r_q)
+                            Z_q = U_q @ W_pair_rbf.T
+                            scale_q = (_IG_W * (self.rbf_gamma / np.maximum(1e-12, r_q))) * Phi_q
+                            beta = np.sum(scale_q, axis=0)[None, :] * W_pair_rbf - Z_q.T @ (scale_q * U_q)
+                        _require_finite_array(beta, "hybrid RBF path-integral weights")
 
-                        w_sp_act = self.W_sp_T[act_idx]
-                        l_sp_act = self.L_sp_T[act_idx] if sp_ok else None
-                        w_eff_sp_c1 = w_sp_act[:, c1] + (l_sp_act @ beta[0] if l_sp_act is not None else 0.0)
-                        w_eff_sp_mg = (w_sp_act[:, c1] - w_sp_act[:, c2]) + (
-                            l_sp_act @ beta[1] if l_sp_act is not None else 0.0
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            w_sp_act = self.W_sp_T[act_idx]
+                            l_sp_act = self.L_sp_T[act_idx] if sp_ok else None
+                            w_eff_sp_c1 = w_sp_act[:, c1] + (l_sp_act @ beta[0] if l_sp_act is not None else 0.0)
+                            w_eff_sp_mg = _require_finite_array(
+                                (w_sp_act[:, c1] - w_sp_act[:, c2]) + (
+                                    l_sp_act @ beta[1] if l_sp_act is not None else 0.0
+                                ),
+                                "hybrid sparse margin weights",
+                            )
+                        b_target = _require_finite_scalar(
+                            float(self.b_eff[c1]) + float(self.b_rbf0[c1]),
+                            "baseline target logit",
                         )
-                        b_target = float(self.b_eff[c1] + self.b_rbf0[c1])
-                        b_margin = float((self.b_eff[c1] - self.b_eff[c2]) + (self.b_rbf0[c1] - self.b_rbf0[c2]))
+                        b_margin = _require_finite_scalar(
+                            (float(self.b_eff[c1]) - float(self.b_eff[c2]))
+                            + (float(self.b_rbf0[c1]) - float(self.b_rbf0[c2])),
+                            "baseline margin",
+                        )
                     else:
                         beta = None
-                        w_sp_act = self.W_sp_T[act_idx]
-                        w_eff_sp_c1 = w_sp_act[:, c1]
-                        w_eff_sp_mg = w_sp_act[:, c1] - w_sp_act[:, c2]
-                        b_target = float(self.b_eff[c1])
-                        b_margin = float(self.b_eff[c1] - self.b_eff[c2])
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            w_sp_act = self.W_sp_T[act_idx]
+                            w_eff_sp_c1 = w_sp_act[:, c1]
+                            w_eff_sp_mg = _require_finite_array(
+                                w_sp_act[:, c1] - w_sp_act[:, c2],
+                                "hybrid sparse margin weights",
+                            )
+                        b_target = _require_finite_scalar(float(self.b_eff[c1]), "baseline target logit")
+                        b_margin = _require_finite_scalar(
+                            float(self.b_eff[c1]) - float(self.b_eff[c2]),
+                            "baseline margin",
+                        )
 
                     t_attrs = [0.0] * n_spans
                     m_attrs = [0.0] * n_spans
 
                     if sp_ok:
-                        self._accumulate_tfidf_span_attrs(
-                            sp_trace, act_idx, w_eff_sp_c1, w_eff_sp_mg, g_sp / norm_sp, t_attrs, m_attrs
-                        )
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            self._accumulate_tfidf_span_attrs(
+                                sp_trace, act_idx, w_eff_sp_c1, w_eff_sp_mg, g_sp / norm_sp, t_attrs, m_attrs
+                            )
 
                     if dn_ok and has_dn_events and hd_trace is not None:
-                        dn_coef = g_dn / norm_dn
-                        wb_c1 = self.W_bucket_dn[c1]
-                        wb_mg = wb_c1 - self.W_bucket_dn[c2]
-                        if beta is not None and self.L_bucket_dn is not None:
-                            b0_dn = beta[0] @ self.L_bucket_dn
-                            b1_dn = beta[1] @ self.L_bucket_dn
-                            for sp_j, h_word, w_wt, sub_w, sub_l in hd_trace["dn_word_events"]:
-                                dt = (float(wb_c1[h_word]) + float(b0_dn[h_word])) * w_wt
-                                dm = (float(wb_mg[h_word]) + float(b1_dn[h_word])) * w_wt
-                                if sub_w is not None and sub_l is not None:
-                                    dt += float(sub_w[c1]) + float(beta[0] @ sub_l)
-                                    dm += float(sub_w[c1] - sub_w[c2]) + float(beta[1] @ sub_l)
-                                t_attrs[sp_j] += dt * dn_coef
-                                m_attrs[sp_j] += dm * dn_coef
-                            for sp_j, b_idx, wt in hd_trace["dn_unary_events"]:
-                                c_wt = wt * dn_coef
-                                t_attrs[sp_j] += (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
-                                m_attrs[sp_j] += (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
-                            for sp0, sp1, b_idx, half_wt in hd_trace["dn_bi_events"]:
-                                c_wt = half_wt * dn_coef
-                                dt = (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
-                                dm = (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
-                                t_attrs[sp0] += dt
-                                t_attrs[sp1] += dt
-                                m_attrs[sp0] += dm
-                                m_attrs[sp1] += dm
-                            for hit_spans, b_idx, wt in hd_trace["dn_mw_events"]:
-                                c_wt = (wt / len(hit_spans)) * dn_coef
-                                dt = (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
-                                dm = (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
-                                for sp_j in hit_spans:
-                                    t_attrs[sp_j] += dt
-                                    m_attrs[sp_j] += dm
-                        else:
-                            for sp_j, h_word, w_wt, sub_w, _ in hd_trace["dn_word_events"]:
-                                dt = float(wb_c1[h_word]) * w_wt
-                                dm = float(wb_mg[h_word]) * w_wt
-                                if sub_w is not None:
-                                    dt += float(sub_w[c1])
-                                    dm += float(sub_w[c1] - sub_w[c2])
-                                t_attrs[sp_j] += dt * dn_coef
-                                m_attrs[sp_j] += dm * dn_coef
-                            for sp_j, b_idx, wt in hd_trace["dn_unary_events"]:
-                                c_wt = wt * dn_coef
-                                t_attrs[sp_j] += float(wb_c1[b_idx]) * c_wt
-                                m_attrs[sp_j] += float(wb_mg[b_idx]) * c_wt
-                            for sp0, sp1, b_idx, half_wt in hd_trace["dn_bi_events"]:
-                                c_wt = half_wt * dn_coef
-                                dt = float(wb_c1[b_idx]) * c_wt
-                                dm = float(wb_mg[b_idx]) * c_wt
-                                t_attrs[sp0] += dt
-                                t_attrs[sp1] += dt
-                                m_attrs[sp0] += dm
-                                m_attrs[sp1] += dm
-                            for hit_spans, b_idx, wt in hd_trace["dn_mw_events"]:
-                                c_wt = (wt / len(hit_spans)) * dn_coef
-                                dt = float(wb_c1[b_idx]) * c_wt
-                                dm = float(wb_mg[b_idx]) * c_wt
-                                for sp_j in hit_spans:
-                                    t_attrs[sp_j] += dt
-                                    m_attrs[sp_j] += dm
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            dn_coef = g_dn / norm_dn
+                            wb_c1 = self.W_bucket_dn[c1]
+                            wb_mg = _require_finite_array(wb_c1 - self.W_bucket_dn[c2], "hybrid dense margin weights")
+                            if beta is not None and self.L_bucket_dn is not None:
+                                b0_dn = beta[0] @ self.L_bucket_dn
+                                b1_dn = beta[1] @ self.L_bucket_dn
+                                for sp_j, h_word, w_wt, sub_w, sub_l in hd_trace["dn_word_events"]:
+                                    dt = (float(wb_c1[h_word]) + float(b0_dn[h_word])) * w_wt
+                                    dm = (float(wb_mg[h_word]) + float(b1_dn[h_word])) * w_wt
+                                    if sub_w is not None and sub_l is not None:
+                                        dt += float(sub_w[c1]) + float(beta[0] @ sub_l)
+                                        dm += float(sub_w[c1] - sub_w[c2]) + float(beta[1] @ sub_l)
+                                    t_attrs[sp_j] += dt * dn_coef
+                                    m_attrs[sp_j] += dm * dn_coef
+                                for sp_j, b_idx, wt in hd_trace["dn_unary_events"]:
+                                    c_wt = wt * dn_coef
+                                    t_attrs[sp_j] += (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
+                                    m_attrs[sp_j] += (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
+                                for sp0, sp1, b_idx, half_wt in hd_trace["dn_bi_events"]:
+                                    c_wt = half_wt * dn_coef
+                                    dt = (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
+                                    dm = (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
+                                    t_attrs[sp0] += dt
+                                    t_attrs[sp1] += dt
+                                    m_attrs[sp0] += dm
+                                    m_attrs[sp1] += dm
+                                for hit_spans, b_idx, wt in hd_trace["dn_mw_events"]:
+                                    c_wt = (wt / len(hit_spans)) * dn_coef
+                                    dt = (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
+                                    dm = (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
+                                    for sp_j in hit_spans:
+                                        t_attrs[sp_j] += dt
+                                        m_attrs[sp_j] += dm
+                            else:
+                                for sp_j, h_word, w_wt, sub_w, _ in hd_trace["dn_word_events"]:
+                                    dt = float(wb_c1[h_word]) * w_wt
+                                    dm = float(wb_mg[h_word]) * w_wt
+                                    if sub_w is not None:
+                                        dt += float(sub_w[c1])
+                                        dm += float(sub_w[c1] - sub_w[c2])
+                                    t_attrs[sp_j] += dt * dn_coef
+                                    m_attrs[sp_j] += dm * dn_coef
+                                for sp_j, b_idx, wt in hd_trace["dn_unary_events"]:
+                                    c_wt = wt * dn_coef
+                                    t_attrs[sp_j] += float(wb_c1[b_idx]) * c_wt
+                                    m_attrs[sp_j] += float(wb_mg[b_idx]) * c_wt
+                                for sp0, sp1, b_idx, half_wt in hd_trace["dn_bi_events"]:
+                                    c_wt = half_wt * dn_coef
+                                    dt = float(wb_c1[b_idx]) * c_wt
+                                    dm = float(wb_mg[b_idx]) * c_wt
+                                    t_attrs[sp0] += dt
+                                    t_attrs[sp1] += dt
+                                    m_attrs[sp0] += dm
+                                    m_attrs[sp1] += dm
+                                for hit_spans, b_idx, wt in hd_trace["dn_mw_events"]:
+                                    c_wt = (wt / len(hit_spans)) * dn_coef
+                                    dt = float(wb_c1[b_idx]) * c_wt
+                                    dm = float(wb_mg[b_idx]) * c_wt
+                                    for sp_j in hit_spans:
+                                        t_attrs[sp_j] += dt
+                                        m_attrs[sp_j] += dm
 
                     if sc_ok and hd_trace is not None:
-                        sc_coef = g_sc / norm_sc
-                        wt_c1 = self.W_term_sc[c1]
-                        wt_mg = wt_c1 - self.W_term_sc[c2]
-                        if beta is not None and self.L_term_sc is not None:
-                            wt_c1 = wt_c1 + beta[0] @ self.L_term_sc
-                            wt_mg = wt_mg + beta[1] @ self.L_term_sc
-                        sc_occ = hd_trace["sc_occ"]
-                        for tidx, sp_list in hd_trace["spec_w_map"].items():
-                            vc = sc_occ[tidx] * sc_coef
-                            dt = float(wt_c1[tidx]) * vc
-                            dm = float(wt_mg[tidx]) * vc
-                            for sp_j in sp_list:
-                                t_attrs[sp_j] += dt
-                                m_attrs[sp_j] += dm
-                        for tidx, sp0, sp1 in hd_trace["spec_bi_events"]:
-                            vc = 0.5 * sc_occ[tidx] * sc_coef
-                            dt = float(wt_c1[tidx]) * vc
-                            dm = float(wt_mg[tidx]) * vc
-                            t_attrs[sp0] += dt
-                            t_attrs[sp1] += dt
-                            m_attrs[sp0] += dm
-                            m_attrs[sp1] += dm
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            sc_coef = g_sc / norm_sc
+                            wt_c1 = self.W_term_sc[c1]
+                            wt_mg = wt_c1 - self.W_term_sc[c2]
+                            if beta is not None and self.L_term_sc is not None:
+                                wt_c1 = wt_c1 + beta[0] @ self.L_term_sc
+                                wt_mg = wt_mg + beta[1] @ self.L_term_sc
+                            _require_finite_array(wt_mg, "hybrid spectral margin weights")
+                            sc_occ = hd_trace["sc_occ"]
+                            for tidx, sp_list in hd_trace["spec_w_map"].items():
+                                vc = sc_occ[tidx] * sc_coef
+                                dt = float(wt_c1[tidx]) * vc
+                                dm = float(wt_mg[tidx]) * vc
+                                for sp_j in sp_list:
+                                    t_attrs[sp_j] += dt
+                                    m_attrs[sp_j] += dm
+                            for tidx, sp0, sp1 in hd_trace["spec_bi_events"]:
+                                vc = 0.5 * sc_occ[tidx] * sc_coef
+                                dt = float(wt_c1[tidx]) * vc
+                                dm = float(wt_mg[tidx]) * vc
+                                t_attrs[sp0] += dt
+                                t_attrs[sp1] += dt
+                                m_attrs[sp0] += dm
+                                m_attrs[sp1] += dm
 
                 rest_pieces: List[np.ndarray] = [(u_dn * (self.wb * g_dn)).astype(np.float32)]
                 if self.spd > 0:
@@ -2057,33 +2119,40 @@ class FastExplainer:
                     sp_scaled = (v_sp * (self.wb * g_sp)).astype(np.float32)
                     sims_all += (sp_scaled @ self.X_train_sp_T[act_idx]).astype(np.float64)
 
-        if not override_hit and self._mode in ("tfidf", "hybrid") and n_spans > 0 and has_active_spans:
-            f32_tol = 32.0 * float(np.finfo(np.float32).eps) * (
-                float(np.sum(np.abs(self.W_eff[c1])))
-                + float(np.sum(np.abs(self.W_eff[c2])))
-                + abs(b_target)
-                + abs(b_margin)
-                + 1.0
-            )
-            res_t = float(logits[c1]) - (sum(t_attrs) + b_target)
-            if 0.0 < abs(res_t) <= f32_tol:
-                abs_t = sum(abs(v) for v in t_attrs)
-                if abs_t > 1e-12:
-                    t_attrs = [v + res_t * (abs(v) / abs_t) for v in t_attrs]
-                else:
-                    t_attrs = [v + (res_t / n_spans) for v in t_attrs]
-            res_m = margin - (sum(m_attrs) + b_margin)
-            if 0.0 < abs(res_m) <= f32_tol:
-                abs_m = sum(abs(v) for v in m_attrs)
-                if abs_m > 1e-12:
-                    m_attrs = [v + res_m * (abs(v) / abs_m) for v in m_attrs]
-                else:
-                    m_attrs = [v + (res_m / n_spans) for v in m_attrs]
+        if not (all(math.isfinite(float(v)) for v in t_attrs) and all(math.isfinite(float(v)) for v in m_attrs)):
+            raise ValueError("Non-finite span attribution in FastExplainer")
 
-        sum_t = sum(t_attrs) + b_target
-        sum_m = sum(m_attrs) + b_margin
-        err_t = abs(sum_t - float(logits[c1]))
-        err_m = abs(sum_m - margin)
+        if not override_hit and self._mode in ("tfidf", "hybrid") and n_spans > 0 and has_active_spans:
+            with np.errstate(over="ignore", invalid="ignore"):
+                f32_tol = 32.0 * float(np.finfo(np.float32).eps) * (
+                    float(np.sum(np.abs(self.W_eff[c1])))
+                    + float(np.sum(np.abs(self.W_eff[c2])))
+                    + abs(b_target)
+                    + abs(b_margin)
+                    + 1.0
+                )
+                if math.isfinite(f32_tol):
+                    res_t = float(logits[c1]) - (sum(t_attrs) + b_target)
+                    if math.isfinite(res_t) and 0.0 < abs(res_t) <= f32_tol:
+                        abs_t = sum(abs(v) for v in t_attrs)
+                        if abs_t > 1e-12:
+                            t_attrs = [v + res_t * (abs(v) / abs_t) for v in t_attrs]
+                        else:
+                            t_attrs = [v + (res_t / n_spans) for v in t_attrs]
+                    res_m = margin - (sum(m_attrs) + b_margin)
+                    if math.isfinite(res_m) and 0.0 < abs(res_m) <= f32_tol:
+                        abs_m = sum(abs(v) for v in m_attrs)
+                        if abs_m > 1e-12:
+                            m_attrs = [v + res_m * (abs(v) / abs_m) for v in m_attrs]
+                        else:
+                            m_attrs = [v + (res_m / n_spans) for v in m_attrs]
+
+        if not (all(math.isfinite(float(v)) for v in t_attrs) and all(math.isfinite(float(v)) for v in m_attrs)):
+            raise ValueError("Non-finite span attribution in FastExplainer")
+        sum_t = _require_finite_scalar(sum(t_attrs) + b_target, "target attribution sum")
+        sum_m = _require_finite_scalar(sum(m_attrs) + b_margin, "margin attribution sum")
+        err_t = _require_finite_scalar(abs(sum_t - float(logits[c1])), "target additivity error")
+        err_m = _require_finite_scalar(abs(sum_m - margin), "margin additivity error")
 
         same_mask = self._class_masks[c1]
         if self._has_same[c1]:
@@ -2136,7 +2205,11 @@ class FastExplainer:
                     cf_k = best_idx + 1
                     cf_tokens = tuple(spans[pos_order[s]][2] for s in range(cf_k))
                     cf_new_lbl = self.options[best_nc]
-                    cf_new_margin = float(best_nl[c1] - best_nl[best_nc])
+                    _require_finite_array(best_nl, "counterfactual logits")
+                    cf_new_margin = _require_finite_scalar(
+                        float(best_nl[c1]) - float(best_nl[best_nc]),
+                        "counterfactual margin",
+                    )
                 else:
                     for step in range(est_idx + 1, max_try):
                         fl, nc_s, nl_s = _probe(step)
@@ -2145,7 +2218,11 @@ class FastExplainer:
                             cf_k = step + 1
                             cf_tokens = tuple(spans[pos_order[s]][2] for s in range(cf_k))
                             cf_new_lbl = self.options[nc_s]
-                            cf_new_margin = float(nl_s[c1] - nl_s[nc_s])
+                            _require_finite_array(nl_s, "counterfactual logits")
+                            cf_new_margin = _require_finite_scalar(
+                                float(nl_s[c1]) - float(nl_s[nc_s]),
+                                "counterfactual margin",
+                            )
                             break
 
         elapsed_us = (time.perf_counter_ns() - t0) / 1000.0

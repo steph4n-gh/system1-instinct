@@ -551,6 +551,20 @@ class UtilityCascadeRouter:
             cal_tiers_eff = None
 
         y_fit = self._parse_tiers(fit_tiers)
+        if len(fit_prompts) != len(y_fit):
+            raise ValueError("fit_prompts and fit_tiers must have identical length")
+        if cal_prompts_eff is not None and cal_tiers_eff is not None:
+            y_cal_chk = self._parse_tiers(cal_tiers_eff)
+            if len(cal_prompts_eff) != len(y_cal_chk):
+                raise ValueError("cal_prompts and cal_tiers must have identical length")
+        if (
+            getattr(self.engine, "_online_lesson_count", 0) > 0
+            or getattr(self.engine, "model_version", 1) > 1
+            or bool(getattr(self.engine, "_learned_prompt_overrides", None))
+            or bool(getattr(self.engine, "_override_counts", None))
+        ):
+            self.engine = SystemOneEngine(RouteLLMCascadeSchema, strict_mode=False, use_cache=True)
+        self.ordinal_head = None
         for prompt, tier_idx in zip(fit_prompts, y_fit):
             tier_name = CASCADE_TIERS[int(tier_idx)]
             self.engine.learn(

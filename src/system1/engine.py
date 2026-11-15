@@ -3790,7 +3790,7 @@ class SystemOneEngine:
             is_hybrid_proj = isinstance(proj_obj, HybridProjector)
             schema_name = self.schema.schema_name
             schema_digest = self.schema.schema_digest()
-            custom_validate = type(self.schema).validate_decision is not DecisionSchema.validate_decision
+            custom_validate = _has_custom_validate_decision(self.schema)
 
             online_bank_map = getattr(self.model, "_online_prototype_bank", {})
             model_field_heads = getattr(self.model, "_field_heads", {})

@@ -789,12 +789,17 @@ def test_utility_cascade_router_end_to_end() -> None:
 
 
 def test_pure_numpy_no_scipy_or_sklearn_in_wave3_modules() -> None:
+    src_root = str(Path(system1.__file__).resolve().parent.parent)
     subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import sys, system1.calibration, system1.compat.universal, "
+                f"import sys; sys.path.insert(0, {src_root!r}); "
+                "sys.modules['mlx'] = None; "
+                "sys.modules['mlx.core'] = None; "
+                "sys.modules['mlx.nn'] = None; "
+                "import system1.calibration, system1.compat.universal, "
                 "system1.integrations.drop_in, system1.explain, system1.fleet, "
                 "system1.guard, system1.teaching; "
                 "assert 'scipy' not in sys.modules; "

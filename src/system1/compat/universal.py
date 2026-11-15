@@ -1447,20 +1447,35 @@ class UniversalDecisionsHTTPServer:
                     self_h.end_headers()
                     self_h.wfile.write(err)
                     return
+                body_consumed = False
                 try:
+                    req_headers = dict(self_h.headers.items())
+                    service.preflight_http_headers(req_headers)
                     raw_len = self_h.headers.get("Content-Length")
                     if raw_len is None:
                         raise InteropError("Missing Content-Length header", status_code=400)
-                    content_len = int(raw_len)
-                    if content_len < 0 or content_len > service.max_body_bytes:
+                    try:
+                        content_len = int(raw_len)
+                    except ValueError as exc:
+                        raise InteropError(
+                            f"Invalid Content-Length header: {raw_len!r}", status_code=400
+                        ) from exc
+                    if content_len < 0:
+                        raise InteropError(
+                            f"Invalid negative Content-Length: {content_len}", status_code=400
+                        )
+                    if content_len > service.max_body_bytes:
                         raise PayloadTooLargeError(f"Content-Length {content_len} exceeds limit")
                     raw_body = self_h.rfile.read(content_len)
+                    body_consumed = True
                     status, body = service.handle_request(
                         path=clean_path,
-                        headers=dict(self_h.headers.items()),
+                        headers=req_headers,
                         raw_body=raw_body,
                     )
                 except InteropError as exc:
+                    if not body_consumed:
+                        self_h.close_connection = True
                     status = exc.status_code
                     body = {"error": str(exc)}
                 except ZeroEgressViolationError as exc:

@@ -1825,6 +1825,35 @@ class AdaptiveConformalTracker:
         }
 
 
+def _is_bool_scalar(val: Any) -> bool:
+    return isinstance(val, (bool, np.bool_)) or getattr(getattr(val, "dtype", None), "kind", None) == "b"
+
+
+def _validate_real_1d_vec(vec: Any, expected_len: int, label: str) -> np.ndarray:
+    if isinstance(vec, (str, bytes, bytearray, Mapping)):
+        raise ValueError(f"{label} must be a 1D numeric sequence, not {type(vec).__name__}")
+    if isinstance(vec, np.ndarray):
+        if vec.dtype == np.bool_ or vec.dtype.kind not in ("i", "u", "f"):
+            raise ValueError(f"{label} must have real numeric dtype, got {vec.dtype}")
+        if vec.ndim != 1 or vec.shape[0] != expected_len:
+            raise ValueError(f"{label} must have shape ({expected_len},), got {vec.shape}")
+        arr = np.asarray(vec, dtype=np.float64)
+    else:
+        try:
+            items = list(vec)
+        except TypeError as exc:
+            raise ValueError(f"{label} must be a 1D numeric sequence, got {type(vec).__name__}") from exc
+        if len(items) != expected_len:
+            raise ValueError(f"{label} must have length {expected_len}, got {len(items)}")
+        for v in items:
+            if _is_bool_scalar(v) or not isinstance(v, (int, float, np.integer, np.floating)):
+                raise ValueError(f"{label} entries must be real numbers, got {v!r}")
+        arr = np.asarray(items, dtype=np.float64)
+    if not bool(np.all(np.isfinite(arr))):
+        raise ValueError(f"{label} must contain only finite values")
+    return arr
+
+
 class OnlineMondrianConformal:
     """Strictly O(1) per-class online adaptive quantile tracker in log-nonconformity space.
 
@@ -1841,30 +1870,30 @@ class OnlineMondrianConformal:
         eta_u: float = 0.30,
         jump_w: float = 0.12,
     ) -> None:
-        if isinstance(num_classes, bool) or not isinstance(num_classes, (int, np.integer)):
+        if _is_bool_scalar(num_classes) or not isinstance(num_classes, (int, np.integer)):
             raise ValueError(f"num_classes must be an integer >= 1, got {num_classes!r}")
         nc = int(num_classes)
         if nc < 1:
             raise ValueError("num_classes must be >= 1")
-        if isinstance(alpha, bool) or not isinstance(alpha, (int, float, np.integer, np.floating)):
+        if _is_bool_scalar(alpha) or not isinstance(alpha, (int, float, np.integer, np.floating)):
             raise ValueError("alpha must be finite and in (0, 1)")
         a = float(alpha)
         if not math.isfinite(a) or not (0.0 < a < 1.0):
             raise ValueError("alpha must be finite and in (0, 1)")
         if gamma_aci is not None:
-            if isinstance(gamma_aci, bool) or not isinstance(gamma_aci, (int, float, np.integer, np.floating)):
+            if _is_bool_scalar(gamma_aci) or not isinstance(gamma_aci, (int, float, np.integer, np.floating)):
                 raise ValueError(f"gamma_aci must be finite and positive, got {gamma_aci!r}")
             g_aci = float(gamma_aci)
             if not math.isfinite(g_aci) or g_aci <= 0.0:
                 raise ValueError(f"gamma_aci must be finite and positive, got {gamma_aci!r}")
         else:
             g_aci = max(0.03, 0.4 * a)
-        if isinstance(eta_u, bool) or not isinstance(eta_u, (int, float, np.integer, np.floating)):
+        if _is_bool_scalar(eta_u) or not isinstance(eta_u, (int, float, np.integer, np.floating)):
             raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
         eta_val = float(eta_u)
         if not math.isfinite(eta_val) or eta_val <= 0.0:
             raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
-        if isinstance(jump_w, bool) or not isinstance(jump_w, (int, float, np.integer, np.floating)):
+        if _is_bool_scalar(jump_w) or not isinstance(jump_w, (int, float, np.integer, np.floating)):
             raise ValueError(f"jump_w must be finite and in [0, 1], got {jump_w!r}")
         jump_val = float(jump_w)
         if not math.isfinite(jump_val) or not (0.0 <= jump_val <= 1.0):
@@ -1875,11 +1904,7 @@ class OnlineMondrianConformal:
         self.eta_u = eta_val
         self.jump_w = jump_val
         if q_init is not None:
-            q0 = np.asarray(q_init, dtype=np.float64)
-            if q0.shape != (self.num_classes,):
-                raise ValueError(f"q_init must have shape ({self.num_classes},), got {q0.shape}")
-            if not bool(np.all(np.isfinite(q0))):
-                raise ValueError("q_init must contain only finite values")
+            q0 = _validate_real_1d_vec(q_init, self.num_classes, "q_init")
         else:
             q0 = np.full(self.num_classes, 0.5, dtype=np.float64)
         self.u_max = 16.0
@@ -1908,7 +1933,7 @@ class OnlineMondrianConformal:
         probs: Optional[Sequence[float]] = None,
     ) -> None:
         """O(1) update after observing true class y and either (score_y, err_y) or probs."""
-        if isinstance(y, bool) or not isinstance(y, (int, np.integer)):
+        if _is_bool_scalar(y) or not isinstance(y, (int, np.integer)):
             raise ValueError(f"Class index y must be an integer, got {y!r}")
         cls_idx = int(y)
         if cls_idx < 0 or cls_idx >= self.num_classes:
@@ -1920,13 +1945,13 @@ class OnlineMondrianConformal:
             if score_y is None:
                 s_val = 1.0 - float(p_arr[cls_idx])
             else:
-                if isinstance(score_y, bool) or not isinstance(score_y, (int, float, np.integer, np.floating)):
+                if _is_bool_scalar(score_y) or not isinstance(score_y, (int, float, np.integer, np.floating)):
                     raise ValueError(f"score_y must be finite in [0, 1], got {score_y!r}")
                 s_val = float(score_y)
         else:
             if score_y is None:
                 raise ValueError("Either score_y or probs must be provided to update()")
-            if isinstance(score_y, bool) or not isinstance(score_y, (int, float, np.integer, np.floating)):
+            if _is_bool_scalar(score_y) or not isinstance(score_y, (int, float, np.integer, np.floating)):
                 raise ValueError(f"score_y must be finite in [0, 1], got {score_y!r}")
             s_val = float(score_y)
         if not math.isfinite(s_val) or s_val < -1e-9 or s_val > 1.0 + 1e-9:
@@ -1964,17 +1989,7 @@ class OnlineMondrianConformal:
 
     def _validate_probs(self, probs: Sequence[float]) -> np.ndarray:
         """Validate 1D finite probability vector in [0.0, 1.0] (rejecting bool/str/object)."""
-        if isinstance(probs, (str, bytes)):
-            raise ValueError("probs must be a numeric 1D sequence, not str or bytes")
-        if not isinstance(probs, np.ndarray) and isinstance(probs, Sequence):
-            if any(isinstance(v, bool) for v in probs):
-                raise ValueError("probs entries must be real numbers, not bool")
-        raw = np.asarray(probs)
-        if raw.dtype == np.bool_ or raw.dtype.kind not in ("i", "u", "f"):
-            raise ValueError(f"probs must have numeric dtype, got {raw.dtype}")
-        p_arr = np.asarray(raw, dtype=np.float64)
-        if p_arr.ndim != 1 or p_arr.shape[0] != self.num_classes or not bool(np.all(np.isfinite(p_arr))):
-            raise ValueError(f"probs must be 1D finite with length {self.num_classes}")
+        p_arr = _validate_real_1d_vec(probs, self.num_classes, "probs")
         if not bool(np.all((p_arr >= 0.0) & (p_arr <= 1.0))):
             raise ValueError("probs entries must lie in [0.0, 1.0]")
         return p_arr
@@ -2035,18 +2050,13 @@ class OnlineMondrianConformal:
             eta_u=eta_val,
             jump_w=jump_val,
         )
-        expected_shape = (obj.num_classes,)
         if "q_c" in data and data["q_c"] is not None:
-            q_arr = np.asarray(data["q_c"], dtype=np.float64).copy()
-            if q_arr.shape != expected_shape or not bool(np.all(np.isfinite(q_arr))):
-                raise ValueError(f"q_c must be finite with shape {expected_shape}, got {q_arr.shape}")
+            q_arr = _validate_real_1d_vec(data["q_c"], obj.num_classes, "q_c").copy()
             if float(np.min(q_arr)) < 0.0 or float(np.max(q_arr)) > 1.0:
                 raise ValueError("q_c values must lie in [0.0, 1.0]")
             obj.q_c = q_arr
         if "u_c" in data and data["u_c"] is not None:
-            u_arr = np.asarray(data["u_c"], dtype=np.float64).copy()
-            if u_arr.shape != expected_shape or not bool(np.all(np.isfinite(u_arr))):
-                raise ValueError(f"u_c must be finite with shape {expected_shape}, got {u_arr.shape}")
+            u_arr = _validate_real_1d_vec(data["u_c"], obj.num_classes, "u_c").copy()
             if float(np.min(u_arr)) < 0.0 or float(np.max(u_arr)) > obj.u_max:
                 raise ValueError(f"u_c values must lie in [0.0, {obj.u_max}]")
             obj.u_c = u_arr
@@ -2057,21 +2067,17 @@ class OnlineMondrianConformal:
                 -np.log(np.clip(1.0 - obj.q_c, 1e-12, 1.0)),
             )
         if "alpha_c" in data and data["alpha_c"] is not None:
-            a_arr = np.asarray(data["alpha_c"], dtype=np.float64).copy()
-            if a_arr.shape != expected_shape or not bool(np.all(np.isfinite(a_arr))):
-                raise ValueError(f"alpha_c must be finite with shape {expected_shape}, got {a_arr.shape}")
+            a_arr = _validate_real_1d_vec(data["alpha_c"], obj.num_classes, "alpha_c").copy()
             if float(np.min(a_arr)) <= 0.0 or float(np.max(a_arr)) >= 1.0:
                 raise ValueError("alpha_c values must lie in (0.0, 1.0)")
             obj.alpha_c = a_arr
         if "err_ewma" in data and data["err_ewma"] is not None:
-            e_arr = np.asarray(data["err_ewma"], dtype=np.float64).copy()
-            if e_arr.shape != expected_shape or not bool(np.all(np.isfinite(e_arr))):
-                raise ValueError(f"err_ewma must be finite with shape {expected_shape}, got {e_arr.shape}")
+            e_arr = _validate_real_1d_vec(data["err_ewma"], obj.num_classes, "err_ewma").copy()
             if float(np.min(e_arr)) < 0.0 or float(np.max(e_arr)) > 1.0:
                 raise ValueError("err_ewma values must lie in [0.0, 1.0]")
             obj.err_ewma = e_arr
         raw_steps = data.get("steps", 0)
-        if isinstance(raw_steps, bool):
+        if _is_bool_scalar(raw_steps):
             raise ValueError(f"steps must be a nonnegative integer, got {raw_steps!r}")
         if isinstance(raw_steps, (int, np.integer)):
             steps = int(raw_steps)
