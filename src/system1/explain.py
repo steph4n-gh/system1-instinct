@@ -276,11 +276,13 @@ def _extract_calibrated_head_params(
             raise ValueError(f"logit_adjustments contains non-finite values for field {fname!r}")
         if is_boolean or w.shape[0] == 1:
             if adj.size == 2:
-                delta_adj = float(adj[1] - adj[0])
+                with np.errstate(over="ignore", invalid="ignore"):
+                    delta_adj = float(adj[1] - adj[0])
                 cal_adj_2 = adj.astype(np.float64).copy()
             elif adj.size == 1:
                 delta_adj = float(adj[0])
-                cal_adj_2 = np.array([-0.5 * delta_adj, 0.5 * delta_adj], dtype=np.float64)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    cal_adj_2 = np.array([-0.5 * delta_adj, 0.5 * delta_adj], dtype=np.float64)
             elif adj.size > 0:
                 raise ValueError(
                     f"Unsupported logit_adjustments length {adj.size} for BooleanField {fname!r}"
@@ -463,9 +465,29 @@ class FastExplainer:
             if is_scalar_bool:
                 w_scaled = (w_f64[0] * self.scale) / self.cal_temp
                 if _bool_raw_meta is not None:
-                    delta_adj = float(_bool_raw_meta.get("delta_adj", 0.0))
-                    b_scaled = ((float(b_f64[0]) * self.scale) + delta_adj) / self.cal_temp - self._bool_logit_shift
-                    adj_eff_vec = np.array([delta_adj / self.cal_temp], dtype=np.float64)
+                    raw_c_adj = _bool_raw_meta.get("cal_adj_2")
+                    if raw_c_adj is not None:
+                        adj2 = np.asarray(raw_c_adj, dtype=np.float64).reshape(2)
+                        raw_b0 = -0.5 * float(b_f64[0]) * self.scale + float(adj2[0])
+                        raw_b1 = 0.5 * float(b_f64[0]) * self.scale + float(adj2[1])
+                        b_s0 = raw_b0 / self.cal_temp
+                        b_s1 = raw_b1 / self.cal_temp
+                        if (
+                            math.isfinite(raw_b0)
+                            and math.isfinite(raw_b1)
+                            and math.isfinite(b_s0)
+                            and math.isfinite(b_s1)
+                        ):
+                            b_scaled = (b_s1 - b_s0) - self._bool_logit_shift
+                        else:
+                            b_scaled = float("nan")
+                        adj_eff_scalar = float(adj2[1] / self.cal_temp) - float(adj2[0] / self.cal_temp)
+                        adj_eff_vec = np.array([adj_eff_scalar], dtype=np.float64)
+                        delta_adj = float(adj2[1] - adj2[0])
+                    else:
+                        delta_adj = float(_bool_raw_meta.get("delta_adj", 0.0))
+                        b_scaled = ((float(b_f64[0]) * self.scale) + delta_adj) / self.cal_temp - self._bool_logit_shift
+                        adj_eff_vec = np.array([delta_adj / self.cal_temp], dtype=np.float64)
                 else:
                     adj_term = float(adj_eff_in[0]) if (adj_eff_in is not None and adj_eff_in.size == 1) else 0.0
                     delta_adj = adj_term * self.cal_temp
@@ -486,7 +508,11 @@ class FastExplainer:
                         if raw_c_adj is not None
                         else np.zeros(self.num_classes, dtype=np.float64)
                     )
-                    b_vec = ((b_f64 * self.scale) + adj_vec) / self.cal_temp
+                    raw_b_sum = (b_f64 * self.scale) + adj_vec
+                    if not bool(np.all(np.isfinite(raw_b_sum))):
+                        b_vec = np.full(self.num_classes, np.nan, dtype=np.float64)
+                    else:
+                        b_vec = raw_b_sum / self.cal_temp
                     adj_eff_vec = (adj_vec / self.cal_temp).astype(np.float64)
                     if self._is_boolean and adj_vec.size == 2:
                         delta_adj = float(adj_vec[1] - adj_vec[0])
@@ -560,7 +586,7 @@ class FastExplainer:
                         np.array([-0.5 * self._delta_adj, 0.5 * self._delta_adj], dtype=np.float64),
                         dtype=np.float64,
                     )
-                    if self._delta_adj != 0.0
+                    if (self._delta_adj != 0.0 and math.isfinite(self._delta_adj))
                     else None
                 )
         else:
@@ -1439,30 +1465,37 @@ class FastExplainer:
         return u_dn, norm_dn, u_sc, norm_sc, trace
 
     def _eval_boolean_raw_logit_f32(self, raw_logit: float) -> int:
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            scaled_z = (
+                float(raw_logit) / 0.25
+                if self._bool_raw_base_scale == 4.0
+                else float(raw_logit) * self._bool_raw_base_scale
+            )
+            arr = np.array([-0.5 * scaled_z, 0.5 * scaled_z], dtype=np.float64)
+            if self._bool_cal_adj_2 is not None:
+                arr = arr + self._bool_cal_adj_2
+            scaled = arr / self._bool_cal_temp
+        if not (
+            math.isfinite(float(raw_logit))
+            and math.isfinite(scaled_z)
+            and bool(np.all(np.isfinite(arr)))
+            and bool(np.all(np.isfinite(scaled)))
+        ):
+            raise ValueError("Reference explanation logits are non-finite (input or temperature overflow)")
         if self.threshold <= 0.0:
             return 1
         if self.threshold > 1.0:
             return 0
-        scaled_z = (
-            float(raw_logit) / 0.25
-            if self._bool_raw_base_scale == 4.0
-            else float(raw_logit) * self._bool_raw_base_scale
-        )
-        arr = np.array([-0.5 * scaled_z, 0.5 * scaled_z], dtype=np.float64)
-        if self._bool_cal_adj_2 is not None:
-            arr = arr + self._bool_cal_adj_2
-        with np.errstate(over="ignore", invalid="ignore"):
-            scaled = arr / self._bool_cal_temp
-        if not bool(np.all(np.isfinite(scaled))):
-            raise ValueError("Reference explanation logits are non-finite (input or temperature overflow)")
-        s = scaled - float(np.max(scaled))
-        exp = np.exp(s)
-        prob_true = float((exp / float(np.sum(exp)))[1])
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            s = scaled - float(np.max(scaled))
+            exp = np.exp(s)
+            prob_true = float((exp / float(np.sum(exp)))[1])
         return 1 if prob_true >= self.threshold else 0
 
     def _eval_boolean_embedding_winner(self, emb: np.ndarray) -> int:
         x_f32 = np.asarray(emb, dtype=np.float32).reshape(1, -1)
-        raw_l = (x_f32 @ self._bool_raw_w.T + self._bool_raw_b).ravel()[0]
+        with np.errstate(over="ignore", invalid="ignore"):
+            raw_l = (x_f32 @ self._bool_raw_w.T + self._bool_raw_b).ravel()[0]
         return self._eval_boolean_raw_logit_f32(float(raw_l))
 
     def _eval_choice_raw_logits_and_top2_f32(
@@ -1516,14 +1549,27 @@ class FastExplainer:
                         if self._bool_raw_base_scale == 4.0
                         else raw_l * self._bool_raw_base_scale
                     )
-                    delta_adj = (
-                        float(self._bool_cal_adj_2[1] - self._bool_cal_adj_2[0])
-                        if (self._bool_cal_adj_2 is not None and self._bool_cal_adj_2.size == 2)
-                        else 0.0
-                    )
-                    s_eff = (scaled_z + delta_adj) / self._bool_cal_temp - self._bool_logit_shift
-                ref_logits = np.array([-0.5 * s_eff, 0.5 * s_eff], dtype=np.float64)
-                if not bool(np.all(np.isfinite(ref_logits))):
+                    s0 = -0.5 * scaled_z
+                    s1 = 0.5 * scaled_z
+                    if self._bool_cal_adj_2 is not None and self._bool_cal_adj_2.size == 2:
+                        s0 += float(self._bool_cal_adj_2[0])
+                        s1 += float(self._bool_cal_adj_2[1])
+                    elif self._delta_adj != 0.0:
+                        s0 -= 0.5 * self._delta_adj
+                        s1 += 0.5 * self._delta_adj
+                    s0_cal = s0 / self._bool_cal_temp
+                    s1_cal = s1 / self._bool_cal_temp
+                    s_eff = (s1_cal - s0_cal) - self._bool_logit_shift
+                    ref_logits = np.array([-0.5 * s_eff, 0.5 * s_eff], dtype=np.float64)
+                if not (
+                    math.isfinite(raw_l)
+                    and math.isfinite(scaled_z)
+                    and math.isfinite(s0)
+                    and math.isfinite(s1)
+                    and math.isfinite(s0_cal)
+                    and math.isfinite(s1_cal)
+                    and bool(np.all(np.isfinite(ref_logits)))
+                ):
                     raise ValueError("Reference explanation logits are non-finite (input or temperature overflow)")
                 c1 = self._eval_boolean_raw_logit_f32(raw_l)
                 c2 = 0 if c1 == 1 else 1
@@ -1850,7 +1896,26 @@ class FastExplainer:
                 with np.errstate(over="ignore", invalid="ignore"):
                     if self._is_boolean:
                         z_raw = 12.0 if bool(ov_val) else -12.0
-                        s_shifted = (z_raw * self.scale + self._delta_adj) / self.cal_temp - self._bool_logit_shift
+                        s0_ov = -0.5 * z_raw * self.scale
+                        s1_ov = 0.5 * z_raw * self.scale
+                        if self._bool_cal_adj_2 is not None and self._bool_cal_adj_2.size == 2:
+                            s0_ov += float(self._bool_cal_adj_2[0])
+                            s1_ov += float(self._bool_cal_adj_2[1])
+                        elif self._delta_adj != 0.0:
+                            s0_ov -= 0.5 * self._delta_adj
+                            s1_ov += 0.5 * self._delta_adj
+                        s0_c = s0_ov / self.cal_temp
+                        s1_c = s1_ov / self.cal_temp
+                        if not (
+                            math.isfinite(s0_ov)
+                            and math.isfinite(s1_ov)
+                            and math.isfinite(s0_c)
+                            and math.isfinite(s1_c)
+                        ):
+                            raise ValueError(
+                                "Reference explanation logits are non-finite (input or temperature overflow)"
+                            )
+                        s_shifted = (s1_c - s0_c) - self._bool_logit_shift
                         logits = np.array([-0.5 * s_shifted, 0.5 * s_shifted], dtype=np.float64)
                         if not bool(np.all(np.isfinite(logits))):
                             raise ValueError(

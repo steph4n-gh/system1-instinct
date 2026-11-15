@@ -2285,10 +2285,16 @@ class SystemOneEngine:
 
                         is_empty_set = getattr(cset, "is_empty", len(cset.prediction_set) == 0)
                         cardinality = len(cset.prediction_set)
+                        pred_excluded = selected_choice not in cset.prediction_set
                         if is_strict:
-                            field_ambiguous = (cardinality != 1) or cset.is_ambiguous or is_empty_set
+                            field_ambiguous = (
+                                (cardinality != 1)
+                                or cset.is_ambiguous
+                                or is_empty_set
+                                or pred_excluded
+                            )
                         else:
-                            field_ambiguous = is_empty_set or cset.is_ambiguous
+                            field_ambiguous = is_empty_set or cset.is_ambiguous or pred_excluded
 
                         if field_ambiguous:
                             ambiguous_fields.append(name)
@@ -2354,10 +2360,16 @@ class SystemOneEngine:
 
                         is_empty_set = getattr(cset, "is_empty", len(cset.prediction_set) == 0)
                         cardinality = len(cset.prediction_set)
+                        pred_excluded = ("True" if val else "False") not in cset.prediction_set
                         if is_strict:
-                            field_ambiguous = (cardinality != 1) or cset.is_ambiguous or is_empty_set
+                            field_ambiguous = (
+                                (cardinality != 1)
+                                or cset.is_ambiguous
+                                or is_empty_set
+                                or pred_excluded
+                            )
                         else:
-                            field_ambiguous = is_empty_set or cset.is_ambiguous
+                            field_ambiguous = is_empty_set or cset.is_ambiguous or pred_excluded
 
                         if field_ambiguous:
                             ambiguous_fields.append(name)
@@ -4177,33 +4189,39 @@ class SystemOneEngine:
                                 else (float(np.max(np.sum(np.abs(raw_w_s), axis=1))) if raw_w_s.size else 0.0)
                             )
                             b_abs = float(np.max(np.abs(raw_b_s))) if raw_b_s.size else 0.0
+                            l1_mag = x_inf_chunk * w_l1 + b_abs
+                            pot_ovf_rows = (~np.isfinite(l1_mag)) | (l1_mag >= 1e37)
                             dz_bound = (
                                 4.0
                                 * (float(self.dimension) + 4.0)
                                 * float(np.finfo(np.float32).eps)
-                                * (x_inf_chunk * w_l1 + b_abs)
+                                * l1_mag
                             )
                             temp_est = max(1e-12, abs(float(getattr(calibrator, "temperature", 1.0))))
                             dp_bound = np.minimum(1.0, (dz_bound / 0.25) / temp_est + 1e-6)
                         else:
+                            pot_ovf_rows = np.zeros(m_docs, dtype=bool)
                             dz_bound = np.empty(0, dtype=np.float64)
                             dp_bound = np.empty(0, dtype=np.float64)
 
                         if spec["is_bool"]:
                             z_col = logits[:, 0].astype(np.float64) / 0.25
-                            raw_logits_nonfin = ~np.isfinite(z_col)
+                            raw_logits_nonfin = (~np.isfinite(logits[:, 0])) | (~np.isfinite(z_col))
                             two_logits = np.column_stack([-z_col / 2.0, z_col / 2.0])
                             probs = calibrator.calibrate_logits(two_logits)
                             if probs.ndim == 1:
                                 probs = probs.reshape(1, -1)
                             if not spec["is_hier"]:
-                                row_finite = (
-                                    (~nonfin_rows) & (~raw_logits_nonfin) & np.all(np.isfinite(probs), axis=1)
-                                )
+                                p_nonfin = ~np.all(np.isfinite(probs), axis=1)
+                                row_finite = (~nonfin_rows) & (~raw_logits_nonfin) & (~p_nonfin)
                                 near_rows = (
                                     (np.abs(probs[:, 1] - spec["bool_threshold"]) <= dp_bound)
+                                    | (np.abs(probs[:, 1] - 0.5) <= dp_bound)
                                     | (np.abs(z_col) <= 2.0 * (dz_bound / 0.25))
                                     | (~np.isfinite(dp_bound))
+                                    | raw_logits_nonfin
+                                    | p_nonfin
+                                    | pot_ovf_rows
                                 )
                                 if conformal is not None:
                                     near_rows |= (
@@ -4244,11 +4262,20 @@ class SystemOneEngine:
                                     raw_b_b = spec["raw_b"]
                                     for r_i in np.flatnonzero(near_rows).tolist():
                                         x_ex = X[r_i : r_i + 1]
-                                        z_ex = float((x_ex @ raw_w_b.T + raw_b_b)[0, 0]) / 0.25
-                                        raw_logits_nonfin[r_i] = not math.isfinite(z_ex)
-                                        probs[r_i] = calibrator.calibrate_logits(
-                                            np.array([-0.5 * z_ex, 0.5 * z_ex], dtype=np.float64)
-                                        ).reshape(-1)
+                                        lin_ex = x_ex @ raw_w_b.T
+                                        raw_sum_ex = lin_ex + raw_b_b
+                                        z_ex = float(raw_sum_ex[0, 0]) / 0.25
+                                        raw_logits_nonfin[r_i] = not (
+                                            bool(np.all(np.isfinite(lin_ex)))
+                                            and bool(np.all(np.isfinite(raw_sum_ex)))
+                                            and math.isfinite(z_ex)
+                                        )
+                                        if raw_logits_nonfin[r_i]:
+                                            probs[r_i] = np.nan
+                                        else:
+                                            probs[r_i] = calibrator.calibrate_logits(
+                                                np.array([-0.5 * z_ex, 0.5 * z_ex], dtype=np.float64)
+                                            ).reshape(-1)
                             p_true = probs[:, 1]
                             b_vals = p_true >= spec["bool_threshold"]
                             confs = np.where(b_vals, p_true, 1.0 - p_true)
@@ -4264,11 +4291,8 @@ class SystemOneEngine:
                             if probs.ndim == 1:
                                 probs = probs.reshape(1, -1)
                             if not spec["is_hier"]:
-                                row_finite = (
-                                    (~nonfin_rows)
-                                    & (~raw_logits_nonfin)
-                                    & np.all(np.isfinite(probs), axis=1)
-                                )
+                                p_nonfin = ~np.all(np.isfinite(probs), axis=1)
+                                row_finite = (~nonfin_rows) & (~raw_logits_nonfin) & (~p_nonfin)
                                 z_s = -np.sort(-logits.astype(np.float64), axis=1)
                                 p_s = -np.sort(-probs, axis=1)
                                 near_rows = (
@@ -4278,6 +4302,9 @@ class SystemOneEngine:
                                         else np.zeros(m_docs, dtype=bool)
                                     )
                                     | (~np.isfinite(dp_bound))
+                                    | raw_logits_nonfin
+                                    | p_nonfin
+                                    | pot_ovf_rows
                                 )
                                 if conformal is not None:
                                     near_rows |= np.any(
@@ -4323,9 +4350,18 @@ class SystemOneEngine:
                                     raw_b_c = spec["raw_b"]
                                     for r_i in np.flatnonzero(near_rows).tolist():
                                         x_ex = X[r_i : r_i + 1]
-                                        z_ex = (x_ex @ raw_w_c.T + raw_b_c).astype(np.float64).ravel() / 0.25
-                                        raw_logits_nonfin[r_i] = not bool(np.all(np.isfinite(z_ex)))
-                                        probs[r_i] = calibrator.calibrate_logits(z_ex).reshape(-1)
+                                        lin_ex = x_ex @ raw_w_c.T
+                                        raw_sum_ex = lin_ex + raw_b_c
+                                        z_ex = raw_sum_ex.astype(np.float64).ravel() / 0.25
+                                        raw_logits_nonfin[r_i] = not (
+                                            bool(np.all(np.isfinite(lin_ex)))
+                                            and bool(np.all(np.isfinite(raw_sum_ex)))
+                                            and bool(np.all(np.isfinite(z_ex)))
+                                        )
+                                        if raw_logits_nonfin[r_i]:
+                                            probs[r_i] = np.nan
+                                        else:
+                                            probs[r_i] = calibrator.calibrate_logits(z_ex).reshape(-1)
                             best_idx = np.argmax(probs, axis=1)
                             confs = probs[np.arange(m_docs), best_idx]
                             for i in range(m_docs):
@@ -4540,7 +4576,17 @@ class SystemOneEngine:
                         elif low_proto[i]:
                             row_reasons[i][fname] = "low_semantic_familiarity"
 
-                        field_amb = (card != 1 or cset_amb or is_empty_set) if is_strict else (is_empty_set or cset_amb)
+                        pred_lbl_i = (
+                            ("True" if row_values[i][fname] else "False")
+                            if spec["is_bool"]
+                            else str(row_values[i][fname])
+                        )
+                        pred_excluded_i = pred_lbl_i not in cset_list
+                        field_amb = (
+                            (card != 1 or cset_amb or is_empty_set or pred_excluded_i)
+                            if is_strict
+                            else (is_empty_set or cset_amb or pred_excluded_i)
+                        )
                         if field_amb:
                             row_amb_fields[i].append(fname)
                             if spec["escalate"]:

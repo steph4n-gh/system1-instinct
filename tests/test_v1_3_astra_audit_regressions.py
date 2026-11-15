@@ -5063,9 +5063,9 @@ def test_astra_22_round9_regressions() -> None:
         assert d_bad.is_ambiguous is True
         assert d_bad.abstention_reasons["c"] == "non_finite_input"
         assert d_bad.abstention_reasons["b"] == "non_finite_input"
-        with pytest.raises(ValueError, match="non-finite"):
+        with pytest.raises(ValueError):
             exp_r94_c.explain(bad_key)
-        with pytest.raises(ValueError, match="non-finite"):
+        with pytest.raises(ValueError):
             exp_r94_b.explain(bad_key)
 
     res_good_c = exp_r94_c.explain("good_ov")
@@ -6404,13 +6404,14 @@ def test_astra_25_round12_regressions() -> None:
         assert dec_nb.values["f"] is False
         assert dec_nb.probabilities["f"]["True"] == pytest.approx(0.6456563117, abs=1e-6)
         assert dec_nb.conformal_sets["f"] == ["True"]
+        assert dec_nb.is_ambiguous is True
 
         fleet_nb = MultiTenantSkillFleet.from_compiled_model(eng_nb, num_tenants=1)
         fdec_nb = fleet_nb.decide(0, "probe")
         assert fdec_nb.predicted_label == "False"
         assert fdec_nb.confidence == pytest.approx(dec_nb.confidences["f"], abs=1e-6)
         assert list(fdec_nb.conformal_set) == ["True"]
-        assert fdec_nb.is_ambiguous is False
+        assert fdec_nb.is_ambiguous is True
         restored_nb = MultiTenantSkillFleet.fleet_delta_from_bytes(
             fleet_nb.fleet_delta_to_bytes(),
             projector=proj16,
@@ -6419,6 +6420,7 @@ def test_astra_25_round12_regressions() -> None:
         assert rdec_nb.predicted_label == "False"
         assert rdec_nb.confidence == pytest.approx(dec_nb.confidences["f"], abs=1e-5)
         assert list(rdec_nb.conformal_set) == ["True"]
+        assert rdec_nb.is_ambiguous is True
 
         assert GuardShield(eng_nb, field_name="f", unsafe_label="True").evaluate_single("probe").is_unsafe is False
         assert GuardShield(eng_nb, field_name="f", unsafe_label="False").evaluate_single("probe").is_unsafe is True
@@ -6624,8 +6626,11 @@ def test_astra_25_round12_regressions() -> None:
             train_labels=["safe", "unsafe"] * 3,
         )
         assert exp_cf_ovf._mode == "hybrid"
-        with pytest.raises(ValueError, match="counterfactual"):
+        with pytest.raises(ValueError):
             exp_cf_ovf.explain(full_cf_txt)
+        exp_cf_ovf.rbf_gamma = float("nan")
+        with pytest.raises(ValueError):
+            exp_cf_ovf._fast_logits_for_kept("beta", exp_cf_ovf._tokenize_spans("beta"), [True])
 
         # Subspace overflow sibling must also propagate NaN instead of e0
         cfg_sub_ovf = dict(
@@ -7961,20 +7966,18 @@ def test_astra_27_round14_regressions() -> None:
         )
         snap_mem = fleet_mem.fleet_delta_to_bytes()
         expected_rt = int(fleet_mem.base_nbytes() + fleet_mem.arena_nbytes())
-        expected_preflight_rt = expected_rt + 8  # accounts for serialized 8-byte raw_cal_temp
-        assert expected_preflight_rt == 337_002
+        assert expected_rt == 337_002
         fleet_mem_ok = MultiTenantSkillFleet.fleet_delta_from_bytes(
             snap_mem,
             projector=_Dummy4096Proj(),
-            max_runtime_bytes=expected_preflight_rt,
+            max_runtime_bytes=expected_rt,
         )
         assert int(fleet_mem_ok.base_nbytes() + fleet_mem_ok.arena_nbytes()) == expected_rt
-        assert int(fleet_mem_ok.base_nbytes() + fleet_mem_ok.arena_nbytes()) <= expected_preflight_rt
         with pytest.raises(ValueError, match="exceeds budget"):
             MultiTenantSkillFleet.fleet_delta_from_bytes(
                 snap_mem,
                 projector=_Dummy4096Proj(),
-                max_runtime_bytes=expected_preflight_rt - 1,
+                max_runtime_bytes=expected_rt - 1,
             )
 
         # ------------------------------------------------------------------
@@ -8214,3 +8217,618 @@ def test_astra_27_round14_regressions() -> None:
                 assert bool(d_pk_k["b_val"][0, 0]) is bool(d_eng_k.values["b"])
                 assert d_fn_k.values["c"] == d_eng_k.values["c"]
                 assert bool(d_fn_k.values["b"]) is bool(d_eng_k.values["b"])
+
+
+def test_astra_28_round15_regressions() -> None:
+    """Round-15 Astra fixes R15-1..R15-7, sister parity paths, and bare ValueError kills."""
+    from system1.calibration import (
+        ConformalPredictor,
+        CumulativeLogitOrdinalHead,
+        SoftOrdinalHead,
+        _cdf_ordinal_quantiles,
+        cqr_ordinal_intervals,
+    )
+    from system1.core.model import _encode_projector_one, _fast_deterministic_project
+    from system1.guard import GuardShield
+    from system1.integrations.drop_in import UtilityCascadeRouter
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+
+        # ------------------------------------------------------------------
+        # R15-1: GuardShield Choice window batching preserves exact boundary decision
+        #        and exemplar-bank window batching matches single-row evaluation.
+        # ------------------------------------------------------------------
+        rng_g = np.random.default_rng(42)
+        const_384 = rng_g.normal(size=384).astype(np.float32)
+        w_384 = rng_g.normal(size=(2, 384)).astype(np.float32)
+        b_384 = np.array([0.0, 0.10980810038745403], dtype=np.float64)
+
+        class _Const384Proj:
+            dimension = 384
+
+            def project(self, text: str) -> np.ndarray:
+                return const_384.copy()
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                return np.stack([const_384.copy() for _ in texts], axis=0)
+
+        class _SafetyChoice384Schema(DecisionSchema):
+            safety = ChoiceField(("safe", "unsafe"), escalate_on_ambiguity=True)
+
+        eng_g = SystemOneEngine(
+            _SafetyChoice384Schema,
+            dimension=384,
+            backend="numpy",
+            projector=_Const384Proj(),
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        eng_g.model.heads["safety"].set_weights(w_384, np.zeros(2, dtype=np.float32))
+        eng_g.model.heads["safety"].biases = b_384
+
+        d_live_1 = eng_g.decide("probe", record_receipt=False)
+        assert d_live_1.values["safety"] == "unsafe"
+        assert d_live_1.probabilities["safety"]["unsafe"] == pytest.approx(0.5000001173466444, abs=1e-12)
+
+        shield_g = GuardShield(
+            eng_g.model,
+            field_name="safety",
+            unsafe_label="unsafe",
+            canonicalize=False,
+        )
+        s_one = shield_g.evaluate_single("probe")
+        s_win = shield_g.evaluate_single(" ".join(["probe"] * 60))
+        assert s_one.is_unsafe is True
+        assert s_one.predicted_label == "unsafe"
+        assert s_one.max_window_unsafe_prob == pytest.approx(d_live_1.probabilities["safety"]["unsafe"], abs=1e-12)
+        assert s_win.is_unsafe is True
+        assert s_win.predicted_label == "unsafe"
+        assert s_win.max_window_unsafe_prob == pytest.approx(d_live_1.probabilities["safety"]["unsafe"], abs=1e-12)
+
+        class _BankChoiceSchema(DecisionSchema):
+            safety = ChoiceField(
+                ("safe", "unsafe"),
+                descriptions={
+                    "safe": ("routine unit test status report", "benign system check"),
+                    "unsafe": ("exfiltrate private production keys immediately", "steal secret credentials"),
+                },
+                escalate_on_ambiguity=True,
+            )
+
+        eng_bk = SystemOneEngine(
+            _BankChoiceSchema,
+            dimension=384,
+            backend="numpy",
+            projector=_Const384Proj(),
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        h_bk = eng_bk.model.heads["safety"]
+        w_bk = rng_g.normal(size=(2, 384)).astype(np.float32)
+        h_bk.set_weights(w_bk, np.array([0.0, 0.25], dtype=np.float32))
+        c_mat = rng_g.normal(size=(2, 384)).astype(np.float32)
+        c_mat /= np.linalg.norm(c_mat, axis=1, keepdims=True)
+        h_bk._exemplar_bank = (
+            c_mat,
+            [
+                rng_g.normal(size=(2, 384)).astype(np.float32),
+                rng_g.normal(size=(2, 384)).astype(np.float32),
+            ],
+        )
+        shield_bk = GuardShield(
+            eng_bk.model,
+            field_name="safety",
+            unsafe_label="unsafe",
+            canonicalize=False,
+            window_words=5,
+            stride_words=5,
+        )
+        atk_1 = "exfiltrate private production keys immediately"
+        atk_60 = " ".join([atk_1] * 12)
+        res_bk_1 = shield_bk.evaluate_single(atk_1)
+        res_bk_60 = shield_bk.evaluate_single(atk_60)
+        assert res_bk_60.is_unsafe == res_bk_1.is_unsafe
+        assert res_bk_60.max_window_unsafe_prob == pytest.approx(res_bk_1.max_window_unsafe_prob, abs=1e-12)
+
+        # ------------------------------------------------------------------
+        # R15-2 + sister parity: predicted label must belong to conformal_set
+        # ------------------------------------------------------------------
+        class _UnitE0Proj16:
+            dimension = 16
+
+            def project(self, text: str) -> np.ndarray:
+                v = np.zeros(16, dtype=np.float32)
+                v[0] = 1.0
+                return v
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                v = np.zeros((len(texts), 16), dtype=np.float32)
+                if len(texts) > 0:
+                    v[:, 0] = 1.0
+                return v
+
+        proj_u16 = _UnitE0Proj16()
+        fleet_r15 = MultiTenantSkillFleet(
+            projector=proj_u16,
+            classes=["allow", "deny"],
+            W_base=np.zeros((2, 16), dtype=np.float32),
+            b_base=np.array([math.log(4.0) / 4.0, 0.0], dtype=np.float32),
+            q_init=np.array([0.1, 0.9], dtype=np.float32),
+            num_tenants=1,
+            r_sub=16,
+            m_sparse=0,
+            m_exemplars=0,
+        )
+        f_snap = fleet_r15.fleet_delta_to_bytes()
+        expected_rt_16 = int(fleet_r15.base_nbytes() + fleet_r15.arena_nbytes())
+        fleet_r15_re = MultiTenantSkillFleet.fleet_delta_from_bytes(
+            f_snap, projector=proj_u16, max_runtime_bytes=expected_rt_16
+        )
+        for flt_chk in (fleet_r15, fleet_r15_re):
+            f_dec = flt_chk.decide(0, "probe")
+            assert f_dec.predicted_label == "allow"
+            assert f_dec.conformal_set == ("deny",)
+            assert f_dec.confidence == pytest.approx(0.8, abs=1e-6)
+            assert f_dec.is_ambiguous is True
+
+        # Post-load budget check coverage in fleet_delta_from_bytes (preflight passes, post-load raises)
+        class _PostLoadBudgetFleet(MultiTenantSkillFleet):
+            def base_nbytes(self) -> int:
+                return super().base_nbytes() + 64
+
+        with pytest.raises(ValueError):
+            _PostLoadBudgetFleet.fleet_delta_from_bytes(
+                f_snap, projector=proj_u16, max_runtime_bytes=expected_rt_16
+            )
+
+        # Mondrian ChoiceField excluded prediction in Engine.decide and decide_batch
+        class _ChoiceMondrianSchema(DecisionSchema):
+            act = ChoiceField(("allow", "deny"), escalate_on_ambiguity=True)
+
+        for st_mode in (True, False):
+            eng_mc = SystemOneEngine(
+                _ChoiceMondrianSchema,
+                dimension=16,
+                backend="numpy",
+                projector=proj_u16,
+                contrastive_whitening=False,
+                use_cache=False,
+                strict_mode=st_mode,
+            )
+            eng_mc.model.heads["act"].set_weights(
+                np.zeros((2, 16), dtype=np.float32),
+                np.array([math.log(4.0) / 4.0, 0.0], dtype=np.float32),
+            )
+            cp_mc = ConformalPredictor("act", ("allow", "deny"), score_method="lac", mondrian=True)
+            cp_mc.calibrate(
+                np.tile([0.9, 0.1], (50, 1)),
+                ["allow"] * 25 + ["deny"] * 25,
+            )
+            eng_mc.conformal_predictors["act"] = cp_mc
+            eng_mc.enable_margin_gating = False
+            d_mc = eng_mc.decide("probe", record_receipt=False)
+            assert d_mc.values["act"] == "allow"
+            assert d_mc.conformal_sets["act"] == ["deny"]
+            assert d_mc.is_ambiguous is True
+            d_mc_b = eng_mc.decide_batch(["probe"], record_receipt=False)[0]
+            assert d_mc_b.values["act"] == "allow"
+            assert d_mc_b.conformal_sets["act"] == ["deny"]
+            assert d_mc_b.is_ambiguous is True
+
+        # BooleanField custom threshold excluded from conformal set (LAC + APS across all engines)
+        for st_mode in (True, False):
+            aps_cal_p = 0.88 if st_mode else 0.80
+            for meth, p_t, cal_true_p in (("lac", 0.80, 0.75), ("aps", 0.85, aps_cal_p)):
+                class _BoolThrSchema(DecisionSchema):
+                    flag = BooleanField(threshold=0.90, escalate_on_ambiguity=True)
+
+                eng_bt = SystemOneEngine(
+                    _BoolThrSchema,
+                    dimension=16,
+                    backend="numpy",
+                    projector=proj_u16,
+                    contrastive_whitening=False,
+                    use_cache=False,
+                    strict_mode=st_mode,
+                    enable_margin_gating=False,
+                )
+                b_logit_val = 0.25 * math.log(p_t / (1.0 - p_t))
+                eng_bt.model.heads["flag"].set_weights(
+                    np.zeros((1, 16), dtype=np.float32),
+                    np.array([b_logit_val], dtype=np.float32),
+                )
+                cp_bt = ConformalPredictor("flag", ("False", "True"), score_method=meth, mondrian=False)
+                cp_bt.calibrate(
+                    np.tile([1.0 - cal_true_p, cal_true_p], (25, 1)),
+                    ["True"] * 25,
+                )
+                eng_bt.conformal_predictors["flag"] = cp_bt
+
+                pk_bt = eng_bt.compile_packed_kernel()
+                fn_bt = eng_bt.compile_callable()
+
+                d_bt = eng_bt.decide("probe", record_receipt=False)
+                d_bt_b = eng_bt.decide_batch(["probe"], record_receipt=False)[0]
+                p_bt_1 = pk_bt.decide_prompt("probe")
+                p_bt_b = pk_bt.decide_batch(["probe"])
+                c_bt_1 = fn_bt("probe")
+
+                assert d_bt.values["flag"] is False
+                assert d_bt.conformal_sets["flag"] == ["True"]
+                assert d_bt.is_ambiguous is True
+                assert d_bt_b.values["flag"] is False
+                assert d_bt_b.conformal_sets["flag"] == ["True"]
+                assert d_bt_b.is_ambiguous is True
+                assert bool(p_bt_1["b_val"][0, 0]) is False
+                assert bool(p_bt_1["is_ambiguous"][0]) is True
+                assert bool(p_bt_b["b_val"][0, 0]) is False
+                assert bool(p_bt_b["is_ambiguous"][0]) is True
+                assert c_bt_1.values["flag"] is False
+                assert c_bt_1.is_ambiguous is True
+
+        # ------------------------------------------------------------------
+        # R15-3: _fast_deterministic_project and kernel.encode_one bit-identical
+        # ------------------------------------------------------------------
+        class _R15ProjSchema(DecisionSchema):
+            flag = BooleanField(threshold=0.5, escalate_on_ambiguity=True)
+
+        proj_det16 = DeterministicSemanticProjector(dimension=16)
+        eng_det16 = SystemOneEngine(
+            _R15ProjSchema,
+            dimension=16,
+            backend="numpy",
+            projector=proj_det16,
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        w_det = np.zeros((1, 16), dtype=np.float32)
+        w_det[0, 3] = np.float32(128.0)
+        b_det = np.zeros(1, dtype=np.float32)
+        eng_det16.model.heads["flag"].set_weights(w_det, b_det)
+
+        pk_det16 = eng_det16.compile_packed_kernel()
+        fn_det16 = eng_det16.compile_callable()
+
+        ref_vec = proj_det16.project("hello hello")
+        live_enc_vec = _encode_projector_one(proj_det16, "hello hello", 16, zero_unit0=False)
+        assert np.array_equal(_fast_deterministic_project(proj_det16, "hello hello"), ref_vec)
+        assert np.array_equal(pk_det16.encode_one("hello hello"), live_enc_vec)
+        assert ref_vec[3] > 0.0
+        assert live_enc_vec[3] > 0.0
+
+        d_det = eng_det16.decide("hello hello", record_receipt=False)
+        d_det_b = eng_det16.decide_batch(["hello hello"], record_receipt=False)[0]
+        p_det = pk_det16.decide_prompt("hello hello")
+        p_det_b = pk_det16.decide_batch(["hello hello"])
+        c_det = fn_det16("hello hello")
+        assert d_det.values["flag"] is True
+        assert d_det_b.values["flag"] is True
+        assert bool(p_det["b_val"][0, 0]) is True
+        assert bool(p_det_b["b_val"][0, 0]) is True
+        assert c_det.values["flag"] is True
+        assert float(p_det["b_conf"][0, 0]) == pytest.approx(d_det.confidences["flag"], abs=1e-12)
+        assert float(p_det_b["b_conf"][0, 0]) == pytest.approx(d_det.confidences["flag"], abs=1e-12)
+        assert c_det.confidences["flag"] == pytest.approx(d_det.confidences["flag"], abs=1e-12)
+
+        # ------------------------------------------------------------------
+        # R15-4: Packed overflow recovery & unrecoverable overflow fail-closed
+        # ------------------------------------------------------------------
+        class _ConstQtr16Proj:
+            dimension = 16
+
+            def project(self, text: str) -> np.ndarray:
+                return np.full(16, 0.25, dtype=np.float32)
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                return np.full((len(texts), 16), 0.25, dtype=np.float32)
+
+        class _R15OvfSchema(DecisionSchema):
+            c = ChoiceField(("a", "b"), escalate_on_ambiguity=True)
+            b = BooleanField(threshold=0.5, escalate_on_ambiguity=True)
+
+        signs_16 = np.array([1, 1, 1, 1, 1, -1, 1, 1, -1, -1, -1, 1, -1, 1, 1, -1], dtype=np.float32)
+        w_ovf_c = np.zeros((2, 16), dtype=np.float32)
+        w_ovf_c[0] = np.float32(3e38) * signs_16
+        w_ovf_c[1, 0] = np.float32(0.3)
+        b_ovf_c = np.array([0.1, 0.0], dtype=np.float32)
+        w_ovf_b = w_ovf_c[:1].copy()
+        b_ovf_b = np.array([0.1], dtype=np.float32)
+
+        eng_ov4 = SystemOneEngine(
+            _R15OvfSchema,
+            dimension=16,
+            backend="numpy",
+            projector=_ConstQtr16Proj(),
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        eng_ov4.model.heads["c"].set_weights(w_ovf_c, b_ovf_c)
+        eng_ov4.model.heads["b"].set_weights(w_ovf_b, b_ovf_b)
+
+        pk_ov4 = eng_ov4.compile_packed_kernel()
+        fn_ov4 = eng_ov4.compile_callable()
+
+        d_o1 = eng_ov4.decide("probe", record_receipt=False)
+        d_o3 = eng_ov4.decide_batch(["probe", "probe", "probe"], record_receipt=False)
+        p_o1 = pk_ov4.decide_prompt("probe")
+        p_o3 = pk_ov4.decide_batch(["probe", "probe", "probe"])
+        c_o1 = fn_ov4("probe")
+
+        assert d_o1.values["c"] == "a" and d_o1.values["b"] is True
+        assert d_o1.confidences["c"] == 1.0 and d_o1.confidences["b"] == 1.0
+        for dr in d_o3:
+            assert dr.values["c"] == "a" and dr.values["b"] is True
+            assert dr.confidences["c"] == 1.0 and dr.confidences["b"] == 1.0
+        assert pk_ov4.c_options[0][int(p_o1["best_idx"][0, 0])] == "a"
+        assert bool(p_o1["b_val"][0, 0]) is True
+        assert float(p_o1["c_conf"][0, 0]) == 1.0
+        assert float(p_o1["b_conf"][0, 0]) == 1.0
+        for row_k in range(3):
+            assert pk_ov4.c_options[0][int(p_o3["best_idx"][row_k, 0])] == "a"
+            assert bool(p_o3["b_val"][row_k, 0]) is True
+            assert float(p_o3["c_conf"][row_k, 0]) == 1.0
+            assert float(p_o3["b_conf"][row_k, 0]) == 1.0
+        assert c_o1.values["c"] == "a" and c_o1.values["b"] is True
+        assert c_o1.confidences["c"] == 1.0 and c_o1.confidences["b"] == 1.0
+
+        # Unrecoverable float32 overflow across all four paths must fail closed cleanly
+        w_unrec_c = np.zeros((2, 16), dtype=np.float32)
+        w_unrec_c[0] = np.float32(3e38)
+        w_unrec_b = np.full((1, 16), np.float32(3e38), dtype=np.float32)
+        eng_unrec = SystemOneEngine(
+            _R15OvfSchema,
+            dimension=16,
+            backend="numpy",
+            projector=_ConstQtr16Proj(),
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        eng_unrec.model.heads["c"].set_weights(w_unrec_c, b_ovf_c)
+        eng_unrec.model.heads["b"].set_weights(w_unrec_b, b_ovf_b)
+        pk_unrec = eng_unrec.compile_packed_kernel()
+        fn_unrec = eng_unrec.compile_callable()
+        d_un1 = eng_unrec.decide("probe", record_receipt=False)
+        d_unb = eng_unrec.decide_batch(["probe"], record_receipt=False)[0]
+        p_un1 = pk_unrec.decide_prompt("probe")
+        p_unb = pk_unrec.decide_batch(["probe"])
+        c_un1 = fn_unrec("probe")
+        assert d_un1.is_ambiguous is True and math.isnan(d_un1.confidences["c"]) and math.isnan(d_un1.confidences["b"])
+        assert d_unb.is_ambiguous is True and math.isnan(d_unb.confidences["c"]) and math.isnan(d_unb.confidences["b"])
+        assert bool(p_un1["is_ambiguous"][0]) is True and math.isnan(float(p_un1["c_conf"][0, 0])) and math.isnan(float(p_un1["b_conf"][0, 0]))
+        assert bool(p_unb["is_ambiguous"][0]) is True and math.isnan(float(p_unb["c_conf"][0, 0])) and math.isnan(float(p_unb["b_conf"][0, 0]))
+        assert c_un1.is_ambiguous is True and math.isnan(c_un1.confidences["c"]) and math.isnan(c_un1.confidences["b"])
+
+        # PackedMultiQuestionKernel construction with extreme b_adj0/b_adj1 avoids RuntimeWarning
+        eng_adj = SystemOneEngine(
+            _R15OvfSchema,
+            dimension=16,
+            backend="numpy",
+            projector=proj_u16,
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        eng_adj.calibrators["b"].temperature = 1e308
+        eng_adj.calibrators["b"].logit_adjustments = np.array([-1.2e308, 1.2e308], dtype=np.float64)
+        pk_adj = eng_adj.compile_packed_kernel()
+        assert pk_adj.Q_b == 1
+
+        # ------------------------------------------------------------------
+        # R15-5 & R15-6: Ordinal consumers reject NaNs; threshold check warning-free
+        # ------------------------------------------------------------------
+        X_ord_fit = np.array([[0.0], [1.0], [2.0]], dtype=np.float64)
+        y_ord_fit = np.array([0, 1, 2], dtype=np.int64)
+        for ord_cls in (SoftOrdinalHead, CumulativeLogitOrdinalHead):
+            h_ord = ord_cls(n_classes=3).fit(X_ord_fit, y_ord_fit)
+            assert bool(np.all(np.isnan(h_ord.predict_proba(np.array([1e308])))))
+            assert bool(np.all(np.isnan(h_ord.predict_proba(np.array([[1e308]])))))
+            with pytest.raises(ValueError):
+                h_ord.predict(np.array([1e308]))
+            with pytest.raises(ValueError):
+                h_ord.predict(np.array([[1e308]]))
+            with pytest.raises(ValueError):
+                h_ord.expected_value(np.array([1e308]))
+            with pytest.raises(ValueError):
+                h_ord.expected_value(np.array([[1e308]]))
+
+        cal_one_hot = np.zeros((30, 3), dtype=np.float64)
+        cal_one_hot[:, 0] = 1.0
+        cal_y_zero = np.zeros(30, dtype=np.int64)
+        test_nan_row = np.full((1, 3), np.nan, dtype=np.float64)
+        with pytest.raises(ValueError):
+            cqr_ordinal_intervals(cal_one_hot, cal_y_zero, test_nan_row, alpha=0.1)
+        with pytest.raises(ValueError):
+            _cdf_ordinal_quantiles(test_nan_row, 0.1)
+        with pytest.raises(ValueError):
+            cqr_ordinal_intervals(cal_one_hot[:3], cal_y_zero[:3], test_nan_row, alpha=0.1)
+        with pytest.raises(ValueError):
+            cqr_ordinal_intervals(cal_one_hot[:5], np.array([0, 1, 2, 0, 99]), np.array([[1.0, 0.0, 0.0]]), alpha=0.1)
+        with pytest.raises(ValueError):
+            _cdf_ordinal_quantiles(np.array([[0.2, 0.2, 0.2]]), 0.1)
+
+        cum_th = CumulativeLogitOrdinalHead(n_classes=3).fit(X_ord_fit, y_ord_fit)
+        cum_th.weights_ = np.zeros_like(cum_th.weights_)
+        cum_th.thresholds_ = np.array([-1.2e308, 1.2e308], dtype=np.float64)
+        p_extreme_th = cum_th.predict_proba(np.array([[1.0]]))
+        assert p_extreme_th.shape == (1, 3)
+        assert bool(np.all(np.isfinite(p_extreme_th)))
+
+        router_r15 = UtilityCascadeRouter(error_multiplier=20.0, alpha=0.10)
+        router_r15.fit(
+            ["safe routine ping"] * 6 + ["ambiguous mixed query"] * 6 + ["critical complex failure"] * 6,
+            [0] * 6 + [1] * 6 + [2] * 6,
+        )
+        cum_router = CumulativeLogitOrdinalHead(n_classes=3)
+        cum_router.weights_ = np.zeros(router_r15.ordinal_head.weights_.shape[0], dtype=np.float64)
+        cum_router.thresholds_ = np.array([-1.2e308, 1.2e308], dtype=np.float64)
+        router_r15.ordinal_head = cum_router  # type: ignore[assignment]
+        r_th_ok = router_r15.route("probe")
+        assert r_th_ok.action_index in (0, 1, 2)
+
+        cum_th.thresholds_ = np.array([1.2e308, -1.2e308], dtype=np.float64)
+        assert bool(np.all(np.isnan(cum_th.predict_proba(np.array([[1.0]])))))
+        with pytest.raises(ValueError):
+            cum_th.predict(np.array([[1.0]]))
+
+        # ------------------------------------------------------------------
+        # R15-7 + sister parity + bare ValueError kills for M15 & M35b
+        # ------------------------------------------------------------------
+        def _make_bool_exp_ovf(
+            w0: float,
+            thresh: float,
+            adj2: tuple[float, float],
+            overrides: dict[str, dict[str, Any]] | None = None,
+        ) -> FastExplainer:
+            class _BSchema(DecisionSchema):
+                flag = BooleanField(threshold=thresh, escalate_on_ambiguity=True)
+
+            mdl_be = SystemOneCompiler(_BSchema, dimension=16, projector=proj_u16).compile(
+                {"flag": [("good", True), ("bad", False)] * 3},
+                calibration_split=0.0,
+                augment=False,
+            )
+            w_be = np.zeros((1, 16), dtype=np.float64)
+            w_be[0, 0] = w0
+            b_be = np.zeros(1, dtype=np.float64)
+            mdl_be.heads["flag"].weights = w_be
+            mdl_be.heads["flag"].biases = b_be
+            mdl_be.heads["flag"].temperature = 1e308
+            mdl_be.heads["flag"].logit_adjustments = np.array(adj2, dtype=np.float64)
+            mdl_be._field_heads["flag"].weights = w_be.copy()
+            mdl_be._field_heads["flag"].biases = b_be.copy()
+            if overrides is not None:
+                mdl_be._learned_prompt_overrides = overrides
+            return FastExplainer.from_compiled_model(
+                mdl_be,
+                "flag",
+                train_texts=["good", "bad"] * 3,
+                train_labels=["True", "False"] * 3,
+            )
+
+        for thr_val in (0.5, 0.0, 1.0, 1.5):
+            exp_be_bad = _make_bool_exp_ovf(
+                3e307, min(1.0, max(0.0, thr_val)), (1.2e308, 1.2e308)
+            )
+            exp_be_bad.threshold = thr_val
+            with pytest.raises(ValueError):
+                exp_be_bad.explain("probe")
+            with pytest.raises(ValueError):
+                exp_be_bad._eval_boolean_text_winner("probe")
+            with pytest.raises(ValueError):
+                exp_be_bad._eval_boolean_raw_logit_f32(3e307)
+
+        exp_be_ok = _make_bool_exp_ovf(0.0, 0.5, (-1.2e308, 1.2e308))
+        res_be_ok = exp_be_ok.explain("probe")
+        assert res_be_ok.predicted_label == "True"
+        exp_be_ov = _make_bool_exp_ovf(
+            0.0,
+            0.5,
+            (-1.2e308, 1.2e308),
+            overrides={"boom_bool": {"flag": True}},
+        )
+        assert exp_be_ov.explain("boom_bool").predicted_label == "True"
+
+        class _BF32Schema(DecisionSchema):
+            flag = BooleanField(threshold=0.5, escalate_on_ambiguity=True)
+
+        mdl_be_f32 = SystemOneCompiler(_BF32Schema, dimension=16, projector=proj_u16).compile(
+            {"flag": [("good", True), ("bad", False)] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        w_f32 = np.zeros((1, 16), dtype=np.float32)
+        w_f32[0, 0] = np.float32(3e38)
+        b_f32 = np.array([3e38], dtype=np.float32)
+        mdl_be_f32.heads["flag"].weights = w_f32
+        mdl_be_f32.heads["flag"].biases = b_f32
+        mdl_be_f32.heads["flag"].temperature = 1e308
+        mdl_be_f32.heads["flag"].logit_adjustments = np.zeros(2, dtype=np.float64)
+        mdl_be_f32._field_heads["flag"].set_weights(w_f32.copy(), b_f32.copy())
+        exp_be_f32 = FastExplainer.from_compiled_model(
+            mdl_be_f32,
+            "flag",
+            train_texts=["good", "bad"] * 3,
+            train_labels=["True", "False"] * 3,
+        )
+        with pytest.raises(ValueError):
+            exp_be_f32.explain("probe")
+        with pytest.raises(ValueError):
+            exp_be_f32._eval_boolean_text_winner("probe")
+
+        # M15 behavioral kill: zero-head override with NaN projector raises bare ValueError
+        class _NanProj16:
+            dimension = 16
+
+            def project(self, text: str) -> np.ndarray:
+                if text == "boom":
+                    return np.full(16, np.nan, dtype=np.float32)
+                v = np.zeros(16, dtype=np.float32)
+                v[0 if ("allow" in text or "True" in text) else 1] = 1.0
+                return v
+
+            def project_batch(self, texts: Sequence[str]) -> np.ndarray:
+                return np.stack([self.project(t) for t in texts], axis=0)
+
+        class _ZeroM15Schema(DecisionSchema):
+            act = ChoiceField(("allow", "deny"), escalate_on_ambiguity=True)
+            flag = BooleanField(threshold=0.5, escalate_on_ambiguity=True)
+
+        mdl_m15 = SystemOneCompiler(_ZeroM15Schema, dimension=16, projector=proj_u16).compile(
+            {
+                "act": [("allow", "allow"), ("deny", "deny")] * 3,
+                "flag": [("allow", True), ("deny", False)] * 3,
+            },
+            calibration_split=0.0,
+            augment=False,
+        )
+        mdl_m15.projector = _NanProj16()
+        for fk_m15, n_rows_m15 in (("act", 2), ("flag", 1)):
+            zw = np.zeros((n_rows_m15, 16), dtype=np.float32)
+            zb = np.zeros(n_rows_m15, dtype=np.float32)
+            mdl_m15.heads[fk_m15].weights = zw.copy()
+            mdl_m15.heads[fk_m15].biases = zb.copy()
+            mdl_m15._field_heads[fk_m15].set_weights(zw.copy(), zb.copy())
+        mdl_m15._learned_prompt_overrides = {"boom": {"act": "deny", "flag": True}}
+        exp_m15_c = FastExplainer.from_compiled_model(mdl_m15, "act", train_texts=[], train_labels=[])
+        exp_m15_b = FastExplainer.from_compiled_model(mdl_m15, "flag", train_texts=[], train_labels=[])
+        with pytest.raises(ValueError):
+            exp_m15_c.explain("boom")
+        with pytest.raises(ValueError):
+            exp_m15_b.explain("boom")
+
+        class _ZeroChoiceSchema(DecisionSchema):
+            act = ChoiceField(("allow", "deny"), escalate_on_ambiguity=True)
+
+        # M35b behavioral kill: TF-IDF+RBF phi=NaN when rbf_gamma is NaN
+        hp_m35 = HybridProjector(sparse_dim=8, dense_dim=8, backend="numpy", spectral_blend=0.0)
+        hp_m35.fit(["alpha beta", "gamma delta", "alpha gamma", "beta delta"], use_subspace=False)
+        v_alpha_base = hp_m35.project("alpha").astype(np.float64)
+        cfg_m35 = hp_m35.to_config()
+        cfg_m35["use_subspace"] = False
+        cfg_m35["spectral_blend"] = 0.0
+        cfg_m35["rbf_weight"] = 0.2
+        cfg_m35["rbf_gamma"] = 1.0
+        cfg_m35["rbf_landmarks"] = [v_alpha_base.tolist()]
+        hp_m35_bad = HybridProjector.from_config(cfg_m35)
+        mdl_m35 = SystemOneCompiler(_ZeroChoiceSchema, dimension=hp_m35_bad.dimension, projector=hp_m35_bad).compile(
+            {"act": [("alpha beta", "allow"), ("gamma delta", "deny")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        exp_m35 = FastExplainer.from_compiled_model(
+            mdl_m35,
+            "act",
+            train_texts=["alpha beta", "gamma delta"] * 3,
+            train_labels=["allow", "deny"] * 3,
+        )
+        exp_m35.rbf_gamma = float("nan")
+        spans_m35 = exp_m35._tokenize_spans("alpha beta")
+        with pytest.raises(ValueError):
+            exp_m35._fast_logits_for_kept("alpha beta", spans_m35, [True, False])
+

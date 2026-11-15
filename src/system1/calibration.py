@@ -3235,7 +3235,7 @@ class CumulativeLogitOrdinalHead:
         params_ok = (
             bool(np.all(np.isfinite(w)))
             and bool(np.all(np.isfinite(thetas)))
-            and (thetas.size <= 1 or bool(np.all(np.diff(thetas) >= -1e-12)))
+            and (thetas.size <= 1 or bool(np.all(thetas[1:] >= (thetas[:-1] - 1e-12))))
         )
         if params_ok and n > 0:
             with np.errstate(over="ignore", under="ignore", invalid="ignore"):
@@ -3262,15 +3262,10 @@ class CumulativeLogitOrdinalHead:
         return probs[0] if single else probs
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        proba = self.predict_proba(X)
-        if proba.ndim == 1:
-            return np.array([int(np.argmax(proba))], dtype=np.int64)
-        return np.argmax(proba, axis=1).astype(np.int64)
+        return _predict_ordinal_class(self.predict_proba(X))
 
     def expected_value(self, X: np.ndarray) -> np.ndarray:
-        proba = self.predict_proba(X)
-        classes = np.arange(self.n_classes or proba.shape[-1], dtype=np.float64)
-        return proba @ classes
+        return _ordinal_expected_value(self.predict_proba(X), self.n_classes)
 
 
 class SoftOrdinalHead:
@@ -3386,21 +3381,56 @@ class SoftOrdinalHead:
         return probs[0] if single else probs
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        proba = self.predict_proba(X)
-        if proba.ndim == 1:
-            return np.array([int(np.argmax(proba))], dtype=np.int64)
-        return np.argmax(proba, axis=1).astype(np.int64)
+        return _predict_ordinal_class(self.predict_proba(X))
 
     def expected_value(self, X: np.ndarray) -> np.ndarray:
-        proba = self.predict_proba(X)
-        classes = np.arange(self.n_classes or proba.shape[-1], dtype=np.float64)
-        return proba @ classes
+        return _ordinal_expected_value(self.predict_proba(X), self.n_classes)
+
+
+def _validate_ordinal_prob_matrix(
+    probs: np.ndarray, *, name: str = "probs", allow_1d: bool = False
+) -> np.ndarray:
+    arr = np.asarray(probs, dtype=np.float64)
+    if allow_1d and arr.ndim == 1:
+        check = arr.reshape(1, -1)
+    elif arr.ndim == 2:
+        check = arr
+    else:
+        shape_desc = "1D or 2D" if allow_1d else "2D"
+        raise ValueError(f"{name} must be a {shape_desc} array, got shape {arr.shape}")
+    if check.shape[1] < 1:
+        raise ValueError(f"{name} must have at least 1 class column, got shape {arr.shape}")
+    if check.shape[0] > 0:
+        if not bool(np.all(np.isfinite(check))):
+            raise ValueError(f"{name} contains non-finite values")
+        if bool(np.any(check < -1e-12)):
+            raise ValueError(f"{name} contains negative probabilities")
+        row_sums = np.sum(check, axis=1)
+        if not bool(np.all(np.isfinite(row_sums))) or bool(np.any(np.abs(row_sums - 1.0) > 1e-4)):
+            raise ValueError(f"{name} rows must sum to 1.0")
+    return arr
+
+
+def _predict_ordinal_class(proba: np.ndarray) -> np.ndarray:
+    p = _validate_ordinal_prob_matrix(proba, name="ordinal probabilities", allow_1d=True)
+    if p.ndim == 1:
+        return np.array([int(np.argmax(p))], dtype=np.int64)
+    return np.argmax(p, axis=1).astype(np.int64)
+
+
+def _ordinal_expected_value(proba: np.ndarray, n_classes: Optional[int]) -> np.ndarray:
+    p = _validate_ordinal_prob_matrix(proba, name="ordinal probabilities", allow_1d=True)
+    classes = np.arange(n_classes or p.shape[-1], dtype=np.float64)
+    return p @ classes
 
 
 def _cdf_ordinal_quantiles(probs: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
-    cdf = np.cumsum(np.asarray(probs, dtype=np.float64), axis=1)
-    lo = np.argmax(cdf >= (0.5 * alpha) - 1e-12, axis=1).astype(np.int64)
-    hi = np.argmax(cdf >= (1.0 - 0.5 * alpha) - 1e-12, axis=1).astype(np.int64)
+    if not (0.0 < float(alpha) < 1.0):
+        raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+    p = _validate_ordinal_prob_matrix(probs, name="probs", allow_1d=False)
+    cdf = np.cumsum(p, axis=1)
+    lo = np.argmax(cdf >= (0.5 * float(alpha)) - 1e-12, axis=1).astype(np.int64)
+    hi = np.argmax(cdf >= (1.0 - 0.5 * float(alpha)) - 1e-12, axis=1).astype(np.int64)
     hi = np.maximum(hi, lo)
     return lo, hi
 
@@ -3417,10 +3447,10 @@ def cqr_ordinal_intervals(
     Returns integer arrays ``(lower, upper)`` with guaranteed finite-sample marginal
     coverage ``>= 1 - alpha`` under exchangeability.
     """
-    p_cal = np.asarray(cal_probs, dtype=np.float64)
+    p_cal = _validate_ordinal_prob_matrix(cal_probs, name="cal_probs", allow_1d=False)
     y_cal = np.asarray(cal_y, dtype=np.int64).ravel()
-    p_test = np.asarray(test_probs, dtype=np.float64)
-    if p_cal.ndim != 2 or p_test.ndim != 2 or p_cal.shape[1] != p_test.shape[1]:
+    p_test = _validate_ordinal_prob_matrix(test_probs, name="test_probs", allow_1d=False)
+    if p_cal.shape[1] != p_test.shape[1]:
         raise ValueError("cal_probs and test_probs must be 2D arrays with matching n_classes")
     if p_cal.shape[0] != y_cal.shape[0] or y_cal.size == 0:
         raise ValueError("cal_probs and cal_y must be non-empty and match in length")
@@ -3428,6 +3458,8 @@ def cqr_ordinal_intervals(
         raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
 
     k = p_cal.shape[1]
+    if bool(np.any((y_cal < 0) | (y_cal >= k))):
+        raise ValueError(f"cal_y labels must lie in [0, {k - 1}]")
     n = y_cal.shape[0]
     cal_lo, cal_hi = _cdf_ordinal_quantiles(p_cal, float(alpha))
     scores = np.maximum(cal_lo - y_cal, y_cal - cal_hi).astype(np.float64)

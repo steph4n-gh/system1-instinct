@@ -668,6 +668,7 @@ class MultiTenantSkillFleet:
             raw_bytes = (
                 int(self._raw_source_head[0].nbytes)
                 + int(self._raw_source_head[1].nbytes)
+                + 8
                 + (0 if self._raw_source_head[3] is None else int(self._raw_source_head[3].nbytes))
             )
         return int(
@@ -1251,13 +1252,14 @@ class MultiTenantSkillFleet:
         probs_ok = bool(np.all(np.isfinite(probs)))
         cset = tuple(self.classes[int(i)] for i in np.flatnonzero(pred_set)) if probs_ok else ()
         conf = float(probs[pred_idx]) if probs_ok else float("nan")
+        pred_in_cset = probs_ok and (0 <= pred_idx < len(pred_set)) and bool(pred_set[pred_idx])
         return TenantDecisionResult(
             tenant_id=int(tid),
             predicted_index=pred_idx,
             predicted_label=self.classes[pred_idx],
             confidence=conf,
             conformal_set=cset,
-            is_ambiguous=(not probs_ok) or (len(cset) != 1),
+            is_ambiguous=(not probs_ok) or (len(cset) != 1) or (not pred_in_cset),
             logits=logits_f32,
         )
 

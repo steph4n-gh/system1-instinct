@@ -2859,140 +2859,7 @@ def _fast_deterministic_project(
     recency_weighted: Optional[bool] = None,
 ) -> np.ndarray:
     """Bit-equivalent single-pass projection for DeterministicSemanticProjector."""
-    if not isinstance(text, str):
-        raise TypeError(f"Expected text to be a string, got {type(text).__name__}")
-    dim = proj.dimension
-    clean_text = text.lower().strip()
-    if not clean_text:
-        out = np.zeros(dim, dtype=np.float32)
-        out[0] = 1.0
-        return out
-    if len(clean_text) > 8192:
-        clean_text = clean_text[:4096] + " " + clean_text[-4096:]
-
-    words = _WORD_RE.findall(clean_text)
-    n_words = len(words)
-    use_recency = proj.recency_weighted if recency_weighted is None else bool(recency_weighted)
-    cache = proj._tok_hash_cache
-    tok_cache_on = proj.token_cache_enabled
-    max_cache = proj.max_token_cache
-    cache_get = cache.get if tok_cache_on else None
-    sha256 = _SHA256
-    unpack_6i = _UNPACK_6I
-    sqrt = math.sqrt
-    log1p = math.log1p
-
-    def _populate_tok(
-        key: str,
-    ) -> Tuple[int, int, int, int, int, int, float, float, float, float, float, float]:
-        v0, v1, v2, v3, v4, v5 = unpack_6i(sha256(key.encode("utf-8")).digest())
-        entry = (
-            v0 % dim,
-            v1 % dim,
-            v2 % dim,
-            v3 % dim,
-            v4 % dim,
-            v5 % dim,
-            1.0 if ((v0 >> 16) & 1) == 0 else -1.0,
-            1.0 if ((v1 >> 16) & 1) == 0 else -1.0,
-            1.0 if ((v2 >> 16) & 1) == 0 else -1.0,
-            1.0 if ((v3 >> 16) & 1) == 0 else -1.0,
-            1.0 if ((v4 >> 16) & 1) == 0 else -1.0,
-            1.0 if ((v5 >> 16) & 1) == 0 else -1.0,
-        )
-        if tok_cache_on:
-            if len(cache) >= max_cache:
-                cache.clear()
-            cache[key] = entry
-        return entry
-
-    vec_list = [0.0] * dim
-
-    for pos, word in enumerate(words):
-        dist = (n_words - 1 - pos) if use_recency else pos
-        ww = (log1p(len(word)) / sqrt(1.0 + dist * 0.05)) * 2.0
-        wk = "word:" + word
-        res = cache_get(wk) if cache_get is not None else None
-        if res is None:
-            res = _populate_tok(wk)
-        i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
-        vec_list[i0] += s0 * ww
-        vec_list[i1] += s1 * ww
-        vec_list[i2] += s2 * ww
-        vec_list[i3] += s3 * ww
-        vec_list[i4] += s4 * ww
-        vec_list[i5] += s5 * ww
-
-        wlen = len(word)
-        if wlen >= 3:
-            for j in range(wlen - 2):
-                nk = "ng:" + word[j : j + 3]
-                res = cache_get(nk) if cache_get is not None else None
-                if res is None:
-                    res = _populate_tok(nk)
-                i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
-                vec_list[i0] += s0 * 0.5
-                vec_list[i1] += s1 * 0.5
-                vec_list[i2] += s2 * 0.5
-                vec_list[i3] += s3 * 0.5
-                vec_list[i4] += s4 * 0.5
-                vec_list[i5] += s5 * 0.5
-            if wlen >= 4:
-                for j in range(wlen - 3):
-                    nk = "ng:" + word[j : j + 4]
-                    res = cache_get(nk) if cache_get is not None else None
-                    if res is None:
-                        res = _populate_tok(nk)
-                    i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
-                    vec_list[i0] += s0 * 0.5
-                    vec_list[i1] += s1 * 0.5
-                    vec_list[i2] += s2 * 0.5
-                    vec_list[i3] += s3 * 0.5
-                    vec_list[i4] += s4 * 0.5
-                    vec_list[i5] += s5 * 0.5
-
-    for i in range(n_words - 1):
-        bk = "bi:" + words[i] + "_" + words[i + 1]
-        res = cache_get(bk) if cache_get is not None else None
-        if res is None:
-            res = _populate_tok(bk)
-        i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
-        vec_list[i0] += s0 * 1.5
-        vec_list[i1] += s1 * 1.5
-        vec_list[i2] += s2 * 1.5
-        vec_list[i3] += s3 * 1.5
-        vec_list[i4] += s4 * 1.5
-        vec_list[i5] += s5 * 1.5
-
-    btext = " " + clean_text + " "
-    blimit = max(0, len(btext) - 4)
-    for j in range(blimit):
-        ck = "char4:" + btext[j : j + 4]
-        res = cache_get(ck) if cache_get is not None else None
-        if res is None:
-            res = _populate_tok(ck)
-        i0, i1, i2, i3, i4, i5, s0, s1, s2, s3, s4, s5 = res
-        vec_list[i0] += s0 * 0.3
-        vec_list[i1] += s1 * 0.3
-        vec_list[i2] += s2 * 0.3
-        vec_list[i3] += s3 * 0.3
-        vec_list[i4] += s4 * 0.3
-        vec_list[i5] += s5 * 0.3
-
-    vec = np.array(vec_list, dtype=np.float32)
-    max_abs = float(np.max(np.abs(vec))) if len(vec) > 0 else 0.0
-    if max_abs < 1e-12 or not math.isfinite(max_abs):
-        vec.fill(0.0)
-        vec[0] = 1.0
-        return vec
-    vec /= max_abs
-    norm = float(np.linalg.norm(vec))
-    if norm > 1e-12:
-        vec /= norm
-    else:
-        vec.fill(0.0)
-        vec[0] = 1.0
-    return vec
+    return proj.project(text, recency_weighted=recency_weighted)
 
 
 _VALID_PACKED_STORAGE_MODES = ("float32", "float16", "float16_upcast")
@@ -3187,19 +3054,21 @@ class PackedMultiQuestionKernel:
                 _owned_readonly_array(np.asarray(arr, dtype=np.float64).reshape(-1), dtype=np.float64)
                 for arr in c_adj
             )
-            self.c_adj_div_temp = tuple(
-                _owned_readonly_array(arr / float(t), dtype=np.float64)
-                for arr, t in zip(self.c_adj, self.c_temp)
-            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                self.c_adj_div_temp = tuple(
+                    _owned_readonly_array(arr / float(t), dtype=np.float64)
+                    for arr, t in zip(self.c_adj, self.c_temp)
+                )
         elif c_adj_div_temp is not None:
             self.c_adj_div_temp = tuple(
                 _owned_readonly_array(np.asarray(arr, dtype=np.float64).reshape(-1), dtype=np.float64)
                 for arr in c_adj_div_temp
             )
-            self.c_adj = tuple(
-                _owned_readonly_array(arr * float(t), dtype=np.float64)
-                for arr, t in zip(self.c_adj_div_temp, self.c_temp)
-            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                self.c_adj = tuple(
+                    _owned_readonly_array(arr * float(t), dtype=np.float64)
+                    for arr, t in zip(self.c_adj_div_temp, self.c_temp)
+                )
         else:
             self.c_adj = tuple(
                 _owned_readonly_array(np.zeros(int(k), dtype=np.float64), dtype=np.float64)
@@ -3232,9 +3101,10 @@ class PackedMultiQuestionKernel:
             self.b_adj1 = _owned_readonly_array(
                 np.asarray(b_adj1, dtype=np.float64).reshape(-1), dtype=np.float64
             )
-            self.b_adj_div_temp = _owned_readonly_array(
-                (self.b_adj1 - self.b_adj0) / self.b_temp, dtype=np.float64
-            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                self.b_adj_div_temp = _owned_readonly_array(
+                    (self.b_adj1 - self.b_adj0) / self.b_temp, dtype=np.float64
+                )
         elif b_adj_div_temp is not None:
             self.b_adj_div_temp = _owned_readonly_array(
                 np.asarray(b_adj_div_temp, dtype=np.float64).reshape(-1), dtype=np.float64
@@ -3242,9 +3112,10 @@ class PackedMultiQuestionKernel:
             self.b_adj0 = _owned_readonly_array(
                 np.zeros(self.Q_b, dtype=np.float64), dtype=np.float64
             )
-            self.b_adj1 = _owned_readonly_array(
-                self.b_adj_div_temp * self.b_temp, dtype=np.float64
-            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                self.b_adj1 = _owned_readonly_array(
+                    self.b_adj_div_temp * self.b_temp, dtype=np.float64
+                )
         else:
             self.b_adj0 = _owned_readonly_array(
                 np.zeros(self.Q_b, dtype=np.float64), dtype=np.float64
@@ -3947,11 +3818,13 @@ class PackedMultiQuestionKernel:
                     x_inf = np.max(
                         np.abs(np.where(np.isfinite(Xm_2d), Xm_2d, 0.0)), axis=1
                     ).astype(np.float64)
+                    c_mag = x_inf[:, None] * self.c_w_l1_max[None, :] + self.c_b_abs_max[None, :]
+                    pot_ovf_c = (~np.isfinite(c_mag)) | (c_mag >= 1e37)
                     dz_bound_c = (
                         4.0
                         * (float(self.dimension) + 4.0)
                         * _FLOAT32_EPS
-                        * (x_inf[:, None] * self.c_w_l1_max[None, :] + self.c_b_abs_max[None, :])
+                        * c_mag
                     )
                     dz_cal_bound_c = (dz_bound_c / 0.25) / self.c_temp[None, :]
                     dp_bound_c = np.minimum(1.0, dz_cal_bound_c + 1e-9)
@@ -4014,11 +3887,10 @@ class PackedMultiQuestionKernel:
                         )
                         near_c |= near_mg_c
 
+                    near_c = near_c | c_nonfin | pot_ovf_c
                     if np.any(self.c_has_raw_f64):
-                        near_c = np.where(self.c_has_raw_f64[None, :], True, near_c & (~c_nonfin))
-                        near_c &= (~x_row_nonfin[:, None]) & (~self.c_zero_head[None, :]) & (~c_model_ov)
-                    else:
-                        near_c &= (~c_nonfin) & (~self.c_zero_head[None, :]) & (~c_model_ov)
+                        near_c = np.where(self.c_has_raw_f64[None, :], True, near_c)
+                    near_c &= (~x_row_nonfin[:, None]) & (~self.c_zero_head[None, :]) & (~c_model_ov)
                 if np.any(near_c):
                     r_idxs, c_idxs = np.nonzero(near_c)
                     for r_pos, ci_pos in zip(r_idxs.tolist(), c_idxs.tolist()):
@@ -4123,6 +3995,12 @@ class PackedMultiQuestionKernel:
                     & (odds >= self.c_gamma[None, :])
                 )
                 c_ambig = (in_c == 0) | ((in_c > 1) & (~mg))
+            pred_in_c = np.where(
+                self.c_is_cal[None, :] & self.c_is_lac[None, :],
+                (1.0 - c_conf) <= self.c_qhat[None, :] + 1e-7,
+                in_c >= 1,
+            )
+            c_ambig |= ~pred_in_c
             if np.any(c_nonfin):
                 best_idx = np.array(best_idx, dtype=np.int32, copy=True)
                 best_idx[c_nonfin] = 0
@@ -4170,11 +4048,13 @@ class PackedMultiQuestionKernel:
                         x_inf = np.max(
                             np.abs(np.where(np.isfinite(Xm_2d), Xm_2d, 0.0)), axis=1
                         ).astype(np.float64)
+                    b_mag = x_inf[:, None] * self.b_w_l1[None, :] + self.b_b_abs[None, :]
+                    pot_ovf_b = (~np.isfinite(b_mag)) | (b_mag >= 1e37)
                     dz_bound_b = (
                         4.0
                         * (float(self.dimension) + 4.0)
                         * _FLOAT32_EPS
-                        * (x_inf[:, None] * self.b_w_l1[None, :] + self.b_b_abs[None, :])
+                        * b_mag
                     )
                     dz_cal_b = (dz_bound_b / 0.25) / self.b_temp[None, :]
                     dp_bound_b = np.minimum(1.0, 0.5 * dz_cal_b + 1e-9)
@@ -4211,11 +4091,10 @@ class PackedMultiQuestionKernel:
                         )
                         near_b |= near_mg_b
 
+                    near_b = near_b | b_nonfin | pot_ovf_b
                     if np.any(self.b_has_raw_f64):
-                        near_b = np.where(self.b_has_raw_f64[None, :], True, near_b & (~b_nonfin))
-                        near_b &= (~x_row_nonfin[:, None]) & (~self.b_zero_head[None, :]) & (~b_model_ov)
-                    else:
-                        near_b &= (~b_nonfin) & (~self.b_zero_head[None, :]) & (~b_model_ov)
+                        near_b = np.where(self.b_has_raw_f64[None, :], True, near_b)
+                    near_b &= (~x_row_nonfin[:, None]) & (~self.b_zero_head[None, :]) & (~b_model_ov)
                 if np.any(near_b):
                     r_idxs, b_idxs = np.nonzero(near_b)
                     for r_pos, bi_pos in zip(r_idxs.tolist(), b_idxs.tolist()):
@@ -4240,14 +4119,17 @@ class PackedMultiQuestionKernel:
                             b_nonfin[r_pos, bi_pos] = False
                         else:
                             p_true[r_pos, bi_pos] = float("nan")
+                            p_false[r_pos, bi_pos] = float("nan")
                             b_val[r_pos, bi_pos] = False
                             b_conf[r_pos, bi_pos] = float("nan")
                             b_nonfin[r_pos, bi_pos] = True
 
+            top_is_true_b = p_true > p_false
             if self.b_all_lac:
-                in_b = ((1.0 - p_true) <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
-                    (1.0 - p_false) <= self.b_qhat[None, :] + 1e-7
-                ).astype(np.int32)
+                true_in_b = (1.0 - p_true) <= self.b_qhat[None, :] + 1e-7
+                false_in_b = (1.0 - p_false) <= self.b_qhat[None, :] + 1e-7
+                in_b = true_in_b.astype(np.int32) + false_in_b.astype(np.int32)
+                pred_in_b = np.where(b_val, true_in_b, false_in_b)
             elif self.b_all_aps_cal:
                 if self.strict:
                     in_b = (b_top <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
@@ -4255,10 +4137,12 @@ class PackedMultiQuestionKernel:
                     ).astype(np.int32)
                 else:
                     in_b = 1 + (b_top < self.b_qhat[None, :] - 1e-7).astype(np.int32)
+                pred_in_b = (in_b >= 2) | ((in_b == 1) & (b_val == top_is_true_b))
             else:
-                in_lac_b = ((1.0 - p_true) <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
-                    (1.0 - p_false) <= self.b_qhat[None, :] + 1e-7
-                ).astype(np.int32)
+                true_in_lac = (1.0 - p_true) <= self.b_qhat[None, :] + 1e-7
+                false_in_lac = (1.0 - p_false) <= self.b_qhat[None, :] + 1e-7
+                in_lac_b = true_in_lac.astype(np.int32) + false_in_lac.astype(np.int32)
+                pred_in_lac_b = np.where(b_val, true_in_lac, false_in_lac)
                 if self.strict:
                     in_aps_b = (b_top <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
                         1.0 <= self.b_qhat[None, :] + 1e-7
@@ -4267,10 +4151,19 @@ class PackedMultiQuestionKernel:
                 else:
                     in_aps_b = 1 + (b_top < self.b_qhat[None, :] - 1e-7).astype(np.int32)
                     in_uncal_b = 1 + (b_top < (1.0 - self.alpha - 1e-7)).astype(np.int32)
+                in_aps_or_uncal = np.where(self.b_is_cal[None, :], in_aps_b, in_uncal_b)
+                pred_in_aps_or_uncal = (in_aps_or_uncal >= 2) | (
+                    (in_aps_or_uncal == 1) & (b_val == top_is_true_b)
+                )
                 in_b = np.where(
                     self.b_is_cal[None, :],
                     np.where(self.b_is_lac[None, :], in_lac_b, in_aps_b),
                     in_uncal_b,
+                )
+                pred_in_b = np.where(
+                    self.b_is_cal[None, :] & self.b_is_lac[None, :],
+                    pred_in_lac_b,
+                    pred_in_aps_or_uncal,
                 )
 
             if self.strict:
@@ -4287,6 +4180,7 @@ class PackedMultiQuestionKernel:
                     & (odds_b >= self.b_gamma[None, :])
                 )
                 b_ambig = (in_b == 0) | ((in_b > 1) & (~mg_b))
+            b_ambig |= ~pred_in_b
             if np.any(b_nonfin):
                 b_val[b_nonfin] = False
                 in_b[b_nonfin] = 0
@@ -4885,12 +4779,20 @@ class FastDecisionCallable:
             s0 = st.c_starts[ci]
             temp = st.c_temp[ci]
             adj_vec = st.c_adj[ci]
-            if (
-                emb_ok
+            if not emb_ok:
+                vals[fn] = st.c_options[ci][0]
+                confs[fn] = float("nan")
+                ambig = True
+                continue
+            can_exact_c = (
+                self._storage_mode == "float32"
                 and len(st.c_raw_w) == st.Q_c
+                and not st.c_zero_head[ci]
+            )
+            if (
+                can_exact_c
                 and ci < len(st.c_has_raw_f64)
                 and st.c_has_raw_f64[ci]
-                and not st.c_zero_head[ci]
             ):
                 p_ex, ok_ex = _exact_choice_probs_row(
                     emb.reshape(1, -1),
@@ -4907,39 +4809,42 @@ class FastDecisionCallable:
                 probs = p_ex.tolist()
             else:
                 z_cal = [(z_list[s0 + j] / 0.25 + adj_vec[j]) / temp for j in range(K)]
-                if (not emb_ok) or not (
+                probs_opt: Optional[List[float]] = None
+                if (
                     all(isfinite(z_list[s0 + j]) for j in range(K))
                     and all(isfinite(v) for v in z_cal)
                 ):
-                    vals[fn] = st.c_options[ci][0]
-                    confs[fn] = float("nan")
-                    ambig = True
-                    continue
-                m = max(z_cal)
-                exps = [exp(v - m) for v in z_cal]
-                sum_e = sum(exps)
-                if not (isfinite(sum_e) and sum_e > 0.0):
-                    vals[fn] = st.c_options[ci][0]
-                    confs[fn] = float("nan")
-                    ambig = True
-                    continue
-                inv_sum = 1.0 / sum_e
-                probs = [e * inv_sum for e in exps]
-                if not all(isfinite(pv) for pv in probs):
-                    vals[fn] = st.c_options[ci][0]
-                    confs[fn] = float("nan")
-                    ambig = True
-                    continue
-                if len(st.c_raw_w) == st.Q_c and not st.c_zero_head[ci]:
+                    m = max(z_cal)
+                    exps = [exp(v - m) for v in z_cal]
+                    sum_e = sum(exps)
+                    if isfinite(sum_e) and sum_e > 0.0:
+                        inv_sum = 1.0 / sum_e
+                        cand_probs = [e * inv_sum for e in exps]
+                        if all(isfinite(pv) for pv in cand_probs):
+                            probs_opt = cand_probs
+                if probs_opt is None:
+                    if not can_exact_c:
+                        vals[fn] = st.c_options[ci][0]
+                        confs[fn] = float("nan")
+                        ambig = True
+                        continue
+                    near_ci = True
+                    probs = []
+                else:
+                    probs = probs_opt
+                    near_ci = False
+                if can_exact_c and not near_ci:
+                    c_mag_b = x_inf_val * st.c_w_l1_max[ci] + st.c_b_abs_max[ci]
+                    pot_ovf_ci = (not isfinite(c_mag_b)) or c_mag_b >= 1e37
                     dz_b = (
                         4.0
                         * (st.dimension_f + 4.0)
                         * _FLOAT32_EPS
-                        * (x_inf_val * st.c_w_l1_max[ci] + st.c_b_abs_max[ci])
+                        * c_mag_b
                     )
                     dz_cal_b = (dz_b / 0.25) / temp
                     dp_b = min(1.0, dz_cal_b + 1e-9)
-                    near_ci = not (isfinite(dz_cal_b) and isfinite(dp_b))
+                    near_ci = pot_ovf_ci or (not (isfinite(dz_cal_b) and isfinite(dp_b)))
                     if not near_ci and K >= 2:
                         zcs = sorted(z_cal, reverse=True)
                         if (not isfinite(zcs[0] - zcs[1])) or (zcs[0] - zcs[1]) <= 2.0 * dz_cal_b:
@@ -4992,20 +4897,20 @@ class FastDecisionCallable:
                             or abs(ru_chk - 1e-6) <= dp_b + 1e-9
                         ):
                             near_ci = True
-                    if near_ci:
-                        p_ex, ok_ex = _exact_choice_probs_row(
-                            emb.reshape(1, -1),
-                            st.c_raw_w[ci],
-                            st.c_raw_b[ci],
-                            np.asarray(adj_vec, dtype=np.float64),
-                            temp,
-                        )
-                        if not ok_ex:
-                            vals[fn] = st.c_options[ci][0]
-                            confs[fn] = float("nan")
-                            ambig = True
-                            continue
-                        probs = p_ex.tolist()
+                if near_ci:
+                    p_ex, ok_ex = _exact_choice_probs_row(
+                        emb.reshape(1, -1),
+                        st.c_raw_w[ci],
+                        st.c_raw_b[ci],
+                        np.asarray(adj_vec, dtype=np.float64),
+                        temp,
+                    )
+                    if not ok_ex:
+                        vals[fn] = st.c_options[ci][0]
+                        confs[fn] = float("nan")
+                        ambig = True
+                        continue
+                    probs = p_ex.tolist()
             best_i = 0
             best_p = probs[0]
             for j in range(1, K):
@@ -5029,10 +4934,12 @@ class FastDecisionCallable:
                         cnt += 1
                         if cs >= thr:
                             break
+                pred_in = cnt >= 1
             else:
                 qh = st.c_qhats[ci]
                 if st.c_lacs[ci]:
                     cnt = sum(1 for pv in probs if (1.0 - pv) <= qh + 1e-7)
+                    pred_in = (1.0 - best_p) <= qh + 1e-7
                 elif strict:
                     ps = sorted(probs, reverse=True)
                     cs = 0.0
@@ -5043,6 +4950,7 @@ class FastDecisionCallable:
                             cnt += 1
                         else:
                             break
+                    pred_in = cnt >= 1
                 else:
                     ps = sorted(probs, reverse=True)
                     cs = 0.0
@@ -5052,8 +4960,9 @@ class FastDecisionCallable:
                         cnt += 1
                         if cs >= qh - 1e-7:
                             break
+                    pred_in = cnt >= 1
 
-            field_ambig = False
+            field_ambig = not pred_in
             if strict:
                 if (not st.c_cals[ci]) or (cnt != 1):
                     field_ambig = True
@@ -5085,12 +4994,20 @@ class FastDecisionCallable:
             zv = z_list[st.b_offset + bi]
             scaled_z = zv / 0.25
             temp_b = st.b_temp[bi]
-            if (
-                emb_ok
+            if not emb_ok:
+                vals[fn] = False
+                confs[fn] = float("nan")
+                ambig = True
+                continue
+            can_exact_b = (
+                self._storage_mode == "float32"
                 and len(st.b_raw_w) == st.Q_b
+                and not st.b_zero_head[bi]
+            )
+            if (
+                can_exact_b
                 and bi < len(st.b_has_raw_f64)
                 and st.b_has_raw_f64[bi]
-                and not st.b_zero_head[bi]
             ):
                 _, _, _, pt, pf, ok_ex = _exact_bool_probs_row(
                     emb.reshape(1, -1),
@@ -5108,39 +5025,40 @@ class FastDecisionCallable:
             else:
                 s0 = (-0.5 * scaled_z + st.b_adj0[bi]) / temp_b
                 s1 = (0.5 * scaled_z + st.b_adj1[bi]) / temp_b
-                if (not emb_ok) or not (isfinite(zv) and isfinite(s0) and isfinite(s1)):
-                    vals[fn] = False
-                    confs[fn] = float("nan")
-                    ambig = True
-                    continue
-                mb = s0 if s0 >= s1 else s1
-                e0 = exp(s0 - mb)
-                e1 = exp(s1 - mb)
-                denom_b = e0 + e1
-                if not (isfinite(denom_b) and denom_b > 0.0):
-                    vals[fn] = False
-                    confs[fn] = float("nan")
-                    ambig = True
-                    continue
-                pf = e0 / denom_b
-                pt = e1 / denom_b
-                if not (isfinite(pt) and isfinite(pf)):
-                    vals[fn] = False
-                    confs[fn] = float("nan")
-                    ambig = True
-                    continue
-                if len(st.b_raw_w) == st.Q_b and not st.b_zero_head[bi]:
+                packed_b_ok = False
+                pt = pf = 0.0
+                if isfinite(zv) and isfinite(s0) and isfinite(s1):
+                    mb = s0 if s0 >= s1 else s1
+                    e0 = exp(s0 - mb)
+                    e1 = exp(s1 - mb)
+                    denom_b = e0 + e1
+                    if isfinite(denom_b) and denom_b > 0.0:
+                        pf = e0 / denom_b
+                        pt = e1 / denom_b
+                        if isfinite(pt) and isfinite(pf):
+                            packed_b_ok = True
+                if not packed_b_ok:
+                    if not can_exact_b:
+                        vals[fn] = False
+                        confs[fn] = float("nan")
+                        ambig = True
+                        continue
+                    near_bi = True
+                elif can_exact_b:
+                    b_mag_b = x_inf_val * st.b_w_l1[bi] + st.b_b_abs[bi]
+                    pot_ovf_bi = (not isfinite(b_mag_b)) or b_mag_b >= 1e37
                     dz_b = (
                         4.0
                         * (st.dimension_f + 4.0)
                         * _FLOAT32_EPS
-                        * (x_inf_val * st.b_w_l1[bi] + st.b_b_abs[bi])
+                        * b_mag_b
                     )
                     dz_cal_b = (dz_b / 0.25) / temp_b
                     dp_b = min(1.0, 0.5 * dz_cal_b + 1e-9)
                     top_chk = pt if pt >= pf else pf
                     near_bi = (
-                        (not (isfinite(dz_cal_b) and isfinite(dp_b)))
+                        pot_ovf_bi
+                        or (not (isfinite(dz_cal_b) and isfinite(dp_b)))
                         or abs(pt - st.b_thresh[bi]) <= dp_b
                         or abs(pt - 0.5) <= dp_b
                     )
@@ -5175,42 +5093,50 @@ class FastDecisionCallable:
                             or abs(bot_chk - 1e-6) <= dp_b + 1e-9
                         ):
                             near_bi = True
-                    if near_bi:
-                        _, _, _, pt, pf, ok_ex = _exact_bool_probs_row(
-                            emb.reshape(1, -1),
-                            st.b_raw_w[bi],
-                            st.b_raw_b[bi],
-                            st.b_adj0[bi],
-                            st.b_adj1[bi],
-                            temp_b,
-                        )
-                        if not ok_ex:
-                            vals[fn] = False
-                            confs[fn] = float("nan")
-                            ambig = True
-                            continue
+                else:
+                    near_bi = False
+                if near_bi:
+                    _, _, _, pt, pf, ok_ex = _exact_bool_probs_row(
+                        emb.reshape(1, -1),
+                        st.b_raw_w[bi],
+                        st.b_raw_b[bi],
+                        st.b_adj0[bi],
+                        st.b_adj1[bi],
+                        temp_b,
+                    )
+                    if not ok_ex:
+                        vals[fn] = False
+                        confs[fn] = float("nan")
+                        ambig = True
+                        continue
             bv = pt >= st.b_thresh[bi]
             vals[fn] = bv
             confs[fn] = pt if bv else pf
 
             top = pt if pt >= pf else pf
+            top_is_true = pt > pf
             if not st.b_cals[bi]:
                 if strict:
                     cnt = 2
+                    pred_in = True
                 else:
                     cnt = 1 if top >= (1.0 - st.alpha - 1e-7) else 2
+                    pred_in = (cnt >= 2) or (bv == top_is_true)
             else:
                 qh = st.b_qhats[bi]
                 if st.b_lacs[bi]:
-                    cnt = (1 if (1.0 - pt) <= qh + 1e-7 else 0) + (
-                        1 if (1.0 - pf) <= qh + 1e-7 else 0
-                    )
+                    true_in = (1.0 - pt) <= qh + 1e-7
+                    false_in = (1.0 - pf) <= qh + 1e-7
+                    cnt = (1 if true_in else 0) + (1 if false_in else 0)
+                    pred_in = true_in if bv else false_in
                 elif strict:
                     cnt = (1 if top <= qh + 1e-7 else 0) + (1 if 1.0 <= qh + 1e-7 else 0)
+                    pred_in = (cnt >= 2) or ((cnt == 1) and (bv == top_is_true))
                 else:
                     cnt = 1 if top >= qh - 1e-7 else 2
+                    pred_in = (cnt >= 2) or (bv == top_is_true)
 
-            field_ambig = False
+            field_ambig = not pred_in
             if strict:
                 if (not st.b_cals[bi]) or (cnt != 1):
                     field_ambig = True

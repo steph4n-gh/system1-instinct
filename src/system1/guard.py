@@ -557,28 +557,21 @@ class GuardShield:
                 or getattr(self.head, "_exemplar_bank", None) is not None
             ):
                 raw_logits = np.full((n_views, k_out), np.nan, dtype=np.float64)
-                fin_idx = np.flatnonzero(x_fin).tolist()
-                if fin_idx:
-                    fin_texts = [str(texts[i]) for i in fin_idx]
-                    ex_logits = np.asarray(
-                        self.head.compute_logits(X[fin_idx], prompts=fin_texts),
+                for r_i in np.flatnonzero(x_fin).tolist():
+                    raw_logits[r_i] = np.asarray(
+                        self.head.compute_logits(X[r_i : r_i + 1], prompts=[str(texts[r_i])]),
                         dtype=np.float64,
-                    )
-                    raw_logits[fin_idx] = ex_logits
-            elif self.is_boolean:
+                    ).reshape(-1)
+            else:
+                n_cols = 1 if self.is_boolean else k_out
                 raw_logits = np.full(
-                    (n_views, 1),
+                    (n_views, n_cols),
                     np.nan,
                     dtype=np.result_type(self.raw_W.dtype, self.raw_b.dtype),
                 )
                 for r_i in np.flatnonzero(x_fin).tolist():
                     x_in = X[r_i : r_i + 1].astype(self.raw_W.dtype, copy=False)
                     raw_logits[r_i] = (x_in @ self.raw_W.T + self.raw_b)[0]
-            else:
-                raw_logits = X.astype(self.raw_W.dtype, copy=False) @ self.raw_W.T + self.raw_b
-                if bool(np.any(~x_fin)):
-                    raw_logits = np.array(raw_logits, copy=True)
-                    raw_logits[~x_fin] = np.nan
 
             z_col = raw_logits.astype(np.float64) / 0.25
             raw_ok = (
