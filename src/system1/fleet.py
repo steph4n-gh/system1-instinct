@@ -28,6 +28,8 @@ MAX_FLEET_RUNTIME_BYTES = 256 * 1024 * 1024
 MAX_FLEET_TENANTS = 100_000
 MAX_FLEET_ARCHIVE_ENTRIES = 32
 MAX_FLEET_DIRECTORY_BYTES = 65536
+MAX_FLEET_SPARSE_CAP = 255
+MAX_FLEET_EXEMPLAR_CAP = 255
 _FLEET_REQUIRED_ARRAYS = frozenset(
     {
         "W_base",
@@ -308,8 +310,25 @@ class MultiTenantSkillFleet:
                 raise ValueError(f"base_tok_df length {df_arr.shape[0]} != {self.BASE_HASH_SIZE}")
             self.base_tok_df = df_arr
 
-        self.m_sparse = max(0, int(m_sparse))
-        self.m_exemplars = max(0, int(m_exemplars))
+        if isinstance(m_sparse, bool) or not isinstance(m_sparse, (int, np.integer)):
+            raise ValueError(
+                f"m_sparse must be an integer in [0, {MAX_FLEET_SPARSE_CAP}], got {m_sparse!r}"
+            )
+        m_sparse_i = int(m_sparse)
+        if not (0 <= m_sparse_i <= MAX_FLEET_SPARSE_CAP):
+            raise ValueError(f"m_sparse must be in [0, {MAX_FLEET_SPARSE_CAP}], got {m_sparse_i}")
+        self.m_sparse = m_sparse_i
+
+        if isinstance(m_exemplars, bool) or not isinstance(m_exemplars, (int, np.integer)):
+            raise ValueError(
+                f"m_exemplars must be an integer in [0, {MAX_FLEET_EXEMPLAR_CAP}], got {m_exemplars!r}"
+            )
+        m_exemplars_i = int(m_exemplars)
+        if not (0 <= m_exemplars_i <= MAX_FLEET_EXEMPLAR_CAP):
+            raise ValueError(
+                f"m_exemplars must be in [0, {MAX_FLEET_EXEMPLAR_CAP}], got {m_exemplars_i}"
+            )
+        self.m_exemplars = m_exemplars_i
         if isinstance(lam_rls, bool) or not isinstance(lam_rls, (int, float, np.integer, np.floating)):
             raise ValueError(f"lam_rls must be finite in [1e-12, 1e12], got {lam_rls!r}")
         self.lam_rls = float(lam_rls)
@@ -586,7 +605,25 @@ class MultiTenantSkillFleet:
             if precomputed_x is not None
             else self._project_batch(texts)
         )
+        if (
+            X.ndim != 2
+            or X.shape != (len(texts), self.W_base.shape[1])
+            or not bool(np.all(np.isfinite(X)))
+        ):
+            raise ValueError(
+                f"adapt_tenant_batch features must be finite with shape ({len(texts)}, {self.W_base.shape[1]})"
+            )
         with self._lock:
+            m_sp = int(self.m_sparse)
+            m_ex = int(self.m_exemplars)
+            if not (0 <= m_sp <= min(MAX_FLEET_SPARSE_CAP, self.sp_hash.shape[1])):
+                raise ValueError(
+                    f"m_sparse {m_sp} invalid for uint8/buffer capacity {self.sp_hash.shape[1]}"
+                )
+            if not (0 <= m_ex <= min(MAX_FLEET_EXEMPLAR_CAP, self.ex_vecs_q.shape[1])):
+                raise ValueError(
+                    f"m_exemplars {m_ex} invalid for uint8/buffer capacity {self.ex_vecs_q.shape[1]}"
+                )
             dW = self.dW_q[tid].astype(np.float32) * self.dW_scale[tid].astype(np.float32)
             P_t = self.P_blk[tid].copy()
 
@@ -654,38 +691,57 @@ class MultiTenantSkillFleet:
                         ex_list_v.append(z_norm)
                         ex_list_c.append(int(y))
 
-            max_abs = np.max(np.abs(dW), axis=1, keepdims=True)
-            scale_q = np.maximum(max_abs / 127.0, 1e-6).astype(np.float16)
-            self.P_blk[tid] = P_t
-            self.dW_scale[tid] = scale_q
-            self.dW_q[tid] = np.clip(np.round(dW / scale_q.astype(np.float32)), -127, 127).astype(np.int8)
+            with np.errstate(over="ignore", invalid="ignore"):
+                max_abs = np.max(np.abs(dW), axis=1, keepdims=True)
+                scale_q = np.maximum(max_abs / 127.0, 1e-6).astype(np.float16)
+                dW_q_new = np.clip(np.round(dW / scale_q.astype(np.float32)), -127, 127).astype(np.int8)
+            if (
+                not bool(np.all(np.isfinite(P_t)))
+                or (P_t.size > 0 and float(np.max(np.abs(P_t))) > 1e12)
+                or not bool(np.all(np.isfinite(dW)))
+                or not bool(np.all(np.isfinite(scale_q)))
+            ):
+                raise ValueError(
+                    "adapt_tenant_batch produced non-finite or out-of-range tenant parameters"
+                )
 
-            if self.m_sparse > 0:
-                top_sp = sorted(sp_map.items(), key=lambda kv: abs(kv[1]), reverse=True)[: self.m_sparse]
-                self.sp_len[tid] = len(top_sp)
-                for i, ((h, ci), wv) in enumerate(top_sp):
-                    self.sp_hash[tid, i] = h
-                    self.sp_cls[tid, i] = ci
-                    self.sp_w[tid, i] = np.float16(wv)
+            staged_sp: Optional[Tuple[int, np.ndarray, np.ndarray, np.ndarray]] = None
+            if m_sp > 0:
+                top_sp = sorted(sp_map.items(), key=lambda kv: abs(kv[1]), reverse=True)[:m_sp]
+                n_sp_new = len(top_sp)
+                if n_sp_new > MAX_FLEET_SPARSE_CAP or n_sp_new > self.sp_hash.shape[1]:
+                    raise ValueError(f"Sparse count {n_sp_new} exceeds capacity")
+                sp_h_new = np.empty(n_sp_new, dtype=np.uint16)
+                sp_c_new = np.empty(n_sp_new, dtype=np.uint16)
+                sp_w_new = np.empty(n_sp_new, dtype=np.float16)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    for i, ((h, ci), wv) in enumerate(top_sp):
+                        sp_h_new[i] = h
+                        sp_c_new[i] = ci
+                        sp_w_new[i] = np.float16(wv)
+                if not bool(np.all(np.isfinite(sp_w_new))):
+                    raise ValueError("adapt_tenant_batch produced non-finite sparse weights")
+                staged_sp = (n_sp_new, sp_h_new, sp_c_new, sp_w_new)
 
-            if ex_list_v and self.m_exemplars > 0:
+            staged_ex: Optional[Tuple[int, np.ndarray, np.ndarray, np.ndarray]] = None
+            if ex_list_v and m_ex > 0:
                 by_cls: Dict[int, List[np.ndarray]] = defaultdict(list)
                 for v, ci in zip(ex_list_v, ex_list_c):
                     by_cls[ci].append(v)
                 chosen_v: List[np.ndarray] = []
                 chosen_c: List[int] = []
                 for ci, vs in by_cls.items():
-                    if len(chosen_v) >= self.m_exemplars:
+                    if len(chosen_v) >= m_ex:
                         break
                     cen = np.mean(vs, axis=0)
                     cen /= float(np.linalg.norm(cen)) + 1e-8
                     chosen_v.append(cen)
                     chosen_c.append(ci)
                 shot_idx = 0
-                while len(chosen_v) < self.m_exemplars:
+                while len(chosen_v) < m_ex:
                     added = False
                     for ci, vs in by_cls.items():
-                        if shot_idx < len(vs) and len(chosen_v) < self.m_exemplars:
+                        if shot_idx < len(vs) and len(chosen_v) < m_ex:
                             chosen_v.append(vs[shot_idx])
                             chosen_c.append(ci)
                             added = True
@@ -693,12 +749,41 @@ class MultiTenantSkillFleet:
                         break
                     shot_idx += 1
 
-                self.ex_len[tid] = len(chosen_v)
-                for i, (vec, ci) in enumerate(zip(chosen_v, chosen_c)):
-                    sc = max(float(np.max(np.abs(vec))) / 127.0, 1e-6)
-                    self.ex_scales[tid, i] = np.float16(sc)
-                    self.ex_vecs_q[tid, i] = np.clip(np.round(vec / sc), -127, 127).astype(np.int8)
-                    self.ex_cls[tid, i] = ci
+                n_ex_new = len(chosen_v)
+                if n_ex_new > MAX_FLEET_EXEMPLAR_CAP or n_ex_new > self.ex_vecs_q.shape[1]:
+                    raise ValueError(f"Exemplar count {n_ex_new} exceeds capacity")
+                ex_s_new = np.empty(n_ex_new, dtype=np.float16)
+                ex_vq_new = np.empty((n_ex_new, self.r_sub), dtype=np.int8)
+                ex_c_new = np.empty(n_ex_new, dtype=np.int16)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    for i, (vec, ci) in enumerate(zip(chosen_v, chosen_c)):
+                        if not bool(np.all(np.isfinite(vec))):
+                            raise ValueError("adapt_tenant_batch produced non-finite exemplar vector")
+                        sc = max(float(np.max(np.abs(vec))) / 127.0, 1e-6)
+                        ex_s_new[i] = np.float16(sc)
+                        ex_vq_new[i] = np.clip(np.round(vec / sc), -127, 127).astype(np.int8)
+                        ex_c_new[i] = ci
+                if not bool(np.all(np.isfinite(ex_s_new))):
+                    raise ValueError("adapt_tenant_batch produced non-finite exemplar scales")
+                staged_ex = (n_ex_new, ex_s_new, ex_vq_new, ex_c_new)
+
+            self.P_blk[tid] = P_t
+            self.dW_scale[tid] = scale_q
+            self.dW_q[tid] = dW_q_new
+            if staged_sp is not None:
+                n_sp_new, sp_h_new, sp_c_new, sp_w_new = staged_sp
+                self.sp_len[tid] = n_sp_new
+                if n_sp_new > 0:
+                    self.sp_hash[tid, :n_sp_new] = sp_h_new
+                    self.sp_cls[tid, :n_sp_new] = sp_c_new
+                    self.sp_w[tid, :n_sp_new] = sp_w_new
+            if staged_ex is not None:
+                n_ex_new, ex_s_new, ex_vq_new, ex_c_new = staged_ex
+                self.ex_len[tid] = n_ex_new
+                if n_ex_new > 0:
+                    self.ex_scales[tid, :n_ex_new] = ex_s_new
+                    self.ex_vecs_q[tid, :n_ex_new] = ex_vq_new
+                    self.ex_cls[tid, :n_ex_new] = ex_c_new
 
             if tid == self._active_tid:
                 self._active_views = self._bind_views(tid)
@@ -947,13 +1032,28 @@ class MultiTenantSkillFleet:
             raise ValueError(f"Projector dimension {proj_dim} != snapshot feature dimension {D}")
 
         sp_dtype, sp_shape = headers["sp_hash"]
-        if sp_dtype != np.dtype(np.uint16) or len(sp_shape) != 2 or sp_shape[0] != T or sp_shape[1] > 4096:
-            raise ValueError(f"Invalid sp_hash spec: dtype={sp_dtype}, shape={sp_shape}, expected ({T}, <=4096)")
+        if (
+            sp_dtype != np.dtype(np.uint16)
+            or len(sp_shape) != 2
+            or sp_shape[0] != T
+            or sp_shape[1] > MAX_FLEET_SPARSE_CAP
+        ):
+            raise ValueError(
+                f"Invalid sp_hash spec: dtype={sp_dtype}, shape={sp_shape}, expected ({T}, <={MAX_FLEET_SPARSE_CAP})"
+            )
         M_sp = sp_shape[1]
 
         ex_dtype, ex_shape = headers["ex_vecs_q"]
-        if ex_dtype != np.dtype(np.int8) or len(ex_shape) != 3 or ex_shape[0] != T or ex_shape[1] > 1024 or ex_shape[2] != R:
-            raise ValueError(f"Invalid ex_vecs_q spec: dtype={ex_dtype}, shape={ex_shape}, expected ({T}, <=1024, {R})")
+        if (
+            ex_dtype != np.dtype(np.int8)
+            or len(ex_shape) != 3
+            or ex_shape[0] != T
+            or ex_shape[1] > MAX_FLEET_EXEMPLAR_CAP
+            or ex_shape[2] != R
+        ):
+            raise ValueError(
+                f"Invalid ex_vecs_q spec: dtype={ex_dtype}, shape={ex_shape}, expected ({T}, <={MAX_FLEET_EXEMPLAR_CAP}, {R})"
+            )
         M_ex = ex_shape[1]
 
         alpha_dtypes = (np.dtype(np.float16), np.dtype(np.float32), np.dtype(np.float64))
@@ -1207,19 +1307,25 @@ class MultiTenantSkillFleet:
                     raise ValueError(f"Snapshot meta_ints num_tenants {num_tenants} != array dim {T}")
                 if r_sub < 1 or _round_up_16(max(r_sub, K)) != R:
                     raise ValueError(f"Snapshot meta_ints r_sub {r_sub} incompatible with array dim {R}")
-                if m_sparse != M_sp:
-                    raise ValueError(f"Snapshot meta_ints m_sparse {m_sparse} != array dim {M_sp}")
-                if m_exemplars != M_ex:
-                    raise ValueError(f"Snapshot meta_ints m_exemplars {m_exemplars} != array dim {M_ex}")
+                if m_sparse != M_sp or not (0 <= m_sparse <= MAX_FLEET_SPARSE_CAP):
+                    raise ValueError(
+                        f"Snapshot meta_ints m_sparse {m_sparse} incompatible with capacity [0, {min(M_sp, MAX_FLEET_SPARSE_CAP)}]"
+                    )
+                if m_exemplars != M_ex or not (0 <= m_exemplars <= MAX_FLEET_EXEMPLAR_CAP):
+                    raise ValueError(
+                        f"Snapshot meta_ints m_exemplars {m_exemplars} incompatible with capacity [0, {min(M_ex, MAX_FLEET_EXEMPLAR_CAP)}]"
+                    )
             else:
                 num_tenants, r_sub, m_sparse, m_exemplars = T, R, M_sp, M_ex
+                if m_sparse > MAX_FLEET_SPARSE_CAP or m_exemplars > MAX_FLEET_EXEMPLAR_CAP:
+                    raise ValueError("Snapshot array capacities exceed uint8 limit 255")
 
             if "meta_floats" in zf:
                 m_flt = zf["meta_floats"]
                 lam_rls, alpha = float(m_flt[0]), float(m_flt[1])
             else:
                 lam_rls, alpha = 1.5, 0.10
-            if not math.isfinite(lam_rls) or lam_rls <= 0.0:
+            if not math.isfinite(lam_rls) or not (1e-12 <= lam_rls <= 1e12):
                 raise ValueError(f"Invalid snapshot lam_rls: {lam_rls!r}")
             if not math.isfinite(alpha) or not (0.0 < alpha < 1.0):
                 raise ValueError(f"Invalid snapshot alpha: {alpha!r}")
@@ -1243,24 +1349,66 @@ class MultiTenantSkillFleet:
                 if bool(np.any(ex_cls_arr[active_ex] < 0)):
                     raise ValueError("Snapshot contains negative ex_cls in active exemplar slot")
 
+            def _load_checked_raw(
+                name: str,
+                *,
+                min_v: Optional[float] = None,
+                max_v: Optional[float] = None,
+                max_abs: Optional[float] = None,
+                strict_gt: Optional[float] = None,
+                strict_lt: Optional[float] = None,
+            ) -> np.ndarray:
+                raw = zf[name]
+                arr64 = np.asarray(raw, dtype=np.float64)
+                if not bool(np.all(np.isfinite(arr64))):
+                    raise ValueError(f"Snapshot array {name!r} contains non-finite values")
+                if arr64.size > 0:
+                    lo = float(np.min(arr64))
+                    hi = float(np.max(arr64))
+                    if max_abs is not None and max(abs(lo), abs(hi)) > max_abs:
+                        raise ValueError(
+                            f"Snapshot array {name!r} exceeds safe magnitude bound {max_abs}"
+                        )
+                    if min_v is not None and lo < min_v:
+                        raise ValueError(f"Snapshot {name!r} below minimum {min_v}: {lo}")
+                    if strict_gt is not None and lo <= strict_gt:
+                        raise ValueError(f"Snapshot {name!r} must be > {strict_gt}: {lo}")
+                    if max_v is not None and hi > max_v:
+                        raise ValueError(f"Snapshot {name!r} above maximum {max_v}: {hi}")
+                    if strict_lt is not None and hi >= strict_lt:
+                        raise ValueError(f"Snapshot {name!r} must be < {strict_lt}: {hi}")
+                return raw
+
+            raw_W_base = _load_checked_raw("W_base", max_abs=1e12)
+            raw_b_base = _load_checked_raw("b_base", max_abs=1e12)
+            raw_U_shared = _load_checked_raw("U_shared", max_abs=1e12)
+            raw_q_init = _load_checked_raw("q_init", min_v=0.0, max_v=1.0)
+            raw_dW_scale = _load_checked_raw("dW_scale", min_v=0.0, max_v=65504.0)
+            raw_P_blk = _load_checked_raw("P_blk", max_abs=1e12)
+            raw_sp_w = _load_checked_raw("sp_w", max_abs=65504.0)
+            raw_ex_scales = _load_checked_raw("ex_scales", min_v=0.0, max_v=65504.0)
+            raw_q_c = _load_checked_raw("q_c", min_v=0.0, max_v=1.0)
+            raw_u_c = _load_checked_raw("u_c", min_v=0.0, max_v=16.0)
+            raw_alpha_c = _load_checked_raw("alpha_c", strict_gt=0.0, strict_lt=1.0)
+            raw_err_ewma = _load_checked_raw("err_ewma", min_v=0.0, max_v=1.0)
+
             with np.errstate(over="ignore", invalid="ignore"):
-                W_base_arr = zf["W_base"].astype(np.float32)
-                b_base_arr = zf["b_base"].astype(np.float32)
-                U_shared_arr = zf["U_shared"].astype(np.float32)
+                W_base_arr = raw_W_base.astype(np.float32)
+                b_base_arr = raw_b_base.astype(np.float32)
+                U_shared_arr = raw_U_shared.astype(np.float32)
                 base_tok_df_arr = zf["base_tok_df"].astype(np.uint16)
-                q_init_arr = zf["q_init"].astype(np.float32)
+                q_init_arr = raw_q_init.astype(np.float32)
                 dW_q_arr = zf["dW_q"]
-                dW_scale_arr = zf["dW_scale"].astype(np.float16)
-                P_blk_arr = zf["P_blk"].astype(np.float32)
+                dW_scale_arr = raw_dW_scale.astype(np.float16)
+                P_blk_arr = raw_P_blk.astype(np.float32)
                 sp_hash_arr = zf["sp_hash"]
-                sp_w_arr = zf["sp_w"].astype(np.float16)
+                sp_w_arr = raw_sp_w.astype(np.float16)
                 ex_vecs_q_arr = zf["ex_vecs_q"]
-                ex_scales_arr = zf["ex_scales"].astype(np.float16)
-                raw_q_c = zf["q_c"]
+                ex_scales_arr = raw_ex_scales.astype(np.float16)
                 q_c_arr = raw_q_c.copy() if raw_q_c.dtype == np.dtype(np.float16) else raw_q_c.astype(np.float64)
-                u_c_arr = zf["u_c"].astype(np.float16)
-                alpha_c_arr = zf["alpha_c"].astype(np.float64)
-                err_ewma_arr = zf["err_ewma"].astype(np.float16)
+                u_c_arr = raw_u_c.astype(np.float16)
+                alpha_c_arr = raw_alpha_c.astype(np.float64)
+                err_ewma_arr = raw_err_ewma.astype(np.float16)
 
             for arr_name, arr_val in (
                 ("W_base", W_base_arr),

@@ -55,11 +55,17 @@ from system1.core import (
 from system1.core.model import (
     FastDecisionCallable,
     PackedMultiQuestionKernel,
+    _compute_engine_inference_signature,
     _has_custom_validate_decision,
+    _normalize_raw_projection,
+    _normalize_raw_projection_batch,
     _stable_sigmoid,
+    _validate_packed_engine_support,
 )
 from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
+from system1.core.embeddings import HybridProjector
 from system1.core.telemetry import TelemetryProjector
+from system1.core.text import PragmaticCompositeProjector
 from system1.ledger import ActionLedger, LedgerWriteError
 from system1.receipt import (
     DecisionWitnessReceipt,
@@ -2146,8 +2152,9 @@ class SystemOneEngine:
                 except Exception:
                     prompt_raw_norm = None
 
+            emb_finite = bool(np.all(np.isfinite(raw_result.embedding)))
             learned_overrides: Dict[str, Any] = {}
-            if embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
+            if emb_finite and embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
                 norm_key = " ".join(prompt.strip().casefold().split())
                 model_ov = getattr(self.model, "_learned_prompt_overrides", {})
                 model_rec = getattr(self.model, "_learned_prompt_override_recency", {})
@@ -2203,7 +2210,19 @@ class SystemOneEngine:
                         ood_blocked = True
 
                 if isinstance(f_def, ChoiceField):
-                    calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
+                    if not (emb_finite and bool(np.all(np.isfinite(calibrated_p)))):
+                        values[name] = f_def.options[0]
+                        confidences[name] = float("nan")
+                        probabilities[name] = {opt: float("nan") for opt in f_def.options}
+                        conformal_sets[name] = []
+                        abstention_reasons[name] = "non_finite_input"
+                        ambiguous_fields.append(name)
+                        if getattr(f_def, "escalate_on_ambiguity", True):
+                            escalated_fields.append(name)
+                        is_ambiguous = True
+                        continue
                     best_idx = int(np.argmax(calibrated_p))
                     selected_choice = f_def.options[best_idx]
                     conf = float(calibrated_p[best_idx])
@@ -2260,7 +2279,19 @@ class SystemOneEngine:
                         margins[name] = 1.0
 
                 elif isinstance(f_def, BooleanField):
-                    calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
+                    if not (emb_finite and bool(np.all(np.isfinite(calibrated_p)))):
+                        values[name] = False
+                        confidences[name] = float("nan")
+                        probabilities[name] = {"False": float("nan"), "True": float("nan")}
+                        conformal_sets[name] = []
+                        abstention_reasons[name] = "non_finite_input"
+                        ambiguous_fields.append(name)
+                        if getattr(f_def, "escalate_on_ambiguity", True):
+                            escalated_fields.append(name)
+                        is_ambiguous = True
+                        continue
                     prob_true = float(calibrated_p[1])
                     val = bool(prob_true >= f_def.threshold)
                     conf = prob_true if val else (1.0 - prob_true)
@@ -2317,8 +2348,20 @@ class SystemOneEngine:
 
                 elif isinstance(f_def, MultiChoiceField):
                     calibrated_temp = calibrator.temperature
-                    scaled_logits = raw_eval.logits / max(1e-4, calibrated_temp)
-                    probs = _stable_sigmoid(scaled_logits, temperature=1.0)
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        scaled_logits = raw_eval.logits / max(1e-4, calibrated_temp)
+                        probs = _stable_sigmoid(scaled_logits, temperature=1.0)
+                    if not (emb_finite and bool(np.all(np.isfinite(probs)))):
+                        values[name] = ()
+                        confidences[name] = float("nan")
+                        probabilities[name] = {opt: float("nan") for opt in f_def.options}
+                        conformal_sets[name] = []
+                        abstention_reasons[name] = "non_finite_input"
+                        ambiguous_fields.append(name)
+                        if getattr(f_def, "escalate_on_ambiguity", True):
+                            escalated_fields.append(name)
+                        is_ambiguous = True
+                        continue
                     selected = tuple(
                         f_def.options[i] for i, p in enumerate(probs) if p >= f_def.threshold
                     )
@@ -2362,10 +2405,22 @@ class SystemOneEngine:
                 elif isinstance(f_def, ScoreField):
                     calibrator = self.calibrators.get(name)
                     calibrated_temp = calibrator.temperature if calibrator is not None else 1.0
-                    scaled_logit = float(raw_eval.logits[0] / max(1e-4, calibrated_temp))
-                    prob = float(_stable_sigmoid(np.array([scaled_logit]), temperature=1.0)[0])
-                    val = f_def.min_value + (f_def.max_value - f_def.min_value) * prob
-                    conf = float(getattr(raw_eval, "confidence", max(prob, 1.0 - prob)))
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        scaled_logit = float(raw_eval.logits[0] / max(1e-4, calibrated_temp))
+                        prob = float(_stable_sigmoid(np.array([scaled_logit]), temperature=1.0)[0])
+                        val = f_def.min_value + (f_def.max_value - f_def.min_value) * prob
+                        conf = float(getattr(raw_eval, "confidence", max(prob, 1.0 - prob)))
+                    if not (emb_finite and math.isfinite(val) and math.isfinite(conf)):
+                        values[name] = float("nan")
+                        confidences[name] = float("nan")
+                        probabilities[name] = {"score_ratio": float("nan")}
+                        conformal_sets[name] = []
+                        abstention_reasons[name] = "non_finite_input"
+                        ambiguous_fields.append(name)
+                        if getattr(f_def, "escalate_on_ambiguity", True):
+                            escalated_fields.append(name)
+                        is_ambiguous = True
+                        continue
                     values[name] = val
                     confidences[name] = conf
                     probabilities[name] = {"score_ratio": prob}
@@ -3401,143 +3456,34 @@ class SystemOneEngine:
             return compiled
 
     def _packed_kernel_cache_key(self, storage_mode: str) -> Tuple[Any, ...]:
-        cal_sig = tuple(
-            (
-                name,
-                float(getattr(cal, "temperature", 1.0)),
-                tuple(
-                    np.asarray(getattr(cal, "logit_adjustments", ()), dtype=np.float64)
-                    .ravel()
-                    .tolist()
-                )
-                if getattr(cal, "logit_adjustments", None) is not None
-                else (),
-            )
-            for name, cal in sorted(self.calibrators.items())
-        )
-        cp_sig = tuple(
-            (
-                name,
-                float(getattr(cp, "q_hat", 0.0)),
-                int(len(getattr(cp, "calibration_scores", ()))),
-                str(getattr(cp, "score_method", "")),
-                float(getattr(cp, "calibrated_margin_threshold", 0.0)),
-            )
-            for name, cp in sorted(self.conformal_predictors.items())
-        )
-        rcp_sig = tuple(
-            (
-                name,
-                float(getattr(rcp, "q_hat", 0.0)),
-                int(len(getattr(rcp, "residuals", ()))),
-            )
-            for name, rcp in sorted(getattr(self, "regression_conformal_predictors", {}).items())
-        )
-        thresh_sig = tuple(
-            (name, float(getattr(fd, "threshold", 0.5)))
-            for name, fd in sorted(self.schema.fields.items())
-            if hasattr(fd, "threshold")
-        )
         aci_obj = getattr(self, "aci_tracker", None)
-        aci_sig = (
-            None
-            if aci_obj is None
-            else (float(aci_obj.alpha_t), getattr(aci_obj, "margin_floor", None))
-        )
-
-        def _ov_snapshot(src_obj: Any) -> Tuple[Any, ...]:
-            ov_map = getattr(src_obj, "_learned_prompt_overrides", None)
-            if not isinstance(ov_map, Mapping) or not ov_map:
-                return ()
-            rec_map = getattr(src_obj, "_learned_prompt_override_recency", {})
-            default_rec = bool(getattr(self, "recency_weighted", False))
-            return tuple(
-                (
-                    str(pk),
-                    bool(rec_map.get(pk, default_rec)) if isinstance(rec_map, Mapping) else default_rec,
-                    tuple(sorted((str(fk), repr(fv)) for fk, fv in f_map.items()))
-                    if isinstance(f_map, Mapping)
-                    else (),
-                )
-                for pk, f_map in sorted(ov_map.items())
-            )
-
-        eng_schema = self.schema
-        model_schema = getattr(getattr(self, "model", None), "schema", None)
-        validate_sig = (
-            getattr(type(eng_schema), "validate_decision", None),
-            getattr(eng_schema, "__dict__", {}).get("validate_decision"),
-            None if model_schema is None else getattr(type(model_schema), "validate_decision", None),
-            None
-            if model_schema is None
-            else getattr(model_schema, "__dict__", {}).get("validate_decision"),
-        )
-        schema_sig = (
-            id(eng_schema),
-            eng_schema.schema_digest() if hasattr(eng_schema, "schema_digest") else None,
-            None if model_schema is None else id(model_schema),
-            None
-            if model_schema is None or not hasattr(model_schema, "schema_digest")
-            else model_schema.schema_digest(),
-        )
-        return (
-            str(storage_mode),
-            int(getattr(self, "model_version", 1)),
-            int(getattr(self, "policy_epoch", 0)),
-            float(self.default_alpha),
-            bool(self.strict_mode),
-            bool(getattr(self, "enable_margin_gating", False)),
-            self.margin_threshold,
-            getattr(self, "relative_odds_ratio", None),
-            getattr(self, "confidence_floor_tau0", None),
-            bool(getattr(self, "recency_weighted", False)),
-            bool(getattr(self, "selective_calibrators", None)),
-            getattr(self, "joint_calibrator", None) is not None,
-            validate_sig,
-            aci_sig,
-            (_ov_snapshot(self), _ov_snapshot(getattr(self, "model", None))),
-            thresh_sig,
-            cal_sig,
-            cp_sig,
-            rcp_sig,
-            schema_sig,
-        )
+        eff_alpha = float(aci_obj.alpha_t) if aci_obj is not None else float(self.default_alpha)
+        return _compute_engine_inference_signature(self, storage_mode, effective_alpha=eff_alpha)
 
     def compile_packed_kernel(self, *, storage_mode: str = "float32") -> PackedMultiQuestionKernel:
         """Compiles and caches a fused multi-question inference kernel for this engine."""
-        with self._lock:
-            model = getattr(self, "model", None)
-            if _has_custom_validate_decision(self.schema) or _has_custom_validate_decision(
-                getattr(model, "schema", None)
-            ):
-                raise ValueError(
-                    "PackedMultiQuestionKernel does not support custom DecisionSchema.validate_decision"
-                )
-            if getattr(self, "selective_calibrators", None):
-                raise ValueError(
-                    "PackedMultiQuestionKernel does not support engines with active selective_calibrators"
-                )
-            if getattr(self, "joint_calibrator", None) is not None:
-                raise ValueError(
-                    "PackedMultiQuestionKernel does not support engines with active joint_calibrator"
-                )
+        model = getattr(self, "model", None)
+        model_lock = getattr(model, "_lock", nullcontext()) if model is not None else nullcontext()
+        with self._lock, model_lock:
+            _validate_packed_engine_support(self)
             aci_tracker = getattr(self, "aci_tracker", None)
-            if aci_tracker is not None and getattr(aci_tracker, "margin_floor", None) is not None:
-                raise ValueError(
-                    "PackedMultiQuestionKernel does not support engines with active aci_tracker margin_floor"
-                )
-            cache_key = self._packed_kernel_cache_key(storage_mode)
-            key_aci_sig = cache_key[13] if isinstance(cache_key, tuple) and len(cache_key) > 13 else None
-            if key_aci_sig is not None and key_aci_sig[1] is not None:
-                raise ValueError(
-                    "PackedMultiQuestionKernel does not support engines with active aci_tracker margin_floor"
-                )
-            captured_alpha = float(key_aci_sig[0]) if key_aci_sig is not None else None
+            raw_alpha = aci_tracker.alpha_t if aci_tracker is not None else self.default_alpha
+            if (
+                isinstance(raw_alpha, bool)
+                or not isinstance(raw_alpha, (int, float))
+                or not math.isfinite(float(raw_alpha))
+                or not (0.0 < float(raw_alpha) < 1.0)
+            ):
+                raise ValueError(f"alpha must be in (0, 1), got {raw_alpha!r}")
+            captured_alpha = float(raw_alpha)
+            cache_key = _compute_engine_inference_signature(
+                self, storage_mode, effective_alpha=captured_alpha
+            )
             cached = getattr(self, "_packed_kernel_cache", None)
             if (
                 cached is not None
                 and cached[0] == cache_key
-                and (captured_alpha is None or cached[1].alpha == captured_alpha)
+                and cached[1].alpha == captured_alpha
             ):
                 return cached[1]
             kernel = PackedMultiQuestionKernel.from_engine(
@@ -3545,10 +3491,11 @@ class SystemOneEngine:
                 storage_mode=storage_mode,
                 alpha=captured_alpha,
             )
-            if captured_alpha is not None and kernel.alpha != captured_alpha:
+            if kernel.alpha != captured_alpha:
                 raise ValueError(
                     f"PackedMultiQuestionKernel alpha mismatch: expected {captured_alpha}, got {kernel.alpha}"
                 )
+            kernel._inference_sig = cache_key
             self._packed_kernel_cache = (cache_key, kernel)
             return kernel
 
@@ -3831,6 +3778,11 @@ class SystemOneEngine:
 
             proj_obj = getattr(self.model, "projector", self.projector)
             is_tfidf_proj = isinstance(proj_obj, TfidfProjector)
+            zero_unit0 = (
+                type(self.model).__name__ == "CompiledSystemOneModel"
+                and not isinstance(proj_obj, (TfidfProjector, PragmaticCompositeProjector))
+            )
+            is_hybrid_proj = isinstance(proj_obj, HybridProjector)
             schema_name = self.schema.schema_name
             schema_digest = self.schema.schema_digest()
             custom_validate = type(self.schema).validate_decision is not DecisionSchema.validate_decision
@@ -4019,40 +3971,62 @@ class SystemOneEngine:
                 t_chunk_start = time.perf_counter()
 
                 raw_norms_arr: Optional[np.ndarray] = None
-                if needs_raw_norm:
-                    try:
-                        proj_ret = proj_obj.project_batch(
-                            chunk_prompts, recency_weighted=recency_flag, return_norms=True
+                X_raw_2d: Optional[np.ndarray] = None
+                if is_hybrid_proj:
+                    hyb_rows: List[np.ndarray] = []
+                    for p in chunk_prompts:
+                        try:
+                            raw_p = proj_obj.project(p, recency_weighted=recency_flag)
+                        except TypeError:
+                            raw_p = proj_obj.project(p)
+                        hyb_rows.append(
+                            _normalize_raw_projection(raw_p, self.dimension, zero_unit0=zero_unit0)
                         )
-                    except TypeError:
-                        proj_ret = proj_obj.project_batch(chunk_prompts, return_norms=True)
-                    if isinstance(proj_ret, tuple):
-                        X_raw, raw_norms_arr = proj_ret
-                        raw_norms_arr = np.asarray(raw_norms_arr, dtype=np.float64).reshape(-1)
-                    else:
-                        X_raw = proj_ret
-                        if hasattr(proj_obj, "raw_norm"):
-                            raw_norms_arr = np.array(
-                                [float(proj_obj.raw_norm(p)) for p in chunk_prompts], dtype=np.float64
+                    X = np.stack(hyb_rows, axis=0)
+                    if needs_raw_norm and hasattr(proj_obj, "raw_norm"):
+                        raw_norms_arr = np.array(
+                            [float(proj_obj.raw_norm(p)) for p in chunk_prompts], dtype=np.float64
+                        )
+                else:
+                    if needs_raw_norm:
+                        try:
+                            proj_ret = proj_obj.project_batch(
+                                chunk_prompts, recency_weighted=recency_flag, return_norms=True
                             )
-                else:
-                    try:
-                        X_raw = proj_obj.project_batch(chunk_prompts, recency_weighted=recency_flag)
-                    except TypeError:
-                        X_raw = proj_obj.project_batch(chunk_prompts)
+                        except TypeError:
+                            proj_ret = proj_obj.project_batch(chunk_prompts, return_norms=True)
+                        if isinstance(proj_ret, tuple):
+                            X_raw, raw_norms_arr = proj_ret
+                            raw_norms_arr = np.asarray(raw_norms_arr, dtype=np.float64).reshape(-1)
+                        else:
+                            X_raw = proj_ret
+                            if hasattr(proj_obj, "raw_norm"):
+                                raw_norms_arr = np.array(
+                                    [float(proj_obj.raw_norm(p)) for p in chunk_prompts], dtype=np.float64
+                                )
+                    else:
+                        try:
+                            X_raw = proj_obj.project_batch(chunk_prompts, recency_weighted=recency_flag)
+                        except TypeError:
+                            X_raw = proj_obj.project_batch(chunk_prompts)
 
-                X_arr = np.asarray(X_raw, dtype=np.float32)
-                norms = np.linalg.norm(X_arr, axis=1, keepdims=True)
-                good = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
-                X = np.zeros((m_docs, self.dimension), dtype=np.float32)
-                if np.any(good):
-                    X[good] = (X_arr[good] / norms[good]).astype(np.float32)
+                    X_raw_2d = np.asarray(X_raw)
+                    if X_raw_2d.ndim == 1:
+                        X_raw_2d = X_raw_2d.reshape(1, -1)
+                    X = _normalize_raw_projection_batch(
+                        X_raw_2d, m_docs, self.dimension, zero_unit0=zero_unit0
+                    )
+                nonfin_rows = ~np.all(np.isfinite(X), axis=1)
+                x_inf_chunk = (
+                    np.max(np.abs(np.where(np.isfinite(X), X, 0.0)), axis=1).astype(np.float64)
+                    if m_docs > 1
+                    else np.empty(0, dtype=np.float64)
+                )
                 if is_tfidf_proj:
-                    zero_emb_mask = ~good
+                    zero_emb_mask = (~nonfin_rows) & (~np.any(X, axis=1))
                 else:
-                    if np.any(~good):
-                        X[~good, 0] = 1.0
                     zero_emb_mask = np.zeros(m_docs, dtype=bool)
+                row_any_nonfin = nonfin_rows.copy()
 
                 row_values: List[Dict[str, Any]] = [{} for _ in range(m_docs)]
                 row_confs: List[Dict[str, float]] = [{} for _ in range(m_docs)]
@@ -4080,57 +4054,194 @@ class SystemOneEngine:
                     calibrator = spec["calibrator"]
                     conformal = spec["conformal"]
 
-                    logits = X @ spec["w"].T + spec["b"]
-                    if spec["is_hier"]:
-                        coarse_logits = X @ spec["coarse_w"].T + spec["coarse_b"]
-                        c_scaled = coarse_logits.astype(np.float64) / 0.25
-                        c_scaled -= np.max(c_scaled, axis=1, keepdims=True)
-                        c_exp = np.exp(c_scaled)
-                        coarse_probs = c_exp / np.sum(c_exp, axis=1, keepdims=True)
-                        assign = spec["cluster_assign"]
-                        mapped_coarse = coarse_logits[:, assign]
-                        if spec["fine_w"] is not None and spec["fine_b"] is not None:
-                            spec_logits = X @ spec["fine_w"].T + spec["fine_b"]
-                            mapped_probs = coarse_probs[:, assign]
-                            logits = (
-                                0.65 * logits
-                                + (0.20 + 0.30 * mapped_probs) * spec_logits
-                                + 0.20 * mapped_coarse
-                            ).astype(np.float32)
-                        else:
-                            logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        logits = X @ spec["w"].T + spec["b"]
+                        if spec["is_hier"]:
+                            coarse_logits = X @ spec["coarse_w"].T + spec["coarse_b"]
+                            c_scaled = coarse_logits.astype(np.float64) / 0.25
+                            c_scaled -= np.max(c_scaled, axis=1, keepdims=True)
+                            c_exp = np.exp(c_scaled)
+                            coarse_probs = c_exp / np.sum(c_exp, axis=1, keepdims=True)
+                            assign = spec["cluster_assign"]
+                            mapped_coarse = coarse_logits[:, assign]
+                            if spec["fine_w"] is not None and spec["fine_b"] is not None:
+                                spec_logits = X @ spec["fine_w"].T + spec["fine_b"]
+                                mapped_probs = coarse_probs[:, assign]
+                                logits = (
+                                    0.65 * logits
+                                    + (0.20 + 0.30 * mapped_probs) * spec_logits
+                                    + 0.20 * mapped_coarse
+                                ).astype(np.float32)
+                            else:
+                                logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
 
-                    if spec["is_bool"]:
-                        z_col = logits[:, 0].astype(np.float64) / 0.25
-                        two_logits = np.column_stack([-z_col / 2.0, z_col / 2.0])
-                        probs = calibrator.calibrate_logits(two_logits)
-                        if probs.ndim == 1:
-                            probs = probs.reshape(1, -1)
-                        p_true = probs[:, 1]
-                        b_vals = p_true >= spec["bool_threshold"]
-                        confs = np.where(b_vals, p_true, 1.0 - p_true)
-                        for i in range(m_docs):
-                            pt = float(p_true[i])
-                            row_values[i][fname] = bool(b_vals[i])
-                            row_confs[i][fname] = float(confs[i])
-                            row_probs[i][fname] = {"False": float(probs[i, 0]), "True": pt}
-                    else:
-                        probs = calibrator.calibrate_logits(logits.astype(np.float64) / 0.25)
-                        if probs.ndim == 1:
-                            probs = probs.reshape(1, -1)
-                        best_idx = np.argmax(probs, axis=1)
-                        confs = probs[np.arange(m_docs), best_idx]
-                        for i in range(m_docs):
-                            bi = int(best_idx[i])
-                            prow = probs[i]
-                            row_values[i][fname] = options[bi]
-                            row_confs[i][fname] = float(confs[i])
-                            row_probs[i][fname] = {opt: float(prow[j]) for j, opt in enumerate(options)}
+                        if m_docs > 1 and not spec["is_hier"]:
+                            w_l1 = (
+                                float(np.sum(np.abs(spec["w"])))
+                                if spec["is_bool"]
+                                else (float(np.max(np.sum(np.abs(spec["w"]), axis=1))) if spec["w"].size else 0.0)
+                            )
+                            b_abs = float(np.max(np.abs(spec["b"]))) if spec["b"].size else 0.0
+                            dz_bound = (
+                                4.0
+                                * (float(self.dimension) + 4.0)
+                                * float(np.finfo(np.float32).eps)
+                                * (x_inf_chunk * w_l1 + b_abs)
+                            )
+                            temp_est = max(1e-12, abs(float(getattr(calibrator, "temperature", 1.0))))
+                            dp_bound = np.minimum(1.0, (dz_bound / 0.25) / temp_est + 1e-6)
+                        else:
+                            dz_bound = np.empty(0, dtype=np.float64)
+                            dp_bound = np.empty(0, dtype=np.float64)
+
+                        if spec["is_bool"]:
+                            z_col = logits[:, 0].astype(np.float64) / 0.25
+                            two_logits = np.column_stack([-z_col / 2.0, z_col / 2.0])
+                            probs = calibrator.calibrate_logits(two_logits)
+                            if probs.ndim == 1:
+                                probs = probs.reshape(1, -1)
+                            if m_docs > 1 and not spec["is_hier"]:
+                                row_finite = (
+                                    (~nonfin_rows) & np.isfinite(z_col) & np.all(np.isfinite(probs), axis=1)
+                                )
+                                near_rows = (
+                                    (np.abs(probs[:, 1] - spec["bool_threshold"]) <= dp_bound)
+                                    | (np.abs(z_col) <= 2.0 * (dz_bound / 0.25))
+                                )
+                                if conformal is not None:
+                                    near_rows |= (
+                                        np.any(
+                                            np.abs((1.0 - probs) - spec["q_hat"]) <= dp_bound[:, None] + 1e-6,
+                                            axis=1,
+                                        )
+                                        | (
+                                            np.abs(np.abs(2.0 * probs[:, 1] - 1.0) - spec["eff_m"])
+                                            <= 2.0 * dp_bound + 1e-6
+                                        )
+                                        | (
+                                            np.abs(np.maximum(probs[:, 1], probs[:, 0]) - spec["conf_floor"])
+                                            <= dp_bound + 1e-6
+                                        )
+                                        | (
+                                            np.abs(
+                                                np.maximum(probs[:, 1], probs[:, 0])
+                                                - spec["eff_g"] * np.maximum(1e-6, np.minimum(probs[:, 1], probs[:, 0]))
+                                            )
+                                            <= (1.0 + spec["eff_g"]) * dp_bound + 1e-6
+                                        )
+                                    )
+                                    if spec["q_per_cls"] is not None:
+                                        near_rows |= np.any(
+                                            np.abs((1.0 - probs) - spec["q_per_cls"][None, :])
+                                            <= dp_bound[:, None] + 1e-6,
+                                            axis=1,
+                                        )
+                                if spec["sel_cal"] is not None or aci_has_floor:
+                                    near_rows |= row_finite
+                                near_rows &= row_finite
+                                if np.any(near_rows):
+                                    probs = np.array(probs, dtype=np.float64, copy=True)
+                                    for r_i in np.flatnonzero(near_rows).tolist():
+                                        x_ex = (
+                                            X[r_i]
+                                            if X_raw_2d is None
+                                            else _normalize_raw_projection(
+                                                X_raw_2d[r_i], self.dimension, zero_unit0=zero_unit0
+                                            )
+                                        )
+                                        z_ex = float((x_ex @ spec["w"].T + spec["b"])[0]) / 0.25
+                                        probs[r_i] = calibrator.calibrate_logits(
+                                            np.array([-0.5 * z_ex, 0.5 * z_ex], dtype=np.float64)
+                                        ).reshape(-1)
+                            p_true = probs[:, 1]
+                            b_vals = p_true >= spec["bool_threshold"]
+                            confs = np.where(b_vals, p_true, 1.0 - p_true)
+                            for i in range(m_docs):
+                                pt = float(p_true[i])
+                                row_values[i][fname] = bool(b_vals[i])
+                                row_confs[i][fname] = float(confs[i])
+                                row_probs[i][fname] = {"False": float(probs[i, 0]), "True": pt}
+                        else:
+                            probs = calibrator.calibrate_logits(logits.astype(np.float64) / 0.25)
+                            if probs.ndim == 1:
+                                probs = probs.reshape(1, -1)
+                            if m_docs > 1 and not spec["is_hier"]:
+                                row_finite = (
+                                    (~nonfin_rows)
+                                    & np.all(np.isfinite(logits), axis=1)
+                                    & np.all(np.isfinite(probs), axis=1)
+                                )
+                                z_s = -np.sort(-logits.astype(np.float64), axis=1)
+                                p_s = -np.sort(-probs, axis=1)
+                                near_rows = (
+                                    ((z_s[:, 0] - z_s[:, 1]) <= 2.0 * dz_bound + 1e-9)
+                                    if k_opts >= 2
+                                    else np.zeros(m_docs, dtype=bool)
+                                )
+                                if conformal is not None:
+                                    near_rows |= np.any(
+                                        np.abs((1.0 - probs) - spec["q_hat"]) <= dp_bound[:, None] + 1e-6,
+                                        axis=1,
+                                    )
+                                    near_rows |= np.any(
+                                        np.abs(np.cumsum(np.maximum(p_s, 0.0), axis=1) - spec["q_hat"])
+                                        <= (float(k_opts) + 1.0) * dp_bound[:, None] + 1e-6,
+                                        axis=1,
+                                    )
+                                    if spec["q_per_cls"] is not None:
+                                        near_rows |= np.any(
+                                            np.abs((1.0 - probs) - spec["q_per_cls"][None, :])
+                                            <= dp_bound[:, None] + 1e-6,
+                                            axis=1,
+                                        )
+                                    if k_opts >= 2:
+                                        top_chk = p_s[:, 0]
+                                        run_chk = p_s[:, 1]
+                                        near_rows |= (
+                                            (np.abs((top_chk - run_chk) - spec["eff_m"]) <= 2.0 * dp_bound + 1e-6)
+                                            | (np.abs(top_chk - spec["conf_floor"]) <= dp_bound + 1e-6)
+                                            | (
+                                                np.abs(top_chk - spec["eff_g"] * np.maximum(1e-6, run_chk))
+                                                <= (1.0 + spec["eff_g"]) * dp_bound + 1e-6
+                                            )
+                                            | (np.abs(run_chk - 1e-6) <= dp_bound + 1e-6)
+                                        )
+                                    else:
+                                        near_rows |= (
+                                            (np.abs(p_s[:, 0] - spec["conf_floor"]) <= dp_bound + 1e-6)
+                                            | (np.abs(1.0 - spec["eff_m"]) <= 2.0 * dp_bound + 1e-6)
+                                        )
+                                if spec["sel_cal"] is not None or aci_has_floor:
+                                    near_rows |= row_finite
+                                near_rows &= row_finite
+                                if np.any(near_rows):
+                                    probs = np.array(probs, dtype=np.float64, copy=True)
+                                    for r_i in np.flatnonzero(near_rows).tolist():
+                                        x_ex = (
+                                            X[r_i]
+                                            if X_raw_2d is None
+                                            else _normalize_raw_projection(
+                                                X_raw_2d[r_i], self.dimension, zero_unit0=zero_unit0
+                                            )
+                                        )
+                                        z_ex = (x_ex @ spec["w"].T + spec["b"]).astype(np.float64).ravel() / 0.25
+                                        probs[r_i] = calibrator.calibrate_logits(z_ex).reshape(-1)
+                            best_idx = np.argmax(probs, axis=1)
+                            confs = probs[np.arange(m_docs), best_idx]
+                            for i in range(m_docs):
+                                bi = int(best_idx[i])
+                                prow = probs[i]
+                                row_values[i][fname] = options[bi]
+                                row_confs[i][fname] = float(confs[i])
+                                row_probs[i][fname] = {opt: float(prow[j]) for j, opt in enumerate(options)}
                     probs_by_field_arr[fname] = probs
+                    field_nonfin = nonfin_rows | (~np.all(np.isfinite(probs), axis=1))
+                    row_any_nonfin |= field_nonfin
 
                     protos_unit = spec["protos_unit"]
                     if protos_unit is not None:
-                        p_sims = np.max(X @ protos_unit.T, axis=1).astype(np.float64)
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            p_sims = np.max(X @ protos_unit.T, axis=1).astype(np.float64)
                         if np.any(zero_emb_mask):
                             p_sims = np.where(zero_emb_mask, 0.0, p_sims)
                         for i in range(m_docs):
@@ -4140,11 +4251,26 @@ class SystemOneEngine:
 
                     if conformal is None:
                         for i in range(m_docs):
-                            if spec["is_bool"]:
-                                row_csets[i][fname] = ["True" if row_values[i][fname] else "False"]
+                            if field_nonfin[i]:
+                                row_values[i][fname] = False if spec["is_bool"] else options[0]
+                                row_confs[i][fname] = float("nan")
+                                row_probs[i][fname] = (
+                                    {"False": float("nan"), "True": float("nan")}
+                                    if spec["is_bool"]
+                                    else {opt: float("nan") for opt in options}
+                                )
+                                row_csets[i][fname] = []
+                                row_reasons[i][fname] = "non_finite_input"
+                                row_amb_fields[i].append(fname)
+                                if spec["escalate"]:
+                                    row_esc_fields[i].append(fname)
+                                row_is_amb[i] = True
                             else:
-                                row_csets[i][fname] = [str(row_values[i][fname])]
-                            row_margins[i][fname] = 1.0
+                                if spec["is_bool"]:
+                                    row_csets[i][fname] = ["True" if row_values[i][fname] else "False"]
+                                else:
+                                    row_csets[i][fname] = [str(row_values[i][fname])]
+                                row_margins[i][fname] = 1.0
                         continue
 
                     cp_fam_t = spec["cp_fam_t"]
@@ -4289,6 +4415,22 @@ class SystemOneEngine:
                         row_odds[i][fname] = odds_i
                         row_ror[i][fname] = eff_g
                         row_cfloor[i][fname] = conf_floor
+
+                        if field_nonfin[i]:
+                            row_values[i][fname] = False if spec["is_bool"] else options[0]
+                            row_confs[i][fname] = float("nan")
+                            row_probs[i][fname] = (
+                                {"False": float("nan"), "True": float("nan")}
+                                if spec["is_bool"]
+                                else {opt: float("nan") for opt in options}
+                            )
+                            row_csets[i][fname] = []
+                            row_reasons[i][fname] = "non_finite_input"
+                            row_amb_fields[i].append(fname)
+                            row_is_amb[i] = True
+                            if spec["escalate"]:
+                                row_esc_fields[i].append(fname)
+                            continue
 
                         if low_fam[i]:
                             row_reasons[i][fname] = "low_feature_familiarity"

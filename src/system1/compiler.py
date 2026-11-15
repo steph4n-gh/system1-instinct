@@ -28,6 +28,7 @@ from system1.core.model import (
     ModelInferenceResult,
     RawFieldEvaluation,
     SystemOneModel,
+    _normalize_raw_projection,
     _stable_sigmoid,
     _stable_softmax,
 )
@@ -854,13 +855,11 @@ class CompiledSystemOneModel:
                 emb = self.projector.project(prompt)
         else:
             emb = self.projector(prompt)
-        norm = float(np.linalg.norm(emb))
-        if norm > 1e-12:
-            emb = emb / norm
-        else:
-            emb = np.zeros(self.dimension, dtype=np.float32)
-            if not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector)):
-                emb[0] = 1.0
+        emb = _normalize_raw_projection(
+            emb,
+            self.dimension,
+            zero_unit0=not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector)),
+        )
         if telemetry is not None:
             emb = self.telemetry_projector.fuse(emb, telemetry)
         return emb, raw_norm
@@ -916,9 +915,10 @@ class CompiledSystemOneModel:
             emb, raw_norm = self._encode_with_norm(prompt, telemetry=telemetry, recency_weighted=use_recency)
 
         # Check Tier 0 Semantic System 1 Cache
+        emb_finite = bool(np.all(np.isfinite(emb)))
         cur_version = getattr(self, "model_version", 1)
-        if eff_use_cache:
-            schema_dig = self.schema.schema_digest()
+        schema_dig = self.schema.schema_digest()
+        if eff_use_cache and emb_finite:
             hit = self.cache.get(
                 prompt,
                 embedding=emb,
@@ -940,7 +940,14 @@ class CompiledSystemOneModel:
                     )
 
         override_map: Optional[Dict[str, Any]] = None
-        if self._learned_prompt_overrides and embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
+        if (
+            emb_finite
+            and self._learned_prompt_overrides
+            and embedding is None
+            and telemetry is None
+            and isinstance(prompt, str)
+            and prompt.strip()
+        ):
             norm_key = " ".join(prompt.strip().casefold().split())
             if self._learned_prompt_override_recency.get(norm_key, bool(self.recency_weighted)) == bool(use_recency):
                 override_map = self._learned_prompt_overrides.get(norm_key)
@@ -965,7 +972,7 @@ class CompiledSystemOneModel:
             raw_norm=raw_norm,
         )
 
-        if eff_use_cache:
+        if eff_use_cache and emb_finite:
             self.cache.put(
                 prompt,
                 result,

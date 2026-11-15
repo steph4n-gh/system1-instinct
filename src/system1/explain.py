@@ -202,19 +202,25 @@ def _extract_calibrated_head_params(
                 f"FastExplainer cannot faithfully represent nonlinear exemplar-bank head for field {fname!r}"
             )
 
+    if isinstance(temperature_scale, bool) or not isinstance(temperature_scale, (int, float, np.integer, np.floating)):
+        raise ValueError(f"temperature_scale must be finite and positive, got {temperature_scale!r}")
     base_scale = float(temperature_scale)
-    if base_scale <= 0.0:
-        raise ValueError(f"temperature_scale must be positive, got {temperature_scale}")
+    if not math.isfinite(base_scale) or base_scale <= 0.0:
+        raise ValueError(f"temperature_scale must be finite and positive, got {temperature_scale!r}")
 
     if calibrator is not None:
-        raw_temp = float(getattr(calibrator, "temperature", 1.0))
+        raw_temp_obj = getattr(calibrator, "temperature", 1.0)
         adj_raw = getattr(calibrator, "logit_adjustments", None)
     else:
         src_head = compiled_head if compiled_head is not None else head
-        raw_temp = float(getattr(src_head, "temperature", 1.0))
+        raw_temp_obj = getattr(src_head, "temperature", 1.0)
         adj_raw = getattr(src_head, "logit_adjustments", None)
 
-    temp = max(1e-4, raw_temp)
+    if isinstance(raw_temp_obj, bool) or not isinstance(raw_temp_obj, (int, float, np.integer, np.floating)):
+        raise ValueError(f"calibrator temperature must be finite and positive, got {raw_temp_obj!r}")
+    temp = float(raw_temp_obj)
+    if not math.isfinite(temp) or temp <= 0.0:
+        raise ValueError(f"calibrator temperature must be finite and positive, got {raw_temp_obj!r}")
     eff_scale = base_scale / temp
 
     w = np.asarray(head.weights, dtype=np.float64)
@@ -286,7 +292,7 @@ def _extract_calibrated_head_params(
         "raw_w_f32": raw_w_f32,
         "raw_b_f32": raw_b_f32,
         "base_scale": base_scale,
-        "cal_temp": raw_temp if (math.isfinite(raw_temp) and raw_temp > 0.0) else temp,
+        "cal_temp": temp,
         "cal_adj_2": cal_adj_2,
         "cal_adj_choice": cal_adj_choice,
     }
