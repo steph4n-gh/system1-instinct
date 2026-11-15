@@ -514,22 +514,24 @@ class DeterministicSemanticProjector:
 def _stable_softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     """Numerically stable softmax with temperature."""
     temp = max(1e-4, float(temperature))
-    scaled = np.asarray(logits, dtype=np.float64) / temp
-    max_val = np.max(scaled, axis=-1, keepdims=True)
-    exp = np.exp(scaled - max_val)
-    return exp / np.sum(exp, axis=-1, keepdims=True)
+    with np.errstate(over="ignore", invalid="ignore"):
+        scaled = np.asarray(logits, dtype=np.float64) / temp
+        max_val = np.max(scaled, axis=-1, keepdims=True)
+        exp = np.exp(scaled - max_val)
+        return exp / np.sum(exp, axis=-1, keepdims=True)
 
 
 def _stable_sigmoid(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     """Numerically stable sigmoid with temperature."""
     temp = max(1e-4, float(temperature))
-    scaled = np.asarray(logits, dtype=np.float64) / temp
-    pos_mask = scaled >= 0
-    out = np.empty_like(scaled)
-    out[pos_mask] = 1.0 / (1.0 + np.exp(-scaled[pos_mask]))
-    exp_neg = np.exp(scaled[~pos_mask])
-    out[~pos_mask] = exp_neg / (1.0 + exp_neg)
-    return out
+    with np.errstate(over="ignore", invalid="ignore"):
+        scaled = np.asarray(logits, dtype=np.float64) / temp
+        pos_mask = scaled >= 0
+        out = np.empty_like(scaled)
+        out[pos_mask] = 1.0 / (1.0 + np.exp(-scaled[pos_mask]))
+        exp_neg = np.exp(scaled[~pos_mask])
+        out[~pos_mask] = exp_neg / (1.0 + exp_neg)
+        return out
 
 
 # Public aliases for stable softmax and sigmoid
@@ -1997,70 +1999,71 @@ class DecisionFieldHead:
     def evaluate_logits(self, logits: np.ndarray) -> RawFieldEvaluation:
         """Constructs a RawFieldEvaluation from precomputed logits."""
         logits = np.asarray(logits, dtype=np.float64).flatten()
-        if isinstance(self.field_def, ChoiceField):
-            scaled_logits = logits / 0.25
-            probs = _stable_softmax(scaled_logits, temperature=1.0)
-            best_idx = int(np.argmax(probs))
-            selected = self.field_def.options[best_idx]
-            conf = float(probs[best_idx])
-            return RawFieldEvaluation(
-                field_name=self.field_def.name,
-                field_type=self.field_def.field_type,
-                logits=scaled_logits,
-                raw_probabilities=probs,
-                options=self.field_def.options,
-                selected_value=selected,
-                confidence=conf,
-            )
+        with np.errstate(over="ignore", invalid="ignore"):
+            if isinstance(self.field_def, ChoiceField):
+                scaled_logits = logits / 0.25
+                probs = _stable_softmax(scaled_logits, temperature=1.0)
+                best_idx = int(np.argmax(probs))
+                selected = self.field_def.options[best_idx]
+                conf = float(probs[best_idx])
+                return RawFieldEvaluation(
+                    field_name=self.field_def.name,
+                    field_type=self.field_def.field_type,
+                    logits=scaled_logits,
+                    raw_probabilities=probs,
+                    options=self.field_def.options,
+                    selected_value=selected,
+                    confidence=conf,
+                )
 
-        elif isinstance(self.field_def, BooleanField):
-            prob = float(_stable_sigmoid(logits, temperature=0.25)[0])
-            val = bool(prob >= self.field_def.threshold)
-            conf = prob if val else (1.0 - prob)
-            scaled_z = float(logits[0] / 0.25)
-            two_class_logits = np.array([-scaled_z / 2.0, scaled_z / 2.0], dtype=np.float64)
-            return RawFieldEvaluation(
-                field_name=self.field_def.name,
-                field_type=self.field_def.field_type,
-                logits=two_class_logits,
-                raw_probabilities=np.array([1.0 - prob, prob], dtype=np.float64),
-                options=("False", "True"),
-                selected_value=val,
-                confidence=conf,
-            )
+            elif isinstance(self.field_def, BooleanField):
+                prob = float(_stable_sigmoid(logits, temperature=0.25)[0])
+                val = bool(prob >= self.field_def.threshold)
+                conf = prob if val else (1.0 - prob)
+                scaled_z = float(logits[0] / 0.25)
+                two_class_logits = np.array([-scaled_z / 2.0, scaled_z / 2.0], dtype=np.float64)
+                return RawFieldEvaluation(
+                    field_name=self.field_def.name,
+                    field_type=self.field_def.field_type,
+                    logits=two_class_logits,
+                    raw_probabilities=np.array([1.0 - prob, prob], dtype=np.float64),
+                    options=("False", "True"),
+                    selected_value=val,
+                    confidence=conf,
+                )
 
-        elif isinstance(self.field_def, MultiChoiceField):
-            scaled_logits = logits / 0.25
-            probs = _stable_sigmoid(scaled_logits, temperature=1.0)
-            selected = tuple(
-                self.field_def.options[i]
-                for i, p in enumerate(probs)
-                if p >= self.field_def.threshold
-            )
-            conf = float(np.mean([max(p, 1.0 - p) for p in probs])) if len(probs) > 0 else 1.0
-            return RawFieldEvaluation(
-                field_name=self.field_def.name,
-                field_type=self.field_def.field_type,
-                logits=scaled_logits,
-                raw_probabilities=probs,
-                options=self.field_def.options,
-                selected_value=selected,
-                confidence=conf,
-            )
+            elif isinstance(self.field_def, MultiChoiceField):
+                scaled_logits = logits / 0.25
+                probs = _stable_sigmoid(scaled_logits, temperature=1.0)
+                selected = tuple(
+                    self.field_def.options[i]
+                    for i, p in enumerate(probs)
+                    if p >= self.field_def.threshold
+                )
+                conf = float(np.mean([max(p, 1.0 - p) for p in probs])) if len(probs) > 0 else 1.0
+                return RawFieldEvaluation(
+                    field_name=self.field_def.name,
+                    field_type=self.field_def.field_type,
+                    logits=scaled_logits,
+                    raw_probabilities=probs,
+                    options=self.field_def.options,
+                    selected_value=selected,
+                    confidence=conf,
+                )
 
-        elif isinstance(self.field_def, ScoreField):
-            scaled_logits = logits / 0.25
-            prob = float(_stable_sigmoid(scaled_logits, temperature=1.0)[0])
-            val = self.field_def.min_value + (self.field_def.max_value - self.field_def.min_value) * prob
-            return RawFieldEvaluation(
-                field_name=self.field_def.name,
-                field_type=self.field_def.field_type,
-                logits=scaled_logits,
-                raw_probabilities=np.array([prob], dtype=np.float64),
-                options=(),
-                selected_value=float(val),
-                confidence=float(max(prob, 1.0 - prob)),
-            )
+            elif isinstance(self.field_def, ScoreField):
+                scaled_logits = logits / 0.25
+                prob = float(_stable_sigmoid(scaled_logits, temperature=1.0)[0])
+                val = self.field_def.min_value + (self.field_def.max_value - self.field_def.min_value) * prob
+                return RawFieldEvaluation(
+                    field_name=self.field_def.name,
+                    field_type=self.field_def.field_type,
+                    logits=scaled_logits,
+                    raw_probabilities=np.array([prob], dtype=np.float64),
+                    options=(),
+                    selected_value=float(val),
+                    confidence=float(max(prob, 1.0 - prob)),
+                )
 
         raise TypeError(f"Unknown field type: {self.field_def}")
 
@@ -2090,84 +2093,85 @@ class DecisionFieldHead:
             mx.eval(mx_logits)
             logits = np.array(mx_logits)
         else:
-            logits = emb @ self.weights.T + self.biases
-            if self._exemplar_bank is not None and not self.hierarchical:
-                w_cons, sub_banks = self._exemplar_bank
-                if concept_embedding is not None:
-                    c_emb = np.asarray(concept_embedding, dtype=np.float32)
-                    if c_emb.ndim == 1:
-                        c_emb = c_emb.reshape(1, -1)
-                elif prompts is not None and self._exemplar_projector is not None:
-                    if isinstance(prompts, str):
-                        c_emb = self._exemplar_projector._project_concept_aware(prompts).reshape(1, -1)
+            with np.errstate(over="ignore", invalid="ignore"):
+                logits = emb @ self.weights.T + self.biases
+                if self._exemplar_bank is not None and not self.hierarchical:
+                    w_cons, sub_banks = self._exemplar_bank
+                    if concept_embedding is not None:
+                        c_emb = np.asarray(concept_embedding, dtype=np.float32)
+                        if c_emb.ndim == 1:
+                            c_emb = c_emb.reshape(1, -1)
+                    elif prompts is not None and self._exemplar_projector is not None:
+                        if isinstance(prompts, str):
+                            c_emb = self._exemplar_projector._project_concept_aware(prompts).reshape(1, -1)
+                        else:
+                            c_emb = np.stack(
+                                [self._exemplar_projector._project_concept_aware(str(p)) for p in prompts],
+                                axis=0,
+                            ).astype(np.float32)
                     else:
-                        c_emb = np.stack(
-                            [self._exemplar_projector._project_concept_aware(str(p)) for p in prompts],
-                            axis=0,
-                        ).astype(np.float32)
-                else:
-                    c_emb = emb
-                cons_logits = c_emb @ w_cons.T
-                max_ex = np.zeros_like(logits)
-                for k, bank in enumerate(sub_banks):
-                    if bank.size > 0:
-                        max_ex[:, k] = np.max(c_emb @ bank.T, axis=1)
-                w0_logits = (
-                    emb @ self._initial_weights.T
-                    if self._online_shots_p is not None and self._initial_weights is not None
-                    else logits
-                )
-                base_logits = (0.20 * w0_logits + 0.40 * cons_logits + 0.60 * max_ex).astype(np.float32)
-                if self._online_shots_p is not None and self.weights.shape[0] > 8:
-                    K_cls = self.weights.shape[0]
-                    D_dim = self.dimension
-                    all_p = [v for k in range(K_cls) for v in self._online_shots_p[k]]
-                    all_c = (
-                        [v for k in range(K_cls) for v in self._online_shots_c[k]]
-                        if self._online_shots_c is not None
-                        else []
+                        c_emb = emb
+                    cons_logits = c_emb @ w_cons.T
+                    max_ex = np.zeros_like(logits)
+                    for k, bank in enumerate(sub_banks):
+                        if bank.size > 0:
+                            max_ex[:, k] = np.max(c_emb @ bank.T, axis=1)
+                    w0_logits = (
+                        emb @ self._initial_weights.T
+                        if self._online_shots_p is not None and self._initial_weights is not None
+                        else logits
                     )
-                    if all_p:
-                        mu_p = np.mean(all_p, axis=0)
-                        mu_c = np.mean(all_c, axis=0) if all_c else np.zeros(D_dim, dtype=np.float32)
-                        W_shot_p = np.zeros((K_cls, D_dim), dtype=np.float32)
-                        W_shot_c = np.zeros((K_cls, D_dim), dtype=np.float32)
-                        for k in range(K_cls):
-                            if self._online_shots_p[k]:
-                                cp = np.mean(self._online_shots_p[k], axis=0) - mu_p
-                                np_n = float(np.linalg.norm(cp))
-                                if np_n > 1e-12:
-                                    W_shot_p[k] = (cp / np_n).astype(np.float32)
-                            if self._online_shots_c is not None and self._online_shots_c[k]:
-                                cc = np.mean(self._online_shots_c[k], axis=0) - mu_c
-                                nc_n = float(np.linalg.norm(cc))
-                                if nc_n > 1e-12:
-                                    W_shot_c[k] = (cc / nc_n).astype(np.float32)
-                        shot_logits = 0.55 * (emb @ W_shot_p.T) + 0.45 * (c_emb @ W_shot_c.T)
-                        avg_shots = float(len(all_p)) / float(max(1, K_cls))
-                        alpha = min(0.65, 0.28 * avg_shots / (1.0 + 0.25 * avg_shots))
-                        base_logits = ((1.0 - alpha) * base_logits + alpha * shot_logits).astype(np.float32)
-                logits = base_logits
-            elif (
-                self.hierarchical
-                and self.coarse_weights is not None
-                and self.coarse_biases is not None
-                and len(self.cluster_assignments) == self.weights.shape[0]
-            ):
-                coarse_logits = emb @ self.coarse_weights.T + self.coarse_biases
-                coarse_probs = _stable_softmax(coarse_logits / 0.25, temperature=1.0)
-                assign = np.asarray(self.cluster_assignments, dtype=np.int64)
-                mapped_coarse = coarse_logits[:, assign]
-                mapped_probs = coarse_probs[:, assign]
-                if self.fine_weights is not None and self.fine_biases is not None:
-                    spec_logits = emb @ self.fine_weights.T + self.fine_biases
-                    logits = (
-                        0.65 * logits
-                        + (0.20 + 0.30 * mapped_probs) * spec_logits
-                        + 0.20 * mapped_coarse
-                    ).astype(np.float32)
-                else:
-                    logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
+                    base_logits = (0.20 * w0_logits + 0.40 * cons_logits + 0.60 * max_ex).astype(np.float32)
+                    if self._online_shots_p is not None and self.weights.shape[0] > 8:
+                        K_cls = self.weights.shape[0]
+                        D_dim = self.dimension
+                        all_p = [v for k in range(K_cls) for v in self._online_shots_p[k]]
+                        all_c = (
+                            [v for k in range(K_cls) for v in self._online_shots_c[k]]
+                            if self._online_shots_c is not None
+                            else []
+                        )
+                        if all_p:
+                            mu_p = np.mean(all_p, axis=0)
+                            mu_c = np.mean(all_c, axis=0) if all_c else np.zeros(D_dim, dtype=np.float32)
+                            W_shot_p = np.zeros((K_cls, D_dim), dtype=np.float32)
+                            W_shot_c = np.zeros((K_cls, D_dim), dtype=np.float32)
+                            for k in range(K_cls):
+                                if self._online_shots_p[k]:
+                                    cp = np.mean(self._online_shots_p[k], axis=0) - mu_p
+                                    np_n = float(np.linalg.norm(cp))
+                                    if np_n > 1e-12:
+                                        W_shot_p[k] = (cp / np_n).astype(np.float32)
+                                if self._online_shots_c is not None and self._online_shots_c[k]:
+                                    cc = np.mean(self._online_shots_c[k], axis=0) - mu_c
+                                    nc_n = float(np.linalg.norm(cc))
+                                    if nc_n > 1e-12:
+                                        W_shot_c[k] = (cc / nc_n).astype(np.float32)
+                            shot_logits = 0.55 * (emb @ W_shot_p.T) + 0.45 * (c_emb @ W_shot_c.T)
+                            avg_shots = float(len(all_p)) / float(max(1, K_cls))
+                            alpha = min(0.65, 0.28 * avg_shots / (1.0 + 0.25 * avg_shots))
+                            base_logits = ((1.0 - alpha) * base_logits + alpha * shot_logits).astype(np.float32)
+                    logits = base_logits
+                elif (
+                    self.hierarchical
+                    and self.coarse_weights is not None
+                    and self.coarse_biases is not None
+                    and len(self.cluster_assignments) == self.weights.shape[0]
+                ):
+                    coarse_logits = emb @ self.coarse_weights.T + self.coarse_biases
+                    coarse_probs = _stable_softmax(coarse_logits / 0.25, temperature=1.0)
+                    assign = np.asarray(self.cluster_assignments, dtype=np.int64)
+                    mapped_coarse = coarse_logits[:, assign]
+                    mapped_probs = coarse_probs[:, assign]
+                    if self.fine_weights is not None and self.fine_biases is not None:
+                        spec_logits = emb @ self.fine_weights.T + self.fine_biases
+                        logits = (
+                            0.65 * logits
+                            + (0.20 + 0.30 * mapped_probs) * spec_logits
+                            + 0.20 * mapped_coarse
+                        ).astype(np.float32)
+                    else:
+                        logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
 
         return logits.flatten() if single else logits
 

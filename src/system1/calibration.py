@@ -167,10 +167,17 @@ class ConformalPredictionSet:
 def _stable_softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     """Numerically stable softmax with temperature."""
     temp = max(1e-4, float(temperature))
-    scaled = np.asarray(logits, dtype=np.float64) / temp
-    max_val = np.max(scaled, axis=-1, keepdims=True)
-    exp = np.exp(scaled - max_val)
-    return exp / np.sum(exp, axis=-1, keepdims=True)
+    with np.errstate(over="ignore", invalid="ignore"):
+        arr = np.asarray(logits, dtype=np.float64)
+        scaled = arr / temp
+        row_finite = np.all(np.isfinite(arr), axis=-1) & np.all(np.isfinite(scaled), axis=-1)
+        safe_scaled = np.where(row_finite[..., None], scaled, 0.0)
+        max_val = np.max(safe_scaled, axis=-1, keepdims=True)
+        exp = np.exp(safe_scaled - max_val)
+        out = exp / np.sum(exp, axis=-1, keepdims=True)
+        if not bool(np.all(row_finite)):
+            out = np.where(row_finite[..., None], out, np.nan)
+        return out
 
 
 def compute_nll(probs: np.ndarray, labels: np.ndarray) -> float:
@@ -390,47 +397,72 @@ class DecisionCalibrator:
         arr = np.asarray(logits, dtype=np.float64)
         temp = self.temperature
         adj = self.logit_adjustments
-        if self.is_binary:
-            if arr.ndim == 0:
-                z = float(arr)
-                if adj is not None and adj.shape == (2,):
-                    z += float(adj[1] - adj[0])
-                half_z = z / (2.0 * temp)
-                s_max = half_z if half_z >= -half_z else -half_z
-                e0 = math.exp(-half_z - s_max)
-                e1 = math.exp(half_z - s_max)
-                inv = 1.0 / (e0 + e1)
-                return np.array([e0 * inv, e1 * inv], dtype=np.float64)
-            if arr.ndim == 1:
-                arr = np.column_stack([-arr / 2.0, arr / 2.0])
-                if adj is not None and adj.shape == (2,):
-                    arr = arr + adj
-                return _stable_softmax(arr / temp)
+        with np.errstate(over="ignore", invalid="ignore"):
+            if self.is_binary:
+                if arr.ndim == 0:
+                    z = float(arr)
+                    if not math.isfinite(z):
+                        return np.array([np.nan, np.nan], dtype=np.float64)
+                    if adj is not None and adj.shape == (2,):
+                        z += float(adj[1] - adj[0])
+                    half_z = z / (2.0 * temp)
+                    if not (math.isfinite(z) and math.isfinite(half_z)):
+                        return np.array([np.nan, np.nan], dtype=np.float64)
+                    s_max = half_z if half_z >= -half_z else -half_z
+                    e0 = math.exp(-half_z - s_max)
+                    e1 = math.exp(half_z - s_max)
+                    inv = 1.0 / (e0 + e1)
+                    return np.array([e0 * inv, e1 * inv], dtype=np.float64)
+                if arr.ndim == 1:
+                    finite_1d = np.isfinite(arr)
+                    two = np.column_stack([-arr / 2.0, arr / 2.0])
+                    if adj is not None and adj.shape == (2,):
+                        two = two + adj
+                    scaled_two = two / temp
+                    out = _stable_softmax(scaled_two, temperature=1.0)
+                    row_ok = finite_1d & np.all(np.isfinite(scaled_two), axis=-1)
+                    if not bool(np.all(row_ok)):
+                        out = np.where(row_ok[:, None], out, np.nan)
+                    return out
 
-        if arr.ndim == 1:
-            if len(arr) == 1:
-                z = float(arr[0])
-                if adj is not None and adj.shape == (2,):
-                    z += float(adj[1] - adj[0])
-                half_z = z / (2.0 * temp)
-                s_max = half_z if half_z >= -half_z else -half_z
-                e0 = math.exp(-half_z - s_max)
-                e1 = math.exp(half_z - s_max)
-                inv = 1.0 / (e0 + e1)
-                return np.array([e0 * inv, e1 * inv], dtype=np.float64)
-            if adj is not None and adj.shape == (len(arr),):
+            if arr.ndim == 1:
+                if len(arr) == 1:
+                    z = float(arr[0])
+                    if not math.isfinite(z):
+                        return np.array([np.nan, np.nan], dtype=np.float64)
+                    if adj is not None and adj.shape == (2,):
+                        z += float(adj[1] - adj[0])
+                    half_z = z / (2.0 * temp)
+                    if not (math.isfinite(z) and math.isfinite(half_z)):
+                        return np.array([np.nan, np.nan], dtype=np.float64)
+                    s_max = half_z if half_z >= -half_z else -half_z
+                    e0 = math.exp(-half_z - s_max)
+                    e1 = math.exp(half_z - s_max)
+                    inv = 1.0 / (e0 + e1)
+                    return np.array([e0 * inv, e1 * inv], dtype=np.float64)
+                if not bool(np.all(np.isfinite(arr))):
+                    return np.full(arr.shape, np.nan, dtype=np.float64)
+                if adj is not None and adj.shape == (len(arr),):
+                    arr = arr + adj
+                scaled = arr / temp
+                if not bool(np.all(np.isfinite(scaled))):
+                    return np.full(arr.shape, np.nan, dtype=np.float64)
+                s = scaled - float(np.max(scaled))
+                exp = np.exp(s)
+                return exp / float(np.sum(exp))
+
+            row_finite = np.all(np.isfinite(arr), axis=-1)
+            if adj is not None and adj.shape == (arr.shape[-1],):
                 arr = arr + adj
             scaled = arr / temp
-            s = scaled - float(np.max(scaled))
-            exp = np.exp(s)
-            return exp / float(np.sum(exp))
-
-        if adj is not None and adj.shape == (arr.shape[-1],):
-            arr = arr + adj
-        scaled = arr / temp
-        max_val = np.max(scaled, axis=-1, keepdims=True)
-        exp = np.exp(scaled - max_val)
-        return exp / np.sum(exp, axis=-1, keepdims=True)
+            row_finite = row_finite & np.all(np.isfinite(scaled), axis=-1)
+            safe_scaled = np.where(row_finite[..., None], scaled, 0.0)
+            max_val = np.max(safe_scaled, axis=-1, keepdims=True)
+            exp = np.exp(safe_scaled - max_val)
+            out = exp / np.sum(exp, axis=-1, keepdims=True)
+            if not bool(np.all(row_finite)):
+                out = np.where(row_finite[..., None], out, np.nan)
+            return out
 
     def fit_imbalance_aware(
         self,

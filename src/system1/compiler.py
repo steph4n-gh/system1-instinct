@@ -2135,7 +2135,13 @@ class CompiledSystemOneModel:
         projector_config: Mapping[str, Any],
         array_map: Mapping[str, np.ndarray],
         dimension: int,
-    ) -> Tuple[int, Optional[TfidfProjector]]:
+    ) -> Tuple[
+        int,
+        Optional[TfidfProjector],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+    ]:
         """Validate HybridProjector config scalars, TF-IDF header, and tensor shapes before reconstruction."""
         from system1.core.embeddings import HybridProjector
 
@@ -2181,7 +2187,7 @@ class CompiledSystemOneModel:
             raise ValueError("Saved hybrid projector subspace_weight must be in [0, 1]")
         if _req_num(projector_config.get("context_smooth", 1.0), "context_smooth") < 0.0:
             raise ValueError("Saved hybrid projector context_smooth must be nonnegative")
-        if _req_num(projector_config.get("rbf_gamma", 2.5), "rbf_gamma") <= 0.0:
+        if _req_num(projector_config.get("rbf_gamma", 3.0), "rbf_gamma") <= 0.0:
             raise ValueError("Saved hybrid projector rbf_gamma must be positive")
         rbf_weight = _req_num(projector_config.get("rbf_weight", 0.0), "rbf_weight")
         if not (0.0 <= rbf_weight < 1.0):
@@ -2278,23 +2284,62 @@ class CompiledSystemOneModel:
         if not bool(np.all(np.isfinite(spec_w_f32))):
             raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
 
-        def _inline_or_map_f32(map_key: str, cfg_key: str) -> Optional[np.ndarray]:
-            if map_key in array_map:
-                return array_map[map_key]
-            raw_inline = projector_config.get(cfg_key)
-            if raw_inline is None:
-                return None
+        if len(terms) > 2048:
+            raise ValueError("Saved hybrid projector spectral_terms exceeds limit")
+
+        def _parse_inline_matrix_f32(raw_val: Any, cfg_key: str) -> np.ndarray:
+            if not isinstance(raw_val, (list, tuple)) or len(raw_val) == 0:
+                raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+            if len(raw_val) > 2048:
+                raise ValueError(f"Saved hybrid projector {cfg_key} exceeds row limit")
+            row_len: Optional[int] = None
+            for row in raw_val:
+                if not isinstance(row, (list, tuple)) or len(row) == 0:
+                    raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                if row_len is None:
+                    row_len = len(row)
+                    if row_len > MAX_SKILL_DIMENSION:
+                        raise ValueError(f"Saved hybrid projector {cfg_key} exceeds dimension limit")
+                elif len(row) != row_len:
+                    raise ValueError(f"Saved hybrid projector {cfg_key} is ragged")
+                for elem in row:
+                    if isinstance(elem, bool) or not isinstance(elem, (int, float)):
+                        raise ValueError(f"Saved hybrid projector {cfg_key} contains invalid element")
             try:
                 with np.errstate(over="ignore", invalid="ignore"):
-                    arr = np.asarray(raw_inline, dtype=np.float32)
-            except (TypeError, ValueError) as exc:
+                    arr = np.asarray(raw_val, dtype=np.float32)
+            except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError(f"Saved hybrid projector {cfg_key} is invalid") from exc
-            if not bool(np.all(np.isfinite(arr))):
+            if arr.ndim != 2 or not bool(np.all(np.isfinite(arr))):
                 raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
+            arr.setflags(write=False)
             return arr
 
+        def _inline_or_map_f32(map_key: str, cfg_key: str) -> Optional[np.ndarray]:
+            bin_raw = array_map.get(map_key)
+            bin_arr = (
+                CompiledSystemOneModel._coerce_readonly_float_array(bin_raw, np.float32)
+                if bin_raw is not None
+                else None
+            )
+            inline_arr: Optional[np.ndarray] = None
+            if cfg_key in projector_config and projector_config[cfg_key] is not None:
+                inline_arr = _parse_inline_matrix_f32(projector_config[cfg_key], cfg_key)
+            if bin_arr is not None:
+                if inline_arr is not None and (
+                    inline_arr.shape != bin_arr.shape
+                    or not np.allclose(inline_arr, bin_arr, rtol=0.0, atol=1e-4)
+                ):
+                    raise ValueError(
+                        f"Saved hybrid projector inline {cfg_key} mismatches binary tensor"
+                    )
+                return bin_arr
+            return inline_arr
+
         spec_arr = _inline_or_map_f32("_projector_spectral_vectors", "spectral_vectors")
-        basis_arr = array_map.get("_projector_spectral_basis")
+        basis_arr = CompiledSystemOneModel._coerce_readonly_float_array(
+            array_map.get("_projector_spectral_basis"), np.float32
+        )
         sub_arr = _inline_or_map_f32("_projector_subspace_components", "subspace_components")
         rbf_arr = _inline_or_map_f32("_projector_rbf_landmarks", "rbf_landmarks")
 
@@ -2339,13 +2384,22 @@ class CompiledSystemOneModel:
                 raise ValueError("Saved hybrid projector subspace_components have invalid shape")
         rbf_rows = 0
         if rbf_arr is not None and len(rbf_arr) > 0:
-            if rbf_arr.ndim != 2 or rbf_arr.shape[0] < 1 or rbf_arr.shape[1] != base_dim:
+            if (
+                rbf_arr.ndim != 2
+                or not (1 <= rbf_arr.shape[0] <= MAX_SKILL_OPTIONS)
+                or rbf_arr.shape[1] != base_dim
+            ):
                 raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
+            eff_rbf_weight = _req_num(projector_config.get("rbf_weight", 0.14), "rbf_weight")
+            if not (0.0 < eff_rbf_weight < 1.0):
+                raise ValueError(
+                    "Saved hybrid projector rbf_weight must be in (0, 1) when rbf_landmarks are present"
+                )
             rbf_rows = int(rbf_arr.shape[0])
 
         if base_dim + rbf_rows != dimension:
             raise ValueError("Saved hybrid projector dimensions do not match the skill")
-        return eff_spec_dim, top_tfidf
+        return eff_spec_dim, top_tfidf, spec_arr, sub_arr, rbf_arr
 
     @classmethod
     def _reconstruct_model_from_parts(
@@ -2444,12 +2498,13 @@ class CompiledSystemOneModel:
 
         saved_hybrid = None
         if projector_config is not None and projector_config["type"] == "hybrid":
-            eff_spec_dim, top_tfidf = cls._validate_hybrid_projector_config_and_tensors(
-                projector_config,
-                array_map,
-                dimension,
+            eff_spec_dim, top_tfidf, spec_arr, sub_arr, rbf_arr = (
+                cls._validate_hybrid_projector_config_and_tensors(
+                    projector_config,
+                    array_map,
+                    dimension,
+                )
             )
-            rbf_arr = array_map.get("_projector_rbf_landmarks")
 
             if is_v3 and embed_vocab_flag:
                 if "_projector_dense_table" not in array_map:
@@ -2558,10 +2613,12 @@ class CompiledSystemOneModel:
                 if not bool(np.all(np.isfinite(spec_w_arr))):
                     raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
                 hp._spectral_weights_arr = spec_w_arr
-                hp._spectral_vectors = _as_f32(array_map.get("_projector_spectral_vectors"))
+                hp._spectral_vectors = _as_f32(spec_arr)
                 hp._spectral_basis = _as_f32(array_map.get("_projector_spectral_basis"))
-                hp._subspace_components = _as_f32(array_map.get("_projector_subspace_components"))
-                hp._subspace_weight = float(projector_config.get("subspace_weight", 0.0))
+                hp._subspace_components = _as_f32(sub_arr)
+                hp._subspace_weight = float(
+                    projector_config.get("subspace_weight", 0.20 if sub_arr is not None else 0.0)
+                )
                 hp._use_subspace = bool(
                     projector_config.get("use_subspace", hp._subspace_components is not None)
                 )
@@ -2582,21 +2639,21 @@ class CompiledSystemOneModel:
                         hp._spectral_basis = hp._build_spectral_basis(hp._spectral_vectors.shape[1])
                 hp._context_smooth = float(projector_config.get("context_smooth", 1.0))
                 hp._rbf_landmarks = _as_f32(rbf_arr)
-                hp._rbf_gamma = float(projector_config.get("rbf_gamma", 2.5))
-                hp._rbf_weight = float(projector_config.get("rbf_weight", 0.0))
+                hp._rbf_gamma = float(projector_config.get("rbf_gamma", 3.0))
+                hp._rbf_weight = float(projector_config.get("rbf_weight", 0.14)) if rbf_arr is not None else 0.0
                 hp._digest = None
                 hp._fit_base_cache = {}
                 saved_hybrid = hp
             else:
                 hyb_kwargs: Dict[str, Any] = {
                     "backend": backend,
-                    "spectral_vectors": _as_f32(array_map.get("_projector_spectral_vectors")),
-                    "subspace_components": _as_f32(array_map.get("_projector_subspace_components")),
+                    "spectral_vectors": _as_f32(spec_arr),
+                    "subspace_components": _as_f32(sub_arr),
                 }
                 if "_projector_hybrid_tfidf_idf" in array_map:
                     hyb_kwargs["tfidf_idf_array"] = array_map["_projector_hybrid_tfidf_idf"]
-                if "_projector_rbf_landmarks" in array_map:
-                    hyb_kwargs["rbf_landmarks"] = _as_f32(array_map["_projector_rbf_landmarks"])
+                if rbf_arr is not None:
+                    hyb_kwargs["rbf_landmarks"] = _as_f32(rbf_arr)
                 try:
                     saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
                 except TypeError:

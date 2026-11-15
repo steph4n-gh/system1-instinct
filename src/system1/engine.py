@@ -2228,7 +2228,8 @@ class SystemOneEngine:
                 if isinstance(f_def, ChoiceField):
                     with np.errstate(over="ignore", invalid="ignore"):
                         calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
-                    if not (emb_finite and bool(np.all(np.isfinite(calibrated_p)))):
+                    logits_finite = bool(np.all(np.isfinite(raw_eval.logits)))
+                    if not (emb_finite and logits_finite and bool(np.all(np.isfinite(calibrated_p)))):
                         values[name] = f_def.options[0]
                         confidences[name] = float("nan")
                         probabilities[name] = {opt: float("nan") for opt in f_def.options}
@@ -2297,7 +2298,8 @@ class SystemOneEngine:
                 elif isinstance(f_def, BooleanField):
                     with np.errstate(over="ignore", invalid="ignore"):
                         calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
-                    if not (emb_finite and bool(np.all(np.isfinite(calibrated_p)))):
+                    logits_finite = bool(np.all(np.isfinite(raw_eval.logits)))
+                    if not (emb_finite and logits_finite and bool(np.all(np.isfinite(calibrated_p)))):
                         values[name] = False
                         confidences[name] = float("nan")
                         probabilities[name] = {"False": float("nan"), "True": float("nan")}
@@ -2367,7 +2369,10 @@ class SystemOneEngine:
                     with np.errstate(over="ignore", invalid="ignore"):
                         scaled_logits = raw_eval.logits / max(1e-4, calibrated_temp)
                         probs = _stable_sigmoid(scaled_logits, temperature=1.0)
-                    if not (emb_finite and bool(np.all(np.isfinite(probs)))):
+                    logits_finite = bool(np.all(np.isfinite(raw_eval.logits))) and bool(
+                        np.all(np.isfinite(scaled_logits))
+                    )
+                    if not (emb_finite and logits_finite and bool(np.all(np.isfinite(probs)))):
                         values[name] = ()
                         confidences[name] = float("nan")
                         probabilities[name] = {opt: float("nan") for opt in f_def.options}
@@ -2422,11 +2427,13 @@ class SystemOneEngine:
                     calibrator = self.calibrators.get(name)
                     calibrated_temp = calibrator.temperature if calibrator is not None else 1.0
                     with np.errstate(over="ignore", invalid="ignore"):
-                        scaled_logit = float(raw_eval.logits[0] / max(1e-4, calibrated_temp))
+                        raw_logit = float(raw_eval.logits[0])
+                        scaled_logit = float(raw_logit / max(1e-4, calibrated_temp))
                         prob = float(_stable_sigmoid(np.array([scaled_logit]), temperature=1.0)[0])
                         val = f_def.min_value + (f_def.max_value - f_def.min_value) * prob
                         conf = float(getattr(raw_eval, "confidence", max(prob, 1.0 - prob)))
-                    if not (emb_finite and math.isfinite(val) and math.isfinite(conf)):
+                    logits_finite = math.isfinite(raw_logit) and math.isfinite(scaled_logit)
+                    if not (emb_finite and logits_finite and math.isfinite(val) and math.isfinite(conf)):
                         values[name] = (
                             float(f_def.default)
                             if getattr(f_def, "default", None) is not None
@@ -4129,13 +4136,14 @@ class SystemOneEngine:
 
                         if spec["is_bool"]:
                             z_col = logits[:, 0].astype(np.float64) / 0.25
+                            raw_logits_nonfin = ~np.isfinite(z_col)
                             two_logits = np.column_stack([-z_col / 2.0, z_col / 2.0])
                             probs = calibrator.calibrate_logits(two_logits)
                             if probs.ndim == 1:
                                 probs = probs.reshape(1, -1)
                             if not spec["is_hier"]:
                                 row_finite = (
-                                    (~nonfin_rows) & np.isfinite(z_col) & np.all(np.isfinite(probs), axis=1)
+                                    (~nonfin_rows) & (~raw_logits_nonfin) & np.all(np.isfinite(probs), axis=1)
                                 )
                                 near_rows = (
                                     (np.abs(probs[:, 1] - spec["bool_threshold"]) <= dp_bound)
@@ -4181,6 +4189,7 @@ class SystemOneEngine:
                                     for r_i in np.flatnonzero(near_rows).tolist():
                                         x_ex = X[r_i : r_i + 1]
                                         z_ex = float((x_ex @ raw_w_b.T + raw_b_b)[0, 0]) / 0.25
+                                        raw_logits_nonfin[r_i] = not math.isfinite(z_ex)
                                         probs[r_i] = calibrator.calibrate_logits(
                                             np.array([-0.5 * z_ex, 0.5 * z_ex], dtype=np.float64)
                                         ).reshape(-1)
@@ -4193,13 +4202,15 @@ class SystemOneEngine:
                                 row_confs[i][fname] = float(confs[i])
                                 row_probs[i][fname] = {"False": float(probs[i, 0]), "True": pt}
                         else:
-                            probs = calibrator.calibrate_logits(logits.astype(np.float64) / 0.25)
+                            z_mat = logits.astype(np.float64) / 0.25
+                            raw_logits_nonfin = (~np.all(np.isfinite(logits), axis=1)) | (~np.all(np.isfinite(z_mat), axis=1))
+                            probs = calibrator.calibrate_logits(z_mat)
                             if probs.ndim == 1:
                                 probs = probs.reshape(1, -1)
                             if not spec["is_hier"]:
                                 row_finite = (
                                     (~nonfin_rows)
-                                    & np.all(np.isfinite(logits), axis=1)
+                                    & (~raw_logits_nonfin)
                                     & np.all(np.isfinite(probs), axis=1)
                                 )
                                 z_s = -np.sort(-logits.astype(np.float64), axis=1)
@@ -4254,6 +4265,7 @@ class SystemOneEngine:
                                     for r_i in np.flatnonzero(near_rows).tolist():
                                         x_ex = X[r_i : r_i + 1]
                                         z_ex = (x_ex @ raw_w_c.T + raw_b_c).astype(np.float64).ravel() / 0.25
+                                        raw_logits_nonfin[r_i] = not bool(np.all(np.isfinite(z_ex)))
                                         probs[r_i] = calibrator.calibrate_logits(z_ex).reshape(-1)
                             best_idx = np.argmax(probs, axis=1)
                             confs = probs[np.arange(m_docs), best_idx]
@@ -4263,8 +4275,11 @@ class SystemOneEngine:
                                 row_values[i][fname] = options[bi]
                                 row_confs[i][fname] = float(confs[i])
                                 row_probs[i][fname] = {opt: float(prow[j]) for j, opt in enumerate(options)}
+                    field_nonfin = nonfin_rows | raw_logits_nonfin | (~np.all(np.isfinite(probs), axis=1))
+                    if np.any(field_nonfin):
+                        probs = np.array(probs, dtype=np.float64, copy=True)
+                        probs[field_nonfin] = np.nan
                     probs_by_field_arr[fname] = probs
-                    field_nonfin = nonfin_rows | (~np.all(np.isfinite(probs), axis=1))
                     row_any_nonfin |= field_nonfin
 
                     protos_unit = spec["protos_unit"]

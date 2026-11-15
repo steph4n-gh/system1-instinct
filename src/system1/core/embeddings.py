@@ -2689,9 +2689,47 @@ class HybridProjector:
             proj._spectral_weights = weights
             proj._spectral_weights_arr = weights_arr
 
-            raw_spec = spectral_vectors if spectral_vectors is not None else config.get("spectral_vectors")
-            if raw_spec is not None and len(raw_spec) > 0:
-                spec_arr = np.asarray(raw_spec, dtype=np.float32)
+            def _resolve_hybrid_matrix(
+                cfg_key: str,
+                arg_arr: Optional[np.ndarray],
+            ) -> Optional[np.ndarray]:
+                raw_cfg = config.get(cfg_key)
+                cfg_arr: Optional[np.ndarray] = None
+                if cfg_key in config and raw_cfg is not None:
+                    if not isinstance(raw_cfg, (list, tuple)) or len(raw_cfg) == 0:
+                        raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                    row_len: Optional[int] = None
+                    for row in raw_cfg:
+                        if not isinstance(row, (list, tuple)) or len(row) == 0:
+                            raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                        if row_len is None:
+                            row_len = len(row)
+                        elif len(row) != row_len:
+                            raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                        for elem in row:
+                            if isinstance(elem, bool) or not isinstance(elem, (int, float)):
+                                raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        cfg_arr = np.asarray(raw_cfg, dtype=np.float32)
+                    if cfg_arr.ndim != 2 or not bool(np.all(np.isfinite(cfg_arr))):
+                        raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
+                if arg_arr is not None:
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        out_arr = np.asarray(arg_arr, dtype=np.float32)
+                    if not bool(np.all(np.isfinite(out_arr))):
+                        raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
+                    if cfg_arr is not None and (
+                        cfg_arr.shape != out_arr.shape
+                        or not np.allclose(cfg_arr, out_arr, rtol=0.0, atol=1e-4)
+                    ):
+                        raise ValueError(
+                            f"Saved hybrid projector inline {cfg_key} mismatches binary tensor"
+                        )
+                    return out_arr
+                return cfg_arr
+
+            spec_arr = _resolve_hybrid_matrix("spectral_vectors", spectral_vectors)
+            if spec_arr is not None and len(spec_arr) > 0:
                 if proj._direct_spectral:
                     max_r = proj._direct_spectral_dim if proj._direct_spectral_dim > 0 else spec_arr.shape[1]
                     if (
@@ -2721,11 +2759,12 @@ class HybridProjector:
                         proj._spectral_basis = (aligned_basis / b_norms).astype(np.float32)
                     else:
                         proj._spectral_basis = proj._build_spectral_basis(spec_arr.shape[1])
+            elif terms or (proj._direct_spectral and proj._direct_spectral_dim != 0):
+                raise ValueError("Saved hybrid projector missing spectral_vectors")
 
             proj._update_dimension()
-            raw_sub = subspace_components if subspace_components is not None else config.get("subspace_components")
-            if raw_sub is not None and len(raw_sub) > 0:
-                sub_arr = np.asarray(raw_sub, dtype=np.float32)
+            sub_arr = _resolve_hybrid_matrix("subspace_components", subspace_components)
+            if sub_arr is not None and len(sub_arr) > 0:
                 base_dim = proj._base_dimension
                 if (
                     sub_arr.ndim != 2
@@ -2740,20 +2779,48 @@ class HybridProjector:
                 raise ValueError("Saved hybrid projector subspace_weight must be finite")
             proj._subspace_weight = sub_w
 
-            raw_rbf = rbf_landmarks if rbf_landmarks is not None else config.get("rbf_landmarks")
-            if raw_rbf is not None and len(raw_rbf) > 0:
-                rbf_arr = np.asarray(raw_rbf, dtype=np.float32)
+            rbf_arr = _resolve_hybrid_matrix("rbf_landmarks", rbf_landmarks)
+            if rbf_arr is not None and len(rbf_arr) > 0:
                 base_dim = proj._base_dimension
                 if rbf_arr.ndim != 2 or rbf_arr.shape[0] < 1 or rbf_arr.shape[1] != base_dim or not np.all(np.isfinite(rbf_arr)):
                     raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
+                raw_gamma = config.get("rbf_gamma", 3.0)
+                raw_rw = config.get("rbf_weight", 0.14)
+                if (
+                    isinstance(raw_gamma, bool)
+                    or not isinstance(raw_gamma, (int, float))
+                    or not math.isfinite(float(raw_gamma))
+                    or float(raw_gamma) <= 0.0
+                ):
+                    raise ValueError("Saved hybrid projector rbf_gamma must be positive")
+                if (
+                    isinstance(raw_rw, bool)
+                    or not isinstance(raw_rw, (int, float))
+                    or not math.isfinite(float(raw_rw))
+                    or not (0.0 < float(raw_rw) < 1.0)
+                ):
+                    raise ValueError(
+                        "Saved hybrid projector rbf_weight must be in (0, 1) when rbf_landmarks are present"
+                    )
                 proj._rbf_landmarks = rbf_arr
-                proj._rbf_gamma = float(config.get("rbf_gamma", 3.0))
-                proj._rbf_weight = float(config.get("rbf_weight", 0.14))
+                proj._rbf_gamma = float(raw_gamma)
+                proj._rbf_weight = float(raw_rw)
 
             proj._update_dimension()
             proj._fitted = True
-        elif has_any_tfidf_cfg or tfidf_idf_array is not None:
-            raise ValueError("Unfitted saved hybrid projector cannot carry TF-IDF state")
+        elif (
+            has_any_tfidf_cfg
+            or tfidf_idf_array is not None
+            or terms
+            or config.get("spectral_vectors") is not None
+            or config.get("subspace_components") is not None
+            or config.get("rbf_landmarks") is not None
+            or spectral_vectors is not None
+            or subspace_components is not None
+            or rbf_landmarks is not None
+            or (proj._direct_spectral and proj._direct_spectral_dim != 0)
+        ):
+            raise ValueError("Unfitted saved hybrid projector cannot carry TF-IDF state or fitted tensors")
         proj._digest = None
         return proj
 

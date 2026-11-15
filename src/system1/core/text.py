@@ -1097,7 +1097,7 @@ def _num_mag_bucket(val: float) -> str:
 def _parse_scaled_float(num_str: str, suffix: Optional[str]) -> Optional[float]:
     try:
         v = float(num_str.replace(",", ""))
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     if suffix:
         s = suffix.lower()
@@ -1172,7 +1172,7 @@ def _emit_numeric_and_http_tokens(
         v = _parse_scaled_float(m.group(1), m.group(2))
         if v is None:
             continue
-        if v.is_integer() and int(v) in seen_codes:
+        if 200.0 <= v <= 599.0 and v.is_integer() and int(v) in seen_codes:
             continue
         _add(_num_mag_bucket(v), 1.15)
 
@@ -1207,12 +1207,19 @@ def _walk_json_obj(
         if path != leaf:
             weights[f"KV_{path}={bval}"] += 2.2
     elif isinstance(obj, (int, float)):
-        num_v = float(obj)
+        try:
+            num_v = float(obj)
+        except (OverflowError, ValueError, TypeError):
+            return
         if not math.isfinite(num_v):
             return
         leaf = path.split(".")[-1] if path else "val"
         if enable_num_http:
-            if num_v.is_integer() and ("status" in leaf or "http" in leaf or "code" in leaf) and 200 <= int(num_v) <= 599:
+            if (
+                200.0 <= num_v <= 599.0
+                and num_v.is_integer()
+                and ("status" in leaf or "http" in leaf or "code" in leaf)
+            ):
                 code = int(num_v)
                 weights[f"HTTP_{code // 100}XX"] += 2.4
                 weights[f"KV_{leaf}=HTTP_{code // 100}XX"] += 2.4
@@ -1298,7 +1305,7 @@ def extract_pragmatic_features(
             k = m.group(1).lower()
             v_raw = m.group(2).lower()
             weights[f"KV_{k}={v_raw}"] += 2.0
-            if enable_num_http and v_raw.isdigit() and ("status" in k or "http" in k or "code" in k):
+            if enable_num_http and len(v_raw) == 3 and v_raw.isdigit() and ("status" in k or "http" in k or "code" in k):
                 code = int(v_raw)
                 if 200 <= code <= 599:
                     weights[f"HTTP_{code // 100}XX"] += 2.2

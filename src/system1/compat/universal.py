@@ -93,6 +93,16 @@ def _reject_nonfinite_json(token: str) -> Any:
     raise InteropError(f"Non-finite JSON constant is not allowed: {token!r}", status_code=400)
 
 
+def _parse_strict_json_float(token: str) -> float:
+    try:
+        val = float(token)
+    except ValueError as exc:
+        raise InteropError(f"Invalid JSON float token: {token!r}", status_code=400) from exc
+    if not math.isfinite(val):
+        raise InteropError(f"Non-finite JSON number is not allowed: {token!r}", status_code=400)
+    return val
+
+
 def _reject_duplicate_json_keys(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in pairs:
@@ -100,6 +110,33 @@ def _reject_duplicate_json_keys(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, A
             raise InteropError(f"Duplicate JSON object key is not allowed: {k!r}", status_code=400)
         out[k] = v
     return out
+
+
+_MAX_JSON_NESTING_DEPTH = 64
+
+
+def _validate_container_depth(root: Any, *, max_depth: int = _MAX_JSON_NESTING_DEPTH) -> None:
+    stack: List[Tuple[Any, int]] = [(root, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, Mapping):
+            if depth >= max_depth:
+                raise InteropError(
+                    f"JSON nesting depth exceeds maximum allowed limit ({max_depth})",
+                    status_code=400,
+                )
+            for v in node.values():
+                if isinstance(v, (Mapping, list, tuple)):
+                    stack.append((v, depth + 1))
+        elif isinstance(node, (list, tuple)):
+            if depth >= max_depth:
+                raise InteropError(
+                    f"JSON nesting depth exceeds maximum allowed limit ({max_depth})",
+                    status_code=400,
+                )
+            for v in node:
+                if isinstance(v, (Mapping, list, tuple)):
+                    stack.append((v, depth + 1))
 
 
 def strict_json_loads(raw: bytes | str) -> Any:
@@ -115,22 +152,25 @@ def strict_json_loads(raw: bytes | str) -> Any:
         raise InteropError(f"Expected bytes or str JSON body, got {type(raw).__name__}", status_code=400)
 
     try:
-        return json.loads(
+        parsed = json.loads(
             text,
             parse_constant=_reject_nonfinite_json,
+            parse_float=_parse_strict_json_float,
             object_pairs_hook=_reject_duplicate_json_keys,
         )
     except InteropError:
         raise
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise InteropError(f"Malformed JSON body: {exc}", status_code=400) from exc
+    _validate_container_depth(parsed)
+    return parsed
 
 
 def strict_json_dumps(payload: Any) -> bytes:
     """Serialize payload to UTF-8 JSON while disallowing NaN/Infinity."""
     try:
         return json.dumps(payload, allow_nan=False, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, RecursionError) as exc:
         raise InteropError(f"Unable to serialize JSON payload: {exc}", status_code=500) from exc
 
 
@@ -140,7 +180,7 @@ def parse_finite_float(value: Any, *, field_name: str = "value") -> float:
         raise InteropError(f"Expected float for {field_name}, got bool", status_code=422)
     try:
         num = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise InteropError(f"Invalid float value {value!r} for {field_name}", status_code=422) from exc
     if not math.isfinite(num):
         raise InteropError(f"Non-finite float {value!r} for {field_name}", status_code=422)
@@ -151,16 +191,33 @@ def coerce_probability_dict(raw_probs: Mapping[Any, Any], keys: Sequence[str]) -
     """Coerce stringified/numeric probability mapping onto target keys and normalize to 1.0."""
     if not isinstance(raw_probs, Mapping):
         raise InteropError("probabilities must be a mapping", status_code=422)
+    str_map: Dict[str, Any] = {}
+    for rk, rv in raw_probs.items():
+        sk = str(rk)
+        if sk in str_map:
+            raise InteropError(f"Duplicate probability key after stringification: {sk!r}", status_code=422)
+        str_map[sk] = rv
     parsed: Dict[str, float] = {}
-    str_map = {str(k): v for k, v in raw_probs.items()}
     for k in keys:
-        v = str_map.get(str(k), 0.0)
-        p = max(0.0, parse_finite_float(v, field_name=f"probabilities[{k!r}]"))
-        parsed[str(k)] = p
-    total = float(sum(parsed.values()))
-    if total <= 0.0:
+        sk = str(k)
+        v = str_map.get(sk, 0.0)
+        raw_p = parse_finite_float(v, field_name=f"probabilities[{k!r}]")
+        if raw_p < -1e-9:
+            raise InteropError(f"Negative probability {raw_p!r} for {k!r}", status_code=422)
+        parsed[sk] = 0.0 if raw_p <= 0.0 else raw_p
+    max_p = max(parsed.values(), default=0.0)
+    if not math.isfinite(max_p) or max_p <= 0.0:
         raise InteropError("Probability vector has non-positive sum", status_code=422)
-    return {k: float(v / total) for k, v in parsed.items()}
+    scaled = {k: float(v / max_p) for k, v in parsed.items()}
+    total = math.fsum(scaled.values())
+    if not math.isfinite(total) or total <= 0.0:
+        raise InteropError("Probability vector has non-positive sum", status_code=422)
+    out = {k: float(v / total) for k, v in scaled.items()}
+    if not all(math.isfinite(v) and v >= 0.0 for v in out.values()) or not math.isclose(
+        math.fsum(out.values()), 1.0, rel_tol=0.0, abs_tol=1e-9
+    ):
+        raise InteropError("Probability vector failed normalization", status_code=422)
+    return out
 
 
 def detect_wire_format(path: str, payload: Mapping[str, Any]) -> str:
@@ -194,13 +251,20 @@ def extract_semantic_text(payload: Mapping[str, Any]) -> Tuple[str, Any]:
 
     parts: List[str] = []
 
-    def _collect(node: Any, prefix: str = "") -> None:
+    def _collect(node: Any, prefix: str = "", depth: int = 0) -> None:
+        if depth > _MAX_JSON_NESTING_DEPTH:
+            raise InteropError(
+                f"Input structure nesting depth exceeds maximum allowed limit ({_MAX_JSON_NESTING_DEPTH})",
+                status_code=400,
+            )
         if isinstance(node, str):
             s = node.strip()
             if s:
                 parts.append(f"{prefix}: {s}" if prefix else s)
             return
-        if isinstance(node, (int, float)) and not isinstance(node, bool):
+        if isinstance(node, (int, float, np.integer, np.floating)) and not isinstance(node, bool):
+            if isinstance(node, (float, np.floating)) and not math.isfinite(float(node)):
+                raise InteropError(f"Non-finite numeric value in input: {node!r}", status_code=400)
             parts.append(f"{prefix}: {node}" if prefix else str(node))
             return
         if isinstance(node, bool):
@@ -210,23 +274,23 @@ def extract_semantic_text(payload: Mapping[str, Any]) -> Tuple[str, Any]:
             for item in node:
                 if isinstance(item, Mapping):
                     if "text" in item and isinstance(item["text"], str):
-                        _collect(item["text"], prefix)
+                        _collect(item["text"], prefix, depth + 1)
                     elif "parts" in item and isinstance(item["parts"], list):
-                        _collect(item["parts"], prefix)
+                        _collect(item["parts"], prefix, depth + 1)
                     elif item.get("type") == "input_text" and isinstance(item.get("text"), str):
-                        _collect(item["text"], prefix)
+                        _collect(item["text"], prefix, depth + 1)
                     else:
-                        _collect(item, prefix)
+                        _collect(item, prefix, depth + 1)
                 else:
-                    _collect(item, prefix)
+                    _collect(item, prefix, depth + 1)
             return
         if isinstance(node, Mapping):
             if "text" in node and isinstance(node["text"], str) and set(node.keys()) <= {"type", "text"}:
-                _collect(node["text"], prefix)
+                _collect(node["text"], prefix, depth + 1)
                 return
             for k in sorted(node.keys(), key=lambda x: str(x)):
                 sub_prefix = f"{prefix}.{k}" if prefix else str(k)
-                _collect(node[k], sub_prefix)
+                _collect(node[k], sub_prefix, depth + 1)
             return
         s = str(node).strip()
         if s:
@@ -653,17 +717,55 @@ def parse_teacher_answers(
 
         elif c.q_type == "score":
             if c.criteria_legend:
+                max_idx = len(c.options) - 1
                 raw_probs = ans.get("probabilities")
+                has_explicit_score = ("score" in ans and ans["score"] is not None) or (
+                    "value" in ans and ans["value"] is not None
+                )
                 if isinstance(raw_probs, Mapping) and raw_probs:
                     probs = coerce_probability_dict(raw_probs, c.options)
-                    exp_score = float(sum(int(k) * probs[k] for k in c.options))
+                    exp_score = float(math.fsum(int(k) * probs[k] for k in c.options))
+                    if has_explicit_score:
+                        raw_s_val = ans["score"] if ("score" in ans and ans["score"] is not None) else ans["value"]
+                        explicit_s = parse_finite_float(raw_s_val, field_name="score")
+                        if explicit_s < 0.0 or explicit_s > float(max_idx):
+                            raise InteropError(
+                                f"Ordinal score {explicit_s!r} out of bounds [0, {max_idx}] for {c.external_name!r}",
+                                status_code=502,
+                            )
+                        if abs(explicit_s - exp_score) > 1e-3:
+                            raise InteropError(
+                                f"Ordinal score {explicit_s!r} mismatches probability expectation {exp_score:.6f} for {c.external_name!r}",
+                                status_code=502,
+                            )
                     ord_idx = str(max(c.options, key=lambda opt: probs[opt]))
                 else:
-                    raw_s = parse_finite_float(ans.get("score", ans.get("value")), field_name="score")
-                    idx = max(0, min(len(c.options) - 1, int(math.floor(raw_s + 0.5))))
-                    ord_idx = str(idx)
-                    probs = {k: (1.0 if k == ord_idx else 0.0) for k in c.options}
-                    exp_score = float(raw_s)
+                    if not has_explicit_score:
+                        raise InteropError(
+                            f"Upstream score answer missing 'score'/'value' for {c.external_name!r}",
+                            status_code=502,
+                        )
+                    raw_s_val = ans["score"] if ("score" in ans and ans["score"] is not None) else ans["value"]
+                    raw_s = parse_finite_float(raw_s_val, field_name="score")
+                    if raw_s < 0.0 or raw_s > float(max_idx):
+                        raise InteropError(
+                            f"Ordinal score {raw_s!r} out of bounds [0, {max_idx}] for {c.external_name!r}",
+                            status_code=502,
+                        )
+                    if max_idx == 0 or raw_s >= float(max_idx):
+                        probs = {str(i): (1.0 if i == max_idx else 0.0) for i in range(max_idx + 1)}
+                    else:
+                        lo = int(math.floor(raw_s))
+                        hi = lo + 1
+                        frac = float(raw_s - float(lo))
+                        w_lo = float(1.0 - frac)
+                        w_hi = float(1.0 - w_lo)
+                        probs = {
+                            str(i): (w_lo if i == lo else (w_hi if i == hi else 0.0))
+                            for i in range(max_idx + 1)
+                        }
+                    exp_score = float(math.fsum(int(k) * probs[k] for k in c.options))
+                    ord_idx = str(max(c.options, key=lambda opt: (probs[opt], -abs(int(opt) - exp_score))))
                 conf = parse_finite_float(ans.get("confidence", probs[ord_idx]), field_name="confidence")
                 conf = float(min(1.0, max(0.0, conf)))
                 legend = {str(i): txt for i, txt in enumerate(c.criteria_legend)}
@@ -695,14 +797,34 @@ def parse_teacher_answers(
 
         elif c.q_type == "multichoice":
             vals = ans.get("choices", ans.get("value", ()))
-            selected = [str(v) for v in vals if str(v) in c.options]
+            if vals is None:
+                vals = ()
+            elif not isinstance(vals, (list, tuple)):
+                raise InteropError(
+                    f"Upstream multichoice 'choices'/'value' must be a sequence for {c.external_name!r}",
+                    status_code=502,
+                )
+            selected: List[str] = []
+            seen_mc: set[str] = set()
+            for v in vals:
+                if isinstance(v, bool) or str(v) not in c.options:
+                    raise InteropError(
+                        f"Invalid upstream multichoice option {v!r} for {c.external_name!r}",
+                        status_code=502,
+                    )
+                sv = str(v)
+                if sv not in seen_mc:
+                    seen_mc.add(sv)
+                    selected.append(sv)
+            conf = parse_finite_float(ans.get("confidence", 1.0), field_name="confidence")
+            conf = float(min(1.0, max(0.0, conf)))
             lifecycle_values[c.internal_name] = selected
             soft_targets[c.internal_name] = {"type": "multichoice", "choices": selected}
             normalized_external[c.external_name] = {
                 "type": "multichoice",
                 "choices": selected,
                 "value": selected,
-                "confidence": parse_finite_float(ans.get("confidence", 1.0), field_name="confidence"),
+                "confidence": conf,
             }
 
     return lifecycle_values, soft_targets, normalized_external
@@ -1284,11 +1406,15 @@ class UniversalDecisionService:
         )
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                return strict_json_loads(resp.read())
+                raw_resp_bytes = resp.read()
         except ZeroEgressViolationError:
             raise
         except urllib.error.URLError as exc:
             raise InteropError(f"Upstream teacher HTTP error: {exc}", status_code=502) from exc
+        try:
+            return strict_json_loads(raw_resp_bytes)
+        except InteropError as exc:
+            raise InteropError(f"Invalid upstream teacher JSON: {exc}", status_code=502) from exc
 
     def _get_or_create_lifecycle(
         self,

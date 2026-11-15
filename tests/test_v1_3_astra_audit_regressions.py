@@ -5260,3 +5260,470 @@ def test_astra_22_round9_regressions() -> None:
     with pytest.raises(ValueError):
         HybridProjector.from_config(base_hyb_cfg, tfidf_idf_array=mismatch_idf_arr)
 
+
+def test_astra_23_round10_regressions() -> None:
+    """R10-1..R10-6: overflowed logit fail-closed parity, inline hybrid v3 tensors,
+    arbitrary-precision JSON integers in pragmatic extraction, gateway strict float parsing,
+    overflow-safe probability normalization, and ordinal score expectation consistency.
+    """
+    from system1 import InteropError, MultiChoiceField, PragmaticCompositeProjector, ScoreField
+    from system1.calibration import DecisionCalibrator
+    from system1.compat.universal import coerce_probability_dict, strict_json_loads
+    from system1.core.text import extract_pragmatic_features
+
+    class _E0Proj:
+        def __init__(self, dimension: int = 16) -> None:
+            self.dimension = int(dimension)
+
+        def project(self, text: str, recency_weighted: bool = False) -> np.ndarray:
+            v = np.zeros(self.dimension, dtype=np.float32)
+            v[0] = 1.0
+            return v
+
+        def project_batch(self, texts: Sequence[str], recency_weighted: bool = False) -> np.ndarray:
+            out = np.zeros((len(texts), self.dimension), dtype=np.float32)
+            out[:, 0] = 1.0
+            return out
+
+        def projector_digest(self) -> str:
+            return f"r10-e0-{self.dimension}"
+
+    # ------------------------------------------------------------------
+    # R10-1 (+ siblings): overflowed raw / scaled logits fail closed across
+    # scalar decide, vectorized batch decide, packed kernel, and fast callable.
+    # ------------------------------------------------------------------
+    proj16 = _E0Proj(16)
+
+    class _R10ScoreSchema(DecisionSchema):
+        s = ScoreField(min_value=0.0, max_value=1.0, default=0.0)
+
+    for sign in (1.0, -1.0):
+        mdl_s = SystemOneCompiler(_R10ScoreSchema, dimension=16, projector=proj16).compile(
+            {"s": [("lo", 0.0), ("hi", 1.0)] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        w_ov = np.zeros((1, 16), dtype=np.float32)
+        w_ov[0, 0] = np.float32(sign * 3e38)
+        b_ov = np.array([np.float32(sign * 3e38)], dtype=np.float32)
+        mdl_s._field_heads["s"].set_weights(w_ov, b_ov)
+
+        for strict_flag in (False, True):
+            eng_s = SystemOneEngine(
+                _R10ScoreSchema, compiled_model=mdl_s, strict_mode=strict_flag, use_cache=False
+            )
+            dec_s = eng_s.decide("probe", record_receipt=False)
+            assert dec_s.values["s"] == 0.0
+            assert math.isnan(dec_s.confidences["s"])
+            assert math.isnan(dec_s.probabilities["s"]["score_ratio"])
+            assert dec_s.conformal_sets["s"] == []
+            assert dec_s.abstention_reasons["s"] == "non_finite_input"
+            assert dec_s.is_ambiguous is True
+
+            kern_s = eng_s.compile_packed_kernel()
+            k_res = kern_s.decide_prompt("probe")
+            assert float(k_res["s_val"][0, 0]) == 0.0
+            assert math.isnan(float(k_res["s_conf"][0, 0]))
+            assert bool(k_res["is_ambiguous"][0]) is True
+
+            fn_s = eng_s.compile_callable()
+            f_res = fn_s("probe")
+            assert f_res.values["s"] == 0.0
+            assert math.isnan(f_res.confidences["s"])
+            assert f_res.is_ambiguous is True
+
+    # Sibling MultiChoiceField overflowed logit
+    class _R10McSchema(DecisionSchema):
+        mc = MultiChoiceField(("t0", "t1"))
+
+    mdl_mc = SystemOneCompiler(_R10McSchema, dimension=16, projector=proj16).compile(
+        {"mc": [("a", ["t0"]), ("b", ["t1"])] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    w_mc = np.zeros((2, 16), dtype=np.float32)
+    w_mc[0, 0] = np.float32(3e38)
+    b_mc = np.array([np.float32(3e38), np.float32(0.0)], dtype=np.float32)
+    mdl_mc._field_heads["mc"].set_weights(w_mc, b_mc)
+    eng_mc = SystemOneEngine(_R10McSchema, compiled_model=mdl_mc, strict_mode=False, use_cache=False)
+    dec_mc = eng_mc.decide("probe", record_receipt=False)
+    assert dec_mc.values["mc"] == ()
+    assert math.isnan(dec_mc.confidences["mc"])
+    assert math.isnan(dec_mc.probabilities["mc"]["t0"])
+    assert dec_mc.abstention_reasons["mc"] == "non_finite_input"
+    assert dec_mc.is_ambiguous is True
+
+    # Sibling ChoiceField/BooleanField single-class -inf logit across calibrate_logits, decide, decide_batch, packed, callable
+    cal_inf = DecisionCalibrator(1.0)
+    p_inf = cal_inf.calibrate_logits(np.array([-np.inf, 0.0], dtype=np.float64))
+    assert np.all(np.isnan(p_inf))
+
+    class _R10ChoiceBoolSchema(DecisionSchema):
+        c = ChoiceField(("a", "b"))
+        b = BooleanField()
+
+    mdl_cb = SystemOneCompiler(_R10ChoiceBoolSchema, dimension=16, projector=proj16).compile(
+        {"c": [("p0", "a"), ("p1", "b")] * 3, "b": [("p0", False), ("p1", True)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    w_c_inf = np.zeros((2, 16), dtype=np.float32)
+    w_c_inf[0, 0] = np.float32(-3e38)
+    b_c_inf = np.array([np.float32(-3e38), np.float32(0.0)], dtype=np.float32)
+    w_b_inf = np.zeros((1, 16), dtype=np.float32)
+    w_b_inf[0, 0] = np.float32(3e38)
+    b_b_inf = np.array([np.float32(3e38)], dtype=np.float32)
+    mdl_cb._field_heads["c"].set_weights(w_c_inf, b_c_inf)
+    mdl_cb._field_heads["b"].set_weights(w_b_inf, b_b_inf)
+    eng_cb = SystemOneEngine(
+        _R10ChoiceBoolSchema, compiled_model=mdl_cb, strict_mode=False, use_cache=False
+    )
+    dec_cb = eng_cb.decide("probe", record_receipt=False)
+    batch_cb = eng_cb.decide_batch(["probe", "probe"], record_receipt=False)
+    kern_cb = eng_cb.compile_packed_kernel().decide_prompt("probe")
+    call_cb = eng_cb.compile_callable()("probe")
+    for outcome in (dec_cb, batch_cb[0]):
+        assert outcome.abstention_reasons["c"] == "non_finite_input"
+        assert outcome.abstention_reasons["b"] == "non_finite_input"
+        assert math.isnan(outcome.confidences["c"]) and math.isnan(outcome.confidences["b"])
+        assert outcome.is_ambiguous is True
+    assert math.isnan(call_cb.confidences["c"]) and math.isnan(call_cb.confidences["b"])
+    assert call_cb.is_ambiguous is True
+    assert bool(kern_cb["is_ambiguous"][0]) is True
+    assert math.isnan(float(kern_cb["c_conf"][0, 0])) and math.isnan(float(kern_cb["b_conf"][0, 0]))
+
+    # ------------------------------------------------------------------
+    # R10-2: Embedded v3 and v2/ext-v3 reconstruction of inline hybrid tensors.
+    # ------------------------------------------------------------------
+    class _R10HybSchema(DecisionSchema):
+        topic = ChoiceField(("billing", "outage"))
+
+    hyb_texts = [
+        "invoice charge refund duplicate payment receipt",
+        "server 503 outage timeout database crash incident",
+        "subscription plan renewal card billing charge",
+        "api gateway latency spike error 502 cluster down",
+        "annual invoice credit memo payment pending",
+        "worker pod crashloop timeout kubelet unhealthy",
+    ]
+    hyb_labels = ["billing", "outage"] * 3
+    fitted_rbf = HybridProjector(sparse_dim=32, dense_dim=32, seed=17).fit(hyb_texts, hyb_labels)
+    fitted_rbf.attach_rbf_landmarks(hyb_texts, hyb_labels, rbf_gamma=3.0, rbf_weight=0.14)
+    assert fitted_rbf.dimension == 66
+
+    mdl_rbf = SystemOneCompiler(_R10HybSchema, dimension=fitted_rbf.dimension, projector=fitted_rbf).compile(
+        {"topic": list(zip(hyb_texts, hyb_labels))},
+        calibration_split=0.0,
+        augment=False,
+    )
+
+    def _move_v3_tensor_inline(
+        src_b: bytes,
+        moves: Sequence[tuple[str, str]],
+        extra_mut: Callable[[Dict[str, Any]], None] | None = None,
+    ) -> bytes:
+        old_hdr_len = struct.unpack_from("<Q", src_b, 8)[0]
+        hdr_start = 16
+        hdr_end = hdr_start + old_hdr_len
+        meta_obj = json.loads(src_b[hdr_start:hdr_end].decode("utf-8"))
+        payload = src_b[hdr_end:]
+        for tensor_name, cfg_key in moves:
+            spec = meta_obj["tensors"].pop(tensor_name)
+            rel_off = int(spec["offset"]) - hdr_end
+            arr = np.frombuffer(
+                payload[rel_off : rel_off + int(spec["nbytes"])],
+                dtype=np.dtype(spec["dtype"]),
+            ).reshape(spec["shape"])
+            meta_obj["projector"][cfg_key] = np.asarray(arr, dtype=np.float32).tolist()
+        if extra_mut is not None:
+            extra_mut(meta_obj)
+        enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(enc) <= old_hdr_len:
+            new_hdr_len = old_hdr_len
+        else:
+            extra_pages = (len(enc) - old_hdr_len + 16383) // 16384
+            new_hdr_len = old_hdr_len + extra_pages * 16384
+            delta = new_hdr_len - old_hdr_len
+            for t_spec in meta_obj["tensors"].values():
+                t_spec["offset"] += delta
+            enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            if len(enc) > new_hdr_len:
+                for t_spec in meta_obj["tensors"].values():
+                    t_spec["offset"] += 16384
+                new_hdr_len += 16384
+                enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            assert len(enc) <= new_hdr_len
+        hdr_padded = enc + b" " * (new_hdr_len - len(enc))
+        return b"S1M\x03\x00\x00\x00\x00" + struct.pack("<Q", new_hdr_len) + hdr_padded + payload
+
+    v3_rbf_emb = mdl_rbf.to_bytes(compact=False, format_version=3, embed_vocab=True)
+    v3_rbf_inline = _move_v3_tensor_inline(v3_rbf_emb, [("_projector_rbf_landmarks", "rbf_landmarks")])
+    loaded_rbf = CompiledSystemOneModel.from_bytes(v3_rbf_inline)
+    loaded_rbf_sup = CompiledSystemOneModel.from_bytes(v3_rbf_inline, projector=fitted_rbf)
+    probe_vec_ref = fitted_rbf.project("invoice payment outage crash")
+    assert loaded_rbf.projector is not None and loaded_rbf_sup.projector is not None
+    assert loaded_rbf.projector.dimension == 66
+    assert np.allclose(loaded_rbf.projector.project("invoice payment outage crash"), probe_vec_ref, atol=1e-4)
+    assert SystemOneEngine(_R10HybSchema, compiled_model=loaded_rbf, use_cache=False).decide("invoice payment outage crash").values["topic"] in ("billing", "outage")
+
+    # Direct-spectral + subspace + RBF inline reconstruction in embedded v3
+    fitted_full = HybridProjector(
+        sparse_dim=24, dense_dim=16, seed=19
+    ).fit(hyb_texts, hyb_labels, spectral_dim=4, use_subspace=True, direct_spectral=True)
+    fitted_full.attach_rbf_landmarks(hyb_texts, hyb_labels, rbf_gamma=2.8, rbf_weight=0.18)
+    mdl_full = SystemOneCompiler(_R10HybSchema, dimension=fitted_full.dimension, projector=fitted_full).compile(
+        {"topic": list(zip(hyb_texts, hyb_labels))},
+        calibration_split=0.0,
+        augment=False,
+    )
+    v3_full_emb = mdl_full.to_bytes(compact=False, format_version=3, embed_vocab=True)
+    moves_full = [
+        ("_projector_spectral_vectors", "spectral_vectors"),
+        ("_projector_rbf_landmarks", "rbf_landmarks"),
+    ]
+    if getattr(fitted_full, "_subspace_components", None) is not None:
+        moves_full.append(("_projector_subspace_components", "subspace_components"))
+    v3_full_inline = _move_v3_tensor_inline(v3_full_emb, moves_full)
+    loaded_full = CompiledSystemOneModel.from_bytes(v3_full_inline)
+    assert loaded_full.projector is not None
+    assert np.allclose(
+        loaded_full.projector.project("server outage billing invoice"),
+        fitted_full.project("server outage billing invoice"),
+        atol=1e-4,
+    )
+
+    # Mismatched inline vs binary RBF tensor and zero rbf_weight with landmarks must reject
+    def _add_mismatch_inline(m: Dict[str, Any]) -> None:
+        m["projector"]["rbf_landmarks"] = (fitted_rbf._rbf_landmarks + 0.5).tolist()  # type: ignore[operator]
+
+    bad_mismatch = _move_v3_tensor_inline(v3_rbf_emb, [], extra_mut=_add_mismatch_inline)
+    with pytest.raises(ValueError, match="mismatches"):
+        CompiledSystemOneModel.from_bytes(bad_mismatch)
+
+    bad_zero_rw = _move_v3_tensor_inline(
+        v3_rbf_emb,
+        [("_projector_rbf_landmarks", "rbf_landmarks")],
+        extra_mut=lambda m: m["projector"].__setitem__("rbf_weight", 0.0),
+    )
+    with pytest.raises(ValueError, match="rbf_weight"):
+        CompiledSystemOneModel.from_bytes(bad_zero_rw)
+    bad_cfg_rw = fitted_rbf.to_config(include_arrays=True)
+    bad_cfg_rw["rbf_weight"] = 0.0
+    with pytest.raises(ValueError, match="rbf_weight"):
+        HybridProjector.from_config(bad_cfg_rw)
+
+    # ------------------------------------------------------------------
+    # R10-3: Arbitrary-precision JSON integers in pragmatic feature extraction.
+    # ------------------------------------------------------------------
+    huge_json_prompt = '{"amount":' + ("9" * 400) + "}"
+    feats = extract_pragmatic_features(huge_json_prompt)
+    assert "KV_KEY_amount" in feats
+    assert all(math.isfinite(float(v)) for v in feats.values())
+
+    neg_and_status_prompt = '{"neg": -' + ("9" * 400) + ', "status": ' + ("9" * 400) + "}"
+    feats2 = extract_pragmatic_features(neg_and_status_prompt)
+    assert "KV_KEY_neg" in feats2 and "KV_KEY_status" in feats2
+
+    very_long_int_prompt = "status=" + ("9" * 4500) + " amount=" + ("9" * 4500)
+    feats3 = extract_pragmatic_features(very_long_int_prompt)
+    assert all(math.isfinite(float(v)) for v in feats3.values())
+
+    prag_proj = PragmaticCompositeProjector.fit(
+        [
+            '{"amount": 1200, "status": 200} normal order',
+            '{"amount": 9500, "status": 503} outage alert',
+            '{"amount": 40, "status": 200} ok billing',
+            '{"amount": 12000, "status": 500} critical failure',
+        ],
+        max_features=32,
+        prag_max_dim=24,
+        min_df=1,
+    )
+    emb_huge = prag_proj.project(huge_json_prompt)
+    assert np.all(np.isfinite(emb_huge))
+
+    # ------------------------------------------------------------------
+    # R10-4: strict_json_loads and gateway reject overflowed float tokens before teacher call.
+    # ------------------------------------------------------------------
+    teacher_calls = 0
+
+    def _counting_teacher(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        nonlocal teacher_calls
+        teacher_calls += 1
+        return {"answers": {"q": {"choice": "a"}}}
+
+    svc_r10 = UniversalDecisionService(
+        upstream_handlers={"gemini": _counting_teacher},
+        bearer_token="tok-r10",
+    )
+    raw_overflow = (
+        b'{"input":{"price":1e400},"force_teacher":true,"questions":{"q":{"type":"choice","options":["a","b"]}}}'
+    )
+    with pytest.raises(InteropError) as exc_ovf:
+        svc_r10.handle_request(
+            path="/v1beta/decisions",
+            headers={"Authorization": "Bearer tok-r10", "Content-Type": "application/json"},
+            raw_body=raw_overflow,
+        )
+    assert exc_ovf.value.status_code == 400
+    assert teacher_calls == 0
+    assert len(svc_r10._lifecycles) == 0
+
+    for bad_json in (
+        '{"p": -1e400}',
+        '{"big": ' + ("9" * 5000) + "}",
+        ("[" * 1200) + "1" + ("]" * 1200),
+        ("[" * 10000) + "1" + ("]" * 10000),
+    ):
+        with pytest.raises(InteropError) as exc_bj:
+            strict_json_loads(bad_json)
+        assert exc_bj.value.status_code == 400
+
+    raw_deep_req = (
+        b'{"input":'
+        + (b"[" * 1200)
+        + b'"hi"'
+        + (b"]" * 1200)
+        + b',"force_teacher":true,"questions":{"q":{"type":"choice","options":["a","b"]}}}'
+    )
+    with pytest.raises(InteropError) as exc_deep_http:
+        svc_r10.handle_request(
+            path="/v1beta/decisions",
+            headers={"Authorization": "Bearer tok-r10", "Content-Type": "application/json"},
+            raw_body=raw_deep_req,
+        )
+    assert exc_deep_http.value.status_code == 400
+    assert teacher_calls == 0
+
+    nested_py: Any = "hi"
+    for _ in range(100):
+        nested_py = [nested_py]
+    with pytest.raises(InteropError) as exc_deep_py:
+        svc_r10.process_payload(
+            path="/v1beta/decisions",
+            payload={
+                "input": nested_py,
+                "force_teacher": True,
+                "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+            },
+        )
+    assert exc_deep_py.value.status_code == 400
+    assert teacher_calls == 0
+
+    with pytest.raises(InteropError) as exc_inf_py:
+        svc_r10.process_payload(
+            path="/v1beta/decisions",
+            payload={
+                "input": {"price": float("inf")},
+                "force_teacher": True,
+                "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+            },
+        )
+    assert exc_inf_py.value.status_code == 400
+    assert teacher_calls == 0
+
+    # ------------------------------------------------------------------
+    # R10-5: Overflow-safe coerce_probability_dict and gateway normalization.
+    # ------------------------------------------------------------------
+    norm_big = coerce_probability_dict({"a": 1e308, "b": 1e308}, ("a", "b"))
+    assert norm_big["a"] == pytest.approx(0.5)
+    assert norm_big["b"] == pytest.approx(0.5)
+    assert sum(norm_big.values()) == pytest.approx(1.0)
+
+    norm_sub = coerce_probability_dict({"a": 5e-324, "b": 5e-324}, ("a", "b"))
+    assert norm_sub["a"] == pytest.approx(0.5)
+    assert norm_sub["b"] == pytest.approx(0.5)
+
+    with pytest.raises(InteropError):
+        coerce_probability_dict({"a": -0.2, "b": 1.2}, ("a", "b"))
+    with pytest.raises(InteropError):
+        coerce_probability_dict({"a": 0.0, "b": 0.0}, ("a", "b"))
+
+    def _huge_prob_teacher(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        return {"answers": {"q": {"choice": "a", "probabilities": {"a": 1e308, "b": 1e308}}}}
+
+    svc_p10 = UniversalDecisionService(
+        upstream_handlers={"gemini": _huge_prob_teacher},
+        bearer_token="tok-p10",
+    )
+    st_p, body_p = svc_p10.handle_request(
+        path="/v1beta/decisions",
+        headers={"Authorization": "Bearer tok-p10", "Content-Type": "application/json"},
+        raw_body=json.dumps(
+            {
+                "input": "check probability normalization",
+                "force_teacher": True,
+                "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+            }
+        ).encode(),
+    )
+    assert st_p == 200
+    probs_out = body_p["answers"]["q"]["probabilities"]
+    assert probs_out["a"] == pytest.approx(0.5)
+    assert probs_out["b"] == pytest.approx(0.5)
+    assert sum(probs_out.values()) == pytest.approx(1.0)
+
+    # ------------------------------------------------------------------
+    # R10-6: Ordinal score bounds and score == E[probabilities] contract.
+    # ------------------------------------------------------------------
+    ord_questions = {"q": {"type": "score", "criteria": ["low", "medium", "high"]}}
+
+    def _ord_teacher_factory(ans_payload: Dict[str, Any]) -> Callable[..., Dict[str, Any]]:
+        def _t(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+            return {"answers": {"q": dict(ans_payload)}}
+
+        return _t
+
+    svc_frac = UniversalDecisionService(
+        upstream_handlers={"gemini": _ord_teacher_factory({"score": 1.4})},
+        bearer_token="tok-ord",
+    )
+    st_frac, body_frac = svc_frac.handle_request(
+        path="/v1beta/decisions",
+        headers={"Authorization": "Bearer tok-ord", "Content-Type": "application/json"},
+        raw_body=json.dumps({"input": "fractional ordinal test", "force_teacher": True, "questions": ord_questions}).encode(),
+    )
+    assert st_frac == 200
+    ans_frac = body_frac["answers"]["q"]
+    assert ans_frac["score"] == pytest.approx(1.4)
+    assert ans_frac["probabilities"]["0"] == pytest.approx(0.0)
+    assert ans_frac["probabilities"]["1"] == pytest.approx(0.6)
+    assert ans_frac["probabilities"]["2"] == pytest.approx(0.4)
+    assert sum(ans_frac["probabilities"].values()) == pytest.approx(1.0)
+    expected_from_dist = sum(int(k) * v for k, v in ans_frac["probabilities"].items())
+    assert expected_from_dist == pytest.approx(ans_frac["score"], abs=1e-12)
+
+    for bound_val in (0, 2.0):
+        svc_bnd = UniversalDecisionService(
+            upstream_handlers={"gemini": _ord_teacher_factory({"score": bound_val})},
+            bearer_token="tok-ord",
+        )
+        st_b, body_b = svc_bnd.handle_request(
+            path="/v1beta/decisions",
+            headers={"Authorization": "Bearer tok-ord", "Content-Type": "application/json"},
+            raw_body=json.dumps({"input": "boundary test", "force_teacher": True, "questions": ord_questions}).encode(),
+        )
+        assert st_b == 200
+        ans_b = body_b["answers"]["q"]
+        assert ans_b["score"] == pytest.approx(float(bound_val))
+        assert sum(int(k) * v for k, v in ans_b["probabilities"].items()) == pytest.approx(ans_b["score"], abs=1e-12)
+
+    for bad_ord_ans in (
+        {"score": 1000},
+        {"score": -0.1},
+        {"score": 2.01},
+        {"score": 2.0, "probabilities": {"0": 1.0, "1": 0.0, "2": 0.0}},
+    ):
+        svc_bad_ord = UniversalDecisionService(
+            upstream_handlers={"gemini": _ord_teacher_factory(bad_ord_ans)},
+            bearer_token="tok-ord",
+        )
+        with pytest.raises(InteropError) as exc_ord:
+            svc_bad_ord.handle_request(
+                path="/v1beta/decisions",
+                headers={"Authorization": "Bearer tok-ord", "Content-Type": "application/json"},
+                raw_body=json.dumps({"input": "bad ordinal test", "force_teacher": True, "questions": ord_questions}).encode(),
+            )
+        assert exc_ord.value.status_code == 502
+
+
