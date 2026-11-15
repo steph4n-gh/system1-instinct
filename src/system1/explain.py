@@ -168,6 +168,18 @@ def _normalize_label_str(label: Any) -> str:
     return str(label)
 
 
+def _coerce_bool_override_val(val: Any) -> bool:
+    if isinstance(val, (bool, np.bool_)):
+        return bool(val)
+    if isinstance(val, str):
+        s = val.strip().casefold()
+        if s in ("true", "1", "yes"):
+            return True
+        if s in ("false", "0", "no"):
+            return False
+    return bool(val)
+
+
 def _canonical_explain_field(schema: Any, field_name: Optional[str]) -> str:
     explainable = [
         name for name, f_def in schema.fields.items() if isinstance(f_def, (ChoiceField, BooleanField))
@@ -871,6 +883,18 @@ class FastExplainer:
                 temperature_scale=temperature_scale,
                 recency_weighted=eng_rec,
             )
+            learned_overrides = dict(meta["learned_overrides"])
+            if hasattr(engine.model, "_build_override_eval"):
+                eng_ov = getattr(engine, "_learned_prompt_overrides", None)
+                eng_ov_rec = getattr(engine, "_learned_prompt_override_recency", {})
+                if isinstance(eng_ov, Mapping):
+                    for p_k, f_map in eng_ov.items():
+                        if isinstance(p_k, str) and isinstance(f_map, Mapping) and fname in f_map:
+                            rec_flag = eng_ov_rec.get(p_k, eng_rec) if isinstance(eng_ov_rec, Mapping) else eng_rec
+                            if bool(rec_flag) == bool(meta["recency_weighted"]):
+                                learned_overrides[p_k] = f_map[fname]
+                            else:
+                                learned_overrides.pop(p_k, None)
             return cls(
                 projector=engine.model.projector,
                 weights=w,
@@ -882,7 +906,7 @@ class FastExplainer:
                 threshold=thr,
                 recency_weighted=meta["recency_weighted"],
                 is_boolean=meta["is_boolean"],
-                learned_overrides=meta["learned_overrides"],
+                learned_overrides=learned_overrides,
                 is_zero_head=meta["is_zero_head"],
                 calibrator_temperature=meta["cal_temp"],
                 zero_emb_unit0=meta["zero_emb_unit0"],
@@ -1596,7 +1620,85 @@ class FastExplainer:
         c1, c2 = self._select_top2(ref_logits)
         return ref_logits, c1, c2
 
+    def _eval_override_if_applicable(
+        self,
+        text: str,
+        emb_opt: Optional[np.ndarray] = None,
+    ) -> Optional[Tuple[np.ndarray, int, int, np.ndarray]]:
+        if not self._learned_overrides:
+            return None
+        norm_key = " ".join(text.strip().casefold().split()) if text.strip() else ""
+        ov_val = self._learned_overrides.get(norm_key) if norm_key else None
+        if ov_val is None:
+            return None
+        if emb_opt is None:
+            emb_ov = _project_one(
+                self.projector,
+                text,
+                recency_weighted=self.recency_weighted,
+                zero_unit0=self.zero_emb_unit0,
+                dimension=self.dimension,
+            )
+        else:
+            emb_ov = np.asarray(emb_opt, dtype=np.float32).reshape(-1)
+        if not bool(np.all(np.isfinite(emb_ov))):
+            raise ValueError("Reference explanation logits are non-finite (non-finite embedding)")
+        if bool(np.any(emb_ov)) and (not self._is_zero_head):
+            return None
+        with np.errstate(over="ignore", invalid="ignore"):
+            if self._is_boolean:
+                z_raw = 12.0 if _coerce_bool_override_val(ov_val) else -12.0
+                s0_ov = -0.5 * z_raw * self.scale
+                s1_ov = 0.5 * z_raw * self.scale
+                if self._bool_cal_adj_2 is not None and self._bool_cal_adj_2.size == 2:
+                    s0_ov += float(self._bool_cal_adj_2[0])
+                    s1_ov += float(self._bool_cal_adj_2[1])
+                elif self._delta_adj != 0.0:
+                    s0_ov -= 0.5 * self._delta_adj
+                    s1_ov += 0.5 * self._delta_adj
+                s0_c = s0_ov / self.cal_temp
+                s1_c = s1_ov / self.cal_temp
+                if not (
+                    math.isfinite(s0_ov)
+                    and math.isfinite(s1_ov)
+                    and math.isfinite(s0_c)
+                    and math.isfinite(s1_c)
+                ):
+                    raise ValueError(
+                        "Reference explanation logits are non-finite (input or temperature overflow)"
+                    )
+                s_shifted = (s1_c - s0_c) - self._bool_logit_shift
+                logits = np.array([-0.5 * s_shifted, 0.5 * s_shifted], dtype=np.float64)
+                if not bool(np.all(np.isfinite(logits))):
+                    raise ValueError(
+                        "Reference explanation logits are non-finite (input or temperature overflow)"
+                    )
+                if self._bool_has_scalar_raw:
+                    c1 = self._eval_boolean_raw_logit_f32(z_raw)
+                    c2 = 0 if c1 == 1 else 1
+                else:
+                    c1, c2 = self._select_top2(logits)
+            else:
+                z_raw = np.full(self.num_classes, -12.0, dtype=np.float64)
+                ov_lbl = _normalize_label_str(ov_val)
+                if ov_lbl in self.label_to_idx:
+                    z_raw[self.label_to_idx[ov_lbl]] = 12.0
+                scaled_ov = z_raw * self.scale
+                if self._choice_cal_adj is not None and self._choice_cal_adj.size == self.num_classes:
+                    scaled_ov = scaled_ov + self._choice_cal_adj
+                logits = scaled_ov / self.cal_temp
+                if not bool(np.all(np.isfinite(logits))):
+                    raise ValueError(
+                        "Reference explanation logits are non-finite (input or temperature overflow)"
+                    )
+                c1, c2 = self._select_top2(logits)
+        _require_finite_array(logits, "logits")
+        return logits, int(c1), int(c2), emb_ov
+
     def _eval_reference_logits_and_top2_text(self, text: str) -> Tuple[np.ndarray, int, int]:
+        ov_res = self._eval_override_if_applicable(text)
+        if ov_res is not None:
+            return ov_res[0], ov_res[1], ov_res[2]
         emb_f32 = _project_one(
             self.projector,
             text,
@@ -1607,6 +1709,9 @@ class FastExplainer:
         return self._eval_reference_logits_and_top2_from_emb(emb_f32)
 
     def _eval_boolean_text_winner(self, text: str) -> int:
+        ov_res = self._eval_override_if_applicable(text)
+        if ov_res is not None:
+            return ov_res[1]
         emb = _project_one(
             self.projector,
             text,
@@ -1617,6 +1722,10 @@ class FastExplainer:
         return self._eval_boolean_embedding_winner(emb)
 
     def _select_top2_text(self, text: str, logits: np.ndarray) -> Tuple[int, int]:
+        if self._learned_overrides:
+            ov_res = self._eval_override_if_applicable(text)
+            if ov_res is not None:
+                return ov_res[1], ov_res[2]
         if (self._is_boolean and self._bool_has_scalar_raw) or self._choice_has_raw:
             _, c1, c2 = self._eval_reference_logits_and_top2_text(text)
             return c1, c2
@@ -1628,6 +1737,11 @@ class FastExplainer:
         spans: List[Tuple[int, int, str, str]],
         kept_mask: List[bool],
     ) -> int:
+        if self._learned_overrides:
+            kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
+            ov_res = self._eval_override_if_applicable(kept_text)
+            if ov_res is not None:
+                return ov_res[1]
         if (self._is_boolean and self._bool_has_scalar_raw) or self._choice_has_raw:
             kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
             _, c1, _ = self._eval_reference_logits_and_top2_text(kept_text)
@@ -1668,6 +1782,11 @@ class FastExplainer:
         spans: List[Tuple[int, int, str, str]],
         kept_mask: List[bool],
     ) -> Tuple[int, np.ndarray]:
+        if self._learned_overrides:
+            kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
+            ov_res = self._eval_override_if_applicable(kept_text)
+            if ov_res is not None:
+                return ov_res[1], ov_res[0]
         if self._mode == "generic":
             kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
             x_sub_f32 = _project_one(
@@ -1856,7 +1975,11 @@ class FastExplainer:
         )
         logits_loo = np.empty((len(loo_texts), self.num_classes), dtype=np.float64)
         for r_idx in range(len(loo_texts)):
-            rl, _, _ = self._eval_reference_logits_and_top2_from_emb(X_loo[r_idx])
+            ov_res = self._eval_override_if_applicable(loo_texts[r_idx], emb_opt=X_loo[r_idx])
+            if ov_res is not None:
+                rl = ov_res[0]
+            else:
+                rl, _, _ = self._eval_reference_logits_and_top2_from_emb(X_loo[r_idx])
             logits_loo[r_idx] = rl
         with np.errstate(over="ignore", invalid="ignore"):
             _require_finite_array(logits_loo, "LOO logits")
@@ -1885,76 +2008,17 @@ class FastExplainer:
         spans = self._tokenize_spans(text)
         n_spans = len(spans)
 
-        norm_key = " ".join(text.strip().casefold().split()) if text.strip() else ""
-        ov_val = self._learned_overrides.get(norm_key) if norm_key else None
-        override_hit = False
-        if ov_val is not None:
-            emb_ov = _project_one(
-                self.projector,
-                text,
-                recency_weighted=self.recency_weighted,
-                zero_unit0=self.zero_emb_unit0,
-                dimension=self.dimension,
-            )
-            if not bool(np.all(np.isfinite(emb_ov))):
-                raise ValueError("Reference explanation logits are non-finite (non-finite embedding)")
-            if (not bool(np.any(emb_ov))) or self._is_zero_head:
-                override_hit = True
-                with np.errstate(over="ignore", invalid="ignore"):
-                    if self._is_boolean:
-                        z_raw = 12.0 if bool(ov_val) else -12.0
-                        s0_ov = -0.5 * z_raw * self.scale
-                        s1_ov = 0.5 * z_raw * self.scale
-                        if self._bool_cal_adj_2 is not None and self._bool_cal_adj_2.size == 2:
-                            s0_ov += float(self._bool_cal_adj_2[0])
-                            s1_ov += float(self._bool_cal_adj_2[1])
-                        elif self._delta_adj != 0.0:
-                            s0_ov -= 0.5 * self._delta_adj
-                            s1_ov += 0.5 * self._delta_adj
-                        s0_c = s0_ov / self.cal_temp
-                        s1_c = s1_ov / self.cal_temp
-                        if not (
-                            math.isfinite(s0_ov)
-                            and math.isfinite(s1_ov)
-                            and math.isfinite(s0_c)
-                            and math.isfinite(s1_c)
-                        ):
-                            raise ValueError(
-                                "Reference explanation logits are non-finite (input or temperature overflow)"
-                            )
-                        s_shifted = (s1_c - s0_c) - self._bool_logit_shift
-                        logits = np.array([-0.5 * s_shifted, 0.5 * s_shifted], dtype=np.float64)
-                        if not bool(np.all(np.isfinite(logits))):
-                            raise ValueError(
-                                "Reference explanation logits are non-finite (input or temperature overflow)"
-                            )
-                        if self._bool_has_scalar_raw:
-                            c1 = self._eval_boolean_raw_logit_f32(z_raw)
-                            c2 = 0 if c1 == 1 else 1
-                        else:
-                            c1, c2 = self._select_top2(logits)
-                    else:
-                        z_raw = np.full(self.num_classes, -12.0, dtype=np.float64)
-                        ov_lbl = _normalize_label_str(ov_val)
-                        if ov_lbl in self.label_to_idx:
-                            z_raw[self.label_to_idx[ov_lbl]] = 12.0
-                        scaled_ov = z_raw * self.scale
-                        if self._choice_cal_adj is not None and self._choice_cal_adj.size == self.num_classes:
-                            scaled_ov = scaled_ov + self._choice_cal_adj
-                        logits = scaled_ov / self.cal_temp
-                        if not bool(np.all(np.isfinite(logits))):
-                            raise ValueError(
-                                "Reference explanation logits are non-finite (input or temperature overflow)"
-                            )
-                        c1, c2 = self._select_top2(logits)
-                _require_finite_array(logits, "logits")
-                margin = _require_finite_scalar(float(logits[c1]) - float(logits[c2]), "margin")
-                t_attrs = [0.0] * n_spans
-                m_attrs = [0.0] * n_spans
-                b_target = float(logits[c1])
-                b_margin = margin
-                with np.errstate(over="ignore", invalid="ignore"):
-                    sims_all = (self.X_train_full @ emb_ov.astype(np.float32)).astype(np.float64)
+        ov_res = self._eval_override_if_applicable(text)
+        override_hit = ov_res is not None
+        if ov_res is not None:
+            logits, c1, c2, emb_ov = ov_res
+            margin = _require_finite_scalar(float(logits[c1]) - float(logits[c2]), "margin")
+            t_attrs = [0.0] * n_spans
+            m_attrs = [0.0] * n_spans
+            b_target = float(logits[c1])
+            b_margin = margin
+            with np.errstate(over="ignore", invalid="ignore"):
+                sims_all = (self.X_train_full @ emb_ov.astype(np.float32)).astype(np.float64)
 
         has_active_spans = False
         if override_hit:

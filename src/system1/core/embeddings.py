@@ -3699,12 +3699,11 @@ class SmartsCrossZeroFewRouter:
                 q_eff = 1.0 if rank > n_cal else float(self._cal_scores[max(0, rank - 1)])
             else:
                 q_eff = self._conformal_q
-            cset = tuple(
-                self._public_value(self.options[j])
-                for j in range(self.K)
-                if (1.0 - float(probs[j])) <= q_eff + 1e-12
-            )
-            is_ambig = len(cset) != 1
+            cset_indices = [
+                j for j in range(self.K) if (1.0 - float(probs[j])) <= q_eff + 1e-12
+            ]
+            cset = tuple(self._public_value(self.options[j]) for j in cset_indices)
+            is_ambig = cset_indices != [bi]
         else:
             cset = (pred,)
             is_ambig = False

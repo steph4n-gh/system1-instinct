@@ -10500,3 +10500,594 @@ def test_astra_30_round17_regressions() -> None:
     )
 
 
+def test_astra_31_round18_regressions() -> None:
+    """Round-18 regression tests for R18-1 through R18-9 and sister paths."""
+    from system1 import ConformalPredictor
+    from system1.calibration import CumulativeLogitOrdinalHead, SoftOrdinalHead, cqr_ordinal_intervals
+    from system1.compat.universal import UnsupportedMediaError, extract_semantic_text
+    from system1.guard import GuardShield
+    from system1.teaching import TeachingSession
+
+    # R18-1: extract_semantic_text preserves sibling fields inside list items and custom type wrappers.
+    p_false = {"state": [{"text": "transfer", "approved": False, "amount": 9000}]}
+    p_true = {"state": [{"text": "transfer", "approved": True, "amount": 9000}]}
+    txt_false, _ = extract_semantic_text(p_false)
+    txt_true, _ = extract_semantic_text(p_true)
+    assert "transfer" in txt_false
+    assert "approved" in txt_false and "false" in txt_false.lower() and "9000" in txt_false
+    assert "true" in txt_true.lower() and txt_false != txt_true
+
+    txt_tool, _ = extract_semantic_text({"state": {"items": [{"type": "tool_call", "text": "approve", "blocked": True}]}})
+    assert "tool_call" in txt_tool and "blocked" in txt_tool and "true" in txt_tool.lower()
+    txt_tool_2key, _ = extract_semantic_text({"state": [{"type": "tool_call", "text": "approve"}]})
+    assert "tool_call" in txt_tool_2key and "approve" in txt_tool_2key
+
+    txt_parts_sib, _ = extract_semantic_text(
+        {"state": {"messages": [{"role": "assistant", "parts": [{"text": "ok"}], "flagged": True}]}}
+    )
+    assert "flagged" in txt_parts_sib and "true" in txt_parts_sib.lower() and "ok" in txt_parts_sib
+
+    txt_input_text, _ = extract_semantic_text({"input": [{"type": "input_text", "text": "Refund charge"}]})
+    assert "Refund charge" in txt_input_text
+
+    # End-to-end UniversalDecisionService cutover cache isolation on sibling boolean field.
+    teacher_calls = 0
+
+    def _approval_teacher(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        nonlocal teacher_calls
+        teacher_calls += 1
+        state_items = raw_payload.get("state", [])
+        is_ok = bool(isinstance(state_items, list) and state_items and state_items[0].get("approved"))
+        choice = "allow" if is_ok else "deny"
+        probs = {"allow": 0.99, "deny": 0.01} if is_ok else {"allow": 0.01, "deny": 0.99}
+        return {"answers": {"act": {"choice": choice, "probabilities": probs}}, "usage": {"input_tokens": 4}}
+
+    svc_sib = UniversalDecisionService(
+        upstream_handlers={"gemini": _approval_teacher},
+        require_auth=False,
+        cutover_config=CutoverConfig(
+            milestones=(20, 40),
+            k_min=2,
+            alpha_target=0.15,
+            canary_rate=0.001,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    q_act = {"act": {"type": "choice", "options": ("allow", "deny")}}
+    for idx_s in range(44):
+        is_ok = idx_s % 2 == 0
+        req_s = {
+            "state": [{"text": f"transfer request {idx_s}", "approved": is_ok}],
+            "questions": q_act,
+            "slot": "r18_sibling",
+        }
+        st_s, body_s = svc_sib.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=json.dumps(req_s).encode("utf-8"),
+        )
+        assert st_s == 200
+        assert body_s["answers"]["act"]["choice"] == ("allow" if is_ok else "deny")
+
+    # Repeat an exact approved payload then flip only sibling "approved" to False: must never leak cached "allow".
+    req_ok = json.dumps({"state": [{"text": "transfer", "approved": True}], "questions": q_act, "slot": "r18_sibling"}).encode("utf-8")
+    req_deny = json.dumps({"state": [{"text": "transfer", "approved": False}], "questions": q_act, "slot": "r18_sibling"}).encode("utf-8")
+    for _ in range(3):
+        st_ok, body_ok = svc_sib.handle_request(
+            path="/v1beta/decisions",
+            headers={"Content-Type": "application/json"},
+            raw_body=req_ok,
+        )
+        assert st_ok == 200 and body_ok["answers"]["act"]["choice"] == "allow"
+    st_deny, body_deny = svc_sib.handle_request(
+        path="/v1beta/decisions",
+        headers={"Content-Type": "application/json"},
+        raw_body=req_deny,
+    )
+    assert st_deny == 200 and body_deny["answers"]["act"]["choice"] == "deny"
+
+    # R18-2: GuardShield honors learned overrides on compiled models and wrapped engines.
+    class _R18GuardBoolSchema(DecisionSchema):
+        is_safe = BooleanField(description="Safety flag")
+
+    tf_g = TfidfProjector.fit(["alpha beta", "gamma delta"], max_features=32)
+    m_g = SystemOneCompiler(
+        _R18GuardBoolSchema,
+        projector=tf_g,
+        dimension=tf_g.dimension,
+        regularization=0.1,
+    ).compile(
+        {"is_safe": [("alpha beta", False)] * 20 + [("gamma delta", True)] * 10},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_g = SystemOneEngine(
+        _R18GuardBoolSchema,
+        compiled_model=m_g,
+        backend="numpy",
+        strict_mode=False,
+        use_cache=False,
+    )
+    cm_g = eng_g.model
+    assert eng_g.decide("omega", record_receipt=False).values["is_safe"] is True
+    eng_g.learn("omega", {"is_safe": False})
+    assert eng_g.decide("omega", record_receipt=False).values["is_safe"] is False
+
+    shield_eng = GuardShield(eng_g, field_name="is_safe", unsafe_label="False", use_windows=False)
+    shield_cm = GuardShield(cm_g, field_name="is_safe", unsafe_label="False", use_windows=False)
+    dec_sh_eng = shield_eng.evaluate_single("omega")
+    dec_sh_cm = shield_cm.evaluate_single("omega")
+    assert dec_sh_eng.is_unsafe is True and dec_sh_eng.predicted_label == "False"
+    assert dec_sh_cm.is_unsafe is True and dec_sh_cm.predicted_label == "False"
+
+    # Engine-only override + string coercion + ChoiceField shield override.
+    cm_g._learned_prompt_overrides.pop("omega", None)
+    eng_g._learned_prompt_overrides["omega_str"] = {"is_safe": "False"}
+    eng_g._learned_prompt_override_recency["omega_str"] = bool(eng_g.recency_weighted)
+    shield_eng_post = GuardShield(eng_g, field_name="is_safe", unsafe_label="False", use_windows=False)
+    assert shield_eng_post.evaluate_single("omega").is_unsafe is True
+    assert shield_eng_post.evaluate_single("omega_str").predicted_label == "False"
+
+    class _R18GuardChoiceSchema(DecisionSchema):
+        tier = ChoiceField(options=("safe", "risky"), descriptions={"safe": "ok", "risky": "bad"})
+
+    m_gc = SystemOneCompiler(
+        _R18GuardChoiceSchema,
+        projector=tf_g,
+        dimension=tf_g.dimension,
+        regularization=0.1,
+    ).compile(
+        {"tier": [("alpha beta", "safe")] * 20 + [("gamma delta", "risky")] * 10},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_gc = SystemOneEngine(
+        _R18GuardChoiceSchema,
+        compiled_model=m_gc,
+        backend="numpy",
+        strict_mode=False,
+        use_cache=False,
+    )
+    assert eng_gc.decide("omega", record_receipt=False).values["tier"] == "safe"
+    eng_gc.learn("omega", {"tier": "risky"})
+    shield_gc = GuardShield(eng_gc, field_name="tier", unsafe_label="risky", use_windows=False)
+    dec_gc = shield_gc.evaluate_single("omega")
+    assert dec_gc.is_unsafe is True and dec_gc.predicted_label == "risky"
+
+    # R18-3: SmartsCrossZeroFewRouter marks ambiguous whenever pred is outside conformal set.
+    class _R18ThreshBoolSchema(DecisionSchema):
+        approve = BooleanField(
+            description="approve routine safe request",
+            true_description="routine approved standard bill",
+            false_description="suspicious unauthorized risk",
+            threshold=0.6,
+        )
+
+    router_t = SmartsCrossZeroFewRouter(_R18ThreshBoolSchema, disable_concept_gate=True)
+    router_t.calibrate(["routine approved standard bill"] * 9, [True] * 9, alpha=0.20)
+    router_t._cal_scores = np.array([0.445] * 9, dtype=np.float64)
+    router_t._conformal_q = 0.445
+    orig_sap = router_t.score_and_predict
+    try:
+        def _mid_prob_sap(text: str) -> tuple[bool, np.ndarray]:
+            return False, np.array([0.4434, 0.5566], dtype=np.float64)
+
+        router_t.score_and_predict = _mid_prob_sap  # type: ignore[method-assign]
+        res_mid = router_t.decide("ambiguous threshold mismatch probe", alpha=0.20)
+        assert res_mid.values["approve"] is False
+        assert res_mid.conformal_sets["approve"] == (True,)
+        assert res_mid.is_ambiguous is True
+    finally:
+        router_t.score_and_predict = orig_sap  # type: ignore[method-assign]
+    res_real = router_t.decide("routine approved standard bill", alpha=0.20)
+    assert isinstance(res_real.values["approve"], bool)
+
+    class _R18ExactUrgentSchema(DecisionSchema):
+        approve = BooleanField(
+            description="approve urgent triage",
+            true_description="urgent critical emergency",
+            false_description="routine documentation",
+            threshold=0.6,
+        )
+
+    router_exact = SmartsCrossZeroFewRouter(_R18ExactUrgentSchema, dimension=48)
+    router_exact.calibrate(["urgent routine critical"] * 20, [True] * 20, alpha=0.1)
+    res_exact_r = router_exact.decide("urgent routine critical")
+    assert res_exact_r.values["approve"] is False
+    assert res_exact_r.conformal_sets["approve"] == (True,)
+    assert res_exact_r.is_ambiguous is True
+
+    # R18-4: MultiTenantSkillFleet and TeachingSession forward recency_weighted consistently.
+    class _RecencySpyProjector:
+        dimension = 8
+        recency_weighted = False
+
+        def __init__(self) -> None:
+            self.norm_calls: List[bool] = []
+            self.proj_calls: List[bool] = []
+
+        def raw_norm(self, text: str, recency_weighted: bool = False) -> float:
+            self.norm_calls.append(bool(recency_weighted))
+            return 2.0 if recency_weighted else 0.5
+
+        def project(self, text: str, recency_weighted: bool = False) -> np.ndarray:
+            self.proj_calls.append(bool(recency_weighted))
+            v = np.zeros(8, dtype=np.float32)
+            v[0] = 1.0 if recency_weighted else -1.0
+            return v
+
+    spy_proj = _RecencySpyProjector()
+    m_rec = SystemOneCompiler(
+        _R18GuardBoolSchema,
+        projector=spy_proj,
+        dimension=8,
+        recency_weighted=True,
+    ).compile(
+        {"is_safe": [("first text", True), ("second text", False)] * 4},
+        calibration_split=0.0,
+        augment=False,
+    )
+    m_rec.recency_weighted = False
+    eng_rec = SystemOneEngine(
+        _R18GuardBoolSchema,
+        compiled_model=m_rec,
+        backend="numpy",
+        strict_mode=False,
+        use_cache=False,
+        recency_weighted=True,
+    )
+    eng_rec.recency_weighted = True
+    eng_rec.conformal_predictors["is_safe"].familiarity_threshold = 0.1
+    fleet_rec = MultiTenantSkillFleet.from_compiled_model(eng_rec, "is_safe", num_tenants=2)
+    assert fleet_rec.recency_weighted is True
+    spy_proj.norm_calls.clear()
+    spy_proj.proj_calls.clear()
+    fleet_rec.decide(0, "check recency path")
+    assert spy_proj.norm_calls and all(spy_proj.norm_calls)
+    assert spy_proj.proj_calls and all(spy_proj.proj_calls)
+
+    # Exact R18-4 familiarity abstention parity between uncompiled SystemOneEngine and MultiTenantSkillFleet.
+    class _R18FamChoiceSchema(DecisionSchema):
+        c = ChoiceField(options=("a", "b"))
+
+    class _UnitFamRecencyProj:
+        dimension = 8
+        recency_weighted = True
+
+        def raw_norm(self, text: str, recency_weighted: bool = False) -> float:
+            return 0.01 if recency_weighted else 1.0
+
+        def project(self, text: str, recency_weighted: bool = False) -> np.ndarray:
+            v = np.zeros(8, dtype=np.float32)
+            v[0] = 1.0
+            return v
+
+    fam_proj = _UnitFamRecencyProj()
+    eng_fam = SystemOneEngine(
+        _R18FamChoiceSchema,
+        dimension=8,
+        backend="numpy",
+        projector=fam_proj,
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+        recency_weighted=True,
+    )
+    eng_fam.model.heads["c"].set_weights(
+        np.zeros((2, 8), dtype=np.float32),
+        np.array([1.0, 0.0], dtype=np.float32),
+    )
+    eng_fam.conformal_predictors["c"] = ConformalPredictor("c", ("a", "b"), score_method="lac", mondrian=False)
+    eng_fam.conformal_predictors["c"].calibrate(np.tile([0.8, 0.2], (100, 1)), ["a"] * 100)
+    eng_fam.conformal_predictors["c"].familiarity_threshold = 0.5
+    dec_eng_fam = eng_fam.decide("probe", record_receipt=False)
+    assert dec_eng_fam.conformal_sets["c"] == [] and dec_eng_fam.is_ambiguous is True
+    fleet_fam = MultiTenantSkillFleet.from_compiled_model(eng_fam, "c", num_tenants=2)
+    dec_fl_fam = fleet_fam.decide(0, "probe")
+    assert dec_fl_fam.conformal_set == () and dec_fl_fam.is_ambiguous is True
+    assert abs(float(fleet_fam._encode_one_with_familiarity("probe")[1]) - 0.01) < 1e-6
+
+    class _MemTeachingSession(TeachingSession):
+        @property
+        def engine(self):
+            return eng_rec
+
+        def predict(self, text: str):
+            return eng_rec.decide(text, alpha=0.1, record_receipt=False)
+
+    mem_sess = object.__new__(_MemTeachingSession)
+    mem_sess.schema = _R18GuardBoolSchema()
+    mem_sess.field_name = "is_safe"
+    mem_sess.current_path = Path("__nonexistent_r18_session_file__")
+    spy_proj.norm_calls.clear()
+    spy_proj.proj_calls.clear()
+    det = mem_sess.decision_details("check session recency")
+    assert "values" in det
+    assert spy_proj.norm_calls and all(spy_proj.norm_calls)
+    assert spy_proj.proj_calls and all(spy_proj.proj_calls)
+
+    # R18-5: CompiledSystemOneModel v3 preserves Fortran-contiguous 2D matrices and validates tampered order metadata.
+    class _R18Tie3Schema(DecisionSchema):
+        c = ChoiceField(options=("a", "b", "c"))
+
+    eng_f3 = SystemOneEngine(
+        _R18Tie3Schema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    rng_f3 = np.random.default_rng(18)
+    w_f3 = np.asfortranarray(rng_f3.normal(size=(3, 32)).astype(np.float32))
+    b_f3 = rng_f3.normal(size=(3,)).astype(np.float32)
+    eng_f3.model.heads["c"].set_weights(w_f3, b_f3)
+    cm_f3 = eng_f3.to_compiled_model()
+    cm_f3.heads["c"].weights = np.asfortranarray(w_f3)
+    blob_v3 = cm_f3.to_bytes(format_version=3)
+    re_f3 = CompiledSystemOneModel.from_bytes(blob_v3, backend="numpy")
+    assert re_f3.heads["c"].weights.flags["F_CONTIGUOUS"]
+    assert not re_f3.heads["c"].weights.flags["C_CONTIGUOUS"]
+    assert not re_f3.heads["c"].weights.flags["WRITEABLE"]
+    assert np.array_equal(re_f3.heads["c"].weights, cm_f3.heads["c"].weights)
+    assert np.array_equal(
+        re_f3.forward_single("fortran v3 layout parity").fields["c"].logits,
+        cm_f3.forward_single("fortran v3 layout parity").fields["c"].logits,
+    )
+
+    # Tampered manifest checks for invalid "order" values and 1D Fortran flags.
+    _hlen = struct.unpack_from("<Q", blob_v3, 8)[0]
+    _hdr = json.loads(blob_v3[16 : 16 + _hlen].decode("utf-8"))
+    for bad_mod in (
+        {"order": "G"},
+        {"order": "F", "shape": [int(math.prod(_hdr["tensors"][next(k for k, v in _hdr["tensors"].items() if v.get("order") == "F")]["shape"]))]},
+    ):
+        hdr_tamper = copy.deepcopy(_hdr)
+        f_key = next(k for k, v in hdr_tamper["tensors"].items() if v.get("order") == "F")
+        hdr_tamper["tensors"][f_key].update(bad_mod)
+        hdr_bytes = json.dumps(hdr_tamper, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        pad = _hlen - len(hdr_bytes)
+        assert pad >= 0
+        tampered_v3 = blob_v3[:16] + hdr_bytes + (b" " * pad) + blob_v3[16 + _hlen :]
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(tampered_v3, backend="numpy")
+    b_key_1d = next(k for k, v in _hdr["tensors"].items() if len(v.get("shape", [])) == 1)
+    hdr_1d_f = copy.deepcopy(_hdr)
+    hdr_1d_f["tensors"][b_key_1d]["order"] = "F"
+    hdr_1d_b = json.dumps(hdr_1d_f, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    tampered_1d_f = blob_v3[:8] + struct.pack("<Q", len(hdr_1d_b)) + hdr_1d_b + blob_v3[16 + _hlen :]
+    with pytest.raises(ValueError):
+        CompiledSystemOneModel.from_bytes(tampered_1d_f, backend="numpy")
+
+    # Exact R18-5 near-tie abstention parity across v3 compact=False reload.
+    eng_f3_tie = SystemOneEngine(
+        _R18Tie3Schema,
+        dimension=32,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=True,
+        enable_margin_gating=False,
+    )
+    eng_f3_tie.model.heads["c"].set_weights(
+        np.asfortranarray(np.random.default_rng(1).normal(size=(3, 32)).astype(np.float32)),
+        np.zeros(3, dtype=np.float32),
+    )
+    raw_f3 = eng_f3_tie.model.heads["c"].compute_logits(eng_f3_tie.model.encode("fortran layout check"))
+    eng_f3_tie.calibrators["c"].logit_adjustments = -raw_f3.astype(np.float64) / 0.25
+    eng_f3_tie.conformal_predictors["c"] = ConformalPredictor("c", ("a", "b", "c"), score_method="lac", mondrian=False)
+    eng_f3_tie.conformal_predictors["c"].calibrate(
+        np.tile([1.0 / 3.0 + 1.5e-7, 1.0 / 3.0 - 0.75e-7, 1.0 / 3.0 - 0.75e-7], (100, 1)),
+        ["a"] * 100,
+    )
+    dec_f3_pre = eng_f3_tie.decide("fortran layout check", record_receipt=False)
+    cm_f3_tie = eng_f3_tie.to_compiled_model()
+    eng_f3_re = SystemOneEngine.from_bytes(
+        cm_f3_tie.to_bytes(format_version=3, compact=False),
+        schema=_R18Tie3Schema,
+        backend="numpy",
+        use_cache=False,
+    )
+    assert eng_f3_re.model._field_heads is not None
+    assert eng_f3_re.model._field_heads["c"].weights.flags["F_CONTIGUOUS"]
+    dec_f3_post = eng_f3_re.decide("fortran layout check", record_receipt=False)
+    assert dec_f3_post.values["c"] == dec_f3_pre.values["c"] == "a"
+    assert dec_f3_post.conformal_sets["c"] == dec_f3_pre.conformal_sets["c"] == []
+    assert dec_f3_post.is_ambiguous is True and dec_f3_pre.is_ambiguous is True
+
+    # R18-6: FastExplainer honors learned overrides during counterfactual search and generic LOO evaluation.
+    class _R18ExplainSchema(DecisionSchema):
+        allow = BooleanField(description="Allow action")
+
+    exp_train = [("alpha beta", True)] * 20 + [("gamma delta", False)] * 10
+    tf_ex = TfidfProjector.fit(["alpha beta", "gamma delta"], max_features=32)
+    m_ex = SystemOneCompiler(
+        _R18ExplainSchema,
+        projector=tf_ex,
+        dimension=tf_ex.dimension,
+        regularization=0.1,
+    ).compile(
+        {"allow": exp_train},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_ex = SystemOneEngine(
+        _R18ExplainSchema,
+        compiled_model=m_ex,
+        backend="numpy",
+        strict_mode=False,
+        use_cache=False,
+    )
+    assert eng_ex.decide("omega", record_receipt=False).values["allow"] is False
+    eng_ex.learn("omega", {"allow": True})
+
+    expl_eng = FastExplainer.from_engine(
+        eng_ex,
+        field_name="allow",
+        train_texts=[t for t, _ in exp_train],
+        train_labels=[lbl for _, lbl in exp_train],
+    )
+    ex_stay = expl_eng.explain("alpha omega")
+    assert ex_stay.predicted_label == "True"
+    assert ex_stay.counterfactual_found is False
+
+    ex_flip = expl_eng.explain("gamma omega")
+    assert ex_flip.predicted_label == "False"
+    assert ex_flip.counterfactual_found is True
+    assert ex_flip.counterfactual_new_label == "True"
+    assert ex_flip.counterfactual_tokens == ("gamma",)
+    assert expl_eng._select_winner_kept(
+        np.array([1.0, -1.0]),
+        [(0, 5, "gamma", "gamma"), (6, 11, "omega", "omega")],
+        [False, True],
+    ) == 1
+    fe_2row = FastExplainer(
+        projector=tf_ex,
+        weights=np.zeros((2, tf_ex.dimension), dtype=np.float32),
+        biases=np.array([1.0, -1.0], dtype=np.float32),
+        options=("False", "True"),
+        is_boolean=True,
+        learned_overrides={"omega": True},
+    )
+    assert fe_2row._select_winner_kept(
+        np.array([1.0, -1.0]),
+        [(0, 5, "gamma", "gamma"), (6, 11, "omega", "omega")],
+        [False, True],
+    ) == 1
+
+    # Engine-only override + string bool + custom generic LOO projector path.
+    eng_ex.model._learned_prompt_overrides.pop("omega", None)
+    eng_ex._learned_prompt_overrides["omega"] = {"allow": "True"}
+    eng_ex._learned_prompt_override_recency["omega"] = bool(eng_ex.recency_weighted)
+    expl_eng_only = FastExplainer.from_engine(
+        eng_ex,
+        field_name="allow",
+        train_texts=[t for t, _ in exp_train],
+        train_labels=[lbl for _, lbl in exp_train],
+    )
+    assert expl_eng_only.explain("alpha omega").counterfactual_found is False
+
+    from system1.core.text import PragmaticCompositeProjector
+
+    prag_ex = PragmaticCompositeProjector.fit(["alpha beta", "gamma delta"], max_features=32)
+    m_ex_gen = SystemOneCompiler(
+        _R18ExplainSchema,
+        projector=prag_ex,
+        dimension=prag_ex.dimension,
+        regularization=0.1,
+    ).compile(
+        {"allow": exp_train},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_ex_gen = SystemOneEngine(
+        _R18ExplainSchema,
+        compiled_model=m_ex_gen,
+        backend="numpy",
+        strict_mode=False,
+        use_cache=False,
+    )
+    eng_ex_gen.learn("omega1", {"allow": True})
+    eng_ex_gen.learn("omega2", {"allow": False})
+    expl_gen = FastExplainer.from_engine(
+        eng_ex_gen,
+        field_name="allow",
+        train_texts=[t for t, _ in exp_train],
+        train_labels=[lbl for _, lbl in exp_train],
+    )
+    ex_gen_pair = expl_gen.explain("omega1 omega2")
+    assert ex_gen_pair.spans[0].target_logit_attr > 10.0
+    assert ex_gen_pair.spans[1].target_logit_attr < -10.0
+    assert ex_gen_pair.counterfactual_found is True
+    assert ex_gen_pair.counterfactual_tokens == ("omega1",)
+    assert ex_gen_pair.counterfactual_new_label == "False"
+    ex_gen_flip = expl_gen.explain("gamma omega1")
+    assert ex_gen_flip.counterfactual_found is True
+    assert ex_gen_flip.counterfactual_new_label == "True"
+
+    # Exact R18-6 reproduction on eng_g (where "omega" was learned False).
+    eng_g.learn("omega", {"is_safe": False})
+    expl_g_exact = FastExplainer.from_engine(
+        eng_g,
+        field_name="is_safe",
+        train_texts=["alpha beta", "gamma delta"],
+        train_labels=[False, True],
+    )
+    ex_g_res = expl_g_exact.explain("alpha omega")
+    assert ex_g_res.predicted_label == "False"
+    assert ex_g_res.counterfactual_found is False
+
+    # R18-7: OnlineMondrianConformal preserves q_c == 0.0 for q_init=[0.0, 0.0] and alpha=1.0.
+    tracker_z = OnlineMondrianConformal(2, q_init=[0.0, 0.0])
+    assert np.all(tracker_z.q_c == 0.0) and np.all(tracker_z.u_c == 0.0)
+    assert tracker_z.predict_set([0.99995, 0.00005]) == []
+    assert tracker_z.should_accept([0.99995, 0.00005]) is False
+
+    omc_zero = OnlineMondrianConformal(num_classes=3, q_init=np.zeros(3))
+    assert np.all(omc_zero.q_c == 0.0)
+    assert np.all(omc_zero.u_c == 0.0)
+    assert omc_zero.predict_set(np.array([0.8, 0.1, 0.1])) == []
+    omc_zero_re = OnlineMondrianConformal.from_state_dict(omc_zero.state_dict())
+    assert np.all(omc_zero_re.q_c == 0.0)
+    assert np.all(omc_zero_re.u_c == 0.0)
+    omc_zero.update(0, 1.0)
+    assert 0.0 < float(omc_zero.q_c[0]) < 1.0
+
+    # R18-8: UniversalDecisionService enforces exact application/json media type and UTF-8 charset.
+    svc_ct = UniversalDecisionService(
+        upstream_handlers={"gemini": _mock_universal_handler},
+        require_auth=False,
+    )
+    valid_body = json.dumps(
+        {
+            "contents": [{"parts": [{"text": "routine check"}]}],
+            "questions": {"ok": {"type": "noul"}},
+        }
+    ).encode("utf-8")
+    for bad_ct in (
+        "",
+        "application/jsonp",
+        "text/plain; application/json",
+        "application/json, text/plain",
+        "application/json; charset=latin-1",
+        "application/json; malformed",
+    ):
+        with pytest.raises(UnsupportedMediaError):
+            svc_ct.handle_request(path="/v1beta/decisions", headers={"Content-Type": bad_ct}, raw_body=valid_body)
+    for good_ct in ("application/json", "Application/JSON; charset=utf-8", 'application/json; charset="UTF-8"'):
+        st_ok, _ = svc_ct.handle_request(path="/v1beta/decisions", headers={"Content-Type": good_ct}, raw_body=valid_body)
+        assert st_ok == 200
+
+    # R18-9: Ordinal heads and CQR intervals reject booleans (including mixed bools) and non-1D labels.
+    X_ord = np.array([[float(i % 3), float((i + 1) % 3)] for i in range(20)], dtype=np.float64)
+    y_mixed_bool: Any = [0, True, 0, 1] * 5
+    y_col = np.zeros((20, 1), dtype=np.int64)
+    y_3d = np.zeros((20, 1, 1), dtype=np.int64)
+    X_mixed_bool: Any = X_ord.tolist()
+    X_mixed_bool[0][0] = False
+
+    for head_cls in (CumulativeLogitOrdinalHead, SoftOrdinalHead):
+        for bad_y in (y_mixed_bool, y_col, y_3d, [True] * 20, "012" * 6, {"a": 1}):
+            with pytest.raises(ValueError):
+                head_cls().fit(X_ord, bad_y)
+        with pytest.raises(ValueError):
+            head_cls().fit(X_mixed_bool, np.arange(20) % 3)
+        fitted_head = head_cls().fit(X_ord, np.arange(20) % 3)
+        with pytest.raises(ValueError):
+            fitted_head.predict_proba(X_mixed_bool)
+
+    cal_p = np.full((20, 3), 1.0 / 3.0, dtype=np.float64)
+    test_p = np.full((3, 3), 1.0 / 3.0, dtype=np.float64)
+    for bad_cal_y in (y_mixed_bool, y_col, y_3d):
+        with pytest.raises(ValueError):
+            cqr_ordinal_intervals(cal_p, bad_cal_y, test_p, alpha=0.2)
+    bad_test_p: Any = test_p.tolist()
+    bad_test_p[0] = [False, 0.5, 0.5]
+    with pytest.raises(ValueError):
+        cqr_ordinal_intervals(cal_p, np.arange(20) % 3, bad_test_p, alpha=0.2)
+
+
+

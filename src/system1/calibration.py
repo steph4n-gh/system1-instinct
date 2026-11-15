@@ -1928,11 +1928,11 @@ class OnlineMondrianConformal:
         else:
             q0 = np.full(self.num_classes, 0.5, dtype=np.float64)
         self.u_max = 16.0
-        self.q_c = np.clip(q0.copy(), 1e-4, 1.0)
+        self.q_c = np.clip(q0.copy(), 0.0, 1.0)
         self.u_c = np.where(
             self.q_c >= 1.0 - math.exp(-(self.u_max - 1e-6)),
             self.u_max,
-            -np.log(np.clip(1.0 - self.q_c, 1e-12, 1.0)),
+            np.maximum(0.0, -np.log(np.clip(1.0 - self.q_c, 1e-12, 1.0))),
         )
         self.alpha_c = np.full(self.num_classes, a, dtype=np.float64)
         self.err_ewma = np.full(self.num_classes, a, dtype=np.float64)
@@ -3123,10 +3123,38 @@ class UtilityCalibrator:
         return out[:1] if single else out
 
 
+def _contains_bool_element(obj: Any) -> bool:
+    if isinstance(obj, (bool, np.bool_)):
+        return True
+    if isinstance(obj, np.ndarray):
+        if obj.dtype == np.dtype(np.bool_):
+            return True
+        if obj.dtype == np.object_:
+            return any(_contains_bool_element(v) for v in obj.flat)
+        return False
+    if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray, memoryview)):
+        return any(_contains_bool_element(v) for v in obj)
+    return False
+
+
+def _coerce_real_numeric_array(arr: Any, *, name: str) -> np.ndarray:
+    """Convert numeric array-like to float64, rejecting booleans and non-real dtypes."""
+    if _contains_bool_element(arr):
+        raise ValueError(f"{name} must have real numeric dtype, not boolean")
+    raw = np.asarray(arr)
+    if raw.dtype == np.dtype(np.bool_) or raw.dtype.kind not in ("i", "u", "f"):
+        raise ValueError(f"{name} must have real numeric dtype, got {raw.dtype}")
+    return np.asarray(raw, dtype=np.float64)
+
+
 def _validate_ordinal_class_indices(y: Any, *, name: str) -> np.ndarray:
     """Validate 1D ordinal class labels strictly without lossy float/object truncation."""
+    if isinstance(y, (str, bytes, bytearray, Mapping, set, frozenset)):
+        raise ValueError(f"{name} must be a 1D array of integer class indices")
+    if not isinstance(y, np.ndarray) and _contains_bool_element(y):
+        raise ValueError(f"{name} must contain integer class indices, not booleans")
     raw = np.asarray(y)
-    if raw.ndim == 0 or (raw.ndim > 1 and raw.size != raw.shape[0]):
+    if raw.ndim != 1:
         raise ValueError(f"{name} must be a 1D array of integer class indices")
     if raw.dtype == np.dtype(np.object_):
         out_vals: List[int] = []
@@ -3204,10 +3232,7 @@ class CumulativeLogitOrdinalHead:
         return thetas, slopes
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "CumulativeLogitOrdinalHead":
-        X_raw = np.asarray(X)
-        if X_raw.dtype == np.dtype(np.bool_) or X_raw.dtype.kind not in ("i", "u", "f"):
-            raise ValueError(f"X must have real numeric dtype, got {X_raw.dtype}")
-        X_arr = np.asarray(X_raw, dtype=np.float64)
+        X_arr = _coerce_real_numeric_array(X, name="X")
         y_arr = _validate_ordinal_class_indices(y, name="y")
         if (
             X_arr.ndim != 2
@@ -3276,10 +3301,7 @@ class CumulativeLogitOrdinalHead:
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if self.weights_ is None or self.thresholds_ is None or self.n_classes is None:
             raise RuntimeError("CumulativeLogitOrdinalHead must be fit before calling predict_proba")
-        X_raw = np.asarray(X)
-        if X_raw.dtype == np.dtype(np.bool_) or X_raw.dtype.kind not in ("i", "u", "f"):
-            raise ValueError(f"X must have real numeric dtype, got {X_raw.dtype}")
-        X_arr = np.asarray(X_raw, dtype=np.float64)
+        X_arr = _coerce_real_numeric_array(X, name="X")
         single = X_arr.ndim == 1
         X2 = X_arr.reshape(1, -1) if single else X_arr
         w = np.asarray(self.weights_, dtype=np.float64)
@@ -3358,14 +3380,8 @@ class SoftOrdinalHead:
         return _softmax_np(logits, axis=1)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "SoftOrdinalHead":
-        X_raw = np.asarray(X)
-        if X_raw.dtype == np.dtype(np.bool_) or X_raw.dtype.kind not in ("i", "u", "f"):
-            raise ValueError(f"X must have real numeric dtype, got {X_raw.dtype}")
-        X_arr = np.asarray(X_raw, dtype=np.float64)
-        y_raw = np.asarray(y)
-        if y_raw.dtype == np.dtype(np.bool_) or y_raw.dtype.kind not in ("i", "u"):
-            raise ValueError(f"y must have integer dtype, got {y_raw.dtype}")
-        y_arr = np.asarray(y_raw, dtype=np.int64).ravel()
+        X_arr = _coerce_real_numeric_array(X, name="X")
+        y_arr = _validate_ordinal_class_indices(y, name="y")
         if (
             X_arr.ndim != 2
             or X_arr.shape[0] != y_arr.shape[0]
@@ -3408,10 +3424,7 @@ class SoftOrdinalHead:
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         if self.weights_ is None or self.bias_ is None:
             raise RuntimeError("SoftOrdinalHead must be fit before calling predict_proba")
-        X_raw = np.asarray(X)
-        if X_raw.dtype == np.dtype(np.bool_) or X_raw.dtype.kind not in ("i", "u", "f"):
-            raise ValueError(f"X must have real numeric dtype, got {X_raw.dtype}")
-        X_arr = np.asarray(X_raw, dtype=np.float64)
+        X_arr = _coerce_real_numeric_array(X, name="X")
         single = X_arr.ndim == 1
         X2 = X_arr.reshape(1, -1) if single else X_arr
         w = np.asarray(self.weights_, dtype=np.float64)
@@ -3449,11 +3462,9 @@ class SoftOrdinalHead:
 def _validate_ordinal_prob_matrix(
     probs: np.ndarray, *, name: str = "probs", allow_1d: bool = False
 ) -> np.ndarray:
-    raw = np.asarray(probs)
-    if raw.dtype == np.bool_ or (
-        raw.dtype == np.object_ and any(isinstance(v, (bool, np.bool_)) for v in raw.flat)
-    ):
+    if _contains_bool_element(probs):
         raise ValueError(f"{name} must be numeric, not boolean")
+    raw = np.asarray(probs)
     if np.issubdtype(raw.dtype, np.complexfloating) or np.issubdtype(raw.dtype, np.character):
         raise ValueError(f"{name} must contain real numeric probabilities")
     try:

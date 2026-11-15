@@ -279,6 +279,16 @@ def _normalize_unsafe_label_arg(
     return tuple(out)
 
 
+def _coerce_override_bool(val: Any) -> bool:
+    if isinstance(val, str):
+        low = val.strip().lower()
+        if low == "true":
+            return True
+        if low == "false":
+            return False
+    return bool(val)
+
+
 class GuardShield:
     """Canonicalizing prototype-similarity-gated sliding-window shield for System 1."""
 
@@ -494,7 +504,9 @@ class GuardShield:
             else None
         )
         self.projector = resolved.projector
-        self.recency_weighted = bool(getattr(resolved, "recency_weighted", False))
+        self.recency_weighted = bool(
+            getattr(model, "recency_weighted", getattr(resolved, "recency_weighted", False))
+        )
         self._zero_unit0 = _model_zero_unit0(resolved, self.projector)
         self._accepts_recency = _accepts_recency_weighted(getattr(self.projector, "project", None))
         self._pwn_accepts_recency = _accepts_recency_weighted(
@@ -503,6 +515,30 @@ class GuardShield:
         self._batch_accepts_recency = _accepts_recency_weighted(
             getattr(self.projector, "project_batch", None)
         )
+        self._is_zero_head = not (bool(np.any(self.raw_W)) or bool(np.any(self.raw_b)))
+        self._learned_overrides: Dict[str, Any] = {}
+        if hasattr(resolved, "_build_override_eval"):
+            default_ov_rec = bool(getattr(resolved, "recency_weighted", self.recency_weighted))
+            ov_sources = (resolved,) if model is resolved else (resolved, model)
+            for src_obj in ov_sources:
+                src_ov = getattr(src_obj, "_learned_prompt_overrides", None)
+                src_rec = getattr(src_obj, "_learned_prompt_override_recency", {})
+                if isinstance(src_ov, Mapping):
+                    for p_k, f_map in src_ov.items():
+                        if (
+                            isinstance(p_k, str)
+                            and p_k.strip()
+                            and isinstance(f_map, Mapping)
+                            and self.field_name in f_map
+                        ):
+                            norm_k = " ".join(p_k.strip().casefold().split())
+                            rec_flag = (
+                                src_rec.get(p_k, src_rec.get(norm_k, default_ov_rec))
+                                if isinstance(src_rec, Mapping)
+                                else default_ov_rec
+                            )
+                            if bool(rec_flag) == self.recency_weighted:
+                                self._learned_overrides[norm_k] = f_map[self.field_name]
 
         self.unsafe_bank: Optional[np.ndarray] = None
         if unsafe_exemplars:
@@ -526,6 +562,15 @@ class GuardShield:
             pwn_accepts_recency=self._pwn_accepts_recency,
         )
 
+    def _override_raw_logits_row(self, ov_val: Any) -> np.ndarray:
+        if self.is_boolean:
+            return np.array([12.0 if _coerce_override_bool(ov_val) else -12.0], dtype=np.float64)
+        z_ov = np.full(len(self.options), -12.0, dtype=np.float64)
+        lbl = str(ov_val)
+        if lbl in self.options:
+            z_ov[self.options.index(lbl)] = 12.0
+        return z_ov
+
     def _batch_eval_logits_and_emb(self, texts: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
         X = self._project_batch(texts)
         n_views = X.shape[0]
@@ -533,12 +578,32 @@ class GuardShield:
         cal_logits = np.full((n_views, k_out), np.nan, dtype=np.float64)
         if n_views == 0:
             return cal_logits, X
+
+        def _try_override_logits(row_idx: int) -> Optional[np.ndarray]:
+            if not self._learned_overrides or row_idx >= len(texts):
+                return None
+            raw_t = texts[row_idx]
+            norm_k = (
+                " ".join(raw_t.strip().casefold().split())
+                if isinstance(raw_t, str) and raw_t.strip()
+                else ""
+            )
+            if not norm_k or norm_k not in self._learned_overrides:
+                return None
+            if bool(np.any(X[row_idx])) and not self._is_zero_head:
+                return None
+            return self._override_raw_logits_row(self._learned_overrides[norm_k])
+
         with np.errstate(over="ignore", under="ignore", invalid="ignore"):
             x_fin = np.all(np.isfinite(X), axis=1)
             if self.is_hier:
                 assert self._raw_coarse_w is not None and self._raw_coarse_b is not None and self._cluster_assign is not None
                 raw_logits = np.full((n_views, k_out), np.nan, dtype=self._hier_dtype)
                 for r_i in np.flatnonzero(x_fin).tolist():
+                    ov_row = _try_override_logits(r_i)
+                    if ov_row is not None:
+                        raw_logits[r_i] = ov_row
+                        continue
                     x_row = X[r_i : r_i + 1]
                     x_in = x_row.astype(self.raw_W.dtype, copy=False)
                     base_ex = x_in @ self.raw_W.T + self.raw_b
@@ -558,6 +623,10 @@ class GuardShield:
             ):
                 raw_logits = np.full((n_views, k_out), np.nan, dtype=np.float64)
                 for r_i in np.flatnonzero(x_fin).tolist():
+                    ov_row = _try_override_logits(r_i)
+                    if ov_row is not None:
+                        raw_logits[r_i] = ov_row
+                        continue
                     raw_logits[r_i] = np.asarray(
                         self.head.compute_logits(X[r_i : r_i + 1], prompts=[str(texts[r_i])]),
                         dtype=np.float64,
@@ -570,6 +639,10 @@ class GuardShield:
                     dtype=np.result_type(self.raw_W.dtype, self.raw_b.dtype),
                 )
                 for r_i in np.flatnonzero(x_fin).tolist():
+                    ov_row = _try_override_logits(r_i)
+                    if ov_row is not None:
+                        raw_logits[r_i] = ov_row
+                        continue
                     x_in = X[r_i : r_i + 1].astype(self.raw_W.dtype, copy=False)
                     raw_logits[r_i] = (x_in @ self.raw_W.T + self.raw_b)[0]
 

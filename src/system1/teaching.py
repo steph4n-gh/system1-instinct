@@ -29,6 +29,7 @@ from system1.core.schema import (
     MultiChoiceField,
     ScoreField,
 )
+from system1.core.model import _accepts_recency_weighted
 from system1.core.text import MAX_FEATURES, MAX_TEXT_LENGTH, TfidfProjector
 from system1.engine import SystemOneEngine
 from system1.compat.typesafe import _binomial_lower_bound
@@ -505,15 +506,27 @@ class TeachingSession:
         reasons = []
         engine = self.engine
         proj = engine.model.projector
+        eff_rec = bool(getattr(engine, "recency_weighted", getattr(engine.model, "recency_weighted", False)))
         norm_key = " ".join(text.strip().casefold().split()) if isinstance(text, str) else ""
         has_override = (
             norm_key in getattr(engine.model, "_learned_prompt_overrides", {})
             or norm_key in getattr(engine, "_learned_prompt_overrides", {})
         )
-        if not has_override and not proj.project(text).any():
+        proj_fn = getattr(proj, "project", None)
+        proj_vec = (
+            proj_fn(text, recency_weighted=eff_rec)
+            if callable(proj_fn) and _accepts_recency_weighted(proj_fn)
+            else proj.project(text)
+        )
+        if not has_override and not proj_vec.any():
             reasons.append("unknown_vocabulary")
         if not has_override and hasattr(proj, "raw_norm"):
-            raw_n = float(proj.raw_norm(text))
+            rn_fn = getattr(proj, "raw_norm")
+            raw_n = float(
+                rn_fn(text, recency_weighted=eff_rec)
+                if _accepts_recency_weighted(rn_fn)
+                else rn_fn(text)
+            )
             for h in getattr(engine.model, "heads", {}).values():
                 fam_t = float(getattr(h, "familiarity_threshold", 0.0))
                 if fam_t > 0.0 and raw_n < fam_t - 1e-12:

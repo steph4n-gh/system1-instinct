@@ -1965,27 +1965,39 @@ class CompiledSystemOneModel:
         if format_version == 3:
             header_meta["embed_vocab"] = bool(embed_vocab)
 
+        def _is_f_2d_tensor(arr: np.ndarray) -> bool:
+            return bool(
+                isinstance(arr, np.ndarray)
+                and arr.ndim == 2
+                and arr.size > 0
+                and arr.flags["F_CONTIGUOUS"]
+                and not arr.flags["C_CONTIGUOUS"]
+            )
+
         def _pack_array(arr: np.ndarray) -> np.ndarray:
+            is_f_2d = _is_f_2d_tensor(arr)
             with np.errstate(over="ignore", invalid="ignore"):
-                a32 = np.asarray(arr, dtype=np.float32)
+                a32 = np.asarray(arr).astype(np.float32, order="K", copy=False)
             if not bool(np.all(np.isfinite(a32))):
                 raise ValueError("Compiled model array must be finite in float32")
             if a32.ndim == 2 and a32.size > 0:
                 if format_version == 3:
                     if compact is True:
                         with np.errstate(over="ignore", invalid="ignore"):
-                            a16 = a32.astype(np.float16)
+                            a16 = a32.astype(np.float16, order="K")
                         if np.all(np.isfinite(a16)):
-                            return np.ascontiguousarray(a16)
-                    return np.ascontiguousarray(a32)
+                            return np.asfortranarray(a16) if is_f_2d else np.ascontiguousarray(a16)
+                    return np.asfortranarray(a32) if is_f_2d else np.ascontiguousarray(a32)
                 with np.errstate(over="ignore", invalid="ignore"):
-                    a16 = a32.astype(np.float16)
+                    a16 = a32.astype(np.float16, order="K")
                 if np.all(np.isfinite(a16)) and (
                     compact is True
                     or (compact is None and np.array_equal(a32, a16.astype(np.float32)))
                 ):
-                    return a16
-            return np.ascontiguousarray(a32) if format_version == 3 else a32
+                    return np.asfortranarray(a16) if is_f_2d else a16
+            if format_version == 3:
+                return np.asfortranarray(a32) if is_f_2d else np.ascontiguousarray(a32)
+            return np.asfortranarray(a32) if is_f_2d else a32
 
         def _pack_f32_vec(arr: np.ndarray, label: str) -> np.ndarray:
             with np.errstate(over="ignore", invalid="ignore"):
@@ -2104,10 +2116,16 @@ class CompiledSystemOneModel:
 
         if format_version == 3:
             for tname, arr in list(arrays_to_save.items()):
-                arr_c = np.ascontiguousarray(arr)
-                if arr_c.dtype.name not in _ALLOWED_V3_DTYPES:
-                    arr_c = np.ascontiguousarray(arr_c, dtype=np.float32)
-                arrays_to_save[tname] = arr_c
+                is_f_2d = _is_f_2d_tensor(arr)
+                if arr.dtype.name not in _ALLOWED_V3_DTYPES:
+                    arr_norm = (
+                        np.asfortranarray(arr, dtype=np.float32)
+                        if is_f_2d
+                        else np.ascontiguousarray(arr, dtype=np.float32)
+                    )
+                else:
+                    arr_norm = np.asfortranarray(arr) if is_f_2d else np.ascontiguousarray(arr)
+                arrays_to_save[tname] = arr_norm
 
         return header_meta, arrays_to_save
 
@@ -2125,14 +2143,25 @@ class CompiledSystemOneModel:
             embed_vocab=embed_vocab,
         )
         arrays_ordered = sorted(arrays_to_save.items(), key=lambda kv: kv[0])
-        manifest: Dict[str, Dict[str, Any]] = {
-            tname: {
+
+        def _v3_manifest_entry(arr: np.ndarray, offset: int) -> Dict[str, Any]:
+            entry: Dict[str, Any] = {
                 "dtype": arr.dtype.name,
                 "shape": [int(d) for d in arr.shape],
-                "offset": 0,
+                "offset": int(offset),
                 "nbytes": int(arr.nbytes),
             }
-            for tname, arr in arrays_ordered
+            if (
+                arr.ndim == 2
+                and arr.size > 0
+                and arr.flags["F_CONTIGUOUS"]
+                and not arr.flags["C_CONTIGUOUS"]
+            ):
+                entry["order"] = "F"
+            return entry
+
+        manifest: Dict[str, Dict[str, Any]] = {
+            tname: _v3_manifest_entry(arr, 0) for tname, arr in arrays_ordered
         }
         header_meta["tensors"] = manifest
         header_bytes = json.dumps(header_meta, sort_keys=True, allow_nan=False).encode("utf-8")
@@ -2152,12 +2181,7 @@ class CompiledSystemOneModel:
                     else 64
                 )
                 cursor = ((cursor + align - 1) // align) * align
-                next_manifest[tname] = {
-                    "dtype": arr.dtype.name,
-                    "shape": [int(d) for d in arr.shape],
-                    "offset": int(cursor),
-                    "nbytes": int(arr.nbytes),
-                }
+                next_manifest[tname] = _v3_manifest_entry(arr, cursor)
                 cursor += int(arr.nbytes)
             header_meta["tensors"] = next_manifest
             next_header_bytes = json.dumps(header_meta, sort_keys=True, allow_nan=False).encode("utf-8")
@@ -2198,7 +2222,10 @@ class CompiledSystemOneModel:
             nbytes = int(spec["nbytes"])
             if nbytes > 0:
                 offset = int(spec["offset"])
-                out[offset : offset + nbytes] = np.ascontiguousarray(arr).tobytes()
+                if spec.get("order") == "F":
+                    out[offset : offset + nbytes] = arr.tobytes(order="F")
+                else:
+                    out[offset : offset + nbytes] = np.ascontiguousarray(arr).tobytes()
         return bytes(out)
 
     def to_bytes(
@@ -2275,7 +2302,7 @@ class CompiledSystemOneModel:
         if arr.dtype == target:
             return arr
         with np.errstate(over="ignore", invalid="ignore"):
-            out = np.asarray(arr, dtype=target)
+            out = np.asarray(arr).astype(target, order="K", copy=False)
         out.setflags(write=False)
         return out
 
@@ -3340,6 +3367,11 @@ class CompiledSystemOneModel:
                 or any(type(d) is not int or d < 0 or d > max_dim_bound for d in shape)
             ):
                 raise ValueError(f"Saved v3 skill tensor {tname!r} has invalid shape {shape!r}")
+            raw_order = spec.get("order", "C")
+            if type(raw_order) is not str or raw_order not in ("C", "F"):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} has unsupported order {raw_order!r}")
+            if raw_order == "F" and len(shape) != 2:
+                raise ValueError(f"Saved v3 skill tensor {tname!r} order 'F' requires a 2D shape, got {shape!r}")
             count = 1
             for d in shape:
                 count *= d
@@ -3424,9 +3456,12 @@ class CompiledSystemOneModel:
             for tname, spec in raw_tensors.items():
                 shape = tuple(spec["shape"])
                 dt = np.dtype(spec["dtype"])
+                order_flag = spec.get("order", "C")
                 count = int(math.prod(shape)) if shape else 1
                 if count == 0:
-                    arr = np.empty(shape, dtype=dt)
+                    arr = np.empty(shape, dtype=dt, order=order_flag)
+                elif order_flag == "F":
+                    arr = np.ndarray(shape, dtype=dt, buffer=buf, offset=spec["offset"], order="F")
                 else:
                     arr = np.frombuffer(buf, dtype=dt, count=count, offset=spec["offset"]).reshape(shape)
                 arr.setflags(write=False)

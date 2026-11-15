@@ -46,6 +46,27 @@ _GATEWAY_POST_ROUTES = frozenset(
 )
 
 
+def _is_json_media_type(ctype: str) -> bool:
+    """Return True iff Content-Type parses as application/json without invalid parameters."""
+    if not isinstance(ctype, str) or not ctype.strip() or "," in ctype:
+        return False
+    parts = ctype.split(";")
+    if parts[0].strip().lower() != "application/json":
+        return False
+    for raw_param in parts[1:]:
+        param = raw_param.strip()
+        if not param or "=" not in param:
+            return False
+        p_name, p_val = param.split("=", 1)
+        p_key = p_name.strip().lower()
+        p_clean = p_val.strip().strip('"')
+        if not p_key or not p_clean or not all(ch.isalnum() or ch in "-_." for ch in p_key):
+            return False
+        if p_key == "charset" and p_clean.lower() not in ("utf-8", "utf8"):
+            return False
+    return True
+
+
 class InteropError(ValueError):
     """Base error for Universal Decision Gateway validation and HTTP protocol failures."""
 
@@ -285,21 +306,27 @@ def extract_semantic_text(payload: Mapping[str, Any]) -> Tuple[str, Any]:
             return
         if isinstance(node, list):
             for item in node:
-                if isinstance(item, Mapping):
-                    if "text" in item and isinstance(item["text"], str):
-                        _collect(item["text"], prefix, depth + 1)
-                    elif "parts" in item and isinstance(item["parts"], list):
-                        _collect(item["parts"], prefix, depth + 1)
-                    elif item.get("type") == "input_text" and isinstance(item.get("text"), str):
-                        _collect(item["text"], prefix, depth + 1)
-                    else:
-                        _collect(item, prefix, depth + 1)
-                else:
-                    _collect(item, prefix, depth + 1)
+                _collect(item, prefix, depth + 1)
             return
         if isinstance(node, Mapping):
-            if "text" in node and isinstance(node["text"], str) and set(node.keys()) <= {"type", "text"}:
+            if (
+                "text" in node
+                and isinstance(node["text"], str)
+                and (
+                    set(node.keys()) == {"text"}
+                    or (
+                        set(node.keys()) == {"type", "text"}
+                        and node.get("type") in ("text", "input_text", "output_text")
+                    )
+                )
+            ):
                 _collect(node["text"], prefix, depth + 1)
+                return
+            if (
+                set(node.keys()) == {"parts"}
+                and isinstance(node.get("parts"), list)
+            ):
+                _collect(node["parts"], prefix, depth + 1)
                 return
             for k in sorted(node.keys(), key=lambda x: str(x)):
                 sub_prefix = f"{prefix}.{k}" if prefix else str(k)
@@ -1644,7 +1671,7 @@ class UniversalDecisionService:
         lower_h = {str(k).lower(): str(v) for k, v in headers.items()}
         self.check_headers(lower_h)
         ctype = lower_h.get("content-type", "")
-        if "application/json" not in ctype.lower():
+        if not _is_json_media_type(ctype):
             raise UnsupportedMediaError(f"Expected Content-Type: application/json, got {ctype!r}")
 
         payload = strict_json_loads(raw_body)

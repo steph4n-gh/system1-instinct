@@ -372,6 +372,9 @@ class MultiTenantSkillFleet:
         self._pwn_accepts_recency = _accepts_recency_weighted(
             getattr(self.projector, "project_with_norm", None)
         )
+        self._raw_norm_accepts_recency = _accepts_recency_weighted(
+            getattr(self.projector, "raw_norm", None)
+        )
         self._batch_accepts_recency = _accepts_recency_weighted(
             getattr(self.projector, "project_batch", None)
         )
@@ -588,7 +591,11 @@ class MultiTenantSkillFleet:
                 raw_norm_fn = getattr(self.projector, "raw_norm", None)
                 if callable(raw_norm_fn):
                     try:
-                        rn_val = raw_norm_fn(text)
+                        rn_val = (
+                            raw_norm_fn(text, recency_weighted=bool(self.recency_weighted))
+                            if self._raw_norm_accepts_recency
+                            else raw_norm_fn(text)
+                        )
                         if rn_val is not None and not isinstance(rn_val, (bool, np.bool_)):
                             raw_norm = float(rn_val)
                     except Exception:
@@ -1038,7 +1045,9 @@ class MultiTenantSkillFleet:
             token_cache_limit=token_cache_limit,
             is_boolean=is_bool_head,
             bool_threshold=bool_threshold,
-            recency_weighted=bool(getattr(resolved, "recency_weighted", False)),
+            recency_weighted=bool(
+                getattr(model, "recency_weighted", getattr(resolved, "recency_weighted", False))
+            ),
             zero_unit0=_model_zero_unit0(resolved, resolved.projector),
             score_method=score_method,
             familiarity_threshold=familiarity_threshold,
