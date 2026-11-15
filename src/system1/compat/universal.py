@@ -144,7 +144,7 @@ def parse_finite_float(value: Any, *, field_name: str = "value") -> float:
         raise InteropError(f"Invalid float value {value!r} for {field_name}", status_code=422) from exc
     if not math.isfinite(num):
         raise InteropError(f"Non-finite float {value!r} for {field_name}", status_code=422)
-    return num
+    return 0.0 if num == 0.0 else num
 
 
 def coerce_probability_dict(raw_probs: Mapping[Any, Any], keys: Sequence[str]) -> Dict[str, float]:
@@ -532,15 +532,15 @@ def diff_schemas(prev: CompiledContractSchema, curr: CompiledContractSchema) -> 
                 "added_options": sorted(set(cc.options) - set(pc.options)),
                 "removed_options": sorted(set(pc.options) - set(cc.options)),
             }
-        elif pc.q_type in ("noul", "multichoice") and abs(float(pc.threshold) - float(cc.threshold)) > 1e-12:
+        elif pc.q_type in ("noul", "multichoice") and float(pc.threshold) != float(cc.threshold):
             changed[qname] = {
                 "reason": "threshold_changed",
                 "from": pc.threshold,
                 "to": cc.threshold,
             }
         elif pc.q_type == "score" and not pc_is_ord and (
-            abs(float(pc.min_value) - float(cc.min_value)) > 1e-12
-            or abs(float(pc.max_value) - float(cc.max_value)) > 1e-12
+            float(pc.min_value) != float(cc.min_value)
+            or float(pc.max_value) != float(cc.max_value)
         ):
             changed[qname] = {
                 "reason": "bounds_changed",

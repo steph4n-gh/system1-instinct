@@ -52,7 +52,12 @@ from system1.core import (
     ScoreField,
     SystemOneModel,
 )
-from system1.core.model import FastDecisionCallable, PackedMultiQuestionKernel, _stable_sigmoid
+from system1.core.model import (
+    FastDecisionCallable,
+    PackedMultiQuestionKernel,
+    _has_custom_validate_decision,
+    _stable_sigmoid,
+)
 from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
 from system1.core.telemetry import TelemetryProjector
 from system1.ledger import ActionLedger, LedgerWriteError
@@ -3457,6 +3462,16 @@ class SystemOneEngine:
                 for pk, f_map in sorted(ov_map.items())
             )
 
+        eng_schema = self.schema
+        model_schema = getattr(getattr(self, "model", None), "schema", None)
+        validate_sig = (
+            getattr(type(eng_schema), "validate_decision", None),
+            getattr(eng_schema, "__dict__", {}).get("validate_decision"),
+            None if model_schema is None else getattr(type(model_schema), "validate_decision", None),
+            None
+            if model_schema is None
+            else getattr(model_schema, "__dict__", {}).get("validate_decision"),
+        )
         return (
             str(storage_mode),
             int(getattr(self, "model_version", 1)),
@@ -3470,7 +3485,7 @@ class SystemOneEngine:
             bool(getattr(self, "recency_weighted", False)),
             bool(getattr(self, "selective_calibrators", None)),
             getattr(self, "joint_calibrator", None) is not None,
-            "validate_decision" in getattr(self.schema, "__dict__", {}),
+            validate_sig,
             aci_sig,
             (_ov_snapshot(self), _ov_snapshot(getattr(self, "model", None))),
             thresh_sig,
@@ -3482,11 +3497,49 @@ class SystemOneEngine:
     def compile_packed_kernel(self, *, storage_mode: str = "float32") -> PackedMultiQuestionKernel:
         """Compiles and caches a fused multi-question inference kernel for this engine."""
         with self._lock:
+            model = getattr(self, "model", None)
+            if _has_custom_validate_decision(self.schema) or _has_custom_validate_decision(
+                getattr(model, "schema", None)
+            ):
+                raise ValueError(
+                    "PackedMultiQuestionKernel does not support custom DecisionSchema.validate_decision"
+                )
+            if getattr(self, "selective_calibrators", None):
+                raise ValueError(
+                    "PackedMultiQuestionKernel does not support engines with active selective_calibrators"
+                )
+            if getattr(self, "joint_calibrator", None) is not None:
+                raise ValueError(
+                    "PackedMultiQuestionKernel does not support engines with active joint_calibrator"
+                )
+            aci_tracker = getattr(self, "aci_tracker", None)
+            if aci_tracker is not None and getattr(aci_tracker, "margin_floor", None) is not None:
+                raise ValueError(
+                    "PackedMultiQuestionKernel does not support engines with active aci_tracker margin_floor"
+                )
             cache_key = self._packed_kernel_cache_key(storage_mode)
+            key_aci_sig = cache_key[13] if isinstance(cache_key, tuple) and len(cache_key) > 13 else None
+            if key_aci_sig is not None and key_aci_sig[1] is not None:
+                raise ValueError(
+                    "PackedMultiQuestionKernel does not support engines with active aci_tracker margin_floor"
+                )
+            captured_alpha = float(key_aci_sig[0]) if key_aci_sig is not None else None
             cached = getattr(self, "_packed_kernel_cache", None)
-            if cached is not None and cached[0] == cache_key:
+            if (
+                cached is not None
+                and cached[0] == cache_key
+                and (captured_alpha is None or cached[1].alpha == captured_alpha)
+            ):
                 return cached[1]
-            kernel = PackedMultiQuestionKernel.from_engine(self, storage_mode=storage_mode)
+            kernel = PackedMultiQuestionKernel.from_engine(
+                self,
+                storage_mode=storage_mode,
+                alpha=captured_alpha,
+            )
+            if captured_alpha is not None and kernel.alpha != captured_alpha:
+                raise ValueError(
+                    f"PackedMultiQuestionKernel alpha mismatch: expected {captured_alpha}, got {kernel.alpha}"
+                )
             self._packed_kernel_cache = (cache_key, kernel)
             return kernel
 
@@ -3512,6 +3565,17 @@ class SystemOneEngine:
         if self.auto_reload and self.model_path is not None:
             self.reload_if_changed()
         with self._lock:
+            model = getattr(self, "model", None)
+            if _has_custom_validate_decision(self.schema) or _has_custom_validate_decision(
+                getattr(model, "schema", None)
+            ):
+                raise ValueError(
+                    "FastExplainer does not support custom DecisionSchema.validate_decision"
+                )
+            if getattr(self, "joint_calibrator", None) is not None:
+                raise ValueError(
+                    "FastExplainer does not support engines with active joint_calibrator"
+                )
             if train_texts is None and train_labels is None:
                 cache_key = self._packed_kernel_cache_key("float32")
                 cached = self._explainer_cache.get(resolved_field)

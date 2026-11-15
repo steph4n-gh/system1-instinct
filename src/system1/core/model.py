@@ -536,6 +536,22 @@ stable_softmax = _stable_softmax
 stable_sigmoid = _stable_sigmoid
 
 
+def _has_custom_validate_decision(schema: Any) -> bool:
+    """Return True if a schema instance or subclass overrides DecisionSchema.validate_decision."""
+    if schema is None:
+        return False
+    schema_cls = schema if isinstance(schema, type) else type(schema)
+    if not isinstance(schema, type) and "validate_decision" in getattr(schema, "__dict__", {}):
+        return True
+    if (
+        isinstance(schema_cls, type)
+        and issubclass(schema_cls, DecisionSchema)
+        and schema_cls.validate_decision is not DecisionSchema.validate_decision
+    ):
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class RawFieldEvaluation:
     """Intermediate raw evaluation for a single decision field before calibration."""
@@ -857,16 +873,22 @@ class DecisionFieldHead:
         clear_exemplar_bank: bool = True,
     ) -> None:
         """Updates head weights and biases, synchronizing MLX buffers if active."""
+        with np.errstate(over="ignore", invalid="ignore"):
+            w_f32 = np.asarray(weights, dtype=np.float32)
+            b_f32 = (
+                np.asarray(biases, dtype=np.float32)
+                if biases is not None
+                else np.zeros(w_f32.shape[0], dtype=np.float32)
+            )
+        if not bool(np.all(np.isfinite(w_f32))) or not bool(np.all(np.isfinite(b_f32))):
+            raise ValueError("Head weights and biases must be finite in float32")
         if clear_exemplar_bank:
             self._exemplar_bank = None
             self._exemplar_mean = None
             self._online_shots_p = None
             self._online_shots_c = None
-        self.weights = np.asarray(weights, dtype=np.float32)
-        if biases is not None:
-            self.biases = np.asarray(biases, dtype=np.float32)
-        else:
-            self.biases = np.zeros(self.weights.shape[0], dtype=np.float32)
+        self.weights = w_f32
+        self.biases = b_f32
         if self.backend == "mlx" and HAS_MLX and mx is not None:
             self.mx_weights = mx.array(self.weights)
             self.mx_biases = mx.array(self.biases)
@@ -881,8 +903,18 @@ class DecisionFieldHead:
         fine_biases: Optional[np.ndarray] = None,
     ) -> None:
         """Configures two-stage coarse-to-fine hierarchical routing parameters."""
-        cw = np.asarray(coarse_weights, dtype=np.float32)
-        cb = np.asarray(coarse_biases, dtype=np.float32).flatten()
+        with np.errstate(over="ignore", invalid="ignore"):
+            cw = np.asarray(coarse_weights, dtype=np.float32)
+            cb = np.asarray(coarse_biases, dtype=np.float32).flatten()
+            fw = np.asarray(fine_weights, dtype=np.float32) if fine_weights is not None else None
+            fb = np.asarray(fine_biases, dtype=np.float32).flatten() if fine_biases is not None else None
+        if (
+            not bool(np.all(np.isfinite(cw)))
+            or not bool(np.all(np.isfinite(cb)))
+            or (fw is not None and not bool(np.all(np.isfinite(fw))))
+            or (fb is not None and not bool(np.all(np.isfinite(fb))))
+        ):
+            raise ValueError("Hierarchical weights and biases must be finite in float32")
         assign = tuple(int(c) for c in cluster_assignments)
         if cw.ndim != 2 or cb.shape[0] != cw.shape[0]:
             raise ValueError("coarse_weights and coarse_biases shape mismatch")
@@ -892,12 +924,8 @@ class DecisionFieldHead:
         self.cluster_assignments = assign
         self.coarse_weights = cw
         self.coarse_biases = cb
-        self.fine_weights = (
-            np.asarray(fine_weights, dtype=np.float32) if fine_weights is not None else None
-        )
-        self.fine_biases = (
-            np.asarray(fine_biases, dtype=np.float32).flatten() if fine_biases is not None else None
-        )
+        self.fine_weights = fw
+        self.fine_biases = fb
 
     def init_covariance(
         self,
@@ -2544,17 +2572,10 @@ class PackedMultiQuestionKernel:
         fields = eng.schema.fields
         if not fields:
             raise ValueError("PackedMultiQuestionKernel requires a non-empty schema")
-        schema_obj = eng.schema
-        schema_cls = schema_obj if isinstance(schema_obj, type) else type(schema_obj)
-        has_instance_vd = not isinstance(schema_obj, type) and "validate_decision" in getattr(
-            schema_obj, "__dict__", {}
-        )
-        has_override_vd = (
-            isinstance(schema_cls, type)
-            and issubclass(schema_cls, DecisionSchema)
-            and schema_cls.validate_decision is not DecisionSchema.validate_decision
-        )
-        if has_instance_vd or has_override_vd:
+        model = eng.model
+        if _has_custom_validate_decision(eng.schema) or _has_custom_validate_decision(
+            getattr(model, "schema", None)
+        ):
             raise ValueError(
                 "PackedMultiQuestionKernel does not support custom DecisionSchema.validate_decision"
             )
@@ -2565,7 +2586,6 @@ class PackedMultiQuestionKernel:
         aci_tracker = getattr(eng, "aci_tracker", None)
         if aci_tracker is not None and getattr(aci_tracker, "margin_floor", None) is not None:
             raise ValueError("PackedMultiQuestionKernel does not support engines with active aci_tracker margin_floor")
-        model = eng.model
         heads = model.heads
         field_heads = getattr(model, "_field_heads", {})
         raw_alpha = (
@@ -3029,7 +3049,7 @@ class PackedMultiQuestionKernel:
             c_ambig = np.empty((B, 0), dtype=bool)
 
         if self.Q_b > 0:
-            p_true = 1.0 / (1.0 + np.exp(-np.clip(zb, -50.0, 50.0)))
+            p_true = _stable_sigmoid(zb)
             p_false = 1.0 - p_true
             b_val = p_true >= self.b_thresh[None, :]
             b_conf = np.where(b_val, p_true, p_false)
@@ -3084,9 +3104,9 @@ class PackedMultiQuestionKernel:
             in_b = np.empty((B, 0), dtype=np.int32)
 
         if self.Q_s > 0:
-            p_s = 1.0 / (1.0 + np.exp(-np.clip(zs, -50.0, 50.0)))
+            p_s = _stable_sigmoid(zs)
             s_val = self.s_min[None, :] + self.s_range[None, :] * p_s
-            p_s_raw = 1.0 / (1.0 + np.exp(-np.clip(zs * self.s_raw_scale[None, :], -50.0, 50.0)))
+            p_s_raw = _stable_sigmoid(zs * self.s_raw_scale[None, :])
             s_conf = np.maximum(p_s_raw, 1.0 - p_s_raw)
             if self.strict:
                 s_ambig = np.broadcast_to(
@@ -3284,7 +3304,9 @@ class FastDecisionCallable:
     def __init__(self, eng: Any, *, storage_mode: str = "float32") -> None:
         self._storage_mode = storage_mode
         self._aci_tracker = getattr(eng, "aci_tracker", None)
-        self._eng_ref = eng if self._aci_tracker is not None else None
+        self._eng_ref = eng
+        self._schema_ref = getattr(eng, "schema", None)
+        self._model_schema_ref = getattr(getattr(eng, "model", None), "schema", None)
         self._rebind_lock = threading.Lock()
         if hasattr(eng, "compile_packed_kernel"):
             kernel = eng.compile_packed_kernel(storage_mode=storage_mode)
@@ -3356,26 +3378,48 @@ class FastDecisionCallable:
     def __call__(
         self, prompt: Optional[str] = None, *, embedding: Optional[np.ndarray] = None
     ) -> FastDecisionOutput:
+        if _has_custom_validate_decision(self._schema_ref) or _has_custom_validate_decision(
+            self._model_schema_ref
+        ):
+            raise ValueError(
+                "PackedMultiQuestionKernel does not support custom DecisionSchema.validate_decision"
+            )
+        eng_ref = self._eng_ref
+        if getattr(eng_ref, "selective_calibrators", None):
+            raise ValueError(
+                "PackedMultiQuestionKernel does not support engines with active selective_calibrators"
+            )
+        if getattr(eng_ref, "joint_calibrator", None) is not None:
+            raise ValueError(
+                "PackedMultiQuestionKernel does not support engines with active joint_calibrator"
+            )
         st = self._state
-        tracker = self._aci_tracker
+        tracker = getattr(eng_ref, "aci_tracker", None) if eng_ref is not None else self._aci_tracker
         if tracker is not None and (
             getattr(tracker, "margin_floor", None) is not None
             or float(tracker.alpha_t) != st.alpha
         ):
             with self._rebind_lock:
                 st = self._state
-                if (
+                tracker = (
+                    getattr(eng_ref, "aci_tracker", None)
+                    if eng_ref is not None
+                    else self._aci_tracker
+                )
+                if tracker is not None and (
                     getattr(tracker, "margin_floor", None) is not None
                     or float(tracker.alpha_t) != st.alpha
                 ):
-                    assert self._eng_ref is not None
-                    if hasattr(self._eng_ref, "compile_packed_kernel"):
-                        new_kernel = self._eng_ref.compile_packed_kernel(
+                    assert eng_ref is not None
+                    if hasattr(eng_ref, "compile_packed_kernel"):
+                        new_kernel = eng_ref.compile_packed_kernel(
                             storage_mode=self._storage_mode
                         )
                     else:
                         new_kernel = PackedMultiQuestionKernel.from_engine(
-                            self._eng_ref, storage_mode=self._storage_mode
+                            eng_ref,
+                            storage_mode=self._storage_mode,
+                            alpha=float(tracker.alpha_t),
                         )
                     st = self._build_state(new_kernel, storage_mode=self._storage_mode)
                     self._state = st
@@ -3513,11 +3557,11 @@ class FastDecisionCallable:
         for bi in range(st.Q_b):
             fn = st.b_names[bi]
             zv = z_list[st.b_offset + bi]
-            if zv > 50.0:
-                zv = 50.0
-            elif zv < -50.0:
-                zv = -50.0
-            pt = 1.0 / (1.0 + exp(-zv))
+            if zv >= 0.0:
+                pt = 1.0 / (1.0 + exp(-zv))
+            else:
+                ez = exp(zv)
+                pt = ez / (1.0 + ez)
             pf = 1.0 - pt
             bv = pt >= st.b_thresh[bi]
             vals[fn] = bv
@@ -3567,12 +3611,18 @@ class FastDecisionCallable:
         for si in range(st.Q_s):
             fn = st.s_names[si]
             zv = z_list[st.s_offset + si]
-            zv_c = 50.0 if zv > 50.0 else (-50.0 if zv < -50.0 else zv)
-            ps = 1.0 / (1.0 + exp(-zv_c))
+            if zv >= 0.0:
+                ps = 1.0 / (1.0 + exp(-zv))
+            else:
+                ez = exp(zv)
+                ps = ez / (1.0 + ez)
             vals[fn] = st.s_min[si] + st.s_range[si] * ps
             z_raw = zv * st.s_raw_scale[si]
-            z_rc = 50.0 if z_raw > 50.0 else (-50.0 if z_raw < -50.0 else z_raw)
-            ps_raw = 1.0 / (1.0 + exp(-z_rc))
+            if z_raw >= 0.0:
+                ps_raw = 1.0 / (1.0 + exp(-z_raw))
+            else:
+                ez_raw = exp(z_raw)
+                ps_raw = ez_raw / (1.0 + ez_raw)
             confs[fn] = ps_raw if ps_raw >= 0.5 else (1.0 - ps_raw)
             if (
                 strict

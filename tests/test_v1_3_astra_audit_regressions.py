@@ -6,8 +6,10 @@ import asyncio
 import copy
 import io
 import json
+import math
 import struct
 import threading
+import types
 import warnings
 import zipfile
 from typing import Any, Callable, Dict, List
@@ -263,6 +265,75 @@ def test_astra_02_fleet_delta_preflight_blocks_header_and_metadata_bombs() -> No
             projector=proj,
         )
 
+    # F7: large base/covariance arrays (> 65500) round-trip in float32 without float16 overflow,
+    # q_init retains float32 precision, and __init__ validates base arrays, lam_rls, and alpha.
+    big_w = np.full((2, 32), 1e5, dtype=np.float32)
+    big_b = np.array([1e5, -1e5], dtype=np.float32)
+    q_precise = np.array([1e-4, 0.5], dtype=np.float32)
+    fleet_hi = MultiTenantSkillFleet(
+        proj,
+        classes=("a", "b"),
+        W_base=big_w,
+        b_base=big_b,
+        num_tenants=1,
+        r_sub=16,
+        lam_rls=1e-6,
+        alpha=0.10,
+        q_init=q_precise,
+    )
+    snap_hi = fleet_hi.fleet_delta_to_bytes()
+    restored_hi = MultiTenantSkillFleet.fleet_delta_from_bytes(snap_hi, projector=proj)
+    np.testing.assert_allclose(restored_hi.W_base, big_w, rtol=1e-6, atol=0.0)
+    np.testing.assert_allclose(restored_hi.b_base, big_b, rtol=1e-6, atol=0.0)
+    assert np.all(np.isfinite(restored_hi.P_blk))
+    assert float(np.max(restored_hi.P_blk)) >= 9.9e5
+    assert float(restored_hi.q_init[0]) == pytest.approx(1e-4, rel=1e-6, abs=1e-7)
+
+    with pytest.raises(ValueError, match="finite"):
+        MultiTenantSkillFleet(
+            proj,
+            classes=("a", "b"),
+            W_base=np.full((2, 32), float("nan"), dtype=np.float32),
+            b_base=np.zeros(2, dtype=np.float32),
+        )
+    for bad_lam in (float("nan"), 1e-40, 1e15, True):
+        with pytest.raises(ValueError, match="lam_rls"):
+            MultiTenantSkillFleet(
+                proj,
+                classes=("a", "b"),
+                W_base=np.zeros((2, 32), dtype=np.float32),
+                b_base=np.zeros(2, dtype=np.float32),
+                lam_rls=bad_lam,  # type: ignore[arg-type]
+            )
+    for bad_alpha in (float("nan"), 0.0, 1.0, 1.2, False):
+        with pytest.raises(ValueError, match="alpha"):
+            MultiTenantSkillFleet(
+                proj,
+                classes=("a", "b"),
+                W_base=np.zeros((2, 32), dtype=np.float32),
+                b_base=np.zeros(2, dtype=np.float32),
+                alpha=bad_alpha,  # type: ignore[arg-type]
+            )
+
+    # F8: bounded memoryview/bytearray handling rejects oversized non-1D views without copying.
+    oversized_mv = memoryview(np.broadcast_to(np.uint8(0), (70_000_000,)))
+    assert oversized_mv.nbytes == 70_000_000
+    with pytest.raises(ValueError, match="exceeds"):
+        MultiTenantSkillFleet._preflight_snapshot_bytes(
+            oversized_mv, projector=proj, max_runtime_bytes=64 * 1024 * 1024  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="exceeds"):
+        MultiTenantSkillFleet.fleet_delta_from_bytes(oversized_mv, projector=proj)  # type: ignore[arg-type]
+
+    ba_snap = bytearray(snap_hi)
+    restored_from_ba = MultiTenantSkillFleet.fleet_delta_from_bytes(memoryview(ba_snap), projector=proj)
+    assert restored_from_ba.num_tenants == 1
+    restored_from_2d = MultiTenantSkillFleet.fleet_delta_from_bytes(
+        memoryview(np.frombuffer(snap_hi, dtype=np.uint8).reshape(1, len(snap_hi))),
+        projector=proj,
+    )
+    np.testing.assert_allclose(restored_from_2d.W_base, big_w, rtol=1e-6, atol=0.0)
+
 
 def test_astra_03_fleet_concurrent_decide_live_and_adapt_isolation() -> None:
     """Finding #3: MultiTenantSkillFleet isolates tenant snapshots and locks under concurrent access."""
@@ -352,6 +423,155 @@ def test_astra_04_s1m_v3_preflight_validates_shapes_and_python_tuple_budget(
     )
     with pytest.raises(ValueError, match="incompatible weight dimensions"):
         CompiledSystemOneModel.from_bytes(tampered)
+
+    def _rewrite_v3_aligned(
+        src_bytes: bytes,
+        mutator: Callable[[Dict[str, Any], bytearray], None],
+    ) -> bytes:
+        old_hdr_len = struct.unpack_from("<Q", src_bytes, 8)[0]
+        meta_obj = json.loads(src_bytes[16 : 16 + old_hdr_len].decode("utf-8"))
+        payload = bytearray(src_bytes[16 + old_hdr_len :])
+        mutator(meta_obj, payload)
+        enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(enc) <= old_hdr_len:
+            new_hdr_len = old_hdr_len
+            delta = 0
+        else:
+            extra_pages = (len(enc) - old_hdr_len + 4095) // 4096
+            new_hdr_len = old_hdr_len + extra_pages * 4096
+            delta = new_hdr_len - old_hdr_len
+            for spec in meta_obj["tensors"].values():
+                spec["offset"] += delta
+            enc = json.dumps(meta_obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            assert len(enc) <= new_hdr_len
+        hdr_padded = enc + b" " * (new_hdr_len - len(enc))
+        return b"S1M\x03\x00\x00\x00\x00" + struct.pack("<Q", new_hdr_len) + hdr_padded + bytes(payload)
+
+    def _append_tensor_payload(
+        src_bytes: bytes,
+        meta_obj: Dict[str, Any],
+        payload: bytearray,
+        tname: str,
+        arr: np.ndarray,
+    ) -> None:
+        base_off = 16 + struct.unpack_from("<Q", src_bytes, 8)[0]
+        raw = np.ascontiguousarray(arr).tobytes()
+        align = 4096 if (len(raw) >= 65536 or tname == "_projector_dense_table") else 64
+        pad = (-(base_off + len(payload))) % align
+        if pad:
+            payload.extend(b"\x00" * pad)
+        new_abs = base_off + len(payload)
+        payload.extend(raw)
+        spec = meta_obj["tensors"][tname]
+        spec["offset"] = int(new_abs)
+        spec["dtype"] = arr.dtype.name
+        spec["nbytes"] = len(raw)
+
+    # F4: float16 weight tensors upcast to float32 cleanly without overflow warnings; non-finite rejected.
+    def _to_f16_valid(meta_obj: Dict[str, Any], payload: bytearray) -> None:
+        shape = tuple(meta_obj["tensors"]["q_a_w"]["shape"])
+        _append_tensor_payload(v3_bytes, meta_obj, payload, "q_a_w", np.full(shape, 65504.0, dtype=np.float16))
+
+    v3_f16_valid = _rewrite_v3_aligned(v3_bytes, _to_f16_valid)
+    with warnings.catch_warnings(record=True) as caught_f16:
+        warnings.simplefilter("always", RuntimeWarning)
+        loaded_f16 = CompiledSystemOneModel.from_bytes(v3_f16_valid)
+        assert not any("overflow" in str(w.message).lower() for w in caught_f16)
+    assert loaded_f16.heads["q_a"].weights.dtype == np.dtype(np.float32)
+    assert float(loaded_f16.heads["q_a"].weights[0, 0]) == 65504.0
+
+    def _to_f64_overflow(meta_obj: Dict[str, Any], payload: bytearray) -> None:
+        shape = tuple(meta_obj["tensors"]["q_a_w"]["shape"])
+        _append_tensor_payload(v3_bytes, meta_obj, payload, "q_a_w", np.full(shape, 1e40, dtype=np.float64))
+
+    v3_f64_overflow = _rewrite_v3_aligned(v3_bytes, _to_f64_overflow)
+    with warnings.catch_warnings(record=True) as caught_f64:
+        warnings.simplefilter("always", RuntimeWarning)
+        with pytest.raises(ValueError, match="non-finite"):
+            CompiledSystemOneModel.from_bytes(v3_f64_overflow)
+        assert not any("overflow" in str(w.message).lower() for w in caught_f64)
+
+    def _to_f64_valid(meta_obj: Dict[str, Any], payload: bytearray) -> None:
+        shape = tuple(meta_obj["tensors"]["q_a_w"]["shape"])
+        _append_tensor_payload(v3_bytes, meta_obj, payload, "q_a_w", np.ones(shape, dtype=np.float64))
+
+    v3_f64_valid = _rewrite_v3_aligned(v3_bytes, _to_f64_valid)
+    captured_budget: List[int] = []
+    orig_vpb = CompiledSystemOneModel._validate_projector_and_budget
+    with monkeypatch.context() as mp:
+        def _capture_vpb(*args: Any, **kwargs: Any) -> Any:
+            res = orig_vpb(*args, **kwargs)
+            captured_budget.append(int(res[2]))
+            return res
+
+        mp.setattr(CompiledSystemOneModel, "_validate_projector_and_budget", _capture_vpb)
+        CompiledSystemOneModel.from_bytes(v3_bytes)
+        assert len(captured_budget) == 1
+        tight_cap = captured_budget[0] + 64
+        mp.setattr(CompiledSystemOneModel, "_validate_projector_and_budget", orig_vpb)
+        mp.setattr("system1.compiler.MAX_SKILL_RUNTIME_BYTES_V3", tight_cap)
+        assert CompiledSystemOneModel.from_bytes(v3_bytes).dimension == 32
+        with pytest.raises(ValueError, match="memory budget"):
+            CompiledSystemOneModel.from_bytes(v3_f16_valid)
+        with pytest.raises(ValueError, match="memory budget"):
+            CompiledSystemOneModel.from_bytes(v3_f64_valid)
+
+    # F5: HybridProjector config/tensor validation must enforce invariants on both embed_vocab branches.
+    class _HybValSchema(DecisionSchema):
+        cat = ChoiceField(options=("billing", "tech"))
+
+    hyb_corpus = [
+        "invoice refund payment charge billing",
+        "server outage crash database error",
+    ]
+    hyb_proj = HybridProjector(sparse_dim=24, dense_dim=16).fit(
+        hyb_corpus, labels=["billing", "tech"], min_df=1
+    )
+    hyb_model = SystemOneCompiler(_HybValSchema, projector=hyb_proj, dimension=hyb_proj.dimension).compile(
+        {"cat": [(hyb_corpus[0], "billing"), (hyb_corpus[1], "tech")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    for embed_vocab_opt in (False, True):
+        hyb_bytes = hyb_model.to_bytes(format_version=3, embed_vocab=embed_vocab_opt)
+
+        def _bad_alpha(meta_obj: Dict[str, Any], _payload: bytearray) -> None:
+            meta_obj["projector"]["alpha"] = 0.0
+
+        with pytest.raises(ValueError, match="alpha"):
+            CompiledSystemOneModel.from_bytes(_rewrite_v3_aligned(hyb_bytes, _bad_alpha))
+
+        def _extra_key(meta_obj: Dict[str, Any], _payload: bytearray) -> None:
+            meta_obj["projector"]["unexpected_key"] = 1
+
+        with pytest.raises(ValueError, match="unsupported"):
+            CompiledSystemOneModel.from_bytes(_rewrite_v3_aligned(hyb_bytes, _extra_key))
+
+        def _bad_unfitted(meta_obj: Dict[str, Any], _payload: bytearray) -> None:
+            meta_obj["projector"]["fitted"] = False
+
+        with pytest.raises(ValueError, match="Unfitted"):
+            CompiledSystemOneModel.from_bytes(_rewrite_v3_aligned(hyb_bytes, _bad_unfitted))
+
+    # F6: mutable bytearray / memoryview snapshots are frozen before parsing, and oversized memoryviews fail fast.
+    ba_v3 = bytearray(v3_bytes)
+    model_ba = CompiledSystemOneModel.from_bytes(ba_v3)
+    w_ref = model_ba.heads["q_a"].weights.copy()
+    assert model_ba.heads["q_a"].weights.flags.writeable is False
+    ba_v3[:] = b"\x00" * len(ba_v3)
+    np.testing.assert_array_equal(model_ba.heads["q_a"].weights, w_ref)
+
+    ba_mv = bytearray(v3_bytes)
+    mv_ro = memoryview(ba_mv).toreadonly()
+    model_mv = CompiledSystemOneModel._from_v3_buffer(mv_ro, len(ba_mv))
+    ba_mv[:] = b"\x00" * len(ba_mv)
+    np.testing.assert_array_equal(model_mv.heads["q_a"].weights, w_ref)
+
+    oversized_v3_mv = memoryview(np.broadcast_to(np.uint8(0), (300_000_000,)))
+    with pytest.raises(ValueError, match="size"):
+        CompiledSystemOneModel.from_bytes(oversized_v3_mv)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="out of bounds"):
+        CompiledSystemOneModel._from_v3_buffer(oversized_v3_mv, oversized_v3_mv.nbytes)  # type: ignore[arg-type]
 
 
 def test_astra_05_packed_kernel_and_callable_parity_on_gates_ood_and_overrides() -> None:
@@ -536,18 +756,25 @@ def test_astra_05_packed_kernel_and_callable_parity_on_gates_ood_and_overrides()
 
     # Free-running multi-thread toggle stress on FastDecisionCallable state invariants.
     stop_flag = threading.Event()
+    free_barrier = threading.Barrier(6)
     race_errors: List[str] = []
     race_err_lock = threading.Lock()
 
     def _toggler() -> None:
-        idx = 0
-        while not stop_flag.is_set() and idx < 80:
-            tracker_race.alpha_t = 0.01 if (idx % 2 == 0) else 0.20
-            idx += 1
+        try:
+            free_barrier.wait(timeout=5.0)
+            idx = 0
+            while not stop_flag.is_set() and idx < 300:
+                tracker_race.alpha_t = 0.01 if (idx % 2 == 0) else 0.20
+                idx += 1
+        except Exception as exc:
+            with race_err_lock:
+                race_errors.append(repr(exc))
 
     def _reader() -> None:
         try:
-            for _ in range(120):
+            free_barrier.wait(timeout=5.0)
+            for _ in range(250):
                 st = fn_race._state
                 if (st.alpha < 0.10 and abs(st.c_qhats[0] - qhat_01) > 1e-6) or (
                     st.alpha >= 0.10 and abs(st.c_qhats[0] - qhat_20) > 1e-6
@@ -595,6 +822,75 @@ def test_astra_05_packed_kernel_and_callable_parity_on_gates_ood_and_overrides()
         eng_cv.compile_packed_kernel()
     with pytest.raises(ValueError, match="validate_decision"):
         eng_cv.compile_callable()
+
+    # F1: swapping tracker, attaching selective/joint calibrators, or attaching validate_decision after
+    # compile_packed_kernel / compile_callable must invalidate cache or fail closed.
+    tracker_new = AdaptiveConformalTracker(alpha_target=0.20, alpha_max=0.25, gamma=1.0)
+    eng_a.aci_tracker = tracker_new
+    tracker_new.alpha_t = 0.20
+    assert fn_a("invoice refund charge billing").is_ambiguous is False
+    tracker_new.alpha_t = 0.01
+    assert fn_a("invoice refund charge billing").is_ambiguous is True
+
+    key_before = eng_a._packed_kernel_cache_key("float32")
+    eng_a.selective_calibrators["cat"] = SelectiveRiskCalibrator().fit(np.array([0.1, 0.9]), np.array([0, 1]))
+    with pytest.raises(ValueError, match="selective_calibrators"):
+        eng_a.compile_packed_kernel()
+    with pytest.raises(ValueError, match="selective_calibrators"):
+        fn_a("invoice refund charge billing")
+    eng_a.selective_calibrators.clear()
+
+    eng_a.schema.validate_decision = types.MethodType(  # type: ignore[method-assign]
+        lambda self, values: values,
+        eng_a.schema,
+    )
+    key_after = eng_a._packed_kernel_cache_key("float32")
+    assert key_after != key_before
+    with pytest.raises(ValueError, match="validate_decision"):
+        eng_a.compile_packed_kernel()
+    with pytest.raises(ValueError, match="validate_decision"):
+        fn_a("invoice refund charge billing")
+
+    # F2 & F11: extreme logits emit no float32/64 sigmoid overflow warnings and set_weights rejects 1e40 cleanly.
+    class _ExtremeBoolSchema(DecisionSchema):
+        flag = BooleanField(threshold=0.5)
+
+    m_ext = SystemOneCompiler(_ExtremeBoolSchema, dimension=16).compile(
+        {"flag": [("positive signal case", True), ("negative signal case", False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    for ext_bias, ext_expected in ((1000.0, True), (-1000.0, False)):
+        m_ext.heads["flag"].biases = np.array([ext_bias], dtype=np.float32)
+        m_ext._field_heads["flag"].biases = np.array([ext_bias], dtype=np.float32)
+        eng_ext = SystemOneEngine(_ExtremeBoolSchema, compiled_model=m_ext, strict_mode=False, use_cache=False)
+        pk_ext = eng_ext.compile_packed_kernel()
+        fn_ext = eng_ext.compile_callable()
+        with warnings.catch_warnings(record=True) as caught_sig:
+            warnings.simplefilter("always", RuntimeWarning)
+            out_pk = pk_ext.decide_prompt("positive signal case")
+            out_fn = fn_ext("positive signal case")
+            assert not any("overflow" in str(w.message).lower() for w in caught_sig)
+        assert bool(out_pk["b_val"][0, 0]) is ext_expected
+        assert float(out_pk["p_true"][0, 0]) == (1.0 if ext_expected else 0.0)
+        assert float(out_pk["b_conf"][0, 0]) == 1.0
+        assert out_fn.values["flag"] is ext_expected
+        assert float(out_fn.confidences["flag"]) == 1.0
+
+    with warnings.catch_warnings(record=True) as caught_hw:
+        warnings.simplefilter("always", RuntimeWarning)
+        with pytest.raises(ValueError, match="finite"):
+            eng_ext.model._field_heads["flag"].set_weights(
+                np.full((1, 16), 1e40, dtype=np.float64),
+                np.zeros(1, dtype=np.float64),
+            )
+        with pytest.raises(ValueError, match="finite"):
+            eng_ext.model._field_heads["flag"].set_hierarchical_weights(
+                cluster_assignments=[0],
+                coarse_weights=np.full((1, 16), 1e40, dtype=np.float64),
+                coarse_biases=np.zeros(1, dtype=np.float64),
+            )
+        assert not any("overflow" in str(w.message).lower() for w in caught_hw)
 
 
 def test_astra_06_universal_service_fails_closed_without_auth_token() -> None:
@@ -688,6 +984,29 @@ def test_astra_07_contract_fingerprint_and_drift_track_instructions_descriptions
     assert r2["schema_drift_detected"] is True
     assert len(svc._lifecycles) == 2
 
+    # F12: negative zero canonicalizes to +0.0 and tiny threshold/bound deltas are detected by diff_schemas.
+    from system1.compat.universal import parse_finite_float
+
+    parsed_nz = parse_finite_float("-0.0")
+    assert parsed_nz == 0.0 and math.copysign(1.0, parsed_nz) > 0.0
+
+    q_num_a = {"score_q": {"type": "score", "min_value": 0.0, "max_value": 10.0}}
+    q_num_b = {"score_q": {"type": "score", "min_value": 1e-13, "max_value": 10.0}}
+    c_num_a = compile_questions_contract(q_num_a)
+    c_num_b = compile_questions_contract(q_num_b)
+    drift_bounds = diff_schemas(c_num_a, c_num_b)
+    assert drift_bounds["drifted"] is True
+    assert drift_bounds["changed_questions"]["score_q"]["reason"] == "bounds_changed"
+
+    q_thr_tiny_a = {"tags": {"type": "multichoice", "options": ["x", "y"], "threshold": 0.5}}
+    q_thr_tiny_b = {"tags": {"type": "multichoice", "options": ["x", "y"], "threshold": 0.5 + 1e-13}}
+    drift_tiny_thr = diff_schemas(
+        compile_questions_contract(q_thr_tiny_a),
+        compile_questions_contract(q_thr_tiny_b),
+    )
+    assert drift_tiny_thr["drifted"] is True
+    assert drift_tiny_thr["changed_questions"]["tags"]["reason"] == "threshold_changed"
+
 
 def test_astra_08_soft_distilling_lifecycle_distills_before_calibration_and_cutover() -> None:
     """Finding #8: SoftDistillingLifecycle distills weights before calibration & cutover, never post-hoc."""
@@ -767,18 +1086,35 @@ def test_astra_08_soft_distilling_lifecycle_distills_before_calibration_and_cuto
     assert eng.conformal_predictors["q0_intent"].calibration_scores == pytest.approx(recorded_scores)
 
 
-def test_astra_09_active_teacher_selector_never_leaks_reserved_calibration_labels() -> None:
+def test_astra_09_active_teacher_selector_never_leaks_reserved_calibration_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Finding #9: ActiveTeacherSelector excludes reserved calibration holdout labels from selection."""
-    x_pool = np.random.default_rng(19).normal(size=(30, 4)).astype(np.float32)
-    y_base = np.arange(30, dtype=np.int64) % 2
+    from system1 import teaching as teaching_mod
+
+    x_pool = np.random.default_rng(19).normal(size=(36, 4)).astype(np.float32)
+    y_base = np.arange(36, dtype=np.int64) % 2
     sel = ActiveTeacherSelector(x_pool, num_classes=2, batch_size=1)
 
     for strategy in ("active_rls", "confidence_only"):
-        order_1 = sel.select_order(y_base, 16, strategy=strategy, seed=5, reserve_calibration=8)
+        # F13: budget=24 with reserve_calibration=8 ensures uncertainty loop executes after warm-up.
+        seen_rows: List[int] = []
+        orig_solve = teaching_mod._solve_ridge_dual
+
+        def _spy_solve(x_tr: np.ndarray, y_tr: np.ndarray, reg: float = 1.0) -> Any:
+            seen_rows.append(int(x_tr.shape[0]))
+            return orig_solve(x_tr, y_tr, reg=reg)
+
+        monkeypatch.setattr(teaching_mod, "_solve_ridge_dual", _spy_solve)
+        order_1 = sel.select_order(y_base, 24, strategy=strategy, seed=5, reserve_calibration=8)
+        assert len(seen_rows) > 0
+        assert max(seen_rows) < 24
+
         y_flipped = y_base.copy()
         y_flipped[order_1[:8]] = 1 - y_flipped[order_1[:8]]
-        order_2 = sel.select_order(y_flipped, 16, strategy=strategy, seed=5, reserve_calibration=8)
+        order_2 = sel.select_order(y_flipped, 24, strategy=strategy, seed=5, reserve_calibration=8)
         assert order_1 == order_2
+        monkeypatch.undo()
 
 
 def test_astra_10_fast_explainer_matches_calibrated_engine_and_rejects_nonlinear_heads() -> None:
@@ -913,6 +1249,75 @@ def test_astra_10_fast_explainer_matches_calibrated_engine_and_rejects_nonlinear
         assert exp_eb.additivity_error_target <= 1e-6
         assert exp_eb.additivity_error_margin <= 1e-6
 
+    # F3: exact Boolean tie & nextafter boundary parity across Deterministic, Tfidf, and Hybrid projectors.
+    class _AsymBoolSchema(DecisionSchema):
+        flag = BooleanField(threshold=0.75)
+
+    target_raw_75 = np.float32(0.25 * math.log(3.0))
+    boundary_biases = (
+        np.nextafter(target_raw_75, np.float32(-np.inf)),
+        target_raw_75,
+        np.nextafter(target_raw_75, np.float32(np.inf)),
+    )
+    bool_projs = [
+        DeterministicSemanticProjector(dimension=16),
+        TfidfProjector.fit(["alpha token case", "beta token case"], max_features=16),
+        HybridProjector(sparse_dim=16, dense_dim=8).fit(
+            ["alpha token case", "beta token case"], labels=["True", "False"], min_df=1
+        ),
+        HybridProjector(sparse_dim=16, dense_dim=8).fit(
+            ["alpha token case", "beta token case"],
+            labels=["True", "False"],
+            min_df=1,
+            direct_spectral=True,
+        ),
+    ]
+    for b_proj in bool_projs:
+        m_b = SystemOneCompiler(_AsymBoolSchema, projector=b_proj, dimension=b_proj.dimension).compile(
+            {"flag": [("alpha token case", True), ("beta token case", False)] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        # Keep compiled non-zero weights on the first pass and recenter bias to hit boundary ULPs.
+        x_raw = np.asarray(b_proj.project("alpha token case"), dtype=np.float32).reshape(-1)
+        x_norm = float(np.linalg.norm(x_raw))
+        x_unit = (x_raw / np.float32(x_norm)) if x_norm > 1e-12 else x_raw
+        wx = float(np.dot(m_b.heads["flag"].weights[0].astype(np.float32), x_unit))
+        b_center = np.float32(float(target_raw_75) - wx)
+        for b_edge in (
+            np.nextafter(b_center, np.float32(-np.inf)),
+            b_center,
+            np.nextafter(b_center, np.float32(np.inf)),
+        ):
+            b_vec = np.array([float(b_edge)], dtype=np.float32)
+            m_b.heads["flag"].biases = b_vec
+            m_b._field_heads["flag"].biases = b_vec
+            eng_probe = SystemOneEngine(_AsymBoolSchema, compiled_model=m_b, strict_mode=False, use_cache=False)
+            dec_b = eng_probe.decide("alpha token case", record_receipt=False)
+            exp_e = eng_probe.explain("alpha token case", "flag")
+            exp_m = FastExplainer.from_compiled_model(m_b, "flag").explain("alpha token case")
+            expected_lbl = "True" if dec_b.values["flag"] else "False"
+            assert exp_e.predicted_label == expected_lbl
+            assert exp_m.predicted_label == expected_lbl
+            assert exp_e.additivity_error_target <= 1e-6
+            assert exp_m.additivity_error_target <= 1e-6
+
+        m_b.heads["flag"].weights = np.zeros_like(m_b.heads["flag"].weights)
+        m_b._field_heads["flag"].weights = np.zeros_like(m_b._field_heads["flag"].weights)
+        for b_edge in boundary_biases:
+            b_vec = np.array([float(b_edge)], dtype=np.float32)
+            m_b.heads["flag"].biases = b_vec
+            m_b._field_heads["flag"].biases = b_vec
+            eng_b = SystemOneEngine(_AsymBoolSchema, compiled_model=m_b, strict_mode=False, use_cache=False)
+            dec_b = eng_b.decide("alpha token case", record_receipt=False)
+            exp_e = eng_b.explain("alpha token case", "flag")
+            exp_m = FastExplainer.from_compiled_model(m_b, "flag").explain("alpha token case")
+            expected_lbl = "True" if dec_b.values["flag"] else "False"
+            assert exp_e.predicted_label == expected_lbl
+            assert exp_m.predicted_label == expected_lbl
+            assert exp_e.additivity_error_target <= 1e-6
+            assert exp_m.additivity_error_target <= 1e-6
+
     # Cross-field coupling guards: active joint_calibrator or custom validate_decision must fail closed.
     class _PairSchema(DecisionSchema):
         a = ChoiceField(options=("x", "y"))
@@ -1019,6 +1424,60 @@ def test_astra_10_fast_explainer_matches_calibrated_engine_and_rejects_nonlinear
         t.join(timeout=15.0)
         assert not t.is_alive()
     assert mt_errors == []
+
+    # F14: concurrent OOV cache writes near _MAX_EXPLAIN_OOV_CACHE must remain thread-safe and bounded.
+    from system1 import explain as explain_mod
+
+    cap_explainer = FastExplainer.from_engine(eng_mt, "cat")
+    cap_target = explain_mod._MAX_EXPLAIN_OOV_CACHE - 2
+    idx = 0
+    while len(cap_explainer._char_arr_cache) < cap_target:
+        cap_explainer._char_arr_cache[f"pf_{idx}"] = (
+            np.empty(0, dtype=np.intp),
+            np.empty(0, dtype=np.int32),
+            False,
+            (),
+            (),
+        )
+        idx += 1
+    idx = 0
+    while len(cap_explainer._word_dn_cache) < cap_target:
+        cap_explainer._word_dn_cache[f"pf_{idx}"] = (idx, None, None, None)
+        idx += 1
+    idx = 0
+    while len(cap_explainer._bi_hash_cache) < cap_target:
+        cap_explainer._bi_hash_cache[(f"pfa_{idx}", f"pfb_{idx}")] = idx
+        idx += 1
+    oov_prompts = [f"zzq_oov_{tid}_alpha zzq_oov_{tid}_beta" for tid in range(8)]
+    oov_refs = [cap_explainer.explain(p) for p in oov_prompts]
+    cap_barrier = threading.Barrier(8)
+    cap_errors: List[str] = []
+
+    def _cap_worker(tid: int) -> None:
+        try:
+            cap_barrier.wait(timeout=5.0)
+            for rep in range(6):
+                res = cap_explainer.explain(f"{oov_prompts[tid]} extra_{tid}_{rep}")
+                if res.additivity_error_target > 1e-6:
+                    cap_errors.append(f"tid={tid} err={res.additivity_error_target}")
+                    return
+                res_ref = cap_explainer.explain(oov_prompts[tid])
+                if res_ref.predicted_label != oov_refs[tid].predicted_label:
+                    cap_errors.append(f"tid={tid} label mismatch")
+                    return
+        except Exception as exc:
+            cap_errors.append(repr(exc))
+
+    cap_threads = [threading.Thread(target=_cap_worker, args=(i,)) for i in range(8)]
+    for t in cap_threads:
+        t.start()
+    for t in cap_threads:
+        t.join(timeout=15.0)
+        assert not t.is_alive()
+    assert cap_errors == []
+    assert len(cap_explainer._char_arr_cache) <= explain_mod._MAX_EXPLAIN_OOV_CACHE
+    assert len(cap_explainer._word_dn_cache) <= explain_mod._MAX_EXPLAIN_OOV_CACHE
+    assert len(cap_explainer._bi_hash_cache) <= explain_mod._MAX_EXPLAIN_OOV_CACHE
 
 
 def test_astra_11_smarts_router_honors_per_call_alpha() -> None:
@@ -1189,12 +1648,77 @@ def test_astra_14_online_mondrian_and_fleet_conformal_cover_large_label_spaces()
     assert bool(mask[0]) is True
     assert "c0" in fleet.decide(0, "probe").conformal_set
 
+    # F9: OnlineMondrianConformal & fleet.update_conformal validate scalars/scores without poisoning state.
+    for kw in (
+        {"num_classes": True, "alpha": 0.1},
+        {"num_classes": 2.5, "alpha": 0.1},
+        {"num_classes": 2, "alpha": float("nan")},
+        {"num_classes": 2, "alpha": 0.1, "gamma_aci": 0.0},
+        {"num_classes": 2, "alpha": 0.1, "eta_u": float("nan")},
+        {"num_classes": 2, "alpha": 0.1, "jump_w": 1.5},
+    ):
+        with pytest.raises(ValueError):
+            OnlineMondrianConformal(**kw)  # type: ignore[arg-type]
+
+    q_snap = omc.q_c.copy()
+    u_snap = omc.u_c.copy()
+    with pytest.raises(ValueError):
+        omc.update(True, score_y=0.2)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        omc.update(0, score_y=float("nan"))
+    with pytest.raises(ValueError):
+        omc.update(0, score_y=1.5)
+    with pytest.raises(ValueError):
+        omc.update(0, probs=np.full(k, float("nan")))
+    np.testing.assert_array_equal(omc.q_c, q_snap)
+    np.testing.assert_array_equal(omc.u_c, u_snap)
+
+    for key, val in (
+        ("gamma_aci", None),
+        ("eta_u", None),
+        ("jump_w", None),
+        ("steps", True),
+        ("steps", -0.5),
+        ("steps", 1.5),
+    ):
+        bad_state = omc.state_dict()
+        bad_state[key] = val
+        with pytest.raises(ValueError):
+            OnlineMondrianConformal.from_state_dict(bad_state)
+
+    fleet_q_snap = fleet.q_c.copy()
+    with pytest.raises(ValueError):
+        fleet.update_conformal(0, 0, np.full(k, float("nan")))
+    with pytest.raises(ValueError):
+        fleet.update_conformal(0, 0, probs, eta_u=float("nan"))
+    with pytest.raises(ValueError):
+        fleet.update_conformal(0, 0, probs, jump_w=-0.1)
+    with pytest.raises(ValueError):
+        fleet.update_conformal(0, 0, probs, gamma_aci=0.0)
+    np.testing.assert_array_equal(fleet.q_c, fleet_q_snap)
+
 
 def test_astra_15_binary_platt_beta_calibrator_uses_identity_below_74_samples() -> None:
     """Finding #15: BinaryPlattBetaCalibrator returns unperturbed identity passthrough when n < 74."""
     cal_small = BinaryPlattBetaCalibrator().fit(np.full(25, 0.9), np.zeros(25))
     assert cal_small.mode == "identity"
     assert cal_small.transform(np.array([0.9]))[0] == pytest.approx(0.9)
+
+    # F10: identity mode preserves exact boundary probabilities and rejects non-finite/out-of-range inputs.
+    exact_edge = np.array([0.0, 1e-12, 1.0 - 1e-12, 1.0], dtype=np.float64)
+    np.testing.assert_allclose(cal_small.transform(exact_edge), exact_edge, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(
+        cal_small.predict_proba(np.array([0.0, 1.0])),
+        np.array([[1.0, 0.0], [0.0, 1.0]]),
+        rtol=0.0,
+        atol=0.0,
+    )
+    with pytest.raises(ValueError, match="finite"):
+        cal_small.transform(np.array([float("nan")]))
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        cal_small.transform(np.array([1.2]))
+    with pytest.raises(ValueError, match="finite"):
+        BinaryPlattBetaCalibrator().fit(np.array([float("inf"), 0.5]), np.array([1, 0]))
 
     rng = np.random.default_rng(7)
     probs = rng.uniform(0.05, 0.95, size=160)

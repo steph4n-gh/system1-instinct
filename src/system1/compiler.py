@@ -2020,6 +2020,168 @@ class CompiledSystemOneModel:
             )
         )
 
+    @staticmethod
+    def _coerce_readonly_float_array(arr: Optional[np.ndarray], dtype: Any) -> Optional[np.ndarray]:
+        """Convert array to target runtime float dtype without overflow warnings and mark read-only."""
+        if arr is None:
+            return None
+        target = np.dtype(dtype)
+        if arr.dtype == target:
+            return arr
+        with np.errstate(over="ignore", invalid="ignore"):
+            out = np.asarray(arr, dtype=target)
+        out.setflags(write=False)
+        return out
+
+    @staticmethod
+    def _validate_hybrid_projector_config_and_tensors(
+        projector_config: Mapping[str, Any],
+        array_map: Mapping[str, np.ndarray],
+        dimension: int,
+    ) -> int:
+        """Validate HybridProjector config scalars and tensor shapes before either reconstruction branch."""
+        from system1.core.embeddings import HybridProjector
+
+        if not isinstance(projector_config, Mapping):
+            raise ValueError("Saved hybrid projector config must be a mapping")
+        if set(projector_config) - HybridProjector.CONFIG_KEYS:
+            raise ValueError("Saved hybrid projector contains unsupported settings")
+
+        sparse = projector_config.get("sparse_dim")
+        dense = projector_config.get("dense_dim")
+        if type(sparse) is not int or type(dense) is not int or sparse <= 0 or dense <= 0:
+            raise ValueError("Saved hybrid projector dimensions are invalid")
+
+        def _req_num(val: Any, name: str) -> float:
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise ValueError(f"Saved hybrid projector {name} must be finite")
+            fval = float(val)
+            if not math.isfinite(fval):
+                raise ValueError(f"Saved hybrid projector {name} must be finite")
+            return fval
+
+        def _req_bool(key: str, default: bool = False) -> bool:
+            if key not in projector_config:
+                return default
+            val = projector_config[key]
+            if type(val) is not bool:
+                raise ValueError(f"Saved hybrid projector {key} must be a boolean")
+            return val
+
+        alpha = _req_num(projector_config.get("alpha", 0.5), "alpha")
+        if not (0.0 < alpha < 1.0):
+            raise ValueError("Saved hybrid projector alpha must be in (0, 1)")
+        seed = projector_config.get("seed", 42)
+        if type(seed) is not int:
+            raise ValueError("Saved hybrid projector seed must be an integer")
+        if _req_num(projector_config.get("svd_power", 0.5), "svd_power") < 0.0:
+            raise ValueError("Saved hybrid projector svd_power must be nonnegative")
+        spectral_blend = _req_num(projector_config.get("spectral_blend", 0.35), "spectral_blend")
+        if not (0.0 <= spectral_blend <= 1.0):
+            raise ValueError("Saved hybrid projector spectral_blend must be in [0, 1]")
+        subspace_weight = _req_num(projector_config.get("subspace_weight", 0.0), "subspace_weight")
+        if not (0.0 <= subspace_weight <= 1.0):
+            raise ValueError("Saved hybrid projector subspace_weight must be in [0, 1]")
+        if _req_num(projector_config.get("context_smooth", 1.0), "context_smooth") < 0.0:
+            raise ValueError("Saved hybrid projector context_smooth must be nonnegative")
+        if _req_num(projector_config.get("rbf_gamma", 2.5), "rbf_gamma") <= 0.0:
+            raise ValueError("Saved hybrid projector rbf_gamma must be positive")
+        rbf_weight = _req_num(projector_config.get("rbf_weight", 0.0), "rbf_weight")
+        if not (0.0 <= rbf_weight < 1.0):
+            raise ValueError("Saved hybrid projector rbf_weight must be in [0, 1)")
+
+        fitted = _req_bool("fitted", False)
+        _req_bool("use_subspace", False)
+        direct_spectral = _req_bool("direct_spectral", False)
+        raw_ds_dim = projector_config.get("direct_spectral_dim", 0)
+        if type(raw_ds_dim) is not int or not (0 <= raw_ds_dim <= 1024):
+            raise ValueError("Saved hybrid projector direct_spectral_dim is invalid")
+
+        raw_terms = projector_config.get("spectral_terms", ())
+        raw_weights = projector_config.get("spectral_weights", ())
+        if not isinstance(raw_terms, (list, tuple)) or not isinstance(raw_weights, (list, tuple)):
+            raise ValueError("Saved hybrid projector spectral terms and weights must be sequences")
+        terms: List[str] = []
+        for tm in raw_terms:
+            if not isinstance(tm, str) or not tm.strip():
+                raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
+            terms.append(tm)
+        if len(set(terms)) != len(terms):
+            raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
+        if len(terms) != len(raw_weights):
+            raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
+        for w_val in raw_weights:
+            _req_num(w_val, "spectral_weights")
+
+        def _inline_or_map_f32(map_key: str, cfg_key: str) -> Optional[np.ndarray]:
+            if map_key in array_map:
+                return array_map[map_key]
+            raw_inline = projector_config.get(cfg_key)
+            if raw_inline is None:
+                return None
+            try:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    arr = np.asarray(raw_inline, dtype=np.float32)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Saved hybrid projector {cfg_key} is invalid") from exc
+            if not bool(np.all(np.isfinite(arr))):
+                raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
+            return arr
+
+        spec_arr = _inline_or_map_f32("_projector_spectral_vectors", "spectral_vectors")
+        basis_arr = array_map.get("_projector_spectral_basis")
+        sub_arr = _inline_or_map_f32("_projector_subspace_components", "subspace_components")
+        rbf_arr = _inline_or_map_f32("_projector_rbf_landmarks", "rbf_landmarks")
+
+        if not fitted:
+            if (
+                terms
+                or (spec_arr is not None and len(spec_arr) > 0)
+                or basis_arr is not None
+                or (sub_arr is not None and len(sub_arr) > 0)
+                or (rbf_arr is not None and len(rbf_arr) > 0)
+                or (direct_spectral and raw_ds_dim != 0)
+            ):
+                raise ValueError("Unfitted saved hybrid projector cannot carry fitted tensors")
+
+        if spec_arr is not None and len(spec_arr) > 0:
+            if spec_arr.ndim != 2 or spec_arr.shape[0] != len(terms) or len(terms) == 0:
+                raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
+            if direct_spectral:
+                if (
+                    not (1 <= spec_arr.shape[1] <= 1024)
+                    or (raw_ds_dim != 0 and spec_arr.shape[1] != raw_ds_dim)
+                    or basis_arr is not None
+                ):
+                    raise ValueError("Saved hybrid projector direct spectral_vectors have invalid shape")
+                eff_spec_dim = int(spec_arr.shape[1])
+            else:
+                if not (1 <= spec_arr.shape[1] <= dense):
+                    raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
+                if basis_arr is not None and (
+                    basis_arr.ndim != 2 or basis_arr.shape != (spec_arr.shape[1], dense)
+                ):
+                    raise ValueError("Saved hybrid projector _projector_spectral_basis shape mismatch")
+                eff_spec_dim = 0
+        else:
+            if terms or basis_arr is not None or (direct_spectral and raw_ds_dim != 0):
+                raise ValueError("Saved hybrid projector missing spectral_vectors")
+            eff_spec_dim = 0
+
+        base_dim = sparse + dense + eff_spec_dim
+        if sub_arr is not None and len(sub_arr) > 0:
+            if sub_arr.ndim != 2 or not (1 <= sub_arr.shape[0] <= base_dim) or sub_arr.shape[1] != base_dim:
+                raise ValueError("Saved hybrid projector subspace_components have invalid shape")
+        rbf_rows = 0
+        if rbf_arr is not None and len(rbf_arr) > 0:
+            if rbf_arr.ndim != 2 or rbf_arr.shape[0] < 1 or rbf_arr.shape[1] != base_dim:
+                raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
+            rbf_rows = int(rbf_arr.shape[0])
+
+        if base_dim + rbf_rows != dimension:
+            raise ValueError("Saved hybrid projector dimensions do not match the skill")
+        return eff_spec_dim
+
     @classmethod
     def _reconstruct_model_from_parts(
         cls,
@@ -2038,10 +2200,12 @@ class CompiledSystemOneModel:
         from system1.core.embeddings import HybridProjector, SubwordSemanticEmbeddings
 
         def _as_f32(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
-            if arr is None:
-                return None
-            return np.asarray(arr, dtype=np.float32) if arr.dtype == np.float16 else arr
+            return cls._coerce_readonly_float_array(arr, np.float32)
 
+        def _as_f64(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            return cls._coerce_readonly_float_array(arr, np.float64)
+
+        array_map = dict(array_map)
         is_v3 = format_version == 3
         embed_vocab_flag = bool(meta.get("embed_vocab", False)) if is_v3 else False
 
@@ -2071,15 +2235,28 @@ class CompiledSystemOneModel:
             "_projector_tfidf_idf",
             "_projector_prag_base_idf",
             "_projector_prag_idf",
+            "_projector_hybrid_tfidf_idf",
+        ):
+            if proj_arr_key in array_map:
+                conv_f64 = _as_f64(array_map[proj_arr_key])
+                assert conv_f64 is not None
+                if not np.all(np.isfinite(conv_f64)):
+                    raise ValueError(f"Saved projector array {proj_arr_key!r} contains non-finite values")
+                array_map[proj_arr_key] = conv_f64
+
+        for proj_arr_key in (
             "_projector_spectral_vectors",
             "_projector_spectral_basis",
             "_projector_subspace_components",
             "_projector_rbf_landmarks",
-            "_projector_hybrid_tfidf_idf",
             "_projector_dense_table",
         ):
-            if proj_arr_key in array_map and not np.all(np.isfinite(array_map[proj_arr_key])):
-                raise ValueError(f"Saved projector array {proj_arr_key!r} contains non-finite values")
+            if proj_arr_key in array_map:
+                conv_f32 = _as_f32(array_map[proj_arr_key])
+                assert conv_f32 is not None
+                if not np.all(np.isfinite(conv_f32)):
+                    raise ValueError(f"Saved projector array {proj_arr_key!r} contains non-finite values")
+                array_map[proj_arr_key] = conv_f32
 
         if projector_config is not None and projector_config["type"] == "tfidf" and saved_tfidf is None:
             saved_tfidf = TfidfProjector.from_config(
@@ -2095,22 +2272,12 @@ class CompiledSystemOneModel:
 
         saved_hybrid = None
         if projector_config is not None and projector_config["type"] == "hybrid":
+            eff_spec_dim = cls._validate_hybrid_projector_config_and_tensors(
+                projector_config,
+                array_map,
+                dimension,
+            )
             rbf_arr = array_map.get("_projector_rbf_landmarks")
-            rbf_rows = (
-                int(rbf_arr.shape[0])
-                if rbf_arr is not None
-                else len(projector_config.get("rbf_landmarks") or ())
-            )
-            direct_spec = (
-                projector_config.get("direct_spectral_dim", 0)
-                if projector_config.get("direct_spectral")
-                else 0
-            )
-            if (
-                projector_config["sparse_dim"] + projector_config["dense_dim"] + direct_spec + rbf_rows
-                != dimension
-            ):
-                raise ValueError("Saved hybrid projector dimensions do not match the skill")
 
             if is_v3 and embed_vocab_flag and "_projector_dense_table" in array_map:
                 vocab_meta = meta.get("dense_embed_vocab")
@@ -2123,8 +2290,6 @@ class CompiledSystemOneModel:
                 dense_table = array_map["_projector_dense_table"]
                 if dense_table.ndim != 2 or dense_table.shape != (vocab_size, dense_dim):
                     raise ValueError("Saved v3 skill _projector_dense_table shape mismatch")
-                if dense_table.dtype == np.float16:
-                    dense_table = np.asarray(dense_table, dtype=np.float32)
 
                 raw_mw = vocab_meta.get("multiword_by_space3", {})
                 if not isinstance(raw_mw, Mapping):
@@ -2158,11 +2323,16 @@ class CompiledSystemOneModel:
                         sparse_cfg,
                         idf_array=array_map.get("_projector_hybrid_tfidf_idf"),
                     )
+                    if tfidf_proj.dimension > int(projector_config["sparse_dim"]):
+                        raise ValueError("Saved hybrid TF-IDF vocabulary exceeds sparse_dim")
 
                 dense_engine = object.__new__(SubwordSemanticEmbeddings)
                 dense_engine.dimension = dense_dim
                 dense_engine.vocab_size = vocab_size
-                dense_engine.seed = int(vocab_meta.get("seed", projector_config.get("seed", 42)))
+                vm_seed = vocab_meta.get("seed", projector_config.get("seed", 42))
+                if type(vm_seed) is not int:
+                    raise ValueError("Saved v3 skill dense_embed_vocab seed is invalid")
+                dense_engine.seed = vm_seed
                 dense_engine._table = dense_table
                 dense_engine._multiword_by_space3 = mw_map
 
@@ -2197,7 +2367,20 @@ class CompiledSystemOneModel:
                     projector_config.get("use_subspace", hp._subspace_components is not None)
                 )
                 hp._direct_spectral = bool(projector_config.get("direct_spectral", False))
-                hp._direct_spectral_dim = int(projector_config.get("direct_spectral_dim", 0))
+                hp._direct_spectral_dim = eff_spec_dim
+                if (
+                    hp._spectral_vectors is not None
+                    and hp._spectral_vectors.size > 0
+                    and not hp._direct_spectral
+                    and hp._spectral_basis is None
+                ):
+                    vocab_dense = dense_engine.encode_batch(list(spec_terms)).astype(np.float32)
+                    aligned_basis = (hp._spectral_vectors.T @ vocab_dense).astype(np.float32)
+                    b_norms = np.linalg.norm(aligned_basis, axis=1, keepdims=True)
+                    if np.all(b_norms.flatten() > 1e-6):
+                        hp._spectral_basis = (aligned_basis / b_norms).astype(np.float32)
+                    else:
+                        hp._spectral_basis = hp._build_spectral_basis(hp._spectral_vectors.shape[1])
                 hp._context_smooth = float(projector_config.get("context_smooth", 1.0))
                 hp._rbf_landmarks = _as_f32(rbf_arr)
                 hp._rbf_gamma = float(projector_config.get("rbf_gamma", 2.5))
@@ -2273,8 +2456,8 @@ class CompiledSystemOneModel:
                 raise ValueError(f"Saved head {name!r} is missing required weights")
             w = _as_f32(array_map[f"{name}_w"])
             assert w is not None
-            b_raw = array_map[f"{name}_b"]
-            b = np.asarray(b_raw, dtype=np.float32) if b_raw.dtype == np.float16 else b_raw
+            b = _as_f32(array_map[f"{name}_b"])
+            assert b is not None
             widths = (
                 (1, 2)
                 if isinstance(definition, BooleanField)
@@ -2380,16 +2563,12 @@ class CompiledSystemOneModel:
                     raise ValueError(f"Saved head {name!r} has out-of-range cluster_assignments")
 
             exemplar_arrays = {
-                suffix: (
-                    _as_f32(array_map[f"{name}_{suffix}"])
-                    if array_map[f"{name}_{suffix}"].dtype == np.float16
-                    else array_map[f"{name}_{suffix}"]
-                )
+                suffix: _as_f32(array_map[f"{name}_{suffix}"])
                 for suffix in EXEMPLAR_ARRAYS
                 if f"{name}_{suffix}" in array_map
             }
             for ex_arr in exemplar_arrays.values():
-                if not np.all(np.isfinite(ex_arr)):
+                if ex_arr is None or not np.all(np.isfinite(ex_arr)):
                     raise ValueError(f"Saved head {name!r} contains non-finite exemplar arrays")
             if "exemplar_state" in h_info:
                 exemplar_meta = h_info["exemplar_state"]
@@ -2533,8 +2712,32 @@ class CompiledSystemOneModel:
         backend: str = "numpy",
     ) -> CompiledSystemOneModel:
         """Preflight-validates and constructs a zero-copy CompiledSystemOneModel over a v3 buffer."""
-        if buf_len < 16 or buf_len > MAX_SKILL_BYTES_V3:
+        if not isinstance(buf, (bytes, bytearray, memoryview, mmap.mmap)):
+            raise ValueError("Invalid System 1 v3 Model binary: unsupported buffer type")
+        actual_len = buf.nbytes if isinstance(buf, memoryview) else len(buf)
+        if (
+            type(buf_len) is not int
+            or buf_len != actual_len
+            or buf_len < 16
+            or buf_len > MAX_SKILL_BYTES_V3
+        ):
             raise ValueError("Saved v3 skill file size is out of bounds")
+        if isinstance(buf, bytearray):
+            buf = memoryview(bytes(buf))
+        elif isinstance(buf, memoryview):
+            if not buf.c_contiguous:
+                buf = memoryview(buf.tobytes())
+            else:
+                if buf.ndim != 1 or buf.format != "B":
+                    buf = buf.cast("B")
+                buf_obj = getattr(buf, "obj", None)
+                if not buf.readonly or not (
+                    type(buf_obj) is bytes or isinstance(buf_obj, mmap.mmap)
+                ):
+                    buf = memoryview(buf.tobytes())
+        elif type(buf) is not bytes and not isinstance(buf, mmap.mmap):
+            buf = memoryview(bytes(buf))
+
         magic, hdr_len = _V3_HDR_STRUCT.unpack_from(buf, 0)
         if magic != MAGIC_HEADER_V3:
             raise ValueError("Invalid System 1 v3 Model binary: missing or invalid magic header")
@@ -2663,12 +2866,21 @@ class CompiledSystemOneModel:
         shapes_v3: Dict[str, Tuple[int, ...]] = {
             tname: tuple(spec["shape"]) for tname, spec in raw_tensors.items()
         }
-        upcast_bytes_v3 = sum(
-            4 * int(math.prod(shapes_v3[tname]))
-            for tname, spec in raw_tensors.items()
-            if np.dtype(spec["dtype"]).itemsize == 2
-            and not tname.endswith(("_calib_scores", "_proto_scores"))
-        )
+        idf_tensor_names = frozenset((
+            "_projector_tfidf_idf",
+            "_projector_prag_base_idf",
+            "_projector_prag_idf",
+            "_projector_hybrid_tfidf_idf",
+        ))
+        upcast_bytes_v3 = 0
+        for tname, spec in raw_tensors.items():
+            dt_bytes = np.dtype(spec["dtype"]).itemsize
+            cnt = int(math.prod(shapes_v3[tname]))
+            if tname in idf_tensor_names:
+                if dt_bytes != 8:
+                    upcast_bytes_v3 += 8 * cnt
+            elif not tname.endswith(("_calib_scores", "_proto_scores")) and dt_bytes != 4:
+                upcast_bytes_v3 += 4 * cnt
         extra_runtime_bytes = _validate_skill_shapes_and_runtime_delta(
             schema,
             dimension,
@@ -2724,29 +2936,65 @@ class CompiledSystemOneModel:
     @classmethod
     def from_bytes(
         cls,
-        data: bytes,
+        data: Union[bytes, bytearray, memoryview],
         projector: Optional[Any] = None,
         backend: str = "numpy",
     ) -> CompiledSystemOneModel:
         """Deserializes a CompiledSystemOneModel from .s1m binary bytes (v1, v2, or v3)."""
-        if len(data) >= 8 and data[:8] == MAGIC_HEADER_V3:
-            return cls._from_v3_buffer(memoryview(data), len(data), projector=projector, backend=backend)
-
-        if len(data) > MAX_SKILL_BYTES:
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise ValueError("Invalid System 1 Model binary: unsupported buffer type")
+        mv = memoryview(data)
+        total_bytes = mv.nbytes
+        if total_bytes > max(MAX_SKILL_BYTES, MAX_SKILL_BYTES_V3):
             raise ValueError("Saved skill file exceeds size limit")
-        if len(data) < 8 or data[:4] not in (b"S1M\x01", MAGIC_HEADER):
+        if total_bytes < 8:
             raise ValueError("Invalid System 1 Model binary: missing or invalid magic header")
 
-        header_len = struct.unpack(">I", data[4:8])[0]
+        if not mv.c_contiguous:
+            frozen: Optional[bytes] = mv.tobytes()
+            mv_b = memoryview(frozen)
+        else:
+            mv_b = mv if (mv.ndim == 1 and mv.format == "B") else mv.cast("B")
+            frozen = None
+
+        magic8 = bytes(mv_b[:8])
+        if magic8 == MAGIC_HEADER_V3:
+            if total_bytes > MAX_SKILL_BYTES_V3:
+                raise ValueError("Saved v3 skill file size is out of bounds")
+            if frozen is None and not (
+                type(data) is bytes
+                or (
+                    isinstance(data, memoryview)
+                    and data.readonly
+                    and type(getattr(data, "obj", None)) is bytes
+                )
+            ):
+                mv_b = memoryview(mv_b.tobytes())
+            return cls._from_v3_buffer(mv_b, total_bytes, projector=projector, backend=backend)
+
+        if total_bytes > MAX_SKILL_BYTES:
+            raise ValueError("Saved skill file exceeds size limit")
+        if magic8[:4] not in (b"S1M\x01", MAGIC_HEADER):
+            raise ValueError("Invalid System 1 Model binary: missing or invalid magic header")
+
+        raw_bytes = frozen if frozen is not None else (data if type(data) is bytes else mv_b.tobytes())
+        header_len = struct.unpack(">I", raw_bytes[4:8])[0]
         if header_len > MAX_SKILL_HEADER_BYTES:
             raise ValueError("Saved skill header exceeds size limit")
         header_end = 8 + header_len
-        if len(data) < header_end:
+        if len(raw_bytes) < header_end:
             raise ValueError("Corrupted System 1 Model binary: truncated header")
 
-        header_json = data[8:header_end].decode("utf-8")
-        meta = json.loads(header_json)
-        if meta.get("version") not in (1, 2) or meta["version"] != data[3]:
+        try:
+            header_json = raw_bytes[8:header_end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Corrupted System 1 header encoding: {exc}") from exc
+
+        def _reject_nonfinite(tok: str) -> Any:
+            raise ValueError(f"Saved skill header contains non-finite constant: {tok!r}")
+
+        meta = json.loads(header_json, parse_constant=_reject_nonfinite)
+        if meta.get("version") not in (1, 2) or meta["version"] != raw_bytes[3]:
             raise ValueError("Unsupported or inconsistent saved skill format version")
 
         fields_data = meta["schema_dict"]["fields"]
@@ -2776,7 +3024,7 @@ class CompiledSystemOneModel:
             cov_fields=cov_fields,
             max_runtime_bytes=MAX_SKILL_RUNTIME_BYTES,
         )
-        npz_file = _read_skill_arrays(data[header_end:], schema, dimension, runtime_bytes)
+        npz_file = _read_skill_arrays(raw_bytes[header_end:], schema, dimension, runtime_bytes)
         return cls._reconstruct_model_from_parts(
             meta,
             npz_file,

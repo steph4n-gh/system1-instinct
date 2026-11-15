@@ -22,7 +22,8 @@ from system1.core.embeddings import (
     _stem_word as _emb_stem_word,
     _tokenize_with_negation_scope,
 )
-from system1.core.schema import BooleanField, ChoiceField, DecisionSchema
+from system1.core.model import _has_custom_validate_decision
+from system1.core.schema import BooleanField, ChoiceField
 from system1.core.text import (
     _CONTRACTION_RE,
     MAX_TERM_LENGTH,
@@ -53,21 +54,6 @@ def _boolean_threshold_logit_shift(threshold: float) -> float:
     if t == 1.0:
         return math.nextafter(53.0 * math.log(2.0), math.inf)
     return math.log(t) - math.log1p(-t)
-
-
-def _has_custom_validate_decision(schema: Any) -> bool:
-    if schema is None:
-        return False
-    schema_cls = schema if isinstance(schema, type) else type(schema)
-    if not isinstance(schema, type) and "validate_decision" in getattr(schema, "__dict__", {}):
-        return True
-    if (
-        isinstance(schema_cls, type)
-        and issubclass(schema_cls, DecisionSchema)
-        and schema_cls.validate_decision is not DecisionSchema.validate_decision
-    ):
-        return True
-    return False
 
 
 def _normalize_head_weights_and_options(
@@ -235,14 +221,27 @@ def _extract_calibrated_head_params(
     b = np.asarray(head.biases, dtype=np.float64).reshape(-1).copy()
     is_boolean = isinstance(f_def, BooleanField)
     is_zero_head = bool(not np.any(w) and not np.any(b))
+    raw_w_f32 = (
+        np.ascontiguousarray(head.weights, dtype=np.float32)[:1]
+        if is_boolean
+        else np.ascontiguousarray(head.weights, dtype=np.float32)
+    )
+    raw_b_f32 = (
+        np.ascontiguousarray(head.biases, dtype=np.float32).reshape(-1)[:1]
+        if is_boolean
+        else np.ascontiguousarray(head.biases, dtype=np.float32).reshape(-1)
+    )
+    cal_adj_2: Optional[np.ndarray] = None
 
     if adj_raw is not None:
         adj = np.asarray(adj_raw, dtype=np.float64).reshape(-1)
         if is_boolean or w.shape[0] == 1:
             if adj.size == 2:
                 delta_adj = float(adj[1] - adj[0])
+                cal_adj_2 = adj.astype(np.float64).copy()
             elif adj.size == 1:
                 delta_adj = float(adj[0])
+                cal_adj_2 = np.array([-0.5 * float(adj[0]), 0.5 * float(adj[0])], dtype=np.float64)
             else:
                 raise ValueError(
                     f"Unsupported logit_adjustments length {adj.size} for BooleanField {fname!r}"
@@ -282,6 +281,11 @@ def _extract_calibrated_head_params(
         "adj_eff": adj_eff,
         "learned_overrides": learned_overrides,
         "recency_weighted": eff_recency,
+        "raw_w_f32": raw_w_f32,
+        "raw_b_f32": raw_b_f32,
+        "base_scale": base_scale,
+        "cal_temp": temp,
+        "cal_adj_2": cal_adj_2,
     }
     return w, b, opts, thr, eff_scale, meta
 
@@ -347,6 +351,7 @@ class FastExplainer:
         learned_overrides: Optional[Mapping[str, Any]] = None,
         is_zero_head: bool = False,
         adj_eff: Optional[np.ndarray] = None,
+        _bool_raw_meta: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.projector = projector
         self.scale = float(temperature_scale)
@@ -382,6 +387,44 @@ class FastExplainer:
         else:
             self._adj_eff = np.zeros(1 if self._is_boolean else self.num_classes, dtype=np.float64)
 
+        self._bool_has_scalar_raw = False
+        self._bool_raw_w_f32 = np.empty((0, 0), dtype=np.float32)
+        self._bool_raw_b_f32 = np.empty(0, dtype=np.float32)
+        self._bool_raw_base_scale = 4.0
+        self._bool_cal_temp = 1.0
+        self._bool_cal_adj_2: Optional[np.ndarray] = None
+        if self._is_boolean:
+            if _bool_raw_meta is not None:
+                self._bool_has_scalar_raw = True
+                self._bool_raw_w_f32 = np.ascontiguousarray(_bool_raw_meta["raw_w_f32"], dtype=np.float32)[:1]
+                self._bool_raw_b_f32 = np.ascontiguousarray(
+                    _bool_raw_meta["raw_b_f32"], dtype=np.float32
+                ).reshape(-1)[:1]
+                self._bool_raw_base_scale = float(_bool_raw_meta["base_scale"])
+                self._bool_cal_temp = float(_bool_raw_meta["cal_temp"])
+                raw_c_adj = _bool_raw_meta.get("cal_adj_2")
+                self._bool_cal_adj_2 = (
+                    None if raw_c_adj is None else np.ascontiguousarray(raw_c_adj, dtype=np.float64).reshape(2)
+                )
+            elif w_in.ndim == 2 and w_in.shape[0] == 1:
+                self._bool_has_scalar_raw = True
+                self._bool_raw_w_f32 = np.ascontiguousarray(w_in[:1], dtype=np.float32)
+                b_flat = np.asarray(biases, dtype=np.float32).reshape(-1)
+                self._bool_raw_b_f32 = np.ascontiguousarray(
+                    b_flat[:1] if b_flat.size >= 1 else np.zeros(1, dtype=np.float32),
+                    dtype=np.float32,
+                )
+                self._bool_raw_base_scale = float(temperature_scale)
+                self._bool_cal_temp = 1.0
+                self._bool_cal_adj_2 = (
+                    np.array(
+                        [-0.5 * float(self._adj_eff[0]), 0.5 * float(self._adj_eff[0])],
+                        dtype=np.float64,
+                    )
+                    if (self._adj_eff.size == 1 and float(self._adj_eff[0]) != 0.0)
+                    else None
+                )
+
         if train_texts and train_labels:
             if len(train_texts) != len(train_labels):
                 raise ValueError("train_texts and train_labels must have equal length")
@@ -416,6 +459,7 @@ class FastExplainer:
 
         X_train = _project_texts(projector, self.train_texts, recency_weighted=self.recency_weighted)
         self.X_train_full = np.ascontiguousarray(X_train, dtype=np.float32)
+        self._cache_lock = threading.Lock()
 
         if self._mode == "hybrid":
             hp = projector
@@ -568,6 +612,7 @@ class FastExplainer:
             learned_overrides=meta["learned_overrides"],
             is_zero_head=meta["is_zero_head"],
             adj_eff=meta["adj_eff"],
+            _bool_raw_meta=meta,
         )
 
     @classmethod
@@ -583,7 +628,9 @@ class FastExplainer:
         """Build a FastExplainer bound to a live SystemOneEngine head."""
         if getattr(engine, "joint_calibrator", None) is not None:
             raise ValueError("FastExplainer does not support engines with active joint_calibrator")
-        if _has_custom_validate_decision(getattr(engine, "schema", None)):
+        if _has_custom_validate_decision(getattr(engine, "schema", None)) or _has_custom_validate_decision(
+            getattr(getattr(engine, "model", None), "schema", None)
+        ):
             raise ValueError("FastExplainer does not support custom DecisionSchema.validate_decision")
         fname = _canonical_explain_field(engine.model.schema, field_name)
         calibrators = getattr(engine, "calibrators", None)
@@ -610,6 +657,7 @@ class FastExplainer:
             learned_overrides=meta["learned_overrides"],
             is_zero_head=meta["is_zero_head"],
             adj_eff=meta["adj_eff"],
+            _bool_raw_meta=meta,
         )
 
     def _get_char_arr(
@@ -619,7 +667,7 @@ class FastExplainer:
         if entry is None:
             hits = self.tfidf._word_char_hits(w)
             if not hits:
-                entry = (np.empty(0, dtype=np.intp), np.empty(0, dtype=np.int32), False, (), ())
+                computed = (np.empty(0, dtype=np.intp), np.empty(0, dtype=np.int32), False, (), ())
             else:
                 u_idx, u_cnt = np.unique(np.asarray(hits, dtype=np.intp), return_counts=True)
                 has_mult = bool(np.any(u_cnt > 1))
@@ -627,9 +675,14 @@ class FastExplainer:
                 u_pair_tup = (
                     tuple((int(i), int(c)) for i, c in zip(u_idx_tup, u_cnt.tolist())) if has_mult else ()
                 )
-                entry = (u_idx, u_cnt.astype(np.int32), has_mult, u_idx_tup, u_pair_tup)
-            if len(self._char_arr_cache) < _MAX_EXPLAIN_OOV_CACHE:
-                self._char_arr_cache[w] = entry
+                computed = (u_idx, u_cnt.astype(np.int32), has_mult, u_idx_tup, u_pair_tup)
+            with self._cache_lock:
+                existing = self._char_arr_cache.get(w)
+                if existing is not None:
+                    return existing
+                if len(self._char_arr_cache) < _MAX_EXPLAIN_OOV_CACHE:
+                    self._char_arr_cache[w] = computed
+                entry = computed
         return entry
 
     def _get_word_dn_entry(
@@ -652,20 +705,30 @@ class FastExplainer:
                     if self.has_rbf and self.L_bucket_dn is not None
                     else None
                 )
-                entry = (h_word, sub_vec, sub_w, sub_l)
+                computed = (h_word, sub_vec, sub_w, sub_l)
             else:
-                entry = (h_word, None, None, None)
-            if len(self._word_dn_cache) < _MAX_EXPLAIN_OOV_CACHE:
-                self._word_dn_cache[w] = entry
+                computed = (h_word, None, None, None)
+            with self._cache_lock:
+                existing = self._word_dn_cache.get(w)
+                if existing is not None:
+                    return existing
+                if len(self._word_dn_cache) < _MAX_EXPLAIN_OOV_CACHE:
+                    self._word_dn_cache[w] = computed
+                entry = computed
         return entry
 
     def _bi_hash(self, a: str, b: str) -> int:
         key = (a, b)
         h = self._bi_hash_cache.get(key)
         if h is None:
-            h = self._hash_token(f"bi:{a}_{b}")
-            if len(self._bi_hash_cache) < _MAX_EXPLAIN_OOV_CACHE:
-                self._bi_hash_cache[key] = h
+            computed = self._hash_token(f"bi:{a}_{b}")
+            with self._cache_lock:
+                existing = self._bi_hash_cache.get(key)
+                if existing is not None:
+                    return existing
+                if len(self._bi_hash_cache) < _MAX_EXPLAIN_OOV_CACHE:
+                    self._bi_hash_cache[key] = computed
+                h = computed
         return h
 
     def _tokenize_spans(self, text: str) -> List[Tuple[int, int, str, str]]:
@@ -1172,6 +1235,51 @@ class FastExplainer:
         } if need_trace else None
         return u_dn, norm_dn, u_sc, norm_sc, trace
 
+    def _eval_boolean_raw_logit_f32(self, raw_logit: float) -> int:
+        if self.threshold <= 0.0:
+            return 1
+        if self.threshold > 1.0:
+            return 0
+        scaled_z = (
+            float(raw_logit) / 0.25
+            if self._bool_raw_base_scale == 4.0
+            else float(raw_logit) * self._bool_raw_base_scale
+        )
+        arr = np.array([-0.5 * scaled_z, 0.5 * scaled_z], dtype=np.float64)
+        if self._bool_cal_adj_2 is not None:
+            arr = arr + self._bool_cal_adj_2
+        scaled = arr / self._bool_cal_temp
+        s = scaled - float(np.max(scaled))
+        exp = np.exp(s)
+        prob_true = float((exp / float(np.sum(exp)))[1])
+        return 1 if prob_true >= self.threshold else 0
+
+    def _eval_boolean_embedding_winner(self, emb: np.ndarray) -> int:
+        x_f32 = np.asarray(emb, dtype=np.float32).reshape(1, -1)
+        raw_l = (x_f32 @ self._bool_raw_w_f32.T + self._bool_raw_b_f32).ravel()[0]
+        return self._eval_boolean_raw_logit_f32(float(raw_l))
+
+    def _eval_boolean_text_winner(self, text: str) -> int:
+        emb = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
+        return self._eval_boolean_embedding_winner(emb)
+
+    def _select_top2_text(self, text: str, logits: np.ndarray) -> Tuple[int, int]:
+        if self._is_boolean and self._bool_has_scalar_raw:
+            c1 = self._eval_boolean_text_winner(text)
+            return c1, (0 if c1 == 1 else 1)
+        return self._select_top2(logits)
+
+    def _select_winner_kept(
+        self,
+        logits: np.ndarray,
+        spans: List[Tuple[int, int, str, str]],
+        kept_mask: List[bool],
+    ) -> int:
+        if self._is_boolean and self._bool_has_scalar_raw:
+            kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
+            return self._eval_boolean_text_winner(kept_text)
+        return self._select_winner(logits)
+
     def _select_winner(self, logits: np.ndarray) -> int:
         if self._is_boolean and logits.size == 2:
             if self.threshold <= 0.0:
@@ -1204,9 +1312,15 @@ class FastExplainer:
     ) -> Tuple[int, np.ndarray]:
         if self._mode == "generic":
             kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
-            x_sub = _project_one(self.projector, kept_text, recency_weighted=self.recency_weighted).astype(np.float64)
+            x_sub_f32 = _project_one(self.projector, kept_text, recency_weighted=self.recency_weighted)
+            x_sub = x_sub_f32.astype(np.float64)
             logits = (self.W_eff @ x_sub) + self.b_eff
-            return self._select_winner(logits), logits
+            c_win = (
+                self._eval_boolean_embedding_winner(x_sub_f32)
+                if (self._is_boolean and self._bool_has_scalar_raw)
+                else self._select_winner(logits)
+            )
+            return c_win, logits
 
         act_idx, act_raw, norm_sp, _ = self._extract_tfidf_fast(text, spans, kept_mask=kept_mask, need_trace=False)
         if not self.is_hybrid:
@@ -1215,7 +1329,7 @@ class FastExplainer:
                 logits = (v_sp @ self.W_sp_T[act_idx]) + self.b_eff
             else:
                 logits = self.b_eff.copy()
-            return self._select_winner(logits), logits
+            return self._select_winner_kept(logits, spans, kept_mask), logits
 
         u_dn, norm_dn, u_sc, norm_sc, _ = self._extract_hybrid_dense_and_spec_fast(
             text, spans, kept_mask=kept_mask, need_trace=False
@@ -1240,7 +1354,7 @@ class FastExplainer:
                 logits = base_logits + self.W_rbf @ u_rbf
             else:
                 logits = base_logits
-            return self._select_winner(logits), logits
+            return self._select_winner_kept(logits, spans, kept_mask), logits
 
         g_sp = (self.w_sparse / base_norm) if sp_ok else 0.0
         g_dn = (self.w_dense / base_norm) if dn_ok else 0.0
@@ -1267,7 +1381,7 @@ class FastExplainer:
             if pnorm > 1e-12:
                 logits += self.W_rbf @ (phi / pnorm)
 
-        return self._select_winner(logits), logits
+        return self._select_winner_kept(logits, spans, kept_mask), logits
 
     def _accumulate_tfidf_span_attrs(
         self,
@@ -1329,9 +1443,14 @@ class FastExplainer:
         self, text: str, spans: List[Tuple[int, int, str, str]]
     ) -> Tuple[np.ndarray, int, int, float, List[float], List[float], float, float, np.ndarray]:
         n_spans = len(spans)
-        x_full = _project_one(self.projector, text, recency_weighted=self.recency_weighted).astype(np.float64)
+        x_f32 = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
+        x_full = x_f32.astype(np.float64)
         logits = (self.W_eff @ x_full) + self.b_eff
-        c1, c2 = self._select_top2(logits)
+        if self._is_boolean and self._bool_has_scalar_raw:
+            c1 = self._eval_boolean_embedding_winner(x_f32)
+            c2 = 0 if c1 == 1 else 1
+        else:
+            c1, c2 = self._select_top2(logits)
         margin = float(logits[c1] - logits[c2])
         sims_all = (self.X_train_full @ x_full.astype(np.float32)).astype(np.float64)
 
@@ -1374,13 +1493,18 @@ class FastExplainer:
                     z_raw = 12.0 if bool(ov_val) else -12.0
                     s_shifted = (z_raw * self.scale + float(self._adj_eff[0])) - self._bool_logit_shift
                     logits = np.array([-0.5 * s_shifted, 0.5 * s_shifted], dtype=np.float64)
+                    if self._bool_has_scalar_raw:
+                        c1 = self._eval_boolean_raw_logit_f32(z_raw)
+                        c2 = 0 if c1 == 1 else 1
+                    else:
+                        c1, c2 = self._select_top2(logits)
                 else:
                     z_raw = np.full(self.num_classes, -12.0, dtype=np.float64)
                     ov_lbl = _normalize_label_str(ov_val)
                     if ov_lbl in self.label_to_idx:
                         z_raw[self.label_to_idx[ov_lbl]] = 12.0
                     logits = z_raw * self.scale + self._adj_eff
-                c1, c2 = self._select_top2(logits)
+                    c1, c2 = self._select_top2(logits)
                 margin = float(logits[c1] - logits[c2])
                 t_attrs = [0.0] * n_spans
                 m_attrs = [0.0] * n_spans
@@ -1400,7 +1524,7 @@ class FastExplainer:
             v_sp = (act_raw / norm_sp).astype(np.float32).astype(np.float64) if sp_ok else act_raw
             logits = (v_sp @ self.W_sp_T[act_idx]) + self.b_eff if sp_ok else self.b_eff.copy()
 
-            c1, c2 = self._select_top2(logits)
+            c1, c2 = self._select_top2_text(text, logits)
             margin = float(logits[c1] - logits[c2])
 
             t_attrs = [0.0] * n_spans
@@ -1443,7 +1567,7 @@ class FastExplainer:
                     pnorm = float(np.linalg.norm(phi))
                     if pnorm > 1e-12:
                         logits = logits + self.W_rbf @ (phi / pnorm)
-                c1, c2 = self._select_top2(logits)
+                c1, c2 = self._select_top2_text(text, logits)
                 margin = float(logits[c1] - logits[c2])
                 t_attrs = [0.0] * n_spans
                 m_attrs = [0.0] * n_spans
@@ -1482,7 +1606,7 @@ class FastExplainer:
                     sims = np.empty(0, dtype=np.float64)
                     u_rbf = np.empty(0, dtype=np.float64)
 
-                c1, c2 = self._select_top2(logits)
+                c1, c2 = self._select_top2_text(text, logits)
                 margin = float(logits[c1] - logits[c2])
 
                 if self.has_rbf and self.W_rbf is not None and self.L_sp_T is not None:

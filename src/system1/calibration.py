@@ -1841,16 +1841,39 @@ class OnlineMondrianConformal:
         eta_u: float = 0.30,
         jump_w: float = 0.12,
     ) -> None:
-        if int(num_classes) < 1:
+        if isinstance(num_classes, bool) or not isinstance(num_classes, (int, np.integer)):
+            raise ValueError(f"num_classes must be an integer >= 1, got {num_classes!r}")
+        nc = int(num_classes)
+        if nc < 1:
             raise ValueError("num_classes must be >= 1")
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float, np.integer, np.floating)):
+            raise ValueError("alpha must be finite and in (0, 1)")
         a = float(alpha)
         if not math.isfinite(a) or not (0.0 < a < 1.0):
             raise ValueError("alpha must be finite and in (0, 1)")
-        self.num_classes = int(num_classes)
+        if gamma_aci is not None:
+            if isinstance(gamma_aci, bool) or not isinstance(gamma_aci, (int, float, np.integer, np.floating)):
+                raise ValueError(f"gamma_aci must be finite and positive, got {gamma_aci!r}")
+            g_aci = float(gamma_aci)
+            if not math.isfinite(g_aci) or g_aci <= 0.0:
+                raise ValueError(f"gamma_aci must be finite and positive, got {gamma_aci!r}")
+        else:
+            g_aci = max(0.03, 0.4 * a)
+        if isinstance(eta_u, bool) or not isinstance(eta_u, (int, float, np.integer, np.floating)):
+            raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
+        eta_val = float(eta_u)
+        if not math.isfinite(eta_val) or eta_val <= 0.0:
+            raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
+        if isinstance(jump_w, bool) or not isinstance(jump_w, (int, float, np.integer, np.floating)):
+            raise ValueError(f"jump_w must be finite and in [0, 1], got {jump_w!r}")
+        jump_val = float(jump_w)
+        if not math.isfinite(jump_val) or not (0.0 <= jump_val <= 1.0):
+            raise ValueError(f"jump_w must be finite and in [0, 1], got {jump_w!r}")
+        self.num_classes = nc
         self.alpha_target = a
-        self.gamma_aci = float(gamma_aci) if gamma_aci is not None else max(0.03, 0.4 * a)
-        self.eta_u = float(eta_u)
-        self.jump_w = float(jump_w)
+        self.gamma_aci = g_aci
+        self.eta_u = eta_val
+        self.jump_w = jump_val
         if q_init is not None:
             q0 = np.asarray(q_init, dtype=np.float64)
             if q0.shape != (self.num_classes,):
@@ -1885,18 +1908,33 @@ class OnlineMondrianConformal:
         probs: Optional[Sequence[float]] = None,
     ) -> None:
         """O(1) update after observing true class y and either (score_y, err_y) or probs."""
+        if isinstance(y, bool) or not isinstance(y, (int, np.integer)):
+            raise ValueError(f"Class index y must be an integer, got {y!r}")
         cls_idx = int(y)
         if cls_idx < 0 or cls_idx >= self.num_classes:
             raise IndexError(f"Class index {cls_idx} out of range [0, {self.num_classes})")
+        if err_y is not None and isinstance(err_y, (float, np.floating)) and not math.isfinite(float(err_y)):
+            raise ValueError(f"err_y must be finite, got {err_y!r}")
         if probs is not None:
             p_arr = np.asarray(probs, dtype=np.float64)
-            s_val = 1.0 - float(p_arr[cls_idx]) if score_y is None else float(score_y)
-            e_flag = (1 if s_val > float(self.q_c[cls_idx]) else 0) if err_y is None else (1 if err_y else 0)
+            if p_arr.ndim != 1 or p_arr.shape[0] != self.num_classes or not bool(np.all(np.isfinite(p_arr))):
+                raise ValueError(f"probs must be 1D finite with length {self.num_classes}")
+            if score_y is None:
+                s_val = 1.0 - float(p_arr[cls_idx])
+            else:
+                if isinstance(score_y, bool) or not isinstance(score_y, (int, float, np.integer, np.floating)):
+                    raise ValueError(f"score_y must be finite in [0, 1], got {score_y!r}")
+                s_val = float(score_y)
         else:
             if score_y is None:
                 raise ValueError("Either score_y or probs must be provided to update()")
+            if isinstance(score_y, bool) or not isinstance(score_y, (int, float, np.integer, np.floating)):
+                raise ValueError(f"score_y must be finite in [0, 1], got {score_y!r}")
             s_val = float(score_y)
-            e_flag = (1 if s_val > float(self.q_c[cls_idx]) else 0) if err_y is None else (1 if err_y else 0)
+        if not math.isfinite(s_val) or s_val < -1e-9 or s_val > 1.0 + 1e-9:
+            raise ValueError(f"Nonconformity score {s_val!r} must be finite in [0, 1]")
+        s_val = min(1.0, max(0.0, s_val))
+        e_flag = (1 if s_val > float(self.q_c[cls_idx]) else 0) if err_y is None else (1 if err_y else 0)
 
         s_clip = s_val if s_val < 1.0 - 1e-7 else (1.0 - 1e-7)
         u_obs = -math.log(max(1.0 - s_clip, 1e-7))
@@ -1954,13 +1992,35 @@ class OnlineMondrianConformal:
 
     @classmethod
     def from_state_dict(cls, data: Mapping[str, Any]) -> "OnlineMondrianConformal":
+        if not isinstance(data, Mapping):
+            raise ValueError("OnlineMondrianConformal state must be a mapping")
+        if "num_classes" not in data or "alpha_target" not in data:
+            raise ValueError("OnlineMondrianConformal state requires 'num_classes' and 'alpha_target'")
+        if "gamma_aci" in data:
+            gamma_val = data["gamma_aci"]
+            if gamma_val is None:
+                raise ValueError("gamma_aci cannot be None when explicitly present in state_dict")
+        else:
+            gamma_val = None
+        if "eta_u" in data:
+            eta_val = data["eta_u"]
+            if eta_val is None:
+                raise ValueError("eta_u cannot be None when explicitly present in state_dict")
+        else:
+            eta_val = 0.30
+        if "jump_w" in data:
+            jump_val = data["jump_w"]
+            if jump_val is None:
+                raise ValueError("jump_w cannot be None when explicitly present in state_dict")
+        else:
+            jump_val = 0.12
         obj = cls(
-            num_classes=int(data["num_classes"]),
-            alpha=float(data["alpha_target"]),
+            num_classes=data["num_classes"],
+            alpha=data["alpha_target"],
             q_init=None,
-            gamma_aci=data.get("gamma_aci"),
-            eta_u=float(data.get("eta_u", 0.30)),
-            jump_w=float(data.get("jump_w", 0.12)),
+            gamma_aci=gamma_val,
+            eta_u=eta_val,
+            jump_w=jump_val,
         )
         expected_shape = (obj.num_classes,)
         if "q_c" in data and data["q_c"] is not None:
@@ -1997,7 +2057,19 @@ class OnlineMondrianConformal:
             if float(np.min(e_arr)) < 0.0 or float(np.max(e_arr)) > 1.0:
                 raise ValueError("err_ewma values must lie in [0.0, 1.0]")
             obj.err_ewma = e_arr
-        steps = int(data.get("steps", 0))
+        raw_steps = data.get("steps", 0)
+        if isinstance(raw_steps, bool):
+            raise ValueError(f"steps must be a nonnegative integer, got {raw_steps!r}")
+        if isinstance(raw_steps, (int, np.integer)):
+            steps = int(raw_steps)
+        elif (
+            isinstance(raw_steps, (float, np.floating))
+            and math.isfinite(float(raw_steps))
+            and float(raw_steps).is_integer()
+        ):
+            steps = int(raw_steps)
+        else:
+            raise ValueError(f"steps must be a nonnegative integer, got {raw_steps!r}")
         if steps < 0:
             raise ValueError(f"steps must be nonnegative, got {steps}")
         obj.steps = steps
@@ -3200,7 +3272,11 @@ class BinaryPlattBetaCalibrator:
             p1 = arr
         else:
             raise ValueError(f"Expected 1D or 2D probabilities, got ndim={arr.ndim}")
-        return np.clip(p1, 1e-6, 1.0 - 1e-6)
+        if not bool(np.all(np.isfinite(arr))):
+            raise ValueError("BinaryPlattBetaCalibrator received non-finite probabilities")
+        if arr.size > 0 and (float(np.min(arr)) < -1e-9 or float(np.max(arr)) > 1.0 + 1e-9):
+            raise ValueError("BinaryPlattBetaCalibrator probabilities must lie in [0, 1]")
+        return np.where(p1 == 0.0, 0.0, np.clip(p1, 0.0, 1.0))
 
     def fit(self, probs: np.ndarray, y_true: np.ndarray) -> "BinaryPlattBetaCalibrator":
         p1 = self._extract_positive_probs(probs)
@@ -3216,9 +3292,10 @@ class BinaryPlattBetaCalibrator:
             self.mode = "identity"
             self.params_ = np.array([1.0, 0.0], dtype=np.float64)
             return self
+        p1_eps = np.clip(p1, 1e-6, 1.0 - 1e-6)
         if n < self.min_beta_samples:
             self.mode = "platt"
-            z = np.log(p1 / (1.0 - p1))
+            z = np.log(p1_eps / (1.0 - p1_eps))
 
             def _obj_platt(params: np.ndarray) -> Tuple[float, np.ndarray]:
                 w, c = float(params[0]), float(params[1])
@@ -3240,8 +3317,8 @@ class BinaryPlattBetaCalibrator:
             self.params_ = opt.copy()
         else:
             self.mode = "beta"
-            x_pos = np.log(p1)
-            x_neg = -np.log(1.0 - p1)
+            x_pos = np.log(p1_eps)
+            x_neg = -np.log(1.0 - p1_eps)
 
             def _obj_beta(params: np.ndarray) -> Tuple[float, np.ndarray]:
                 a, b, c = float(params[0]), float(params[1]), float(params[2])
@@ -3271,13 +3348,14 @@ class BinaryPlattBetaCalibrator:
         p1 = self._extract_positive_probs(probs)
         if self.mode == "identity":
             return p1
+        p1_eps = np.clip(p1, 1e-6, 1.0 - 1e-6)
         if self.mode == "platt":
             w, c = float(self.params_[0]), float(self.params_[1])
-            z = np.log(p1 / (1.0 - p1))
+            z = np.log(p1_eps / (1.0 - p1_eps))
             out = _expit_np(w * z + c)
         else:
             a, b, c = float(self.params_[0]), float(self.params_[1]), float(self.params_[2])
-            out = _expit_np(a * np.log(p1) - b * np.log(1.0 - p1) + c)
+            out = _expit_np(a * np.log(p1_eps) - b * np.log(1.0 - p1_eps) + c)
         return np.clip(np.asarray(out, dtype=np.float64), 1e-6, 1.0 - 1e-6)
 
     def predict_proba(self, probs: np.ndarray) -> np.ndarray:

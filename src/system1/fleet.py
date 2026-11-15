@@ -259,12 +259,17 @@ class MultiTenantSkillFleet:
             raise ValueError("classes must be non-empty")
         self.num_classes = len(self.classes)
         self.c2i = {c: i for i, c in enumerate(self.classes)}
-        self.W_base = np.asarray(W_base, dtype=np.float32)
-        self.b_base = np.asarray(b_base, dtype=np.float32).reshape(-1)
-        if self.W_base.ndim != 2 or self.W_base.shape[0] != self.num_classes:
-            raise ValueError(f"W_base shape {self.W_base.shape} must be ({self.num_classes}, D)")
+        with np.errstate(over="ignore", invalid="ignore"):
+            self.W_base = np.asarray(W_base, dtype=np.float32)
+            self.b_base = np.asarray(b_base, dtype=np.float32).reshape(-1)
+        if self.W_base.ndim != 2 or self.W_base.shape[0] != self.num_classes or self.W_base.shape[1] < 1:
+            raise ValueError(f"W_base shape {self.W_base.shape} must be ({self.num_classes}, >=1)")
         if self.b_base.shape[0] != self.num_classes:
             raise ValueError(f"b_base length {self.b_base.shape[0]} != num_classes {self.num_classes}")
+        if not bool(np.all(np.isfinite(self.W_base))) or float(np.max(np.abs(self.W_base))) > 1e12:
+            raise ValueError("W_base must contain finite values within [-1e12, 1e12]")
+        if not bool(np.all(np.isfinite(self.b_base))) or float(np.max(np.abs(self.b_base))) > 1e12:
+            raise ValueError("b_base must contain finite values within [-1e12, 1e12]")
 
         self.num_tenants = int(num_tenants)
         if self.num_tenants <= 0:
@@ -274,11 +279,17 @@ class MultiTenantSkillFleet:
         self.blk_sz = 16
         self.n_blk = self.r_sub // self.blk_sz
 
-        self.U_shared = (
-            _prepare_shared_subspace(self.W_base, self.r_sub)
-            if U_shared is None
-            else _adapt_subspace_width(U_shared, self.W_base, self.r_sub)
-        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            self.U_shared = (
+                _prepare_shared_subspace(self.W_base, self.r_sub)
+                if U_shared is None
+                else _adapt_subspace_width(U_shared, self.W_base, self.r_sub)
+            )
+        if (
+            self.U_shared.size > 0
+            and (not bool(np.all(np.isfinite(self.U_shared))) or float(np.max(np.abs(self.U_shared))) > 1e12)
+        ):
+            raise ValueError("U_shared must contain finite values within [-1e12, 1e12]")
         if base_tok_df is None:
             self.base_tok_df = np.zeros(self.BASE_HASH_SIZE, dtype=np.uint16)
         else:
@@ -289,10 +300,16 @@ class MultiTenantSkillFleet:
 
         self.m_sparse = max(0, int(m_sparse))
         self.m_exemplars = max(0, int(m_exemplars))
+        if isinstance(lam_rls, bool) or not isinstance(lam_rls, (int, float, np.integer, np.floating)):
+            raise ValueError(f"lam_rls must be finite in [1e-12, 1e12], got {lam_rls!r}")
         self.lam_rls = float(lam_rls)
-        if self.lam_rls <= 0.0:
-            raise ValueError(f"lam_rls must be positive, got {self.lam_rls}")
+        if not math.isfinite(self.lam_rls) or not (1e-12 <= self.lam_rls <= 1e12):
+            raise ValueError(f"lam_rls must be finite in [1e-12, 1e12], got {self.lam_rls!r}")
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float, np.integer, np.floating)):
+            raise ValueError(f"alpha must be finite in (0.0, 1.0), got {alpha!r}")
         self.alpha = float(alpha)
+        if not math.isfinite(self.alpha) or not (0.0 < self.alpha < 1.0):
+            raise ValueError(f"alpha must be finite in (0.0, 1.0), got {self.alpha!r}")
         self.token_cache_limit = max(0, int(token_cache_limit))
         self._tok_cache: OrderedDict[str, Tuple[int, ...]] = OrderedDict()
 
@@ -817,10 +834,24 @@ class MultiTenantSkillFleet:
         if pos != eocd or cd_count != entries:
             raise ValueError("Fleet snapshot central directory count/offset mismatch")
 
+    @staticmethod
+    def _materialize_snapshot_bytes(data: Any) -> bytes:
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise ValueError("Fleet snapshot data must be non-empty bytes")
+        mv = memoryview(data)
+        raw_len = mv.nbytes
+        if raw_len == 0:
+            raise ValueError("Fleet snapshot data must be non-empty bytes")
+        if raw_len > MAX_FLEET_ARCHIVE_RAW_BYTES:
+            raise ValueError(
+                f"Fleet snapshot raw size {raw_len} exceeds {MAX_FLEET_ARCHIVE_RAW_BYTES} bytes"
+            )
+        return data if type(data) is bytes else mv.tobytes()
+
     @classmethod
     def _preflight_snapshot_bytes(
         cls,
-        data: bytes,
+        data: Union[bytes, bytearray, memoryview],
         *,
         projector: Any,
         max_runtime_bytes: int,
@@ -828,16 +859,10 @@ class MultiTenantSkillFleet:
         """Validate fleet archive bounds, NPY headers, array dtypes/shapes, and memory budget."""
         import zipfile
 
-        if not isinstance(data, (bytes, bytearray, memoryview)) or len(data) == 0:
-            raise ValueError("Fleet snapshot data must be non-empty bytes")
-        if len(data) > MAX_FLEET_ARCHIVE_RAW_BYTES:
-            raise ValueError(
-                f"Fleet snapshot raw size {len(data)} exceeds {MAX_FLEET_ARCHIVE_RAW_BYTES} bytes"
-            )
-        if int(max_runtime_bytes) <= 0:
+        if isinstance(max_runtime_bytes, bool) or int(max_runtime_bytes) <= 0:
             raise ValueError(f"max_runtime_bytes must be positive, got {max_runtime_bytes}")
 
-        buf_bytes = data if isinstance(data, bytes) else bytes(data)
+        buf_bytes = cls._materialize_snapshot_bytes(data)
         cls._validate_zip_directory(buf_bytes)
 
         try:
@@ -990,10 +1015,33 @@ class MultiTenantSkillFleet:
         """Perform an O(1) per-tenant, per-class Mondrian conformal quantile update."""
         tid = self._validate_tid(tid)
         yi = self._resolve_class_idx(y)
+        if isinstance(eta_u, bool) or not isinstance(eta_u, (int, float, np.integer, np.floating)):
+            raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
+        eta_val = float(eta_u)
+        if not math.isfinite(eta_val) or eta_val <= 0.0:
+            raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
+        if isinstance(jump_w, bool) or not isinstance(jump_w, (int, float, np.integer, np.floating)):
+            raise ValueError(f"jump_w must be finite in [0.0, 1.0], got {jump_w!r}")
+        jump_val = float(jump_w)
+        if not math.isfinite(jump_val) or not (0.0 <= jump_val <= 1.0):
+            raise ValueError(f"jump_w must be finite in [0.0, 1.0], got {jump_w!r}")
+        if gamma_aci is not None:
+            if isinstance(gamma_aci, bool) or not isinstance(gamma_aci, (int, float, np.integer, np.floating)):
+                raise ValueError(f"gamma_aci must be finite and positive, got {gamma_aci!r}")
+            g_aci = float(gamma_aci)
+            if not math.isfinite(g_aci) or g_aci <= 0.0:
+                raise ValueError(f"gamma_aci must be finite and positive, got {gamma_aci!r}")
+        else:
+            g_aci = max(0.03, 0.4 * self.alpha)
+
         arr = np.asarray(probs_or_logits, dtype=np.float64).reshape(-1)
         if arr.shape[0] != self.num_classes:
             raise ValueError(f"Expected length {self.num_classes}, got {arr.shape[0]}")
+        if not bool(np.all(np.isfinite(arr))):
+            raise ValueError("probs_or_logits must contain only finite values")
         probs = _softmax_temp(arr, temp=0.25) if is_logits else arr
+        if not bool(np.all(np.isfinite(probs))):
+            raise ValueError("Computed probabilities from probs_or_logits contain non-finite values")
         score_y = 1.0 - float(np.clip(probs[yi], 0.0, 1.0))
 
         with self._lock:
@@ -1002,7 +1050,6 @@ class MultiTenantSkillFleet:
 
             s_clip = min(score_y, 1.0 - 1e-7)
             u_obs = min(16.0, -math.log(max(1.0 - s_clip, 1e-7)))
-            g_aci = float(gamma_aci) if gamma_aci is not None else max(0.03, 0.4 * self.alpha)
             alpha_min = max(0.015, 0.35 * self.alpha)
             alpha_max = min(0.40, 2.5 * self.alpha)
             fe = float(err_y)
@@ -1014,9 +1061,9 @@ class MultiTenantSkillFleet:
             a_next = min(max(a_next, alpha_min), alpha_max)
 
             u_cur = float(self.u_c[tid, yi])
-            u_next = u_cur + float(eta_u) * boost * (fe - a_next)
+            u_next = u_cur + eta_val * boost * (fe - a_next)
             if err_y and shift:
-                u_jump = (1.0 - float(jump_w)) * u_cur + float(jump_w) * min(u_obs, 15.5)
+                u_jump = (1.0 - jump_val) * u_cur + jump_val * min(u_obs, 15.5)
                 if u_jump > u_next:
                     u_next = u_jump
             u_next = min(max(u_next, 0.01), 16.0)
@@ -1035,7 +1082,41 @@ class MultiTenantSkillFleet:
 
     def fleet_delta_to_bytes(self) -> bytes:
         """Serialize all per-tenant arenas without the shared projector via compressed NumPy stream."""
+        def _pack_base_or_cov(arr: np.ndarray, name: str) -> np.ndarray:
+            arr_f32 = np.asarray(arr, dtype=np.float32)
+            if not bool(np.all(np.isfinite(arr_f32))):
+                raise ValueError(f"Fleet array {name!r} contains non-finite values")
+            if arr_f32.size == 0:
+                return arr_f32.astype(np.float16)
+            max_abs = float(np.max(np.abs(arr_f32)))
+            if max_abs > 1e12:
+                raise ValueError(f"Fleet array {name!r} exceeds safe float32 magnitude bound")
+            if max_abs <= 65500.0:
+                return arr_f32.astype(np.float16)
+            return arr_f32
+
         with self._lock:
+            for arena_name, arena_arr in (
+                ("dW_scale", self.dW_scale),
+                ("sp_w", self.sp_w),
+                ("ex_scales", self.ex_scales),
+                ("q_c", self.q_c),
+                ("u_c", self.u_c),
+                ("alpha_c", self.alpha_c),
+                ("err_ewma", self.err_ewma),
+            ):
+                if not bool(np.all(np.isfinite(arena_arr))):
+                    raise ValueError(f"Fleet array {arena_name!r} contains non-finite values")
+
+            q_init_f32 = np.asarray(self.q_init, dtype=np.float32)
+            if not bool(np.all(np.isfinite(q_init_f32))):
+                raise ValueError("Fleet array 'q_init' contains non-finite values")
+
+            w_out = _pack_base_or_cov(self.W_base, "W_base")
+            b_out = _pack_base_or_cov(self.b_base, "b_base")
+            u_out = _pack_base_or_cov(self.U_shared, "U_shared")
+            p_out = _pack_base_or_cov(self.P_blk, "P_blk")
+
             buf = io.BytesIO()
             classes_bytes = np.frombuffer(json.dumps(self.classes).encode("utf-8"), dtype=np.uint8)
             meta_ints = np.array([self.num_tenants, self.r_sub, self.m_sparse, self.m_exemplars], dtype=np.int64)
@@ -1045,14 +1126,14 @@ class MultiTenantSkillFleet:
                 meta_ints=meta_ints,
                 meta_floats=meta_floats,
                 classes_utf8=classes_bytes,
-                W_base=self.W_base.astype(np.float16),
-                b_base=self.b_base.astype(np.float16),
-                U_shared=self.U_shared.astype(np.float16),
+                W_base=w_out,
+                b_base=b_out,
+                U_shared=u_out,
                 base_tok_df=self.base_tok_df,
-                q_init=self.q_init.astype(np.float16),
+                q_init=q_init_f32,
                 dW_q=self.dW_q,
                 dW_scale=self.dW_scale,
-                P_blk=self.P_blk.astype(np.float16),
+                P_blk=p_out,
                 sp_hash=self.sp_hash,
                 sp_cls=self.sp_cls,
                 sp_w=self.sp_w,
@@ -1071,7 +1152,7 @@ class MultiTenantSkillFleet:
     @classmethod
     def fleet_delta_from_bytes(
         cls,
-        data: bytes,
+        data: Union[bytes, bytearray, memoryview],
         *,
         projector: Any,
         classes: Optional[Sequence[str]] = None,
@@ -1079,7 +1160,7 @@ class MultiTenantSkillFleet:
         max_runtime_bytes: int = MAX_FLEET_RUNTIME_BYTES,
     ) -> MultiTenantSkillFleet:
         """Restore a MultiTenantSkillFleet from bytes produced by `fleet_delta_to_bytes()`."""
-        raw_bytes = data if isinstance(data, bytes) else bytes(data)
+        raw_bytes = cls._materialize_snapshot_bytes(data)
         (T, K, R, M_sp, M_ex), _ = cls._preflight_snapshot_bytes(
             raw_bytes,
             projector=projector,
