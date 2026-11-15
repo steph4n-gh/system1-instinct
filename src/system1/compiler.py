@@ -2112,6 +2112,13 @@ class CompiledSystemOneModel:
             raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
         for w_val in raw_weights:
             _req_num(w_val, "spectral_weights")
+        try:
+            with np.errstate(over="ignore", invalid="ignore"):
+                spec_w_f32 = np.asarray([float(w_val) for w_val in raw_weights], dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Saved hybrid projector spectral weights are invalid") from exc
+        if not bool(np.all(np.isfinite(spec_w_f32))):
+            raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
 
         def _inline_or_map_f32(map_key: str, cfg_key: str) -> Optional[np.ndarray]:
             if map_key in array_map:
@@ -2354,11 +2361,15 @@ class CompiledSystemOneModel:
                 hp._spectral_terms = spec_terms
                 hp._spectral_vocab = {t: idx for idx, t in enumerate(spec_terms)}
                 hp._spectral_weights = spec_weights
-                hp._spectral_weights_arr = (
-                    np.asarray(spec_weights, dtype=np.float32)
-                    if spec_weights
-                    else np.empty(0, dtype=np.float32)
-                )
+                with np.errstate(over="ignore", invalid="ignore"):
+                    spec_w_arr = (
+                        np.asarray(spec_weights, dtype=np.float32)
+                        if spec_weights
+                        else np.empty(0, dtype=np.float32)
+                    )
+                if not bool(np.all(np.isfinite(spec_w_arr))):
+                    raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
+                hp._spectral_weights_arr = spec_w_arr
                 hp._spectral_vectors = _as_f32(array_map.get("_projector_spectral_vectors"))
                 hp._spectral_basis = _as_f32(array_map.get("_projector_spectral_basis"))
                 hp._subspace_components = _as_f32(array_map.get("_projector_subspace_components"))
@@ -2703,6 +2714,11 @@ class CompiledSystemOneModel:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
         return saved_tfidf, saved_prag, runtime_bytes
 
+    @staticmethod
+    def _is_readonly_mmap(mm: mmap.mmap) -> bool:
+        with memoryview(mm) as mv:
+            return bool(mv.readonly)
+
     @classmethod
     def _from_v3_buffer(
         cls,
@@ -2724,6 +2740,9 @@ class CompiledSystemOneModel:
             raise ValueError("Saved v3 skill file size is out of bounds")
         if isinstance(buf, bytearray):
             buf = memoryview(bytes(buf))
+        elif isinstance(buf, mmap.mmap):
+            if not cls._is_readonly_mmap(buf):
+                buf = memoryview(bytes(buf))
         elif isinstance(buf, memoryview):
             if not buf.c_contiguous:
                 buf = memoryview(buf.tobytes())
@@ -2731,11 +2750,12 @@ class CompiledSystemOneModel:
                 if buf.ndim != 1 or buf.format != "B":
                     buf = buf.cast("B")
                 buf_obj = getattr(buf, "obj", None)
-                if not buf.readonly or not (
-                    type(buf_obj) is bytes or isinstance(buf_obj, mmap.mmap)
-                ):
+                is_ro_backing = type(buf_obj) is bytes or (
+                    isinstance(buf_obj, mmap.mmap) and cls._is_readonly_mmap(buf_obj)
+                )
+                if not buf.readonly or not is_ro_backing:
                     buf = memoryview(buf.tobytes())
-        elif type(buf) is not bytes and not isinstance(buf, mmap.mmap):
+        elif type(buf) is not bytes:
             buf = memoryview(bytes(buf))
 
         magic, hdr_len = _V3_HDR_STRUCT.unpack_from(buf, 0)

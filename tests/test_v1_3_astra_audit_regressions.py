@@ -7,11 +7,15 @@ import copy
 import io
 import json
 import math
+import mmap
 import struct
+import sys
 import threading
+import time
 import types
 import warnings
 import zipfile
+from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 import numpy as np
@@ -1371,7 +1375,9 @@ def test_astra_10_fast_explainer_matches_calibrated_engine_and_rejects_nonlinear
         "api exception latency crash traceback failed",
     ]
     labels_mt = ["billing", "billing", "tech", "tech"]
-    proj_mt = HybridProjector(sparse_dim=64, dense_dim=32).fit(corpus_mt, labels=labels_mt, min_df=1)
+    proj_mt = HybridProjector(sparse_dim=64, dense_dim=32).fit(
+        corpus_mt, labels=labels_mt, min_df=1, direct_spectral=True
+    )
     m_mt = SystemOneCompiler(_OvExplainSchema, projector=proj_mt, dimension=proj_mt.dimension).compile(
         {"cat": list(zip(corpus_mt * 3, labels_mt * 3))},
         calibration_split=0.0,
@@ -1425,11 +1431,13 @@ def test_astra_10_fast_explainer_matches_calibrated_engine_and_rejects_nonlinear
         assert not t.is_alive()
     assert mt_errors == []
 
-    # F14: concurrent OOV cache writes near _MAX_EXPLAIN_OOV_CACHE must remain thread-safe and bounded.
+    # F14 / R5-14: concurrent OOV cache writes near _MAX_EXPLAIN_OOV_CACHE must contend on workers
+    # before filling remaining slots and remain strictly bounded.
     from system1 import explain as explain_mod
 
     cap_explainer = FastExplainer.from_engine(eng_mt, "cat")
-    cap_target = explain_mod._MAX_EXPLAIN_OOV_CACHE - 2
+    ref_explainer = FastExplainer.from_engine(eng_mt, "cat")
+    cap_target = explain_mod._MAX_EXPLAIN_OOV_CACHE - 4
     idx = 0
     while len(cap_explainer._char_arr_cache) < cap_target:
         cap_explainer._char_arr_cache[f"pf_{idx}"] = (
@@ -1448,36 +1456,85 @@ def test_astra_10_fast_explainer_matches_calibrated_engine_and_rejects_nonlinear
     while len(cap_explainer._bi_hash_cache) < cap_target:
         cap_explainer._bi_hash_cache[(f"pfa_{idx}", f"pfb_{idx}")] = idx
         idx += 1
+
+    base_char_keys = set(cap_explainer._char_arr_cache.keys())
+    base_word_keys = set(cap_explainer._word_dn_cache.keys())
+    base_bi_keys = set(cap_explainer._bi_hash_cache.keys())
+
     oov_prompts = [f"zzq_oov_{tid}_alpha zzq_oov_{tid}_beta" for tid in range(8)]
-    oov_refs = [cap_explainer.explain(p) for p in oov_prompts]
-    cap_barrier = threading.Barrier(8)
-    cap_errors: List[str] = []
+    oov_refs = [ref_explainer.explain(p) for p in oov_prompts]
 
-    def _cap_worker(tid: int) -> None:
-        try:
-            cap_barrier.wait(timeout=5.0)
-            for rep in range(6):
-                res = cap_explainer.explain(f"{oov_prompts[tid]} extra_{tid}_{rep}")
-                if res.additivity_error_target > 1e-6:
-                    cap_errors.append(f"tid={tid} err={res.additivity_error_target}")
+    def _run_oov_cap_wave(rnd: int, *, trace_preempt: bool = False) -> None:
+        for k in list(cap_explainer._char_arr_cache.keys()):
+            if k not in base_char_keys:
+                del cap_explainer._char_arr_cache[k]
+        for k in list(cap_explainer._word_dn_cache.keys()):
+            if k not in base_word_keys:
+                del cap_explainer._word_dn_cache[k]
+        for k in list(cap_explainer._bi_hash_cache.keys()):
+            if k not in base_bi_keys:
+                del cap_explainer._bi_hash_cache[k]
+        assert len(cap_explainer._char_arr_cache) == cap_target
+        assert len(cap_explainer._word_dn_cache) == cap_target
+        assert len(cap_explainer._bi_hash_cache) == cap_target
+
+        cap_barrier = threading.Barrier(8)
+        cap_errors: List[str] = []
+        trace_targets = {"_get_char_arr", "_get_word_dn_entry", "_bi_hash"}
+
+        def _preempt_trace(frame: Any, event: str, arg: Any) -> Any:
+            if event == "call":
+                return _preempt_trace if frame.f_code.co_name in trace_targets else None
+            if event == "line":
+                time.sleep(0.0005)
+            return _preempt_trace
+
+        def _cap_worker(tid: int) -> None:
+            try:
+                cap_barrier.wait(timeout=5.0)
+                if trace_preempt:
+                    sys.settrace(_preempt_trace)
+                try:
+                    res_ref = cap_explainer.explain(oov_prompts[tid])
+                finally:
+                    if trace_preempt:
+                        sys.settrace(None)
+                if res_ref.additivity_error_target > 1e-6:
+                    cap_errors.append(f"rnd={rnd} tid={tid} ref_err={res_ref.additivity_error_target}")
                     return
-                res_ref = cap_explainer.explain(oov_prompts[tid])
                 if res_ref.predicted_label != oov_refs[tid].predicted_label:
-                    cap_errors.append(f"tid={tid} label mismatch")
+                    cap_errors.append(f"rnd={rnd} tid={tid} label mismatch")
                     return
-        except Exception as exc:
-            cap_errors.append(repr(exc))
+                for rep in range(3):
+                    fresh_toks = " ".join(
+                        f"xq{rnd}_{tid}_{rep}_{j} yq{rnd}_{tid}_{rep}_{j}" for j in range(4)
+                    )
+                    res = cap_explainer.explain(f"{oov_prompts[tid]} {fresh_toks}")
+                    if res.additivity_error_target > 1e-6:
+                        cap_errors.append(f"rnd={rnd} tid={tid} err={res.additivity_error_target}")
+                        return
+            except Exception as exc:
+                cap_errors.append(repr(exc))
 
-    cap_threads = [threading.Thread(target=_cap_worker, args=(i,)) for i in range(8)]
-    for t in cap_threads:
-        t.start()
-    for t in cap_threads:
-        t.join(timeout=15.0)
-        assert not t.is_alive()
-    assert cap_errors == []
-    assert len(cap_explainer._char_arr_cache) <= explain_mod._MAX_EXPLAIN_OOV_CACHE
-    assert len(cap_explainer._word_dn_cache) <= explain_mod._MAX_EXPLAIN_OOV_CACHE
-    assert len(cap_explainer._bi_hash_cache) <= explain_mod._MAX_EXPLAIN_OOV_CACHE
+        cap_threads = [threading.Thread(target=_cap_worker, args=(i,)) for i in range(8)]
+        for t in cap_threads:
+            t.start()
+        for t in cap_threads:
+            t.join(timeout=15.0)
+            assert not t.is_alive()
+        assert cap_errors == []
+        assert len(cap_explainer._char_arr_cache) == explain_mod._MAX_EXPLAIN_OOV_CACHE
+        assert len(cap_explainer._word_dn_cache) == explain_mod._MAX_EXPLAIN_OOV_CACHE
+        assert len(cap_explainer._bi_hash_cache) == explain_mod._MAX_EXPLAIN_OOV_CACHE
+
+    old_switch = sys.getswitchinterval()
+    try:
+        sys.setswitchinterval(1e-6)
+        _run_oov_cap_wave(0, trace_preempt=True)
+        for rnd in range(1, 4):
+            _run_oov_cap_wave(rnd, trace_preempt=False)
+    finally:
+        sys.setswitchinterval(old_switch)
 
 
 def test_astra_11_smarts_router_honors_per_call_alpha() -> None:
@@ -1785,3 +1842,587 @@ def test_astra_17_guard_hook_lazy_sliding_window_uses_calibrated_exemplar_gate()
     )
     res_attack = hook.evaluate(attack_padded)
     assert res_attack.outcome == DecisionOutcome.DENY
+
+
+def test_astra_18_round5_regressions(tmp_path: Path) -> None:
+    """Round-5 GPT-6-Astra regression checks covering findings R5-1 through R5-13."""
+    from system1.calibration import DecisionCalibrator
+    from system1.compiler import MAGIC_HEADER_V3
+
+    def _set_head(cm: Any, field: str, w: np.ndarray, b: np.ndarray) -> None:
+        cm._field_heads[field].set_weights(w, b)
+        cm.heads[field].weights = np.ascontiguousarray(w, dtype=np.float32)
+        cm.heads[field].biases = np.ascontiguousarray(b, dtype=np.float32)
+
+    # R5-1: Packed float32/float16/float16_upcast calibration parity & non-finite fail-closed.
+    class _R5ChoiceSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"))
+
+    m_extreme = SystemOneCompiler(_R5ChoiceSchema, dimension=16).compile(
+        {"cat": [("alpha", "a"), ("beta", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    _set_head(
+        m_extreme,
+        "cat",
+        np.zeros((2, 16), dtype=np.float32),
+        np.array([1e38, 0.0], dtype=np.float32),
+    )
+    eng_extreme = SystemOneEngine(_R5ChoiceSchema, compiled_model=m_extreme, strict_mode=False, use_cache=False)
+    dec_extreme = eng_extreme.decide("probe", record_receipt=False)
+    assert math.isfinite(dec_extreme.confidences["cat"]) and dec_extreme.confidences["cat"] == pytest.approx(1.0)
+    k_f32 = eng_extreme.compile_packed_kernel(storage_mode="float32")
+    fn_f32 = eng_extreme.compile_callable(storage_mode="float32")
+    emb_probe = m_extreme.projector.project("probe").reshape(1, -1)
+    out_kf32 = k_f32.forward_embeddings(emb_probe, prompts=["probe"])
+    out_ff32 = fn_f32("probe")
+    assert math.isfinite(float(out_kf32["c_conf"][0, 0]))
+    assert math.isfinite(out_ff32.confidences["cat"])
+    assert out_ff32.values["cat"] == dec_extreme.values["cat"] == "a"
+    assert out_ff32.is_ambiguous == dec_extreme.is_ambiguous
+    assert bool(out_kf32["is_ambiguous"][0]) == dec_extreme.is_ambiguous
+    with pytest.raises(ValueError, match="float16"):
+        eng_extreme.compile_packed_kernel(storage_mode="float16")
+
+    m_f16_ok = SystemOneCompiler(_R5ChoiceSchema, dimension=16).compile(
+        {"cat": [("alpha", "a"), ("beta", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    _set_head(
+        m_f16_ok,
+        "cat",
+        np.zeros((2, 16), dtype=np.float32),
+        np.array([20000.0, 0.0], dtype=np.float32),
+    )
+    eng_f16 = SystemOneEngine(_R5ChoiceSchema, compiled_model=m_f16_ok, strict_mode=False, use_cache=False)
+    dec_f16 = eng_f16.decide("probe", record_receipt=False)
+    for smode in ("float16", "float16_upcast"):
+        km = eng_f16.compile_packed_kernel(storage_mode=smode)
+        fm = eng_f16.compile_callable(storage_mode=smode)
+        rk = km.forward_embeddings(emb_probe, prompts=["probe"])
+        rf = fm("probe")
+        assert math.isfinite(float(rk["c_conf"][0, 0]))
+        assert math.isfinite(rf.confidences["cat"])
+        assert rf.values["cat"] == dec_f16.values["cat"] == "a"
+
+    class _NonFiniteNoEscSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"), escalate_on_ambiguity=False)
+
+    m_nf = SystemOneCompiler(_NonFiniteNoEscSchema, dimension=16).compile(
+        {"cat": [("alpha", "a"), ("beta", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_nf = SystemOneEngine(_NonFiniteNoEscSchema, compiled_model=m_nf, strict_mode=False, use_cache=False)
+    eng_nf.learn("nan override probe", {"cat": "a"})
+    k_nf = eng_nf.compile_packed_kernel(storage_mode="float32")
+    fn_nf = eng_nf.compile_callable(storage_mode="float32")
+    out_k_nf = k_nf.forward_embeddings(np.full((1, 16), np.nan, dtype=np.float32), prompts=["nan override probe"])
+    assert bool(out_k_nf["is_ambiguous"][0]) is True
+    assert int(out_k_nf["in_c"][0, 0]) == 0
+    nan_emb = np.full(16, np.nan, dtype=np.float32)
+    out_f_nf_smallq = fn_nf(embedding=nan_emb)
+    out_f_nf_ov = fn_nf("nan override probe", embedding=nan_emb)
+    assert out_f_nf_smallq.is_ambiguous is True
+    assert math.isnan(out_f_nf_smallq.confidences["cat"])
+    assert out_f_nf_ov.is_ambiguous is True
+    assert math.isnan(out_f_nf_ov.confidences["cat"])
+    out_f_inf = fn_nf(embedding=np.full(16, np.inf, dtype=np.float32))
+    assert out_f_inf.is_ambiguous is True
+    assert math.isnan(out_f_inf.confidences["cat"])
+    _set_head(m_nf, "cat", np.zeros((2, 16), dtype=np.float32), np.zeros(2, dtype=np.float32))
+    eng_nf.learn("zero head nan probe", {"cat": "a"})
+    k_nf0 = eng_nf.compile_packed_kernel(storage_mode="float32")
+    fn_nf0 = eng_nf.compile_callable(storage_mode="float32")
+    out_k_nf0 = k_nf0.forward_embeddings(np.full((1, 16), np.nan, dtype=np.float32), prompts=["zero head nan probe"])
+    out_f_nf0 = fn_nf0("zero head nan probe", embedding=nan_emb)
+    assert bool(out_k_nf0["is_ambiguous"][0]) is True
+    assert math.isnan(float(out_k_nf0["c_conf"][0, 0]))
+    assert out_f_nf0.is_ambiguous is True
+    assert math.isnan(out_f_nf0.confidences["cat"])
+
+    # R5-2: Boolean threshold ULP boundary parity between Engine, PackedKernel, and FastDecisionCallable.
+    class _R5BoolSchema(DecisionSchema):
+        ok = BooleanField(threshold=0.75)
+
+    m_bool = SystemOneCompiler(_R5BoolSchema, dimension=16).compile(
+        {"ok": [("yes", True), ("no", False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    _set_head(
+        m_bool,
+        "ok",
+        np.zeros((1, 16), dtype=np.float32),
+        np.array([np.float32(0.35704898834228516)], dtype=np.float32),
+    )
+    eng_bool = SystemOneEngine(_R5BoolSchema, compiled_model=m_bool, strict_mode=False, use_cache=False)
+    cal_bool = DecisionCalibrator(temperature=1.3)
+    eng_bool.calibrators["ok"] = cal_bool
+
+    dec_b = eng_bool.decide("probe", record_receipt=False)
+    k_b = eng_bool.compile_packed_kernel(storage_mode="float32")
+    fn_b = eng_bool.compile_callable(storage_mode="float32")
+    rk_b = k_b.forward_embeddings(np.zeros((1, 16), dtype=np.float32), prompts=["probe"])
+    rf_b = fn_b("probe")
+    assert dec_b.values["ok"] is False
+    assert bool(rk_b["b_val"][0, 0]) is False
+    assert rf_b.values["ok"] is False
+
+    target_b_raw = 0.25 * 1.3 * math.log(0.75 / 0.25)
+    for ulp_step in range(-3, 4):
+        b_test = np.float32(target_b_raw)
+        if ulp_step > 0:
+            for _ in range(ulp_step):
+                b_test = np.nextafter(b_test, np.float32(np.inf))
+        elif ulp_step < 0:
+            for _ in range(-ulp_step):
+                b_test = np.nextafter(b_test, np.float32(-np.inf))
+        _set_head(
+            m_bool,
+            "ok",
+            np.zeros((1, 16), dtype=np.float32),
+            np.array([b_test], dtype=np.float32),
+        )
+        eng_b_ulp = SystemOneEngine(_R5BoolSchema, compiled_model=m_bool, strict_mode=False, use_cache=False)
+        eng_b_ulp.calibrators["ok"] = DecisionCalibrator(temperature=1.3)
+        d_u = eng_b_ulp.decide("probe", record_receipt=False)
+        k_u = eng_b_ulp.compile_packed_kernel(storage_mode="float32")
+        f_u = eng_b_ulp.compile_callable(storage_mode="float32")
+        rk_u = k_u.forward_embeddings(np.zeros((1, 16), dtype=np.float32), prompts=["probe"])
+        rf_u = f_u("probe")
+        assert bool(rk_u["b_val"][0, 0]) is d_u.values["ok"]
+        assert rf_u.values["ok"] is d_u.values["ok"]
+
+    # R5-3: Fitted non-direct_spectral HybridProjector and empty/punctuation Dense fallback parity in FastExplainer.
+    def _ind_calibrated_logits(eng_obj: SystemOneEngine, fname: str, sample: str) -> tuple[float, float]:
+        x_f32 = eng_obj.model.encode(sample).astype(np.float32).reshape(1, -1)
+        head_obj = eng_obj.model._field_heads[fname]
+        cal_obj = eng_obj.calibrators[fname]
+        f_def_obj = eng_obj.schema.fields[fname]
+        raw_f32 = (
+            x_f32 @ np.asarray(head_obj.weights, dtype=np.float32).T
+            + np.asarray(head_obj.biases, dtype=np.float32)
+        ).ravel()
+        scaled = raw_f32.astype(np.float64) / 0.25
+        temp_v = max(1e-4, float(getattr(cal_obj, "temperature", 1.0)))
+        adj_raw = getattr(cal_obj, "logit_adjustments", None)
+        if isinstance(f_def_obj, BooleanField):
+            delta_adj = (
+                float(adj_raw[1]) - float(adj_raw[0])
+                if (adj_raw is not None and len(adj_raw) == 2)
+                else (float(adj_raw[0]) if (adj_raw is not None and len(adj_raw) == 1) else 0.0)
+            )
+            thr_v = float(getattr(f_def_obj, "threshold", 0.5))
+            shift_v = (
+                0.0
+                if thr_v == 0.5
+                else (math.log(thr_v) - math.log1p(-thr_v) if 0.0 < thr_v < 1.0 else (-750.0 if thr_v <= 0.0 else 750.0))
+            )
+            s_cal_raw = (float(scaled[0]) + delta_adj) / temp_v
+            s_half = 0.5 * s_cal_raw
+            m_half = max(s_half, -s_half)
+            p_true = math.exp(s_half - m_half) / (math.exp(-s_half - m_half) + math.exp(s_half - m_half))
+            s_eff = s_cal_raw - shift_v
+            c1 = 1 if p_true >= thr_v else 0
+            c2 = 1 - c1
+            l2 = (-0.5 * s_eff, 0.5 * s_eff)
+            return float(l2[c1]), float(l2[c1] - l2[c2])
+        scaled_c = (
+            scaled + np.asarray(adj_raw, dtype=np.float64).reshape(-1)
+            if (adj_raw is not None and len(adj_raw) == len(f_def_obj.options))
+            else scaled
+        )
+        cal_l = scaled_c / temp_v
+        exps_c = np.exp(cal_l - float(np.max(cal_l)))
+        probs_c = exps_c / float(np.sum(exps_c))
+        c1 = int(np.argmax(probs_c))
+        c2 = max(
+            (j for j in range(len(f_def_obj.options)) if j != c1),
+            key=lambda j: (float(probs_c[j]), float(cal_l[j]), -j),
+        )
+        return float(cal_l[c1]), float(cal_l[c1] - cal_l[c2])
+
+    class _R5HybridSchema(DecisionSchema):
+        cat = ChoiceField(options=("billing", "tech"))
+        flag = BooleanField(threshold=0.5)
+
+    proj_nd = HybridProjector(sparse_dim=24, dense_dim=16).fit(
+        ["invoice refund payment charge billing", "server outage crash database error"],
+        min_df=1,
+    )
+    assert proj_nd._direct_spectral is False and proj_nd._spectral_basis is not None
+    m_nd = SystemOneCompiler(_R5HybridSchema, projector=proj_nd, dimension=proj_nd.dimension).compile(
+        {
+            "cat": [("invoice refund payment", "billing"), ("server outage crash", "tech")] * 3,
+            "flag": [("invoice refund payment", True), ("server outage crash", False)] * 3,
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_nd = SystemOneEngine(_R5HybridSchema, compiled_model=m_nd, strict_mode=False, use_cache=False)
+    for sample in ("invoice refund payment", "server outage crash", "", "   ", "!!!"):
+        dec_nd = eng_nd.decide(sample, record_receipt=False)
+        exp_nd_c = eng_nd.explain(sample, "cat", include_counterfactual=False)
+        exp_nd_b = eng_nd.explain(sample, "flag", include_counterfactual=False)
+        ind_t_c, ind_m_c = _ind_calibrated_logits(eng_nd, "cat", sample)
+        ind_t_b, ind_m_b = _ind_calibrated_logits(eng_nd, "flag", sample)
+        assert exp_nd_c.predicted_label == dec_nd.values["cat"]
+        assert exp_nd_c.predicted_logit == pytest.approx(ind_t_c, abs=1e-6)
+        assert sum(sp.target_logit_attr for sp in exp_nd_c.spans) + exp_nd_c.baseline_target_logit == pytest.approx(
+            ind_t_c, abs=1e-6
+        )
+        assert sum(sp.margin_attr for sp in exp_nd_c.spans) + exp_nd_c.baseline_margin == pytest.approx(
+            ind_m_c, abs=1e-6
+        )
+        assert exp_nd_b.predicted_label == ("True" if dec_nd.values["flag"] else "False")
+        assert exp_nd_b.predicted_logit == pytest.approx(ind_t_b, abs=1e-6)
+        assert sum(sp.target_logit_attr for sp in exp_nd_b.spans) + exp_nd_b.baseline_target_logit == pytest.approx(
+            ind_t_b, abs=1e-6
+        )
+        assert sum(sp.margin_attr for sp in exp_nd_b.spans) + exp_nd_b.baseline_margin == pytest.approx(
+            ind_m_b, abs=1e-6
+        )
+
+    # Boundary Choice decision between true spectral-blended margin and omitted-spectral margin.
+    m_nd_bnd = SystemOneCompiler(_R5ChoiceSchema, projector=proj_nd, dimension=proj_nd.dimension).compile(
+        {
+            "cat": [
+                ("invoice refund payment charge billing", "a"),
+                ("server outage crash database error", "b"),
+            ]
+            * 3
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_nd_bnd = SystemOneEngine(_R5ChoiceSchema, compiled_model=m_nd_bnd, strict_mode=False, use_cache=False)
+    sample_bnd = "invoice refund payment charge billing"
+    raw_bnd = (
+        eng_nd_bnd.model.encode(sample_bnd).reshape(1, -1)
+        @ m_nd_bnd._field_heads["cat"].weights.T
+        + m_nd_bnd._field_heads["cat"].biases
+    ).ravel()
+    true_bnd_margin = float((raw_bnd[0] - raw_bnd[1]) / 0.25)
+    b_bnd = m_nd_bnd._field_heads["cat"].biases.copy()
+    b_bnd[0] -= np.float32(0.25 * (true_bnd_margin - 0.008))
+    _set_head(m_nd_bnd, "cat", m_nd_bnd._field_heads["cat"].weights.copy(), b_bnd)
+    dec_bnd = eng_nd_bnd.decide(sample_bnd, record_receipt=False)
+    exp_bnd = eng_nd_bnd.explain(sample_bnd, "cat", include_counterfactual=False)
+    ind_t_bnd, ind_m_bnd = _ind_calibrated_logits(eng_nd_bnd, "cat", sample_bnd)
+    assert dec_bnd.values["cat"] == "a"
+    assert exp_bnd.predicted_label == "a"
+    assert exp_bnd.predicted_logit == pytest.approx(ind_t_bnd, abs=1e-6)
+    assert sum(sp.margin_attr for sp in exp_bnd.spans) + exp_bnd.baseline_margin == pytest.approx(ind_m_bnd, abs=1e-6)
+
+    proj_ds = HybridProjector(sparse_dim=24, dense_dim=16).fit(
+        ["invoice refund payment charge billing", "server outage crash database error"],
+        labels=["billing", "tech"],
+        min_df=1,
+        direct_spectral=True,
+    )
+    assert proj_ds._direct_spectral is True
+    m_ds = SystemOneCompiler(_R5HybridSchema, projector=proj_ds, dimension=proj_ds.dimension).compile(
+        {
+            "cat": [("invoice refund payment", "billing"), ("server outage crash", "tech")] * 3,
+            "flag": [("invoice refund payment", True), ("server outage crash", False)] * 3,
+        },
+        calibration_split=0.0,
+        augment=False,
+    )
+    eng_ds = SystemOneEngine(_R5HybridSchema, compiled_model=m_ds, strict_mode=False, use_cache=False)
+    for sample in ("", "   ", "!!!"):
+        dec_ds = eng_ds.decide(sample, record_receipt=False)
+        exp_ds_c = eng_ds.explain(sample, "cat", include_counterfactual=False)
+        exp_ds_b = eng_ds.explain(sample, "flag", include_counterfactual=False)
+        ind_t_c, ind_m_c = _ind_calibrated_logits(eng_ds, "cat", sample)
+        ind_t_b, ind_m_b = _ind_calibrated_logits(eng_ds, "flag", sample)
+        assert exp_ds_c.predicted_label == dec_ds.values["cat"]
+        assert exp_ds_c.predicted_logit == pytest.approx(ind_t_c, abs=1e-6)
+        assert sum(sp.target_logit_attr for sp in exp_ds_c.spans) + exp_ds_c.baseline_target_logit == pytest.approx(
+            ind_t_c, abs=1e-6
+        )
+        assert sum(sp.margin_attr for sp in exp_ds_c.spans) + exp_ds_c.baseline_margin == pytest.approx(
+            ind_m_c, abs=1e-6
+        )
+        assert exp_ds_b.predicted_label == ("True" if dec_ds.values["flag"] else "False")
+        assert exp_ds_b.predicted_logit == pytest.approx(ind_t_b, abs=1e-6)
+        assert sum(sp.target_logit_attr for sp in exp_ds_b.spans) + exp_ds_b.baseline_target_logit == pytest.approx(
+            ind_t_b, abs=1e-6
+        )
+        assert sum(sp.margin_attr for sp in exp_ds_b.spans) + exp_ds_b.baseline_margin == pytest.approx(
+            ind_m_b, abs=1e-6
+        )
+
+    # R5-4: Choice and Boolean exact float32 tie parity between Engine and FastExplainer.
+    m_tie = SystemOneCompiler(_R5ChoiceSchema, dimension=16).compile(
+        {"cat": [("alpha", "a"), ("beta", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    rng_tie = np.random.default_rng(0)
+    w_tie = np.zeros((2, 16), dtype=np.float32)
+    w_tie[0] = rng_tie.normal(size=16).astype(np.float32)
+    x_tie = m_tie.projector.project("tie probe text").astype(np.float32).reshape(1, -1)
+    b_tie = np.array([-float((x_tie @ w_tie.T)[0, 0]), 0.0], dtype=np.float32)
+    _set_head(m_tie, "cat", w_tie, b_tie)
+    eng_tie = SystemOneEngine(_R5ChoiceSchema, compiled_model=m_tie, strict_mode=False, use_cache=False)
+    dec_tie = eng_tie.decide("tie probe text", record_receipt=False)
+    exp_tie = eng_tie.explain("tie probe text", "cat", include_counterfactual=False)
+    assert dec_tie.values["cat"] == "a"
+    assert exp_tie.predicted_label == "a"
+    assert abs(exp_tie.margin) <= 1e-9
+    assert sum(sp.target_logit_attr for sp in exp_tie.spans) + exp_tie.baseline_target_logit == pytest.approx(0.0, abs=1e-9)
+    assert exp_tie.additivity_error_target <= 1e-6
+
+    class _R5TieBoolSchema(DecisionSchema):
+        ok = BooleanField(threshold=0.5)
+
+    m_tie_b = SystemOneCompiler(_R5TieBoolSchema, dimension=16).compile(
+        {"ok": [("yes", True), ("no", False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    w_tie_b = rng_tie.normal(size=(1, 16)).astype(np.float32)
+    x_tie_b = m_tie_b.projector.project("tie bool probe").astype(np.float32).reshape(1, -1)
+    b_tie_b = np.array([-float((x_tie_b @ w_tie_b.T)[0, 0])], dtype=np.float32)
+    _set_head(m_tie_b, "ok", w_tie_b, b_tie_b)
+    eng_tie_b = SystemOneEngine(_R5TieBoolSchema, compiled_model=m_tie_b, strict_mode=False, use_cache=False)
+    dec_tie_b = eng_tie_b.decide("tie bool probe", record_receipt=False)
+    exp_tie_b = eng_tie_b.explain("tie bool probe", "ok", include_counterfactual=False)
+    assert dec_tie_b.values["ok"] is True
+    assert exp_tie_b.predicted_label == "True"
+    assert abs(exp_tie_b.margin) <= 1e-9
+    assert exp_tie_b.additivity_error_target <= 1e-6
+
+    # R5-5 & R5-6: Setting eng.aci_tracker = None and mutating eng.schema after compile_callable().
+    m_r55 = SystemOneCompiler(_R5ChoiceSchema, dimension=16).compile(
+        {"cat": [("alpha item", "a"), ("beta item", "b")] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    _set_head(
+        m_r55,
+        "cat",
+        np.zeros((2, 16), dtype=np.float32),
+        np.array([0.08, -0.08], dtype=np.float32),
+    )
+    eng_r55 = SystemOneEngine(_R5ChoiceSchema, compiled_model=m_r55, strict_mode=True, use_cache=True)
+    eng_r55.calibrators["cat"] = DecisionCalibrator(temperature=1.0)
+    eng_r55.calibrators["cat"].is_calibrated = True
+    eng_r55.calibrators["cat"].qhat = 0.72
+    eng_r55.aci_tracker = AdaptiveConformalTracker(alpha_target=0.01, alpha_max=0.25, gamma=1.0)
+    fn_r55 = eng_r55.compile_callable()
+    assert eng_r55.decide("alpha item", record_receipt=False).is_ambiguous == fn_r55("alpha item").is_ambiguous
+    eng_r55.aci_tracker = None
+    dec_no_aci = eng_r55.decide("alpha item", record_receipt=False)
+    fn_no_aci = fn_r55("alpha item")
+    assert fn_no_aci.is_ambiguous == dec_no_aci.is_ambiguous
+
+    class _OverrideValidateSchema(DecisionSchema):
+        cat = ChoiceField(options=("a", "b"))
+
+        def validate_decision(self, values: Any) -> Dict[str, Any]:
+            out = super().validate_decision(values)
+            out["cat"] = "b"
+            return out
+
+    eng_r55.schema = _OverrideValidateSchema()
+    with pytest.raises(ValueError, match="validate_decision"):
+        fn_r55("alpha item")
+    with pytest.raises(ValueError, match="validate_decision"):
+        eng_r55.compile_packed_kernel()
+
+    class _AltBoolSchemaA(DecisionSchema):
+        ok = BooleanField(threshold=0.2)
+
+    class _AltBoolSchemaB(DecisionSchema):
+        ok = BooleanField(threshold=0.9)
+
+    m_s6 = SystemOneCompiler(_AltBoolSchemaA, dimension=16).compile(
+        {"ok": [("yes", True), ("no", False)] * 3},
+        calibration_split=0.0,
+        augment=False,
+    )
+    _set_head(
+        m_s6,
+        "ok",
+        np.zeros((1, 16), dtype=np.float32),
+        np.array([0.0], dtype=np.float32),
+    )
+    eng_s6 = SystemOneEngine(_AltBoolSchemaA, compiled_model=m_s6, strict_mode=False, use_cache=True)
+    fn_s6 = eng_s6.compile_callable()
+    assert fn_s6("probe").values["ok"] is True
+    eng_s6.schema = _AltBoolSchemaB()
+    assert eng_s6.decide("probe", record_receipt=False).values["ok"] is False
+    assert fn_s6("probe").values["ok"] is False
+    k_s6 = eng_s6.compile_packed_kernel()
+    assert bool(k_s6.forward_embeddings(np.zeros((1, 16), dtype=np.float32))["b_val"][0, 0]) is False
+
+    # R5-7: HybridProjector.spectral_weights float32 overflow must fail validation on embed_vocab=True and False.
+    for ev_flag in (True, False):
+        m_v3_hp = SystemOneCompiler(_R5ChoiceSchema, projector=proj_nd, dimension=proj_nd.dimension).compile(
+            {"cat": [("invoice refund", "a"), ("server outage", "b")] * 3},
+            calibration_split=0.0,
+            augment=False,
+        )
+        raw_hp_bytes = bytearray(m_v3_hp.to_bytes(compact=False, format_version=3, embed_vocab=ev_flag))
+        _, hlen_hp = struct.unpack_from("<8sQ", raw_hp_bytes, 0)
+        hdr_hp = json.loads(bytes(raw_hp_bytes[16 : 16 + hlen_hp]).decode("utf-8"))
+        n_spec_w = len(hdr_hp["projector"]["spectral_weights"])
+        assert n_spec_w >= 1
+        hdr_hp["projector"]["spectral_weights"] = [1e40] + [1.0] * (n_spec_w - 1)
+        new_hdr_hp = json.dumps(hdr_hp, sort_keys=True).encode("utf-8")
+        first_off_hp = min(spec["offset"] for spec in hdr_hp["tensors"].values())
+        assert 16 + len(new_hdr_hp) <= first_off_hp
+        struct.pack_into("<8sQ", raw_hp_bytes, 0, MAGIC_HEADER_V3, len(new_hdr_hp))
+        raw_hp_bytes[16 : 16 + first_off_hp - 16] = new_hdr_hp.ljust(first_off_hp - 16, b" ")
+        with pytest.raises(ValueError, match="spectral weights"):
+            CompiledSystemOneModel.from_bytes(bytes(raw_hp_bytes))
+    bad_hp_cfg = proj_nd.to_config()
+    bad_hp_cfg["spectral_weights"] = [1e40] + [1.0] * (len(proj_nd._spectral_terms) - 1)
+    with pytest.raises(ValueError, match="spectral weights"):
+        HybridProjector.from_config(bad_hp_cfg)
+
+    # R5-8: Writable mmap and readonly view over writable mmap must freeze against post-load mutation.
+    raw_v3_ok = m_bool.to_bytes(compact=False, format_version=3)
+    mm_rw = mmap.mmap(-1, len(raw_v3_ok))
+    try:
+        mm_rw.write(raw_v3_ok)
+        loaded_mm = CompiledSystemOneModel._from_v3_buffer(mm_rw, len(raw_v3_ok))
+        w_before = loaded_mm.heads["ok"].biases.copy()
+        mm_rw[:] = b"\x00" * len(raw_v3_ok)
+        np.testing.assert_array_equal(loaded_mm.heads["ok"].biases, w_before)
+    finally:
+        mm_rw.close()
+
+    mm_ro_view_rw = mmap.mmap(-1, len(raw_v3_ok))
+    try:
+        mm_ro_view_rw.write(raw_v3_ok)
+        with memoryview(mm_ro_view_rw).toreadonly() as mv_ro:
+            loaded_mv = CompiledSystemOneModel._from_v3_buffer(mv_ro, len(raw_v3_ok))
+            loaded_fb = CompiledSystemOneModel.from_bytes(mv_ro)
+        b_before = loaded_mv.heads["ok"].biases.copy()
+        mm_ro_view_rw[:] = b"\x00" * len(raw_v3_ok)
+        np.testing.assert_array_equal(loaded_mv.heads["ok"].biases, b_before)
+        np.testing.assert_array_equal(loaded_fb.heads["ok"].biases, b_before)
+    finally:
+        mm_ro_view_rw.close()
+
+    # R5-9: MultiTenantSkillFleet preserves P_blk float32 precision for lam_rls=1e8 and 1e12.
+    class _SmallProj:
+        dimension = 16
+
+        def project(self, text: str) -> np.ndarray:
+            v = np.zeros(16, dtype=np.float32)
+            v[sum(ord(c) for c in text) % 16] = 1.0
+            return v
+
+    sproj = _SmallProj()
+    for lam_val in (1e8, 1e12):
+        fl = MultiTenantSkillFleet(
+            sproj,
+            classes=("a", "b"),
+            W_base=np.zeros((2, 16), dtype=np.float32),
+            b_base=np.zeros(2, dtype=np.float32),
+            num_tenants=2,
+            r_sub=16,
+            lam_rls=lam_val,
+        )
+        fl_rest = MultiTenantSkillFleet.fleet_delta_from_bytes(fl.fleet_delta_to_bytes(), projector=sproj)
+        diag_expected = 1.0 / lam_val
+        assert float(fl_rest.P_blk[0, 0, 0, 0]) == pytest.approx(diag_expected, rel=1e-4)
+        np.testing.assert_allclose(fl_rest.P_blk, fl.P_blk, rtol=1e-6, atol=0.0)
+        assert float(np.max(np.abs(fl_rest.P_blk))) > 0.0
+
+    fl_adapt = MultiTenantSkillFleet(
+        sproj,
+        classes=("a", "b"),
+        W_base=np.zeros((2, 16), dtype=np.float32),
+        b_base=np.zeros(2, dtype=np.float32),
+        num_tenants=2,
+        r_sub=16,
+        lam_rls=1e5,
+    )
+    fl_adapt_rest = MultiTenantSkillFleet.fleet_delta_from_bytes(
+        fl_adapt.fleet_delta_to_bytes(), projector=sproj
+    )
+    assert float(fl_adapt_rest.P_blk[0, 0, 0, 0]) == pytest.approx(1e-5, rel=1e-4)
+    fl_adapt_rest.adapt_tenant_batch(0, ["strong signal"], ["a"], epochs=1)
+    assert float(np.max(np.abs(fl_adapt_rest.dW_q[0]))) > 0
+
+    # R5-10: Extreme alpha in float64 survives MultiTenantSkillFleet snapshot round-trip.
+    for alpha_ok in (1e-12, 0.99999):
+        fl_a = MultiTenantSkillFleet(
+            sproj,
+            classes=("a", "b"),
+            W_base=np.zeros((2, 16), dtype=np.float32),
+            b_base=np.zeros(2, dtype=np.float32),
+            num_tenants=2,
+            r_sub=16,
+            alpha=alpha_ok,
+        )
+        fl_a_rest = MultiTenantSkillFleet.fleet_delta_from_bytes(fl_a.fleet_delta_to_bytes(), projector=sproj)
+        assert fl_a_rest.alpha_c.dtype == np.dtype(np.float64)
+        np.testing.assert_allclose(fl_a_rest.alpha_c, alpha_ok, rtol=1e-12, atol=0.0)
+
+    # R5-11: q_init and restored float32 q_c round conservatively UPWARD in float16.
+    fl_q = MultiTenantSkillFleet(
+        sproj,
+        classes=("a", "b"),
+        W_base=np.zeros((2, 16), dtype=np.float32),
+        b_base=np.array([0.25 * math.log(0.49995 / 0.50005), 0.0], dtype=np.float32),
+        num_tenants=1,
+        r_sub=16,
+        q_init=np.array([0.5001, 0.4], dtype=np.float32),
+    )
+    assert float(fl_q.q_c[0, 0]) >= 0.5001
+    assert "a" in fl_q.decide(0, "probe").conformal_set
+    snap_q = fl_q.fleet_delta_to_bytes()
+    q32_arr = np.full((1, 2), np.array([0.5001, 0.4], dtype=np.float32), dtype=np.float32)
+    q32_buf = io.BytesIO()
+    np.save(q32_buf, q32_arr, allow_pickle=False)
+    fl_q_rest = MultiTenantSkillFleet.fleet_delta_from_bytes(
+        _rewrite_zip_members(snap_q, {"q_c.npy": q32_buf.getvalue()}),
+        projector=sproj,
+    )
+    assert float(fl_q_rest.q_c[0, 0]) >= 0.5001
+    assert "a" in fl_q_rest.decide(0, "probe").conformal_set
+
+    # R5-12: OnlineMondrianConformal and MultiTenantSkillFleet strict probs/bool/float validation.
+    omc = OnlineMondrianConformal(num_classes=2, alpha=0.1)
+    q_snap = omc.q_c.copy()
+    with pytest.raises(ValueError, match="probs"):
+        omc.update(0, probs=[0.5, 2.0])
+    with pytest.raises(ValueError, match="probs"):
+        omc.update(0, score_y=0.25, probs=[2.0, -1.0])
+    np.testing.assert_array_equal(omc.q_c, q_snap)
+
+    fl_v = MultiTenantSkillFleet(
+        sproj,
+        classes=("a", "b"),
+        W_base=np.zeros((2, 16), dtype=np.float32),
+        b_base=np.zeros(2, dtype=np.float32),
+        num_tenants=3,
+        r_sub=16,
+    )
+    fl_q_before = fl_v.q_c.copy()
+    for bad_tid in (True, 1.5):
+        with pytest.raises(ValueError, match="tenant_id"):
+            fl_v.update_conformal(bad_tid, 0, np.array([0.6, 0.4]))  # type: ignore[arg-type]
+    for bad_y in (True, 1.5):
+        with pytest.raises(ValueError, match="Class label"):
+            fl_v.update_conformal(0, bad_y, np.array([0.6, 0.4]))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Probabilities"):
+        fl_v.update_conformal(0, 0, np.array([0.5, 2.0]), is_logits=False)
+    np.testing.assert_array_equal(fl_v.q_c, fl_q_before)
+
+    # R5-13: UniversalDecisionService rejects non-bool require_auth values.
+    for bad_req_auth in (None, 0, "", 1, "false"):
+        with pytest.raises(ValueError, match="require_auth"):
+            UniversalDecisionService(
+                upstream_handlers={"gemini": _mock_universal_handler},
+                require_auth=bad_req_auth,  # type: ignore[arg-type]
+            )

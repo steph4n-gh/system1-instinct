@@ -1919,6 +1919,8 @@ class OnlineMondrianConformal:
             p_arr = np.asarray(probs, dtype=np.float64)
             if p_arr.ndim != 1 or p_arr.shape[0] != self.num_classes or not bool(np.all(np.isfinite(p_arr))):
                 raise ValueError(f"probs must be 1D finite with length {self.num_classes}")
+            if not bool(np.all((p_arr >= 0.0) & (p_arr <= 1.0))):
+                raise ValueError("probs entries must lie in [0.0, 1.0]")
             if score_y is None:
                 s_val = 1.0 - float(p_arr[cls_idx])
             else:

@@ -2412,6 +2412,9 @@ class PackedMultiQuestionKernel:
         b_adj_div_temp: Optional[np.ndarray] = None,
         b_zero_head: Optional[np.ndarray] = None,
         s_zero_head: Optional[np.ndarray] = None,
+        c_adj: Optional[Tuple[np.ndarray, ...]] = None,
+        b_adj0: Optional[np.ndarray] = None,
+        b_adj1: Optional[np.ndarray] = None,
     ) -> None:
         self.projector = projector
         self.dimension = dimension
@@ -2520,10 +2523,34 @@ class PackedMultiQuestionKernel:
             if c_temp is not None
             else np.ones(self.Q_c, dtype=np.float64)
         )
-        self.c_adj_div_temp: Tuple[np.ndarray, ...] = (
-            tuple(np.asarray(arr, dtype=np.float64) for arr in c_adj_div_temp)
-            if c_adj_div_temp is not None
-            else tuple(np.zeros(int(k), dtype=np.float64) for k in self.c_K)
+        if c_adj is not None:
+            self.c_adj: Tuple[np.ndarray, ...] = tuple(
+                np.asarray(arr, dtype=np.float64).reshape(-1) for arr in c_adj
+            )
+            self.c_adj_div_temp = tuple(
+                arr / float(t) for arr, t in zip(self.c_adj, self.c_temp)
+            )
+        elif c_adj_div_temp is not None:
+            self.c_adj_div_temp = tuple(
+                np.asarray(arr, dtype=np.float64).reshape(-1) for arr in c_adj_div_temp
+            )
+            self.c_adj = tuple(
+                arr * float(t) for arr, t in zip(self.c_adj_div_temp, self.c_temp)
+            )
+        else:
+            self.c_adj = tuple(np.zeros(int(k), dtype=np.float64) for k in self.c_K)
+            self.c_adj_div_temp = tuple(
+                np.zeros(int(k), dtype=np.float64) for k in self.c_K
+            )
+        self.c_adj_flat = (
+            np.ascontiguousarray(np.concatenate(self.c_adj), dtype=np.float64)
+            if self.Q_c
+            else np.empty(0, dtype=np.float64)
+        )
+        self.c_temp_flat = (
+            np.ascontiguousarray(self.c_temp[self.c_seg_idx], dtype=np.float64)
+            if self.Q_c
+            else np.empty(0, dtype=np.float64)
         )
         self.c_zero_head = (
             np.asarray(c_zero_head, dtype=bool)
@@ -2535,11 +2562,18 @@ class PackedMultiQuestionKernel:
             if b_temp is not None
             else np.ones(self.Q_b, dtype=np.float64)
         )
-        self.b_adj_div_temp = (
-            np.asarray(b_adj_div_temp, dtype=np.float64)
-            if b_adj_div_temp is not None
-            else np.zeros(self.Q_b, dtype=np.float64)
-        )
+        if b_adj0 is not None and b_adj1 is not None:
+            self.b_adj0 = np.asarray(b_adj0, dtype=np.float64).reshape(-1)
+            self.b_adj1 = np.asarray(b_adj1, dtype=np.float64).reshape(-1)
+            self.b_adj_div_temp = (self.b_adj1 - self.b_adj0) / self.b_temp
+        elif b_adj_div_temp is not None:
+            self.b_adj_div_temp = np.asarray(b_adj_div_temp, dtype=np.float64).reshape(-1)
+            self.b_adj0 = np.zeros(self.Q_b, dtype=np.float64)
+            self.b_adj1 = self.b_adj_div_temp * self.b_temp
+        else:
+            self.b_adj0 = np.zeros(self.Q_b, dtype=np.float64)
+            self.b_adj1 = np.zeros(self.Q_b, dtype=np.float64)
+            self.b_adj_div_temp = np.zeros(self.Q_b, dtype=np.float64)
         self.b_zero_head = (
             np.asarray(b_zero_head, dtype=bool)
             if b_zero_head is not None
@@ -2661,7 +2695,7 @@ class PackedMultiQuestionKernel:
         c_tau0: List[float] = []
         c_escalate: List[bool] = []
         c_temp: List[float] = []
-        c_adj_div_temp: List[np.ndarray] = []
+        c_adj: List[np.ndarray] = []
         c_zero_head: List[bool] = []
 
         bool_names: List[str] = []
@@ -2674,7 +2708,8 @@ class PackedMultiQuestionKernel:
         b_tau0: List[float] = []
         b_escalate: List[bool] = []
         b_temp: List[float] = []
-        b_adj_div_temp: List[float] = []
+        b_adj0: List[float] = []
+        b_adj1: List[float] = []
         b_zero_head: List[bool] = []
 
         score_names: List[str] = []
@@ -2728,16 +2763,20 @@ class PackedMultiQuestionKernel:
                 K = len(f_def.options)
                 c_K.append(K)
                 cal = eng.calibrators[fname]
-                temp = max(1e-4, float(cal.temperature))
-                W = np.asarray(head.weights, dtype=np.float64) / (0.25 * temp)
-                b = np.asarray(head.biases, dtype=np.float64).reshape(-1) / (0.25 * temp)
-                if getattr(cal, "logit_adjustments", None) is not None:
-                    adj_vec = np.asarray(cal.logit_adjustments, dtype=np.float64) / temp
-                    b = b + adj_vec
+                temp = float(cal.temperature)
+                if not math.isfinite(temp) or temp <= 0.0:
+                    raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
+                W = np.asarray(head.weights, dtype=np.float64)
+                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)
+                raw_adj = getattr(cal, "logit_adjustments", None)
+                if raw_adj is not None:
+                    adj_vec = np.asarray(raw_adj, dtype=np.float64).reshape(-1)
+                    if adj_vec.shape[0] != K or not np.all(np.isfinite(adj_vec)):
+                        raise ValueError(f"Invalid calibrator logit_adjustments for {fname!r}")
                 else:
                     adj_vec = np.zeros(K, dtype=np.float64)
                 c_temp.append(temp)
-                c_adj_div_temp.append(adj_vec)
+                c_adj.append(adj_vec)
                 c_zero_head.append(bool(not np.any(head.weights) and not np.any(head.biases)))
                 W_cols.append(W.T)
                 b_cols.append(b)
@@ -2766,15 +2805,29 @@ class PackedMultiQuestionKernel:
                 cp = _validate_cp(fname)
                 bool_names.append(fname)
                 cal = eng.calibrators[fname]
-                temp = max(1e-4, float(cal.temperature))
-                W = np.asarray(head.weights, dtype=np.float64)[:1] / (0.25 * temp)
-                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)[:1] / (0.25 * temp)
+                temp = float(cal.temperature)
+                if not math.isfinite(temp) or temp <= 0.0:
+                    raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
+                W = np.asarray(head.weights, dtype=np.float64)[:1]
+                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)[:1]
                 adj = getattr(cal, "logit_adjustments", None)
-                adj_scalar = (float(adj[1]) - float(adj[0])) / temp if (adj is not None and len(adj) == 2) else 0.0
-                if adj_scalar != 0.0:
-                    b = b + adj_scalar
+                if adj is not None and len(adj) == 2:
+                    adj0_val = float(adj[0])
+                    adj1_val = float(adj[1])
+                    if not (math.isfinite(adj0_val) and math.isfinite(adj1_val)):
+                        raise ValueError(f"Invalid calibrator logit_adjustments for {fname!r}")
+                elif adj is not None and len(adj) != 0:
+                    adj_arr = np.asarray(adj, dtype=np.float64).reshape(-1)
+                    if not np.all(np.isfinite(adj_arr)):
+                        raise ValueError(f"Invalid calibrator logit_adjustments for {fname!r}")
+                    adj0_val = 0.0
+                    adj1_val = 0.0
+                else:
+                    adj0_val = 0.0
+                    adj1_val = 0.0
                 b_temp.append(temp)
-                b_adj_div_temp.append(adj_scalar)
+                b_adj0.append(adj0_val)
+                b_adj1.append(adj1_val)
                 b_zero_head.append(bool(not np.any(head.weights) and not np.any(head.biases)))
                 W_cols.append(W.T)
                 b_cols.append(b)
@@ -2800,9 +2853,12 @@ class PackedMultiQuestionKernel:
                 head = _validate_head(fname)
                 score_names.append(fname)
                 cal = eng.calibrators[fname]
-                temp = max(1e-4, float(cal.temperature))
-                W = np.asarray(head.weights, dtype=np.float64)[:1] / (0.25 * temp)
-                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)[:1] / (0.25 * temp)
+                raw_t = float(cal.temperature)
+                if not math.isfinite(raw_t) or raw_t <= 0.0:
+                    raise ValueError(f"Invalid calibrator temperature for {fname!r}: {raw_t!r}")
+                temp = max(1e-4, raw_t)
+                W = np.asarray(head.weights, dtype=np.float64)[:1]
+                b = np.asarray(head.biases, dtype=np.float64).reshape(-1)[:1]
                 W_cols.append(W.T)
                 b_cols.append(b)
                 s_raw_scale.append(temp)
@@ -2823,8 +2879,13 @@ class PackedMultiQuestionKernel:
                 s_zero_head.append(bool(not np.any(head.weights) and not np.any(head.biases)))
 
         arr_dtype = np.float32 if storage_mode == "float32" else np.float16
-        W_packed = np.ascontiguousarray(np.hstack(W_cols), dtype=arr_dtype)
-        b_packed = np.ascontiguousarray(np.concatenate(b_cols), dtype=arr_dtype)
+        with np.errstate(over="ignore", invalid="ignore"):
+            W_packed = np.ascontiguousarray(np.hstack(W_cols), dtype=arr_dtype)
+            b_packed = np.ascontiguousarray(np.concatenate(b_cols), dtype=arr_dtype)
+        if not (np.all(np.isfinite(W_packed)) and np.all(np.isfinite(b_packed))):
+            raise ValueError(
+                f"PackedMultiQuestionKernel weights/biases non-finite or overflowed {storage_mode}"
+            )
 
         return cls(
             projector=getattr(model, "projector", eng.projector),
@@ -2868,12 +2929,13 @@ class PackedMultiQuestionKernel:
             learned_overrides=learned_overrides_map,
             model_learned_overrides=model_overrides_map,
             c_temp=np.asarray(c_temp, dtype=np.float64),
-            c_adj_div_temp=tuple(c_adj_div_temp),
             c_zero_head=np.asarray(c_zero_head, dtype=bool),
             b_temp=np.asarray(b_temp, dtype=np.float64),
-            b_adj_div_temp=np.asarray(b_adj_div_temp, dtype=np.float64),
             b_zero_head=np.asarray(b_zero_head, dtype=bool),
             s_zero_head=np.asarray(s_zero_head, dtype=bool),
+            c_adj=tuple(c_adj),
+            b_adj0=np.asarray(b_adj0, dtype=np.float64),
+            b_adj1=np.asarray(b_adj1, dtype=np.float64),
         )
 
     def forward_embeddings(
@@ -2898,15 +2960,22 @@ class PackedMultiQuestionKernel:
                 "is_ambiguous": np.empty((0,), dtype=bool),
             }
 
-        if self.storage_mode == "float32":
-            Xm = X if X.dtype == np.float32 else X.astype(np.float32, copy=False)
-            logits = Xm @ self.W_packed + self.b_packed
-        elif self.storage_mode == "float16":
-            Xm = X if X.dtype == np.float16 else X.astype(np.float16, copy=False)
-            logits = Xm @ self.W_packed + self.b_packed
-        else:
-            Xm = X if X.dtype == np.float32 else X.astype(np.float32, copy=False)
-            logits = Xm @ self.W_packed.astype(np.float32) + self.b_packed.astype(np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            if self.storage_mode == "float32":
+                Xm = X if X.dtype == np.float32 else X.astype(np.float32, copy=False)
+                logits = Xm @ self.W_packed + self.b_packed
+            elif self.storage_mode == "float16":
+                Xm = X if X.dtype == np.float16 else X.astype(np.float16, copy=False)
+                logits = Xm @ self.W_packed + self.b_packed
+            else:
+                Xm = X if X.dtype == np.float32 else X.astype(np.float32, copy=False)
+                logits = Xm @ self.W_packed.astype(np.float32) + self.b_packed.astype(np.float32)
+
+        x_row_nonfin = (
+            np.array([not bool(np.all(np.isfinite(Xm)))], dtype=bool)
+            if is_1d
+            else (~np.all(np.isfinite(Xm), axis=1))
+        )
 
         if logits.dtype != np.float64:
             logits = logits.astype(np.float64)
@@ -2920,6 +2989,8 @@ class PackedMultiQuestionKernel:
             for r, raw_p in enumerate(prompts):
                 if r >= B:
                     break
+                if bool(x_row_nonfin[r]):
+                    continue
                 if not isinstance(raw_p, str) or not raw_p.strip():
                     continue
                 norm_key = " ".join(raw_p.strip().casefold().split())
@@ -2931,39 +3002,42 @@ class PackedMultiQuestionKernel:
                     if fname in m_ov and (is_zero_r or bool(self.c_zero_head[ci])):
                         s0 = int(self.c_offsets[ci])
                         K = int(self.c_K[ci])
-                        scale_c = 0.25 * float(self.c_temp[ci])
-                        z_ov = np.full(K, -12.0 / scale_c, dtype=np.float64)
+                        z_ov = np.full(K, -12.0, dtype=np.float64)
                         if m_ov[fname] in self.c_options[ci]:
-                            z_ov[self.c_options[ci].index(m_ov[fname])] = 12.0 / scale_c
-                        logits[r, s0 : s0 + K] = z_ov + self.c_adj_div_temp[ci]
+                            z_ov[self.c_options[ci].index(m_ov[fname])] = 12.0
+                        logits[r, s0 : s0 + K] = z_ov
                 for bi, fname in enumerate(self.bool_names):
                     if fname in m_ov and (is_zero_r or bool(self.b_zero_head[bi])):
-                        scale_b = 0.25 * float(self.b_temp[bi])
-                        z_raw = 12.0 if bool(m_ov[fname]) else -12.0
-                        logits[r, self.M_c + bi] = (z_raw / scale_b) + float(self.b_adj_div_temp[bi])
+                        logits[r, self.M_c + bi] = 12.0 if bool(m_ov[fname]) else -12.0
                 for si, fname in enumerate(self.score_names):
                     if fname in m_ov and (is_zero_r or bool(self.s_zero_head[si])):
                         val_f = float(m_ov[fname])
                         rng_f = max(1e-6, float(self.s_range[si]))
                         ratio = float(np.clip((val_f - float(self.s_min[si])) / rng_f, 1e-4, 1.0 - 1e-4))
                         logit_t = float(np.float32(0.25 * math.log(ratio / (1.0 - ratio))))
-                        logits[r, self.M_c + self.Q_b + si] = (logit_t / 0.25) / float(self.s_raw_scale[si])
+                        logits[r, self.M_c + self.Q_b + si] = logit_t
 
         zc = logits[:, : self.M_c]
         zb = logits[:, self.M_c : self.M_c + self.Q_b]
         zs = logits[:, self.M_c + self.Q_b :]
 
         if self.Q_c > 0:
-            seg_max = np.maximum.reduceat(zc, self.c_offsets, axis=1)
-            exp_z = np.exp(zc - seg_max[:, self.c_seg_idx])
-            seg_sum = np.add.reduceat(exp_z, self.c_offsets, axis=1)
-            p_c = exp_z / seg_sum[:, self.c_seg_idx]
+            with np.errstate(over="ignore", invalid="ignore"):
+                zc_cal = ((zc / 0.25) + self.c_adj_flat[None, :]) / self.c_temp_flat[None, :]
+                seg_max = np.maximum.reduceat(zc_cal, self.c_offsets, axis=1)
+                exp_z = np.exp(zc_cal - seg_max[:, self.c_seg_idx])
+                seg_sum = np.add.reduceat(exp_z, self.c_offsets, axis=1)
+                p_c = exp_z / seg_sum[:, self.c_seg_idx]
 
             p_pad = np.full((B, self.Q_c, self.K_max), -1.0, dtype=np.float64)
             p_pad[:, self.c_pad_rows, self.c_pad_cols] = p_c
             best_idx = np.argmax(p_pad, axis=2)
             p_sorted = -np.sort(-p_pad, axis=2)
             c_conf = p_sorted[:, :, 0]
+            bad_c_col = (~np.isfinite(zc)) | (~np.isfinite(zc_cal)) | (~np.isfinite(p_c))
+            bad_c_pad = np.zeros((B, self.Q_c, self.K_max), dtype=bool)
+            bad_c_pad[:, self.c_pad_rows, self.c_pad_cols] = bad_c_col
+            c_nonfin = np.any(bad_c_pad, axis=2) | (~np.isfinite(c_conf)) | x_row_nonfin[:, None]
 
             if self.c_all_lac:
                 in_c = np.sum(
@@ -3042,18 +3116,40 @@ class PackedMultiQuestionKernel:
                     & (odds >= self.c_gamma[None, :])
                 )
                 c_ambig = (in_c == 0) | ((in_c > 1) & (~mg))
+            if np.any(c_nonfin):
+                in_c = np.array(in_c, dtype=np.int32, copy=True)
+                in_c[c_nonfin] = 0
+                c_ambig[c_nonfin] = True
+                c_conf[c_nonfin] = np.nan
         else:
             p_c = np.empty((B, 0), dtype=np.float64)
             best_idx = in_c = np.empty((B, 0), dtype=np.int32)
             c_conf = np.empty((B, 0), dtype=np.float64)
-            c_ambig = np.empty((B, 0), dtype=bool)
+            c_ambig = c_nonfin = np.empty((B, 0), dtype=bool)
 
         if self.Q_b > 0:
-            p_true = _stable_sigmoid(zb)
-            p_false = 1.0 - p_true
-            b_val = p_true >= self.b_thresh[None, :]
-            b_conf = np.where(b_val, p_true, p_false)
-            b_top = np.maximum(p_true, p_false)
+            with np.errstate(over="ignore", invalid="ignore"):
+                scaled_zb = zb / 0.25
+                s0 = (-0.5 * scaled_zb + self.b_adj0[None, :]) / self.b_temp[None, :]
+                s1 = (0.5 * scaled_zb + self.b_adj1[None, :]) / self.b_temp[None, :]
+                mb = np.maximum(s0, s1)
+                e0 = np.exp(s0 - mb)
+                e1 = np.exp(s1 - mb)
+                denom_b = e0 + e1
+                p_false = e0 / denom_b
+                p_true = e1 / denom_b
+                b_val = p_true >= self.b_thresh[None, :]
+                b_conf = np.where(b_val, p_true, p_false)
+                b_top = np.maximum(p_true, p_false)
+            b_nonfin = (
+                (~np.isfinite(zb))
+                | (~np.isfinite(s0))
+                | (~np.isfinite(s1))
+                | (~np.isfinite(p_true))
+                | (~np.isfinite(p_false))
+                | (~np.isfinite(b_conf))
+                | x_row_nonfin[:, None]
+            )
 
             if self.b_all_lac:
                 in_b = ((1.0 - p_true) <= self.b_qhat[None, :] + 1e-7).astype(np.int32) + (
@@ -3098,16 +3194,33 @@ class PackedMultiQuestionKernel:
                     & (odds_b >= self.b_gamma[None, :])
                 )
                 b_ambig = (in_b == 0) | ((in_b > 1) & (~mg_b))
+            if np.any(b_nonfin):
+                in_b[b_nonfin] = 0
+                b_ambig[b_nonfin] = True
+                b_conf[b_nonfin] = np.nan
         else:
             p_true = b_conf = np.empty((B, 0), dtype=np.float64)
-            b_val = b_ambig = np.empty((B, 0), dtype=bool)
+            b_val = b_ambig = b_nonfin = np.empty((B, 0), dtype=bool)
             in_b = np.empty((B, 0), dtype=np.int32)
 
         if self.Q_s > 0:
-            p_s = _stable_sigmoid(zs)
-            s_val = self.s_min[None, :] + self.s_range[None, :] * p_s
-            p_s_raw = _stable_sigmoid(zs * self.s_raw_scale[None, :])
-            s_conf = np.maximum(p_s_raw, 1.0 - p_s_raw)
+            with np.errstate(over="ignore", invalid="ignore"):
+                scaled_zs = zs / 0.25
+                zs_cal = scaled_zs / self.s_raw_scale[None, :]
+                p_s = _stable_sigmoid(zs_cal)
+                s_val = self.s_min[None, :] + self.s_range[None, :] * p_s
+                p_s_raw = _stable_sigmoid(scaled_zs)
+                s_conf = np.maximum(p_s_raw, 1.0 - p_s_raw)
+            s_nonfin = (
+                (~np.isfinite(zs))
+                | (~np.isfinite(scaled_zs))
+                | (~np.isfinite(zs_cal))
+                | (~np.isfinite(p_s))
+                | (~np.isfinite(s_val))
+                | (~np.isfinite(p_s_raw))
+                | (~np.isfinite(s_conf))
+                | x_row_nonfin[:, None]
+            )
             if self.strict:
                 s_ambig = np.broadcast_to(
                     (~self.s_is_cal) | (self.s_norm_margin > self.eff_score_thresh),
@@ -3115,9 +3228,14 @@ class PackedMultiQuestionKernel:
                 )
             else:
                 s_ambig = np.zeros((B, self.Q_s), dtype=bool)
+            if np.any(s_nonfin):
+                if not s_ambig.flags.writeable:
+                    s_ambig = np.array(s_ambig, dtype=bool, copy=True)
+                s_ambig[s_nonfin] = True
+                s_conf[s_nonfin] = np.nan
         else:
             p_s = s_val = s_conf = np.empty((B, 0), dtype=np.float64)
-            s_ambig = np.empty((B, 0), dtype=bool)
+            s_ambig = s_nonfin = np.empty((B, 0), dtype=bool)
 
         if self.is_tfidf_projector:
             zero_rows = (
@@ -3149,23 +3267,40 @@ class PackedMultiQuestionKernel:
                     continue
                 is_zero_r = not bool(np.any(Xm if is_1d else Xm[r]))
                 for ci, fname in enumerate(self.choice_names):
-                    if fname in ov and (is_zero_r or self.c_options[ci][int(best_idx[r, ci])] == ov[fname]):
+                    if (
+                        not c_nonfin[r, ci]
+                        and fname in ov
+                        and (is_zero_r or self.c_options[ci][int(best_idx[r, ci])] == ov[fname])
+                    ):
                         in_c[r, ci] = 1
                         c_ambig[r, ci] = False
                 for bi, fname in enumerate(self.bool_names):
-                    if fname in ov and (is_zero_r or bool(b_val[r, bi]) == bool(ov[fname])):
+                    if (
+                        not b_nonfin[r, bi]
+                        and fname in ov
+                        and (is_zero_r or bool(b_val[r, bi]) == bool(ov[fname]))
+                    ):
                         in_b[r, bi] = 1
                         b_ambig[r, bi] = False
                 for si, fname in enumerate(self.score_names):
-                    if fname in ov:
+                    if not s_nonfin[r, si] and fname in ov:
                         if not s_ambig.flags.writeable:
                             s_ambig = np.array(s_ambig, dtype=bool, copy=True)
                         s_ambig[r, si] = False
+
+        any_nonfin_row = x_row_nonfin.copy()
+        if self.Q_c:
+            any_nonfin_row |= np.any(c_nonfin, axis=1)
+        if self.Q_b:
+            any_nonfin_row |= np.any(b_nonfin, axis=1)
+        if self.Q_s:
+            any_nonfin_row |= np.any(s_nonfin, axis=1)
 
         row_ambig = (
             (np.any(c_ambig[:, self.c_escalate], axis=1) if self.c_any_escalate else np.zeros(B, dtype=bool))
             | (np.any(b_ambig[:, self.b_escalate], axis=1) if self.b_any_escalate else np.zeros(B, dtype=bool))
             | (np.any(s_ambig[:, self.s_escalate], axis=1) if self.s_any_escalate else np.zeros(B, dtype=bool))
+            | any_nonfin_row
         )
 
         return {
@@ -3267,6 +3402,8 @@ class _BoundCallableState:
     c_names: Tuple[str, ...]
     c_K_list: Tuple[int, ...]
     c_starts: Tuple[int, ...]
+    c_temp: Tuple[float, ...]
+    c_adj: Tuple[Tuple[float, ...], ...]
     c_qhats: Tuple[float, ...]
     c_cals: Tuple[bool, ...]
     c_lacs: Tuple[bool, ...]
@@ -3275,6 +3412,9 @@ class _BoundCallableState:
     c_conf_floor: Tuple[float, ...]
     b_names: Tuple[str, ...]
     b_thresh: Tuple[float, ...]
+    b_temp: Tuple[float, ...]
+    b_adj0: Tuple[float, ...]
+    b_adj1: Tuple[float, ...]
     b_qhats: Tuple[float, ...]
     b_cals: Tuple[bool, ...]
     b_lacs: Tuple[bool, ...]
@@ -3296,6 +3436,30 @@ class _BoundCallableState:
     any_escalating_field: bool
     is_tfidf_projector: bool
     learned_overrides: Mapping[str, Mapping[str, Any]]
+    schema_id: int
+    schema_digest: Optional[str]
+    model_schema_id: int
+    model_schema_digest: Optional[str]
+    model_version: int
+    policy_epoch: int
+
+
+def _snapshot_engine_schema_state(eng: Any) -> Tuple[Any, Any, int, Optional[str], int, Optional[str]]:
+    live_schema = getattr(eng, "schema", None)
+    live_model_schema = getattr(getattr(eng, "model", None), "schema", None)
+    s_id = id(live_schema) if live_schema is not None else 0
+    s_dig = (
+        live_schema.schema_digest()
+        if live_schema is not None and hasattr(live_schema, "schema_digest")
+        else None
+    )
+    ms_id = id(live_model_schema) if live_model_schema is not None else 0
+    ms_dig = (
+        live_model_schema.schema_digest()
+        if live_model_schema is not None and hasattr(live_model_schema, "schema_digest")
+        else None
+    )
+    return live_schema, live_model_schema, s_id, s_dig, ms_id, ms_dig
 
 
 class FastDecisionCallable:
@@ -3305,17 +3469,39 @@ class FastDecisionCallable:
         self._storage_mode = storage_mode
         self._aci_tracker = getattr(eng, "aci_tracker", None)
         self._eng_ref = eng
-        self._schema_ref = getattr(eng, "schema", None)
-        self._model_schema_ref = getattr(getattr(eng, "model", None), "schema", None)
         self._rebind_lock = threading.Lock()
+        live_schema, live_model_schema, s_id, s_dig, ms_id, ms_dig = _snapshot_engine_schema_state(eng)
+        self._schema_ref = live_schema
+        self._model_schema_ref = live_model_schema
+        mv = int(getattr(eng, "model_version", 1))
+        pe = int(getattr(eng, "policy_epoch", 0))
         if hasattr(eng, "compile_packed_kernel"):
             kernel = eng.compile_packed_kernel(storage_mode=storage_mode)
         else:
             kernel = PackedMultiQuestionKernel.from_engine(eng, storage_mode=storage_mode)
-        self._state = self._build_state(kernel, storage_mode=storage_mode)
+        self._state = self._build_state(
+            kernel,
+            storage_mode=storage_mode,
+            schema_id=s_id,
+            schema_digest=s_dig,
+            model_schema_id=ms_id,
+            model_schema_digest=ms_dig,
+            model_version=mv,
+            policy_epoch=pe,
+        )
 
     @staticmethod
-    def _build_state(kernel: PackedMultiQuestionKernel, *, storage_mode: str) -> _BoundCallableState:
+    def _build_state(
+        kernel: PackedMultiQuestionKernel,
+        *,
+        storage_mode: str,
+        schema_id: int = 0,
+        schema_digest: Optional[str] = None,
+        model_schema_id: int = 0,
+        model_schema_digest: Optional[str] = None,
+        model_version: int = 1,
+        policy_epoch: int = 0,
+    ) -> _BoundCallableState:
         W_t = np.ascontiguousarray(kernel.W_packed, dtype=np.float32)
         b = np.ascontiguousarray(kernel.b_packed, dtype=np.float32)
         W_t.setflags(write=False)
@@ -3337,6 +3523,8 @@ class FastDecisionCallable:
             c_names=tuple(kernel.choice_names),
             c_K_list=tuple(int(x) for x in kernel.c_K),
             c_starts=tuple(int(x) for x in kernel.c_offsets),
+            c_temp=tuple(float(x) for x in kernel.c_temp),
+            c_adj=tuple(tuple(float(v) for v in arr) for arr in kernel.c_adj),
             c_qhats=tuple(float(x) for x in kernel.c_qhat),
             c_cals=tuple(bool(x) for x in kernel.c_is_cal),
             c_lacs=tuple(bool(x) for x in kernel.c_is_lac),
@@ -3345,6 +3533,9 @@ class FastDecisionCallable:
             c_conf_floor=tuple(float(x) for x in kernel.c_conf_floor),
             b_names=tuple(kernel.bool_names),
             b_thresh=tuple(float(x) for x in kernel.b_thresh),
+            b_temp=tuple(float(x) for x in kernel.b_temp),
+            b_adj0=tuple(float(x) for x in kernel.b_adj0),
+            b_adj1=tuple(float(x) for x in kernel.b_adj1),
             b_qhats=tuple(float(x) for x in kernel.b_qhat),
             b_cals=tuple(bool(x) for x in kernel.b_is_cal),
             b_lacs=tuple(bool(x) for x in kernel.b_is_lac),
@@ -3366,6 +3557,12 @@ class FastDecisionCallable:
             any_escalating_field=kernel.any_escalating_field,
             is_tfidf_projector=kernel.is_tfidf_projector,
             learned_overrides=kernel.learned_overrides,
+            schema_id=schema_id,
+            schema_digest=schema_digest,
+            model_schema_id=model_schema_id,
+            model_schema_digest=model_schema_digest,
+            model_version=model_version,
+            policy_epoch=policy_epoch,
         )
 
     def _bind_kernel(self, kernel: PackedMultiQuestionKernel, *, storage_mode: str) -> None:
@@ -3375,64 +3572,122 @@ class FastDecisionCallable:
         state = object.__getattribute__(self, "_state")
         return getattr(state, name)
 
-    def __call__(
-        self, prompt: Optional[str] = None, *, embedding: Optional[np.ndarray] = None
-    ) -> FastDecisionOutput:
-        if _has_custom_validate_decision(self._schema_ref) or _has_custom_validate_decision(
-            self._model_schema_ref
+    @staticmethod
+    def _validate_live_constraints(
+        eng_ref: Any, live_schema: Any, live_model_schema: Any, tracker: Any
+    ) -> None:
+        if _has_custom_validate_decision(live_schema) or _has_custom_validate_decision(
+            live_model_schema
         ):
             raise ValueError(
                 "PackedMultiQuestionKernel does not support custom DecisionSchema.validate_decision"
             )
-        eng_ref = self._eng_ref
-        if getattr(eng_ref, "selective_calibrators", None):
+        if eng_ref is not None and getattr(eng_ref, "selective_calibrators", None):
             raise ValueError(
                 "PackedMultiQuestionKernel does not support engines with active selective_calibrators"
             )
-        if getattr(eng_ref, "joint_calibrator", None) is not None:
+        if eng_ref is not None and getattr(eng_ref, "joint_calibrator", None) is not None:
             raise ValueError(
                 "PackedMultiQuestionKernel does not support engines with active joint_calibrator"
             )
+        if tracker is not None and getattr(tracker, "margin_floor", None) is not None:
+            raise ValueError(
+                "PackedMultiQuestionKernel does not support engines with active aci_tracker margin_floor"
+            )
+
+    def __call__(
+        self, prompt: Optional[str] = None, *, embedding: Optional[np.ndarray] = None
+    ) -> FastDecisionOutput:
         st = self._state
-        tracker = getattr(eng_ref, "aci_tracker", None) if eng_ref is not None else self._aci_tracker
-        if tracker is not None and (
-            getattr(tracker, "margin_floor", None) is not None
-            or float(tracker.alpha_t) != st.alpha
-        ):
-            with self._rebind_lock:
-                st = self._state
-                tracker = (
-                    getattr(eng_ref, "aci_tracker", None)
-                    if eng_ref is not None
-                    else self._aci_tracker
-                )
-                if tracker is not None and (
-                    getattr(tracker, "margin_floor", None) is not None
-                    or float(tracker.alpha_t) != st.alpha
-                ):
-                    assert eng_ref is not None
-                    if hasattr(eng_ref, "compile_packed_kernel"):
-                        new_kernel = eng_ref.compile_packed_kernel(
-                            storage_mode=self._storage_mode
-                        )
-                    else:
-                        new_kernel = PackedMultiQuestionKernel.from_engine(
-                            eng_ref,
+        eng_ref = self._eng_ref
+        if eng_ref is not None:
+            live_schema, live_model_schema, s_id, s_dig, ms_id, ms_dig = _snapshot_engine_schema_state(
+                eng_ref
+            )
+            tracker = getattr(eng_ref, "aci_tracker", None)
+            self._validate_live_constraints(eng_ref, live_schema, live_model_schema, tracker)
+            eff_alpha = (
+                float(tracker.alpha_t)
+                if tracker is not None
+                else float(getattr(eng_ref, "default_alpha", st.alpha))
+            )
+            live_strict = bool(getattr(eng_ref, "strict_mode", st.strict))
+            live_mv = int(getattr(eng_ref, "model_version", st.model_version))
+            live_pe = int(getattr(eng_ref, "policy_epoch", st.policy_epoch))
+            needs_rebind = (
+                eff_alpha != st.alpha
+                or s_id != st.schema_id
+                or s_dig != st.schema_digest
+                or ms_id != st.model_schema_id
+                or ms_dig != st.model_schema_digest
+                or live_strict != st.strict
+                or live_mv != st.model_version
+                or live_pe != st.policy_epoch
+            )
+            if needs_rebind:
+                with self._rebind_lock:
+                    st = self._state
+                    live_schema, live_model_schema, s_id, s_dig, ms_id, ms_dig = (
+                        _snapshot_engine_schema_state(eng_ref)
+                    )
+                    tracker = getattr(eng_ref, "aci_tracker", None)
+                    self._validate_live_constraints(eng_ref, live_schema, live_model_schema, tracker)
+                    eff_alpha = (
+                        float(tracker.alpha_t)
+                        if tracker is not None
+                        else float(getattr(eng_ref, "default_alpha", st.alpha))
+                    )
+                    live_strict = bool(getattr(eng_ref, "strict_mode", st.strict))
+                    live_mv = int(getattr(eng_ref, "model_version", st.model_version))
+                    live_pe = int(getattr(eng_ref, "policy_epoch", st.policy_epoch))
+                    if (
+                        eff_alpha != st.alpha
+                        or s_id != st.schema_id
+                        or s_dig != st.schema_digest
+                        or ms_id != st.model_schema_id
+                        or ms_dig != st.model_schema_digest
+                        or live_strict != st.strict
+                        or live_mv != st.model_version
+                        or live_pe != st.policy_epoch
+                    ):
+                        if hasattr(eng_ref, "compile_packed_kernel"):
+                            new_kernel = eng_ref.compile_packed_kernel(
+                                storage_mode=self._storage_mode
+                            )
+                        else:
+                            new_kernel = PackedMultiQuestionKernel.from_engine(
+                                eng_ref,
+                                storage_mode=self._storage_mode,
+                                alpha=eff_alpha,
+                            )
+                        st = self._build_state(
+                            new_kernel,
                             storage_mode=self._storage_mode,
-                            alpha=float(tracker.alpha_t),
+                            schema_id=s_id,
+                            schema_digest=s_dig,
+                            model_schema_id=ms_id,
+                            model_schema_digest=ms_dig,
+                            model_version=live_mv,
+                            policy_epoch=live_pe,
                         )
-                    st = self._build_state(new_kernel, storage_mode=self._storage_mode)
-                    self._state = st
+                        self._state = st
+                        self._schema_ref = live_schema
+                        self._model_schema_ref = live_model_schema
+        else:
+            self._validate_live_constraints(
+                None, self._schema_ref, self._model_schema_ref, self._aci_tracker
+            )
         if embedding is None:
             if prompt is None:
                 raise ValueError("Either prompt or embedding must be provided")
             emb = st.kernel.encode_one(prompt)
         else:
-            emb = (
-                embedding
-                if isinstance(embedding, np.ndarray) and embedding.dtype == np.float32
-                else np.asarray(embedding, dtype=np.float32)
-            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                emb = (
+                    embedding
+                    if isinstance(embedding, np.ndarray) and embedding.dtype == np.float32
+                    else np.asarray(embedding, dtype=np.float32)
+                )
             if emb.ndim != 1:
                 emb = emb.ravel()
             if emb.shape[0] != st.kernel.dimension:
@@ -3464,22 +3719,48 @@ class FastDecisionCallable:
                 confs[fn] = float(out["s_conf"][0, si])
             return FastDecisionOutput(vals, confs, bool(out["is_ambiguous"][0]))
 
-        z_list: List[float] = (emb @ st.W_t + st.b).tolist()
+        with np.errstate(over="ignore", invalid="ignore"):
+            z_list: List[float] = (emb @ st.W_t + st.b).tolist()
         vals = {}
         confs = {}
-        ambig = bool(st.is_tfidf_projector and not bool(np.any(emb)) and st.any_escalating_field)
+        emb_ok = bool(np.all(np.isfinite(emb)))
+        ambig = (not emb_ok) or bool(
+            st.is_tfidf_projector and not bool(np.any(emb)) and st.any_escalating_field
+        )
         exp = math.exp
+        isfinite = math.isfinite
         strict = st.strict
 
         for ci in range(st.Q_c):
             fn = st.c_names[ci]
             K = st.c_K_list[ci]
             s0 = st.c_starts[ci]
-            z_slice = z_list[s0 : s0 + K]
-            m = max(z_slice)
-            exps = [exp(v - m) for v in z_slice]
-            inv_sum = 1.0 / sum(exps)
+            temp = st.c_temp[ci]
+            adj_vec = st.c_adj[ci]
+            z_cal = [(z_list[s0 + j] / 0.25 + adj_vec[j]) / temp for j in range(K)]
+            if (not emb_ok) or not (
+                all(isfinite(z_list[s0 + j]) for j in range(K))
+                and all(isfinite(v) for v in z_cal)
+            ):
+                vals[fn] = st.c_options[ci][0]
+                confs[fn] = float("nan")
+                ambig = True
+                continue
+            m = max(z_cal)
+            exps = [exp(v - m) for v in z_cal]
+            sum_e = sum(exps)
+            if not (isfinite(sum_e) and sum_e > 0.0):
+                vals[fn] = st.c_options[ci][0]
+                confs[fn] = float("nan")
+                ambig = True
+                continue
+            inv_sum = 1.0 / sum_e
             probs = [e * inv_sum for e in exps]
+            if not all(isfinite(pv) for pv in probs):
+                vals[fn] = st.c_options[ci][0]
+                confs[fn] = float("nan")
+                ambig = True
+                continue
             best_i = 0
             best_p = probs[0]
             for j in range(1, K):
@@ -3557,12 +3838,31 @@ class FastDecisionCallable:
         for bi in range(st.Q_b):
             fn = st.b_names[bi]
             zv = z_list[st.b_offset + bi]
-            if zv >= 0.0:
-                pt = 1.0 / (1.0 + exp(-zv))
-            else:
-                ez = exp(zv)
-                pt = ez / (1.0 + ez)
-            pf = 1.0 - pt
+            scaled_z = zv / 0.25
+            temp_b = st.b_temp[bi]
+            s0 = (-0.5 * scaled_z + st.b_adj0[bi]) / temp_b
+            s1 = (0.5 * scaled_z + st.b_adj1[bi]) / temp_b
+            if (not emb_ok) or not (isfinite(zv) and isfinite(s0) and isfinite(s1)):
+                vals[fn] = False
+                confs[fn] = float("nan")
+                ambig = True
+                continue
+            mb = s0 if s0 >= s1 else s1
+            e0 = exp(s0 - mb)
+            e1 = exp(s1 - mb)
+            denom_b = e0 + e1
+            if not (isfinite(denom_b) and denom_b > 0.0):
+                vals[fn] = False
+                confs[fn] = float("nan")
+                ambig = True
+                continue
+            pf = e0 / denom_b
+            pt = e1 / denom_b
+            if not (isfinite(pt) and isfinite(pf)):
+                vals[fn] = False
+                confs[fn] = float("nan")
+                ambig = True
+                continue
             bv = pt >= st.b_thresh[bi]
             vals[fn] = bv
             confs[fn] = pt if bv else pf
@@ -3611,19 +3911,32 @@ class FastDecisionCallable:
         for si in range(st.Q_s):
             fn = st.s_names[si]
             zv = z_list[st.s_offset + si]
-            if zv >= 0.0:
-                ps = 1.0 / (1.0 + exp(-zv))
+            scaled_zs = zv / 0.25
+            z_cal = scaled_zs / st.s_raw_scale[si]
+            if (not emb_ok) or not (isfinite(zv) and isfinite(scaled_zs) and isfinite(z_cal)):
+                vals[fn] = float("nan")
+                confs[fn] = float("nan")
+                ambig = True
+                continue
+            if z_cal >= 0.0:
+                ps = 1.0 / (1.0 + exp(-z_cal))
             else:
-                ez = exp(zv)
+                ez = exp(z_cal)
                 ps = ez / (1.0 + ez)
-            vals[fn] = st.s_min[si] + st.s_range[si] * ps
-            z_raw = zv * st.s_raw_scale[si]
-            if z_raw >= 0.0:
-                ps_raw = 1.0 / (1.0 + exp(-z_raw))
+            s_val = st.s_min[si] + st.s_range[si] * ps
+            if scaled_zs >= 0.0:
+                ps_raw = 1.0 / (1.0 + exp(-scaled_zs))
             else:
-                ez_raw = exp(z_raw)
+                ez_raw = exp(scaled_zs)
                 ps_raw = ez_raw / (1.0 + ez_raw)
-            confs[fn] = ps_raw if ps_raw >= 0.5 else (1.0 - ps_raw)
+            s_conf = ps_raw if ps_raw >= 0.5 else (1.0 - ps_raw)
+            if not (isfinite(s_val) and isfinite(s_conf)):
+                vals[fn] = s_val
+                confs[fn] = float("nan")
+                ambig = True
+                continue
+            vals[fn] = s_val
+            confs[fn] = s_conf
             if (
                 strict
                 and st.s_escalate[si]

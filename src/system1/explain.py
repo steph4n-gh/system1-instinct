@@ -232,6 +232,7 @@ def _extract_calibrated_head_params(
         else np.ascontiguousarray(head.biases, dtype=np.float32).reshape(-1)
     )
     cal_adj_2: Optional[np.ndarray] = None
+    cal_adj_choice: Optional[np.ndarray] = None
 
     if adj_raw is not None:
         adj = np.asarray(adj_raw, dtype=np.float64).reshape(-1)
@@ -251,6 +252,7 @@ def _extract_calibrated_head_params(
         elif adj.size == w.shape[0]:
             b += adj / base_scale
             adj_eff = (adj / temp).astype(np.float64)
+            cal_adj_choice = adj.astype(np.float64).copy()
         elif adj.size > 0:
             raise ValueError(
                 f"logit_adjustments length {adj.size} != head outputs {w.shape[0]} for field {fname!r}"
@@ -284,8 +286,9 @@ def _extract_calibrated_head_params(
         "raw_w_f32": raw_w_f32,
         "raw_b_f32": raw_b_f32,
         "base_scale": base_scale,
-        "cal_temp": temp,
+        "cal_temp": raw_temp if (math.isfinite(raw_temp) and raw_temp > 0.0) else temp,
         "cal_adj_2": cal_adj_2,
+        "cal_adj_choice": cal_adj_choice,
     }
     return w, b, opts, thr, eff_scale, meta
 
@@ -393,6 +396,12 @@ class FastExplainer:
         self._bool_raw_base_scale = 4.0
         self._bool_cal_temp = 1.0
         self._bool_cal_adj_2: Optional[np.ndarray] = None
+        self._choice_has_raw = False
+        self._choice_raw_w_f32 = np.empty((0, 0), dtype=np.float32)
+        self._choice_raw_b_f32 = np.empty(0, dtype=np.float32)
+        self._choice_raw_base_scale = 4.0
+        self._choice_cal_temp = 1.0
+        self._choice_cal_adj: Optional[np.ndarray] = None
         if self._is_boolean:
             if _bool_raw_meta is not None:
                 self._bool_has_scalar_raw = True
@@ -424,6 +433,32 @@ class FastExplainer:
                     if (self._adj_eff.size == 1 and float(self._adj_eff[0]) != 0.0)
                     else None
                 )
+        else:
+            if _bool_raw_meta is not None:
+                self._choice_has_raw = True
+                self._choice_raw_w_f32 = np.ascontiguousarray(_bool_raw_meta["raw_w_f32"], dtype=np.float32)
+                self._choice_raw_b_f32 = np.ascontiguousarray(
+                    _bool_raw_meta["raw_b_f32"], dtype=np.float32
+                ).reshape(-1)
+                self._choice_raw_base_scale = float(_bool_raw_meta["base_scale"])
+                self._choice_cal_temp = float(_bool_raw_meta["cal_temp"])
+                raw_c_adj_c = _bool_raw_meta.get("cal_adj_choice")
+                self._choice_cal_adj = (
+                    None
+                    if raw_c_adj_c is None
+                    else np.ascontiguousarray(raw_c_adj_c, dtype=np.float64).reshape(-1)
+                )
+            else:
+                self._choice_has_raw = True
+                self._choice_raw_w_f32 = np.ascontiguousarray(w_norm, dtype=np.float32)
+                self._choice_raw_b_f32 = np.ascontiguousarray(b_norm, dtype=np.float32).reshape(-1)
+                self._choice_raw_base_scale = float(self.scale)
+                self._choice_cal_temp = 1.0
+                self._choice_cal_adj = (
+                    np.ascontiguousarray(self._adj_eff, dtype=np.float64).reshape(-1)
+                    if (self._adj_eff.size == self.num_classes and np.any(self._adj_eff))
+                    else None
+                )
 
         if train_texts and train_labels:
             if len(train_texts) != len(train_labels):
@@ -447,6 +482,12 @@ class FastExplainer:
                 projector._fitted
                 and projector._subspace_components is not None
                 and float(projector._subspace_weight) > 0.0
+            )
+            and not (
+                not bool(getattr(projector, "_direct_spectral", False))
+                and projector._fitted
+                and getattr(projector, "_spectral_basis", None) is not None
+                and float(getattr(projector, "spectral_blend", 0.0)) > 0.0
             )
         )
         if has_hybrid_fast:
@@ -1008,9 +1049,12 @@ class FastExplainer:
             active_spans = [(j, spans[j][3]) for j in range(n_spans) if kept_mask[j]]
 
         if not clean_text:
+            u_dn_fb = np.zeros(self.dd, dtype=np.float64)
+            if self.dd > 0:
+                u_dn_fb[0] = 1.0
             return (
-                np.zeros(self.dd, dtype=np.float64),
-                0.0,
+                u_dn_fb,
+                1.0 if self.dd > 0 else 0.0,
                 np.zeros(max(1, self.spd), dtype=np.float64),
                 0.0,
                 None,
@@ -1137,10 +1181,14 @@ class FastExplainer:
                 u_dn = raw_dn32.astype(np.float64) / norm_dn
             else:
                 u_dn = np.zeros(self.dd, dtype=np.float64)
-                norm_dn = 0.0
+                if self.dd > 0:
+                    u_dn[0] = 1.0
+                norm_dn = 1.0 if self.dd > 0 else 0.0
         else:
             u_dn = np.zeros(self.dd, dtype=np.float64)
-            norm_dn = 0.0
+            if self.dd > 0:
+                u_dn[0] = 1.0
+            norm_dn = 1.0 if self.dd > 0 else 0.0
 
         spec_counts: Dict[int, int] = {}
         spec_w_map: Dict[int, List[int]] = {}
@@ -1259,14 +1307,83 @@ class FastExplainer:
         raw_l = (x_f32 @ self._bool_raw_w_f32.T + self._bool_raw_b_f32).ravel()[0]
         return self._eval_boolean_raw_logit_f32(float(raw_l))
 
+    def _eval_choice_raw_logits_and_top2_f32(
+        self, emb_f32: np.ndarray
+    ) -> Tuple[np.ndarray, int, int]:
+        x_f32 = np.asarray(emb_f32, dtype=np.float32).reshape(1, -1)
+        raw_f32 = (x_f32 @ self._choice_raw_w_f32.T + self._choice_raw_b_f32).ravel()
+        scaled = (
+            raw_f32.astype(np.float64) / 0.25
+            if self._choice_raw_base_scale == 4.0
+            else raw_f32.astype(np.float64) * self._choice_raw_base_scale
+        )
+        if self._choice_cal_adj is not None and self._choice_cal_adj.size == self.num_classes:
+            scaled = scaled + self._choice_cal_adj
+        cal_logits = scaled / self._choice_cal_temp
+        if not bool(np.all(np.isfinite(cal_logits))):
+            return cal_logits, 0, (1 if self.num_classes > 1 else 0)
+        s = cal_logits - float(np.max(cal_logits))
+        exps = np.exp(s)
+        denom = float(np.sum(exps))
+        if not (math.isfinite(denom) and denom > 0.0):
+            order = np.argsort(-cal_logits, kind="stable")
+            c1 = int(order[0])
+            c2 = int(order[1]) if len(order) > 1 else c1
+            return cal_logits, c1, c2
+        probs = exps / denom
+        c1 = int(np.argmax(probs))
+        if self.num_classes > 1:
+            c2 = max(
+                (j for j in range(self.num_classes) if j != c1),
+                key=lambda j: (float(probs[j]), float(cal_logits[j]), -j),
+            )
+        else:
+            c2 = c1
+        return cal_logits, c1, c2
+
+    def _eval_reference_logits_and_top2_from_emb(
+        self, emb_f32: np.ndarray
+    ) -> Tuple[np.ndarray, int, int]:
+        if self._is_boolean:
+            if self._bool_has_scalar_raw:
+                x_f32 = np.asarray(emb_f32, dtype=np.float32).reshape(1, -1)
+                raw_l = float((x_f32 @ self._bool_raw_w_f32.T + self._bool_raw_b_f32).ravel()[0])
+                scaled_z = (
+                    raw_l / 0.25
+                    if self._bool_raw_base_scale == 4.0
+                    else raw_l * self._bool_raw_base_scale
+                )
+                delta_adj = (
+                    float(self._bool_cal_adj_2[1] - self._bool_cal_adj_2[0])
+                    if (self._bool_cal_adj_2 is not None and self._bool_cal_adj_2.size == 2)
+                    else 0.0
+                )
+                s_eff = (scaled_z + delta_adj) / self._bool_cal_temp - self._bool_logit_shift
+                ref_logits = np.array([-0.5 * s_eff, 0.5 * s_eff], dtype=np.float64)
+                c1 = self._eval_boolean_raw_logit_f32(raw_l)
+                c2 = 0 if c1 == 1 else 1
+                return ref_logits, c1, c2
+            ref_logits = (self.W_eff @ emb_f32.astype(np.float64)) + self.b_eff
+            c1, c2 = self._select_top2(ref_logits)
+            return ref_logits, c1, c2
+        if self._choice_has_raw:
+            return self._eval_choice_raw_logits_and_top2_f32(emb_f32)
+        ref_logits = (self.W_eff @ emb_f32.astype(np.float64)) + self.b_eff
+        c1, c2 = self._select_top2(ref_logits)
+        return ref_logits, c1, c2
+
+    def _eval_reference_logits_and_top2_text(self, text: str) -> Tuple[np.ndarray, int, int]:
+        emb_f32 = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
+        return self._eval_reference_logits_and_top2_from_emb(emb_f32)
+
     def _eval_boolean_text_winner(self, text: str) -> int:
         emb = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
         return self._eval_boolean_embedding_winner(emb)
 
     def _select_top2_text(self, text: str, logits: np.ndarray) -> Tuple[int, int]:
-        if self._is_boolean and self._bool_has_scalar_raw:
-            c1 = self._eval_boolean_text_winner(text)
-            return c1, (0 if c1 == 1 else 1)
+        if (self._is_boolean and self._bool_has_scalar_raw) or self._choice_has_raw:
+            _, c1, c2 = self._eval_reference_logits_and_top2_text(text)
+            return c1, c2
         return self._select_top2(logits)
 
     def _select_winner_kept(
@@ -1275,9 +1392,10 @@ class FastExplainer:
         spans: List[Tuple[int, int, str, str]],
         kept_mask: List[bool],
     ) -> int:
-        if self._is_boolean and self._bool_has_scalar_raw:
+        if (self._is_boolean and self._bool_has_scalar_raw) or self._choice_has_raw:
             kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
-            return self._eval_boolean_text_winner(kept_text)
+            _, c1, _ = self._eval_reference_logits_and_top2_text(kept_text)
+            return c1
         return self._select_winner(logits)
 
     def _select_winner(self, logits: np.ndarray) -> int:
@@ -1313,13 +1431,7 @@ class FastExplainer:
         if self._mode == "generic":
             kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
             x_sub_f32 = _project_one(self.projector, kept_text, recency_weighted=self.recency_weighted)
-            x_sub = x_sub_f32.astype(np.float64)
-            logits = (self.W_eff @ x_sub) + self.b_eff
-            c_win = (
-                self._eval_boolean_embedding_winner(x_sub_f32)
-                if (self._is_boolean and self._bool_has_scalar_raw)
-                else self._select_winner(logits)
-            )
+            logits, c_win, _ = self._eval_reference_logits_and_top2_from_emb(x_sub_f32)
             return c_win, logits
 
         act_idx, act_raw, norm_sp, _ = self._extract_tfidf_fast(text, spans, kept_mask=kept_mask, need_trace=False)
@@ -1445,12 +1557,7 @@ class FastExplainer:
         n_spans = len(spans)
         x_f32 = _project_one(self.projector, text, recency_weighted=self.recency_weighted)
         x_full = x_f32.astype(np.float64)
-        logits = (self.W_eff @ x_full) + self.b_eff
-        if self._is_boolean and self._bool_has_scalar_raw:
-            c1 = self._eval_boolean_embedding_winner(x_f32)
-            c2 = 0 if c1 == 1 else 1
-        else:
-            c1, c2 = self._select_top2(logits)
+        logits, c1, c2 = self._eval_reference_logits_and_top2_from_emb(x_f32)
         margin = float(logits[c1] - logits[c2])
         sims_all = (self.X_train_full @ x_full.astype(np.float32)).astype(np.float64)
 
@@ -1461,8 +1568,11 @@ class FastExplainer:
         b_margin = float(self.b_eff[c1] - self.b_eff[c2])
 
         loo_texts = [" ".join(spans[k][2] for k in range(n_spans) if k != j) for j in range(n_spans)]
-        X_loo = _project_texts(self.projector, loo_texts, recency_weighted=self.recency_weighted).astype(np.float64)
-        logits_loo = (X_loo @ self.W_eff.T) + self.b_eff
+        X_loo = _project_texts(self.projector, loo_texts, recency_weighted=self.recency_weighted)
+        logits_loo = np.empty((len(loo_texts), self.num_classes), dtype=np.float64)
+        for r_idx in range(len(loo_texts)):
+            rl, _, _ = self._eval_reference_logits_and_top2_from_emb(X_loo[r_idx])
+            logits_loo[r_idx] = rl
         raw_t = logits[c1] - logits_loo[:, c1]
         raw_m = margin - (logits_loo[:, c1] - logits_loo[:, c2])
 
@@ -1512,6 +1622,7 @@ class FastExplainer:
                 b_margin = margin
                 sims_all = (self.X_train_full @ emb_ov.astype(np.float32)).astype(np.float64)
 
+        has_active_spans = False
         if override_hit:
             pass
         elif self._mode == "generic":
@@ -1521,10 +1632,10 @@ class FastExplainer:
         elif self._mode == "tfidf":
             act_idx, act_raw, norm_sp, sp_trace = self._extract_tfidf_fast(text, spans, need_trace=True)
             sp_ok = norm_sp > 1e-12
+            has_active_spans = sp_ok
             v_sp = (act_raw / norm_sp).astype(np.float32).astype(np.float64) if sp_ok else act_raw
-            logits = (v_sp @ self.W_sp_T[act_idx]) + self.b_eff if sp_ok else self.b_eff.copy()
 
-            c1, c2 = self._select_top2_text(text, logits)
+            logits, c1, c2 = self._eval_reference_logits_and_top2_text(text)
             margin = float(logits[c1] - logits[c2])
 
             t_attrs = [0.0] * n_spans
@@ -1534,9 +1645,11 @@ class FastExplainer:
                 w_c1 = w_sp_act[:, c1]
                 w_mg = w_c1 - w_sp_act[:, c2]
                 self._accumulate_tfidf_span_attrs(sp_trace, act_idx, w_c1, w_mg, 1.0 / norm_sp, t_attrs, m_attrs)
-
-            b_target = float(self.b_eff[c1])
-            b_margin = float(self.b_eff[c1] - self.b_eff[c2])
+                b_target = float(self.b_eff[c1])
+                b_margin = float(self.b_eff[c1] - self.b_eff[c2])
+            else:
+                b_target = float(logits[c1])
+                b_margin = margin
             sims_all = (
                 (v_sp.astype(np.float32) @ self.X_train_sp_T[act_idx]).astype(np.float64)
                 if sp_ok
@@ -1559,16 +1672,10 @@ class FastExplainer:
             )
             base_norm = math.sqrt(b_sq)
 
+            logits, c1, c2 = self._eval_reference_logits_and_top2_text(text)
+            margin = float(logits[c1] - logits[c2])
+
             if base_norm <= 1e-12:
-                logits = self.W_base[:, 0] + self.b_eff
-                if self.has_rbf and self.L_sp_T is not None and self.W_rbf is not None:
-                    sims = self.L_sp_T[0]
-                    phi = np.exp(self.rbf_gamma * (sims - 1.0)).astype(np.float32).astype(np.float64)
-                    pnorm = float(np.linalg.norm(phi))
-                    if pnorm > 1e-12:
-                        logits = logits + self.W_rbf @ (phi / pnorm)
-                c1, c2 = self._select_top2_text(text, logits)
-                margin = float(logits[c1] - logits[c2])
                 t_attrs = [0.0] * n_spans
                 m_attrs = [0.0] * n_spans
                 b_target = float(logits[c1])
@@ -1578,14 +1685,6 @@ class FastExplainer:
                 g_sp = (self.w_sparse / base_norm) if sp_ok else 0.0
                 g_dn = (self.w_dense / base_norm) if dn_ok else 0.0
                 g_sc = (self.w_spec / base_norm) if sc_ok else 0.0
-
-                logits = self.b_eff.copy()
-                if sp_ok:
-                    logits += g_sp * (v_sp @ self.W_sp_T[act_idx])
-                if dn_ok:
-                    logits += g_dn * (self.W_dn @ u_dn)
-                if sc_ok:
-                    logits += g_sc * (self.W_sc @ u_sc)
 
                 if self.has_rbf and self.L_sp_T is not None and self.L_dn is not None and self.L_sc is not None and self.W_rbf is not None:
                     sims = np.zeros(self.num_landmarks, dtype=np.float64)
@@ -1599,136 +1698,145 @@ class FastExplainer:
                     pnorm = float(np.linalg.norm(phi))
                     if pnorm > 1e-12:
                         u_rbf = phi / pnorm
-                        logits += self.W_rbf @ u_rbf
                     else:
                         u_rbf = np.zeros(self.num_landmarks, dtype=np.float64)
                 else:
                     sims = np.empty(0, dtype=np.float64)
                     u_rbf = np.empty(0, dtype=np.float64)
 
-                c1, c2 = self._select_top2_text(text, logits)
-                margin = float(logits[c1] - logits[c2])
-
-                if self.has_rbf and self.W_rbf is not None and self.L_sp_T is not None:
-                    # 10-point Gauss-Legendre path integral for RBF + L2 normalization nonlinearity.
-                    W_pair_rbf = np.vstack([self.W_rbf[c1], self.W_rbf[c1] - self.W_rbf[c2]])
-                    Phi_q = np.exp(self.rbf_gamma * (_IG_T * sims.reshape(1, -1) - 1.0))
-                    r_q = np.linalg.norm(Phi_q, axis=1, keepdims=True)
-                    U_q = Phi_q / np.maximum(1e-12, r_q)
-                    Z_q = U_q @ W_pair_rbf.T
-                    scale_q = (_IG_W * (self.rbf_gamma / np.maximum(1e-12, r_q))) * Phi_q
-                    beta = np.sum(scale_q, axis=0)[None, :] * W_pair_rbf - Z_q.T @ (scale_q * U_q)
-
-                    w_sp_act = self.W_sp_T[act_idx]
-                    l_sp_act = self.L_sp_T[act_idx] if sp_ok else None
-                    w_eff_sp_c1 = w_sp_act[:, c1] + (l_sp_act @ beta[0] if l_sp_act is not None else 0.0)
-                    w_eff_sp_mg = (w_sp_act[:, c1] - w_sp_act[:, c2]) + (
-                        l_sp_act @ beta[1] if l_sp_act is not None else 0.0
-                    )
-                    b_target = float(self.b_eff[c1] + self.b_rbf0[c1])
-                    b_margin = float((self.b_eff[c1] - self.b_eff[c2]) + (self.b_rbf0[c1] - self.b_rbf0[c2]))
+                has_dn_events = hd_trace is not None and bool(
+                    hd_trace["dn_word_events"]
+                    or hd_trace["dn_unary_events"]
+                    or hd_trace["dn_bi_events"]
+                    or hd_trace["dn_mw_events"]
+                )
+                if not sp_ok and not sc_ok and not has_dn_events:
+                    t_attrs = [0.0] * n_spans
+                    m_attrs = [0.0] * n_spans
+                    b_target = float(logits[c1])
+                    b_margin = margin
                 else:
-                    beta = None
-                    w_sp_act = self.W_sp_T[act_idx]
-                    w_eff_sp_c1 = w_sp_act[:, c1]
-                    w_eff_sp_mg = w_sp_act[:, c1] - w_sp_act[:, c2]
-                    b_target = float(self.b_eff[c1])
-                    b_margin = float(self.b_eff[c1] - self.b_eff[c2])
+                    has_active_spans = True
+                    if self.has_rbf and self.W_rbf is not None and self.L_sp_T is not None:
+                        # 10-point Gauss-Legendre path integral for RBF + L2 normalization nonlinearity.
+                        W_pair_rbf = np.vstack([self.W_rbf[c1], self.W_rbf[c1] - self.W_rbf[c2]])
+                        Phi_q = np.exp(self.rbf_gamma * (_IG_T * sims.reshape(1, -1) - 1.0))
+                        r_q = np.linalg.norm(Phi_q, axis=1, keepdims=True)
+                        U_q = Phi_q / np.maximum(1e-12, r_q)
+                        Z_q = U_q @ W_pair_rbf.T
+                        scale_q = (_IG_W * (self.rbf_gamma / np.maximum(1e-12, r_q))) * Phi_q
+                        beta = np.sum(scale_q, axis=0)[None, :] * W_pair_rbf - Z_q.T @ (scale_q * U_q)
 
-                t_attrs = [0.0] * n_spans
-                m_attrs = [0.0] * n_spans
-
-                if sp_ok:
-                    self._accumulate_tfidf_span_attrs(
-                        sp_trace, act_idx, w_eff_sp_c1, w_eff_sp_mg, g_sp / norm_sp, t_attrs, m_attrs
-                    )
-
-                if dn_ok and hd_trace is not None:
-                    dn_coef = g_dn / norm_dn
-                    wb_c1 = self.W_bucket_dn[c1]
-                    wb_mg = wb_c1 - self.W_bucket_dn[c2]
-                    if beta is not None and self.L_bucket_dn is not None:
-                        b0_dn = beta[0] @ self.L_bucket_dn
-                        b1_dn = beta[1] @ self.L_bucket_dn
-                        for sp_j, h_word, w_wt, sub_w, sub_l in hd_trace["dn_word_events"]:
-                            dt = (float(wb_c1[h_word]) + float(b0_dn[h_word])) * w_wt
-                            dm = (float(wb_mg[h_word]) + float(b1_dn[h_word])) * w_wt
-                            if sub_w is not None and sub_l is not None:
-                                dt += float(sub_w[c1]) + float(beta[0] @ sub_l)
-                                dm += float(sub_w[c1] - sub_w[c2]) + float(beta[1] @ sub_l)
-                            t_attrs[sp_j] += dt * dn_coef
-                            m_attrs[sp_j] += dm * dn_coef
-                        for sp_j, b_idx, wt in hd_trace["dn_unary_events"]:
-                            c_wt = wt * dn_coef
-                            t_attrs[sp_j] += (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
-                            m_attrs[sp_j] += (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
-                        for sp0, sp1, b_idx, half_wt in hd_trace["dn_bi_events"]:
-                            c_wt = half_wt * dn_coef
-                            dt = (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
-                            dm = (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
-                            t_attrs[sp0] += dt
-                            t_attrs[sp1] += dt
-                            m_attrs[sp0] += dm
-                            m_attrs[sp1] += dm
-                        for hit_spans, b_idx, wt in hd_trace["dn_mw_events"]:
-                            c_wt = (wt / len(hit_spans)) * dn_coef
-                            dt = (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
-                            dm = (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
-                            for sp_j in hit_spans:
-                                t_attrs[sp_j] += dt
-                                m_attrs[sp_j] += dm
+                        w_sp_act = self.W_sp_T[act_idx]
+                        l_sp_act = self.L_sp_T[act_idx] if sp_ok else None
+                        w_eff_sp_c1 = w_sp_act[:, c1] + (l_sp_act @ beta[0] if l_sp_act is not None else 0.0)
+                        w_eff_sp_mg = (w_sp_act[:, c1] - w_sp_act[:, c2]) + (
+                            l_sp_act @ beta[1] if l_sp_act is not None else 0.0
+                        )
+                        b_target = float(self.b_eff[c1] + self.b_rbf0[c1])
+                        b_margin = float((self.b_eff[c1] - self.b_eff[c2]) + (self.b_rbf0[c1] - self.b_rbf0[c2]))
                     else:
-                        for sp_j, h_word, w_wt, sub_w, _ in hd_trace["dn_word_events"]:
-                            dt = float(wb_c1[h_word]) * w_wt
-                            dm = float(wb_mg[h_word]) * w_wt
-                            if sub_w is not None:
-                                dt += float(sub_w[c1])
-                                dm += float(sub_w[c1] - sub_w[c2])
-                            t_attrs[sp_j] += dt * dn_coef
-                            m_attrs[sp_j] += dm * dn_coef
-                        for sp_j, b_idx, wt in hd_trace["dn_unary_events"]:
-                            c_wt = wt * dn_coef
-                            t_attrs[sp_j] += float(wb_c1[b_idx]) * c_wt
-                            m_attrs[sp_j] += float(wb_mg[b_idx]) * c_wt
-                        for sp0, sp1, b_idx, half_wt in hd_trace["dn_bi_events"]:
-                            c_wt = half_wt * dn_coef
-                            dt = float(wb_c1[b_idx]) * c_wt
-                            dm = float(wb_mg[b_idx]) * c_wt
+                        beta = None
+                        w_sp_act = self.W_sp_T[act_idx]
+                        w_eff_sp_c1 = w_sp_act[:, c1]
+                        w_eff_sp_mg = w_sp_act[:, c1] - w_sp_act[:, c2]
+                        b_target = float(self.b_eff[c1])
+                        b_margin = float(self.b_eff[c1] - self.b_eff[c2])
+
+                    t_attrs = [0.0] * n_spans
+                    m_attrs = [0.0] * n_spans
+
+                    if sp_ok:
+                        self._accumulate_tfidf_span_attrs(
+                            sp_trace, act_idx, w_eff_sp_c1, w_eff_sp_mg, g_sp / norm_sp, t_attrs, m_attrs
+                        )
+
+                    if dn_ok and has_dn_events and hd_trace is not None:
+                        dn_coef = g_dn / norm_dn
+                        wb_c1 = self.W_bucket_dn[c1]
+                        wb_mg = wb_c1 - self.W_bucket_dn[c2]
+                        if beta is not None and self.L_bucket_dn is not None:
+                            b0_dn = beta[0] @ self.L_bucket_dn
+                            b1_dn = beta[1] @ self.L_bucket_dn
+                            for sp_j, h_word, w_wt, sub_w, sub_l in hd_trace["dn_word_events"]:
+                                dt = (float(wb_c1[h_word]) + float(b0_dn[h_word])) * w_wt
+                                dm = (float(wb_mg[h_word]) + float(b1_dn[h_word])) * w_wt
+                                if sub_w is not None and sub_l is not None:
+                                    dt += float(sub_w[c1]) + float(beta[0] @ sub_l)
+                                    dm += float(sub_w[c1] - sub_w[c2]) + float(beta[1] @ sub_l)
+                                t_attrs[sp_j] += dt * dn_coef
+                                m_attrs[sp_j] += dm * dn_coef
+                            for sp_j, b_idx, wt in hd_trace["dn_unary_events"]:
+                                c_wt = wt * dn_coef
+                                t_attrs[sp_j] += (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
+                                m_attrs[sp_j] += (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
+                            for sp0, sp1, b_idx, half_wt in hd_trace["dn_bi_events"]:
+                                c_wt = half_wt * dn_coef
+                                dt = (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
+                                dm = (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
+                                t_attrs[sp0] += dt
+                                t_attrs[sp1] += dt
+                                m_attrs[sp0] += dm
+                                m_attrs[sp1] += dm
+                            for hit_spans, b_idx, wt in hd_trace["dn_mw_events"]:
+                                c_wt = (wt / len(hit_spans)) * dn_coef
+                                dt = (float(wb_c1[b_idx]) + float(b0_dn[b_idx])) * c_wt
+                                dm = (float(wb_mg[b_idx]) + float(b1_dn[b_idx])) * c_wt
+                                for sp_j in hit_spans:
+                                    t_attrs[sp_j] += dt
+                                    m_attrs[sp_j] += dm
+                        else:
+                            for sp_j, h_word, w_wt, sub_w, _ in hd_trace["dn_word_events"]:
+                                dt = float(wb_c1[h_word]) * w_wt
+                                dm = float(wb_mg[h_word]) * w_wt
+                                if sub_w is not None:
+                                    dt += float(sub_w[c1])
+                                    dm += float(sub_w[c1] - sub_w[c2])
+                                t_attrs[sp_j] += dt * dn_coef
+                                m_attrs[sp_j] += dm * dn_coef
+                            for sp_j, b_idx, wt in hd_trace["dn_unary_events"]:
+                                c_wt = wt * dn_coef
+                                t_attrs[sp_j] += float(wb_c1[b_idx]) * c_wt
+                                m_attrs[sp_j] += float(wb_mg[b_idx]) * c_wt
+                            for sp0, sp1, b_idx, half_wt in hd_trace["dn_bi_events"]:
+                                c_wt = half_wt * dn_coef
+                                dt = float(wb_c1[b_idx]) * c_wt
+                                dm = float(wb_mg[b_idx]) * c_wt
+                                t_attrs[sp0] += dt
+                                t_attrs[sp1] += dt
+                                m_attrs[sp0] += dm
+                                m_attrs[sp1] += dm
+                            for hit_spans, b_idx, wt in hd_trace["dn_mw_events"]:
+                                c_wt = (wt / len(hit_spans)) * dn_coef
+                                dt = float(wb_c1[b_idx]) * c_wt
+                                dm = float(wb_mg[b_idx]) * c_wt
+                                for sp_j in hit_spans:
+                                    t_attrs[sp_j] += dt
+                                    m_attrs[sp_j] += dm
+
+                    if sc_ok and hd_trace is not None:
+                        sc_coef = g_sc / norm_sc
+                        wt_c1 = self.W_term_sc[c1]
+                        wt_mg = wt_c1 - self.W_term_sc[c2]
+                        if beta is not None and self.L_term_sc is not None:
+                            wt_c1 = wt_c1 + beta[0] @ self.L_term_sc
+                            wt_mg = wt_mg + beta[1] @ self.L_term_sc
+                        sc_occ = hd_trace["sc_occ"]
+                        for tidx, sp_list in hd_trace["spec_w_map"].items():
+                            vc = sc_occ[tidx] * sc_coef
+                            dt = float(wt_c1[tidx]) * vc
+                            dm = float(wt_mg[tidx]) * vc
+                            for sp_j in sp_list:
+                                t_attrs[sp_j] += dt
+                                m_attrs[sp_j] += dm
+                        for tidx, sp0, sp1 in hd_trace["spec_bi_events"]:
+                            vc = 0.5 * sc_occ[tidx] * sc_coef
+                            dt = float(wt_c1[tidx]) * vc
+                            dm = float(wt_mg[tidx]) * vc
                             t_attrs[sp0] += dt
                             t_attrs[sp1] += dt
                             m_attrs[sp0] += dm
                             m_attrs[sp1] += dm
-                        for hit_spans, b_idx, wt in hd_trace["dn_mw_events"]:
-                            c_wt = (wt / len(hit_spans)) * dn_coef
-                            dt = float(wb_c1[b_idx]) * c_wt
-                            dm = float(wb_mg[b_idx]) * c_wt
-                            for sp_j in hit_spans:
-                                t_attrs[sp_j] += dt
-                                m_attrs[sp_j] += dm
-
-                if sc_ok and hd_trace is not None:
-                    sc_coef = g_sc / norm_sc
-                    wt_c1 = self.W_term_sc[c1]
-                    wt_mg = wt_c1 - self.W_term_sc[c2]
-                    if beta is not None and self.L_term_sc is not None:
-                        wt_c1 = wt_c1 + beta[0] @ self.L_term_sc
-                        wt_mg = wt_mg + beta[1] @ self.L_term_sc
-                    sc_occ = hd_trace["sc_occ"]
-                    for tidx, sp_list in hd_trace["spec_w_map"].items():
-                        vc = sc_occ[tidx] * sc_coef
-                        dt = float(wt_c1[tidx]) * vc
-                        dm = float(wt_mg[tidx]) * vc
-                        for sp_j in sp_list:
-                            t_attrs[sp_j] += dt
-                            m_attrs[sp_j] += dm
-                    for tidx, sp0, sp1 in hd_trace["spec_bi_events"]:
-                        vc = 0.5 * sc_occ[tidx] * sc_coef
-                        dt = float(wt_c1[tidx]) * vc
-                        dm = float(wt_mg[tidx]) * vc
-                        t_attrs[sp0] += dt
-                        t_attrs[sp1] += dt
-                        m_attrs[sp0] += dm
-                        m_attrs[sp1] += dm
 
                 rest_pieces: List[np.ndarray] = [(u_dn * (self.wb * g_dn)).astype(np.float32)]
                 if self.spd > 0:
@@ -1740,6 +1848,29 @@ class FastExplainer:
                 if sp_ok:
                     sp_scaled = (v_sp * (self.wb * g_sp)).astype(np.float32)
                     sims_all += (sp_scaled @ self.X_train_sp_T[act_idx]).astype(np.float64)
+
+        if not override_hit and self._mode in ("tfidf", "hybrid") and n_spans > 0 and has_active_spans:
+            f32_tol = 32.0 * float(np.finfo(np.float32).eps) * (
+                float(np.sum(np.abs(self.W_eff[c1])))
+                + float(np.sum(np.abs(self.W_eff[c2])))
+                + abs(b_target)
+                + abs(b_margin)
+                + 1.0
+            )
+            res_t = float(logits[c1]) - (sum(t_attrs) + b_target)
+            if 0.0 < abs(res_t) <= f32_tol:
+                abs_t = sum(abs(v) for v in t_attrs)
+                if abs_t > 1e-12:
+                    t_attrs = [v + res_t * (abs(v) / abs_t) for v in t_attrs]
+                else:
+                    t_attrs = [v + (res_t / n_spans) for v in t_attrs]
+            res_m = margin - (sum(m_attrs) + b_margin)
+            if 0.0 < abs(res_m) <= f32_tol:
+                abs_m = sum(abs(v) for v in m_attrs)
+                if abs_m > 1e-12:
+                    m_attrs = [v + res_m * (abs(v) / abs_m) for v in m_attrs]
+                else:
+                    m_attrs = [v + (res_m / n_spans) for v in m_attrs]
 
         sum_t = sum(t_attrs) + b_target
         sum_m = sum(m_attrs) + b_margin

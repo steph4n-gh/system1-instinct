@@ -3472,6 +3472,14 @@ class SystemOneEngine:
             if model_schema is None
             else getattr(model_schema, "__dict__", {}).get("validate_decision"),
         )
+        schema_sig = (
+            id(eng_schema),
+            eng_schema.schema_digest() if hasattr(eng_schema, "schema_digest") else None,
+            None if model_schema is None else id(model_schema),
+            None
+            if model_schema is None or not hasattr(model_schema, "schema_digest")
+            else model_schema.schema_digest(),
+        )
         return (
             str(storage_mode),
             int(getattr(self, "model_version", 1)),
@@ -3492,6 +3500,7 @@ class SystemOneEngine:
             cal_sig,
             cp_sig,
             rcp_sig,
+            schema_sig,
         )
 
     def compile_packed_kernel(self, *, storage_mode: str = "float32") -> PackedMultiQuestionKernel:

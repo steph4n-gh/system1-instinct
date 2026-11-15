@@ -175,6 +175,16 @@ def _round_up_16(val: int) -> int:
     return ((max(16, int(val)) + 15) // 16) * 16
 
 
+def _ceil_float16_unit(vals: np.ndarray) -> np.ndarray:
+    """Conservatively round unit-interval values upward to float16 so thresholds never shrink."""
+    v64 = np.clip(np.asarray(vals, dtype=np.float64), 0.0, 1.0)
+    q16 = v64.astype(np.float16)
+    mask = q16.astype(np.float64) < v64
+    if bool(np.any(mask)):
+        q16 = np.where(mask, np.nextafter(q16, np.float16(1.0)), q16)
+    return q16
+
+
 def _prepare_shared_subspace(W_base: np.ndarray, r_sub: int, seed: int = 42) -> np.ndarray:
     """Build a (D, r_sub) orthonormal float32 basis anchored on SVD of W_base."""
     W64 = np.asarray(W_base, dtype=np.float64)
@@ -331,20 +341,21 @@ class MultiTenantSkillFleet:
         self.ex_cls = np.full((N, self.m_exemplars), -1, dtype=np.int16)
         self.ex_len = np.zeros(N, dtype=np.uint8)
 
-        q0 = np.full(K, 0.5, dtype=np.float32) if q_init is None else np.asarray(q_init, dtype=np.float32).reshape(-1)
-        if q0.shape[0] != K:
-            raise ValueError(f"q_init length {q0.shape[0]} != num_classes {K}")
-        if not bool(np.all(np.isfinite(q0))):
+        q0_f64 = np.full(K, 0.5, dtype=np.float64) if q_init is None else np.asarray(q_init, dtype=np.float64).reshape(-1)
+        if q0_f64.shape[0] != K:
+            raise ValueError(f"q_init length {q0_f64.shape[0]} != num_classes {K}")
+        if not bool(np.all(np.isfinite(q0_f64))):
             raise ValueError("q_init must contain only finite values")
-        self.q_init = np.clip(q0, 1e-4, 1.0).astype(np.float32)
+        q_init_f64 = np.clip(q0_f64, 1e-4, 1.0)
+        self.q_init = q_init_f64.astype(np.float32)
         u_init = np.where(
             self.q_init >= 1.0 - math.exp(-(16.0 - 1e-6)),
             16.0,
             -np.log(np.clip(1.0 - self.q_init.astype(np.float64), 1e-12, 1.0)),
         )
-        self.q_c = np.broadcast_to(self.q_init.astype(np.float16), (N, K)).copy()
+        self.q_c = np.broadcast_to(_ceil_float16_unit(q_init_f64), (N, K)).copy()
         self.u_c = np.broadcast_to(u_init.astype(np.float16), (N, K)).copy()
-        self.alpha_c = np.full((N, K), self.alpha, dtype=np.float16)
+        self.alpha_c = np.full((N, K), self.alpha, dtype=np.float64)
         self.err_ewma = np.full((N, K), self.alpha, dtype=np.float16)
 
         self._lock = threading.RLock()
@@ -352,6 +363,8 @@ class MultiTenantSkillFleet:
         self._active_views: Tuple[Any, ...] = self._bind_views(0)
 
     def _validate_tid(self, tid: int) -> int:
+        if isinstance(tid, bool) or not isinstance(tid, (int, np.integer)):
+            raise ValueError(f"tenant_id must be an integer, got {tid!r}")
         idx = int(tid)
         if not 0 <= idx < self.num_tenants:
             raise IndexError(f"tenant_id {idx} out of range [0, {self.num_tenants})")
@@ -362,6 +375,8 @@ class MultiTenantSkillFleet:
             if label not in self.c2i:
                 raise ValueError(f"Unknown class label {label!r}")
             return self.c2i[label]
+        if isinstance(label, bool) or not isinstance(label, (int, np.integer)):
+            raise ValueError(f"Class label must be a string or integer index, got {label!r}")
         idx = int(label)
         if not 0 <= idx < self.num_classes:
             raise ValueError(f"Class index {idx} out of range [0, {self.num_classes})")
@@ -941,6 +956,7 @@ class MultiTenantSkillFleet:
             raise ValueError(f"Invalid ex_vecs_q spec: dtype={ex_dtype}, shape={ex_shape}, expected ({T}, <=1024, {R})")
         M_ex = ex_shape[1]
 
+        alpha_dtypes = (np.dtype(np.float16), np.dtype(np.float32), np.dtype(np.float64))
         expected_specs: Dict[str, Tuple[Tuple[np.dtype, ...], Tuple[int, ...]]] = {
             "b_base": (float_dtypes, (K,)),
             "U_shared": (float_dtypes, (D, R)),
@@ -956,7 +972,7 @@ class MultiTenantSkillFleet:
             "ex_len": ((np.dtype(np.uint8),), (T,)),
             "q_c": (float_dtypes, (T, K)),
             "u_c": (float_dtypes, (T, K)),
-            "alpha_c": (float_dtypes, (T, K)),
+            "alpha_c": (alpha_dtypes, (T, K)),
             "err_ewma": (float_dtypes, (T, K)),
         }
         for arr_name, (exp_dtypes, exp_shape) in expected_specs.items():
@@ -983,7 +999,7 @@ class MultiTenantSkillFleet:
             if c_dtype != np.dtype(np.uint8) or len(c_shape) != 1 or c_shape[0] > 1_048_576:
                 raise ValueError(f"Invalid classes_utf8 spec: dtype={c_dtype}, shape={c_shape}")
 
-        # Runtime allocation footprint across cls(...) float32 base/P_blk + int8/float16/uint16 arenas.
+        # Runtime allocation footprint across float32 base/P_blk + float64 alpha_c + int8/float16/uint16 arenas.
         base_runtime = 4 * (K * D + K + D * R + K) + 2 * cls.BASE_HASH_SIZE
         arena_runtime = (
             T * K * R * 1
@@ -992,7 +1008,7 @@ class MultiTenantSkillFleet:
             + T * M_sp * (2 + 2 + 2)
             + T * M_ex * (R * 1 + 2 + 2)
             + T * (1 + 1)
-            + T * K * (2 * 4)
+            + T * K * (2 * 3 + 8)
         )
         est_runtime = int(base_runtime + arena_runtime)
         if est_runtime > int(max_runtime_bytes) or total_expanded > int(max_runtime_bytes) + 65536:
@@ -1039,6 +1055,8 @@ class MultiTenantSkillFleet:
             raise ValueError(f"Expected length {self.num_classes}, got {arr.shape[0]}")
         if not bool(np.all(np.isfinite(arr))):
             raise ValueError("probs_or_logits must contain only finite values")
+        if not is_logits and not bool(np.all((arr >= 0.0) & (arr <= 1.0))):
+            raise ValueError("Probabilities must lie in [0.0, 1.0] when is_logits=False")
         probs = _softmax_temp(arr, temp=0.25) if is_logits else arr
         if not bool(np.all(np.isfinite(probs))):
             raise ValueError("Computed probabilities from probs_or_logits contain non-finite values")
@@ -1073,7 +1091,7 @@ class MultiTenantSkillFleet:
                 q_f16 = np.nextafter(q_f16, np.float16(1.0))
 
             self.err_ewma[tid, yi] = np.float16(ewma_next)
-            self.alpha_c[tid, yi] = np.float16(a_next)
+            self.alpha_c[tid, yi] = float(a_next)
             self.u_c[tid, yi] = np.float16(u_next)
             self.q_c[tid, yi] = q_f16
             if tid == self._active_tid:
@@ -1086,13 +1104,8 @@ class MultiTenantSkillFleet:
             arr_f32 = np.asarray(arr, dtype=np.float32)
             if not bool(np.all(np.isfinite(arr_f32))):
                 raise ValueError(f"Fleet array {name!r} contains non-finite values")
-            if arr_f32.size == 0:
-                return arr_f32.astype(np.float16)
-            max_abs = float(np.max(np.abs(arr_f32)))
-            if max_abs > 1e12:
+            if arr_f32.size > 0 and float(np.max(np.abs(arr_f32))) > 1e12:
                 raise ValueError(f"Fleet array {name!r} exceeds safe float32 magnitude bound")
-            if max_abs <= 65500.0:
-                return arr_f32.astype(np.float16)
             return arr_f32
 
         with self._lock:
@@ -1243,9 +1256,10 @@ class MultiTenantSkillFleet:
                 sp_w_arr = zf["sp_w"].astype(np.float16)
                 ex_vecs_q_arr = zf["ex_vecs_q"]
                 ex_scales_arr = zf["ex_scales"].astype(np.float16)
-                q_c_arr = zf["q_c"].astype(np.float16)
+                raw_q_c = zf["q_c"]
+                q_c_arr = raw_q_c.copy() if raw_q_c.dtype == np.dtype(np.float16) else raw_q_c.astype(np.float64)
                 u_c_arr = zf["u_c"].astype(np.float16)
-                alpha_c_arr = zf["alpha_c"].astype(np.float16)
+                alpha_c_arr = zf["alpha_c"].astype(np.float64)
                 err_ewma_arr = zf["err_ewma"].astype(np.float16)
 
             for arr_name, arr_val in (
@@ -1282,6 +1296,8 @@ class MultiTenantSkillFleet:
                 raise ValueError("Snapshot q_init outside [0.0, 1.0]")
             if float(np.min(q_c_arr)) < 0.0 or float(np.max(q_c_arr)) > 1.0:
                 raise ValueError("Snapshot q_c outside [0.0, 1.0]")
+            if q_c_arr.dtype != np.dtype(np.float16):
+                q_c_arr = _ceil_float16_unit(q_c_arr)
             if u_c_arr.size > 0 and (float(np.min(u_c_arr)) < 0.0 or float(np.max(u_c_arr)) > 16.0):
                 raise ValueError("Snapshot u_c outside [0.0, 16.0]")
             if float(np.min(alpha_c_arr)) <= 0.0 or float(np.max(alpha_c_arr)) >= 1.0:

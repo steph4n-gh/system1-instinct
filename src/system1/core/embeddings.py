@@ -2641,10 +2641,18 @@ class HybridProjector:
             weights = tuple(float(w) for w in raw_weights)
             if len(terms) != len(weights) or any(not math.isfinite(w) for w in weights):
                 raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
+            with np.errstate(over="ignore", invalid="ignore"):
+                weights_arr = (
+                    np.asarray(weights, dtype=np.float32)
+                    if weights
+                    else np.empty(0, dtype=np.float32)
+                )
+            if not bool(np.all(np.isfinite(weights_arr))):
+                raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
             proj._spectral_terms = terms
             proj._spectral_vocab = {tm: i for i, tm in enumerate(terms)}
             proj._spectral_weights = weights
-            proj._spectral_weights_arr = np.asarray(weights, dtype=np.float32)
+            proj._spectral_weights_arr = weights_arr
 
             raw_spec = spectral_vectors if spectral_vectors is not None else config.get("spectral_vectors")
             if raw_spec is not None and len(raw_spec) > 0:

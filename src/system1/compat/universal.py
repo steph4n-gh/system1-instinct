@@ -1169,7 +1169,9 @@ class UniversalDecisionService:
     ) -> None:
         self.upstream_handlers = dict(upstream_handlers or {})
         self.upstream_urls = dict(upstream_urls or {})
-        self.require_auth = bool(require_auth)
+        if not isinstance(require_auth, bool):
+            raise ValueError(f"require_auth must be explicitly True or False, got {require_auth!r}")
+        self.require_auth = require_auth
         if bearer_token is not None and not isinstance(bearer_token, str):
             raise TypeError(f"bearer_token must be a string or None, got {type(bearer_token).__name__}")
         if self.require_auth and (bearer_token is None or not bearer_token.strip()):
