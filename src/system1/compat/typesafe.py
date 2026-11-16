@@ -1542,6 +1542,9 @@ class TypeSafeClient:
         self.auto_cutover_lifecycle = auto_cutover_lifecycle
         self._cutover_lifecycles: collections.OrderedDict[str, Any] = collections.OrderedDict()
         self._injected_lc_digest: Optional[str] = None
+        self._lc_inflight_obs: Dict[int, int] = collections.defaultdict(int)
+        self._lc_committed_ops: Dict[int, int] = collections.defaultdict(int)
+        self._lc_pending_new_bind: Dict[str, Tuple[Any, bool, Optional[str]]] = {}
         raw_max_unprom = kwargs.get("max_unpromoted_lifecycles", 256)
         if isinstance(raw_max_unprom, (bool, np.bool_)) or not isinstance(raw_max_unprom, int) or raw_max_unprom < 1:
             raise ValueError(f"max_unpromoted_lifecycles must be a positive int, got {raw_max_unprom!r}")
@@ -2281,6 +2284,7 @@ class TypeSafeClient:
                             self._commit_distill_outcome_locked(digest, outcome)
                     finally:
                         self._compiling_schemas.discard(digest)
+                        self._enforce_unpromoted_history_cap_locked()
                         self._compile_cond.notify_all()
 
         threading.Thread(target=_worker, name=f"system1-cutover-{digest[:8]}", daemon=True).start()
@@ -2299,6 +2303,7 @@ class TypeSafeClient:
             digest = schema.schema_digest()
             if not (self._has_cutover or (digest in self._has_cutover_schemas)):
                 self._distill_and_cutover_locked(questions)
+                self._enforce_unpromoted_history_cap_locked()
             return self._has_cutover or (digest in self._has_cutover_schemas)
 
     @staticmethod
@@ -2317,6 +2322,13 @@ class TypeSafeClient:
         if val < 0:
             raise ValueError(f"egress_bytes must be non-negative, got {val}")
         return val
+
+    @staticmethod
+    def _lifecycle_state_str(lc: Any) -> Optional[str]:
+        st = getattr(lc, "state", None)
+        if st is None:
+            return None
+        return str(st.value) if hasattr(st, "value") else str(st)
 
     @staticmethod
     def _is_lifecycle_promoted(lc: Any) -> bool:
@@ -2366,8 +2378,39 @@ class TypeSafeClient:
         ]
         while len(unpromoted) > limit:
             evict_key = unpromoted.pop(0)
+            evict_lc = self._cutover_lifecycles.get(evict_key)
             self._cutover_lifecycles.pop(evict_key, None)
             self._retire_evicted_schema_bookkeeping_locked(evict_key)
+            self._lc_pending_new_bind.pop(evict_key, None)
+            if (
+                evict_lc is not None
+                and evict_lc is not self.auto_cutover_lifecycle
+                and self._lc_inflight_obs.get(id(evict_lc), 0) <= 0
+            ):
+                self._lc_committed_ops.pop(id(evict_lc), None)
+
+    def _enforce_unpromoted_history_cap_locked(self) -> None:
+        seen_unprom: Set[str] = set()
+        unprom_hist: List[str] = []
+        for store in (
+            self._history,
+            self._call_count,
+            self._teacher_sample_count,
+            self._validation_seen_keys,
+            self._validation_attempts,
+            self._drift_detectors,
+        ):
+            for k in list(store.keys()):
+                if (
+                    k not in seen_unprom
+                    and k not in self._has_cutover_schemas
+                    and k not in self._compiling_schemas
+                    and k not in self._cutover_lifecycles
+                ):
+                    seen_unprom.add(k)
+                    unprom_hist.append(k)
+        while len(unprom_hist) > self.max_unpromoted_lifecycles:
+            self._retire_evicted_schema_bookkeeping_locked(unprom_hist.pop(0))
 
     def systemone(
         self,
@@ -2437,7 +2480,7 @@ class TypeSafeClient:
                 used_injected_cand = raw_is_injected_lc and cand_lc is self.auto_cutover_lifecycle
                 local_tx: Optional[Any] = None
                 try:
-                    if cand_lc is not None and getattr(cand_lc, "state", None) != CutoverState.DRIFT_RECALIBRATE.value:
+                    if cand_lc is not None and self._lifecycle_state_str(cand_lc) != CutoverState.DRIFT_RECALIBRATE.value:
                         t_local = time.perf_counter()
                         if hasattr(cand_lc, "_decide_local_with_tx"):
                             local_vals, local_tx = cand_lc._decide_local_with_tx(encoded_state)
@@ -2475,6 +2518,8 @@ class TypeSafeClient:
                                             self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
                                         self._cutover_lifecycles[digest] = cand_lc
                                         self._cutover_lifecycles.move_to_end(digest)
+                                        self._lc_committed_ops[id(cand_lc)] += 1
+                                        self._lc_pending_new_bind.pop(digest, None)
                                         self._call_count[digest] += 1
                                         self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                                         if digest not in self._cutover_lifecycles:
@@ -2498,7 +2543,7 @@ class TypeSafeClient:
                                         "is_ambiguous": False,
                                         "auto_cutover_active": True,
                                         "is_cutover": self._is_lifecycle_promoted(cand_lc),
-                                        "cutover_state": cand_lc.state,
+                                        "cutover_state": self._lifecycle_state_str(cand_lc),
                                     })
                                 if local_tx is not None and hasattr(cand_lc, "_rollback_local_tx"):
                                     cand_lc._rollback_local_tx(local_tx)
@@ -2535,17 +2580,15 @@ class TypeSafeClient:
                         validated = definition.validate_value(_teaching_target(definition, value))
                         teacher_vals[name] = validated
 
-                    created_new_lc = False
-                    prev_inj_digest: Optional[str] = None
-                    bound_inj_digest = False
                     with self._engine_lock:
                         lc = self._cutover_lifecycles.get(digest)
                         if lc is None:
-                            created_new_lc = True
                             self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
                             is_injected_lc = raw_is_injected_lc and self._matches_injected_lifecycle_locked(
                                 schema, digest
                             )
+                            bound_inj_digest = False
+                            prev_inj_digest: Optional[str] = None
                             if is_injected_lc:
                                 lc = self.auto_cutover_lifecycle
                                 prev_inj_digest = self._injected_lc_digest
@@ -2560,39 +2603,83 @@ class TypeSafeClient:
                                 lc_cfg = lc_cfg if isinstance(lc_cfg, CutoverConfig) else None
                                 lc = AutoCutoverLifecycle(schema, teacher=None, config=lc_cfg)
                             self._cutover_lifecycles[digest] = lc
+                            self._lc_pending_new_bind[digest] = (lc, bound_inj_digest, prev_inj_digest)
                         else:
                             self._cutover_lifecycles.move_to_end(digest)
+                        self._lc_inflight_obs[id(lc)] += 1
 
+                    obs_canary_tx: Optional[Any] = None
                     if lc is not cand_lc and local_tx is not None and cand_lc is not None:
                         if hasattr(cand_lc, "_rollback_local_tx"):
                             cand_lc._rollback_local_tx(local_tx)
                         local_tx = None
+                    elif lc is cand_lc:
+                        obs_canary_tx = local_tx
 
                     try:
-                        lc.observe_teacher(encoded_state, teacher_vals)
+                        if getattr(lc, "_supports_canary_tx_arg", False):
+                            lc.observe_teacher(
+                                encoded_state,
+                                teacher_vals,
+                                _canary_tx=(
+                                    obs_canary_tx
+                                    if obs_canary_tx is not None
+                                    else (0, 0, 0, "", None)
+                                ),
+                            )
+                        else:
+                            lc.observe_teacher(encoded_state, teacher_vals)
                     except BaseException:
                         with self._engine_lock:
-                            if created_new_lc and (
-                                not getattr(lc, "admitted_keys", ())
+                            rem_in = self._lc_inflight_obs.get(id(lc), 0) - 1
+                            if rem_in <= 0:
+                                self._lc_inflight_obs.pop(id(lc), None)
+                            else:
+                                self._lc_inflight_obs[id(lc)] = rem_in
+                            pend_bind = self._lc_pending_new_bind.get(digest)
+                            if (
+                                pend_bind is not None
+                                and pend_bind[0] is lc
+                                and rem_in <= 0
+                                and self._lc_committed_ops.get(id(lc), 0) == 0
+                                and not self._is_lifecycle_promoted(lc)
+                                and getattr(lc, "step_count", 0) == 0
+                                and getattr(lc, "local_hits", 0) == 0
+                                and not getattr(lc, "admitted_keys", ())
                                 and not getattr(lc, "quarantine", ())
                                 and not getattr(lc, "teacher_key_labels", {})
                             ):
+                                self._lc_pending_new_bind.pop(digest, None)
                                 if self._cutover_lifecycles.get(digest) is lc:
                                     self._cutover_lifecycles.pop(digest, None)
-                                if bound_inj_digest:
-                                    self._injected_lc_digest = prev_inj_digest
+                                if pend_bind[1] and self._injected_lc_digest == digest:
+                                    self._injected_lc_digest = pend_bind[2]
                             self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                         raise
                     local_tx = None
                     with self._engine_lock:
+                        rem_in = self._lc_inflight_obs.get(id(lc), 0) - 1
+                        if rem_in <= 0:
+                            self._lc_inflight_obs.pop(id(lc), None)
+                        else:
+                            self._lc_inflight_obs[id(lc)] = rem_in
+                        self._lc_committed_ops[id(lc)] += 1
+                        pend_bind = self._lc_pending_new_bind.get(digest)
+                        if pend_bind is not None and pend_bind[0] is lc:
+                            self._lc_pending_new_bind.pop(digest, None)
                         self._call_count[digest] += 1
                         self._teacher_sample_count[digest] += 1
                         self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                         if digest not in self._cutover_lifecycles:
                             self._retire_evicted_schema_bookkeeping_locked(digest)
+                            if (
+                                lc is not self.auto_cutover_lifecycle
+                                and self._lc_inflight_obs.get(id(lc), 0) <= 0
+                            ):
+                                self._lc_committed_ops.pop(id(lc), None)
                     cloud_resp["auto_cutover_active"] = True
                     cloud_resp["is_cutover"] = self._is_lifecycle_promoted(lc)
-                    cloud_resp["cutover_state"] = lc.state
+                    cloud_resp["cutover_state"] = self._lifecycle_state_str(lc)
                     cloud_resp["egress_bytes"] = egress_bytes
                     return cloud_resp
                 except BaseException:
@@ -2675,13 +2762,7 @@ class TypeSafeClient:
 
                     current_cutover = self._has_cutover or (digest in self._has_cutover_schemas)
                     currently_compiling = digest in self._compiling_schemas
-                    unprom_hist = [
-                        k
-                        for k in self._history
-                        if k not in self._has_cutover_schemas and k not in self._compiling_schemas
-                    ]
-                    while len(unprom_hist) > self.max_unpromoted_lifecycles:
-                        self._retire_evicted_schema_bookkeeping_locked(unprom_hist.pop(0))
+                    self._enforce_unpromoted_history_cap_locked()
 
                 cloud_resp["auto_cutover_active"] = True
                 cloud_resp["is_cutover"] = current_cutover

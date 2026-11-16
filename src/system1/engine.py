@@ -8,6 +8,7 @@ and ActionLedger audit integration.
 from __future__ import annotations
 
 import copy
+import dis
 import functools
 import hashlib
 import inspect
@@ -201,6 +202,24 @@ def _snapshot_obj_dict_and_slots(
     return True
 
 
+def _iter_structured_ndarray_objects(arr: np.ndarray) -> Any:
+    if not arr.dtype.hasobject:
+        return
+    if arr.dtype == np.object_:
+        yield from arr.flat
+        return
+    if arr.dtype.names:
+        for fname in arr.dtype.names:
+            if arr.dtype.fields[fname][0].hasobject:
+                yield from _iter_structured_ndarray_objects(arr[fname])
+    elif arr.dtype.subdtype is not None:
+        sub_dt, _ = arr.dtype.subdtype
+        if sub_dt.hasobject:
+            for item in arr.flat:
+                if isinstance(item, np.ndarray):
+                    yield from _iter_structured_ndarray_objects(item)
+
+
 def _snapshot_duck_graph(
     val: Any,
     seen_ids: set[int],
@@ -241,6 +260,18 @@ def _snapshot_duck_graph(
                     skip_ids,
                     container_snaps,
                 )
+        elif val.dtype != np.object_ and val.dtype.hasobject:
+            for elem in _iter_structured_ndarray_objects(val):
+                _snapshot_duck_graph(
+                    elem,
+                    seen_ids,
+                    state_snaps,
+                    dict_snaps,
+                    slot_snaps,
+                    memo,
+                    skip_ids,
+                    container_snaps,
+                )
         if type(val) is not np.ndarray:
             _snapshot_obj_dict_and_slots(
                 val,
@@ -253,6 +284,27 @@ def _snapshot_duck_graph(
                 skip_ids,
                 container_snaps,
             )
+        return val
+    if isinstance(val, np.void) and val.dtype.names:
+        memo[obj_id] = val
+        cp_void_0d = np.array(val, copy=True)
+        void_fields_snap: List[Tuple[str, Any]] = []
+        for fname in val.dtype.names:
+            f_val = val[fname]
+            f_snap = f_val.copy() if isinstance(f_val, (np.ndarray, np.void)) else f_val
+            void_fields_snap.append((fname, f_snap))
+            _snapshot_duck_graph(
+                f_val,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        if container_snaps is not None:
+            container_snaps.append(("np_void", val, void_fields_snap, bool(val.flags.writeable), cp_void_0d))
         return val
     if isinstance(val, bytearray):
         memo[obj_id] = val
@@ -428,23 +480,17 @@ def _ndarray_state_equal(a: np.ndarray, b: np.ndarray) -> bool:
         return False
     if a.dtype.kind in ("f", "c"):
         return bool(np.array_equal(a, b, equal_nan=True))
-    if a.dtype == np.object_:
-        for x, y in zip(a.flat, b.flat):
-            if x is y:
-                continue
-            if (
-                isinstance(x, float)
-                and isinstance(y, float)
-                and math.isnan(x)
-                and math.isnan(y)
-            ):
-                continue
-            try:
-                if not bool(x == y):
-                    return False
-            except Exception:
-                return False
-        return True
+    if a.dtype.hasobject:
+        if a.dtype == np.object_:
+            return all(x is y for x, y in zip(a.flat, b.flat))
+        if a.dtype.names:
+            return all(_ndarray_state_equal(a[fname], b[fname]) for fname in a.dtype.names)
+        if a.dtype.subdtype is not None:
+            return all(
+                _ndarray_state_equal(np.asarray(x), np.asarray(y))
+                for x, y in zip(a.flat, b.flat)
+            )
+        return False
     return bool(np.array_equal(a, b))
 
 
@@ -471,6 +517,23 @@ def _restore_duck_containers(container_snaps: Sequence[Tuple[Any, ...]]) -> None
                 try:
                     arr.setflags(write=False)
                 except (ValueError, BufferError):
+                    pass
+        elif kind == "np_void":
+            _, void_obj, fields_snap, orig_w, cp_void_0d = entry
+            if bool(orig_w) or (not _ndarray_state_equal(np.asarray(void_obj), cp_void_0d)):
+                try:
+                    if not void_obj.flags.writeable:
+                        void_obj.setflags(write=True)
+                    for fname, orig_val in fields_snap:
+                        void_obj[fname] = orig_val
+                    if not orig_w and void_obj.flags.writeable:
+                        void_obj.setflags(write=False)
+                except (ValueError, BufferError, TypeError):
+                    pass
+            elif not orig_w and void_obj.flags.writeable:
+                try:
+                    void_obj.setflags(write=False)
+                except (ValueError, BufferError, TypeError):
                     pass
         elif kind == "bytearray":
             _, ba, raw_b = entry
@@ -515,6 +578,143 @@ def _clone_head_attr_value(val: Any) -> Any:
     if isinstance(val, set):
         return set(val)
     return copy.deepcopy(val)
+
+
+def _extract_kw_unpack_targets(
+    code: types.CodeType,
+) -> Tuple[set[str], set[Tuple[str, str]], set[str], set[str], set[Tuple[str, str]], set[str]]:
+    """Return bytecode callable targets for CALL_FUNCTION_EX (**kwargs) and non-zero-arg CALLs."""
+    unpacked_names: set[str] = set()
+    unpacked_owner_attrs: set[Tuple[str, str]] = set()
+    unpacked_leaf_attrs: set[str] = set()
+    arg_names: set[str] = set()
+    arg_owner_attrs: set[Tuple[str, str]] = set()
+    arg_leaf_attrs: set[str] = set()
+
+    stack: List[set[Tuple[str, Any]]] = []
+    locals_env: Dict[str, set[Tuple[str, Any]]] = {}
+
+    def _record(slot: set[Tuple[str, Any]], *, unpacked: bool) -> None:
+        names_dst = unpacked_names if unpacked else arg_names
+        oattrs_dst = unpacked_owner_attrs if unpacked else arg_owner_attrs
+        lattrs_dst = unpacked_leaf_attrs if unpacked else arg_leaf_attrs
+        for kind, val in slot:
+            if kind == "name":
+                names_dst.add(val)
+            elif kind == "attr":
+                oattrs_dst.add(val)
+            elif kind == "leaf_attr":
+                lattrs_dst.add(val)
+
+    for ins in dis.get_instructions(code):
+        op = ins.opname
+        arg_int = ins.arg if isinstance(ins.arg, int) else 0
+        if op == "LOAD_GLOBAL":
+            if arg_int & 1:
+                stack.append(set())
+            stack.append({("name", str(ins.argval))})
+            continue
+        if op in ("LOAD_NAME", "LOAD_DEREF", "LOAD_CLOSURE", "LOAD_FAST", "LOAD_FAST_CHECK", "LOAD_FAST_AND_CLEAR"):
+            varname = str(ins.argval)
+            if op.startswith("LOAD_FAST") and varname in locals_env:
+                stack.append(set(locals_env[varname]) | {("name", varname)})
+            else:
+                stack.append({("name", varname)})
+            continue
+        if op == "LOAD_FAST_LOAD_FAST" and isinstance(ins.argval, tuple) and len(ins.argval) == 2:
+            for vn in ins.argval:
+                s_vn = str(vn)
+                stack.append((set(locals_env[s_vn]) | {("name", s_vn)}) if s_vn in locals_env else {("name", s_vn)})
+            continue
+        if op == "LOAD_ATTR":
+            base = stack.pop() if stack else set()
+            attr_name = str(ins.argval)
+            derived: set[Tuple[str, Any]] = {("leaf_attr", attr_name)}
+            for kind, val in base:
+                if kind == "name":
+                    derived.add(("attr", (val, attr_name)))
+                elif kind == "attr":
+                    derived.add(("attr", (val[1], attr_name)))
+            if arg_int & 1:
+                stack.append(derived)
+                stack.append(set())
+            else:
+                stack.append(derived)
+            continue
+        if op == "LOAD_SUPER_ATTR":
+            # Pops self, class, super; pushes method (+ optional self/NULL).
+            base = stack[-1] if stack else set()
+            try:
+                eff = dis.stack_effect(ins.opcode, ins.arg, jump=False)
+            except (ValueError, TypeError):
+                eff = -2
+            pops = 3
+            for _ in range(pops):
+                if stack:
+                    stack.pop()
+            push_cnt = eff + pops
+            derived_sup: set[Tuple[str, Any]] = {("leaf_attr", str(ins.argval)), ("attr", ("super", str(ins.argval)))}
+            for kind, val in base:
+                if kind == "name":
+                    derived_sup.add(("attr", (val, str(ins.argval))))
+            for j in range(max(0, push_cnt)):
+                stack.append(derived_sup if j == 0 else set())
+            continue
+        if op in ("STORE_FAST", "STORE_NAME", "STORE_DEREF"):
+            top = stack.pop() if stack else set()
+            locals_env.setdefault(str(ins.argval), set()).update(top)
+            continue
+        if op == "COPY":
+            stack.append(set(stack[-arg_int]) if 1 <= arg_int <= len(stack) else set())
+            continue
+        if op == "CALL_FUNCTION_EX":
+            try:
+                eff = dis.stack_effect(ins.opcode, ins.arg, jump=False)
+            except (ValueError, TypeError):
+                eff = -2 - (1 if (arg_int & 1) else 0)
+            total_pop = max(0, 1 - eff)
+            popped = [stack.pop() if stack else set() for _ in range(total_pop)]
+            has_kw_map = bool(arg_int & 1)
+            for slot in popped[2:]:
+                if has_kw_map:
+                    _record(slot, unpacked=True)
+                _record(slot, unpacked=False)
+            stack.append(set())
+            continue
+        if op in ("CALL", "CALL_KW"):
+            try:
+                eff = dis.stack_effect(ins.opcode, ins.arg, jump=False)
+            except (ValueError, TypeError):
+                eff = -(arg_int + 1)
+            total_pop = max(0, 1 - eff)
+            popped = [stack.pop() if stack else set() for _ in range(total_pop)]
+            has_args = arg_int > 0
+            if has_args:
+                callable_start = arg_int + (1 if op == "CALL_KW" else 0)
+                for slot in popped[callable_start:]:
+                    _record(slot, unpacked=False)
+            stack.append(set())
+            continue
+        try:
+            eff = dis.stack_effect(ins.opcode, ins.arg, jump=False)
+        except (ValueError, TypeError):
+            eff = 0
+        if eff < 0:
+            for _ in range(-eff):
+                if stack:
+                    stack.pop()
+        elif eff > 0:
+            for _ in range(eff):
+                stack.append(set())
+
+    return (
+        unpacked_names,
+        unpacked_owner_attrs,
+        unpacked_leaf_attrs,
+        arg_names,
+        arg_owner_attrs,
+        arg_leaf_attrs,
+    )
 
 
 def _inspect_varkw_wrapper(
@@ -567,111 +767,392 @@ def _inspect_varkw_wrapper(
                 cur = call_attr
         return cur, cur_owner
 
+    def _collect_explicit_params(fn_target: Any) -> None:
+        try:
+            sub_sig = inspect.signature(fn_target)
+            for p_name, p_obj in sub_sig.parameters.items():
+                if (
+                    p_obj.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                    and p_name in candidate_keys
+                ):
+                    referenced.add(p_name)
+        except (TypeError, ValueError):
+            pass
+
     root_owner = getattr(fn_obj, "__self__", None) if owner_self is None else owner_self
+    root_method_name = getattr(fn_obj, "__name__", None)
+    root_mro = set(type(root_owner).__mro__) if root_owner is not None else set()
     root_calls_super = False
     max_depth = 6
     max_callables = 64
     queue: deque[Tuple[Any, Any, int]] = deque([(fn_obj, root_owner, 0)])
-    visited_fn_ids: set[int] = set()
-    seen_codes: set[int] = set()
+    visited_call_keys: set[Tuple[int, int, bool]] = set()
+    visited_depths: Dict[int, int] = {}
+    sig_param_fn_ids: set[int] = set()
+    fwd_kw_fn_ids: set[int] = set()
+    code_info_cache: Dict[
+        int,
+        Tuple[set[str], set[str], set[Tuple[str, str]], set[str], set[str], set[Tuple[str, str]], set[str]],
+    ] = {}
+
+    def _mark_unpacked_edge(cand: Any, sub_owner: Any, *, unpacked: bool, can_fwd_kw: bool) -> None:
+        if cand is None or isinstance(cand, type) or not callable(cand):
+            return
+        if not unpacked and not can_fwd_kw:
+            return
+        u_cand, _ = _unwrap_callable_and_owner(cand, sub_owner)
+        if u_cand is None:
+            return
+        u_id = id(u_cand)
+        if unpacked:
+            sig_param_fn_ids.add(u_id)
+            fwd_kw_fn_ids.add(u_id)
+            if visited_depths.get(u_id, 0) > 0:
+                _collect_explicit_params(u_cand)
+        elif can_fwd_kw:
+            fwd_kw_fn_ids.add(u_id)
 
     def _enqueue(cand: Any, sub_owner: Any, nxt_depth: int) -> None:
-        if cand is None or nxt_depth > max_depth or len(visited_fn_ids) >= max_callables:
+        if cand is None or nxt_depth > max_depth or len(visited_call_keys) >= max_callables:
             return
         if isinstance(cand, type) or not callable(cand):
             return
         queue.append((cand, getattr(cand, "__self__", sub_owner), nxt_depth))
 
-    def _consider_val(val: Any, sub_owner: Any, local_names: set[str], nxt_depth: int) -> None:
+    def _consider_val(
+        val: Any,
+        sub_owner: Any,
+        local_names: set[str],
+        nxt_depth: int,
+        *,
+        edge_unpacked: bool = False,
+        edge_can_fwd: bool = False,
+        via_name: Optional[str] = None,
+        unpacked_owner_attrs: Optional[set[Tuple[str, str]]] = None,
+        unpacked_leaf_attrs: Optional[set[str]] = None,
+        arg_owner_attrs: Optional[set[Tuple[str, str]]] = None,
+        arg_leaf_attrs: Optional[set[str]] = None,
+        parent_can_fwd_kw: bool = False,
+        is_root_code: bool = False,
+        visited_types: Optional[set[int]] = None,
+    ) -> None:
+        nonlocal root_calls_super
         _collect_const_strings(val)
-        if nxt_depth > max_depth or len(visited_fn_ids) >= max_callables or val is None:
+        if nxt_depth > max_depth or len(visited_call_keys) >= max_callables or val is None:
             return
         if isinstance(val, type):
+            if visited_types is None:
+                visited_types = set()
+            tid = id(val)
+            if tid in visited_types:
+                return
+            visited_types.add(tid)
+            uo_attrs = unpacked_owner_attrs or set()
+            ul_attrs = unpacked_leaf_attrs or set()
+            ao_attrs = arg_owner_attrs or set()
+            al_attrs = arg_leaf_attrs or set()
+            # Inspect custom __init__ if defined directly on val.
+            raw_init = val.__dict__.get("__init__")
+            if raw_init is not None:
+                if edge_unpacked or edge_can_fwd:
+                    _mark_unpacked_edge(
+                        raw_init,
+                        None,
+                        unpacked=edge_unpacked,
+                        can_fwd_kw=edge_can_fwd,
+                    )
+                _enqueue(raw_init, None, nxt_depth)
+            for sub_n in local_names:
+                if val in root_mro and sub_n == root_method_name:
+                    if is_root_code and (
+                        ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
+                    ):
+                        root_calls_super = True
+                    continue
+                raw_sub = inspect.getattr_static(val, sub_n, _UNSET_SLOT)
+                if raw_sub is _UNSET_SLOT or isinstance(raw_sub, property):
+                    continue
+                is_sub_unp = parent_can_fwd_kw and (
+                    ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
+                )
+                is_sub_fwd = is_sub_unp or (
+                    parent_can_fwd_kw
+                    and (((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs))
+                )
+                if isinstance(raw_sub, type):
+                    _consider_val(
+                        raw_sub,
+                        None,
+                        local_names,
+                        nxt_depth,
+                        edge_unpacked=is_sub_unp,
+                        edge_can_fwd=is_sub_fwd,
+                        via_name=sub_n,
+                        unpacked_owner_attrs=unpacked_owner_attrs,
+                        unpacked_leaf_attrs=unpacked_leaf_attrs,
+                        arg_owner_attrs=arg_owner_attrs,
+                        arg_leaf_attrs=arg_leaf_attrs,
+                        parent_can_fwd_kw=parent_can_fwd_kw,
+                        is_root_code=is_root_code,
+                        visited_types=visited_types,
+                    )
+                    continue
+                if isinstance(raw_sub, staticmethod):
+                    sub_fn, sub_own = raw_sub.__func__, None
+                elif isinstance(raw_sub, classmethod):
+                    sub_fn, sub_own = raw_sub.__func__, val
+                else:
+                    sub_fn, sub_own = raw_sub, None
+                if not isinstance(sub_fn, type) and callable(sub_fn):
+                    if is_sub_unp or is_sub_fwd:
+                        _mark_unpacked_edge(sub_fn, sub_own, unpacked=is_sub_unp, can_fwd_kw=is_sub_fwd)
+                    _enqueue(sub_fn, sub_own, nxt_depth)
             return
+        if edge_unpacked or edge_can_fwd:
+            _mark_unpacked_edge(val, sub_owner, unpacked=edge_unpacked, can_fwd_kw=edge_can_fwd)
         if callable(val):
             _enqueue(val, sub_owner, nxt_depth)
         elif isinstance(val, types.ModuleType):
             mod_d = val.__dict__
+            uo_attrs = unpacked_owner_attrs or set()
+            ul_attrs = unpacked_leaf_attrs or set()
+            ao_attrs = arg_owner_attrs or set()
+            al_attrs = arg_leaf_attrs or set()
             for sub_n in local_names:
                 sub_v = mod_d.get(sub_n)
-                if sub_v is not None and not isinstance(sub_v, type) and callable(sub_v):
+                if sub_v is None:
+                    continue
+                is_sub_unp = parent_can_fwd_kw and (
+                    ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
+                )
+                is_sub_fwd = is_sub_unp or (
+                    parent_can_fwd_kw
+                    and (((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs))
+                )
+                if isinstance(sub_v, type):
+                    _consider_val(
+                        sub_v,
+                        None,
+                        local_names,
+                        nxt_depth,
+                        edge_unpacked=is_sub_unp,
+                        edge_can_fwd=is_sub_fwd,
+                        via_name=sub_n,
+                        unpacked_owner_attrs=unpacked_owner_attrs,
+                        unpacked_leaf_attrs=unpacked_leaf_attrs,
+                        arg_owner_attrs=arg_owner_attrs,
+                        arg_leaf_attrs=arg_leaf_attrs,
+                        parent_can_fwd_kw=parent_can_fwd_kw,
+                        is_root_code=is_root_code,
+                    )
+                elif callable(sub_v):
+                    if is_sub_unp or is_sub_fwd:
+                        _mark_unpacked_edge(sub_v, None, unpacked=is_sub_unp, can_fwd_kw=is_sub_fwd)
                     _enqueue(sub_v, None, nxt_depth)
         elif not isinstance(val, (str, bytes, bytearray, int, float, bool, np.ndarray, Mapping, list, tuple, set, frozenset)):
+            uo_attrs = unpacked_owner_attrs or set()
+            ul_attrs = unpacked_leaf_attrs or set()
+            ao_attrs = arg_owner_attrs or set()
+            al_attrs = arg_leaf_attrs or set()
             for sub_n in local_names:
                 raw_sub = inspect.getattr_static(val, sub_n, _UNSET_SLOT)
                 if raw_sub is _UNSET_SLOT or isinstance(raw_sub, property):
                     continue
+                if isinstance(raw_sub, types.MemberDescriptorType):
+                    try:
+                        raw_sub = raw_sub.__get__(val, type(val))
+                    except Exception:
+                        continue
+                is_sub_unp = parent_can_fwd_kw and (
+                    ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
+                )
+                is_sub_fwd = is_sub_unp or (
+                    parent_can_fwd_kw
+                    and (((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs))
+                )
                 if isinstance(raw_sub, (staticmethod, classmethod)):
                     raw_sub = raw_sub.__func__
-                if not isinstance(raw_sub, type) and callable(raw_sub):
+                if isinstance(raw_sub, type):
+                    _consider_val(
+                        raw_sub,
+                        None,
+                        local_names,
+                        nxt_depth,
+                        edge_unpacked=is_sub_unp,
+                        edge_can_fwd=is_sub_fwd,
+                        via_name=sub_n,
+                        unpacked_owner_attrs=unpacked_owner_attrs,
+                        unpacked_leaf_attrs=unpacked_leaf_attrs,
+                        arg_owner_attrs=arg_owner_attrs,
+                        arg_leaf_attrs=arg_leaf_attrs,
+                        parent_can_fwd_kw=parent_can_fwd_kw,
+                        is_root_code=is_root_code,
+                    )
+                elif callable(raw_sub):
+                    if is_sub_unp or is_sub_fwd:
+                        _mark_unpacked_edge(raw_sub, val, unpacked=is_sub_unp, can_fwd_kw=is_sub_fwd)
                     _enqueue(raw_sub, val, nxt_depth)
 
-    while queue and len(visited_fn_ids) < max_callables:
+    while queue and len(visited_call_keys) < max_callables:
         cand_fn, cur_owner, depth = queue.popleft()
         unwrapped, cur_owner = _unwrap_callable_and_owner(cand_fn, cur_owner)
-        if unwrapped is None or id(unwrapped) in visited_fn_ids:
+        if unwrapped is None:
             continue
-        visited_fn_ids.add(id(unwrapped))
+        u_id = id(unwrapped)
+        can_fwd_here = (depth == 0) or (u_id in fwd_kw_fn_ids)
+        visit_key = (u_id, id(cur_owner) if cur_owner is not None else 0, can_fwd_here)
+        if visit_key in visited_call_keys:
+            continue
+        visited_call_keys.add(visit_key)
+        visited_depths[u_id] = max(visited_depths.get(u_id, depth), depth)
+        if depth == 0:
+            fwd_kw_fn_ids.add(u_id)
 
-        if depth > 0:
-            try:
-                sub_sig = inspect.signature(unwrapped)
-                for p_name, p_obj in sub_sig.parameters.items():
-                    if (
-                        p_obj.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-                        and p_name in candidate_keys
-                    ):
-                        referenced.add(p_name)
-            except (TypeError, ValueError):
-                pass
+        if depth > 0 and u_id in sig_param_fn_ids:
+            _collect_explicit_params(unwrapped)
 
         code = getattr(unwrapped, "__code__", None)
         if not isinstance(code, types.CodeType):
             continue
 
-        local_names: set[str] = set()
-        code_stack: List[types.CodeType] = [code]
-        while code_stack:
-            c = code_stack.pop()
-            cid = id(c)
-            if cid in seen_codes:
-                continue
-            seen_codes.add(cid)
-            local_names.update(c.co_names)
-            local_names.update(c.co_freevars)
-            for const in c.co_consts:
-                if isinstance(const, types.CodeType):
-                    code_stack.append(const)
-                else:
-                    _collect_const_strings(const)
+        cid = id(code)
+        cached_ci = code_info_cache.get(cid)
+        if cached_ci is None:
+            c_local_names: set[str] = set()
+            c_u_names: set[str] = set()
+            c_u_oattrs: set[Tuple[str, str]] = set()
+            c_u_lattrs: set[str] = set()
+            c_a_names: set[str] = set()
+            c_a_oattrs: set[Tuple[str, str]] = set()
+            c_a_lattrs: set[str] = set()
+            seen_sub_codes: set[int] = set()
+            code_stack: List[types.CodeType] = [code]
+            while code_stack:
+                c = code_stack.pop()
+                sub_cid = id(c)
+                if sub_cid in seen_sub_codes:
+                    continue
+                seen_sub_codes.add(sub_cid)
+                c_local_names.update(c.co_names)
+                c_local_names.update(c.co_freevars)
+                un_c, uo_c, ul_c, an_c, ao_c, al_c = _extract_kw_unpack_targets(c)
+                c_u_names.update(un_c)
+                c_u_oattrs.update(uo_c)
+                c_u_lattrs.update(ul_c)
+                c_a_names.update(an_c)
+                c_a_oattrs.update(ao_c)
+                c_a_lattrs.update(al_c)
+                for const in c.co_consts:
+                    if isinstance(const, types.CodeType):
+                        code_stack.append(const)
+                    else:
+                        _collect_const_strings(const)
+            cached_ci = (c_local_names, c_u_names, c_u_oattrs, c_u_lattrs, c_a_names, c_a_oattrs, c_a_lattrs)
+            code_info_cache[cid] = cached_ci
+        local_names, u_names, u_oattrs, u_lattrs, a_names, a_oattrs, a_lattrs = cached_ci
 
         if depth == 0 and "super" in local_names:
             root_calls_super = True
 
+        can_fwd_from_here = u_id in fwd_kw_fn_ids
         nxt_depth = depth + 1
         fn_globals = getattr(unwrapped, "__globals__", None)
         if isinstance(fn_globals, Mapping):
             for n in local_names:
                 if n in fn_globals:
-                    _consider_val(fn_globals[n], None, local_names, nxt_depth)
+                    is_unp = can_fwd_from_here and (n in u_names)
+                    is_fwd = is_unp or (can_fwd_from_here and (n in a_names))
+                    _consider_val(
+                        fn_globals[n],
+                        None,
+                        local_names,
+                        nxt_depth,
+                        edge_unpacked=is_unp,
+                        edge_can_fwd=is_fwd,
+                        via_name=n,
+                        unpacked_owner_attrs=u_oattrs,
+                        unpacked_leaf_attrs=u_lattrs,
+                        arg_owner_attrs=a_oattrs,
+                        arg_leaf_attrs=a_lattrs,
+                        parent_can_fwd_kw=can_fwd_from_here,
+                        is_root_code=(depth == 0),
+                    )
 
         fn_closure = getattr(unwrapped, "__closure__", None)
         if fn_closure:
-            for cell in fn_closure:
+            free_names = code.co_freevars if isinstance(getattr(code, "co_freevars", None), tuple) else ()
+            for c_idx, cell in enumerate(fn_closure):
                 try:
                     val_c = cell.cell_contents
                 except ValueError:
                     continue
-                _consider_val(val_c, None, local_names, nxt_depth)
+                c_name = free_names[c_idx] if c_idx < len(free_names) else None
+                if (
+                    c_name == "__class__"
+                    and isinstance(val_c, type)
+                    and cur_owner is not None
+                    and isinstance(cur_owner, val_c)
+                ):
+                    continue
+                is_unp = can_fwd_from_here and (c_name in u_names if c_name else False)
+                is_fwd = is_unp or (can_fwd_from_here and (c_name in a_names if c_name else bool(a_names)))
+                _consider_val(
+                    val_c,
+                    None,
+                    local_names,
+                    nxt_depth,
+                    edge_unpacked=is_unp,
+                    edge_can_fwd=is_fwd,
+                    via_name=c_name,
+                    unpacked_owner_attrs=u_oattrs,
+                    unpacked_leaf_attrs=u_lattrs,
+                    arg_owner_attrs=a_oattrs,
+                    arg_leaf_attrs=a_lattrs,
+                    parent_can_fwd_kw=can_fwd_from_here,
+                    is_root_code=(depth == 0),
+                )
 
         if cur_owner is not None:
+            owner_is_type = isinstance(cur_owner, type)
             for n in local_names:
                 raw_attr = inspect.getattr_static(cur_owner, n, _UNSET_SLOT)
                 if raw_attr is _UNSET_SLOT or isinstance(raw_attr, property):
                     continue
-                if isinstance(raw_attr, (staticmethod, classmethod)):
+                if isinstance(raw_attr, types.MemberDescriptorType) and not owner_is_type:
+                    try:
+                        raw_attr = raw_attr.__get__(cur_owner, type(cur_owner))
+                    except Exception:
+                        continue
+                if isinstance(raw_attr, staticmethod):
                     raw_attr = raw_attr.__func__
-                _consider_val(raw_attr, cur_owner, local_names, nxt_depth)
+                    attr_owner = None
+                elif isinstance(raw_attr, classmethod):
+                    raw_attr = raw_attr.__func__
+                    attr_owner = cur_owner if owner_is_type else type(cur_owner)
+                else:
+                    attr_owner = cur_owner
+                is_unp = can_fwd_from_here and (
+                    ("self", n) in u_oattrs or (None, n) in u_oattrs or n in u_lattrs
+                )
+                is_fwd = is_unp or (
+                    can_fwd_from_here
+                    and (("self", n) in a_oattrs or (None, n) in a_oattrs or n in a_lattrs)
+                )
+                _consider_val(
+                    raw_attr,
+                    attr_owner,
+                    local_names,
+                    nxt_depth,
+                    edge_unpacked=is_unp,
+                    edge_can_fwd=is_fwd,
+                    via_name=n,
+                    unpacked_owner_attrs=u_oattrs,
+                    unpacked_leaf_attrs=u_lattrs,
+                    arg_owner_attrs=a_oattrs,
+                    arg_leaf_attrs=a_lattrs,
+                    parent_can_fwd_kw=can_fwd_from_here,
+                    is_root_code=(depth == 0),
+                )
 
     return referenced, root_calls_super
 

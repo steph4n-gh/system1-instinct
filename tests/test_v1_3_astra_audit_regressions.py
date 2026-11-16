@@ -10974,13 +10974,13 @@ def test_astra_31_round18_regressions() -> None:
     fe_2row = FastExplainer(
         projector=tf_ex,
         weights=np.zeros((2, tf_ex.dimension), dtype=np.float32),
-        biases=np.array([1.0, -1.0], dtype=np.float32),
+        biases=np.array([-1.0, 1.0], dtype=np.float32),
         options=("False", "True"),
         is_boolean=True,
         learned_overrides={"omega": True},
     )
     assert fe_2row._select_winner_kept(
-        np.array([1.0, -1.0]),
+        np.array([-1.0, 1.0]),
         [(0, 5, "gamma", "gamma"), (6, 11, "omega", "omega")],
         [False, True],
     ) == 1
@@ -17054,3 +17054,862 @@ def test_astra_42_round29_regressions() -> None:
         assert ts_churn.call_count == 100
         assert ts_churn.total_requests == 100
         assert ts_churn.teacher_sample_count == 100
+
+
+def test_astra_43_round30_regressions() -> None:
+    """In-memory Round-30 adversarial regressions for R30-1 through R30-11 and sister paths."""
+    import enum
+    import threading
+    import warnings
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from typing import Tuple
+
+    from system1.compat.typesafe import TypeSafeClient, _build_dynamic_schema
+    from system1.compat.universal import (
+        InteropError,
+        SoftDistillingLifecycle,
+        UniversalDecisionService,
+        _canonical_structured_key,
+        compile_questions_contract,
+    )
+    from system1.core import BooleanField, ChoiceField, DecisionSchema, ScoreField
+    from system1.core.model import DecisionFieldHead, SystemOneModel
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+
+    # ------------------------------------------------------------------
+    # R30-1 & R30-3: Class-qualified helpers & bytecode CALL_FUNCTION_EX
+    # gate for **kwargs wrappers.
+    # ------------------------------------------------------------------
+    class _R30CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="First")
+        g = ChoiceField(options=("a", "b"), description="Second")
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return values
+
+    class _R30SimpleSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="Single")
+
+    class _HelperStatic:
+        @staticmethod
+        def pop(kw: Dict[str, Any]) -> bool:
+            return bool(kw.pop("use_cache", True))
+
+    class _HelperClassmethod:
+        KEY = "use_cache"
+
+        @classmethod
+        def pop(cls, kw: Dict[str, Any]) -> bool:
+            return bool(kw.pop(cls.KEY, True))
+
+    class _OuterHelper:
+        class Inner:
+            @staticmethod
+            def pop(kw: Dict[str, Any]) -> bool:
+                return bool(kw.pop("use_cache", True))
+
+    class _InitPopper:
+        def __init__(self, kw: Dict[str, Any]) -> None:
+            self.flag = bool(kw.pop("use_cache", True))
+
+    class _SlotPopper:
+        __slots__ = ("_inner_helper",)
+
+        def __init__(self) -> None:
+            self._inner_helper = _HelperStatic()
+
+        def pop(self, kw: Dict[str, Any]) -> bool:
+            return self._inner_helper.pop(kw)
+
+    def _audit_helper(*, use_cache: bool = True) -> bool:
+        def _unused_inner(*, recency_weighted: bool = False) -> bool:
+            return recency_weighted
+
+        return bool(use_cache and not _unused_inner())
+
+    def _strip_helper(*, use_cache: bool = True, **rest: Any) -> bool:
+        return bool(use_cache)
+
+    class _SharedTransitiveHelper:
+        @staticmethod
+        def terminal(*, use_cache: bool = True, **rest: Any) -> bool:
+            return bool(use_cache)
+
+        @staticmethod
+        def via_zero() -> bool:
+            return _SharedTransitiveHelper.terminal()
+
+        @staticmethod
+        def via_unpack(**kw: Any) -> bool:
+            return _SharedTransitiveHelper.terminal(**kw)
+
+    class _R30ModelBase:
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            self._inner = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            )
+            for h in self._inner.heads.values():
+                h.set_weights(np.zeros((2, dim), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+            self.schema = self._inner.schema
+            self.dimension = dim
+            self.projector = self._inner.projector
+            self.heads = self._inner.heads
+            self.recency_weighted = False
+            self.forgetting_factor = 0.995
+            self.model_version = 1
+
+        def encode(self, prompt: str, telemetry: Any = None, recency_weighted: Any = None) -> np.ndarray:
+            return self._inner.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
+
+        def forward_single(
+            self, prompt: str, telemetry: Any = None, embedding: Any = None, recency_weighted: Any = None
+        ) -> Any:
+            return self._inner.forward_single(
+                prompt, telemetry=telemetry, embedding=embedding, recency_weighted=recency_weighted
+            )
+
+    class _R30StaticDuck(_R30ModelBase):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            if _HelperStatic.pop(kwargs) and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    class _R30ClsMethodDuck(_R30ModelBase):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            if _HelperClassmethod.pop(kwargs) and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    class _R30NestedClsDuck(_R30ModelBase):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            if _OuterHelper.Inner.pop(kwargs) and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    class _R30InitDuck(_R30ModelBase):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            if _InitPopper(kwargs).flag and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    class _R30SlotDuck(_R30ModelBase):
+        __slots__ = ("_slot_obj",)
+
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            super().__init__(schema, dim)
+            self._slot_obj = _SlotPopper()
+
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            if self._slot_obj.pop(kwargs) and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    x_ones = np.ones(16, dtype=np.float32)
+    for mk_r1 in (
+        lambda: _R30StaticDuck(_R30CoupledSchema(), 16),
+        lambda: _R30ClsMethodDuck(_R30CoupledSchema(), 16),
+        lambda: _R30NestedClsDuck(_R30CoupledSchema(), 16),
+        lambda: _R30InitDuck(_R30CoupledSchema(), 16),
+        lambda: _R30SlotDuck(_R30CoupledSchema(), 16),
+    ):
+        eng_r1 = SystemOneEngine(
+            _R30CoupledSchema,
+            model=mk_r1(),
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        assert eng_r1.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_r1.learn("p", {"f": "b"}, embedding=x_ones)
+        assert eng_r1.model_version == 1
+        assert eng_r1.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+
+    # R30-3 negative check: calling zero-arg helper with keyword-only use_cache must NOT forward use_cache to base.
+    class _R30AuditOnlyDuck(_R30ModelBase):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _ = _audit_helper()
+            _ = _SharedTransitiveHelper.via_zero()
+            return super().forward_single(*args, **kwargs)
+
+    eng_r3_ok = SystemOneEngine(
+        _R30SimpleSchema,
+        model=_R30AuditOnlyDuck(_R30SimpleSchema(), 16),
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    assert eng_r3_ok.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a"}
+    eng_r3_ok.learn("p", {"f": "b"}, embedding=x_ones)
+    assert eng_r3_ok.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "b"}
+
+    # R30-3 positive companion: unpacking into helper (even after an earlier non-unpacked visit) forwards use_cache=False.
+    class _R30UnpackAfterZeroDuck(_R30ModelBase):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _ = _SharedTransitiveHelper.via_zero()
+            uc = _SharedTransitiveHelper.via_unpack(**kwargs)
+            kwargs.pop("use_cache", None)
+            if uc and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    class _R30StripHelperDuck(_R30ModelBase):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            uc = _strip_helper(**kwargs)
+            kwargs.pop("use_cache", None)
+            if uc and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    for mk_unp in (
+        lambda: _R30UnpackAfterZeroDuck(_R30CoupledSchema(), 16),
+        lambda: _R30StripHelperDuck(_R30CoupledSchema(), 16),
+    ):
+        eng_unp = SystemOneEngine(
+            _R30CoupledSchema,
+            model=mk_unp(),
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        assert eng_unp.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_unp.learn("p", {"f": "b"}, embedding=x_ones)
+        assert eng_unp.model_version == 1
+
+    # ------------------------------------------------------------------
+    # R30-2: Failed observation on newly bound schema-less duck lifecycle
+    # does not erase a concurrent request's successful promotion.
+    # ------------------------------------------------------------------
+    q_r2_a = {"act": {"type": "choice", "instructions": "r30-2 schema A", "criteria": ["allow", "block"]}}
+    q_r2_b = {"act": {"type": "choice", "instructions": "r30-2 schema B", "criteria": ["allow", "block"]}}
+    d_r2_a = _build_dynamic_schema(q_r2_a).schema_digest()
+    d_r2_b = _build_dynamic_schema(q_r2_b).schema_digest()
+    assert d_r2_a != d_r2_b
+
+    a_in_obs = threading.Event()
+    release_a = threading.Event()
+    teacher_calls_r2: List[str] = []
+
+    class _R30DuckLifecycleNoCollections:
+        def __init__(self) -> None:
+            self.state = "COLD_START"
+            self.is_cutover = False
+            self.compiled_active = False
+
+        def decide_local(self, prompt: str) -> Optional[Dict[str, Any]]:
+            if self.is_cutover:
+                return {"act": "allow"}
+            return None
+
+        def observe_teacher(self, prompt: str, vals: Mapping[str, Any]) -> bool:
+            if prompt == "req-a-fail":
+                a_in_obs.set()
+                assert release_a.wait(timeout=5.0)
+                raise RuntimeError("transient A failure")
+            self.state = "SELECTIVE_HOT_SWAP"
+            self.compiled_active = True
+            self.is_cutover = True
+            return True
+
+    def _teacher_r2(s: Any, q: Mapping[str, Any]) -> Dict[str, Any]:
+        teacher_calls_r2.append(str(q["act"]["instructions"]))
+        ans = "block" if "schema B" in str(q["act"]["instructions"]) else "allow"
+        return {"answers": {"act": {"type": "choice", "choice": ans, "value": ans}}}
+
+    duck_r2 = _R30DuckLifecycleNoCollections()
+    ts_r2 = TypeSafeClient(
+        api_key="tok-r30",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=duck_r2,
+        baseline_handler=_teacher_r2,
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool_r2:
+        fut_a = pool_r2.submit(ts_r2.decide, "req-a-fail", q_r2_a)
+        assert a_in_obs.wait(timeout=5.0)
+        resp_b_prom = ts_r2.decide("req-a-ok", q_r2_a)
+        assert resp_b_prom["answers"]["act"]["value"] == "allow"
+        release_a.set()
+        with pytest.raises(RuntimeError, match="transient A failure"):
+            fut_a.result(timeout=5.0)
+
+    assert ts_r2._injected_lc_digest == d_r2_a
+    assert ts_r2._cutover_lifecycles.get(d_r2_a) is duck_r2
+    resp_schema_b = ts_r2.decide("probe B", q_r2_b)
+    assert resp_schema_b["answers"]["act"]["value"] == "block"
+    assert not resp_schema_b.get("local_execution", False)
+    assert "r30-2 schema B" in teacher_calls_r2
+    assert d_r2_b in ts_r2._cutover_lifecycles and ts_r2._cutover_lifecycles[d_r2_b] is not duck_r2
+
+    # Unpromoted concurrent commit on schema-less duck: A failing while B is in-flight must not unbind it.
+    a_unp_in = threading.Event()
+    b_unp_in = threading.Event()
+    rel_unp_b = threading.Event()
+
+    class _R30UnpromotedConcurrentDuck:
+        def __init__(self) -> None:
+            self.state = "COLD_START"
+            self.is_cutover = False
+            self.compiled_active = False
+
+        def decide_local(self, prompt: str) -> Optional[Dict[str, Any]]:
+            return None
+
+        def observe_teacher(self, prompt: str, vals: Mapping[str, Any]) -> bool:
+            if prompt == "req-a-fail":
+                a_unp_in.set()
+                assert b_unp_in.wait(timeout=5.0)
+                raise RuntimeError("unp A fail")
+            b_unp_in.set()
+            assert rel_unp_b.wait(timeout=5.0)
+            return True
+
+    ts_r2_unp = TypeSafeClient(
+        api_key="tok-r30",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=_R30UnpromotedConcurrentDuck(),
+        baseline_handler=_teacher_r2,
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool_r2_u:
+        f_unp_a = pool_r2_u.submit(ts_r2_unp.decide, "req-a-fail", q_r2_a)
+        assert a_unp_in.wait(timeout=5.0)
+        f_unp_b = pool_r2_u.submit(ts_r2_unp.decide, "req-a-ok", q_r2_a)
+        with pytest.raises(RuntimeError, match="unp A fail"):
+            f_unp_a.result(timeout=5.0)
+        assert ts_r2_unp._injected_lc_digest == d_r2_a
+        d_r2_unp_check = d_r2_a in ts_r2_unp._cutover_lifecycles
+        assert d_r2_unp_check
+        rel_unp_b.set()
+        assert f_unp_b.result(timeout=5.0)["answers"]["act"]["value"] == "allow"
+    assert d_r2_unp_check
+    assert ts_r2_unp._injected_lc_digest == d_r2_a
+    assert d_r2_a in ts_r2_unp._cutover_lifecycles
+
+    # When ALL initial observers fail with zero commits on a fresh duck lifecycle, cleanup DOES unbind.
+    class _R30AlwaysFailDuck:
+        state = "COLD_START"
+        is_cutover = False
+        compiled_active = False
+
+        def decide_local(self, prompt: str) -> Optional[Dict[str, Any]]:
+            return None
+
+        def observe_teacher(self, prompt: str, vals: Mapping[str, Any]) -> bool:
+            raise RuntimeError("all failed")
+
+    ts_r2_unb = TypeSafeClient(
+        api_key="tok-r30",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=_R30AlwaysFailDuck(),
+        baseline_handler=lambda s, q: {"answers": {"act": {"type": "choice", "choice": "allow", "value": "allow"}}},
+    )
+    with pytest.raises(RuntimeError, match="all failed"):
+        ts_r2_unb.decide("x", q_r2_a)
+    assert ts_r2_unb._injected_lc_digest is None
+    assert d_r2_a not in ts_r2_unb._cutover_lifecycles
+
+    # Sister path: UniversalDecisionService concurrent new-lifecycle observation race (A fails while B is in-flight).
+    q_u2 = {"act": {"type": "choice", "options": ["allow", "block"], "instructions": "r30-2 univ"}}
+    u_a_in = threading.Event()
+    u_b_in = threading.Event()
+    u_rel_b = threading.Event()
+    orig_obs = SoftDistillingLifecycle.observe_teacher
+
+    def _raced_obs(
+        self_lc: SoftDistillingLifecycle,
+        prompt: str,
+        lifecycle_values: Dict[str, Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        if prompt == "u-fail":
+            u_a_in.set()
+            assert u_b_in.wait(timeout=5.0)
+            raise RuntimeError("univ transient fail")
+        if prompt == "u-ok":
+            u_b_in.set()
+            assert u_rel_b.wait(timeout=5.0)
+        return orig_obs(self_lc, prompt, lifecycle_values, *args, **kwargs)
+
+    svc_u2 = UniversalDecisionService(
+        upstream_handlers={
+            "jev": lambda s, p, c: {
+                "answers": {"act": {"choice": "allow"}},
+                "usage": {"input_tokens": 2},
+            }
+        },
+        bearer_token="tok-r30",
+    )
+    try:
+        SoftDistillingLifecycle.observe_teacher = _raced_obs  # type: ignore[method-assign]
+        with ThreadPoolExecutor(max_workers=2) as pool_u2:
+            fut_u_fail = pool_u2.submit(
+                svc_u2.process_payload,
+                path="/v1/decisions",
+                payload={"state": "u-fail", "questions": q_u2, "slot": "u2"},
+            )
+            assert u_a_in.wait(timeout=5.0)
+            fut_u_ok = pool_u2.submit(
+                svc_u2.process_payload,
+                path="/v1/decisions",
+                payload={"state": "u-ok", "questions": q_u2, "slot": "u2"},
+            )
+            with pytest.raises(RuntimeError, match="univ transient fail"):
+                fut_u_fail.result(timeout=5.0)
+            assert len(svc_u2._lifecycles) == 1
+            u_rel_b.set()
+            code_u_ok, _ = fut_u_ok.result(timeout=5.0)
+            assert code_u_ok == 200
+    finally:
+        SoftDistillingLifecycle.observe_teacher = orig_obs  # type: ignore[method-assign]
+    assert len(svc_u2._lifecycles) == 1
+    lc_u2_kept = next(iter(svc_u2._lifecycles.values()))
+    assert lc_u2_kept.lifecycle.step_count == 1
+
+    # ------------------------------------------------------------------
+    # R30-4: Overlapping canary rollbacks never resurrect aborted canaries.
+    # ------------------------------------------------------------------
+    q_r4 = {"act": {"type": "choice", "criteria": ["a", "b"], "instructions": "r30-4 canary"}}
+    s_r4 = _build_dynamic_schema(q_r4)
+    d_r4 = s_r4.schema_digest()
+    for fail_b_first in (False, True):
+        order_lock = threading.Lock()
+        in_teacher_events: List[Tuple[str, threading.Event]] = []
+        both_canaries = threading.Event()
+
+        def _r4_exact_teacher(state: Any, questions: Mapping[str, Any]) -> Dict[str, Any]:
+            ev = threading.Event()
+            with order_lock:
+                role = "A" if len(in_teacher_events) == 0 else "B"
+                in_teacher_events.append((role, ev))
+                if len(in_teacher_events) == 2:
+                    both_canaries.set()
+            assert ev.wait(timeout=5.0)
+            return {"answers": {"act": {"choice": "a"}}, "egress_bytes": -1}
+
+        ts_ex_r4 = TypeSafeClient(
+            api_key="tok-r30",
+            mode="auto_cutover",
+            zero_egress=True,
+            auto_cutover_lifecycle=CutoverConfig(dense_dim=16, canary_rate=1.0),
+            baseline_handler=_r4_exact_teacher,
+        )
+        lc_ex_r4 = AutoCutoverLifecycle(s_r4, config=ts_ex_r4.auto_cutover_lifecycle)
+        lc_ex_r4.state = "SELECTIVE_HOT_SWAP"
+        lc_ex_r4.compiled_active = True
+        lc_ex_r4.active_tau = 0.0
+        lc_ex_r4.clean_cache["probe"] = {"act": "a"}
+        ts_ex_r4._cutover_lifecycles[d_r4] = lc_ex_r4
+
+        with ThreadPoolExecutor(max_workers=2) as pool_r4:
+            fa = pool_r4.submit(ts_ex_r4.decide, "probe", q_r4)
+            fb = pool_r4.submit(ts_ex_r4.decide, "probe", q_r4)
+            assert both_canaries.wait(timeout=5.0)
+            assert len(lc_ex_r4._pending_canaries) == 1 and "probe" in lc_ex_r4._pending_canaries
+            assert lc_ex_r4.local_accept_eligible == 2
+            first_idx, second_idx = (1, 0) if fail_b_first else (0, 1)
+            futs_r4 = [fa, fb]
+            in_teacher_events[first_idx][1].set()
+            with pytest.raises(ValueError, match="egress_bytes"):
+                futs_r4[first_idx].result(timeout=5.0)
+            in_teacher_events[second_idx][1].set()
+            with pytest.raises(ValueError, match="egress_bytes"):
+                futs_r4[second_idx].result(timeout=5.0)
+        assert lc_ex_r4.local_accept_eligible == 0
+        assert lc_ex_r4._pending_canaries == {}
+
+    # B succeeds while A fails: only B's canary check survives, A's rollback removes A's canary only.
+    events_mix: List[threading.Event] = []
+    mix_lock = threading.Lock()
+    mix_ready = threading.Event()
+    mix_fail_flag = threading.Event()
+
+    def _r4_mix_teacher(state: Any, questions: Mapping[str, Any]) -> Dict[str, Any]:
+        ev = threading.Event()
+        with mix_lock:
+            idx = len(events_mix)
+            events_mix.append(ev)
+            if len(events_mix) == 2:
+                mix_ready.set()
+        assert ev.wait(timeout=5.0)
+        if not mix_fail_flag.is_set() and idx == 0:
+            return {"answers": {"act": {"choice": "a", "value": "a"}}, "egress_bytes": -1}
+        if idx == 0:
+            return {"answers": {"act": {"choice": "a", "value": "a"}}, "egress_bytes": -1}
+        return {"answers": {"act": {"choice": "a", "value": "a"}}, "egress_bytes": 0}
+
+    ts_mix = TypeSafeClient(
+        api_key="tok-r30",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=CutoverConfig(dense_dim=16, canary_rate=1.0),
+        baseline_handler=_r4_mix_teacher,
+    )
+    lc_mix = AutoCutoverLifecycle(s_r4, config=ts_mix.auto_cutover_lifecycle)
+    lc_mix.state = "SELECTIVE_HOT_SWAP"
+    lc_mix.compiled_active = True
+    lc_mix.active_tau = 0.0
+    lc_mix.clean_cache["probe"] = {"act": "a"}
+    ts_mix._cutover_lifecycles[d_r4] = lc_mix
+    with ThreadPoolExecutor(max_workers=2) as pool_mix:
+        f0 = pool_mix.submit(ts_mix.decide, "probe", q_r4)
+        f1 = pool_mix.submit(ts_mix.decide, "probe", q_r4)
+        assert mix_ready.wait(timeout=5.0)
+        events_mix[1].set()
+        assert f1.result(timeout=5.0)["answers"]["act"]["value"] == "a"
+        events_mix[0].set()
+        with pytest.raises(ValueError, match="egress_bytes"):
+            f0.result(timeout=5.0)
+    assert lc_mix.local_accept_eligible == 1
+    assert lc_mix.canary_checks == 1
+    assert lc_mix._pending_canaries == {}
+
+    # Sister path: UniversalDecisionService overlapping 502 canary failures.
+    q_ur4 = {"act": {"type": "choice", "options": ["a", "b"], "instructions": "r30-4 univ"}}
+    c_ur4 = compile_questions_contract(q_ur4)
+    u4_lock = threading.Lock()
+    u4_evs: List[threading.Event] = []
+    u4_ready = threading.Event()
+
+    def _u4_upstream(s: str, p: Mapping[str, Any], c: Any) -> Dict[str, Any]:
+        ev = threading.Event()
+        with u4_lock:
+            u4_evs.append(ev)
+            if len(u4_evs) == 2:
+                u4_ready.set()
+        assert ev.wait(timeout=5.0)
+        return {"answers": {"act": {"choice": "a", "conformal_set": ["\ud800"]}}, "usage": {"input_tokens": 1}}
+
+    svc_u4 = UniversalDecisionService(
+        upstream_handlers={"jev": _u4_upstream},
+        bearer_token="tok-r30",
+        cutover_config=CutoverConfig(dense_dim=16, canary_rate=1.0),
+    )
+    lc_u4 = SoftDistillingLifecycle(c_ur4, config=svc_u4.cutover_config)
+    inner_u4 = lc_u4.lifecycle
+    inner_u4.state = "SELECTIVE_HOT_SWAP"
+    inner_u4.compiled_active = True
+    inner_u4.active_tau = 0.0
+    inner_u4.engine = SimpleNamespace()
+    req_u4 = {"state": "probe", "questions": q_ur4, "slot": "su4"}
+    inner_u4.clean_cache[_canonical_structured_key({"state": "probe"})] = {"act": "a"}
+    svc_u4._lifecycles[f"su4:{c_ur4.fingerprint}"] = lc_u4
+    with ThreadPoolExecutor(max_workers=2) as pool_u4:
+        fu0 = pool_u4.submit(svc_u4.process_payload, path="/v1/decisions", payload=req_u4)
+        fu1 = pool_u4.submit(svc_u4.process_payload, path="/v1/decisions", payload=req_u4)
+        assert u4_ready.wait(timeout=5.0)
+        u4_evs[0].set()
+        with pytest.raises(InteropError) as eu0:
+            fu0.result(timeout=5.0)
+        assert eu0.value.status_code == 502
+        u4_evs[1].set()
+        with pytest.raises(InteropError) as eu1:
+            fu1.result(timeout=5.0)
+        assert eu1.value.status_code == 502
+    assert inner_u4.local_accept_eligible == 0
+    assert inner_u4._pending_canaries == {}
+
+    # Concurrent force_teacher request (tx_tok=None) must NOT consume another in-flight request's canary.
+    canary_a_parked = threading.Event()
+    canary_a_rel = threading.Event()
+
+    def _u4_tok_upstream(s: str, p: Mapping[str, Any], c: Any) -> Dict[str, Any]:
+        if bool(p.get("force_teacher", False)):
+            return {"answers": {"act": {"choice": "a"}}, "usage": {"input_tokens": 1}}
+        canary_a_parked.set()
+        assert canary_a_rel.wait(timeout=5.0)
+        return {"answers": {"act": {"choice": "b"}}, "usage": {"input_tokens": 1}}
+
+    svc_u4_tok = UniversalDecisionService(
+        upstream_handlers={"jev": _u4_tok_upstream},
+        bearer_token="tok-r30",
+        cutover_config=CutoverConfig(dense_dim=16, canary_rate=1.0),
+    )
+    lc_u4_tok = SoftDistillingLifecycle(c_ur4, config=svc_u4_tok.cutover_config)
+    inner_tok = lc_u4_tok.lifecycle
+    inner_tok.state = "SELECTIVE_HOT_SWAP"
+    inner_tok.compiled_active = True
+    inner_tok.active_tau = 0.0
+    inner_tok.engine = SimpleNamespace()
+    req_u4_canary = {"state": "probe", "questions": q_ur4, "slot": "su4_tok"}
+    req_u4_forced = {"state": "probe", "questions": q_ur4, "slot": "su4_tok", "force_teacher": True}
+    inner_tok.clean_cache[_canonical_structured_key({"state": "probe"})] = {"act": "b"}
+    svc_u4_tok._lifecycles[f"su4_tok:{c_ur4.fingerprint}"] = lc_u4_tok
+    with ThreadPoolExecutor(max_workers=2) as pool_tok:
+        fut_can = pool_tok.submit(svc_u4_tok.process_payload, path="/v1/decisions", payload=req_u4_canary)
+        assert canary_a_parked.wait(timeout=5.0)
+        code_ft, _ = svc_u4_tok.process_payload(path="/v1/decisions", payload=req_u4_forced)
+        assert code_ft == 200
+        assert inner_tok.canary_checks == 0
+        canary_a_rel.set()
+        code_can, _ = fut_can.result(timeout=5.0)
+        assert code_can == 200
+    assert inner_tok.canary_checks == 1
+    assert list(inner_tok.canary_window) == [1]
+    assert inner_tok._pending_canaries == {}
+
+    # ------------------------------------------------------------------
+    # R30-5: Background compilation enforces max_unpromoted_lifecycles
+    # once workers finish and leave _compiling_schemas.
+    # ------------------------------------------------------------------
+    gate_bg = threading.Event()
+    ts_r5 = TypeSafeClient(
+        api_key="tok-r30",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=False,
+        background_compile=True,
+        cutover_threshold=1,
+        max_unpromoted_lifecycles=1,
+        baseline_handler=lambda s, q: {"answers": {"act": {"type": "choice", "choice": "a", "value": "a"}}},
+    )
+    orig_pipe = ts_r5._run_distill_pipeline
+
+    def _gated_pipe(*args: Any, **kwargs: Any) -> Any:
+        assert gate_bg.wait(timeout=5.0)
+        return orig_pipe(*args, **kwargs)
+
+    ts_r5._run_distill_pipeline = _gated_pipe  # type: ignore[method-assign]
+    for i5 in range(5):
+        q5 = {"act": {"type": "choice", "criteria": ["a", "b"], "instructions": f"r30-5 bg {i5}"}}
+        ts_r5.decide(f"probe {i5}", q5)
+    gate_bg.set()
+    assert ts_r5.wait_for_compilation(timeout=5.0) is True
+    assert len(ts_r5._compiling_schemas) == 0
+    assert len(ts_r5._history) <= 1
+    assert len(ts_r5._call_count) <= 1
+    assert len(ts_r5._teacher_sample_count) <= 1
+    assert len(ts_r5._validation_seen_keys) <= 1
+    assert len(ts_r5._validation_attempts) <= 1
+    assert ts_r5.call_count == 5
+    assert ts_r5.teacher_sample_count == 5
+
+    # ------------------------------------------------------------------
+    # R30-6: Plain Enum drift state blocks local execution.
+    # ------------------------------------------------------------------
+    class _DriftStateEnum(enum.Enum):
+        DRIFT = "DRIFT_RECALIBRATE"
+
+    class _R30EnumDriftDuck:
+        state = _DriftStateEnum.DRIFT
+        is_cutover = True
+        compiled_active = True
+
+        def decide_local(self, prompt: str) -> Dict[str, Any]:
+            return {"act": "allow"}
+
+        def observe_teacher(self, prompt: str, vals: Mapping[str, Any]) -> bool:
+            return False
+
+    q_r6 = {"act": {"type": "choice", "instructions": "r30-6 enum", "criteria": ["allow", "block"]}}
+    ts_r6 = TypeSafeClient(
+        api_key="tok-r30",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=_R30EnumDriftDuck(),
+        baseline_handler=lambda s, q: {"answers": {"act": {"type": "choice", "choice": "block", "value": "block"}}},
+    )
+    resp_r6 = ts_r6.decide("probe enum drift", q_r6)
+    assert resp_r6["answers"]["act"]["value"] == "block"
+    assert not resp_r6.get("local_execution", False)
+    assert resp_r6["is_cutover"] is False
+    assert resp_r6["cutover_state"] == "DRIFT_RECALIBRATE"
+
+    # ------------------------------------------------------------------
+    # R30-7 & R30-8: Structured object arrays + read-only object-array
+    # alias identity restoration on failed learn_from_tier2.
+    # ------------------------------------------------------------------
+    shared_r8 = {"value": 1}
+    ro_obj_arr = np.empty(1, dtype=object)
+    ro_obj_arr[0] = shared_r8
+    ro_obj_arr.setflags(write=False)
+
+    ro_struct_arr = np.empty(1, dtype=[("meta", object), ("index", "i4")])
+    ro_struct_arr[0] = (shared_r8, 7)
+    ro_struct_arr.setflags(write=False)
+
+    class _R30StructuredAndAliasModel(_R30ModelBase):
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            super().__init__(schema, dim)
+            self.records = np.empty(1, dtype=[("meta", object), ("index", "i4")])
+            self.records[0] = ({"count": 0}, 1)
+            v_arr = np.empty(1, dtype=[("meta", object), ("index", "i4")])
+            v_arr[0] = ({"count": 0}, 2)
+            self.void_scalar = v_arr[0]
+            vn_arr = np.empty(1, dtype=[("x", "f4"), ("y", "i4")])
+            vn_arr[0] = (1.5, 3)
+            self.void_num = vn_arr[0]
+            self.ro_obj = ro_obj_arr
+            self.ro_struct = ro_struct_arr
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            out = self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+            self.records[0]["meta"]["count"] = 1
+            self.void_scalar["meta"]["count"] = 2
+            self.void_scalar["index"] = 99
+            self.void_num["x"] = 9.25
+            self.void_num["y"] = 42
+            self.ro_obj.setflags(write=True)
+            self.ro_obj[0] = {"value": 1}
+            self.ro_obj.setflags(write=False)
+            self.ro_struct.setflags(write=True)
+            self.ro_struct[0]["meta"] = {"value": 1}
+            self.ro_struct.setflags(write=False)
+            raise RuntimeError("post-super structured failure")
+            return out
+
+    mdl_r78 = _R30StructuredAndAliasModel(_R30SimpleSchema(), 16)
+    eng_r78 = SystemOneEngine(
+        _R30SimpleSchema,
+        model=mdl_r78,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    with pytest.raises(RuntimeError, match="post-super structured failure"):
+        eng_r78.learn("p", {"f": "b"}, embedding=x_ones)
+    assert eng_r78.model_version == 1
+    assert mdl_r78.records[0]["meta"]["count"] == 0
+    assert mdl_r78.void_scalar["meta"]["count"] == 0
+    assert int(mdl_r78.void_scalar["index"]) == 2
+    assert float(mdl_r78.void_num["x"]) == pytest.approx(1.5)
+    assert int(mdl_r78.void_num["y"]) == 3
+    assert mdl_r78.ro_obj[0] is shared_r8
+    assert not mdl_r78.ro_obj.flags.writeable
+    assert mdl_r78.ro_struct[0]["meta"] is shared_r8
+    assert not mdl_r78.ro_struct.flags.writeable
+    shared_r8["value"] = 2
+    assert mdl_r78.ro_obj[0]["value"] == 2
+    assert mdl_r78.ro_struct[0]["meta"]["value"] == 2
+
+    # ------------------------------------------------------------------
+    # R30-9: FastExplainer accepts valid 2-row Boolean heads whose inactive
+    # row 1 contains NaNs (both from_engine/from_compiled_model and direct).
+    # ------------------------------------------------------------------
+    class _R30BoolSchema(DecisionSchema):
+        b = BooleanField(description="Bool")
+
+    eng_r9 = SystemOneEngine(
+        _R30BoolSchema, dimension=16, backend="numpy", contrastive_whitening=False, use_cache=False
+    )
+    w_r9 = np.vstack([np.zeros(16, dtype="f4"), np.full(16, np.nan, dtype="f4")])
+    b_r9 = np.array([2.0, np.nan], dtype="f4")
+    eng_r9.model.heads["b"].set_weights(np.zeros((2, 16), dtype="f4"), np.array([2.0, 0.0], dtype="f4"))
+    cm_r9 = eng_r9.to_compiled_model()
+    eng_r9.model.heads["b"].weights = w_r9
+    eng_r9.model.heads["b"].biases = b_r9
+    assert eng_r9.decide("probe r9", record_receipt=False).values["b"] is True
+    with warnings.catch_warnings(record=True) as ws_r9:
+        warnings.simplefilter("error", RuntimeWarning)
+        exp_r9_eng = FastExplainer.from_engine(eng_r9, "b")
+        assert exp_r9_eng.explain("probe r9").predicted_label == "True"
+        cm_r9.heads["b"].weights = w_r9.copy()
+        cm_r9.heads["b"].biases = b_r9.copy()
+        assert cm_r9._field_heads is not None
+        cm_r9._field_heads["b"].weights = w_r9.copy()
+        cm_r9._field_heads["b"].biases = b_r9.copy()
+        assert FastExplainer.from_compiled_model(cm_r9, "b").explain("probe r9").predicted_label == "True"
+        exp_r9_dir = FastExplainer(
+            projector=eng_r9.projector,
+            weights=w_r9,
+            biases=b_r9,
+            is_boolean=True,
+        )
+        assert exp_r9_dir.explain("probe r9").predicted_label == "True"
+        exp_r9_dir_opts = FastExplainer(
+            projector=eng_r9.projector,
+            weights=w_r9,
+            biases=b_r9,
+            options=("False", "True"),
+            is_boolean=True,
+        )
+        assert exp_r9_dir_opts.explain("probe r9").predicted_label == "True"
+        exp_r9_fin_opts = FastExplainer(
+            projector=eng_r9.projector,
+            weights=np.zeros((2, 16), dtype="f4"),
+            biases=np.array([2.0, -99.0], dtype="f4"),
+            options=("False", "True"),
+            is_boolean=True,
+        )
+        assert exp_r9_fin_opts.explain("probe r9").predicted_label == "True"
+    assert not ws_r9
+
+    # NaN in active row 0 must still fail closed.
+    w_r9_bad0 = np.vstack([np.full(16, np.nan, dtype="f4"), np.zeros(16, dtype="f4")])
+    with pytest.raises(ValueError):
+        FastExplainer(projector=eng_r9.projector, weights=w_r9_bad0, biases=np.array([2.0, 0.0], dtype="f4"), is_boolean=True)
+
+    # ------------------------------------------------------------------
+    # R30-10: Object-dtype weights overflowing float32 (1e40) fail closed
+    # at FastExplainer construction without RuntimeWarning.
+    # ------------------------------------------------------------------
+    w_obj_1e40 = np.zeros((2, 16), dtype=object)
+    w_obj_1e40[0, 0] = 1e40
+    b_obj_zero = np.zeros(2, dtype=object)
+    w_obj_r1_1e40 = np.zeros((2, 16), dtype=object)
+    w_obj_r1_1e40[1, 0] = 1e40
+    b_obj_r1_ok = np.array([2.0, 0.0], dtype=object)
+    with warnings.catch_warnings(record=True) as ws_r10:
+        warnings.simplefilter("error", RuntimeWarning)
+        with pytest.raises(ValueError):
+            FastExplainer(projector=eng_r9.projector, weights=w_obj_1e40, biases=b_obj_zero, options=("a", "b"))
+        with pytest.raises(ValueError):
+            FastExplainer(projector=eng_r9.projector, weights=w_obj_1e40, biases=b_obj_zero, is_boolean=True)
+        with pytest.raises(ValueError):
+            FastExplainer(
+                projector=eng_r9.projector,
+                weights=w_obj_1e40[:1],
+                biases=b_obj_zero[:1],
+                is_boolean=True,
+            )
+        exp_r10_dir = FastExplainer(
+            projector=eng_r9.projector,
+            weights=w_obj_r1_1e40,
+            biases=b_obj_r1_ok,
+            is_boolean=True,
+        )
+        assert exp_r10_dir.explain("probe r10").predicted_label == "True"
+        eng_r9.model.heads["b"].weights = w_obj_r1_1e40
+        eng_r9.model.heads["b"].biases = b_obj_r1_ok
+        assert FastExplainer.from_engine(eng_r9, "b").explain("probe r10").predicted_label == "True"
+    assert not ws_r10
+
+    # ------------------------------------------------------------------
+    # R30-11: BooleanField and ScoreField DecisionFieldHead.evaluate_logits
+    # reject 0D rank-zero inputs uniformly with Choice/MultiChoice.
+    # ------------------------------------------------------------------
+    hb_r11 = DecisionFieldHead(BooleanField(), dimension=16, backend="numpy", contrastive_whitening=False)
+    hs_r11 = DecisionFieldHead(
+        ScoreField(min_value=0.0, max_value=10.0), dimension=16, backend="numpy", contrastive_whitening=False
+    )
+    for h11 in (hb_r11, hs_r11):
+        for bad_0d in (np.array(0.0), 0.0):
+            with pytest.raises(ValueError):
+                h11.evaluate_logits(bad_0d)  # type: ignore[arg-type]

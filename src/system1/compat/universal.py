@@ -23,7 +23,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -1378,6 +1378,8 @@ class SoftDistillingLifecycle:
                     return False
         return True
 
+    _supports_canary_tx_arg: bool = True
+
     def observe_teacher(
         self,
         prompt: str,
@@ -1386,6 +1388,7 @@ class SoftDistillingLifecycle:
         *,
         cache_key: Optional[str] = None,
         structure_sig: Optional[str] = None,
+        _canary_tx: Optional[Any] = None,
     ) -> bool:
         with self._lock:
             had_soft = prompt in self._soft_records_by_prompt
@@ -1407,6 +1410,16 @@ class SoftDistillingLifecycle:
                             self._structure_field_counts[fk] = self._structure_field_counts.get(fk, 0) + 1
                             inc_fks.append(fk)
             try:
+                inner_tx = _canary_tx[0] if isinstance(_canary_tx, tuple) and len(_canary_tx) >= 1 else None
+                if getattr(self.lifecycle, "_supports_canary_tx_arg", False) and _canary_tx is not None:
+                    return self.lifecycle.observe_teacher(
+                        prompt,
+                        lifecycle_values,
+                        cache_key=cache_key,
+                        _canary_tx=(
+                            inner_tx if inner_tx is not None else (0, 0, 0, "", None)
+                        ),
+                    )
                 return self.lifecycle.observe_teacher(prompt, lifecycle_values, cache_key=cache_key)
             except BaseException:
                 if soft_targets:
@@ -1921,6 +1934,9 @@ class UniversalDecisionService:
         self.max_unpromoted_lifecycles: int = int(max_unpromoted_lifecycles)
         self._lifecycles: OrderedDict[str, SoftDistillingLifecycle] = OrderedDict()
         self._last_schema_by_slot: OrderedDict[str, CompiledContractSchema] = OrderedDict()
+        self._lc_inflight_obs: Dict[int, int] = defaultdict(int)
+        self._lc_committed_ops: Dict[int, int] = defaultdict(int)
+        self._lc_pending_new_bind: Dict[str, SoftDistillingLifecycle] = {}
         self._lock = threading.RLock()
         self.stats: Dict[str, int] = {
             "total_requests": 0,
@@ -2078,7 +2094,10 @@ class UniversalDecisionService:
         unpromoted_keys = [k for k, v in self._lifecycles.items() if not v.is_cutover]
         while len(unpromoted_keys) > limit:
             evict_key = unpromoted_keys.pop(0)
-            self._lifecycles.pop(evict_key, None)
+            evict_lc = self._lifecycles.pop(evict_key, None)
+            self._lc_pending_new_bind.pop(evict_key, None)
+            if evict_lc is not None and self._lc_inflight_obs.get(id(evict_lc), 0) <= 0:
+                self._lc_committed_ops.pop(id(evict_lc), None)
 
     def _get_or_create_lifecycle(
         self,
@@ -2252,6 +2271,8 @@ class UniversalDecisionService:
                 with self._lock:
                     if lc_key in self._lifecycles:
                         self._lifecycles.move_to_end(lc_key)
+                    self._lc_committed_ops[id(existing_lc)] += 1
+                    self._lc_pending_new_bind.pop(lc_key, None)
                     self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
                     drift_info = self._record_slot_schema_locked(slot_key, contract)
                     self.stats["local_fastpath_requests"] += 1
@@ -2297,11 +2318,10 @@ class UniversalDecisionService:
                 status_code=502,
             ) from exc
         if not is_frozen:
-            created_new = False
+            obs_canary_tx: Optional[Any] = None
             with self._lock:
                 lc = self._lifecycles.get(lc_key)
                 if lc is None:
-                    created_new = True
                     self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=True)
                     lc = SoftDistillingLifecycle(
                         contract,
@@ -2310,34 +2330,71 @@ class UniversalDecisionService:
                         config=self.cutover_config,
                     )
                     self._lifecycles[lc_key] = lc
+                    self._lc_pending_new_bind[lc_key] = lc
                 else:
                     self._lifecycles.move_to_end(lc_key)
+                self._lc_inflight_obs[id(lc)] += 1
             if lc is not existing_lc and local_tx_ref[1] is not None and existing_lc is not None:
                 if hasattr(existing_lc, "_rollback_local_tx"):
                     existing_lc._rollback_local_tx(local_tx_ref[1])
                 local_tx_ref[1] = None
+            elif lc is existing_lc:
+                obs_canary_tx = local_tx_ref[1]
             try:
-                lc.observe_teacher(
-                    semantic_text,
-                    lifecycle_vals,
-                    soft_targets=soft_targets,
-                    cache_key=req_cache_key,
-                    structure_sig=req_struct_sig,
-                )
+                if getattr(lc, "_supports_canary_tx_arg", False):
+                    lc.observe_teacher(
+                        semantic_text,
+                        lifecycle_vals,
+                        soft_targets=soft_targets,
+                        cache_key=req_cache_key,
+                        structure_sig=req_struct_sig,
+                        _canary_tx=(
+                            obs_canary_tx
+                            if obs_canary_tx is not None
+                            else ((0, 0, 0, "", None), 0)
+                        ),
+                    )
+                else:
+                    lc.observe_teacher(
+                        semantic_text,
+                        lifecycle_vals,
+                        soft_targets=soft_targets,
+                        cache_key=req_cache_key,
+                        structure_sig=req_struct_sig,
+                    )
             except BaseException:
                 with self._lock:
-                    if created_new:
+                    rem_in = self._lc_inflight_obs.get(id(lc), 0) - 1
+                    if rem_in <= 0:
+                        self._lc_inflight_obs.pop(id(lc), None)
+                    else:
+                        self._lc_inflight_obs[id(lc)] = rem_in
+                    pend_lc = self._lc_pending_new_bind.get(lc_key)
+                    if pend_lc is lc and rem_in <= 0 and self._lc_committed_ops.get(id(lc), 0) == 0:
                         inner_lc = lc.lifecycle
                         if (
-                            not inner_lc.admitted_keys
+                            not lc.is_cutover
+                            and inner_lc.step_count == 0
+                            and inner_lc.local_hits == 0
+                            and not inner_lc.admitted_keys
                             and not inner_lc.quarantine
                             and not inner_lc.teacher_key_labels
                         ):
+                            self._lc_pending_new_bind.pop(lc_key, None)
                             if self._lifecycles.get(lc_key) is lc:
                                 self._lifecycles.pop(lc_key, None)
                     self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
                 raise
             local_tx_ref[1] = None
+            with self._lock:
+                rem_in = self._lc_inflight_obs.get(id(lc), 0) - 1
+                if rem_in <= 0:
+                    self._lc_inflight_obs.pop(id(lc), None)
+                else:
+                    self._lc_inflight_obs[id(lc)] = rem_in
+                self._lc_committed_ops[id(lc)] += 1
+                if self._lc_pending_new_bind.get(lc_key) is lc:
+                    self._lc_pending_new_bind.pop(lc_key, None)
         else:
             local_tx_ref[1] = None
 

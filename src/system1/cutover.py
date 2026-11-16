@@ -267,6 +267,7 @@ class AutoCutoverLifecycle:
         self.canary_checks: int = 0
         self.canary_window: Deque[int] = collections.deque(maxlen=20)
         self._pending_canaries: Dict[str, Tuple[Dict[str, Any], float, bool]] = {}
+        self._pending_canary_stack: Dict[str, List[Tuple[object, Tuple[Dict[str, Any], float, bool]]]] = {}
         self.cutover_events: List[Dict[str, Any]] = []
         self.recalibrate_events: List[Dict[str, Any]] = []
         self.quarantined_total: int = 0
@@ -975,20 +976,28 @@ class AutoCutoverLifecycle:
 
         return False, None, margin, False, False
 
+    _supports_canary_tx_arg: bool = True
+
+    def _sync_pending_canary_locked(self, key: str) -> None:
+        stack = self._pending_canary_stack.get(key)
+        if stack:
+            self._pending_canaries[key] = stack[-1][1]
+        else:
+            self._pending_canary_stack.pop(key, None)
+            self._pending_canaries.pop(key, None)
+
     def _decide_local_with_tx(
         self,
         prompt: str,
         *,
         cache_key: Optional[str] = None,
         accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
-    ) -> Tuple[Optional[Dict[str, Any]], Tuple[int, int, int, str, bool, Any, Any]]:
+    ) -> Tuple[Optional[Dict[str, Any]], Tuple[int, int, int, str, Any]]:
         """Attempt local decision and return (values_or_none, rollback_tx_token)."""
         with self._lock:
             self._maybe_micro_compile_locked()
             key = _resolve_cache_key(prompt, cache_key)
             e0 = self.local_accept_eligible
-            had_pend = key in self._pending_canaries
-            prev_pend = self._pending_canaries.get(key)
             accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(
                 prompt,
                 cache_key=key,
@@ -998,16 +1007,20 @@ class AutoCutoverLifecycle:
             if accepted and vals is not None:
                 self.step_count += 1
                 self.local_hits += 1
-                return vals, (de, 1, 1, key, had_pend, prev_pend, None)
-            added_pend: Any = None
+                return vals, (de, 1, 1, key, None)
+            canary_tok: Any = None
             if is_canary and vals is not None:
+                if key in self._pending_canaries and key not in self._pending_canary_stack:
+                    self._pending_canary_stack[key] = [(object(), self._pending_canaries[key])]
+                canary_tok = object()
                 added_pend = (vals, margin, from_cache)
-                self._pending_canaries[key] = added_pend
-            return None, (de, 0, 0, key, had_pend, prev_pend, added_pend)
+                self._pending_canary_stack.setdefault(key, []).append((canary_tok, added_pend))
+                self._sync_pending_canary_locked(key)
+            return None, (de, 0, 0, key, canary_tok)
 
-    def _rollback_local_tx(self, tx: Tuple[int, int, int, str, bool, Any, Any]) -> None:
+    def _rollback_local_tx(self, tx: Tuple[int, int, int, str, Any]) -> None:
         """Roll back local_accept_eligible, counters, and pending canary state from a failed request."""
-        de, ds, dh, key, had_pend, prev_pend, added_pend = tx
+        de, ds, dh, key, canary_tok = tx
         with self._lock:
             if de:
                 self.local_accept_eligible = max(0, self.local_accept_eligible - de)
@@ -1015,11 +1028,11 @@ class AutoCutoverLifecycle:
                 self.step_count = max(0, self.step_count - ds)
             if dh:
                 self.local_hits = max(0, self.local_hits - dh)
-            if added_pend is not None and self._pending_canaries.get(key) is added_pend:
-                if had_pend:
-                    self._pending_canaries[key] = prev_pend
-                else:
-                    self._pending_canaries.pop(key, None)
+            if canary_tok is not None:
+                stack = self._pending_canary_stack.get(key)
+                if stack is not None:
+                    self._pending_canary_stack[key] = [pair for pair in stack if pair[0] is not canary_tok]
+                    self._sync_pending_canary_locked(key)
 
     def decide_local(
         self,
@@ -1042,12 +1055,33 @@ class AutoCutoverLifecycle:
         teacher_values: Any,
         *,
         cache_key: Optional[str] = None,
+        _canary_tx: Optional[Any] = None,
     ) -> bool:
         """Ingest a validated teacher answer, update canary drift state, and admit/compile."""
         validated = self._coerce_teacher_values(teacher_values)
         with self._lock:
             key = _resolve_cache_key(prompt, cache_key)
-            pending = self._pending_canaries.pop(key, None)
+            pending: Optional[Tuple[Dict[str, Any], float, bool]] = None
+            if _canary_tx is not None:
+                tx_tok = _canary_tx[4] if len(_canary_tx) >= 5 else None
+                if tx_tok is not None:
+                    stack = self._pending_canary_stack.get(key)
+                    if stack is not None:
+                        new_stack: List[Tuple[object, Tuple[Dict[str, Any], float, bool]]] = []
+                        for pair in stack:
+                            if pending is None and pair[0] is tx_tok:
+                                pending = pair[1]
+                            else:
+                                new_stack.append(pair)
+                        self._pending_canary_stack[key] = new_stack
+                        self._sync_pending_canary_locked(key)
+            else:
+                stack = self._pending_canary_stack.get(key)
+                if stack:
+                    _, pending = stack.pop()
+                    self._sync_pending_canary_locked(key)
+                else:
+                    pending = self._pending_canaries.pop(key, None)
             if pending is not None:
                 pred_vals, margin, from_cache = pending
                 self._record_canary_check_locked(

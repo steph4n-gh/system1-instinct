@@ -282,11 +282,11 @@ def _extract_calibrated_head_params(
         if w.ndim != 2 or w.shape[0] != len(f_def.options) or b.size != w.shape[0]:
             raise ValueError(f"Incompatible ChoiceField head shapes weights={w.shape}, biases={b.shape} for {fname!r}")
 
-    if not (bool(np.all(np.isfinite(w))) and bool(np.all(np.isfinite(b)))):
-        raise ValueError(f"Head weights or biases for {fname!r} contain non-finite values")
     if is_boolean and w.shape[0] > 1:
         w = w[:1]
         b = b[:1].copy()
+    if not (bool(np.all(np.isfinite(w))) and bool(np.all(np.isfinite(b)))):
+        raise ValueError(f"Head weights or biases for {fname!r} contain non-finite values")
 
     is_zero_head = bool(not np.any(w) and not np.any(b))
     raw_w_src = w_checked
@@ -468,12 +468,32 @@ class FastExplainer:
             )
         if b_in.ndim != 1:
             raise ValueError(f"Expected 1D bias vector, got shape {b_in.shape}")
-        w_in_f64 = np.asarray(w_in, dtype=np.float64)
-        b_in_f64 = np.asarray(b_in, dtype=np.float64)
-        if not (bool(np.all(np.isfinite(w_in_f64))) and bool(np.all(np.isfinite(b_in_f64)))):
-            raise ValueError("Head weights and biases must be finite")
+        try:
+            with np.errstate(over="ignore", invalid="ignore"):
+                w_in_f64 = np.asarray(w_in, dtype=np.float64)
+                b_in_f64 = np.asarray(b_in, dtype=np.float64)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Head weights and biases must be finite") from exc
         inferred_bool = w_in.ndim == 2 and w_in.shape[0] == 1 and (options is None or len(options) in (0, 2))
         self._is_boolean = bool(inferred_bool if is_boolean is None else is_boolean)
+        if self._is_boolean:
+            if _bool_raw_meta is not None:
+                if w_in.shape[0] != 1 or b_in.shape != (1,):
+                    raise ValueError(
+                        f"Incompatible normalized BooleanField head shapes weights={w_in.shape}, biases={b_in.shape}"
+                    )
+            elif w_in.shape[0] not in (1, 2) or b_in.shape[0] not in (1, w_in.shape[0]):
+                raise ValueError(
+                    f"Incompatible BooleanField head shapes weights={w_in.shape}, biases={b_in.shape}"
+                )
+            if options is not None and len(options) not in (0, 2):
+                raise ValueError(
+                    f"Options length {len(options)} is invalid for BooleanField (expected 2)"
+                )
+        chk_w_in_f64 = w_in_f64[:1] if self._is_boolean else w_in_f64
+        chk_b_in_f64 = b_in_f64[:1] if self._is_boolean else b_in_f64
+        if not (bool(np.all(np.isfinite(chk_w_in_f64))) and bool(np.all(np.isfinite(chk_b_in_f64)))):
+            raise ValueError("Head weights and biases must be finite")
         self._bool_logit_shift = _boolean_threshold_logit_shift(self.threshold)
         self.recency_weighted = bool(
             getattr(projector, "recency_weighted", False) if recency_weighted is None else recency_weighted
@@ -485,9 +505,11 @@ class FastExplainer:
         )
         self._is_zero_head = bool(is_zero_head)
 
+        w_norm_in = w_in[:1] if (self._is_boolean and _bool_raw_meta is None and w_in.shape[0] > 1) else w_in
+        b_norm_in = b_in[:1] if (self._is_boolean and _bool_raw_meta is None and b_in.shape[0] > 1) else b_in
         _, _, resolved_options = _normalize_head_weights_and_options(
-            weights,
-            biases,
+            w_norm_in,
+            b_norm_in,
             options,
             threshold=threshold,
             temperature_scale=self.scale,
@@ -495,10 +517,11 @@ class FastExplainer:
         self.options = resolved_options
         self.label_to_idx = {lbl: i for i, lbl in enumerate(self.options)}
         self.num_classes = len(self.options)
-        w_f64 = np.asarray(w_in, dtype=np.float64)
-        b_f64 = np.asarray(b_in, dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            w_f64 = np.asarray(w_norm_in, dtype=np.float64)
+            b_f64 = np.asarray(b_norm_in, dtype=np.float64)
         opts_in = tuple(str(o) for o in options) if options is not None else ()
-        is_scalar_bool = w_f64.shape[0] == 1 and (not opts_in or len(opts_in) == 2)
+        is_scalar_bool = self._is_boolean or (w_f64.shape[0] == 1 and (not opts_in or len(opts_in) == 2))
 
         adj_eff_in: Optional[np.ndarray] = None
         if adj_eff is not None:
@@ -536,7 +559,12 @@ class FastExplainer:
                         b_scaled = ((float(b_f64[0]) * self.scale) + delta_adj) / self.cal_temp - self._bool_logit_shift
                         adj_eff_vec = np.array([delta_adj / self.cal_temp], dtype=np.float64)
                 else:
-                    adj_term = float(adj_eff_in[0]) if (adj_eff_in is not None and adj_eff_in.size == 1) else 0.0
+                    if adj_eff_in is not None and adj_eff_in.size == 2:
+                        adj_term = float(adj_eff_in[1] - adj_eff_in[0])
+                    elif adj_eff_in is not None and adj_eff_in.size == 1:
+                        adj_term = float(adj_eff_in[0])
+                    else:
+                        adj_term = 0.0
                     delta_adj = adj_term * self.cal_temp
                     b_scaled = ((float(b_f64[0]) * self.scale) / self.cal_temp + adj_term) - self._bool_logit_shift
                     adj_eff_vec = np.array([adj_term], dtype=np.float64)
@@ -625,7 +653,7 @@ class FastExplainer:
                     self._bool_raw_b = _owned_readonly_array(
                         rb_src, dtype=rb_src.dtype if rb_src.dtype in (np.float32, np.float64) else np.float32
                     )
-                if not (bool(np.all(np.isfinite(self._bool_raw_w))) and bool(np.all(np.isfinite(self._bool_raw_b)))):
+                if not (bool(np.all(np.isfinite(self._bool_raw_w[:1]))) and bool(np.all(np.isfinite(self._bool_raw_b[:1])))):
                     raise ValueError("raw_w and raw_b must be finite in float32/float64")
                 raw_bs = _bool_raw_meta["base_scale"]
                 raw_ct = _bool_raw_meta["cal_temp"]
@@ -664,7 +692,7 @@ class FastExplainer:
                         rw_chk = np.asarray(
                             rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
                         )
-                    if not bool(np.all(np.isfinite(rw_chk))):
+                    if not bool(np.all(np.isfinite(rw_chk[:1]))):
                         raise ValueError("raw_w must be finite in float32/float64")
                 if "raw_b" in _bool_raw_meta:
                     rb_raw = np.asarray(_bool_raw_meta["raw_b"])
@@ -676,7 +704,7 @@ class FastExplainer:
                         rb_chk = np.asarray(
                             rb_raw, dtype=rb_raw.dtype if rb_raw.dtype in (np.float32, np.float64) else np.float32
                         )
-                    if not bool(np.all(np.isfinite(rb_chk))):
+                    if not bool(np.all(np.isfinite(rb_chk[:1]))):
                         raise ValueError("raw_b must be finite in float32/float64")
                 raw_c_adj = _bool_raw_meta.get("cal_adj_2")
                 if raw_c_adj is not None:
@@ -686,15 +714,18 @@ class FastExplainer:
                     self._bool_cal_adj_2 = _owned_readonly_array(adj2_arr, dtype=np.float64)
                 else:
                     self._bool_cal_adj_2 = None
-            elif _bool_raw_meta is None and w_in.ndim == 2 and w_in.shape[0] == 1:
+            elif _bool_raw_meta is None and w_in.ndim == 2 and w_in.shape[0] in (1, 2):
                 self._bool_has_scalar_raw = True
                 rw_dt = w_in.dtype if w_in.dtype in (np.float32, np.float64) else np.float32
                 rb_dt = b_in.dtype if b_in.dtype in (np.float32, np.float64) else np.float32
-                self._bool_raw_w = _owned_readonly_array(w_in, dtype=rw_dt)
-                self._bool_raw_b = _owned_readonly_array(
-                    b_in if b_in.size >= 1 else np.zeros(1, dtype=rb_dt),
-                    dtype=rb_dt,
-                )
+                with np.errstate(over="ignore", invalid="ignore"):
+                    self._bool_raw_w = _owned_readonly_array(w_in, dtype=rw_dt)
+                    self._bool_raw_b = _owned_readonly_array(
+                        b_in if b_in.size >= 1 else np.zeros(1, dtype=rb_dt),
+                        dtype=rb_dt,
+                    )
+                if not (bool(np.all(np.isfinite(self._bool_raw_w[:1]))) and bool(np.all(np.isfinite(self._bool_raw_b[:1])))):
+                    raise ValueError("Head weights and biases must be finite in float32/float64")
                 self._bool_raw_base_scale = float(self.scale)
                 self._bool_cal_temp = float(self.cal_temp)
                 self._bool_cal_adj_2 = (
@@ -760,8 +791,11 @@ class FastExplainer:
                 self._choice_has_raw = True
                 rw_dt = w_in.dtype if w_in.dtype in (np.float32, np.float64) else np.float32
                 rb_dt = b_in.dtype if b_in.dtype in (np.float32, np.float64) else np.float32
-                self._choice_raw_w = _owned_readonly_array(w_in, dtype=rw_dt)
-                self._choice_raw_b = _owned_readonly_array(b_in, dtype=rb_dt)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    self._choice_raw_w = _owned_readonly_array(w_in, dtype=rw_dt)
+                    self._choice_raw_b = _owned_readonly_array(b_in, dtype=rb_dt)
+                if not (bool(np.all(np.isfinite(self._choice_raw_w))) and bool(np.all(np.isfinite(self._choice_raw_b)))):
+                    raise ValueError("Head weights and biases must be finite in float32/float64")
                 self._choice_raw_base_scale = float(self.scale)
                 self._choice_cal_temp = float(self.cal_temp)
                 if self._adj_eff.size == self.num_classes and np.any(self._adj_eff):
@@ -1873,7 +1907,14 @@ class FastExplainer:
                 return ov_res[1]
         if (self._is_boolean and self._bool_has_scalar_raw) or self._choice_has_raw:
             kept_text = " ".join(spans[j][2] for j in range(len(spans)) if kept_mask[j])
-            _, c1, _ = self._eval_reference_logits_and_top2_text(kept_text)
+            emb_f32 = _project_one(
+                self.projector,
+                kept_text,
+                recency_weighted=self.recency_weighted,
+                zero_unit0=self.zero_emb_unit0,
+                dimension=self.dimension,
+            )
+            _, c1, _ = self._eval_reference_logits_and_top2_from_emb(emb_f32)
             return c1
         return self._select_winner(logits)
 

@@ -3326,7 +3326,7 @@ class DecisionFieldHead:
                     f"logits length {logits.shape[0]} for {self.field_def.name!r} does not match expected {expected_len}"
                 )
         elif isinstance(self.field_def, (BooleanField, ScoreField)):
-            if logits_chk.ndim > 2 or (logits_chk.ndim == 2 and logits_chk.shape[0] != 1):
+            if logits_chk.ndim == 0 or logits_chk.ndim > 2 or (logits_chk.ndim == 2 and logits_chk.shape[0] != 1):
                 raise ValueError(
                     f"logits for {self.field_def.name!r} must be a 1D vector, got shape {logits_chk.shape}"
                 )
