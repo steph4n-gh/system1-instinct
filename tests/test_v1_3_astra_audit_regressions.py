@@ -20327,4 +20327,557 @@ def test_astra_47_round34_regressions() -> None:
     assert lc_r7.local_accept_eligible == el_before_r7
 
 
+def test_astra_48_round35_regressions() -> None:
+    """Round-35 regressions: unused return gating, scoped cells, fallback drift, canary rollback, CALL_KW, sequences, deep factories."""
+    from collections.abc import Mapping
+    from typing import Tuple
+
+    from system1.core.model import SystemOneModel
+    from system1.core.schema import ChoiceField, DecisionSchema
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig, CutoverState
+    from system1.engine import SystemOneEngine, _inspect_varkw_wrapper
+    from system1.fallback import BoundedReviewFallback
+
+    class _R35CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="First")
+        g = ChoiceField(options=("a", "b"), description="Second")
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return values
+
+    class _R35SimpleSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="Single choice")
+
+    class _R35StrictPosModel:
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            self._inner = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            )
+            for h in self._inner.heads.values():
+                h.set_weights(np.zeros((2, dim), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+            self.schema = self._inner.schema
+            self.projector = self._inner.projector
+            self.dimension = self._inner.dimension
+            self.heads = self._inner.heads
+
+        def encode(self, prompt: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
+            return self._inner.encode(prompt, recency_weighted=recency_weighted)
+
+        def forward_single(self, prompt: str, embedding: Any = None) -> Any:
+            return self._inner.forward_single(prompt, embedding=embedding)
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            return self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+
+    class _R35RetHelper:
+        @staticmethod
+        def make(kw: Dict[str, Any]) -> Callable[[], Tuple[bool, Dict[str, Any]]]:
+            def _run() -> Tuple[bool, Dict[str, Any]]:
+                copied = dict(kw)
+                return bool(copied.pop("use_cache", True)), copied
+
+            return _run
+
+        @staticmethod
+        def wrap(kw: Dict[str, Any]) -> Callable[[], Tuple[bool, Dict[str, Any]]]:
+            return _R35RetHelper.make(kw)
+
+        @staticmethod
+        def make_pair(kw: Dict[str, Any]) -> Tuple[Callable[[], Tuple[bool, Dict[str, Any]]], int]:
+            return (_R35RetHelper.make(kw), 1)
+
+        @staticmethod
+        def make_dict(kw: Dict[str, Any]) -> Dict[str, Callable[[], Tuple[bool, Dict[str, Any]]]]:
+            return {"f": _R35RetHelper.make(kw)}
+
+    def _assert_cache_wrapper_rejects_invalid_learn(model_cls: Any) -> None:
+        m = model_cls(_R35CoupledSchema(), 16)
+        eng = SystemOneEngine(
+            _R35CoupledSchema(),
+            model=m,
+            use_cache=False,
+            strict_mode=True,
+            min_calibration_lessons=1_000_000,
+        )
+        r0 = eng.decide("p", use_cache=False)
+        assert r0.values == {"f": "a", "g": "a"}
+        v_before = int(eng.model_version)
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng.learn("p", {"f": "b"})
+        assert int(eng.model_version) == v_before
+        if hasattr(m, "last"):
+            del m.last
+        eng.use_cache = True
+        r1 = eng.decide("p", use_cache=False)
+        assert r1.values == {"f": "a", "g": "a"}
+
+    # ------------------------------------------------------------------
+    # Finding A: Unused returned closures from helpers do not leak keys,
+    # while actually invoked returned closures (direct, 2-hop, unpacked,
+    # subscripted, dict-stored) are inspected accurately.
+    # ------------------------------------------------------------------
+    class _R35UnusedReturnModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _ = _R35RetHelper.make(kwargs)
+            _ = _R35RetHelper.wrap(kwargs)
+            _ = _R35RetHelper.make_pair(kwargs)[0]
+            prompt_arg = args[0] if args else kwargs.get("prompt", "")
+            return super().forward_single(prompt_arg, embedding=kwargs.get("embedding"))
+
+    m_unused = _R35UnusedReturnModel(_R35CoupledSchema(), 16)
+    ref_unused_a, _ = _inspect_varkw_wrapper(
+        m_unused.forward_single, frozenset({"use_cache", "dimension"})
+    )
+    assert "use_cache" not in ref_unused_a
+    eng_unused = SystemOneEngine(
+        _R35CoupledSchema(),
+        model=m_unused,
+        use_cache=False,
+        strict_mode=True,
+        min_calibration_lessons=1_000_000,
+    )
+    assert eng_unused.decide("p", use_cache=False).values == {"f": "a", "g": "a"}
+
+    class _R35UsedDirectModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            fn = _R35RetHelper.make(kwargs)
+            cached, rest = fn()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R35UsedTwoHopModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            fn = _R35RetHelper.wrap(kwargs)
+            cached, rest = fn()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R35UsedUnpackPairModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            fn, _ = _R35RetHelper.make_pair(kwargs)
+            cached, rest = fn()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R35UsedSubscrPairModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _R35RetHelper.make_pair(kwargs)[0]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R35UsedDictRetModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _R35RetHelper.make_dict(kwargs)["f"]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    for pos_cls_a in (
+        _R35UsedDirectModel,
+        _R35UsedTwoHopModel,
+        _R35UsedUnpackPairModel,
+        _R35UsedSubscrPairModel,
+        _R35UsedDictRetModel,
+    ):
+        _assert_cache_wrapper_rejects_invalid_learn(pos_cls_a)
+        ref_a_pos, _ = _inspect_varkw_wrapper(
+            pos_cls_a(_R35CoupledSchema(), 16).forward_single, frozenset({"use_cache"})
+        )
+        assert "use_cache" in ref_a_pos
+
+    # ------------------------------------------------------------------
+    # Finding B: Lexically scoped cell variables do not collide across
+    # sibling scopes while multi-level nonlocal mutation propagates.
+    # ------------------------------------------------------------------
+    def _sibling_cell_isolation(**kwargs: Any) -> Any:
+        def mutate(fwd: Dict[str, Any]) -> None:
+            forwarded: Any = None
+
+            def write_cell() -> None:
+                nonlocal forwarded
+                forwarded = fwd
+
+            write_cell()
+
+        def audit(tag: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+
+            def check(unused: Any) -> Any:
+                def secret_read() -> Any:
+                    return forwarded.get("dimension")
+
+                return secret_read()
+
+            return check(tag)
+
+        mutate(kwargs)
+        return audit(kwargs)
+
+    ref_sib_b, _ = _inspect_varkw_wrapper(
+        _sibling_cell_isolation, frozenset({"dimension", "use_cache"})
+    )
+    assert "dimension" not in ref_sib_b
+
+    class _R35NestedCellModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def mutate(fwd: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+                forwarded: Any = None
+
+                def mid() -> None:
+                    def inner() -> None:
+                        nonlocal forwarded
+                        forwarded = fwd
+
+                    inner()
+
+                mid()
+
+                def reader() -> Tuple[bool, Dict[str, Any]]:
+                    copied = dict(forwarded)
+                    return bool(copied.pop("use_cache", True)), copied
+
+                return reader()
+
+            def audit(tag: Any) -> Any:
+                forwarded: Dict[str, Any] = {}
+
+                def check() -> Any:
+                    return forwarded.get("dimension")
+
+                return check()
+
+            audit(kwargs)
+            cached, rest = mutate(kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    _assert_cache_wrapper_rejects_invalid_learn(_R35NestedCellModel)
+    ref_b_pos, _ = _inspect_varkw_wrapper(
+        _R35NestedCellModel(_R35CoupledSchema(), 16).forward_single,
+        frozenset({"use_cache", "dimension"}),
+    )
+    assert "use_cache" in ref_b_pos
+    assert "dimension" not in ref_b_pos
+
+    def _direct_parent_read_cell(**kwargs: Any) -> Any:
+        def mutate(fwd: Dict[str, Any]) -> Any:
+            forwarded: Any = None
+
+            def mid() -> None:
+                def inner() -> None:
+                    nonlocal forwarded
+                    forwarded = fwd
+
+                inner()
+
+            mid()
+            return forwarded.get("use_cache")
+
+        return mutate(kwargs)
+
+    ref_b_parent, _ = _inspect_varkw_wrapper(_direct_parent_read_cell, frozenset({"use_cache"}))
+    assert "use_cache" in ref_b_parent
+
+    # ------------------------------------------------------------------
+    # Finding C: BoundedReviewFallback escalates instead of falling
+    # through when self.network is cutover_lifecycle.engine on canary
+    # abstention or DRIFT_RECALIBRATE.
+    # ------------------------------------------------------------------
+    lc_c = AutoCutoverLifecycle(
+        _R35SimpleSchema(),
+        config=CutoverConfig(
+            milestones=(64,),
+            k_min=2,
+            canary_rate=0.05,
+            sparse_dim=128,
+            dense_dim=32,
+            enable_quarantine=False,
+        ),
+    )
+    for i in range(64):
+        if i % 2 == 0:
+            lc_c.observe_teacher(f"accept approve pleasant detail number {i}", {"f": "a"})
+        else:
+            lc_c.observe_teacher(f"reject deny dangerous detail number {i}", {"f": "b"})
+    assert lc_c.state == CutoverState.SELECTIVE_HOT_SWAP.value
+    assert lc_c.engine is not None
+
+    fb_calls_c: List[str] = []
+    fb_c = BoundedReviewFallback(
+        lc_c.engine,
+        review_fn=lambda ctx: (fb_calls_c.append(str(ctx)) or {"f": "b"}),
+        auto_compile_lifecycle=lc_c,
+        auto_record_lessons=False,
+    )
+    local_p_c = next(
+        f"accept approve pleasant detail number {j}"
+        for j in range(0, 64, 2)
+        if lc_c.decide_local(f"accept approve pleasant detail number {j}") is not None
+    )
+    local_res_c = fb_c.decide(local_p_c)
+    assert local_res_c["used_fallback"] is False
+    assert local_res_c["auto_compiled"] is True
+    assert local_res_c["values"] == {"f": "a"}
+    assert len(fb_calls_c) == 0
+
+    lc_c.config = dataclasses.replace(lc_c.config, canary_rate=1.0)
+    canary_res_c = fb_c.decide("accept approve pleasant detail number 2")
+    assert canary_res_c["used_fallback"] is True
+    assert canary_res_c["auto_compiled"] is False
+    assert canary_res_c["abstention_reason"] == "cutover_escalate"
+    assert canary_res_c["values"] == {"f": "b"}
+    assert len(fb_calls_c) == 1
+
+    lc_c.config = dataclasses.replace(lc_c.config, canary_rate=0.05)
+    lc_c.pending_recalibrate = True
+    lc_c.state = CutoverState.DRIFT_RECALIBRATE.value
+    drift_cached_c = fb_c.decide("accept approve pleasant detail number 0")
+    drift_uncached_c = fb_c.decide("accept approve pleasant unseen Drift check")
+    assert drift_cached_c["used_fallback"] is True
+    assert drift_cached_c["abstention_reason"] == "drift_recalibrate"
+    assert drift_uncached_c["used_fallback"] is True
+    assert drift_uncached_c["abstention_reason"] == "drift_recalibrate"
+    assert len(fb_calls_c) == 3
+
+    # ------------------------------------------------------------------
+    # Finding D: Atomic rollback of tracked/untracked canary structures
+    # without shallow overwrite after _restore_mutation_state_locked().
+    # ------------------------------------------------------------------
+    hook_state_d: Dict[str, Any] = {"fail": False}
+
+    def _hook_d(eng: Any, pairs: Any) -> bool:
+        if hook_state_d["fail"]:
+            raise RuntimeError("d compile fail")
+        return True
+
+    lc_d = AutoCutoverLifecycle(
+        _R35SimpleSchema(),
+        post_compile_hook=_hook_d,
+        config=CutoverConfig(
+            milestones=(64, 65),
+            k_min=2,
+            canary_rate=1.0,
+            sparse_dim=128,
+            dense_dim=32,
+            enable_quarantine=False,
+        ),
+    )
+    for i in range(64):
+        if i % 2 == 0:
+            lc_d.observe_teacher(f"accept approve pleasant detail number {i}", {"f": "a"})
+        else:
+            lc_d.observe_teacher(f"reject deny dangerous detail number {i}", {"f": "b"})
+    assert lc_d.state == CutoverState.SELECTIVE_HOT_SWAP.value
+
+    p_untr_d = "accept approve pleasant detail number 0"
+    p_tx_d = "accept approve pleasant detail number 98"
+    p_other_d = "accept approve pleasant detail number 4"
+    assert lc_d.decide_local(p_untr_d) is None
+    val_tx1, tx_info_d = lc_d._decide_local_with_tx(p_tx_d, _track_tx=True)
+    assert val_tx1 is None and tx_info_d[4] is not None
+    val_tx2, tx_other_d = lc_d._decide_local_with_tx(p_other_d, _track_tx=True)
+    assert val_tx2 is None and tx_other_d[4] is not None
+
+    k_untr_d = p_untr_d
+    k_tx_d = tx_info_d[3]
+    assert k_untr_d in lc_d._untracked_canaries
+    assert k_tx_d in lc_d._pending_canary_stack and len(lc_d._pending_canary_stack[k_tx_d]) == 1
+
+    exp_pending_d = {k: (dict(v[0]), v[1], v[2]) for k, v in lc_d._pending_canaries.items()}
+    exp_stack_d = {
+        k: [(tok, (dict(v[0]), v[1], v[2])) for tok, v in stk]
+        for k, stk in lc_d._pending_canary_stack.items()
+    }
+    exp_untr_d = {k: (dict(v[0]), v[1], v[2]) for k, v in lc_d._untracked_canaries.items()}
+    exp_untr_de_d = dict(lc_d._untracked_canary_de)
+    checks_before_d = lc_d.canary_checks
+    elig_before_d = lc_d.local_accept_eligible
+
+    def _failing_pred_d(vals: Dict[str, Any]) -> bool:
+        vals["f"] = "b"
+        lc_d._pending_canary_stack[k_tx_d].append((object(), ({"f": "b"}, 0.1, False)))
+        lc_d._untracked_canaries[k_untr_d] = ({"f": "b"}, 0.1, False)
+        raise RuntimeError("pred d fail")
+
+    with pytest.raises(RuntimeError, match="pred d fail"):
+        lc_d._decide_local_with_tx(
+            "reject deny dangerous detail number 1",
+            accept_predicate=_failing_pred_d,
+            _track_tx=True,
+        )
+    assert lc_d._pending_canaries == exp_pending_d
+    assert lc_d._pending_canary_stack == exp_stack_d
+    assert lc_d._untracked_canaries == exp_untr_d
+    assert lc_d._untracked_canary_de == exp_untr_de_d
+
+    hook_state_d["fail"] = True
+    with pytest.raises(RuntimeError, match="d compile fail"):
+        lc_d.observe_teacher(p_tx_d, {"f": "a"}, _canary_tx=tx_info_d)
+    assert len(lc_d.admitted_vecs) == 64
+    assert lc_d.canary_checks == checks_before_d
+    assert lc_d.local_accept_eligible == elig_before_d
+    assert lc_d._pending_canaries == exp_pending_d
+    assert lc_d._pending_canary_stack == exp_stack_d
+    assert lc_d._untracked_canaries == exp_untr_d
+    assert lc_d._untracked_canary_de == exp_untr_de_d
+
+    hook_state_d["fail"] = False
+    assert lc_d.observe_teacher(p_tx_d, {"f": "a"}, _canary_tx=tx_info_d) is True
+    assert lc_d.canary_checks == checks_before_d + 1
+    assert k_tx_d not in lc_d._pending_canaries
+    assert len(lc_d._pending_canary_stack.get(k_tx_d, ())) == 0
+
+    # ------------------------------------------------------------------
+    # Finding E: Keyword-only / keyword-named argument forwarding via
+    # KW_NAMES + CALL (Python 3.12) and CALL_KW (Python 3.14).
+    # ------------------------------------------------------------------
+    class _R35KwForwardModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def passthrough(
+                *,
+                fn_arg: Optional[Callable[[], Tuple[bool, Dict[str, Any]]]] = None,
+                dummy: Optional[Callable[[], Any]] = None,
+            ) -> Optional[Callable[[], Tuple[bool, Dict[str, Any]]]]:
+                return fn_arg
+
+            fn = passthrough(
+                fn_arg=lambda: (bool(dict(kwargs).get("use_cache", True)), {k: v for k, v in kwargs.items() if k != "use_cache"}),
+                dummy=lambda: kwargs.get("dimension"),
+            )
+            assert fn is not None
+            cached, rest = fn()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    _assert_cache_wrapper_rejects_invalid_learn(_R35KwForwardModel)
+    ref_e, _ = _inspect_varkw_wrapper(
+        _R35KwForwardModel(_R35CoupledSchema(), 16).forward_single,
+        frozenset({"use_cache", "dimension"}),
+    )
+    assert "use_cache" in ref_e
+    assert "dimension" not in ref_e
+
+    # ------------------------------------------------------------------
+    # Finding F: Starred tuple construction (LIST_TO_TUPLE / CALL_INTRINSIC_1 6),
+    # nested tuples, mutable list.append, and dict box indexing.
+    # ------------------------------------------------------------------
+    class _R35ContainerClosureModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            xs: Tuple[Any, ...] = ()
+            starred = (
+                *xs,
+                lambda: (
+                    bool(dict(kwargs).get("use_cache", True)),
+                    {k: v for k, v in kwargs.items() if k != "use_cache"},
+                ),
+            )
+            nested = ((None, starred[0]), (lambda: kwargs.get("dimension"),))
+            seq: List[Any] = []
+            seq.append(nested[0][1])
+            box = {"extract": seq[0]}
+            cached, rest = box["extract"]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    _assert_cache_wrapper_rejects_invalid_learn(_R35ContainerClosureModel)
+    ref_f, _ = _inspect_varkw_wrapper(
+        _R35ContainerClosureModel(_R35CoupledSchema(), 16).forward_single,
+        frozenset({"use_cache", "dimension"}),
+    )
+    assert "use_cache" in ref_f
+    assert "dimension" not in ref_f
+
+    # ------------------------------------------------------------------
+    # Finding G: 17-level deep nested factory chains (chained return and
+    # 17 sequential call hops) converge beyond the old 8-round cap.
+    # ------------------------------------------------------------------
+    class _R35DeepChainedFactoryModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def f0() -> Callable[..., Tuple[bool, Dict[str, Any]]]:
+                return lambda **kw: (bool(dict(kw).get("use_cache", True)), {k: v for k, v in kw.items() if k != "use_cache"})
+
+            def f1() -> Any: return f0()
+            def f2() -> Any: return f1()
+            def f3() -> Any: return f2()
+            def f4() -> Any: return f3()
+            def f5() -> Any: return f4()
+            def f6() -> Any: return f5()
+            def f7() -> Any: return f6()
+            def f8() -> Any: return f7()
+            def f9() -> Any: return f8()
+            def f10() -> Any: return f9()
+            def f11() -> Any: return f10()
+            def f12() -> Any: return f11()
+            def f13() -> Any: return f12()
+            def f14() -> Any: return f13()
+            def f15() -> Any: return f14()
+            def f16() -> Any: return f15()
+
+            cached, rest = f16()(**kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R35DeepSeqFactoryModel(_R35StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def f0() -> Callable[[Dict[str, Any]], Tuple[bool, Dict[str, Any]]]:
+                return lambda kw: (bool(dict(kw).get("use_cache", True)), {k: v for k, v in kw.items() if k != "use_cache"})
+
+            def f1() -> Any: return f0
+            def f2() -> Any: return f1
+            def f3() -> Any: return f2
+            def f4() -> Any: return f3
+            def f5() -> Any: return f4
+            def f6() -> Any: return f5
+            def f7() -> Any: return f6
+            def f8() -> Any: return f7
+            def f9() -> Any: return f8
+            def f10() -> Any: return f9
+            def f11() -> Any: return f10
+            def f12() -> Any: return f11
+            def f13() -> Any: return f12
+            def f14() -> Any: return f13
+            def f15() -> Any: return f14
+            def f16() -> Any: return f15
+
+            fn = f16()()()()()()()()()()()()()()()()()
+            cached, rest = fn(kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    for deep_cls_g in (_R35DeepChainedFactoryModel, _R35DeepSeqFactoryModel):
+        _assert_cache_wrapper_rejects_invalid_learn(deep_cls_g)
+        ref_g, _ = _inspect_varkw_wrapper(
+            deep_cls_g(_R35CoupledSchema(), 16).forward_single, frozenset({"use_cache"})
+        )
+        assert "use_cache" in ref_g
+
+
+
 

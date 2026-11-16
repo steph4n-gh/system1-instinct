@@ -1094,9 +1094,6 @@ class AutoCutoverLifecycle:
         with self._lock:
             need_snap = accept_predicate is not None or self._will_attempt_micro_compile_locked()
             tx_snap = self._snapshot_mutation_state_locked() if need_snap else None
-            stack_snap_tx = {k: list(v) for k, v in self._pending_canary_stack.items()} if need_snap else None
-            untr_snap_tx = dict(self._untracked_canaries) if need_snap else None
-            untr_de_snap_tx = dict(self._untracked_canary_de) if need_snap else None
             key = _resolve_cache_key(prompt, cache_key)
             try:
                 self._maybe_micro_compile_locked()
@@ -1138,9 +1135,6 @@ class AutoCutoverLifecycle:
             except BaseException:
                 if tx_snap is not None:
                     self._restore_mutation_state_locked(tx_snap)
-                    self._pending_canary_stack = stack_snap_tx  # type: ignore[assignment]
-                    self._untracked_canaries = untr_snap_tx  # type: ignore[assignment]
-                    self._untracked_canary_de = untr_de_snap_tx  # type: ignore[assignment]
                     self._sync_pending_canary_locked(key)
                 raise
 
@@ -1309,6 +1303,12 @@ class AutoCutoverLifecycle:
         self._pending_canary_stack = snap["_pending_canary_stack"]
         self._untracked_canaries = snap["_untracked_canaries"]
         self._untracked_canary_de = snap["_untracked_canary_de"]
+        for k_p in (
+            set(self._pending_canaries)
+            | set(self._pending_canary_stack)
+            | set(self._untracked_canaries)
+        ):
+            self._sync_pending_canary_locked(k_p)
         self.recent_unseen_window = snap["recent_unseen_window"]
         self.cutover_events = snap["cutover_events"]
         self.recalibrate_events = snap["recalibrate_events"]
@@ -1335,9 +1335,6 @@ class AutoCutoverLifecycle:
         with self._lock:
             key = _resolve_cache_key(prompt, cache_key)
             obs_snap = self._snapshot_mutation_state_locked()
-            stack_snap = {k: list(v) for k, v in self._pending_canary_stack.items()}
-            untr_snap = dict(self._untracked_canaries)
-            untr_de_snap = dict(self._untracked_canary_de)
             try:
                 pending: Optional[Tuple[Dict[str, Any], float, bool]] = None
                 if has_bound or eff_canary_tx is not None:
@@ -1381,9 +1378,6 @@ class AutoCutoverLifecycle:
                 return not quarantined
             except BaseException:
                 self._restore_mutation_state_locked(obs_snap)
-                self._pending_canary_stack = stack_snap
-                self._untracked_canaries = untr_snap
-                self._untracked_canary_de = untr_de_snap
                 if not has_bound and eff_canary_tx is None:
                     self._untracked_canaries.pop(key, None)
                     prev_de = self._untracked_canary_de.pop(key, 0)

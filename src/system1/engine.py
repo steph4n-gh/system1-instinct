@@ -661,6 +661,7 @@ def _analyze_code_kw_flow(
     frozenset[str],
     frozenset[Tuple[str, Any]],
     Dict[int, Tuple[types.CodeType, bool]],
+    Tuple[set[str], set[Tuple[str, str]], set[str]],
 ]:
     """Analyze bytecode callable targets, mutated container taint, and active constants."""
     unpacked_names: set[str] = set()
@@ -676,14 +677,26 @@ def _analyze_code_kw_flow(
     called_closure_names: set[str] = set()
     returned_slots: set[Tuple[str, Any]] = set()
     invoked_local_codes: Dict[int, Tuple[types.CodeType, bool]] = {}
+    ret_invoked_names: set[str] = set()
+    ret_invoked_owner_attrs: set[Tuple[str, str]] = set()
+    ret_invoked_leaf_attrs: set[str] = set()
 
     tainted_boxes: set[int] = set()
     unpacked_boxes: set[int] = set()
+    box_elem_tags: Dict[int, set[Tuple[str, Any]]] = {}
+    mutated_seq_boxes: set[int] = set()
     locals_env: Dict[str, set[Tuple[str, Any]]] = {
         vn: {("kw_taint", True)} for vn in (taint_vars or ())
     }
+    pos_only_n_p = getattr(code, "co_posonlyargcount", 0)
+    kw_cap_n_p = code.co_argcount + code.co_kwonlyargcount
     for p_idx, p_name in enumerate(code.co_varnames[: code.co_argcount]):
-        locals_env.setdefault(str(p_name), set()).add(("param_idx", p_idx))
+        ent_p = locals_env.setdefault(str(p_name), set())
+        ent_p.add(("param_idx", p_idx))
+        if p_idx >= pos_only_n_p:
+            ent_p.add(("param_name", str(p_name)))
+    for k_p_name in code.co_varnames[code.co_argcount : kw_cap_n_p]:
+        locals_env.setdefault(str(k_p_name), set()).add(("param_name", str(k_p_name)))
     for cvn in closure_vars:
         locals_env.setdefault(cvn, set()).add(("closure_taint", True))
     _mut_dict_methods = frozenset(
@@ -860,18 +873,86 @@ def _analyze_code_kw_flow(
             "attr",
             "leaf_attr",
             "call_origin",
-            "recv_box",
             "seq_items",
             "seq_items_ex",
         }
     )
 
+    def _record_ret_invoked(slots: Sequence[set[Tuple[str, Any]]]) -> None:
+        for sl in slots:
+            for k, v in sl:
+                if k == "call_origin" and isinstance(v, frozenset):
+                    for ok, ov in v:
+                        if ok == "name":
+                            ret_invoked_names.add(ov)
+                        elif ok == "attr":
+                            ret_invoked_owner_attrs.add(ov)
+                        elif ok == "leaf_attr":
+                            ret_invoked_leaf_attrs.add(ov)
+
+    def _container_bids(slot: set[Tuple[str, Any]]) -> set[int]:
+        bids_out: set[int] = set()
+        for bk, bv in slot:
+            if bk in ("box_id", "recv_box") and isinstance(bv, int):
+                bids_out.add(bv)
+            elif bk in ("name", "recv_var") and isinstance(bv, str) and bv in locals_env:
+                for lk, lv in locals_env[bv]:
+                    if lk == "box_id" and isinstance(lv, int):
+                        bids_out.add(lv)
+        return bids_out
+
+    def _seq_nesting_depth(val: Any) -> int:
+        rep_d = 0
+        if isinstance(val, tuple) and len(val) == 4 and isinstance(val[1], bool):
+            for sub in list(val[0]) + list(val[3]):
+                if isinstance(sub, frozenset):
+                    for sk, sv in sub:
+                        if sk in ("seq_items", "seq_items_ex"):
+                            rep_d = max(rep_d, _seq_nesting_depth(sv))
+            if isinstance(val[2], frozenset):
+                for sk, sv in val[2]:
+                    if sk in ("seq_items", "seq_items_ex"):
+                        rep_d = max(rep_d, _seq_nesting_depth(sv))
+            return 1 + rep_d
+        if isinstance(val, tuple):
+            for el in val:
+                if isinstance(el, frozenset):
+                    for sk, sv in el:
+                        if sk in ("seq_items", "seq_items_ex"):
+                            rep_d = max(rep_d, _seq_nesting_depth(sv))
+            return 1 + rep_d
+        return 0
+
     def _freeze_elem_slot(s: set[Tuple[str, Any]]) -> frozenset[Tuple[str, Any]]:
-        return frozenset(
-            kv
-            for kv in s
-            if kv[0] not in ("seq_items", "seq_items_ex") and kv[0] not in _EPHEMERAL_SLOT_KEYS
-        )
+        out_kv: set[Tuple[str, Any]] = set()
+        for kv in s:
+            if kv[0] in _EPHEMERAL_SLOT_KEYS or kv[0] in ("lit_map", "null"):
+                continue
+            if kv[0] in ("seq_items", "seq_items_ex") and _seq_nesting_depth(kv[1]) >= 8:
+                continue
+            out_kv.add(kv)
+        return frozenset(out_kv)
+
+    def _record_container_elem(
+        cont_slot: set[Tuple[str, Any]],
+        elem_slot: set[Tuple[str, Any]],
+        *,
+        seq_mut: bool = False,
+    ) -> None:
+        el_frozen = _freeze_elem_slot(elem_slot)
+        for bid_c in _container_bids(cont_slot):
+            if el_frozen:
+                box_elem_tags.setdefault(bid_c, set()).update(el_frozen)
+            if seq_mut:
+                mutated_seq_boxes.add(bid_c)
+
+    def _lookup_container_elems(cont_slot: set[Tuple[str, Any]]) -> frozenset[Tuple[str, Any]]:
+        merged: set[Tuple[str, Any]] = set()
+        for bid_c in _container_bids(cont_slot):
+            tags = box_elem_tags.get(bid_c)
+            if tags:
+                merged.update(tags)
+        return frozenset(merged)
 
     def _unpack_seq_repr(
         slot: set[Tuple[str, Any]],
@@ -894,6 +975,26 @@ def _analyze_code_kw_flow(
         if exacts:
             return (max(exacts, key=len), False, frozenset(), ())
         return None
+
+    def _unpack_seq_with_boxes(
+        slot: set[Tuple[str, Any]],
+    ) -> Optional[
+        Tuple[
+            Tuple[frozenset[Tuple[str, Any]], ...],
+            bool,
+            frozenset[Tuple[str, Any]],
+            Tuple[frozenset[Tuple[str, Any]], ...],
+        ]
+    ]:
+        rep = _unpack_seq_repr(slot)
+        if rep is None:
+            return None
+        bids_u = _container_bids(slot)
+        if any(b in mutated_seq_boxes for b in bids_u):
+            pref_u, _, se_u, suff_u = rep
+            dyn_u = _lookup_container_elems(slot)
+            return (pref_u, True, se_u | dyn_u, suff_u)
+        return rep
 
     def _collect_rep_elem_tags(
         rep: Tuple[
@@ -970,10 +1071,25 @@ def _analyze_code_kw_flow(
         *,
         is_tainted_call: bool,
         allow_pos_arg_fwd: bool,
+        kw_arg_map: Optional[Mapping[str, set[Tuple[str, Any]]]] = None,
     ) -> None:
         orig_tags: set[Tuple[str, Any]] = set()
         is_partial = False
         is_seq_ctor = False
+
+        def _copy_ret_src_slot(arg_src: set[Tuple[str, Any]]) -> None:
+            if _slot_is_tainted(arg_src):
+                tainted_boxes.add(ret_bid)
+                ret_slot.add(("kw_taint", True))
+            for ak, av in arg_src:
+                if ak in _RET_COPY_KEYS or ak in ("param_idx", "param_name"):
+                    ret_slot.add((ak, av))
+                elif ak in ("box_id", "recv_box"):
+                    ret_slot.add(("recv_box", av))
+                    if av in tainted_boxes:
+                        tainted_boxes.add(ret_bid)
+                        ret_slot.add(("kw_taint", True))
+
         for cs in callable_slots:
             for ck, cv in cs:
                 if ck in ("name", "attr", "leaf_attr"):
@@ -990,24 +1106,24 @@ def _analyze_code_kw_flow(
                     prev_flag = prev_inv[1] if prev_inv is not None else False
                     invoked_local_codes[cid_c] = (cv, prev_flag or is_tainted_call)
                     if known_code_returns and cid_c in known_code_returns:
+                        cv_pos_only = getattr(cv, "co_posonlyargcount", 0)
+                        cv_pos_names = cv.co_varnames[cv_pos_only : cv.co_argcount]
                         for rk, rv in known_code_returns[cid_c]:
                             if rk == "param_idx" and allow_pos_arg_fwd and isinstance(rv, int):
                                 if 0 <= rv < len(arg_slots_rev):
-                                    arg_src = arg_slots_rev[len(arg_slots_rev) - 1 - rv]
-                                    if _slot_is_tainted(arg_src):
-                                        tainted_boxes.add(ret_bid)
-                                        ret_slot.add(("kw_taint", True))
-                                    for ak, av in arg_src:
-                                        if ak in _RET_COPY_KEYS:
-                                            ret_slot.add((ak, av))
-                                        elif ak == "box_id":
-                                            ret_slot.add(("recv_box", av))
-                                            if av in tainted_boxes:
-                                                tainted_boxes.add(ret_bid)
-                                                ret_slot.add(("kw_taint", True))
+                                    _copy_ret_src_slot(arg_slots_rev[len(arg_slots_rev) - 1 - rv])
+                            elif rk == "param_name" and isinstance(rv, str):
+                                if kw_arg_map and rv in kw_arg_map:
+                                    _copy_ret_src_slot(kw_arg_map[rv])
+                                elif allow_pos_arg_fwd and rv in cv_pos_names:
+                                    p_i = cv_pos_only + cv_pos_names.index(rv)
+                                    if 0 <= p_i < len(arg_slots_rev):
+                                        _copy_ret_src_slot(arg_slots_rev[len(arg_slots_rev) - 1 - p_i])
                             elif rk == "kw_taint" and rv:
                                 tainted_boxes.add(ret_bid)
                                 ret_slot.add(("kw_taint", True))
+                            elif rk == "ret_elems" and isinstance(rv, frozenset):
+                                box_elem_tags.setdefault(ret_bid, set()).update(rv)
                             elif rk in _RET_COPY_KEYS:
                                 ret_slot.add((rk, rv))
         if orig_tags:
@@ -1019,15 +1135,31 @@ def _analyze_code_kw_flow(
                     if pk in ("code", "fn_def_consts", "fn_tainted_params", "closure_taint", "name", "attr", "leaf_attr", "call_origin"):
                         ret_slot.add((pk, pv))
             if is_seq_ctor and len(arg_slots_rev) == 1:
+                seq_rep_fa = _unpack_seq_with_boxes(first_arg)
+                if seq_rep_fa is not None:
+                    _set_seq_repr(ret_slot, *seq_rep_fa)
                 for sk, sv in first_arg:
-                    if sk in ("seq_items", "seq_items_ex", "recv_box", "recv_var"):
+                    if sk in ("recv_box", "recv_var"):
                         ret_slot.add((sk, sv))
+                dyn_fa = _lookup_container_elems(first_arg)
+                if dyn_fa:
+                    for bid_f in _container_bids(ret_slot):
+                        box_elem_tags.setdefault(bid_f, set()).update(dyn_fa)
 
     def _run_pass() -> None:
         stack: List[set[Tuple[str, Any]]] = []
+        pending_kw_names: Optional[Tuple[str, ...]] = None
         for ins_idx, ins in enumerate(ins_list):
             op = ins.opname
             arg_int = ins.arg if isinstance(ins.arg, int) else 0
+            cur_kw_names: Optional[Tuple[str, ...]] = None
+            if op != "EXTENDED_ARG":
+                cur_kw_names = pending_kw_names
+                pending_kw_names = None
+            if op == "KW_NAMES":
+                if isinstance(ins.argval, tuple) and all(isinstance(x, str) for x in ins.argval):
+                    pending_kw_names = ins.argval
+                continue
             if op == "PUSH_NULL":
                 stack.append({("null", None)})
                 continue
@@ -1355,6 +1487,8 @@ def _analyze_code_kw_flow(
                     res_map.add(("map_tainted_keys", frozenset(t_keys)))
                 if unk_kt:
                     res_map.add(("map_unk_key_tainted", True))
+                for v_s_bm in vals_bm:
+                    _record_container_elem(res_map, v_s_bm)
                 stack.append(res_map)
                 continue
             if op == "BUILD_CONST_KEY_MAP":
@@ -1395,6 +1529,8 @@ def _analyze_code_kw_flow(
                     res_ckm.add(("map_tainted_keys", frozenset(t_keys)))
                 if unk_kt:
                     res_ckm.add(("map_unk_key_tainted", True))
+                for v_s_ckm in vals_fwd:
+                    _record_container_elem(res_ckm, v_s_ckm)
                 stack.append(res_ckm)
                 continue
             if op in ("DICT_MERGE", "DICT_UPDATE"):
@@ -1414,11 +1550,13 @@ def _analyze_code_kw_flow(
                 val_s = stack.pop() if stack else set()
                 key_s = stack.pop() if stack else set()
                 _flush_consts(val_s, key_s)
-                if 1 <= arg_int <= len(stack) and (_slot_is_tainted(val_s) or _slot_is_tainted(key_s)):
+                if 1 <= arg_int <= len(stack):
                     dst_map = stack[-arg_int]
-                    dst_map.discard(("lit_map", None))
-                    dst_map.add(("kw_taint", True))
-                    _taint_receiver_slot(dst_map)
+                    if _slot_is_tainted(val_s) or _slot_is_tainted(key_s):
+                        dst_map.discard(("lit_map", None))
+                        dst_map.add(("kw_taint", True))
+                        _taint_receiver_slot(dst_map)
+                    _record_container_elem(dst_map, val_s)
                 continue
             if op in ("LIST_APPEND", "SET_ADD", "LIST_EXTEND", "SET_UPDATE"):
                 item_s = stack.pop() if stack else set()
@@ -1439,7 +1577,7 @@ def _analyze_code_kw_flow(
                             else:
                                 _set_seq_repr(dst_seq_s, d_pref, True, d_se, d_suff + (el_fr,))
                         else:
-                            it_rep = _unpack_seq_repr(item_s)
+                            it_rep = _unpack_seq_with_boxes(item_s)
                             if it_rep is not None:
                                 m_pref, m_hs, m_se, m_suff = _concat_seq_reps(dst_rep, it_rep)
                                 _set_seq_repr(dst_seq_s, m_pref, m_hs, m_se, m_suff)
@@ -1457,6 +1595,7 @@ def _analyze_code_kw_flow(
                 _flush_consts(key_s, cont_s, val_s)
                 if _slot_is_tainted(val_s) or _slot_is_tainted(key_s):
                     _taint_receiver_slot(cont_s)
+                _record_container_elem(cont_s, val_s)
                 continue
             if op == "GET_ITER":
                 if stack:
@@ -1476,28 +1615,39 @@ def _analyze_code_kw_flow(
                 _flush_consts(top)
                 has_t = _slot_is_tainted(top)
                 box_t = any(k == "box_id" and v in tainted_boxes for k, v in top)
-                seq_rep = _unpack_seq_repr(top)
+                seq_rep = _unpack_seq_with_boxes(top)
                 pushed_u: Optional[List[set[Tuple[str, Any]]]] = None
                 if seq_rep is not None:
                     pref_u, hs_u, se_u, suff_u = seq_rep
                     if not hs_u and len(pref_u) == arg_int:
                         pushed_u = [set(el) for el in pref_u]
-                    elif hs_u and len(pref_u) + len(suff_u) <= arg_int:
+                    elif hs_u:
                         pushed_u = []
+                        star_and_suff_u = se_u.union(*suff_u) if suff_u else se_u
+                        star_and_pref_u = se_u.union(*pref_u) if pref_u else se_u
                         for idx_u in range(arg_int):
+                            dist_end_u = arg_int - idx_u
                             if idx_u < len(pref_u):
                                 pushed_u.append(set(pref_u[idx_u]))
-                            elif arg_int - idx_u <= len(suff_u):
-                                pushed_u.append(set(suff_u[len(suff_u) - (arg_int - idx_u)]))
+                            elif dist_end_u <= len(suff_u) and idx_u >= len(pref_u):
+                                cand_u = set(suff_u[len(suff_u) - dist_end_u])
+                                if idx_u == len(pref_u):
+                                    cand_u.update(star_and_suff_u)
+                                else:
+                                    cand_u.update(se_u)
+                                pushed_u.append(cand_u)
+                            elif dist_end_u > len(suff_u):
+                                pushed_u.append(set(star_and_pref_u | star_and_suff_u))
                             else:
-                                pushed_u.append(set(se_u))
+                                pushed_u.append(set(star_and_suff_u))
                 if pushed_u is not None:
                     for el_s in reversed(pushed_u):
                         if box_t or _slot_is_tainted(el_s):
                             el_s.add(("kw_taint", True))
                         stack.append(el_s)
                 else:
-                    recv_fb = {kv for kv in top if kv[0] in ("recv_box", "recv_var")}
+                    recv_fb = {kv for kv in top if kv[0] in ("recv_box", "recv_var", "call_origin")}
+                    recv_fb.update(_lookup_container_elems(top))
                     for _ in range(arg_int):
                         fb_s = set(recv_fb)
                         if has_t:
@@ -1511,7 +1661,7 @@ def _analyze_code_kw_flow(
                 after = arg_int >> 8
                 has_t = _slot_is_tainted(top)
                 box_t = any(k == "box_id" and v in tainted_boxes for k, v in top)
-                seq_rep = _unpack_seq_repr(top)
+                seq_rep = _unpack_seq_with_boxes(top)
                 pushed_ex: List[set[Tuple[str, Any]]] = []
                 if seq_rep is not None:
                     pref_x, hs_x, se_x, suff_x = seq_rep
@@ -1533,8 +1683,10 @@ def _analyze_code_kw_flow(
                                 el_s.add(("kw_taint", True))
                     elif hs_x:
                         star_extra_parts: List[frozenset[Tuple[str, Any]]] = [se_x]
+                        star_plus_suff_x = se_x.union(*suff_x) if suff_x else se_x
+                        star_plus_pref_x = se_x.union(*pref_x) if pref_x else se_x
                         before_slots = [
-                            set(pref_x[i]) if i < len(pref_x) else set(se_x)
+                            set(pref_x[i]) if i < len(pref_x) else set(star_plus_suff_x)
                             for i in range(before)
                         ]
                         if len(pref_x) > before:
@@ -1545,7 +1697,7 @@ def _analyze_code_kw_flow(
                             if dist_end <= len(suff_x):
                                 after_slots.append(set(suff_x[len(suff_x) - dist_end]))
                             else:
-                                after_slots.append(set(se_x))
+                                after_slots.append(set(star_plus_pref_x))
                         if len(suff_x) > after:
                             star_extra_parts.extend(suff_x[: len(suff_x) - after])
                         merged_star_el = frozenset().union(*star_extra_parts)
@@ -1562,7 +1714,8 @@ def _analyze_code_kw_flow(
                                 el_s.add(("kw_taint", True))
                 if not pushed_ex:
                     n_push = before + 1 + after
-                    recv_fb_ex = {kv for kv in top if kv[0] in ("recv_box", "recv_var")}
+                    recv_fb_ex = {kv for kv in top if kv[0] in ("recv_box", "recv_var", "call_origin")}
+                    recv_fb_ex.update(_lookup_container_elems(top))
                     pushed_ex = []
                     for _ in range(n_push):
                         fb_ex = set(recv_fb_ex)
@@ -1571,6 +1724,24 @@ def _analyze_code_kw_flow(
                         pushed_ex.append(fb_ex)
                 for el_s in reversed(pushed_ex):
                     stack.append(el_s)
+                continue
+            if op == "LIST_TO_TUPLE" or (op == "CALL_INTRINSIC_1" and arg_int == 6):
+                top_lt = stack.pop() if stack else set()
+                _flush_consts(top_lt)
+                tup_rep = _unpack_seq_with_boxes(top_lt)
+                res_lt: set[Tuple[str, Any]] = {
+                    kv
+                    for kv in top_lt
+                    if kv[0] not in ("box_id", "lit_map", "seq_items", "seq_items_ex")
+                    and kv[0] not in _EPHEMERAL_SLOT_KEYS
+                }
+                if _slot_is_tainted(top_lt):
+                    res_lt.add(("kw_taint", True))
+                if tup_rep is not None:
+                    _set_seq_repr(res_lt, *tup_rep)
+                else:
+                    res_lt.update(_lookup_container_elems(top_lt))
+                stack.append(res_lt)
                 continue
             if op == "CALL_FUNCTION_EX":
                 eff = _safe_stack_effect(
@@ -1658,6 +1829,7 @@ def _analyze_code_kw_flow(
                                 if k == "name":
                                     called_closure_names.add(v)
                 if any_tainted:
+                    _record_ret_invoked(callable_slots)
                     _activate_nested_slots(
                         callable_slots + [pos_slot, kw_slot],
                         is_unpacked=bool(has_kw_map and kw_tainted),
@@ -1686,6 +1858,30 @@ def _analyze_code_kw_flow(
                 _flush_consts(*popped[kw_names_cnt:])
                 arg_slots = popped[kw_names_cnt : kw_names_cnt + arg_int]
                 callable_slots = popped[kw_names_cnt + arg_int :]
+                pos_rev_slots: Sequence[set[Tuple[str, Any]]] = ()
+                allow_pos_fwd = False
+                kw_arg_map: Dict[str, set[Tuple[str, Any]]] = {}
+                if op == "CALL":
+                    if cur_kw_names is not None and len(cur_kw_names) <= len(arg_slots):
+                        m_kw = len(cur_kw_names)
+                        pos_rev_slots = arg_slots[m_kw:]
+                        allow_pos_fwd = True
+                        for kw_i, kw_name in enumerate(cur_kw_names):
+                            kw_arg_map[str(kw_name)] = arg_slots[m_kw - 1 - kw_i]
+                    else:
+                        pos_rev_slots = arg_slots
+                        allow_pos_fwd = True
+                elif op == "CALL_KW" and popped:
+                    kw_names_tup = next(
+                        (v for k, v in popped[0] if k == "raw_key_tuple" and isinstance(v, tuple)),
+                        None,
+                    )
+                    if kw_names_tup is not None and len(kw_names_tup) <= len(arg_slots):
+                        m_kw = len(kw_names_tup)
+                        pos_rev_slots = arg_slots[m_kw:]
+                        allow_pos_fwd = True
+                        for kw_i, kw_name in enumerate(kw_names_tup):
+                            kw_arg_map[str(kw_name)] = arg_slots[m_kw - 1 - kw_i]
                 args_tainted = arg_int > 0 and any(_slot_is_tainted(s) for s in arg_slots)
                 nested_call_tainted = args_tainted or any(
                     ("closure_taint", True) in s or ("iter_taint", True) in s
@@ -1693,6 +1889,52 @@ def _analyze_code_kw_flow(
                 )
                 recv_tainted = any(_slot_is_tainted(s) for s in callable_slots)
                 any_tainted = args_tainted or nested_call_tainted or recv_tainted
+                call_method_names = {
+                    v[1] if k == "attr" else v
+                    for s in callable_slots
+                    for k, v in s
+                    if k in ("leaf_attr", "name") or (k == "attr" and isinstance(v, tuple))
+                }
+                unbound_methods = {
+                    v[1] if k == "attr" else v
+                    for s in callable_slots
+                    for k, v in s
+                    if (
+                        k == "attr"
+                        and v[0] not in ("self", "cls")
+                        and v[1] in _mut_dict_methods
+                    )
+                    or (k == "name" and v in _mut_dict_methods)
+                }
+                if pos_rev_slots:
+                    if call_method_names & {"append", "add"}:
+                        el_app = pos_rev_slots[-2] if (unbound_methods and len(pos_rev_slots) >= 2) else pos_rev_slots[-1]
+                        targets_app = [pos_rev_slots[-1]] if (unbound_methods and len(pos_rev_slots) >= 2) else callable_slots
+                        is_seq_m = "append" in call_method_names
+                        for tgt_s in targets_app:
+                            _record_container_elem(tgt_s, el_app, seq_mut=is_seq_m)
+                    if "insert" in call_method_names:
+                        if unbound_methods and len(pos_rev_slots) >= 3:
+                            _record_container_elem(pos_rev_slots[-1], pos_rev_slots[-3], seq_mut=True)
+                        elif len(pos_rev_slots) >= 2:
+                            for tgt_s in callable_slots:
+                                _record_container_elem(tgt_s, pos_rev_slots[-2], seq_mut=True)
+                    if call_method_names & {"extend", "extendleft"}:
+                        src_ext = pos_rev_slots[-2] if (unbound_methods and len(pos_rev_slots) >= 2) else pos_rev_slots[-1]
+                        targets_ext = [pos_rev_slots[-1]] if (unbound_methods and len(pos_rev_slots) >= 2) else callable_slots
+                        rep_ext = _unpack_seq_with_boxes(src_ext)
+                        ext_el_set = set(_collect_rep_elem_tags(rep_ext)) if rep_ext is not None else (
+                            set(_lookup_container_elems(src_ext)) or _freeze_elem_slot(src_ext)
+                        )
+                        if ext_el_set:
+                            for tgt_s in targets_ext:
+                                _record_container_elem(tgt_s, set(ext_el_set), seq_mut=True)
+                    if "setdefault" in call_method_names:
+                        if unbound_methods and len(pos_rev_slots) >= 3:
+                            _record_container_elem(pos_rev_slots[-1], pos_rev_slots[-3])
+                        elif len(pos_rev_slots) >= 2:
+                            for tgt_s in callable_slots:
+                                _record_container_elem(tgt_s, pos_rev_slots[-2])
                 if args_tainted:
                     is_mut_dict_call = any(
                         (k == "leaf_attr" and v in _mut_dict_methods)
@@ -1703,17 +1945,6 @@ def _analyze_code_kw_flow(
                     if is_mut_dict_call:
                         for s in callable_slots:
                             _taint_receiver_slot(s)
-                        unbound_methods = {
-                            v[1] if k == "attr" else v
-                            for s in callable_slots
-                            for k, v in s
-                            if (
-                                k == "attr"
-                                and v[0] not in ("self", "cls")
-                                and v[1] in _mut_dict_methods
-                            )
-                            or (k == "name" and v in _mut_dict_methods)
-                        }
                         if unbound_methods:
                             min_args = 3 if (unbound_methods & _two_arg_mut_methods) else 2
                             if len(arg_slots) >= min_args:
@@ -1732,6 +1963,8 @@ def _analyze_code_kw_flow(
                             for k, v in s:
                                 if k == "name":
                                     called_closure_names.add(v)
+                if any_tainted:
+                    _record_ret_invoked(callable_slots)
                 if nested_call_tainted:
                     iter_t = any(("iter_taint", True) in s for s in callable_slots + arg_slots)
                     _activate_nested_slots(
@@ -1746,19 +1979,13 @@ def _analyze_code_kw_flow(
                 if any_tainted or ret_bid in tainted_boxes:
                     tainted_boxes.add(ret_bid)
                     ret_slot.add(("kw_taint", True))
-                pos_rev_slots: Sequence[set[Tuple[str, Any]]] = ()
-                allow_pos_fwd = False
-                if op == "CALL":
-                    pos_rev_slots = arg_slots
-                    allow_pos_fwd = True
-                elif op == "CALL_KW" and popped:
-                    kw_names_tup = next(
-                        (v for k, v in popped[0] if k == "raw_key_tuple" and isinstance(v, tuple)),
-                        None,
-                    )
-                    if kw_names_tup is not None:
-                        pos_rev_slots = arg_slots[len(kw_names_tup) :]
-                        allow_pos_fwd = True
+                if call_method_names & {"get", "pop", "setdefault"}:
+                    for tgt_s in callable_slots:
+                        dyn_get = _lookup_container_elems(tgt_s)
+                        if dyn_get:
+                            ret_slot.update(kv for kv in dyn_get if kv[0] in _RET_COPY_KEYS or kv[0] == "box_id")
+                    if "setdefault" in call_method_names and len(pos_rev_slots) >= 2:
+                        ret_slot.update(_freeze_elem_slot(pos_rev_slots[-2]))
                 _apply_known_call_returns(
                     callable_slots,
                     pos_rev_slots,
@@ -1766,6 +1993,7 @@ def _analyze_code_kw_flow(
                     ret_bid,
                     is_tainted_call=bool(args_tainted or iter_t),
                     allow_pos_arg_fwd=allow_pos_fwd,
+                    kw_arg_map=kw_arg_map,
                 )
                 stack.append(ret_slot)
                 continue
@@ -1773,12 +2001,13 @@ def _analyze_code_kw_flow(
                 ret_top = stack.pop() if stack else set()
                 _flush_consts(ret_top)
                 for rk, rv in ret_top:
-                    if rk in _RET_COPY_KEYS or rk == "param_idx":
+                    if rk in _RET_COPY_KEYS or rk in ("param_idx", "param_name"):
                         returned_slots.add((rk, rv))
-                    elif rk == "box_id":
-                        returned_slots.add(("recv_box", rv))
-                        if rv in tainted_boxes:
-                            returned_slots.add(("kw_taint", True))
+                    elif rk == "box_id" and rv in tainted_boxes:
+                        returned_slots.add(("kw_taint", True))
+                ret_el_fset = _lookup_container_elems(ret_top)
+                if ret_el_fset:
+                    returned_slots.add(("ret_elems", ret_el_fset))
                 continue
             eff = _safe_stack_effect(ins, default=0)
             if op in (
@@ -1800,8 +2029,20 @@ def _analyze_code_kw_flow(
                     and str(getattr(ins, "argrepr", "")) in ("+=", "|=")
                     and len(popped_f) >= 2
                 ):
+                    argrepr_bi = str(getattr(ins, "argrepr", ""))
                     if _slot_is_tainted(popped_f[0]):
                         _taint_receiver_slot(popped_f[-1])
+                    if argrepr_bi == "+=":
+                        it_rep_p = _unpack_seq_with_boxes(popped_f[0])
+                        el_add = (
+                            set(_collect_rep_elem_tags(it_rep_p))
+                            if it_rep_p is not None
+                            else (set(_lookup_container_elems(popped_f[0])) or _freeze_elem_slot(popped_f[0]))
+                        )
+                        _record_container_elem(popped_f[-1], set(el_add), seq_mut=True)
+                    else:
+                        el_add_m = _lookup_container_elems(popped_f[0]) or _freeze_elem_slot(popped_f[0])
+                        _record_container_elem(popped_f[-1], set(el_add_m))
                     for k_b, v_b in popped_f[-1]:
                         if k_b == "box_id":
                             res_f.add(("box_id", v_b))
@@ -1812,7 +2053,8 @@ def _analyze_code_kw_flow(
                     key_sub_s = popped_f[0]
                     cont_sub_s = popped_f[1]
                     idx_val = next((v for k, v in key_sub_s if k == "raw_int"), None)
-                    seq_rep_sub = _unpack_seq_repr(cont_sub_s)
+                    seq_rep_sub = _unpack_seq_with_boxes(cont_sub_s)
+                    box_t_sub = any(k == "box_id" and v in tainted_boxes for k, v in cont_sub_s)
                     if seq_rep_sub is not None:
                         pref_sub, hs_sub, se_sub, suff_sub = seq_rep_sub
                         chosen_el: Optional[frozenset[Tuple[str, Any]]] = None
@@ -1824,29 +2066,43 @@ def _analyze_code_kw_flow(
                             else:
                                 if 0 <= idx_val < len(pref_sub):
                                     chosen_el = pref_sub[idx_val]
+                                elif idx_val >= len(pref_sub):
+                                    chosen_el = se_sub.union(*suff_sub) if suff_sub else se_sub
                                 elif idx_val < 0 and (-idx_val) <= len(suff_sub):
                                     chosen_el = suff_sub[len(suff_sub) + idx_val]
                                 else:
-                                    chosen_el = se_sub
+                                    chosen_el = se_sub.union(*pref_sub) if pref_sub else se_sub
                         else:
                             chosen_el = _collect_rep_elem_tags(seq_rep_sub)
                         if chosen_el is not None:
-                            box_t_sub = any(k == "box_id" and v in tainted_boxes for k, v in cont_sub_s)
                             res_f = set(chosen_el)
                             if box_t_sub or _slot_is_tainted(res_f) or _slot_is_tainted(key_sub_s):
                                 res_f.add(("kw_taint", True))
+                    else:
+                        dyn_el_sub = _lookup_container_elems(cont_sub_s)
+                        if dyn_el_sub:
+                            res_f.update(dyn_el_sub)
+                            if box_t_sub or _slot_is_tainted(res_f) or _slot_is_tainted(key_sub_s):
+                                res_f.add(("kw_taint", True))
+                        for k_c_sub, v_c_sub in cont_sub_s:
+                            if k_c_sub == "call_origin":
+                                res_f.add((k_c_sub, v_c_sub))
                 elif op == "BINARY_SLICE" and len(popped_f) >= 3:
-                    seq_rep_sl = _unpack_seq_repr(popped_f[2])
+                    seq_rep_sl = _unpack_seq_with_boxes(popped_f[2])
                     if seq_rep_sl is not None:
                         sl_el = _collect_rep_elem_tags(seq_rep_sl)
                         _set_seq_repr(res_f, (), True, sl_el, ())
+                    else:
+                        for k_c_sl, v_c_sl in popped_f[2]:
+                            if k_c_sl == "call_origin":
+                                res_f.add((k_c_sl, v_c_sl))
                 elif (
                     op == "BINARY_OP"
                     and str(getattr(ins, "argrepr", "")) == "+"
                     and len(popped_f) >= 2
                 ):
-                    lhs_rep = _unpack_seq_repr(popped_f[1])
-                    rhs_rep = _unpack_seq_repr(popped_f[0])
+                    lhs_rep = _unpack_seq_with_boxes(popped_f[1])
+                    rhs_rep = _unpack_seq_with_boxes(popped_f[0])
                     if lhs_rep is not None and rhs_rep is not None:
                         c_pref, c_hs, c_se, c_suff = _concat_seq_reps(lhs_rep, rhs_rep)
                         _set_seq_repr(res_f, c_pref, c_hs, c_se, c_suff)
@@ -1878,6 +2134,11 @@ def _analyze_code_kw_flow(
             frozenset(called_closure_names),
             frozenset(returned_slots),
             frozenset(invoked_local_codes.items()),
+            frozenset((bk, frozenset(bv)) for bk, bv in box_elem_tags.items()),
+            frozenset(mutated_seq_boxes),
+            frozenset(ret_invoked_names),
+            frozenset(ret_invoked_owner_attrs),
+            frozenset(ret_invoked_leaf_attrs),
         )
 
     prev_sig: Optional[Tuple[Any, ...]] = None
@@ -1922,6 +2183,7 @@ def _analyze_code_kw_flow(
         closure_local_names,
         frozenset(returned_slots),
         invoked_local_codes,
+        (ret_invoked_names, ret_invoked_owner_attrs, ret_invoked_leaf_attrs),
     )
 
 
@@ -1931,6 +2193,42 @@ def _extract_kw_unpack_targets(
 ) -> Tuple[set[str], set[Tuple[str, str]], set[str], set[str], set[Tuple[str, str]], set[str]]:
     """Return bytecode callable targets for CALL_FUNCTION_EX (**kwargs) and non-zero-arg CALLs."""
     return _analyze_code_kw_flow(code, taint_vars)[:6]
+
+
+def _build_cell_owner_map(
+    root_code: types.CodeType,
+    cap: int = 256,
+) -> Dict[int, Dict[str, int]]:
+    """Map each nested code id to enclosing declaring code ids for its cell/free vars."""
+    cell_owners: Dict[int, Dict[str, int]] = {}
+    work: deque[Tuple[types.CodeType, Dict[str, int]]] = deque(
+        [(root_code, {str(fv): id(root_code) for fv in root_code.co_freevars})]
+    )
+    while work and len(cell_owners) < cap:
+        c_node, env_map = work.popleft()
+        cid_node = id(c_node)
+        if cid_node in cell_owners:
+            continue
+        node_cells: Dict[str, int] = {}
+        for fv in c_node.co_freevars:
+            fv_s = str(fv)
+            if fv_s in env_map:
+                node_cells[fv_s] = env_map[fv_s]
+        for cv in c_node.co_cellvars:
+            node_cells[str(cv)] = cid_node
+        cell_owners[cid_node] = node_cells
+        child_env = dict(env_map)
+        for cv in c_node.co_cellvars:
+            child_env[str(cv)] = cid_node
+        const_q: List[Any] = list(c_node.co_consts)
+        while const_q:
+            const_item = const_q.pop()
+            if isinstance(const_item, types.CodeType):
+                if id(const_item) not in cell_owners:
+                    work.append((const_item, child_env))
+            elif isinstance(const_item, tuple):
+                const_q.extend(const_item)
+    return cell_owners
 
 
 def _inspect_varkw_wrapper(
@@ -2038,15 +2336,34 @@ def _inspect_varkw_wrapper(
     max_depth = 6
     max_callables = 64
     queue: deque[Tuple[Any, Any, int]] = deque([(fn_obj, root_owner, 0)])
-    visited_call_keys: set[Tuple[int, int]] = set()
+    visited_call_keys: set[Tuple[int, int, bool]] = set()
     visited_depths: Dict[int, int] = {}
     sig_param_fn_ids: set[int] = set()
+    invoked_ret_fn_ids: set[int] = set()
     code_info_cache: Dict[
-        Tuple[int, Optional[frozenset[str]]],
-        Tuple[set[str], set[str], set[Tuple[str, str]], set[str], set[str], set[Tuple[str, str]], set[str], set[str]],
+        Tuple[int, Optional[frozenset[str]], bool],
+        Tuple[
+            set[str],
+            set[str],
+            set[Tuple[str, str]],
+            set[str],
+            set[str],
+            set[Tuple[str, str]],
+            set[str],
+            set[str],
+            set[str],
+            set[Tuple[str, str]],
+            set[str],
+        ],
     ] = {}
 
-    def _mark_unpacked_edge(cand: Any, sub_owner: Any, *, unpacked: bool) -> None:
+    def _mark_unpacked_edge(
+        cand: Any,
+        sub_owner: Any,
+        *,
+        unpacked: bool,
+        ret_invoked: bool = False,
+    ) -> None:
         if cand is None or isinstance(cand, type) or not callable(cand):
             return
         u_cand, _, partial_kw = _unwrap_callable_and_owner(cand, sub_owner)
@@ -2054,6 +2371,8 @@ def _inspect_varkw_wrapper(
             return
         referenced.update(partial_kw)
         u_id = id(u_cand)
+        if ret_invoked:
+            invoked_ret_fn_ids.add(u_id)
         if unpacked:
             sig_param_fn_ids.add(u_id)
             if visited_depths.get(u_id, 0) > 0:
@@ -2074,11 +2393,15 @@ def _inspect_varkw_wrapper(
         *,
         edge_unpacked: bool = False,
         edge_can_fwd: bool = False,
+        ret_invoked: bool = False,
         via_name: Optional[str] = None,
         unpacked_owner_attrs: Optional[set[Tuple[str, str]]] = None,
         unpacked_leaf_attrs: Optional[set[str]] = None,
         arg_owner_attrs: Optional[set[Tuple[str, str]]] = None,
         arg_leaf_attrs: Optional[set[str]] = None,
+        ret_invoked_names: Optional[set[str]] = None,
+        ret_invoked_owner_attrs: Optional[set[Tuple[str, str]]] = None,
+        ret_invoked_leaf_attrs: Optional[set[str]] = None,
         is_root_code: bool = False,
         visited_types: Optional[set[int]] = None,
     ) -> None:
@@ -2098,10 +2421,12 @@ def _inspect_varkw_wrapper(
             ul_attrs = unpacked_leaf_attrs or set()
             ao_attrs = arg_owner_attrs or set()
             al_attrs = arg_leaf_attrs or set()
+            ri_oattrs = ret_invoked_owner_attrs or set()
+            ri_lattrs = ret_invoked_leaf_attrs or set()
             # Inspect custom __init__ if defined directly on val.
             raw_init = val.__dict__.get("__init__")
-            if raw_init is not None and (edge_unpacked or edge_can_fwd):
-                _mark_unpacked_edge(raw_init, None, unpacked=edge_unpacked)
+            if raw_init is not None and (edge_unpacked or edge_can_fwd or ret_invoked):
+                _mark_unpacked_edge(raw_init, None, unpacked=edge_unpacked, ret_invoked=ret_invoked)
                 _enqueue(raw_init, None, nxt_depth)
             for sub_n in local_names:
                 if val in root_mro and sub_n == root_method_name:
@@ -2114,8 +2439,11 @@ def _inspect_varkw_wrapper(
                 if raw_sub is _UNSET_SLOT or isinstance(raw_sub, property):
                     continue
                 is_sub_unp = ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
-                is_sub_fwd = is_sub_unp or (
-                    ((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs)
+                is_sub_ri = ((via_name, sub_n) in ri_oattrs) if via_name else (sub_n in ri_lattrs)
+                is_sub_fwd = (
+                    is_sub_unp
+                    or is_sub_ri
+                    or (((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs))
                 )
                 if isinstance(raw_sub, type):
                     _consider_val(
@@ -2125,11 +2453,15 @@ def _inspect_varkw_wrapper(
                         nxt_depth,
                         edge_unpacked=is_sub_unp,
                         edge_can_fwd=is_sub_fwd,
+                        ret_invoked=is_sub_ri,
                         via_name=sub_n,
                         unpacked_owner_attrs=unpacked_owner_attrs,
                         unpacked_leaf_attrs=unpacked_leaf_attrs,
                         arg_owner_attrs=arg_owner_attrs,
                         arg_leaf_attrs=arg_leaf_attrs,
+                        ret_invoked_names=ret_invoked_names,
+                        ret_invoked_owner_attrs=ret_invoked_owner_attrs,
+                        ret_invoked_leaf_attrs=ret_invoked_leaf_attrs,
                         is_root_code=is_root_code,
                         visited_types=visited_types,
                     )
@@ -2142,12 +2474,12 @@ def _inspect_varkw_wrapper(
                     sub_fn, sub_own = raw_sub, None
                 if not isinstance(sub_fn, type) and callable(sub_fn):
                     if is_sub_unp or is_sub_fwd:
-                        _mark_unpacked_edge(sub_fn, sub_own, unpacked=is_sub_unp)
+                        _mark_unpacked_edge(sub_fn, sub_own, unpacked=is_sub_unp, ret_invoked=is_sub_ri)
                         _enqueue(sub_fn, sub_own, nxt_depth)
             return
         if callable(val):
-            if edge_unpacked or edge_can_fwd:
-                _mark_unpacked_edge(val, sub_owner, unpacked=edge_unpacked)
+            if edge_unpacked or edge_can_fwd or ret_invoked:
+                _mark_unpacked_edge(val, sub_owner, unpacked=edge_unpacked, ret_invoked=ret_invoked)
                 _enqueue(val, sub_owner, nxt_depth)
             if isinstance(
                 val,
@@ -2166,13 +2498,18 @@ def _inspect_varkw_wrapper(
             ul_attrs = unpacked_leaf_attrs or set()
             ao_attrs = arg_owner_attrs or set()
             al_attrs = arg_leaf_attrs or set()
+            ri_oattrs = ret_invoked_owner_attrs or set()
+            ri_lattrs = ret_invoked_leaf_attrs or set()
             for sub_n in local_names:
                 sub_v = mod_d.get(sub_n)
                 if sub_v is None:
                     continue
                 is_sub_unp = ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
-                is_sub_fwd = is_sub_unp or (
-                    ((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs)
+                is_sub_ri = ((via_name, sub_n) in ri_oattrs) if via_name else (sub_n in ri_lattrs)
+                is_sub_fwd = (
+                    is_sub_unp
+                    or is_sub_ri
+                    or (((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs))
                 )
                 if isinstance(sub_v, type):
                     _consider_val(
@@ -2182,22 +2519,28 @@ def _inspect_varkw_wrapper(
                         nxt_depth,
                         edge_unpacked=is_sub_unp,
                         edge_can_fwd=is_sub_fwd,
+                        ret_invoked=is_sub_ri,
                         via_name=sub_n,
                         unpacked_owner_attrs=unpacked_owner_attrs,
                         unpacked_leaf_attrs=unpacked_leaf_attrs,
                         arg_owner_attrs=arg_owner_attrs,
                         arg_leaf_attrs=arg_leaf_attrs,
+                        ret_invoked_names=ret_invoked_names,
+                        ret_invoked_owner_attrs=ret_invoked_owner_attrs,
+                        ret_invoked_leaf_attrs=ret_invoked_leaf_attrs,
                         is_root_code=is_root_code,
                     )
                 elif callable(sub_v):
                     if is_sub_unp or is_sub_fwd:
-                        _mark_unpacked_edge(sub_v, None, unpacked=is_sub_unp)
+                        _mark_unpacked_edge(sub_v, None, unpacked=is_sub_unp, ret_invoked=is_sub_ri)
                         _enqueue(sub_v, None, nxt_depth)
         elif not isinstance(val, (str, bytes, bytearray, int, float, bool, np.ndarray, Mapping, list, tuple, set, frozenset)):
             uo_attrs = unpacked_owner_attrs or set()
             ul_attrs = unpacked_leaf_attrs or set()
             ao_attrs = arg_owner_attrs or set()
             al_attrs = arg_leaf_attrs or set()
+            ri_oattrs = ret_invoked_owner_attrs or set()
+            ri_lattrs = ret_invoked_leaf_attrs or set()
             for sub_n in local_names:
                 raw_sub = inspect.getattr_static(val, sub_n, _UNSET_SLOT)
                 if raw_sub is _UNSET_SLOT or isinstance(raw_sub, property):
@@ -2208,8 +2551,11 @@ def _inspect_varkw_wrapper(
                     except Exception:
                         continue
                 is_sub_unp = ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
-                is_sub_fwd = is_sub_unp or (
-                    ((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs)
+                is_sub_ri = ((via_name, sub_n) in ri_oattrs) if via_name else (sub_n in ri_lattrs)
+                is_sub_fwd = (
+                    is_sub_unp
+                    or is_sub_ri
+                    or (((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs))
                 )
                 if isinstance(raw_sub, (staticmethod, classmethod)):
                     raw_sub = raw_sub.__func__
@@ -2221,16 +2567,20 @@ def _inspect_varkw_wrapper(
                         nxt_depth,
                         edge_unpacked=is_sub_unp,
                         edge_can_fwd=is_sub_fwd,
+                        ret_invoked=is_sub_ri,
                         via_name=sub_n,
                         unpacked_owner_attrs=unpacked_owner_attrs,
                         unpacked_leaf_attrs=unpacked_leaf_attrs,
                         arg_owner_attrs=arg_owner_attrs,
                         arg_leaf_attrs=arg_leaf_attrs,
+                        ret_invoked_names=ret_invoked_names,
+                        ret_invoked_owner_attrs=ret_invoked_owner_attrs,
+                        ret_invoked_leaf_attrs=ret_invoked_leaf_attrs,
                         is_root_code=is_root_code,
                     )
                 elif callable(raw_sub):
                     if is_sub_unp or is_sub_fwd:
-                        _mark_unpacked_edge(raw_sub, val, unpacked=is_sub_unp)
+                        _mark_unpacked_edge(raw_sub, val, unpacked=is_sub_unp, ret_invoked=is_sub_ri)
                         _enqueue(raw_sub, val, nxt_depth)
 
     while queue and len(visited_call_keys) < max_callables:
@@ -2239,7 +2589,8 @@ def _inspect_varkw_wrapper(
         if unwrapped is None:
             continue
         u_id = id(unwrapped)
-        visit_key = (u_id, id(cur_owner) if cur_owner is not None else 0)
+        is_ret_invoked_ctx = depth >= 1 and u_id in invoked_ret_fn_ids
+        visit_key = (u_id, id(cur_owner) if cur_owner is not None else 0, is_ret_invoked_ctx)
         if visit_key in visited_call_keys:
             continue
         visited_call_keys.add(visit_key)
@@ -2254,12 +2605,14 @@ def _inspect_varkw_wrapper(
             continue
 
         taint_here = _extract_taint_var_names(unwrapped, cur_owner, depth)
-        cache_key_ci = (id(code), taint_here)
+        cache_key_ci = (id(code), taint_here, is_ret_invoked_ctx)
         cached_ci = code_info_cache.get(cache_key_ci)
         if cached_ci is None:
+            cell_owner_by_code = _build_cell_owner_map(code)
+            max_ret_rounds = max(16, min(256, len(cell_owner_by_code) + 8))
             known_code_returns: Dict[int, frozenset[Tuple[str, Any]]] = {}
-            cross_tainted_cells: set[str] = set()
-            for _round_ret in range(8):
+            cross_tainted_cells: set[Tuple[int, str]] = set()
+            for _round_ret in range(max_ret_rounds):
                 prev_kcr = dict(known_code_returns)
                 prev_cells = set(cross_tainted_cells)
                 c_local_names: set[str] = set()
@@ -2269,19 +2622,21 @@ def _inspect_varkw_wrapper(
                 c_a_names: set[str] = set()
                 c_a_oattrs: set[Tuple[str, str]] = set()
                 c_a_lattrs: set[str] = set()
+                c_ri_names: set[str] = set()
+                c_ri_oattrs: set[Tuple[str, str]] = set()
+                c_ri_lattrs: set[str] = set()
                 c_consts: set[str] = set()
                 seen_sub_codes: set[Tuple[int, Optional[frozenset[str]], frozenset[str]]] = set()
                 local_code_defs: Dict[str, types.CodeType] = {}
                 local_code_def_taints: Dict[int, frozenset[str]] = {}
-                all_taint_locals: set[str] = set()
-                all_closure_locals: set[str] = set()
+                round_tainted_cells: set[Tuple[int, str]] = set()
+                round_closure_cells: set[Tuple[int, str]] = set()
                 visited_taint_cids: set[int] = set()
                 peek_candidates: Dict[int, types.CodeType] = {}
-                root_taint = (
-                    (taint_here | (cross_tainted_cells & frozenset(str(cv) for cv in code.co_cellvars)))
-                    if taint_here is not None
-                    else None
+                own_root_cells = frozenset(
+                    str(cv) for cv in code.co_cellvars if (id(code), str(cv)) in cross_tainted_cells
                 )
+                root_taint = (taint_here | own_root_cells) if taint_here is not None else None
                 code_stack: List[Tuple[types.CodeType, Optional[frozenset[str]], frozenset[str]]] = [
                     (code, root_taint, frozenset())
                 ]
@@ -2311,6 +2666,7 @@ def _inspect_varkw_wrapper(
                         clos_locals_c,
                         ret_slot_c,
                         invoked_c,
+                        (ri_n_c, ri_oa_c, ri_la_c),
                     ) = _analyze_code_kw_flow(
                         c,
                         c_taint,
@@ -2321,8 +2677,18 @@ def _inspect_varkw_wrapper(
                     )
                     if ret_slot_c:
                         known_code_returns[id(c)] = known_code_returns.get(id(c), frozenset()) | ret_slot_c
-                    if c.co_freevars:
-                        cross_tainted_cells.update(taint_locals_c & frozenset(str(fv) for fv in c.co_freevars))
+                    sub_map = cell_owner_by_code.get(id(c), {})
+                    for tv in taint_locals_c:
+                        owner_cid = sub_map.get(tv)
+                        if owner_cid is not None:
+                            cell_key = (owner_cid, tv)
+                            round_tainted_cells.add(cell_key)
+                            if tv in c.co_freevars:
+                                cross_tainted_cells.add(cell_key)
+                    for cv_n in clos_locals_c:
+                        owner_cid = sub_map.get(cv_n)
+                        if owner_cid is not None:
+                            round_closure_cells.add((owner_cid, cv_n))
                     for cid_inv, (sub_inv_c, _) in invoked_c.items():
                         peek_candidates[cid_inv] = sub_inv_c
                     c_u_names.update(un_c)
@@ -2331,17 +2697,18 @@ def _inspect_varkw_wrapper(
                     c_a_names.update(an_c)
                     c_a_oattrs.update(ao_c)
                     c_a_lattrs.update(al_c)
+                    c_ri_names.update(ri_n_c)
+                    c_ri_oattrs.update(ri_oa_c)
+                    c_ri_lattrs.update(ri_la_c)
                     c_consts.update(act_consts_c)
                     local_code_defs.update(loc_codes_c)
                     for cid_dt, tp_dt in def_tp_c.items():
                         local_code_def_taints[cid_dt] = (
                             local_code_def_taints.get(cid_dt, frozenset()) | tp_dt
                         )
-                    all_taint_locals.update(taint_locals_c)
-                    all_closure_locals.update(clos_locals_c)
                     all_unp_codes: Dict[int, types.CodeType] = dict(unp_codes_c)
                     all_taint_codes: Dict[int, Tuple[types.CodeType, bool]] = dict(taint_codes_c)
-                    if depth >= 1 and c is code and ret_slot_c:
+                    if depth >= 1 and c is code and u_id in invoked_ret_fn_ids and ret_slot_c:
                         ret_scan_slots: List[frozenset[Tuple[str, Any]]] = [ret_slot_c]
                         for rk_s, rv_s in ret_slot_c:
                             if rk_s == "seq_items" and isinstance(rv_s, tuple):
@@ -2351,12 +2718,25 @@ def _inspect_varkw_wrapper(
                                 if rv_s[2]:
                                     ret_scan_slots.append(rv_s[2])
                                 ret_scan_slots.extend(rv_s[3])
+                            elif rk_s == "ret_elems" and isinstance(rv_s, frozenset):
+                                ret_scan_slots.append(rv_s)
                         for sl_ret in ret_scan_slots:
                             for rk, rv in sl_ret:
                                 if rk == "code" and isinstance(rv, types.CodeType):
                                     all_taint_codes[id(rv)] = (rv, True)
                                     if u_id in sig_param_fn_ids:
                                         all_unp_codes[id(rv)] = rv
+                                elif rk == "call_origin" and isinstance(rv, frozenset):
+                                    for ok, ov in rv:
+                                        if ok == "name":
+                                            c_ri_names.add(ov)
+                                            (c_u_names if u_id in sig_param_fn_ids else c_a_names).add(ov)
+                                        elif ok == "attr":
+                                            c_ri_oattrs.add(ov)
+                                            (c_u_oattrs if u_id in sig_param_fn_ids else c_a_oattrs).add(ov)
+                                        elif ok == "leaf_attr":
+                                            c_ri_lattrs.add(ov)
+                                            (c_u_lattrs if u_id in sig_param_fn_ids else c_a_lattrs).add(ov)
                                 elif u_id in sig_param_fn_ids:
                                     if rk == "name":
                                         c_u_names.add(rv)
@@ -2390,6 +2770,7 @@ def _inspect_varkw_wrapper(
                         for pname in unp_c.co_varnames[pos_only_n:kw_cap_n]:
                             if pname in candidate_keys:
                                 c_consts.add(pname)
+                    active_cells = cross_tainted_cells | round_tainted_cells
                     for sub_c, called_t in all_taint_codes.values():
                         sub_n_p = (
                             sub_c.co_argcount
@@ -2403,19 +2784,42 @@ def _inspect_varkw_wrapper(
                             else frozenset()
                         )
                         def_p = local_code_def_taints.get(id(sub_c), frozenset())
-                        free_t = frozenset(str(fv) for fv in sub_c.co_freevars) & (all_taint_locals | cross_tainted_cells)
-                        free_clos = frozenset(str(fv) for fv in sub_c.co_freevars) & all_closure_locals
-                        next_taint = (sub_p | def_p | free_t) if c_taint is not None else (sub_p | def_p)
+                        sub_child_map = cell_owner_by_code.get(id(sub_c), {})
+                        free_t = frozenset(
+                            str(fv)
+                            for fv in sub_c.co_freevars
+                            if sub_child_map.get(str(fv)) is not None
+                            and (sub_child_map[str(fv)], str(fv)) in active_cells
+                        )
+                        own_cell_t = frozenset(
+                            str(cv)
+                            for cv in sub_c.co_cellvars
+                            if (id(sub_c), str(cv)) in cross_tainted_cells
+                        )
+                        free_clos = frozenset(
+                            str(fv)
+                            for fv in sub_c.co_freevars
+                            if sub_child_map.get(str(fv)) is not None
+                            and (sub_child_map[str(fv)], str(fv)) in round_closure_cells
+                        )
+                        next_taint = (
+                            (sub_p | def_p | free_t | own_cell_t)
+                            if c_taint is not None
+                            else (sub_p | def_p)
+                        )
                         code_stack.append((sub_c, next_taint, free_clos))
                 peek_q = [sc for cid_p, sc in peek_candidates.items() if cid_p not in visited_taint_cids]
                 peek_seen: set[int] = set(visited_taint_cids)
                 peek_outer_defs = dict(local_code_defs)
-                while peek_q and len(peek_seen) < 64:
+                peek_order: List[types.CodeType] = []
+                peek_limit = max(64, max_ret_rounds * 2)
+                while peek_q and len(peek_seen) < peek_limit:
                     p_c = peek_q.pop()
                     pid = id(p_c)
                     if pid in peek_seen:
                         continue
                     peek_seen.add(pid)
+                    peek_order.append(p_c)
                     p_res = _analyze_code_kw_flow(
                         p_c,
                         frozenset(),
@@ -2435,11 +2839,52 @@ def _inspect_varkw_wrapper(
                     for sub_cid, (sub_pc, _) in p_res[15].items():
                         if sub_cid not in peek_seen:
                             peek_q.append(sub_pc)
+                for p_c in reversed(peek_order):
+                    pid = id(p_c)
+                    p_res = _analyze_code_kw_flow(
+                        p_c,
+                        frozenset(),
+                        frozenset(),
+                        frozenset(),
+                        known_code_returns=known_code_returns,
+                        outer_code_defs=peek_outer_defs,
+                    )
+                    for cid_dt, tp_dt in p_res[11].items():
+                        local_code_def_taints[cid_dt] = (
+                            local_code_def_taints.get(cid_dt, frozenset()) | tp_dt
+                        )
+                    p_ret = p_res[14]
+                    if p_ret:
+                        known_code_returns[pid] = known_code_returns.get(pid, frozenset()) | p_ret
                 if known_code_returns == prev_kcr and cross_tainted_cells == prev_cells:
                     break
-            cached_ci = (c_local_names, c_u_names, c_u_oattrs, c_u_lattrs, c_a_names, c_a_oattrs, c_a_lattrs, c_consts)
+            cached_ci = (
+                c_local_names,
+                c_u_names,
+                c_u_oattrs,
+                c_u_lattrs,
+                c_a_names,
+                c_a_oattrs,
+                c_a_lattrs,
+                c_consts,
+                c_ri_names,
+                c_ri_oattrs,
+                c_ri_lattrs,
+            )
             code_info_cache[cache_key_ci] = cached_ci
-        local_names, u_names, u_oattrs, u_lattrs, a_names, a_oattrs, a_lattrs, c_consts = cached_ci
+        (
+            local_names,
+            u_names,
+            u_oattrs,
+            u_lattrs,
+            a_names,
+            a_oattrs,
+            a_lattrs,
+            c_consts,
+            c_ri_names,
+            c_ri_oattrs,
+            c_ri_lattrs,
+        ) = cached_ci
         referenced.update(c_consts)
 
         if depth == 0 and "super" in local_names:
@@ -2451,7 +2896,8 @@ def _inspect_varkw_wrapper(
             for n in local_names:
                 if n in fn_globals:
                     is_unp = n in u_names
-                    is_fwd = is_unp or (n in a_names)
+                    is_ri = n in c_ri_names
+                    is_fwd = is_unp or is_ri or (n in a_names)
                     _consider_val(
                         fn_globals[n],
                         None,
@@ -2459,11 +2905,15 @@ def _inspect_varkw_wrapper(
                         nxt_depth,
                         edge_unpacked=is_unp,
                         edge_can_fwd=is_fwd,
+                        ret_invoked=is_ri,
                         via_name=n,
                         unpacked_owner_attrs=u_oattrs,
                         unpacked_leaf_attrs=u_lattrs,
                         arg_owner_attrs=a_oattrs,
                         arg_leaf_attrs=a_lattrs,
+                        ret_invoked_names=c_ri_names,
+                        ret_invoked_owner_attrs=c_ri_oattrs,
+                        ret_invoked_leaf_attrs=c_ri_lattrs,
                         is_root_code=(depth == 0),
                     )
 
@@ -2484,7 +2934,8 @@ def _inspect_varkw_wrapper(
                 ):
                     continue
                 is_unp = c_name in u_names if c_name else False
-                is_fwd = is_unp or (c_name in a_names if c_name else bool(a_names))
+                is_ri = c_name in c_ri_names if c_name else False
+                is_fwd = is_unp or is_ri or (c_name in a_names if c_name else bool(a_names))
                 _consider_val(
                     val_c,
                     None,
@@ -2492,11 +2943,15 @@ def _inspect_varkw_wrapper(
                     nxt_depth,
                     edge_unpacked=is_unp,
                     edge_can_fwd=is_fwd,
+                    ret_invoked=is_ri,
                     via_name=c_name,
                     unpacked_owner_attrs=u_oattrs,
                     unpacked_leaf_attrs=u_lattrs,
                     arg_owner_attrs=a_oattrs,
                     arg_leaf_attrs=a_lattrs,
+                    ret_invoked_names=c_ri_names,
+                    ret_invoked_owner_attrs=c_ri_oattrs,
+                    ret_invoked_leaf_attrs=c_ri_lattrs,
                     is_root_code=(depth == 0),
                 )
 
@@ -2520,8 +2975,11 @@ def _inspect_varkw_wrapper(
                 else:
                     attr_owner = cur_owner
                 is_unp = ("self", n) in u_oattrs or (None, n) in u_oattrs or n in u_lattrs
-                is_fwd = is_unp or (
-                    ("self", n) in a_oattrs or (None, n) in a_oattrs or n in a_lattrs
+                is_ri = ("self", n) in c_ri_oattrs or (None, n) in c_ri_oattrs or n in c_ri_lattrs
+                is_fwd = (
+                    is_unp
+                    or is_ri
+                    or (("self", n) in a_oattrs or (None, n) in a_oattrs or n in a_lattrs)
                 )
                 _consider_val(
                     raw_attr,
@@ -2530,11 +2988,15 @@ def _inspect_varkw_wrapper(
                     nxt_depth,
                     edge_unpacked=is_unp,
                     edge_can_fwd=is_fwd,
+                    ret_invoked=is_ri,
                     via_name=n,
                     unpacked_owner_attrs=u_oattrs,
                     unpacked_leaf_attrs=u_lattrs,
                     arg_owner_attrs=a_oattrs,
                     arg_leaf_attrs=a_lattrs,
+                    ret_invoked_names=c_ri_names,
+                    ret_invoked_owner_attrs=c_ri_oattrs,
+                    ret_invoked_leaf_attrs=c_ri_lattrs,
                     is_root_code=(depth == 0),
                 )
 

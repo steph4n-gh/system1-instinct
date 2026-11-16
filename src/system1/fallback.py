@@ -298,6 +298,22 @@ class BoundedReviewFallback:
                     "auto_compiled": True,
                     "cutover_state": self.cutover_lifecycle.state,
                 }
+            lc_state_raw = getattr(self.cutover_lifecycle, "state", None)
+            lc_state = str(getattr(lc_state_raw, "value", lc_state_raw))
+            lc_drifted = (
+                bool(getattr(self.cutover_lifecycle, "pending_recalibrate", False))
+                or lc_state == "DRIFT_RECALIBRATE"
+            )
+            if lc_drifted or self.network is getattr(self.cutover_lifecycle, "engine", None):
+                return {
+                    self.action_key: None,
+                    "values": {},
+                    "review": True,
+                    "calls": 1,
+                    "auto_compiled": False,
+                    "cutover_state": lc_state,
+                    "abstention_reason": "drift_recalibrate" if lc_drifted else "cutover_escalate",
+                }
         # Support TeachingSession.decision_details
         if hasattr(self.network, "decision_details") and isinstance(prompt, str):
             details = dict(self.network.decision_details(prompt))
