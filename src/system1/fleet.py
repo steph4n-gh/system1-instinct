@@ -741,7 +741,9 @@ class MultiTenantSkillFleet:
             raise ValueError(
                 f"_raw_source_head b shape {raw_b_arr.shape} != expected {valid_b_shapes}"
             )
-        if not (bool(np.all(np.isfinite(raw_w_arr))) and bool(np.all(np.isfinite(raw_b_arr)))):
+        raw_w_chk_f = raw_w_arr[:1] if is_boolean else raw_w_arr
+        raw_b_chk_f = raw_b_arr[:1] if is_boolean else raw_b_arr
+        if not (bool(np.all(np.isfinite(raw_w_chk_f))) and bool(np.all(np.isfinite(raw_b_chk_f)))):
             raise ValueError("_raw_source_head contains non-finite weights or biases")
 
         w_dtype = np.float64 if raw_w_arr.dtype == np.dtype(np.float64) else np.float32
@@ -944,10 +946,10 @@ class MultiTenantSkillFleet:
             raise ValueError(f"Calibration logit_adjustments for {field_name!r} contain non-finite values")
 
         is_bool_fdef = isinstance(f_def, BooleanField)
-        _coerce_inference_array_f32_or_f64(
+        w_coerced = _coerce_inference_array_f32_or_f64(
             head.weights, f"Field head {field_name!r} weights", active_first_only=is_bool_fdef
         )
-        _coerce_inference_array_f32_or_f64(
+        b_coerced = _coerce_inference_array_f32_or_f64(
             head.biases, f"Field head {field_name!r} biases", active_first_only=is_bool_fdef
         )
 
@@ -955,15 +957,23 @@ class MultiTenantSkillFleet:
         raw_b_in = np.asarray(head.biases)
         w_dtype = np.float64 if raw_w_in.dtype == np.float64 else np.float32
         b_dtype = np.float64 if raw_b_in.dtype == np.float64 else np.float32
-        raw_w_auth = _owned_readonly_array(raw_w_in, dtype=w_dtype)
-        raw_b_auth = _owned_readonly_array(raw_b_in, dtype=b_dtype)
+        w_src = w_coerced if raw_w_in.dtype not in (np.float32, np.float64) else raw_w_in
+        b_src = (
+            b_coerced
+            if (raw_b_in.dtype not in (np.float32, np.float64) and raw_b_in.shape == b_coerced.shape)
+            else raw_b_in
+        )
+        raw_w_auth = _owned_readonly_array(w_src, dtype=w_dtype)
+        raw_b_auth = _owned_readonly_array(b_src, dtype=b_dtype)
         if isinstance(f_def, (BooleanField, ChoiceField)):
             _validate_head_weight_bias_shapes(
                 f_def, raw_w_auth, raw_b_auth, int(resolved.dimension), field_name
             )
         raw_w64 = np.asarray(raw_w_auth, dtype=np.float64)
         raw_b64 = np.asarray(raw_b_auth, dtype=np.float64).reshape(-1)
-        if not (np.all(np.isfinite(raw_w64)) and np.all(np.isfinite(raw_b64))):
+        chk_w64 = raw_w64[:1] if is_bool_fdef else raw_w64
+        chk_b64 = raw_b64[:1] if is_bool_fdef else raw_b64
+        if not (np.all(np.isfinite(chk_w64)) and np.all(np.isfinite(chk_b64))):
             raise ValueError(f"Field head {field_name!r} contains non-finite weights or biases")
 
         is_bool_head = bool(isinstance(f_def, BooleanField) or raw_w64.shape[0] == 1)

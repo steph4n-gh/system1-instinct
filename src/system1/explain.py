@@ -468,7 +468,9 @@ class FastExplainer:
             )
         if b_in.ndim != 1:
             raise ValueError(f"Expected 1D bias vector, got shape {b_in.shape}")
-        if not (bool(np.all(np.isfinite(w_in))) and bool(np.all(np.isfinite(b_in)))):
+        w_in_f64 = np.asarray(w_in, dtype=np.float64)
+        b_in_f64 = np.asarray(b_in, dtype=np.float64)
+        if not (bool(np.all(np.isfinite(w_in_f64))) and bool(np.all(np.isfinite(b_in_f64)))):
             raise ValueError("Head weights and biases must be finite")
         inferred_bool = w_in.ndim == 2 and w_in.shape[0] == 1 and (options is None or len(options) in (0, 2))
         self._is_boolean = bool(inferred_bool if is_boolean is None else is_boolean)

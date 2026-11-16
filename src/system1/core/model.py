@@ -1271,7 +1271,7 @@ def _concat_exemplar_groups_preserving_layout(
 
 def _pack_array_sig(
     arr: Any,
-) -> Optional[Tuple[Tuple[int, ...], str, bool, bytes, Optional[Tuple[int, int, int]]]]:
+) -> Optional[Tuple[Tuple[int, ...], str, bool, Any, Optional[Tuple[int, int, int]]]]:
     """Serialize an array's shape, dtype, 2D Fortran flag, raw bytes, and 2D stride/alignment layout."""
     if arr is None:
         return None
@@ -1282,6 +1282,19 @@ def _pack_array_sig(
         and a.flags["F_CONTIGUOUS"]
         and not a.flags["C_CONTIGUOUS"]
     )
+    if a.dtype == np.object_:
+        seq = a.ravel(order="F") if is_f_2d else a.flat
+        obj_sig_items: List[Tuple[str, Any]] = []
+        for v in seq:
+            if _is_real_scalar_elem(v):
+                try:
+                    encoded_v: Any = _pack_f64_scalar(v)
+                except OverflowError:
+                    encoded_v = repr(v)
+            else:
+                encoded_v = repr(v)
+            obj_sig_items.append((type(v).__qualname__, encoded_v))
+        return (a.shape, str(a.dtype), is_f_2d, tuple(obj_sig_items), _2d_matmul_layout_sig(a))
     raw_bytes = a.tobytes(order="F") if is_f_2d else np.ascontiguousarray(a).tobytes()
     layout_2d = _2d_matmul_layout_sig(a)
     return (a.shape, str(a.dtype), is_f_2d, raw_bytes, layout_2d)
@@ -3302,6 +3315,25 @@ class DecisionFieldHead:
         """Constructs a RawFieldEvaluation from precomputed logits."""
         logits_chk = _assert_real_numeric_array_like(logits, "logits")
         logits = np.asarray(logits_chk, dtype=np.float64).flatten()
+        if isinstance(self.field_def, (ChoiceField, MultiChoiceField)):
+            if logits_chk.ndim == 0 or logits_chk.ndim > 2 or (logits_chk.ndim == 2 and logits_chk.shape[0] != 1):
+                raise ValueError(
+                    f"logits for {self.field_def.name!r} must be a 1D vector, got shape {logits_chk.shape}"
+                )
+            expected_len = len(self.field_def.options)
+            if logits.shape[0] != expected_len:
+                raise ValueError(
+                    f"logits length {logits.shape[0]} for {self.field_def.name!r} does not match expected {expected_len}"
+                )
+        elif isinstance(self.field_def, (BooleanField, ScoreField)):
+            if logits_chk.ndim > 2 or (logits_chk.ndim == 2 and logits_chk.shape[0] != 1):
+                raise ValueError(
+                    f"logits for {self.field_def.name!r} must be a 1D vector, got shape {logits_chk.shape}"
+                )
+            if logits.shape[0] not in (1, 2):
+                raise ValueError(
+                    f"logits length {logits.shape[0]} for {self.field_def.name!r} must be 1 or 2"
+                )
         with np.errstate(over="ignore", invalid="ignore"):
             if isinstance(self.field_def, ChoiceField):
                 scaled_logits = logits / 0.25
@@ -4598,10 +4630,10 @@ class PackedMultiQuestionKernel:
                 temp = _validate_real_scalar(cal.temperature, f"Calibrator temperature for {fname!r}")
                 if not math.isfinite(temp) or temp <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
-                _coerce_inference_array_f32_or_f64(
+                w_coerced = _coerce_inference_array_f32_or_f64(
                     head.weights, f"Choice head {fname!r} weights"
                 )
-                _coerce_inference_array_f32_or_f64(
+                b_coerced = _coerce_inference_array_f32_or_f64(
                     head.biases, f"Choice head {fname!r} biases"
                 )
                 raw_w_arr = np.asarray(head.weights)
@@ -4610,6 +4642,10 @@ class PackedMultiQuestionKernel:
                     raise ValueError(
                         f"Choice head {fname!r} shape mismatch: expected ({K}, {dim}) and ({K},), got {raw_w_arr.shape} and {raw_b_arr.shape}"
                     )
+                if raw_w_arr.dtype not in (np.float32, np.float64):
+                    raw_w_arr = w_coerced
+                if raw_b_arr.dtype not in (np.float32, np.float64):
+                    raw_b_arr = b_coerced
                 if not (np.all(np.isfinite(raw_w_arr)) and np.all(np.isfinite(raw_b_arr))):
                     raise ValueError(f"Choice head weights for {fname!r} contain non-finite values")
                 W = np.asarray(raw_w_arr, dtype=np.float64)
@@ -4671,10 +4707,10 @@ class PackedMultiQuestionKernel:
                 temp = _validate_real_scalar(cal.temperature, f"Calibrator temperature for {fname!r}")
                 if not math.isfinite(temp) or temp <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
-                _coerce_inference_array_f32_or_f64(
+                w_coerced = _coerce_inference_array_f32_or_f64(
                     head.weights, f"Boolean head {fname!r} weights", active_first_only=True
                 )
-                _coerce_inference_array_f32_or_f64(
+                b_coerced = _coerce_inference_array_f32_or_f64(
                     head.biases, f"Boolean head {fname!r} biases", active_first_only=True
                 )
                 raw_w_full = np.asarray(head.weights)
@@ -4689,6 +4725,10 @@ class PackedMultiQuestionKernel:
                     raise ValueError(
                         f"Boolean head {fname!r} shape mismatch: expected ((1|2), {dim}) and (1|K,), got {raw_w_full.shape} and {raw_b_full.shape}"
                     )
+                if raw_w_full.dtype not in (np.float32, np.float64):
+                    raw_w_full = w_coerced
+                if raw_b_full.dtype not in (np.float32, np.float64):
+                    raw_b_full = b_coerced
                 raw_w_arr = raw_w_full[:1]
                 raw_b_arr = raw_b_full[:1]
                 if not (np.all(np.isfinite(raw_w_arr)) and np.all(np.isfinite(raw_b_arr))):
@@ -4758,10 +4798,10 @@ class PackedMultiQuestionKernel:
                         f"Field {fname!r} of type ScoreField does not support logit_adjustments"
                     )
                 temp = max(1e-4, raw_t)
-                _coerce_inference_array_f32_or_f64(
+                w_coerced = _coerce_inference_array_f32_or_f64(
                     head.weights, f"Score head {fname!r} weights", active_first_only=True
                 )
-                _coerce_inference_array_f32_or_f64(
+                b_coerced = _coerce_inference_array_f32_or_f64(
                     head.biases, f"Score head {fname!r} biases", active_first_only=True
                 )
                 raw_w_full = np.asarray(head.weights)
@@ -4776,6 +4816,10 @@ class PackedMultiQuestionKernel:
                     raise ValueError(
                         f"Score head {fname!r} shape mismatch: expected ((1|2), {dim}) and (1|K,), got {raw_w_full.shape} and {raw_b_full.shape}"
                     )
+                if raw_w_full.dtype not in (np.float32, np.float64):
+                    raw_w_full = w_coerced
+                if raw_b_full.dtype not in (np.float32, np.float64):
+                    raw_b_full = b_coerced
                 raw_w_arr = raw_w_full[:1]
                 raw_b_arr = raw_b_full[:1]
                 if not (np.all(np.isfinite(raw_w_arr)) and np.all(np.isfinite(raw_b_arr))):

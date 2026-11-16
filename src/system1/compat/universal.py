@@ -1388,9 +1388,16 @@ class SoftDistillingLifecycle:
         structure_sig: Optional[str] = None,
     ) -> bool:
         with self._lock:
+            had_soft = prompt in self._soft_records_by_prompt
+            prev_soft = self._soft_records_by_prompt.get(prompt)
             if soft_targets:
                 self._soft_records_by_prompt[prompt] = soft_targets
+            had_sc = False
+            prev_sc: Optional[int] = None
+            inc_fks: List[Tuple[str, str, str]] = []
             if structure_sig is not None:
+                had_sc = structure_sig in self._structure_counts
+                prev_sc = self._structure_counts.get(structure_sig)
                 self._structure_counts[structure_sig] = self._structure_counts.get(structure_sig, 0) + 1
                 for fname, f_def in self.lifecycle.schema.fields.items():
                     if fname in lifecycle_values:
@@ -1398,7 +1405,27 @@ class SoftDistillingLifecycle:
                         if is_disc:
                             fk = (structure_sig, fname, canon_v)
                             self._structure_field_counts[fk] = self._structure_field_counts.get(fk, 0) + 1
-            return self.lifecycle.observe_teacher(prompt, lifecycle_values, cache_key=cache_key)
+                            inc_fks.append(fk)
+            try:
+                return self.lifecycle.observe_teacher(prompt, lifecycle_values, cache_key=cache_key)
+            except BaseException:
+                if soft_targets:
+                    if had_soft:
+                        self._soft_records_by_prompt[prompt] = prev_soft  # type: ignore[assignment]
+                    else:
+                        self._soft_records_by_prompt.pop(prompt, None)
+                if structure_sig is not None:
+                    if had_sc:
+                        self._structure_counts[structure_sig] = prev_sc  # type: ignore[assignment]
+                    else:
+                        self._structure_counts.pop(structure_sig, None)
+                    for fk in inc_fks:
+                        cur_c = self._structure_field_counts.get(fk, 0) - 1
+                        if cur_c <= 0:
+                            self._structure_field_counts.pop(fk, None)
+                        else:
+                            self._structure_field_counts[fk] = cur_c
+                raise
 
     def _evaluate_frozen_local_locked(
         self,
@@ -1660,43 +1687,47 @@ class SoftDistillingLifecycle:
                 }
         return answers_out
 
-    def decide_local(
+    def _decide_local_with_tx(
         self,
         prompt: str,
         *,
         freeze: bool = False,
         cache_key: Optional[str] = None,
         structure_sig: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Attempt autonomous local execution when in SELECTIVE_HOT_SWAP."""
+    ) -> Tuple[Optional[Dict[str, Any]], Tuple[Optional[Any], int]]:
+        """Attempt autonomous local execution and return (answers_or_none, rollback_tx_token)."""
         with self._lock:
             if not self.is_cutover:
-                return None
+                return None, (None, 0)
             eff_key = (
                 cache_key
                 if (isinstance(cache_key, str) and cache_key)
                 else _normalize_cache_key(prompt)
             )
             if freeze:
+                f0 = self._frozen_eligible_counter
                 local_vals, res, from_cache = self._evaluate_frozen_local_locked(
                     prompt,
                     cache_key=eff_key,
                     structure_sig=structure_sig,
                 )
+                df = self._frozen_eligible_counter - f0
                 if local_vals is None or (not from_cache and res is None):
-                    return None
+                    return None, (None, df)
                 try:
-                    return self._format_local_answers(local_vals, res, from_cache=from_cache)
+                    return self._format_local_answers(local_vals, res, from_cache=from_cache), (None, df)
                 except InteropError:
-                    return None
+                    if df:
+                        self._frozen_eligible_counter = max(0, self._frozen_eligible_counter - df)
+                    return None, (None, 0)
 
             if (
                 eff_key not in self.lifecycle.clean_cache
                 and not self._has_structure_support_locked(structure_sig)
             ):
-                return None
+                return None, (None, 0)
 
-            local_vals = self.lifecycle.decide_local(
+            local_vals, inner_tx = self.lifecycle._decide_local_with_tx(
                 prompt,
                 cache_key=eff_key,
                 accept_predicate=(
@@ -1706,21 +1737,50 @@ class SoftDistillingLifecycle:
                 ),
             )
             if local_vals is None:
-                return None
+                return None, (inner_tx, 0)
             from_cache = eff_key in self.lifecycle.clean_cache
             if from_cache:
                 res = None
             else:
                 engine = self.lifecycle.engine
                 if engine is None:
-                    self.lifecycle.local_hits = max(0, self.lifecycle.local_hits - 1)
-                    return None
-                res = engine.decide(prompt, record_receipt=False)
+                    self.lifecycle._rollback_local_tx(inner_tx)
+                    return None, (None, 0)
+                try:
+                    res = engine.decide(prompt, record_receipt=False)
+                except BaseException:
+                    self.lifecycle._rollback_local_tx(inner_tx)
+                    raise
             try:
-                return self._format_local_answers(local_vals, res, from_cache=from_cache)
+                return self._format_local_answers(local_vals, res, from_cache=from_cache), (inner_tx, 0)
             except InteropError:
-                self.lifecycle.local_hits = max(0, self.lifecycle.local_hits - 1)
-                return None
+                self.lifecycle._rollback_local_tx(inner_tx)
+                return None, (None, 0)
+
+    def _rollback_local_tx(self, tx: Tuple[Optional[Any], int]) -> None:
+        inner_tx, df = tx
+        if inner_tx is not None:
+            self.lifecycle._rollback_local_tx(inner_tx)
+        if df:
+            with self._lock:
+                self._frozen_eligible_counter = max(0, self._frozen_eligible_counter - df)
+
+    def decide_local(
+        self,
+        prompt: str,
+        *,
+        freeze: bool = False,
+        cache_key: Optional[str] = None,
+        structure_sig: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Attempt autonomous local execution when in SELECTIVE_HOT_SWAP."""
+        answers, _ = self._decide_local_with_tx(
+            prompt,
+            freeze=freeze,
+            cache_key=cache_key,
+            structure_sig=structure_sig,
+        )
+        return answers
 
 
 def format_provider_response(
@@ -2097,6 +2157,30 @@ class UniversalDecisionService:
         if raw_model is not None and not isinstance(raw_model, str):
             raise SchemaValidationError("Request 'model' must be a string")
         wire_format = detect_wire_format(path, payload)
+        local_tx_ref: List[Any] = [None, None]
+        try:
+            return self._process_payload_tx(
+                wire_format=wire_format,
+                payload=payload,
+                slot_hint=slot_hint,
+                freeze_learning=freeze_learning,
+                local_tx_ref=local_tx_ref,
+            )
+        except BaseException:
+            tx_lc, tx_tok = local_tx_ref[0], local_tx_ref[1]
+            if tx_tok is not None and tx_lc is not None and hasattr(tx_lc, "_rollback_local_tx"):
+                tx_lc._rollback_local_tx(tx_tok)
+            raise
+
+    def _process_payload_tx(
+        self,
+        *,
+        wire_format: str,
+        payload: Mapping[str, Any],
+        slot_hint: Optional[str],
+        freeze_learning: Optional[bool],
+        local_tx_ref: List[Any],
+    ) -> Tuple[int, Dict[str, Any]]:
         semantic_text, _ = extract_semantic_text(payload)
         context_view = {
             k: v
@@ -2131,12 +2215,22 @@ class UniversalDecisionService:
 
         force_teacher = bool(payload.get("force_teacher", False))
         if not force_teacher and existing_lc is not None:
-            local_answers = existing_lc.decide_local(
-                semantic_text,
-                freeze=is_frozen,
-                cache_key=req_cache_key,
-                structure_sig=req_struct_sig,
-            )
+            if hasattr(existing_lc, "_decide_local_with_tx"):
+                local_answers, local_tx = existing_lc._decide_local_with_tx(
+                    semantic_text,
+                    freeze=is_frozen,
+                    cache_key=req_cache_key,
+                    structure_sig=req_struct_sig,
+                )
+                local_tx_ref[0] = existing_lc
+                local_tx_ref[1] = local_tx
+            else:
+                local_answers = existing_lc.decide_local(
+                    semantic_text,
+                    freeze=is_frozen,
+                    cache_key=req_cache_key,
+                    structure_sig=req_struct_sig,
+                )
             if local_answers is not None:
                 with self._lock:
                     prev_c_loc = self._last_schema_by_slot.get(slot_key)
@@ -2171,6 +2265,8 @@ class UniversalDecisionService:
                         schema_fingerprint=contract.fingerprint,
                         drift_info=drift_info,
                     )
+                    strict_json_dumps(body)
+                local_tx_ref[1] = None
                 return 200, body
 
         upstream_raw = self._call_upstream(wire_format, payload, semantic_text, contract)
@@ -2216,6 +2312,10 @@ class UniversalDecisionService:
                     self._lifecycles[lc_key] = lc
                 else:
                     self._lifecycles.move_to_end(lc_key)
+            if lc is not existing_lc and local_tx_ref[1] is not None and existing_lc is not None:
+                if hasattr(existing_lc, "_rollback_local_tx"):
+                    existing_lc._rollback_local_tx(local_tx_ref[1])
+                local_tx_ref[1] = None
             try:
                 lc.observe_teacher(
                     semantic_text,
@@ -2237,6 +2337,9 @@ class UniversalDecisionService:
                                 self._lifecycles.pop(lc_key, None)
                     self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
                 raise
+            local_tx_ref[1] = None
+        else:
+            local_tx_ref[1] = None
 
         with self._lock:
             if lc_key in self._lifecycles:

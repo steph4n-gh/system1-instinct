@@ -1576,6 +1576,8 @@ class TypeSafeClient:
         self._compiling_schemas: Set[str] = set()
         self._call_count: Dict[str, int] = collections.defaultdict(int)
         self._teacher_sample_count: Dict[str, int] = collections.defaultdict(int)
+        self._evicted_call_count: int = 0
+        self._evicted_teacher_sample_count: int = 0
         self._history: Dict[str, List[Dict[str, Any]]] = collections.defaultdict(list)
         self._validation_seen_keys: Dict[str, Set[str]] = collections.defaultdict(set)
         self._validation_attempts: Dict[str, int] = collections.defaultdict(int)
@@ -1644,17 +1646,20 @@ class TypeSafeClient:
     @property
     def call_count(self) -> int:
         """Total number of queries evaluated by this client."""
-        return sum(self._call_count.values())
+        with self._engine_lock:
+            return self._evicted_call_count + sum(self._call_count.values())
 
     @property
     def total_requests(self) -> int:
         """Total number of queries evaluated by this client."""
-        return sum(self._call_count.values())
+        with self._engine_lock:
+            return self._evicted_call_count + sum(self._call_count.values())
 
     @property
     def teacher_sample_count(self) -> int:
         """Total number of teacher exemplar samples collected."""
-        return sum(self._teacher_sample_count.values())
+        with self._engine_lock:
+            return self._evicted_teacher_sample_count + sum(self._teacher_sample_count.values())
 
     @property
     def cutover_audit_log(self) -> List[Dict[str, Any]]:
@@ -2315,11 +2320,13 @@ class TypeSafeClient:
 
     @staticmethod
     def _is_lifecycle_promoted(lc: Any) -> bool:
-        if hasattr(lc, "is_cutover"):
-            return bool(lc.is_cutover)
         st = getattr(lc, "state", None)
         if st is not None:
-            return bool(getattr(lc, "compiled_active", False)) and str(st) == "SELECTIVE_HOT_SWAP"
+            st_val = st.value if hasattr(st, "value") else str(st)
+            if st_val != "SELECTIVE_HOT_SWAP":
+                return False
+        if hasattr(lc, "is_cutover"):
+            return bool(lc.is_cutover)
         return bool(getattr(lc, "compiled_active", False))
 
     def _matches_injected_lifecycle_locked(self, schema: DecisionSchema, digest: str) -> bool:
@@ -2340,6 +2347,16 @@ class TypeSafeClient:
             return False
         return self._injected_lc_digest is None or self._injected_lc_digest == digest
 
+    def _retire_evicted_schema_bookkeeping_locked(self, evict_key: str) -> None:
+        if evict_key in self._has_cutover_schemas or evict_key in self._compiling_schemas:
+            return
+        self._evicted_call_count += self._call_count.pop(evict_key, 0)
+        self._evicted_teacher_sample_count += self._teacher_sample_count.pop(evict_key, 0)
+        self._history.pop(evict_key, None)
+        self._validation_seen_keys.pop(evict_key, None)
+        self._validation_attempts.pop(evict_key, None)
+        self._drift_detectors.pop(evict_key, None)
+
     def _enforce_unpromoted_cutover_cap_locked(self, *, reserve_for_new: bool = False) -> None:
         limit = max(0, self.max_unpromoted_lifecycles - (1 if reserve_for_new else 0))
         unpromoted = [
@@ -2350,6 +2367,7 @@ class TypeSafeClient:
         while len(unpromoted) > limit:
             evict_key = unpromoted.pop(0)
             self._cutover_lifecycles.pop(evict_key, None)
+            self._retire_evicted_schema_bookkeeping_locked(evict_key)
 
     def systemone(
         self,
@@ -2416,128 +2434,171 @@ class TypeSafeClient:
                     if existing_lc is not None
                     else (self.auto_cutover_lifecycle if is_injected_lc else None)
                 )
-                if cand_lc is not None and getattr(cand_lc, "state", None) != CutoverState.DRIFT_RECALIBRATE.value:
-                    t_local = time.perf_counter()
-                    local_vals = cand_lc.decide_local(encoded_state)
-                    if local_vals is not None:
-                        latency_ms = (time.perf_counter() - t_local) * 1000.0
-                        local_answers = self._build_answers_from_values(
-                            questions,
-                            local_vals,
-                            schema=schema,
-                        )
-                        with self._engine_lock:
-                            if digest not in self._cutover_lifecycles:
-                                self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
-                            self._cutover_lifecycles[digest] = cand_lc
-                            self._cutover_lifecycles.move_to_end(digest)
-                            if raw_is_injected_lc and cand_lc is self.auto_cutover_lifecycle:
-                                self._injected_lc_digest = digest
-                            self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
-                            self._call_count[digest] += 1
-                        return SystemOneResponse({
-                            "model": model,
-                            "state": state,
-                            "answers": local_answers,
-                            "usage": Usage({
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "total_tokens": 0,
-                            }),
-                            "latency_ms": round(latency_ms, 3),
-                            "local_execution": True,
-                            "egress_bytes": 0,
-                            "conformal_alpha": alpha,
-                            "receipt": None,
-                            "is_ambiguous": False,
-                            "auto_cutover_active": True,
-                            "is_cutover": self._is_lifecycle_promoted(cand_lc),
-                            "cutover_state": cand_lc.state,
-                        })
-
-                if self.baseline_handler is not None:
-                    cloud_resp = TypeSafeResponse(self.baseline_handler(state, questions))
-                    egress_bytes = self._parse_nonneg_egress_bytes(
-                        cloud_resp.get("egress_bytes", 0 if self.zero_egress else 800)
-                    )
-                else:
-                    if self.zero_egress:
-                        raise ZeroEgressViolationError(
-                            "Incompatible configuration: mode='auto_cutover' with zero_egress=True "
-                            "requires a local baseline_handler to provide teacher exemplars without egress."
-                        )
-                    fb = kwargs.get("fallback_baseline", self.fallback_baseline)
-                    cloud_resp, _, egress_bytes = self.call_real_api(
-                        state=state,
-                        questions=questions,
-                        model=model,
-                        timeout=self.timeout,
-                        fallback_baseline=fb,
-                        zero_egress=False,
-                    )
-                    egress_bytes = self._parse_nonneg_egress_bytes(egress_bytes)
-
-                teacher_vals = {}
-                for name, definition in schema.fields.items():
-                    answer = cloud_resp.get("answers", {}).get(name)
-                    value = answer.get("value") if isinstance(answer, Mapping) else answer
-                    if value is None:
-                        raise ValueError(f"Teacher response is missing field {name!r}")
-                    validated = definition.validate_value(_teaching_target(definition, value))
-                    teacher_vals[name] = validated
-
-                created_new_lc = False
-                prev_inj_digest: Optional[str] = None
-                bound_inj_digest = False
-                with self._engine_lock:
-                    lc = self._cutover_lifecycles.get(digest)
-                    if lc is None:
-                        created_new_lc = True
-                        self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
-                        is_injected_lc = raw_is_injected_lc and self._matches_injected_lifecycle_locked(
-                            schema, digest
-                        )
-                        if is_injected_lc:
-                            lc = self.auto_cutover_lifecycle
-                            prev_inj_digest = self._injected_lc_digest
-                            self._injected_lc_digest = digest
-                            bound_inj_digest = True
-                        else:
-                            lc_cfg = (
-                                self.auto_cutover_lifecycle
-                                if isinstance(self.auto_cutover_lifecycle, CutoverConfig)
-                                else getattr(self.auto_cutover_lifecycle, "config", None)
-                            )
-                            lc_cfg = lc_cfg if isinstance(lc_cfg, CutoverConfig) else None
-                            lc = AutoCutoverLifecycle(schema, teacher=None, config=lc_cfg)
-                        self._cutover_lifecycles[digest] = lc
-                    else:
-                        self._cutover_lifecycles.move_to_end(digest)
-
+                used_injected_cand = raw_is_injected_lc and cand_lc is self.auto_cutover_lifecycle
+                local_tx: Optional[Any] = None
                 try:
-                    lc.observe_teacher(encoded_state, teacher_vals)
-                except BaseException:
+                    if cand_lc is not None and getattr(cand_lc, "state", None) != CutoverState.DRIFT_RECALIBRATE.value:
+                        t_local = time.perf_counter()
+                        if hasattr(cand_lc, "_decide_local_with_tx"):
+                            local_vals, local_tx = cand_lc._decide_local_with_tx(encoded_state)
+                        else:
+                            local_vals = cand_lc.decide_local(encoded_state)
+                        if local_vals is not None:
+                            latency_ms = (time.perf_counter() - t_local) * 1000.0
+                            try:
+                                local_answers = self._build_answers_from_values(
+                                    questions,
+                                    local_vals,
+                                    schema=schema,
+                                )
+                            except Exception:
+                                lost_race = False
+                                if used_injected_cand:
+                                    with self._engine_lock:
+                                        lost_race = not self._matches_injected_lifecycle_locked(schema, digest)
+                                if not lost_race:
+                                    raise
+                                if local_tx is not None and hasattr(cand_lc, "_rollback_local_tx"):
+                                    cand_lc._rollback_local_tx(local_tx)
+                                    local_tx = None
+                                local_answers = None
+                            if local_answers is not None:
+                                commit_local = True
+                                with self._engine_lock:
+                                    if used_injected_cand:
+                                        if not self._matches_injected_lifecycle_locked(schema, digest):
+                                            commit_local = False
+                                        else:
+                                            self._injected_lc_digest = digest
+                                    if commit_local:
+                                        if digest not in self._cutover_lifecycles:
+                                            self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
+                                        self._cutover_lifecycles[digest] = cand_lc
+                                        self._cutover_lifecycles.move_to_end(digest)
+                                        self._call_count[digest] += 1
+                                        self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
+                                        if digest not in self._cutover_lifecycles:
+                                            self._retire_evicted_schema_bookkeeping_locked(digest)
+                                if commit_local:
+                                    local_tx = None
+                                    return SystemOneResponse({
+                                        "model": model,
+                                        "state": state,
+                                        "answers": local_answers,
+                                        "usage": Usage({
+                                            "input_tokens": 0,
+                                            "output_tokens": 0,
+                                            "total_tokens": 0,
+                                        }),
+                                        "latency_ms": round(latency_ms, 3),
+                                        "local_execution": True,
+                                        "egress_bytes": 0,
+                                        "conformal_alpha": alpha,
+                                        "receipt": None,
+                                        "is_ambiguous": False,
+                                        "auto_cutover_active": True,
+                                        "is_cutover": self._is_lifecycle_promoted(cand_lc),
+                                        "cutover_state": cand_lc.state,
+                                    })
+                                if local_tx is not None and hasattr(cand_lc, "_rollback_local_tx"):
+                                    cand_lc._rollback_local_tx(local_tx)
+                                    local_tx = None
+
+                    if self.baseline_handler is not None:
+                        cloud_resp = TypeSafeResponse(self.baseline_handler(state, questions))
+                        egress_bytes = self._parse_nonneg_egress_bytes(
+                            cloud_resp.get("egress_bytes", 0 if self.zero_egress else 800)
+                        )
+                    else:
+                        if self.zero_egress:
+                            raise ZeroEgressViolationError(
+                                "Incompatible configuration: mode='auto_cutover' with zero_egress=True "
+                                "requires a local baseline_handler to provide teacher exemplars without egress."
+                            )
+                        fb = kwargs.get("fallback_baseline", self.fallback_baseline)
+                        cloud_resp, _, egress_bytes = self.call_real_api(
+                            state=state,
+                            questions=questions,
+                            model=model,
+                            timeout=self.timeout,
+                            fallback_baseline=fb,
+                            zero_egress=False,
+                        )
+                        egress_bytes = self._parse_nonneg_egress_bytes(egress_bytes)
+
+                    teacher_vals = {}
+                    for name, definition in schema.fields.items():
+                        answer = cloud_resp.get("answers", {}).get(name)
+                        value = answer.get("value") if isinstance(answer, Mapping) else answer
+                        if value is None:
+                            raise ValueError(f"Teacher response is missing field {name!r}")
+                        validated = definition.validate_value(_teaching_target(definition, value))
+                        teacher_vals[name] = validated
+
+                    created_new_lc = False
+                    prev_inj_digest: Optional[str] = None
+                    bound_inj_digest = False
                     with self._engine_lock:
-                        if created_new_lc and (
-                            not getattr(lc, "admitted_keys", ())
-                            and not getattr(lc, "quarantine", ())
-                            and not getattr(lc, "teacher_key_labels", {})
-                        ):
-                            if self._cutover_lifecycles.get(digest) is lc:
-                                self._cutover_lifecycles.pop(digest, None)
-                            if bound_inj_digest:
-                                self._injected_lc_digest = prev_inj_digest
+                        lc = self._cutover_lifecycles.get(digest)
+                        if lc is None:
+                            created_new_lc = True
+                            self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
+                            is_injected_lc = raw_is_injected_lc and self._matches_injected_lifecycle_locked(
+                                schema, digest
+                            )
+                            if is_injected_lc:
+                                lc = self.auto_cutover_lifecycle
+                                prev_inj_digest = self._injected_lc_digest
+                                self._injected_lc_digest = digest
+                                bound_inj_digest = True
+                            else:
+                                lc_cfg = (
+                                    self.auto_cutover_lifecycle
+                                    if isinstance(self.auto_cutover_lifecycle, CutoverConfig)
+                                    else getattr(self.auto_cutover_lifecycle, "config", None)
+                                )
+                                lc_cfg = lc_cfg if isinstance(lc_cfg, CutoverConfig) else None
+                                lc = AutoCutoverLifecycle(schema, teacher=None, config=lc_cfg)
+                            self._cutover_lifecycles[digest] = lc
+                        else:
+                            self._cutover_lifecycles.move_to_end(digest)
+
+                    if lc is not cand_lc and local_tx is not None and cand_lc is not None:
+                        if hasattr(cand_lc, "_rollback_local_tx"):
+                            cand_lc._rollback_local_tx(local_tx)
+                        local_tx = None
+
+                    try:
+                        lc.observe_teacher(encoded_state, teacher_vals)
+                    except BaseException:
+                        with self._engine_lock:
+                            if created_new_lc and (
+                                not getattr(lc, "admitted_keys", ())
+                                and not getattr(lc, "quarantine", ())
+                                and not getattr(lc, "teacher_key_labels", {})
+                            ):
+                                if self._cutover_lifecycles.get(digest) is lc:
+                                    self._cutover_lifecycles.pop(digest, None)
+                                if bound_inj_digest:
+                                    self._injected_lc_digest = prev_inj_digest
+                            self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
+                        raise
+                    local_tx = None
+                    with self._engine_lock:
+                        self._call_count[digest] += 1
+                        self._teacher_sample_count[digest] += 1
                         self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
+                        if digest not in self._cutover_lifecycles:
+                            self._retire_evicted_schema_bookkeeping_locked(digest)
+                    cloud_resp["auto_cutover_active"] = True
+                    cloud_resp["is_cutover"] = self._is_lifecycle_promoted(lc)
+                    cloud_resp["cutover_state"] = lc.state
+                    cloud_resp["egress_bytes"] = egress_bytes
+                    return cloud_resp
+                except BaseException:
+                    if local_tx is not None and cand_lc is not None and hasattr(cand_lc, "_rollback_local_tx"):
+                        cand_lc._rollback_local_tx(local_tx)
                     raise
-                with self._engine_lock:
-                    self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
-                    self._call_count[digest] += 1
-                    self._teacher_sample_count[digest] += 1
-                cloud_resp["auto_cutover_active"] = True
-                cloud_resp["is_cutover"] = self._is_lifecycle_promoted(lc)
-                cloud_resp["cutover_state"] = lc.state
-                cloud_resp["egress_bytes"] = egress_bytes
-                return cloud_resp
 
             with self._engine_lock:
                 already_cutover = self._has_cutover or (digest in self._has_cutover_schemas)
@@ -2587,7 +2648,11 @@ class TypeSafeClient:
                         "answers": answers,
                         "timestamp": time.time(),
                     }
-                    self._history[digest].append(sample_record)
+                    hist_entries = self._history.pop(digest, None)
+                    if hist_entries is None:
+                        hist_entries = []
+                    hist_entries.append(sample_record)
+                    self._history[digest] = hist_entries
 
                     if self.ledger is not None:
                         try:
@@ -2610,6 +2675,13 @@ class TypeSafeClient:
 
                     current_cutover = self._has_cutover or (digest in self._has_cutover_schemas)
                     currently_compiling = digest in self._compiling_schemas
+                    unprom_hist = [
+                        k
+                        for k in self._history
+                        if k not in self._has_cutover_schemas and k not in self._compiling_schemas
+                    ]
+                    while len(unprom_hist) > self.max_unpromoted_lifecycles:
+                        self._retire_evicted_schema_bookkeeping_locked(unprom_hist.pop(0))
 
                 cloud_resp["auto_cutover_active"] = True
                 cloud_resp["is_cutover"] = current_cutover

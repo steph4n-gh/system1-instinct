@@ -975,6 +975,52 @@ class AutoCutoverLifecycle:
 
         return False, None, margin, False, False
 
+    def _decide_local_with_tx(
+        self,
+        prompt: str,
+        *,
+        cache_key: Optional[str] = None,
+        accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Tuple[int, int, int, str, bool, Any, Any]]:
+        """Attempt local decision and return (values_or_none, rollback_tx_token)."""
+        with self._lock:
+            self._maybe_micro_compile_locked()
+            key = _resolve_cache_key(prompt, cache_key)
+            e0 = self.local_accept_eligible
+            had_pend = key in self._pending_canaries
+            prev_pend = self._pending_canaries.get(key)
+            accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(
+                prompt,
+                cache_key=key,
+                accept_predicate=accept_predicate,
+            )
+            de = self.local_accept_eligible - e0
+            if accepted and vals is not None:
+                self.step_count += 1
+                self.local_hits += 1
+                return vals, (de, 1, 1, key, had_pend, prev_pend, None)
+            added_pend: Any = None
+            if is_canary and vals is not None:
+                added_pend = (vals, margin, from_cache)
+                self._pending_canaries[key] = added_pend
+            return None, (de, 0, 0, key, had_pend, prev_pend, added_pend)
+
+    def _rollback_local_tx(self, tx: Tuple[int, int, int, str, bool, Any, Any]) -> None:
+        """Roll back local_accept_eligible, counters, and pending canary state from a failed request."""
+        de, ds, dh, key, had_pend, prev_pend, added_pend = tx
+        with self._lock:
+            if de:
+                self.local_accept_eligible = max(0, self.local_accept_eligible - de)
+            if ds:
+                self.step_count = max(0, self.step_count - ds)
+            if dh:
+                self.local_hits = max(0, self.local_hits - dh)
+            if added_pend is not None and self._pending_canaries.get(key) is added_pend:
+                if had_pend:
+                    self._pending_canaries[key] = prev_pend
+                else:
+                    self._pending_canaries.pop(key, None)
+
     def decide_local(
         self,
         prompt: str,
@@ -983,21 +1029,12 @@ class AutoCutoverLifecycle:
         accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Return validated local decision values when safe, or None to escalate/canary."""
-        with self._lock:
-            self._maybe_micro_compile_locked()
-            key = _resolve_cache_key(prompt, cache_key)
-            accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(
-                prompt,
-                cache_key=key,
-                accept_predicate=accept_predicate,
-            )
-            if accepted and vals is not None:
-                self.step_count += 1
-                self.local_hits += 1
-                return vals
-            if is_canary and vals is not None:
-                self._pending_canaries[key] = (vals, margin, from_cache)
-            return None
+        vals, _ = self._decide_local_with_tx(
+            prompt,
+            cache_key=cache_key,
+            accept_predicate=accept_predicate,
+        )
+        return vals
 
     def observe_teacher(
         self,

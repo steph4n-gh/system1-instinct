@@ -8,6 +8,7 @@ and ActionLedger audit integration.
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import inspect
 import json
@@ -228,11 +229,47 @@ def _snapshot_duck_graph(
                 cp.setflags(write=False)
         if container_snaps is not None:
             container_snaps.append(("ndarray", val, cp, bool(val.flags.writeable)))
+        if val.dtype == np.object_:
+            for elem in val.flat:
+                _snapshot_duck_graph(
+                    elem,
+                    seen_ids,
+                    state_snaps,
+                    dict_snaps,
+                    slot_snaps,
+                    memo,
+                    skip_ids,
+                    container_snaps,
+                )
+        if type(val) is not np.ndarray:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
         return val
     if isinstance(val, bytearray):
         memo[obj_id] = val
         if container_snaps is not None:
             container_snaps.append(("bytearray", val, bytes(val)))
+        if type(val) is not bytearray:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
         return val
     if isinstance(val, dict):
         memo[obj_id] = val
@@ -264,7 +301,7 @@ def _snapshot_duck_graph(
         ]
         if container_snaps is not None:
             container_snaps.append(("dict", val, items_snap, has_df, df_snap))
-        if type(val) not in (dict, OrderedDict, defaultdict):
+        if type(val) is not dict:
             _snapshot_obj_dict_and_slots(
                 val,
                 obj_id,
@@ -352,7 +389,7 @@ def _snapshot_duck_graph(
             _snapshot_duck_graph(
                 x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
             )
-        if type(val) not in (tuple, frozenset) and not hasattr(val, "_fields"):
+        if type(val) not in (tuple, frozenset):
             _snapshot_obj_dict_and_slots(
                 val,
                 obj_id,
@@ -386,29 +423,55 @@ def _snapshot_duck_graph(
     return val
 
 
+def _ndarray_state_equal(a: np.ndarray, b: np.ndarray) -> bool:
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    if a.dtype.kind in ("f", "c"):
+        return bool(np.array_equal(a, b, equal_nan=True))
+    if a.dtype == np.object_:
+        for x, y in zip(a.flat, b.flat):
+            if x is y:
+                continue
+            if (
+                isinstance(x, float)
+                and isinstance(y, float)
+                and math.isnan(x)
+                and math.isnan(y)
+            ):
+                continue
+            try:
+                if not bool(x == y):
+                    return False
+            except Exception:
+                return False
+        return True
+    return bool(np.array_equal(a, b))
+
+
 def _restore_duck_containers(container_snaps: Sequence[Tuple[Any, ...]]) -> None:
     for entry in container_snaps:
         kind = entry[0]
         if kind == "ndarray":
             _, arr, cp, orig_w = entry
-            if arr.shape == cp.shape and arr.dtype == cp.dtype:
-                if orig_w:
+            if arr.dtype != cp.dtype:
+                continue
+            needs_copy = (arr.shape != cp.shape) or bool(orig_w) or (not _ndarray_state_equal(arr, cp))
+            if needs_copy:
+                try:
                     if not arr.flags.writeable:
                         arr.setflags(write=True)
+                    if arr.shape != cp.shape:
+                        arr.resize(cp.shape, refcheck=False)
                     np.copyto(arr, cp)
-                else:
-                    if not np.array_equal(arr, cp, equal_nan=True):
-                        try:
-                            arr.setflags(write=True)
-                            np.copyto(arr, cp)
-                            arr.setflags(write=False)
-                        except ValueError:
-                            pass
-                    elif arr.flags.writeable:
-                        try:
-                            arr.setflags(write=False)
-                        except ValueError:
-                            pass
+                    if not orig_w and arr.flags.writeable:
+                        arr.setflags(write=False)
+                except (ValueError, BufferError):
+                    pass
+            elif not orig_w and arr.flags.writeable:
+                try:
+                    arr.setflags(write=False)
+                except (ValueError, BufferError):
+                    pass
         elif kind == "bytearray":
             _, ba, raw_b = entry
             ba[:] = raw_b
@@ -457,51 +520,160 @@ def _clone_head_attr_value(val: Any) -> Any:
 def _inspect_varkw_wrapper(
     fn_obj: Any,
     candidate_keys: frozenset[str],
+    owner_self: Any = None,
 ) -> Tuple[set[str], bool]:
     """Return (referenced_candidate_keys, calls_super) for a **kwargs callable."""
-    unwrapped = inspect.unwrap(fn_obj)
-    code = getattr(unwrapped, "__code__", None)
-    if not isinstance(code, types.CodeType):
-        return set(), False
-
     referenced: set[str] = set()
-    all_names: set[str] = set()
-    stack: List[types.CodeType] = [code]
+
+    def _collect_const_strings(val: Any, depth: int = 0) -> None:
+        if isinstance(val, str):
+            if val in candidate_keys:
+                referenced.add(val)
+            return
+        if depth >= 3:
+            return
+        if isinstance(val, (tuple, list, set, frozenset)):
+            for item in val:
+                _collect_const_strings(item, depth + 1)
+        elif isinstance(val, Mapping):
+            for k_item, v_item in val.items():
+                _collect_const_strings(k_item, depth + 1)
+                _collect_const_strings(v_item, depth + 1)
+
+    def _unwrap_callable_and_owner(obj: Any, default_owner: Any) -> Tuple[Optional[Any], Any]:
+        cur = obj
+        cur_owner = default_owner
+        while isinstance(cur, functools.partial):
+            if cur.keywords:
+                for pk in cur.keywords:
+                    if pk in candidate_keys:
+                        referenced.add(pk)
+            cur = cur.func
+        if isinstance(cur, (staticmethod, classmethod)):
+            cur = cur.__func__
+        elif hasattr(cur, "__func__") and hasattr(cur, "__self__"):
+            cur_owner = cur.__self__
+            cur = cur.__func__
+        try:
+            cur = inspect.unwrap(cur)
+        except Exception:
+            pass
+        if not isinstance(getattr(cur, "__code__", None), types.CodeType) and callable(cur) and not isinstance(cur, type):
+            call_attr = inspect.getattr_static(type(cur), "__call__", None)
+            if isinstance(call_attr, (staticmethod, classmethod)):
+                call_attr = call_attr.__func__
+            if callable(call_attr):
+                cur_owner = cur
+                cur = call_attr
+        return cur, cur_owner
+
+    root_owner = getattr(fn_obj, "__self__", None) if owner_self is None else owner_self
+    root_calls_super = False
+    max_depth = 6
+    max_callables = 64
+    queue: deque[Tuple[Any, Any, int]] = deque([(fn_obj, root_owner, 0)])
+    visited_fn_ids: set[int] = set()
     seen_codes: set[int] = set()
-    while stack:
-        c = stack.pop()
-        cid = id(c)
-        if cid in seen_codes:
+
+    def _enqueue(cand: Any, sub_owner: Any, nxt_depth: int) -> None:
+        if cand is None or nxt_depth > max_depth or len(visited_fn_ids) >= max_callables:
+            return
+        if isinstance(cand, type) or not callable(cand):
+            return
+        queue.append((cand, getattr(cand, "__self__", sub_owner), nxt_depth))
+
+    def _consider_val(val: Any, sub_owner: Any, local_names: set[str], nxt_depth: int) -> None:
+        _collect_const_strings(val)
+        if nxt_depth > max_depth or len(visited_fn_ids) >= max_callables or val is None:
+            return
+        if isinstance(val, type):
+            return
+        if callable(val):
+            _enqueue(val, sub_owner, nxt_depth)
+        elif isinstance(val, types.ModuleType):
+            mod_d = val.__dict__
+            for sub_n in local_names:
+                sub_v = mod_d.get(sub_n)
+                if sub_v is not None and not isinstance(sub_v, type) and callable(sub_v):
+                    _enqueue(sub_v, None, nxt_depth)
+        elif not isinstance(val, (str, bytes, bytearray, int, float, bool, np.ndarray, Mapping, list, tuple, set, frozenset)):
+            for sub_n in local_names:
+                raw_sub = inspect.getattr_static(val, sub_n, _UNSET_SLOT)
+                if raw_sub is _UNSET_SLOT or isinstance(raw_sub, property):
+                    continue
+                if isinstance(raw_sub, (staticmethod, classmethod)):
+                    raw_sub = raw_sub.__func__
+                if not isinstance(raw_sub, type) and callable(raw_sub):
+                    _enqueue(raw_sub, val, nxt_depth)
+
+    while queue and len(visited_fn_ids) < max_callables:
+        cand_fn, cur_owner, depth = queue.popleft()
+        unwrapped, cur_owner = _unwrap_callable_and_owner(cand_fn, cur_owner)
+        if unwrapped is None or id(unwrapped) in visited_fn_ids:
             continue
-        seen_codes.add(cid)
-        all_names.update(c.co_names)
-        all_names.update(c.co_freevars)
-        for const in c.co_consts:
-            if isinstance(const, str):
-                if const in candidate_keys:
-                    referenced.add(const)
-            elif isinstance(const, types.CodeType):
-                stack.append(const)
+        visited_fn_ids.add(id(unwrapped))
 
-    fn_globals = getattr(unwrapped, "__globals__", None)
-    if isinstance(fn_globals, Mapping):
-        for n in all_names:
-            val_g = fn_globals.get(n)
-            if isinstance(val_g, str) and val_g in candidate_keys:
-                referenced.add(val_g)
-
-    fn_closure = getattr(unwrapped, "__closure__", None)
-    if fn_closure:
-        for cell in fn_closure:
+        if depth > 0:
             try:
-                val_c = cell.cell_contents
-            except ValueError:
-                continue
-            if isinstance(val_c, str) and val_c in candidate_keys:
-                referenced.add(val_c)
+                sub_sig = inspect.signature(unwrapped)
+                for p_name, p_obj in sub_sig.parameters.items():
+                    if (
+                        p_obj.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                        and p_name in candidate_keys
+                    ):
+                        referenced.add(p_name)
+            except (TypeError, ValueError):
+                pass
 
-    calls_super = "super" in all_names
-    return referenced, calls_super
+        code = getattr(unwrapped, "__code__", None)
+        if not isinstance(code, types.CodeType):
+            continue
+
+        local_names: set[str] = set()
+        code_stack: List[types.CodeType] = [code]
+        while code_stack:
+            c = code_stack.pop()
+            cid = id(c)
+            if cid in seen_codes:
+                continue
+            seen_codes.add(cid)
+            local_names.update(c.co_names)
+            local_names.update(c.co_freevars)
+            for const in c.co_consts:
+                if isinstance(const, types.CodeType):
+                    code_stack.append(const)
+                else:
+                    _collect_const_strings(const)
+
+        if depth == 0 and "super" in local_names:
+            root_calls_super = True
+
+        nxt_depth = depth + 1
+        fn_globals = getattr(unwrapped, "__globals__", None)
+        if isinstance(fn_globals, Mapping):
+            for n in local_names:
+                if n in fn_globals:
+                    _consider_val(fn_globals[n], None, local_names, nxt_depth)
+
+        fn_closure = getattr(unwrapped, "__closure__", None)
+        if fn_closure:
+            for cell in fn_closure:
+                try:
+                    val_c = cell.cell_contents
+                except ValueError:
+                    continue
+                _consider_val(val_c, None, local_names, nxt_depth)
+
+        if cur_owner is not None:
+            for n in local_names:
+                raw_attr = inspect.getattr_static(cur_owner, n, _UNSET_SLOT)
+                if raw_attr is _UNSET_SLOT or isinstance(raw_attr, property):
+                    continue
+                if isinstance(raw_attr, (staticmethod, classmethod)):
+                    raw_attr = raw_attr.__func__
+                _consider_val(raw_attr, cur_owner, local_names, nxt_depth)
+
+    return referenced, root_calls_super
 
 
 def _resolve_supported_kwargs(
@@ -550,7 +722,7 @@ def _resolve_supported_kwargs(
                 if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in base_params.values()):
                     has_var_kw = False
                     break
-                sub_refs, sub_super = _inspect_varkw_wrapper(target_fn, cand_key_set)
+                sub_refs, sub_super = _inspect_varkw_wrapper(target_fn, cand_key_set, owner_self=owner_self)
                 explicit_names.update(sub_refs)
                 if not sub_super:
                     has_var_kw = True
@@ -3923,11 +4095,14 @@ class SystemOneEngine:
                 _restore_duck_containers(model_container_snaps)
                 for slot_obj, slot_vals in model_slot_snaps:
                     for s_name, s_val in slot_vals:
-                        if s_val is _UNSET_SLOT:
-                            if hasattr(slot_obj, s_name):
-                                delattr(slot_obj, s_name)
-                        else:
-                            setattr(slot_obj, s_name, s_val)
+                        try:
+                            if s_val is _UNSET_SLOT:
+                                if hasattr(slot_obj, s_name):
+                                    delattr(slot_obj, s_name)
+                            else:
+                                setattr(slot_obj, s_name, s_val)
+                        except Exception:
+                            pass
                 for attr_name, existed, orig_map, orig_items in head_map_snaps:
                     if existed:
                         if orig_items is not None and isinstance(orig_map, dict):
@@ -3945,9 +4120,15 @@ class SystemOneEngine:
                 if orig_duck_model_keys is not None and duck_model_extra_snap is not None:
                     for mk in list(model.__dict__):
                         if mk not in orig_duck_model_keys:
-                            delattr(model, mk)
+                            try:
+                                delattr(model, mk)
+                            except Exception:
+                                pass
                     for mk, mv in duck_model_extra_snap.items():
-                        setattr(model, mk, mv)
+                        try:
+                            setattr(model, mk, mv)
+                        except Exception:
+                            pass
                 if has_model_ver:
                     model.model_version = prev_model_ver
                 if has_m_ov and m_ov_snap is not None:
