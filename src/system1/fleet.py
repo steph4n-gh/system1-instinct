@@ -17,13 +17,14 @@ import numpy as np
 
 from system1.core.model import (
     _2d_matmul_layout_sig,
-    _MAX_STRIDED_CLONE_SPAN_BYTES,
     _accepts_recency_weighted,
     _encode_projector_batch,
     _encode_projector_one,
     _model_zero_unit0,
     _normalize_raw_projection,
     _owned_readonly_array,
+    _reconstruct_2d_layout_array,
+    _validate_head_weight_bias_shapes,
 )
 from system1.core.schema import BooleanField, ChoiceField
 from system1.core.text import PragmaticCompositeProjector, TfidfProjector
@@ -80,57 +81,6 @@ _FLEET_ALLOWED_ARCHIVE_MEMBERS = _FLEET_REQUIRED_ARRAYS | frozenset(
 )
 
 
-def _reconstruct_2d_layout_array(
-    arr: np.ndarray,
-    layout_vec: Any,
-    *,
-    max_extra_bytes: Optional[int] = None,
-) -> np.ndarray:
-    """Restore exact 2D byte strides and mod-64 alignment for a validated snapshot matrix."""
-    src = np.asarray(arr)
-    lv = np.asarray(layout_vec)
-    if lv.dtype != np.dtype(np.int64) or lv.shape != (3,):
-        raise ValueError(f"Invalid snapshot raw_W_layout spec: dtype={lv.dtype}, shape={lv.shape}")
-    mod64 = int(lv[0])
-    s0 = int(lv[1])
-    s1 = int(lv[2])
-    if not (0 <= mod64 < 64) or src.ndim != 2 or src.size == 0:
-        raise ValueError(f"Invalid snapshot raw_W_layout parameters: mod64={mod64}, shape={src.shape}")
-    K, D = int(src.shape[0]), int(src.shape[1])
-    itemsize = int(src.dtype.itemsize)
-    if itemsize <= 0 or (s0 % itemsize) != 0 or (s1 % itemsize) != 0:
-        raise ValueError(f"Incompatible raw_W_layout strides ({s0}, {s1}) for itemsize {itemsize}")
-    if (K == 1 and s0 != 0) or (D == 1 and s1 != 0):
-        raise ValueError(f"Invalid singleton stride in raw_W_layout: shape={src.shape}, strides=({s0}, {s1})")
-    min_off = min(0, (K - 1) * s0) + min(0, (D - 1) * s1)
-    max_off = max(0, (K - 1) * s0) + max(0, (D - 1) * s1)
-    span_bytes = (max_off - min_off) + itemsize
-    max_allowed_span = min(_MAX_STRIDED_CLONE_SPAN_BYTES, max(1 << 20, 64 * int(src.nbytes)))
-    if span_bytes <= 0 or span_bytes < int(src.nbytes) or span_bytes > max_allowed_span:
-        raise ValueError(f"Snapshot raw_W_layout span {span_bytes} exceeds limit {max_allowed_span}")
-    extra_bytes = span_bytes - int(src.nbytes)
-    if max_extra_bytes is not None and extra_bytes > int(max_extra_bytes):
-        raise ValueError(
-            f"Snapshot raw_W_layout extra span {extra_bytes} exceeds runtime budget margin {int(max_extra_bytes)}"
-        )
-    a0, a1 = abs(s0), abs(s1)
-    aliased = (K > 1 and a0 == 0) or (D > 1 and a1 == 0)
-    if not aliased and K > 1 and D > 1:
-        g = math.gcd(a0, a1)
-        aliased = (a1 // g) < K and (a0 // g) < D
-    if aliased:
-        raise ValueError("Snapshot raw_W_layout aliases weight elements")
-    raw_buf = np.zeros(span_bytes + 128, dtype=np.uint8)
-    base_start = -min_off
-    cur_mod = (int(raw_buf.ctypes.data) + base_start) % 64
-    origin = base_start + ((mod64 - cur_mod) % 64)
-    anchor = raw_buf[origin : origin + itemsize].view(src.dtype)
-    out = np.lib.stride_tricks.as_strided(anchor, shape=(K, D), strides=(s0, s1), writeable=True)
-    np.copyto(out, src)
-    if not np.array_equal(out, src):
-        raise ValueError("Snapshot raw_W_layout aliases distinct weight elements")
-    out.setflags(write=False)
-    return out
 _U_CAP_F16 = float(
     np.nextafter(
         np.float16(-math.log(1.0 - float(np.nextafter(np.float16(1.0), np.float16(0.0))))),
@@ -767,9 +717,10 @@ class MultiTenantSkillFleet:
             raise ValueError(
                 f"_raw_source_head W shape {raw_w_arr.shape} != expected ({allowed_rows}, {int(dim)})"
             )
-        if raw_b_arr.ndim != 1 or raw_b_arr.shape != (raw_w_arr.shape[0],):
+        valid_b_shapes = ((1,), (raw_w_arr.shape[0],)) if is_boolean else ((raw_w_arr.shape[0],),)
+        if raw_b_arr.ndim != 1 or raw_b_arr.shape not in valid_b_shapes:
             raise ValueError(
-                f"_raw_source_head b shape {raw_b_arr.shape} != expected ({raw_w_arr.shape[0]},)"
+                f"_raw_source_head b shape {raw_b_arr.shape} != expected {valid_b_shapes}"
             )
         if not (bool(np.all(np.isfinite(raw_w_arr))) and bool(np.all(np.isfinite(raw_b_arr)))):
             raise ValueError("_raw_source_head contains non-finite weights or biases")
@@ -947,6 +898,10 @@ class MultiTenantSkillFleet:
         raw_b64 = np.asarray(raw_b_auth, dtype=np.float64).reshape(-1)
         if not (np.all(np.isfinite(raw_w64)) and np.all(np.isfinite(raw_b64))):
             raise ValueError(f"Field head {field_name!r} contains non-finite weights or biases")
+        if isinstance(f_def, (BooleanField, ChoiceField)):
+            _validate_head_weight_bias_shapes(
+                f_def, raw_w_auth, raw_b_auth, int(resolved.dimension), field_name
+            )
 
         is_bool_head = bool(isinstance(f_def, BooleanField) or raw_w64.shape[0] == 1)
         bool_threshold = float(getattr(f_def, "threshold", 0.5)) if is_bool_head else 0.5
@@ -1789,13 +1744,14 @@ class MultiTenantSkillFleet:
                 raise ValueError(
                     f"Invalid raw_W_auth spec: dtype={rw_dtype}, shape={rw_shape}, expected ((1|{K}), {D})"
                 )
-            if rb_dtype not in raw_head_dtypes or rb_shape != (rw_shape[0],):
+            valid_rb_shapes = ((1,), (rw_shape[0],)) if K == 2 else ((rw_shape[0],),)
+            if rb_dtype not in raw_head_dtypes or rb_shape not in valid_rb_shapes:
                 raise ValueError(
-                    f"Invalid raw_b_auth spec: dtype={rb_dtype}, shape={rb_shape}, expected ({rw_shape[0]},)"
+                    f"Invalid raw_b_auth spec: dtype={rb_dtype}, shape={rb_shape}, expected {valid_rb_shapes}"
                 )
             if rt_dtype not in alpha_dtypes or rt_shape != (1,):
                 raise ValueError(f"Invalid raw_cal_temp spec: dtype={rt_dtype}, shape={rt_shape}")
-            raw_runtime += rw_dtype.itemsize * rw_shape[0] * D + rb_dtype.itemsize * rw_shape[0] + 8
+            raw_runtime += rw_dtype.itemsize * rw_shape[0] * D + rb_dtype.itemsize * rb_shape[0] + 8
             if "raw_cal_adj" in headers:
                 ra_dtype, ra_shape = headers["raw_cal_adj"]
                 if ra_dtype not in alpha_dtypes or ra_shape != (K,):
@@ -2035,8 +1991,13 @@ class MultiTenantSkillFleet:
             }
             if self._raw_source_head is not None:
                 raw_w_auth, raw_b_auth, cal_t, cal_adj = self._raw_source_head
-                snapshot_arrays["raw_W_auth"] = np.ascontiguousarray(raw_w_auth) if not raw_w_auth.flags["C_CONTIGUOUS"] else raw_w_auth
-                if not raw_w_auth.flags["C_CONTIGUOUS"]:
+                needs_w_layout = (not raw_w_auth.flags["C_CONTIGUOUS"]) or (
+                    int(raw_w_auth.ctypes.data % 16) != 0
+                )
+                snapshot_arrays["raw_W_auth"] = (
+                    np.array(raw_w_auth, order="C", copy=True) if needs_w_layout else raw_w_auth
+                )
+                if needs_w_layout:
                     layout_sig = _2d_matmul_layout_sig(raw_w_auth)
                     if layout_sig is not None:
                         snapshot_arrays["raw_W_layout"] = np.array(layout_sig, dtype=np.int64)

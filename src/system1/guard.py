@@ -43,8 +43,10 @@ from system1.core.model import (
     _accepts_recency_weighted,
     _compute_hierarchical_logits_np,
     _encode_projector_batch,
+    _is_active_zero_head,
     _model_zero_unit0,
     _owned_readonly_array,
+    _validate_head_weight_bias_shapes,
 )
 from system1.core.text import PragmaticCompositeProjector, TfidfProjector
 
@@ -354,11 +356,10 @@ class GuardShield:
         b_dtype = np.float64 if raw_b_in.dtype == np.float64 else np.float32
         self.raw_W = _owned_readonly_array(raw_w_in, dtype=w_dtype)
         self.raw_b = _owned_readonly_array(raw_b_in, dtype=b_dtype)
-        if (
-            self.raw_W.ndim != 2
-            or self.raw_b.shape != (self.raw_W.shape[0],)
-            or not (np.all(np.isfinite(self.raw_W)) and np.all(np.isfinite(self.raw_b)))
-        ):
+        _validate_head_weight_bias_shapes(
+            f_def, self.raw_W, self.raw_b, int(resolved.dimension), self.field_name
+        )
+        if not (np.all(np.isfinite(self.raw_W)) and np.all(np.isfinite(self.raw_b))):
             raise ValueError(f"Field head {self.field_name!r} contains invalid or non-finite weights or biases")
         self.W = self.raw_W
         self.b = self.raw_b
@@ -514,7 +515,7 @@ class GuardShield:
         self._batch_accepts_recency = _accepts_recency_weighted(
             getattr(self.projector, "project_batch", None)
         )
-        self._is_zero_head = not (bool(np.any(self.raw_W)) or bool(np.any(self.raw_b)))
+        self._is_zero_head = _is_active_zero_head(f_def, self.raw_W, self.raw_b)
         self._learned_overrides: Dict[str, Any] = {}
         if hasattr(resolved, "_build_override_eval"):
             default_ov_rec = bool(getattr(resolved, "recency_weighted", self.recency_weighted))

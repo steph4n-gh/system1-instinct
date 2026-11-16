@@ -67,6 +67,8 @@ from system1.core.model import (
     _normalize_raw_projection_batch,
     _resolve_authoritative_head,
     _stable_sigmoid,
+    _validate_2d_layout_cloneable,
+    _validate_head_weight_bias_shapes,
     _validate_packed_engine_support,
 )
 from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
@@ -3491,6 +3493,14 @@ class SystemOneEngine:
                 for name, ch in self.model.heads.items():
                     if name in self.model._field_heads:
                         live_head = self.model._field_heads[name]
+                        f_def = self.schema.fields[name]
+                        _validate_head_weight_bias_shapes(
+                            f_def,
+                            np.asarray(live_head.weights),
+                            np.asarray(live_head.biases).reshape(-1),
+                            self.dimension,
+                            name,
+                        )
                         ch.weights = _checked_f32_copy(live_head.weights, f"Head {name!r} weights")
                         ch.biases = _checked_f32_copy(live_head.biases, f"Head {name!r} biases")
                         ch.P = live_head.covariance_inv
@@ -3621,11 +3631,14 @@ class SystemOneEngine:
                 else:
                     opts = ()
 
+                w_export = _checked_f32_copy(head.weights, f"Head {name!r} weights")
+                b_export = _checked_f32_copy(head.biases, f"Head {name!r} biases")
+                _validate_head_weight_bias_shapes(f_def, w_export, b_export.reshape(-1), self.dimension, name)
                 compiled_heads[name] = CompiledHeadWeights(
                     field_name=name,
                     field_type=f_def.field_type,
-                    weights=_checked_f32_copy(head.weights, f"Head {name!r} weights"),
-                    biases=_checked_f32_copy(head.biases, f"Head {name!r} biases"),
+                    weights=w_export,
+                    biases=b_export,
                     temperature=temp,
                     logit_adjustments=logit_adj,
                     conformal_quantile=conf_q,
@@ -4034,6 +4047,11 @@ class SystemOneEngine:
 
                 raw_w_arr = np.asarray(head.weights)
                 raw_b_arr = np.asarray(head.biases).reshape(-1)
+                _validate_head_weight_bias_shapes(f_def, raw_w_arr, raw_b_arr, self.dimension, fname)
+                _validate_2d_layout_cloneable(
+                    raw_w_arr,
+                    np.dtype(raw_w_arr.dtype if raw_w_arr.dtype in (np.float32, np.float64) else np.float32),
+                )
                 raw_w_val = raw_w_arr[:1] if is_bool else raw_w_arr
                 raw_b_val = raw_b_arr[:1] if is_bool else raw_b_arr
                 if not (np.all(np.isfinite(raw_w_val)) and np.all(np.isfinite(raw_b_val))):

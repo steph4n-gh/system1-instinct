@@ -258,7 +258,7 @@ def _extract_calibrated_head_params(
     b = np.asarray(head.biases, dtype=np.float64).reshape(-1).copy()
     is_boolean = isinstance(f_def, BooleanField)
     if is_boolean:
-        if w.ndim != 2 or w.shape[0] not in (1, 2) or b.size != w.shape[0]:
+        if w.ndim != 2 or w.shape[0] not in (1, 2) or b.size not in (1, w.shape[0]):
             raise ValueError(f"Incompatible BooleanField head shapes weights={w.shape}, biases={b.shape} for {fname!r}")
     else:
         if w.ndim != 2 or w.shape[0] != len(f_def.options) or b.size != w.shape[0]:

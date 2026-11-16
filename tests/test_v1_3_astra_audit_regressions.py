@@ -12774,3 +12774,393 @@ def test_astra_33_round20_regressions() -> None:
         blob_gap_str, projector=eng_gap.model.projector, max_runtime_bytes=str_budget
     )
     assert loaded_gap_str.base_nbytes() == fleet_gap_str.base_nbytes()
+
+
+
+def test_astra_34_round21_regressions() -> None:
+    """Round-21 regressions R21-1..R21-9 covering .s1m/fleet layouts, 2-row heads, centroids, cutover, and utility scale."""
+    import io
+    import json
+    import struct
+    import zipfile
+    import warnings
+    import numpy as np
+    import pytest
+
+    from system1 import (
+        BooleanField,
+        ChoiceField,
+        DecisionSchema,
+        FastExplainer,
+        GuardShield,
+        ScoreField,
+        SystemOneEngine,
+    )
+    from system1.calibration import ConformalPredictor, UtilityCalibrator
+    from system1.compiler import CompiledHeadWeights, CompiledSystemOneModel, SystemOneCompiler
+    from system1.core.model import _owned_readonly_array
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.fleet import MultiTenantSkillFleet
+    from system1.integrations.drop_in import UtilityCascadeRouter
+
+    class _R21Choices(DecisionSchema):
+        c = ChoiceField(options=("a", "b"), description="Choices")
+
+    class _R21Flags(DecisionSchema):
+        flag = BooleanField(description="Flags")
+
+    class _R21Scores(DecisionSchema):
+        score = ScoreField(min_value=0.0, max_value=100.0, description="Scores")
+
+    def _fresh(schema_cls: Any = _R21Choices, dim: int = 32) -> SystemOneEngine:
+        return SystemOneEngine(
+            schema_cls,
+            dimension=dim,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+
+    def _tamper_s1m_v2_header(raw: bytes, mutator: Any) -> bytes:
+        hlen = struct.unpack(">I", raw[4:8])[0]
+        hdr = json.loads(raw[8 : 8 + hlen].decode("utf-8"))
+        mutator(hdr)
+        new_h = json.dumps(hdr, sort_keys=True).encode("utf-8")
+        return raw[:4] + struct.pack(">I", len(new_h)) + new_h + raw[8 + hlen :]
+
+    def _tamper_s1m_v3_header(raw: bytes, mutator: Any) -> bytes:
+        magic, hlen = struct.unpack("<8sQ", raw[:16])
+        hdr = json.loads(raw[16 : 16 + hlen].decode("utf-8"))
+        mutator(hdr)
+        new_h = json.dumps(hdr, sort_keys=True, allow_nan=False).encode("utf-8")
+        out = bytearray(raw)
+        struct.pack_into("<8sQ", out, 0, magic, len(new_h))
+        page_end = ((16 + hlen + 16383) // 16384) * 16384
+        assert 16 + len(new_h) <= page_end
+        out[16 : 16 + len(new_h)] = new_h
+        out[16 + len(new_h) : page_end] = b"\x00" * (page_end - (16 + len(new_h)))
+        return bytes(out)
+
+    # ------------------------------------------------------------------
+    # R21-1: .s1m v2 & v3 preserve general 2D strided & unaligned layouts
+    # and enforce strict tensor_layouts validation + runtime budget bounds.
+    # ------------------------------------------------------------------
+    eng1 = _fresh(_R21Choices, 32)
+    p1 = "layout parity probe"
+    x1 = eng1.model.encode(p1)
+    w1_strided = np.random.default_rng(42).normal(size=(2, 64)).astype("f4")[:, ::2]
+    w1_strided *= np.float32(1e8)
+    eng1.model.heads["c"].set_weights(w1_strided, -(x1 @ np.array(w1_strided, copy=True).T))
+    cm1 = eng1.to_compiled_model()
+    live_f1 = cm1.forward_single(p1).fields["c"]
+    assert live_f1.selected_value == "b"
+
+    for fmt_v in (2, 3):
+        for compact_opt in (False, None):
+            blob1 = cm1.to_bytes(format_version=fmt_v, compact=compact_opt)
+            re_cm1 = CompiledSystemOneModel.from_bytes(blob1, backend="numpy")
+            re_f1 = re_cm1.forward_single(p1).fields["c"]
+            assert re_f1.selected_value == live_f1.selected_value == "b"
+            assert re_cm1.heads["c"].weights.strides == w1_strided.strides
+            assert int(re_cm1.heads["c"].weights.ctypes.data % 64) == int(w1_strided.ctypes.data % 64)
+            assert np.array_equal(re_f1.logits, live_f1.logits)
+            re_e1 = SystemOneEngine.from_bytes(blob1, backend="numpy", use_cache=False, strict_mode=False)
+            assert re_e1.decide(p1, record_receipt=False).values["c"] == "b"
+            assert re_e1.decide_batch([p1])[0].values["c"] == "b"
+            assert re_e1.compile_callable()(p1).values["c"] == "b"
+            assert int(re_e1.compile_packed_kernel().decide_prompt(p1)["best_idx"][0, 0]) == 1
+            assert GuardShield(re_e1, field_name="c", unsafe_label="b").evaluate_single(p1).predicted_label == "b"
+            assert FastExplainer.from_engine(re_e1, "c").explain(p1).predicted_label == "b"
+
+    # C-contiguous unaligned (offset=1) also preserves alignment across .s1m v2 & v3.
+    eng1_ua = _fresh(_R21Choices, 32)
+    w1_ua = np.ndarray((2, 32), dtype="f4", buffer=np.zeros(320, dtype="u1"), offset=1)
+    w1_ua[:] = np.random.default_rng(42).normal(size=(2, 32))
+    w1_ua *= np.float32(1e8)
+    eng1_ua.model.heads["c"].set_weights(w1_ua, -(x1 @ np.array(w1_ua, copy=True).T))
+    cm1_ua = eng1_ua.to_compiled_model()
+    assert cm1_ua.forward_single(p1).fields["c"].selected_value == "b"
+    for fmt_v in (2, 3):
+        blob1_ua = cm1_ua.to_bytes(format_version=fmt_v, compact=False)
+        re_cm1_ua = CompiledSystemOneModel.from_bytes(blob1_ua, backend="numpy")
+        assert int(re_cm1_ua.heads["c"].weights.ctypes.data % 64) == int(w1_ua.ctypes.data % 64)
+        assert re_cm1_ua.forward_single(p1).fields["c"].selected_value == "b"
+
+    # Tampered tensor_layouts headers fail closed on both v2 and v3.
+    blob_v2_base = cm1.to_bytes(format_version=2, compact=False)
+    blob_v3_base = cm1.to_bytes(format_version=3, compact=False)
+    for tamper_op in (
+        lambda h: h.__setitem__("tensor_layouts", ["bad"]),
+        lambda h: h.__setitem__("tensor_layouts", {"unknown_tensor": [0, 128, 4]}),
+        lambda h: h.__setitem__("tensor_layouts", {"c_b": [0, 4, 4]}),
+        lambda h: h.__setitem__("tensor_layouts", {"c_w": [0, 0, 4]}),
+        lambda h: h.__setitem__("tensor_layouts", {"c_w": [0, 256, 16]}),
+        lambda h: h.__setitem__("tensor_layouts", {"c_w": [0, 2_097_152, 4]}),
+        lambda h: h.__setitem__("tensor_layouts", {"c_w": [True, 128, 4]}),
+    ):
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(_tamper_s1m_v2_header(blob_v2_base, tamper_op), backend="numpy")
+        with pytest.raises(ValueError):
+            CompiledSystemOneModel.from_bytes(_tamper_s1m_v3_header(blob_v3_base, tamper_op), backend="numpy")
+
+    # ------------------------------------------------------------------
+    # R21-2: MultiTenantSkillFleet preserves alignment for unaligned C-contiguous weights.
+    # ------------------------------------------------------------------
+    fleet2 = MultiTenantSkillFleet.from_compiled_model(eng1_ua, "c", num_tenants=1)
+    assert fleet2.decide(0, p1).predicted_label == "b"
+    blob_f2 = fleet2.fleet_delta_to_bytes()
+    with zipfile.ZipFile(io.BytesIO(blob_f2), "r") as zf_f2:
+        assert "raw_W_layout.npy" in zf_f2.namelist()
+    rest_f2 = MultiTenantSkillFleet.fleet_delta_from_bytes(blob_f2, projector=eng1_ua.model.projector)
+    assert rest_f2.decide(0, p1).predicted_label == "b"
+
+    # ------------------------------------------------------------------
+    # R21-3: Oversized 2D strided span or aliasing matrix rejects loudly instead of silent copy.
+    # ------------------------------------------------------------------
+    eng3 = _fresh(_R21Choices, 32)
+    w3_big = np.ndarray((2, 32), dtype="f4", buffer=bytearray(1_100_000), strides=(1_050_000, 8))
+    w3_big[:] = np.random.default_rng(7).normal(size=(4, 64)).astype("f4")[::2, ::2]
+    w3_big[1] = 0
+    w3_big *= np.float32(1e8)
+    with pytest.raises(ValueError, match="Unsupported 2D strided"):
+        _owned_readonly_array(w3_big, dtype=np.float32)
+    with pytest.raises(ValueError, match="Unsupported 2D strided"):
+        eng3.model.heads["c"].set_weights(w3_big, np.zeros(2, dtype="f4"))
+    eng3.model.heads["c"].weights = w3_big
+    for fn3 in (
+        lambda: eng3.decide("strided midpoint check", record_receipt=False),
+        lambda: eng3.decide_batch(["strided midpoint check"]),
+        lambda: eng3.compile_callable(),
+        lambda: eng3.to_compiled_model(),
+        lambda: GuardShield(eng3, field_name="c", unsafe_label="b"),
+        lambda: FastExplainer.from_engine(eng3, "c"),
+        lambda: MultiTenantSkillFleet.from_compiled_model(eng3, "c", num_tenants=1),
+    ):
+        with pytest.raises(ValueError):
+            fn3()
+
+    w3_bcast = np.broadcast_to(np.ones((1, 32), dtype=np.float32), (2, 32))
+    with pytest.raises(ValueError, match="Unsupported 2D strided"):
+        eng3.model.heads["c"].set_weights(w3_bcast, np.zeros(2, dtype=np.float32))
+    w3_alias = np.ndarray((2, 32), dtype=np.float32, buffer=np.zeros(1024, dtype=np.uint8), strides=(256, 16))
+    with pytest.raises(ValueError, match="alias"):
+        eng3.model.heads["c"].set_weights(w3_alias, np.zeros(2, dtype=np.float32))
+
+    # ------------------------------------------------------------------
+    # R21-4: Two-row Boolean & Score heads agree on active-row zero-head learned overrides.
+    # ------------------------------------------------------------------
+    cm4 = CompiledSystemOneModel(
+        _R21Flags(),
+        {
+            "flag": CompiledHeadWeights(
+                "flag",
+                "boolean",
+                np.asfortranarray(np.vstack([np.zeros(16), np.ones(16)])).astype("f4"),
+                np.zeros(2, dtype="f4"),
+            )
+        },
+        dimension=16,
+        use_cache=False,
+        metadata={"learned_prompt_overrides": {"override test": {"flag": False}}},
+    )
+    assert cm4.forward_single("override test").fields["flag"].selected_value is False
+    for fmt_v in (2, 3):
+        blob4 = cm4.to_bytes(format_version=fmt_v, compact=False)
+        e4 = SystemOneEngine.from_bytes(blob4, backend="numpy", use_cache=False, strict_mode=False)
+        assert e4.decide("override test", record_receipt=False).values["flag"] is False
+        assert e4.decide_batch(["override test"])[0].values["flag"] is False
+        assert e4.compile_callable()("override test").values["flag"] is False
+        assert bool(e4.compile_packed_kernel().decide_prompt("override test")["b_val"][0, 0]) is False
+        assert GuardShield(e4, field_name="flag", unsafe_label="True").evaluate_single("override test").predicted_label == "False"
+        assert FastExplainer.from_engine(e4, "flag").explain("override test").predicted_label == "False"
+
+    cm4_sc = CompiledSystemOneModel(
+        _R21Scores(),
+        {
+            "score": CompiledHeadWeights(
+                "score",
+                "score",
+                np.asfortranarray(np.vstack([np.zeros(16), np.ones(16)])).astype("f4"),
+                np.zeros(2, dtype="f4"),
+            )
+        },
+        dimension=16,
+        use_cache=False,
+        metadata={"learned_prompt_overrides": {"score override": {"score": 90.0}}},
+    )
+    assert cm4_sc.forward_single("score override").fields["score"].selected_value == pytest.approx(90.0, abs=0.5)
+    for fmt_v in (2, 3):
+        e4s = SystemOneEngine.from_bytes(
+            cm4_sc.to_bytes(format_version=fmt_v, compact=False),
+            backend="numpy",
+            use_cache=False,
+            strict_mode=False,
+        )
+        assert e4s.decide("score override", record_receipt=False).values["score"] == pytest.approx(90.0, abs=0.5)
+        assert e4s.compile_callable()("score override").values["score"] == pytest.approx(90.0, abs=0.5)
+
+    # ------------------------------------------------------------------
+    # R21-5: Two-row Score heads serialize & reload across .s1m v2 & v3.
+    # ------------------------------------------------------------------
+    eng5 = _fresh(_R21Scores, 16)
+    w5 = np.asfortranarray(np.vstack([np.arange(16, dtype="f4") * 0.1, np.zeros(16, dtype="f4")]))
+    eng5.model.heads["score"].set_weights(w5, np.zeros(2, dtype="f4"))
+    live5 = eng5.decide("score probe", record_receipt=False).values["score"]
+    cm5 = eng5.to_compiled_model()
+    for fmt_v in (2, 3):
+        for inc_cov in (False, True):
+            blob5 = cm5.to_bytes(format_version=fmt_v, compact=False, include_covariance=inc_cov)
+            re_cm5 = CompiledSystemOneModel.from_bytes(blob5, backend="numpy")
+            assert re_cm5.heads["score"].weights.shape == (2, 16)
+            assert re_cm5.forward_single("score probe").fields["score"].selected_value == pytest.approx(live5, abs=1e-5)
+
+    # ------------------------------------------------------------------
+    # R21-6: Broadcast (1,) bias parity across BooleanField and ScoreField, and invalid shape rejection.
+    # ------------------------------------------------------------------
+    eng6 = _fresh(_R21Flags, 16)
+    eng6.model.heads["flag"].set_weights(np.ones((2, 16), dtype="f4"), np.zeros(1, dtype="f4"))
+    live6 = eng6.decide("test", record_receipt=False).values["flag"]
+    assert eng6.decide_batch(["test"])[0].values["flag"] == live6
+    assert eng6.compile_callable()("test").values["flag"] == live6
+    assert bool(eng6.compile_packed_kernel().decide_prompt("test")["b_val"][0, 0]) == live6
+    assert GuardShield(eng6, field_name="flag", unsafe_label="True").evaluate_single("test").predicted_label == str(live6)
+    assert FastExplainer.from_engine(eng6, "flag").explain("test").predicted_label == str(live6)
+    fl6 = MultiTenantSkillFleet.from_compiled_model(eng6, "flag", num_tenants=1)
+    assert fl6.decide(0, "test").predicted_label == str(live6)
+    re_fl6 = MultiTenantSkillFleet.fleet_delta_from_bytes(fl6.fleet_delta_to_bytes(), projector=eng6.model.projector)
+    assert re_fl6.decide(0, "test").predicted_label == str(live6)
+    cm6 = eng6.to_compiled_model()
+    for fmt_v in (2, 3):
+        re_cm6 = CompiledSystemOneModel.from_bytes(cm6.to_bytes(format_version=fmt_v, compact=False), backend="numpy")
+        assert re_cm6.forward_single("test").fields["flag"].selected_value == live6
+
+    eng6_sc = _fresh(_R21Scores, 16)
+    eng6_sc.model.heads["score"].set_weights(
+        np.asfortranarray(np.vstack([np.ones(16, dtype="f4") * 0.2, np.zeros(16, dtype="f4")])),
+        np.zeros(1, dtype="f4"),
+    )
+    live6_sc = eng6_sc.decide("test", record_receipt=False).values["score"]
+    cm6_sc = eng6_sc.to_compiled_model()
+    for fmt_v in (2, 3):
+        re_cm6_sc = CompiledSystemOneModel.from_bytes(cm6_sc.to_bytes(format_version=fmt_v, compact=False), backend="numpy")
+        assert re_cm6_sc.forward_single("test").fields["score"].selected_value == pytest.approx(live6_sc, abs=1e-5)
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        eng6.model.heads["flag"].set_weights(np.ones((3, 16), dtype="f4"), np.zeros(3, dtype="f4"))
+    with pytest.raises(ValueError, match="shape mismatch"):
+        eng1.model.heads["c"].set_weights(np.ones((2, 32), dtype="f4"), np.zeros(1, dtype="f4"))
+    eng6.model.heads["flag"].weights = np.ones((2, 16), dtype="f4")
+    eng6.model.heads["flag"].biases = np.zeros(3, dtype="f4")
+    with pytest.raises(ValueError, match="shape mismatch"):
+        GuardShield(eng6, field_name="flag", unsafe_label="True")
+    with pytest.raises(ValueError, match="shape mismatch"):
+        MultiTenantSkillFleet.from_compiled_model(eng6, "flag", num_tenants=1)
+
+    # ------------------------------------------------------------------
+    # R21-7: Per-column scaled centroids preserve small orthogonal signal after cancellation.
+    # ------------------------------------------------------------------
+    with warnings.catch_warnings(record=True) as caught_p7:
+        warnings.simplefilter("always", RuntimeWarning)
+        X7 = np.array([[1e20, 1.0], [-1e20, 1.0], [1.0, 1e20], [1.0, -1e20]], dtype=np.float64)
+        cp7 = ConformalPredictor("c", ("a", "b"))
+        th7 = cp7.calibrate_prototypes(X7, ["a", "a", "b", "b"], alpha=0.5)
+        assert np.allclose(cp7.prototypes, np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32), atol=1e-6)
+        assert len(cp7.prototype_scores) == 4 and th7 > 0.0
+        comp7 = SystemOneCompiler._compute_class_prototypes(X7, np.array([[1, 0], [1, 0], [0, 1], [0, 1]]))
+        assert np.allclose(comp7, np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32), atol=1e-6)
+        X7_ext = np.array([[1e308, 1e-5], [-1e308, 1e-5], [1e-5, 1e308], [1e-5, -1e308]], dtype=np.float64)
+        cp7_ext = ConformalPredictor("c", ("a", "b"))
+        cp7_ext.calibrate_prototypes(X7_ext, ["a", "a", "b", "b"], alpha=0.5)
+        assert np.allclose(cp7_ext.prototypes, np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32), atol=1e-6)
+        comp7_w = SystemOneCompiler._compute_class_prototypes(
+            X7_ext,
+            np.array([[1, 0], [1, 0], [0, 1], [0, 1]]),
+            sample_weights=np.array([2.0, 2.0, 3.0, 3.0]),
+        )
+        assert np.allclose(comp7_w, np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32), atol=1e-6)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_p7)
+
+    # ------------------------------------------------------------------
+    # R21-8: Cutover ScoreField quarantine scales accurately for narrow and extreme spans.
+    # ------------------------------------------------------------------
+    class _R21SmallScore(DecisionSchema):
+        act = ChoiceField(options=("allow", "deny"))
+        risk = ScoreField(min_value=0.0, max_value=1e-12)
+
+    lc8 = AutoCutoverLifecycle(
+        _R21SmallScore(),
+        config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            alpha_target=0.15,
+            canary_rate=1e-9,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    for i8 in range(60):
+        lbl8 = "allow" if i8 % 2 == 0 else "deny"
+        lc8.observe_teacher(f"{lbl8} warm {i8}", {"act": lbl8, "risk": 0.0}, cache_key=f"w_{i8}")
+    assert lc8.compiled_active is True
+    for r8 in (0.0, 0.0, 1e-12):
+        lc8.observe_teacher("conflicting small", {"act": "allow", "risk": r8}, cache_key="k_small")
+    assert "k_small" in lc8._conflicted_cache_keys
+    assert "k_small" not in lc8.clean_cache
+    assert lc8.decide_local("conflicting small", cache_key="k_small") is None
+
+    class _R21HugeScore(DecisionSchema):
+        act = ChoiceField(options=("allow", "deny"))
+        risk = ScoreField(min_value=-1e308, max_value=1e308)
+
+    with warnings.catch_warnings(record=True) as caught_p8:
+        warnings.simplefilter("always", RuntimeWarning)
+        lc8_h = AutoCutoverLifecycle(
+            _R21HugeScore(),
+            config=CutoverConfig(
+                milestones=(50, 100),
+                k_min=2,
+                alpha_target=0.15,
+                canary_rate=1e-9,
+                sparse_dim=64,
+                dense_dim=16,
+                enable_quarantine=False,
+            ),
+        )
+        assert lc8_h._values_match({"act": "allow", "risk": 0.0}, {"act": "allow", "risk": 0.0}) is True
+        assert lc8_h._values_match({"act": "allow", "risk": -1e308}, {"act": "allow", "risk": 1e308}) is False
+        assert lc8_h._values_match({"act": "allow", "risk": 0.0}, {"act": "allow", "risk": 1e308}) is False
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_p8)
+
+    # ------------------------------------------------------------------
+    # R21-9: UtilityCalibrator & UtilityCascadeRouter scale-invariant without overflow warnings.
+    # ------------------------------------------------------------------
+    p9 = np.tile([1.0, 0.0], (30, 1))
+    y9 = np.zeros(30, dtype=int)
+    base_cost9 = np.array([[-1.7, 1.0], [-1.0, -1.0]], dtype=np.float64)
+    with warnings.catch_warnings(record=True) as caught_u9:
+        warnings.simplefilter("always", RuntimeWarning)
+        for mode9 in ("normalized_excess", "indicator"):
+            for sc9 in (1e-300, 1.0, 1e308):
+                cal9 = UtilityCalibrator(base_cost9 * sc9, safe_action=1, alpha=0.1, loss_mode=mode9).fit(p9, y9)
+                assert np.allclose(cal9.L, np.array([[0.0, 1.0], [0.0, 0.0]], dtype=np.float64), atol=1e-12)
+                assert cal9.lam_crc == pytest.approx(1.0, abs=1e-9)
+                assert cal9.predict([1.0, 0.0]).tolist() == [0]
+                assert cal9.predict([1.0, 0.0], use_crc=False).tolist() == [0]
+                assert cal9.predict([2e307, 0.0]).tolist() == [0]
+        cal9_zero = UtilityCalibrator(np.zeros((2, 2), dtype=np.float64), safe_action=1, alpha=0.1).fit(p9, y9)
+        assert np.all(cal9_zero.L == 0.0)
+        y9_mixed = np.array([0] * 25 + [1] * 5, dtype=int)
+        cal9_ind_tiny = UtilityCalibrator(
+            base_cost9 * 1e-300, safe_action=1, alpha=0.1, loss_mode="indicator"
+        ).fit(p9, y9_mixed)
+        assert cal9_ind_tiny.lam_crc < 0.0
+        assert cal9_ind_tiny.predict([1.0, 0.0]).tolist() == [1]
+        ucr9 = UtilityCascadeRouter(
+            cost_matrix=np.array([[0.0, 1.0, 1.0], [1.0, 0.0, 1.0], [0.5, 0.5, 0.5]], dtype=np.float64) * 1e308,
+            safe_action=2,
+            alpha=0.15,
+        )
+        assert np.all(np.isfinite(ucr9.utility_calibrator.L))
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_u9)

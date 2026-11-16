@@ -19,7 +19,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
+from typing import AbstractSet, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
 
@@ -29,12 +29,17 @@ from system1.core.model import (
     ModelInferenceResult,
     RawFieldEvaluation,
     SystemOneModel,
+    _MAX_STRIDED_CLONE_SPAN_BYTES,
     _accepts_recency_weighted,
+    _is_active_zero_head,
     _is_native_scalar_projector,
+    _needs_2d_layout_preservation,
     _normalize_raw_projection,
     _normalize_raw_projection_batch,
+    _reconstruct_2d_layout_array,
     _stable_sigmoid,
     _stable_softmax,
+    _validate_2d_layout_cloneable,
 )
 
 
@@ -67,6 +72,7 @@ from system1.calibration import (
     DecisionCalibrator,
     _normalize_rows_f32_safe,
     _normalize_vec_f32_safe,
+    _safe_centroid_mean_f64,
 )
 from system1.core.embeddings import compute_strict_loo_weights
 from system1.core.telemetry import TelemetryProjector
@@ -587,7 +593,7 @@ def _validate_skill_shapes_and_runtime_delta(
 
         widths = (
             (1, 2)
-            if isinstance(definition, BooleanField)
+            if isinstance(definition, (BooleanField, ScoreField))
             else (len(definition.options),)
             if hasattr(definition, "options")
             else (1,)
@@ -596,14 +602,21 @@ def _validate_skill_shapes_and_runtime_delta(
         if weight_shape not in tuple((width, dimension) for width in widths):
             raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
         width = weight_shape[0]
+        valid_b_shapes = (
+            ((1,), (width,))
+            if isinstance(definition, (BooleanField, ScoreField))
+            else ((width,),)
+        )
+        b_shape = shapes.get(_k("b"))
+        if b_shape not in valid_b_shapes:
+            raise ValueError(f"Saved head {name!r} has incompatible b dimensions")
         required_shapes = {
-            "b": (width,),
             "P": (dimension + 1, dimension + 1),
             "B": (dimension + 1, width),
         }
         for suffix, shape in required_shapes.items():
             actual = shapes.get(_k(suffix))
-            if (suffix == "b" or actual is not None) and actual != shape:
+            if actual is not None and actual != shape:
                 raise ValueError(f"Saved head {name!r} has incompatible {suffix} dimensions")
         logit_adj_shape = shapes.get(_k("logit_adj"))
         if logit_adj_shape is not None:
@@ -684,6 +697,58 @@ def _validate_skill_shapes_and_runtime_delta(
     return runtime_delta
 
 
+def _validate_tensor_layouts_header(
+    meta: Mapping[str, Any],
+    shapes: Mapping[str, Tuple[int, ...]],
+    *,
+    non_f32_2d_names: AbstractSet[str] = frozenset(),
+) -> Tuple[Dict[str, Tuple[int, int, int]], int]:
+    """Validate optional serialized 2D stride/alignment metadata and return extra runtime bytes."""
+    if "tensor_layouts" not in meta:
+        return {}, 0
+    raw_layouts = meta["tensor_layouts"]
+    if not isinstance(raw_layouts, dict):
+        raise ValueError("Saved skill tensor_layouts header must be a mapping")
+    validated: Dict[str, Tuple[int, int, int]] = {}
+    extra_bytes = 0
+    for tname, lspec in raw_layouts.items():
+        if not isinstance(tname, str) or tname not in shapes or tname in non_f32_2d_names:
+            raise ValueError(f"Saved skill tensor_layouts references unexpected tensor {tname!r}")
+        sh = shapes[tname]
+        if len(sh) != 2 or sh[0] <= 0 or sh[1] <= 0:
+            raise ValueError(f"Saved skill tensor_layouts entry {tname!r} requires non-empty 2D tensor")
+        if not isinstance(lspec, list) or len(lspec) != 3 or any(type(v) is not int for v in lspec):
+            raise ValueError(f"Saved skill tensor_layouts entry {tname!r} must be [mod64, s0, s1]")
+        mod64, s0, s1 = int(lspec[0]), int(lspec[1]), int(lspec[2])
+        K, D = int(sh[0]), int(sh[1])
+        itemsize = 4
+        nbytes_f32 = itemsize * K * D
+        if not (0 <= mod64 < 64):
+            raise ValueError(f"Saved skill tensor_layouts mod64 {mod64} out of range for {tname!r}")
+        if (s0 % itemsize) != 0 or (s1 % itemsize) != 0:
+            raise ValueError(f"Saved skill tensor_layouts strides ({s0}, {s1}) incompatible with float32 for {tname!r}")
+        if (K == 1 and s0 != 0) or (D == 1 and s1 != 0):
+            raise ValueError(f"Saved skill tensor_layouts singleton stride invalid for {tname!r}")
+        min_off = min(0, (K - 1) * s0) + min(0, (D - 1) * s1)
+        max_off = max(0, (K - 1) * s0) + max(0, (D - 1) * s1)
+        span_bytes = (max_off - min_off) + itemsize
+        max_allowed_span = min(_MAX_STRIDED_CLONE_SPAN_BYTES, max(1 << 20, 64 * nbytes_f32))
+        if span_bytes <= 0 or span_bytes < nbytes_f32 or span_bytes > max_allowed_span:
+            raise ValueError(
+                f"Saved skill tensor_layouts span {span_bytes} exceeds limit {max_allowed_span} for {tname!r}"
+            )
+        a0, a1 = abs(s0), abs(s1)
+        aliased = (K > 1 and a0 == 0) or (D > 1 and a1 == 0)
+        if not aliased and K > 1 and D > 1:
+            g = math.gcd(a0, a1)
+            aliased = (a1 // g) < K and (a0 // g) < D
+        if aliased:
+            raise ValueError(f"Saved skill tensor_layouts aliases elements for {tname!r}")
+        extra_bytes += (span_bytes - nbytes_f32) + 128
+        validated[tname] = (mod64, s0, s1)
+    return validated, extra_bytes
+
+
 def _read_skill_arrays(
     data: bytes,
     schema: DecisionSchema,
@@ -691,6 +756,7 @@ def _read_skill_arrays(
     runtime_bytes: int,
     *,
     namespaced: bool = False,
+    meta: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, np.ndarray]:
     """Validate and deserialize `.s1m` v1/v2 NPZ arrays within strict bounds."""
     if not data.startswith(b"PK\x03\x04"):
@@ -764,6 +830,8 @@ def _read_skill_arrays(
             shapes,
             namespaced=namespaced,
         )
+        _, layout_extra_bytes = _validate_tensor_layouts_header(meta or {}, shapes)
+        runtime_bytes += layout_extra_bytes
         runtime_bytes += 2 * effective_array_bytes
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
@@ -1234,7 +1302,7 @@ class CompiledSystemOneModel:
             if (
                 override_map is not None
                 and name in override_map
-                and (is_zero_emb_eval or (not np.any(head.weights) and not np.any(head.biases)))
+                and (is_zero_emb_eval or _is_active_zero_head(head.field_def, head.weights, head.biases))
             ):
                 evals[name] = self._build_override_eval(head, override_map[name])
             else:
@@ -1667,7 +1735,7 @@ class CompiledSystemOneModel:
                 if (
                     override_map is not None
                     and name in override_map
-                    and (is_zero_emb or (not np.any(head.weights) and not np.any(head.biases)))
+                    and (is_zero_emb or _is_active_zero_head(head.field_def, head.weights, head.biases))
                 ):
                     evals[name] = self._build_override_eval(head, override_map[name])
                 else:
@@ -2065,6 +2133,18 @@ class CompiledSystemOneModel:
                 return np.asfortranarray(a32) if is_f_2d else np.ascontiguousarray(a32)
             return np.asfortranarray(a32) if is_f_2d else a32
 
+        tensor_layouts: Dict[str, List[int]] = {}
+
+        def _pack_named_array(tname: str, arr: np.ndarray) -> np.ndarray:
+            arr_np = np.asarray(arr)
+            if _needs_2d_layout_preservation(arr_np):
+                clone_spec = _validate_2d_layout_cloneable(arr_np, np.dtype(np.float32))
+                if clone_spec is not None:
+                    mod64, s0_f32, s1_f32, _, _ = clone_spec
+                    tensor_layouts[tname] = [int(mod64), int(s0_f32), int(s1_f32)]
+                return _pack_array(np.array(arr_np, order="C", copy=True))
+            return _pack_array(arr_np)
+
         def _pack_f32_vec(arr: np.ndarray, label: str) -> np.ndarray:
             with np.errstate(over="ignore", invalid="ignore"):
                 out = np.asarray(arr, dtype=np.float32)
@@ -2087,16 +2167,16 @@ class CompiledSystemOneModel:
                 )
         if isinstance(self.projector, HybridProjector) and getattr(self.projector, "_fitted", False):
             if getattr(self.projector, "_spectral_vectors", None) is not None:
-                arrays_to_save["_projector_spectral_vectors"] = _pack_array(
-                    self.projector._spectral_vectors
+                arrays_to_save["_projector_spectral_vectors"] = _pack_named_array(
+                    "_projector_spectral_vectors", self.projector._spectral_vectors
                 )
             if getattr(self.projector, "_subspace_components", None) is not None:
-                arrays_to_save["_projector_subspace_components"] = _pack_array(
-                    self.projector._subspace_components
+                arrays_to_save["_projector_subspace_components"] = _pack_named_array(
+                    "_projector_subspace_components", self.projector._subspace_components
                 )
             if getattr(self.projector, "_rbf_landmarks", None) is not None:
-                arrays_to_save["_projector_rbf_landmarks"] = _pack_array(
-                    self.projector._rbf_landmarks
+                arrays_to_save["_projector_rbf_landmarks"] = _pack_named_array(
+                    "_projector_rbf_landmarks", self.projector._rbf_landmarks
                 )
             hybrid_tfidf = getattr(self.projector, "_tfidf_projector", None)
             if hybrid_tfidf is not None and getattr(hybrid_tfidf, "_idf", None) is not None:
@@ -2110,8 +2190,8 @@ class CompiledSystemOneModel:
                 dense_eng._table, dtype=np.float32
             )
             if getattr(self.projector, "_spectral_basis", None) is not None:
-                arrays_to_save["_projector_spectral_basis"] = _pack_array(
-                    self.projector._spectral_basis
+                arrays_to_save["_projector_spectral_basis"] = _pack_named_array(
+                    "_projector_spectral_basis", self.projector._spectral_basis
                 )
             header_meta["dense_embed_vocab"] = {
                 "vocab_size": int(dense_eng.vocab_size),
@@ -2132,14 +2212,14 @@ class CompiledSystemOneModel:
             def _hk(suffix: str, _fn: str = name) -> str:
                 return _head_tensor_name(_fn, suffix, namespaced=namespaced_tensors)
 
-            arrays_to_save[_hk("w")] = _pack_array(ch.weights)
+            arrays_to_save[_hk("w")] = _pack_named_array(_hk("w"), ch.weights)
             arrays_to_save[_hk("b")] = _pack_f32_vec(ch.biases, f"Head {name!r} biases")
             state = exemplar_states.get(name)
             if state is not None:
                 for suffix, arr in state["arrays"].items():
                     arr_np = np.asarray(arr)
                     arrays_to_save[_hk(suffix)] = (
-                        _pack_array(arr_np) if arr_np.ndim == 2 else arr_np
+                        _pack_named_array(_hk(suffix), arr_np) if arr_np.ndim == 2 else arr_np
                     )
             if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
                 arrays_to_save[_hk("calib_scores")] = np.asarray(ch.calibration_scores, dtype=np.float64)
@@ -2168,20 +2248,23 @@ class CompiledSystemOneModel:
                 and ch.coarse_weights is not None
                 and ch.coarse_biases is not None
             ):
-                arrays_to_save[_hk("coarse_w")] = _pack_array(ch.coarse_weights)
+                arrays_to_save[_hk("coarse_w")] = _pack_named_array(_hk("coarse_w"), ch.coarse_weights)
                 arrays_to_save[_hk("coarse_b")] = _pack_f32_vec(
                     ch.coarse_biases, f"Head {name!r} coarse biases"
                 )
                 if ch.fine_weights is not None and ch.fine_biases is not None:
-                    arrays_to_save[_hk("fine_w")] = _pack_array(ch.fine_weights)
+                    arrays_to_save[_hk("fine_w")] = _pack_named_array(_hk("fine_w"), ch.fine_weights)
                     arrays_to_save[_hk("fine_b")] = _pack_f32_vec(
                         ch.fine_biases, f"Head {name!r} fine biases"
                     )
             if include_covariance:
                 if ch.P is not None:
-                    arrays_to_save[_hk("P")] = _pack_array(ch.P)
+                    arrays_to_save[_hk("P")] = _pack_named_array(_hk("P"), ch.P)
                 if ch.B is not None:
-                    arrays_to_save[_hk("B")] = _pack_array(ch.B)
+                    arrays_to_save[_hk("B")] = _pack_named_array(_hk("B"), ch.B)
+
+        if tensor_layouts:
+            header_meta["tensor_layouts"] = tensor_layouts
 
         if format_version == 3:
             for tname, arr in list(arrays_to_save.items()):
@@ -2673,6 +2756,22 @@ class CompiledSystemOneModel:
             return cls._coerce_readonly_float_array(arr, np.float64)
 
         array_map = dict(array_map)
+        validated_layouts, _ = _validate_tensor_layouts_header(
+            meta,
+            {k: tuple(np.asarray(v).shape) for k, v in array_map.items()},
+        )
+
+        def _restore_f32_layout(tname: str, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            out_arr = _as_f32(arr)
+            if out_arr is not None and tname in validated_layouts:
+                if not bool(np.all(np.isfinite(out_arr))):
+                    raise ValueError(f"Saved tensor {tname!r} contains non-finite values")
+                mod64, s0, s1 = validated_layouts[tname]
+                out_arr = _reconstruct_2d_layout_array(
+                    out_arr, np.array([mod64, s0, s1], dtype=np.int64)
+                )
+            return out_arr
+
         is_v3 = format_version == 3
         embed_vocab_flag = bool(meta.get("embed_vocab", False)) if is_v3 else False
 
@@ -2726,7 +2825,7 @@ class CompiledSystemOneModel:
             "_projector_dense_table",
         ):
             if proj_arr_key in array_map:
-                conv_f32 = _as_f32(array_map[proj_arr_key])
+                conv_f32 = _restore_f32_layout(proj_arr_key, array_map[proj_arr_key])
                 assert conv_f32 is not None
                 if not np.all(np.isfinite(conv_f32)):
                     raise ValueError(f"Saved projector array {proj_arr_key!r} contains non-finite values")
@@ -2999,18 +3098,28 @@ class CompiledSystemOneModel:
             definition = schema.fields[name]
             if _hk("w") not in array_map or _hk("b") not in array_map:
                 raise ValueError(f"Saved head {name!r} is missing required weights")
-            w = _as_f32(array_map[_hk("w")])
+            w = _restore_f32_layout(_hk("w"), array_map[_hk("w")])
             assert w is not None
             b = _as_f32(array_map[_hk("b")])
             assert b is not None
             widths = (
                 (1, 2)
-                if isinstance(definition, BooleanField)
+                if isinstance(definition, (BooleanField, ScoreField))
                 else (len(definition.options),)
                 if hasattr(definition, "options")
                 else (1,)
             )
-            if w.ndim != 2 or w.shape[0] not in widths or w.shape[1] != dimension or b.shape != (w.shape[0],):
+            valid_b_shapes = (
+                ((1,), (w.shape[0],))
+                if isinstance(definition, (BooleanField, ScoreField))
+                else ((w.shape[0],),)
+            )
+            if (
+                w.ndim != 2
+                or w.shape[0] not in widths
+                or w.shape[1] != dimension
+                or b.shape not in valid_b_shapes
+            ):
                 raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
             if not np.all(np.isfinite(w)) or not np.all(np.isfinite(b)):
                 raise ValueError(f"Saved head {name!r} contains non-finite weights")
@@ -3021,8 +3130,8 @@ class CompiledSystemOneModel:
                 raise ValueError(f"Saved head {name!r} uses an unsupported conformal score")
             if isinstance(definition, (ChoiceField, MultiChoiceField)) and tuple(h_info.get("options", ())) != definition.options:
                 raise ValueError(f"Saved head {name!r} options do not match the schema")
-            p_mat = _as_f32(array_map[_hk("P")]) if _hk("P") in array_map else None
-            b_mat = _as_f32(array_map[_hk("B")]) if _hk("B") in array_map else None
+            p_mat = _restore_f32_layout(_hk("P"), array_map[_hk("P")]) if _hk("P") in array_map else None
+            b_mat = _restore_f32_layout(_hk("B"), array_map[_hk("B")]) if _hk("B") in array_map else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (p_mat, b_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite covariance")
             calib_scores_arr = array_map[_hk("calib_scores")] if _hk("calib_scores") in array_map else None
@@ -3100,9 +3209,9 @@ class CompiledSystemOneModel:
             ):
                 raise ValueError(f"Saved head {name!r} has invalid cluster_assignments")
             cluster_assign = tuple(int(c) for c in raw_assign) if isinstance(raw_assign, (list, tuple)) else ()
-            coarse_w = _as_f32(array_map[_hk("coarse_w")]) if _hk("coarse_w") in array_map else None
+            coarse_w = _restore_f32_layout(_hk("coarse_w"), array_map[_hk("coarse_w")]) if _hk("coarse_w") in array_map else None
             coarse_b = _as_f32(array_map[_hk("coarse_b")]) if _hk("coarse_b") in array_map else None
-            fine_w = _as_f32(array_map[_hk("fine_w")]) if _hk("fine_w") in array_map else None
+            fine_w = _restore_f32_layout(_hk("fine_w"), array_map[_hk("fine_w")]) if _hk("fine_w") in array_map else None
             fine_b = _as_f32(array_map[_hk("fine_b")]) if _hk("fine_b") in array_map else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (coarse_w, coarse_b, fine_w, fine_b)):
                 raise ValueError(f"Saved head {name!r} contains non-finite hierarchical weights")
@@ -3113,7 +3222,7 @@ class CompiledSystemOneModel:
                     raise ValueError(f"Saved head {name!r} has out-of-range cluster_assignments")
 
             exemplar_arrays = {
-                suffix: _as_f32(array_map[_hk(suffix)])
+                suffix: _restore_f32_layout(_hk(suffix), array_map[_hk(suffix)])
                 for suffix in EXEMPLAR_ARRAYS
                 if _hk(suffix) in array_map
             }
@@ -3490,7 +3599,12 @@ class CompiledSystemOneModel:
             heads_meta=meta.get("heads"),
             namespaced=namespaced,
         )
-        extra_runtime_bytes += upcast_bytes_v3
+        _, layout_extra_bytes_v3 = _validate_tensor_layouts_header(
+            meta,
+            shapes_v3,
+            non_f32_2d_names=idf_tensor_names | logit_adj_names | score_f64_names,
+        )
+        extra_runtime_bytes += upcast_bytes_v3 + layout_extra_bytes_v3
 
         cov_fields = sum(
             1
@@ -3640,6 +3754,7 @@ class CompiledSystemOneModel:
             dimension,
             runtime_bytes,
             namespaced=namespaced,
+            meta=meta,
         )
         return cls._reconstruct_model_from_parts(
             meta,
@@ -4281,25 +4396,7 @@ class SystemOneCompiler:
         )
 
         def _safe_weighted_mean(rows: np.ndarray, weights: Optional[np.ndarray]) -> Optional[np.ndarray]:
-            fin_rows = np.all(np.isfinite(rows), axis=1)
-            if not np.any(fin_rows):
-                return None
-            sub = rows[fin_rows]
-            max_abs = float(np.max(np.abs(sub)))
-            if not math.isfinite(max_abs) or max_abs <= 0.0:
-                return None
-            scaled = sub / max_abs
-            if weights is not None:
-                w_sub = weights[fin_rows]
-                w_ok = np.isfinite(w_sub) & (w_sub > 0.0)
-                if not np.any(w_ok):
-                    return None
-                w_pos = w_sub[w_ok]
-                w_max = float(np.max(w_pos))
-                if not math.isfinite(w_max) or w_max <= 0.0:
-                    return None
-                return np.average(scaled[w_ok], axis=0, weights=w_pos / w_max)
-            return np.mean(scaled, axis=0, dtype=np.float64)
+            return _safe_centroid_mean_f64(rows, weights)
 
         if is_boolean:
             y_flat = np.asarray(Y_train, dtype=np.float32).flatten()

@@ -68,6 +68,48 @@ def _normalize_vec_f32_safe(vec: Any) -> Tuple[np.ndarray, float, bool]:
     return unit, raw_norm, True
 
 
+def _safe_centroid_mean_f64(rows: Any, weights: Optional[Any] = None) -> Optional[np.ndarray]:
+    """Compute overflow-free, cancellation-safe centroid mean via per-column abs scaling."""
+    r_arr = np.asarray(rows)
+    if r_arr.ndim != 2 or r_arr.shape[0] == 0 or r_arr.shape[1] == 0:
+        return None
+    fin = np.all(np.isfinite(r_arr), axis=1)
+    if not bool(np.any(fin)):
+        return None
+    sub = np.asarray(r_arr[fin], dtype=np.float64)
+    w_unit: Optional[np.ndarray] = None
+    w_sum = 0.0
+    if weights is not None:
+        w_arr = np.asarray(weights, dtype=np.float64).reshape(-1)
+        if w_arr.shape[0] != r_arr.shape[0]:
+            raise ValueError(
+                f"Sample weights length {w_arr.shape[0]} != rows count {r_arr.shape[0]}"
+            )
+        w_sub = w_arr[fin]
+        w_ok = np.isfinite(w_sub) & (w_sub > 0.0)
+        if not bool(np.any(w_ok)):
+            return None
+        sub = sub[w_ok]
+        w_pos = w_sub[w_ok]
+        w_max = float(np.max(w_pos))
+        if not math.isfinite(w_max) or w_max <= 0.0:
+            return None
+        w_unit = w_pos / w_max
+        w_sum = float(np.sum(w_unit))
+        if not math.isfinite(w_sum) or w_sum <= 0.0:
+            return None
+    col_scales = np.max(np.abs(sub), axis=0)
+    if not bool(np.any(col_scales > 0.0)):
+        return np.zeros(sub.shape[1], dtype=np.float64)
+    safe_scales = np.where(col_scales > 0.0, col_scales, 1.0)
+    scaled = sub / safe_scales[None, :]
+    if w_unit is not None:
+        mean_scaled = np.clip((w_unit @ scaled) / w_sum, -1.0, 1.0)
+    else:
+        mean_scaled = np.clip(np.mean(scaled, axis=0, dtype=np.float64), -1.0, 1.0)
+    return mean_scaled * col_scales
+
+
 def _binom_cdf(k: int, n: int, p: float) -> float:
     """Exact Binomial(n, p) CDF P(X <= k) computed in log space (no scipy required)."""
     if n <= 0 or k >= n or p <= 0.0:
@@ -776,16 +818,11 @@ class ConformalPredictor:
                 for c_idx, opt in enumerate(self.options):
                     mask = [i for i, lbl in enumerate(labels) if str(lbl) == str(opt)]
                     if mask:
-                        sub = arr[mask]
-                        fin = np.all(np.isfinite(sub), axis=1)
-                        if np.any(fin):
-                            sub_fin = sub[fin]
-                            max_abs = float(np.max(np.abs(sub_fin)))
-                            if math.isfinite(max_abs) and max_abs > 0.0:
-                                c_mean = np.mean(sub_fin / max_abs, axis=0, dtype=np.float64)
-                                u_vec, _, ok = _normalize_vec_f32_safe(c_mean)
-                                if ok:
-                                    protos[c_idx] = u_vec
+                        c_mean = _safe_centroid_mean_f64(arr[mask])
+                        if c_mean is not None:
+                            u_vec, _, ok = _normalize_vec_f32_safe(c_mean)
+                            if ok:
+                                protos[c_idx] = u_vec
                 self.prototypes = protos
             if self.prototypes is not None and self.prototypes.size > 0 and len(arr) > 0:
                 sims = [self.compute_prototype_similarity(row) for row in arr]
@@ -2956,10 +2993,29 @@ class UtilityCalibrator:
         self.temperature = max(1e-3, temp_f)
         self.ladder_mode = bool(ladder_mode)
 
+        c_scale = float(np.max(np.abs(self.cost_matrix)))
+        self._cost_scale: float = c_scale
+        self._scaled_cost_matrix: np.ndarray = (
+            (self.cost_matrix / c_scale)
+            if c_scale > 0.0
+            else np.zeros_like(self.cost_matrix, dtype=np.float64)
+        )
         self.c_esc = float(np.max(self.cost_matrix[self.safe_action]))
         self.B = float(np.max(self.cost_matrix))
-        self.denom = max(1e-9, self.B - self.c_esc)
-        self.L = np.maximum(0.0, self.cost_matrix - self.c_esc) / self.denom
+        self._c_esc_scaled: float = float(np.max(self._scaled_cost_matrix[self.safe_action]))
+        b_scaled = float(np.max(self._scaled_cost_matrix))
+        span_scaled = b_scaled - self._c_esc_scaled
+        with np.errstate(over="ignore", invalid="ignore"):
+            raw_span = self.B - self.c_esc
+        self.denom = (
+            float(raw_span)
+            if (math.isfinite(raw_span) and raw_span > 1e-9)
+            else (float("inf") if not math.isfinite(raw_span) else max(1e-9, float(raw_span)))
+        )
+        if span_scaled <= 0.0:
+            self.L = np.zeros_like(self._scaled_cost_matrix, dtype=np.float64)
+        else:
+            self.L = np.maximum(0.0, self._scaled_cost_matrix - self._c_esc_scaled) / span_scaled
 
         self.lam_crc: float = -1.0
         self._is_fitted: bool = False
@@ -3097,8 +3153,11 @@ class UtilityCalibrator:
             return acts
         v_idx = np.flatnonzero(valid)
         with np.errstate(over="ignore", invalid="ignore"):
-            costs_v = probs_2d[v_idx] @ self.cost_matrix.T
-            eh_v = probs_2d[v_idx] @ self.L.T
+            p_rows = probs_2d[v_idx]
+            row_sums = np.sum(p_rows, axis=1, keepdims=True)
+            p_norm = np.where(np.abs(row_sums - 1.0) > 1e-9, p_rows / row_sums, p_rows)
+            costs_v = p_norm @ self._scaled_cost_matrix.T
+            eh_v = p_norm @ self.L.T
         row_fin = np.all(np.isfinite(costs_v), axis=1) & np.all(np.isfinite(eh_v), axis=1)
         if not bool(np.any(row_fin)):
             return acts
@@ -3160,7 +3219,7 @@ class UtilityCalibrator:
             lam_f = float(lam)
             acts = self._apply_policy(p_cal, lam_f)
             if self.loss_mode == "indicator":
-                losses = (self.cost_matrix[acts, y_arr] > self.c_esc + 1e-12).astype(np.float64)
+                losses = (self._scaled_cost_matrix[acts, y_arr] > self._c_esc_scaled + 1e-12).astype(np.float64)
             else:
                 losses = self.L[acts, y_arr]
             env_losses = np.maximum(env_losses, losses)
@@ -3243,7 +3302,10 @@ class UtilityCalibrator:
             if bool(np.any(valid)):
                 v_idx = np.flatnonzero(valid)
                 with np.errstate(over="ignore", invalid="ignore"):
-                    costs_v = p2[v_idx] @ self.cost_matrix.T
+                    p_rows = p2[v_idx]
+                    row_sums = np.sum(p_rows, axis=1, keepdims=True)
+                    p_norm = np.where(np.abs(row_sums - 1.0) > 1e-9, p_rows / row_sums, p_rows)
+                    costs_v = p_norm @ self._scaled_cost_matrix.T
                 c_fin = np.all(np.isfinite(costs_v), axis=1)
                 if bool(np.any(c_fin)):
                     out[v_idx[c_fin]] = np.argmin(costs_v[c_fin], axis=1).astype(np.int64)

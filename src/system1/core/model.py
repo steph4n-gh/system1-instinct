@@ -636,6 +636,181 @@ def _2d_matmul_layout_sig(a: np.ndarray) -> Optional[Tuple[int, int, int]]:
     return (int(a.ctypes.data % 64), s0, s1)
 
 
+def _needs_2d_layout_preservation(arr: Any) -> bool:
+    """Return True when a non-empty 2D numeric array uses non-C/F strides or sub-16B alignment."""
+    return bool(
+        isinstance(arr, np.ndarray)
+        and arr.ndim == 2
+        and arr.size > 0
+        and arr.dtype.kind in ("b", "i", "u", "f", "c")
+        and (
+            (not arr.flags["C_CONTIGUOUS"] and not arr.flags["F_CONTIGUOUS"])
+            or int(arr.ctypes.data % 16) != 0
+        )
+    )
+
+
+def _validate_2d_layout_cloneable(
+    arr: np.ndarray,
+    target: np.dtype,
+    *,
+    max_extra_bytes: Optional[int] = None,
+) -> Optional[Tuple[int, int, int, int, int]]:
+    """Validate 2D strided/unaligned clone bounds and disjointness; return layout tuple or None."""
+    if not (
+        arr.ndim == 2
+        and arr.size > 0
+        and target.kind in ("b", "i", "u", "f", "c")
+        and (
+            (not arr.flags["C_CONTIGUOUS"] and not arr.flags["F_CONTIGUOUS"])
+            or int(arr.ctypes.data % 16) != 0
+        )
+    ):
+        return None
+    K, D = int(arr.shape[0]), int(arr.shape[1])
+    src_item = int(arr.dtype.itemsize)
+    dst_item = int(target.itemsize)
+    if src_item <= 0 or dst_item <= 0 or (int(arr.strides[0]) % src_item) != 0 or (int(arr.strides[1]) % src_item) != 0:
+        raise ValueError(
+            f"Unsupported 2D strided array layout: incompatible strides {arr.strides} for itemsize {src_item}"
+        )
+    s0 = 0 if K == 1 else (int(arr.strides[0]) // src_item) * dst_item
+    s1 = 0 if D == 1 else (int(arr.strides[1]) // src_item) * dst_item
+    min_off = min(0, (K - 1) * s0) + min(0, (D - 1) * s1)
+    max_off = max(0, (K - 1) * s0) + max(0, (D - 1) * s1)
+    span_bytes = (max_off - min_off) + dst_item
+    nbytes_dst = K * D * dst_item
+    max_allowed_span = min(_MAX_STRIDED_CLONE_SPAN_BYTES, max(1 << 20, 64 * nbytes_dst))
+    if span_bytes <= 0 or span_bytes < nbytes_dst or span_bytes > max_allowed_span:
+        raise ValueError(
+            f"Unsupported 2D strided array layout: span {span_bytes} exceeds limit {max_allowed_span}"
+        )
+    extra_bytes = span_bytes - nbytes_dst
+    if max_extra_bytes is not None and extra_bytes > int(max_extra_bytes):
+        raise ValueError(
+            f"Unsupported 2D strided array layout: extra span {extra_bytes} exceeds budget {int(max_extra_bytes)}"
+        )
+    a0, a1 = abs(s0), abs(s1)
+    aliased = (K > 1 and a0 == 0) or (D > 1 and a1 == 0)
+    if not aliased and K > 1 and D > 1:
+        g = math.gcd(a0, a1)
+        aliased = (a1 // g) < K and (a0 // g) < D
+    if aliased:
+        raise ValueError("Unsupported 2D strided array layout: weight elements alias")
+    return (int(arr.ctypes.data % 64), s0, s1, min_off, span_bytes)
+
+
+def _alloc_strided_2d_array(
+    shape: Tuple[int, int],
+    target: np.dtype,
+    mod64: int,
+    s0: int,
+    s1: int,
+    min_off: int,
+    span_bytes: int,
+) -> np.ndarray:
+    """Allocate a writable 2D array with exact byte strides and mod-64 base alignment."""
+    dst_item = int(target.itemsize)
+    raw_buf = np.zeros(span_bytes + 128, dtype=np.uint8)
+    base_start = -min_off
+    cur_mod = (int(raw_buf.ctypes.data) + base_start) % 64
+    origin = base_start + ((mod64 - cur_mod) % 64)
+    anchor = raw_buf[origin : origin + dst_item].view(target)
+    return np.lib.stride_tricks.as_strided(
+        anchor,
+        shape=shape,
+        strides=(s0, s1),
+        writeable=True,
+    )
+
+
+def _reconstruct_2d_layout_array(
+    arr: np.ndarray,
+    layout_vec: Any,
+    *,
+    max_extra_bytes: Optional[int] = None,
+) -> np.ndarray:
+    """Restore exact 2D byte strides and mod-64 alignment for a validated serialized matrix."""
+    src = np.asarray(arr)
+    lv = np.asarray(layout_vec)
+    if lv.dtype != np.dtype(np.int64) or lv.shape != (3,):
+        raise ValueError(f"Invalid snapshot raw_W_layout spec: dtype={lv.dtype}, shape={lv.shape}")
+    mod64 = int(lv[0])
+    s0 = int(lv[1])
+    s1 = int(lv[2])
+    if not (0 <= mod64 < 64) or src.ndim != 2 or src.size == 0:
+        raise ValueError(f"Invalid snapshot raw_W_layout parameters: mod64={mod64}, shape={src.shape}")
+    K, D = int(src.shape[0]), int(src.shape[1])
+    itemsize = int(src.dtype.itemsize)
+    if itemsize <= 0 or (s0 % itemsize) != 0 or (s1 % itemsize) != 0:
+        raise ValueError(f"Incompatible raw_W_layout strides ({s0}, {s1}) for itemsize {itemsize}")
+    if (K == 1 and s0 != 0) or (D == 1 and s1 != 0):
+        raise ValueError(f"Invalid singleton stride in raw_W_layout: shape={src.shape}, strides=({s0}, {s1})")
+    min_off = min(0, (K - 1) * s0) + min(0, (D - 1) * s1)
+    max_off = max(0, (K - 1) * s0) + max(0, (D - 1) * s1)
+    span_bytes = (max_off - min_off) + itemsize
+    max_allowed_span = min(_MAX_STRIDED_CLONE_SPAN_BYTES, max(1 << 20, 64 * int(src.nbytes)))
+    if span_bytes <= 0 or span_bytes < int(src.nbytes) or span_bytes > max_allowed_span:
+        raise ValueError(f"Snapshot raw_W_layout span {span_bytes} exceeds limit {max_allowed_span}")
+    extra_bytes = span_bytes - int(src.nbytes)
+    if max_extra_bytes is not None and extra_bytes > int(max_extra_bytes):
+        raise ValueError(
+            f"Snapshot raw_W_layout extra span {extra_bytes} exceeds runtime budget margin {int(max_extra_bytes)}"
+        )
+    a0, a1 = abs(s0), abs(s1)
+    aliased = (K > 1 and a0 == 0) or (D > 1 and a1 == 0)
+    if not aliased and K > 1 and D > 1:
+        g = math.gcd(a0, a1)
+        aliased = (a1 // g) < K and (a0 // g) < D
+    if aliased:
+        raise ValueError("Snapshot raw_W_layout aliases weight elements")
+    out = _alloc_strided_2d_array((K, D), src.dtype, mod64, s0, s1, min_off, span_bytes)
+    np.copyto(out, src)
+    if not np.array_equal(out, src):
+        raise ValueError("Snapshot raw_W_layout aliases distinct weight elements")
+    out.setflags(write=False)
+    return out
+
+
+def _is_active_zero_head(field_def: Any, weights: Any, biases: Any) -> bool:
+    """Return True when the active row(s) of a head are all zeros."""
+    w_arr = np.asarray(weights)
+    b_arr = np.asarray(biases).reshape(-1)
+    if isinstance(field_def, (BooleanField, ScoreField)):
+        return bool(not np.any(w_arr[:1]) and not np.any(b_arr[:1]))
+    return bool(not np.any(w_arr) and not np.any(b_arr))
+
+
+def _validate_head_weight_bias_shapes(
+    field_def: Any,
+    weights: np.ndarray,
+    biases: np.ndarray,
+    dimension: int,
+    field_name: str = "",
+) -> None:
+    """Enforce consistent (weights, biases) shape contract across all runtimes and artifacts."""
+    label = f"Field head {field_name!r}" if field_name else f"Field head {getattr(field_def, 'name', '')!r}"
+    if weights.ndim != 2 or weights.shape[1] != int(dimension):
+        raise ValueError(
+            f"{label} shape mismatch: expected (*, {int(dimension)}), got weights={weights.shape}, biases={biases.shape}"
+        )
+    if isinstance(field_def, (BooleanField, ScoreField)):
+        if weights.shape[0] not in (1, 2) or biases.ndim != 1 or biases.shape not in ((1,), (weights.shape[0],)):
+            raise ValueError(
+                f"{label} shape mismatch: expected ((1|2), {int(dimension)}) and (1|K,), got weights={weights.shape}, biases={biases.shape}"
+            )
+    elif hasattr(field_def, "options"):
+        k_opts = len(field_def.options)
+        if weights.shape[0] != k_opts or biases.ndim != 1 or biases.shape != (k_opts,):
+            raise ValueError(
+                f"{label} shape mismatch: expected ({k_opts}, {int(dimension)}) and ({k_opts},), got weights={weights.shape}, biases={biases.shape}"
+            )
+    elif biases.ndim != 1 or biases.shape != (weights.shape[0],):
+        raise ValueError(
+            f"{label} shape mismatch: got weights={weights.shape}, biases={biases.shape}"
+        )
+
+
 def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
     """Return an owned read-only copy preserving 2D strides, base alignment, and Fortran contiguity."""
     raw_in = np.asarray(arr)
@@ -649,32 +824,18 @@ def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
             or int(raw_in.ctypes.data % 16) != 0
         )
     ):
-        src = raw_in if raw_in.dtype == target else raw_in.astype(target, order="K", copy=False)
-        K, D = int(src.shape[0]), int(src.shape[1])
-        itemsize = int(target.itemsize)
-        s0 = 0 if K == 1 else int(src.strides[0])
-        s1 = 0 if D == 1 else int(src.strides[1])
-        min_off = min(0, (K - 1) * s0) + min(0, (D - 1) * s1)
-        max_off = max(0, (K - 1) * s0) + max(0, (D - 1) * s1)
-        span_bytes = (max_off - min_off) + itemsize
-        max_allowed_span = min(_MAX_STRIDED_CLONE_SPAN_BYTES, max(1 << 20, 64 * int(src.nbytes)))
-        if (
-            itemsize > 0
-            and span_bytes <= max_allowed_span
-            and (s0 % itemsize == 0)
-            and (s1 % itemsize == 0)
-        ):
-            target_mod = int(src.ctypes.data % 64)
-            raw_buf = np.zeros(span_bytes + 128, dtype=np.uint8)
-            base_start = -min_off
-            cur_mod = (int(raw_buf.ctypes.data) + base_start) % 64
-            origin = base_start + ((target_mod - cur_mod) % 64)
-            anchor = raw_buf[origin : origin + itemsize].view(target)
-            out = np.lib.stride_tricks.as_strided(
-                anchor,
-                shape=(K, D),
-                strides=(s0, s1),
-                writeable=True,
+        clone_spec = _validate_2d_layout_cloneable(raw_in, target)
+        if clone_spec is not None:
+            target_mod, s0, s1, min_off, span_bytes = clone_spec
+            src = raw_in if raw_in.dtype == target else raw_in.astype(target, order="K", copy=False)
+            out = _alloc_strided_2d_array(
+                (int(raw_in.shape[0]), int(raw_in.shape[1])),
+                target,
+                target_mod,
+                s0,
+                s1,
+                min_off,
+                span_bytes,
             )
             np.copyto(out, src)
             out.setflags(write=False)
@@ -1591,13 +1752,38 @@ class DecisionFieldHead:
         clear_exemplar_bank: bool = True,
     ) -> None:
         """Updates head weights and biases, synchronizing MLX buffers if active."""
+        raw_w_in = np.asarray(weights)
+        default_rows = raw_w_in.shape[0] if raw_w_in.ndim == 2 else 1
+        raw_b_in = (
+            np.asarray(biases)
+            if biases is not None
+            else np.zeros(default_rows, dtype=np.float32)
+        )
+        _validate_head_weight_bias_shapes(
+            self.field_def,
+            raw_w_in,
+            raw_b_in,
+            self.dimension,
+            getattr(self.field_def, "name", ""),
+        )
+        f32_dt = np.dtype(np.float32)
+        clone_spec = _validate_2d_layout_cloneable(raw_w_in, f32_dt)
         with np.errstate(over="ignore", invalid="ignore"):
-            w_f32 = np.asarray(weights, dtype=np.float32)
-            b_f32 = (
-                np.asarray(biases, dtype=np.float32)
-                if biases is not None
-                else np.zeros(w_f32.shape[0], dtype=np.float32)
-            )
+            if clone_spec is not None and raw_w_in.dtype != f32_dt:
+                target_mod, s0, s1, min_off, span_bytes = clone_spec
+                w_f32 = _alloc_strided_2d_array(
+                    (int(raw_w_in.shape[0]), int(raw_w_in.shape[1])),
+                    f32_dt,
+                    target_mod,
+                    s0,
+                    s1,
+                    min_off,
+                    span_bytes,
+                )
+                np.copyto(w_f32, np.asarray(raw_w_in, dtype=np.float32))
+            else:
+                w_f32 = np.asarray(raw_w_in, dtype=np.float32)
+            b_f32 = np.asarray(raw_b_in, dtype=np.float32)
         if not bool(np.all(np.isfinite(w_f32))) or not bool(np.all(np.isfinite(b_f32))):
             raise ValueError("Head weights and biases must be finite in float32")
         if clear_exemplar_bank:
@@ -1667,7 +1853,7 @@ class DecisionFieldHead:
             self.cross_covariance = np.asarray(B, dtype=np.float32)
         else:
             w_mat = self.weights  # shape (K, D)
-            b_vec = self.biases.reshape(-1, 1)  # shape (K, 1)
+            b_vec = np.broadcast_to(self.biases.reshape(-1, 1), (w_mat.shape[0], 1))  # shape (K, 1)
             w_aug = np.hstack([w_mat, b_vec])  # shape (K, D+1)
             self.cross_covariance = (self.regularization * w_aug.T).astype(np.float32)
 
@@ -2070,6 +2256,8 @@ class DecisionFieldHead:
         y = np.asarray(y_target, dtype=np.float32).ravel()
         if not np.all(np.isfinite(y)):
             raise ValueError("y_target contains NaN or Inf non-finite values")
+        if isinstance(self.field_def, (BooleanField, ScoreField)) and len(y) == 1 and K == 2:
+            y = np.array([y[0], -y[0] if isinstance(self.field_def, BooleanField) else 0.0], dtype=np.float32)
         if len(y) != K:
             raise ValueError(f"Expected target vector y of length {K}, got {len(y)}")
 
@@ -2185,7 +2373,8 @@ class DecisionFieldHead:
             err = (y_step - z_curr).astype(np.float32)
             new_W = self.weights + np.multiply.outer(err, gain[:D])
             if gain[D] != 0.0:
-                new_b = self.biases + err * gain[D]
+                b_curr = np.broadcast_to(self.biases.reshape(-1), (K,))
+                new_b = b_curr + err * gain[D]
             else:
                 new_b = self.biases
         else:
@@ -2346,6 +2535,16 @@ class DecisionFieldHead:
         concept_embedding: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Compute raw logits (including two-stage coarse-to-fine routing when active)."""
+        w_cur = np.asarray(self.weights)
+        b_cur = np.asarray(self.biases)
+        _validate_head_weight_bias_shapes(
+            self.field_def,
+            w_cur,
+            b_cur,
+            self.dimension,
+            getattr(self.field_def, "name", ""),
+        )
+        _validate_2d_layout_cloneable(w_cur, np.dtype(w_cur.dtype))
         emb = np.asarray(embedding, dtype=np.float32)
         single = emb.ndim == 1
         if single:
@@ -3582,12 +3781,12 @@ class PackedMultiQuestionKernel:
                 raw_b_full = np.asarray(head.biases).reshape(-1)
                 if (
                     raw_w_full.ndim != 2
-                    or raw_w_full.shape[0] < 1
+                    or raw_w_full.shape[0] not in (1, 2)
                     or raw_w_full.shape[1] != dim
                     or raw_b_full.shape[0] not in (1, raw_w_full.shape[0])
                 ):
                     raise ValueError(
-                        f"Boolean head {fname!r} shape mismatch: expected (>=1, {dim}) and (1|K,), got {raw_w_full.shape} and {raw_b_full.shape}"
+                        f"Boolean head {fname!r} shape mismatch: expected ((1|2), {dim}) and (1|K,), got {raw_w_full.shape} and {raw_b_full.shape}"
                     )
                 raw_w_arr = raw_w_full[:1]
                 raw_b_arr = raw_b_full[:1]
@@ -3660,12 +3859,12 @@ class PackedMultiQuestionKernel:
                 raw_b_full = np.asarray(head.biases).reshape(-1)
                 if (
                     raw_w_full.ndim != 2
-                    or raw_w_full.shape[0] < 1
+                    or raw_w_full.shape[0] not in (1, 2)
                     or raw_w_full.shape[1] != dim
                     or raw_b_full.shape[0] not in (1, raw_w_full.shape[0])
                 ):
                     raise ValueError(
-                        f"Score head {fname!r} shape mismatch: expected (>=1, {dim}) and (1|K,), got {raw_w_full.shape} and {raw_b_full.shape}"
+                        f"Score head {fname!r} shape mismatch: expected ((1|2), {dim}) and (1|K,), got {raw_w_full.shape} and {raw_b_full.shape}"
                     )
                 raw_w_arr = raw_w_full[:1]
                 raw_b_arr = raw_b_full[:1]

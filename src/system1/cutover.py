@@ -319,8 +319,12 @@ class AutoCutoverLifecycle:
                     return False
                 if not (math.isfinite(p_f) and math.isfinite(t_f)):
                     return False
-                span = max(1e-9, float(f_def.max_value) - float(f_def.min_value))
-                if abs(p_f - t_f) > float(self.config.score_tolerance) * span:
+                half_span = 0.5 * float(f_def.max_value) - 0.5 * float(f_def.min_value)
+                half_diff = abs(0.5 * p_f - 0.5 * t_f)
+                if half_span <= 0.0:
+                    if p_f != t_f:
+                        return False
+                elif half_diff > float(self.config.score_tolerance) * half_span:
                     return False
             elif isinstance(f_def, BooleanField):
                 if bool(p_val) != bool(t_val):
@@ -345,18 +349,20 @@ class AutoCutoverLifecycle:
                 continue
             f_def = self.schema.fields.get(fname)
             if isinstance(f_def, ScoreField):
-                span = max(1e-9, float(f_def.max_value) - float(f_def.min_value))
+                half_span = 0.5 * float(f_def.max_value) - 0.5 * float(f_def.min_value)
                 conf = float(res.confidences.get(fname, 0.0))
                 rcp = reg_preds.get(fname)
                 alpha_eff = max(1e-6, float(getattr(res, "alpha", self.config.alpha_target)))
                 if (
-                    rcp is not None
+                    half_span > 0.0
+                    and rcp is not None
                     and getattr(rcp, "is_calibrated", False)
                     and len(getattr(rcp, "residuals", ())) >= math.ceil(1.0 / alpha_eff) - 1
                 ):
                     iv = rcp.predict_interval(float(res.values[fname]), alpha=alpha_eff)
-                    half_w_margin = max(0.0, 1.0 - 0.5 * float(iv.margin) / span)
-                    margins.append(min(conf, half_w_margin) if iv.margin < span else conf)
+                    half_iv = 0.5 * float(iv.margin)
+                    half_w_margin = max(0.0, 1.0 - 0.5 * (half_iv / half_span))
+                    margins.append(min(conf, half_w_margin) if half_iv < half_span else conf)
                 else:
                     margins.append(conf)
             else:
