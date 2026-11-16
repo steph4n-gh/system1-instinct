@@ -261,6 +261,7 @@ class AutoCutoverLifecycle:
             min_calibration_lessons=1_000_000,
             min_override_corroborations=2,
         )
+        self._owned_engine_ids: Set[int] = {id(self.engine)}
         self.aci = AdaptiveConformalTracker(
             alpha_target=self.config.alpha_target,
             gamma=0.025,
@@ -921,6 +922,7 @@ class AutoCutoverLifecycle:
         self.eta_hat = next_eta_hat
         sub_eng.aci_tracker = self.aci
         self.engine = sub_eng
+        self._owned_engine_ids.add(id(sub_eng))
         self.selective_cal = sel_cal
         self.active_tau = tau
         self.tau_source = tau_src
@@ -1247,6 +1249,7 @@ class AutoCutoverLifecycle:
             "cutover_events": [dict(ev) for ev in self.cutover_events],
             "recalibrate_events": [dict(ev) for ev in self.recalibrate_events],
             "compile_time_total_ms": self.compile_time_total_ms,
+            "_owned_engine_ids": set(self._owned_engine_ids),
         }
 
     def _restore_mutation_state_locked(self, snap: Dict[str, Any]) -> None:
@@ -1313,6 +1316,7 @@ class AutoCutoverLifecycle:
         self.cutover_events = snap["cutover_events"]
         self.recalibrate_events = snap["recalibrate_events"]
         self.compile_time_total_ms = snap["compile_time_total_ms"]
+        self._owned_engine_ids = snap["_owned_engine_ids"]
 
     def observe_teacher(
         self,

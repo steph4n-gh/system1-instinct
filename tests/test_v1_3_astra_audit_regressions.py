@@ -20879,5 +20879,573 @@ def test_astra_48_round35_regressions() -> None:
         assert "use_cache" in ref_g
 
 
+def _r36_mod_invoke(fn: Callable[[], Any]) -> Any:
+    return fn()
+
+
+def _r36_mod_pack_tuple(fn: Any) -> Tuple[Any, ...]:
+    return (fn,)
+
+
+def _r36_mod_pack_dict(fn: Any) -> Dict[str, Any]:
+    return {"f": fn}
+
+
+def _r36_mod_passthrough(*, fn: Any) -> Any:
+    return fn
+
+
+def _r36_mod_make_kw_extract(kw: Dict[str, Any]) -> Callable[[], Tuple[bool, Dict[str, Any]]]:
+    def _run() -> Tuple[bool, Dict[str, Any]]:
+        copied = dict(kw)
+        return bool(copied.pop("use_cache", True)), copied
+
+    return _run
+
+
+def _r36_mod_make_split(kw: Dict[str, Any]) -> Dict[str, Callable[[], Any]]:
+    return {
+        "live": lambda: 42,
+        "dead": _r36_mod_make_kw_extract(kw),
+    }
+
+
+def test_astra_49_round36_regressions() -> None:
+    """Round-36 regressions covering sequence mutation tracking, higher-order calls and CALL_FUNCTION_EX, fallback recompilation ownership, indicator CRC scaling, dict key closure isolation, and per-request fallback canary transactions."""
+    from collections.abc import Mapping
+    from typing import Optional, Tuple
+
+    from system1.calibration import UtilityCalibrator
+    from system1.core.model import SystemOneModel
+    from system1.core.schema import ChoiceField, DecisionSchema
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig, CutoverState
+    from system1.engine import SystemOneEngine, _inspect_varkw_wrapper
+    from system1.fallback import BoundedReviewFallback
+
+    class _R36CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="First")
+        g = ChoiceField(options=("a", "b"), description="Second")
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return values
+
+    class _R36SimpleSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="Single choice")
+
+    class _R36StrictPosModel:
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            self._inner = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            )
+            for h in self._inner.heads.values():
+                h.set_weights(np.zeros((2, dim), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+            self.schema = self._inner.schema
+            self.projector = self._inner.projector
+            self.dimension = self._inner.dimension
+            self.heads = self._inner.heads
+
+        def encode(self, prompt: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
+            return self._inner.encode(prompt, recency_weighted=recency_weighted)
+
+        def forward_single(self, prompt: str, embedding: Any = None) -> Any:
+            return self._inner.forward_single(prompt, embedding=embedding)
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            return self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+
+    def _keys(fn: Any) -> set[str]:
+        return set(_inspect_varkw_wrapper(fn, frozenset({"use_cache"}))[0])
+
+    def _assert_learn_rejected(model_cls: Any) -> None:
+        m = model_cls(_R36CoupledSchema(), 16)
+        eng = SystemOneEngine(
+            _R36CoupledSchema(),
+            model=m,
+            use_cache=False,
+            strict_mode=True,
+            min_calibration_lessons=1_000_000,
+        )
+        r0 = eng.decide("p", use_cache=False)
+        assert r0.values == {"f": "a", "g": "a"}
+        v_before = int(eng.model_version)
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng.learn("p", {"f": "b"})
+        assert int(eng.model_version) == v_before
+
+    # ------------------------------------------------------------------
+    # R36-1: Sequence mutations (index set, insert, slice assign, pop).
+    # ------------------------------------------------------------------
+    def _seq_subscr(**kwargs: Any) -> Any:
+        seq: List[Any] = [None]
+        seq[0] = lambda: kwargs.pop("use_cache", True)
+        return seq[0]()
+
+    def _seq_insert(**kwargs: Any) -> Any:
+        seq: List[Any] = [None]
+        seq.insert(0, lambda: kwargs.pop("use_cache", True))
+        return seq[0]()
+
+    def _seq_slice(**kwargs: Any) -> Any:
+        seq: List[Any] = [None]
+        seq[:] = [lambda: kwargs.pop("use_cache", True)]
+        return seq[0]()
+
+    def _seq_pop(**kwargs: Any) -> Any:
+        seq: List[Any] = [None]
+        seq[0] = lambda: kwargs.pop("use_cache", True)
+        return seq.pop(0)()
+
+    for seq_fn in (_seq_subscr, _seq_insert, _seq_slice, _seq_pop):
+        assert _keys(seq_fn) == {"use_cache"}
+
+    class _R36SeqSubModel(_R36StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq: List[Any] = [None]
+            seq[0] = lambda: (bool(kwargs.pop("use_cache", True)), kwargs)
+            cached, rest = seq[0]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R36SeqInsertModel(_R36StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq: List[Any] = [None]
+            seq.insert(0, lambda: (bool(kwargs.pop("use_cache", True)), kwargs))
+            cached, rest = seq[0]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R36SeqSliceModel(_R36StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq: List[Any] = [None]
+            seq[:] = [lambda: (bool(kwargs.pop("use_cache", True)), kwargs)]
+            cached, rest = seq[0]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    for seq_cls in (_R36SeqSubModel, _R36SeqInsertModel, _R36SeqSliceModel):
+        _assert_learn_rejected(seq_cls)
+
+    # ------------------------------------------------------------------
+    # R36-2: Higher-order calls, returned container param substitution,
+    # and CALL_FUNCTION_EX keyword/positional propagation.
+    # ------------------------------------------------------------------
+    class _R36HelperClass:
+        @staticmethod
+        def invoke(fn: Callable[[], Any]) -> Any:
+            return fn()
+
+        @classmethod
+        def pack_dict(cls, fn: Any) -> Dict[str, Any]:
+            return {"f": fn}
+
+        def pack_tuple(self, fn: Any) -> Tuple[Any, ...]:
+            return (fn,)
+
+    helper_inst = _R36HelperClass()
+
+    def _ho_invoke_local(**kwargs: Any) -> Any:
+        def invoke(fn: Callable[[], Any]) -> Any:
+            return fn()
+
+        return invoke(lambda: kwargs.pop("use_cache", True))
+
+    def _ho_invoke_mod(**kwargs: Any) -> Any:
+        return _r36_mod_invoke(lambda: kwargs.pop("use_cache", True))
+
+    def _ho_invoke_cls(**kwargs: Any) -> Any:
+        return _R36HelperClass.invoke(lambda: kwargs.pop("use_cache", True))
+
+    def _ho_pack_tuple_local(**kwargs: Any) -> Any:
+        def pack(fn: Any) -> Tuple[Any, ...]:
+            return (fn,)
+
+        return pack(lambda: kwargs.pop("use_cache", True))[0]()
+
+    def _ho_pack_tuple_mod(**kwargs: Any) -> Any:
+        return _r36_mod_pack_tuple(lambda: kwargs.pop("use_cache", True))[0]()
+
+    def _ho_pack_tuple_inst(**kwargs: Any) -> Any:
+        return helper_inst.pack_tuple(lambda: kwargs.pop("use_cache", True))[0]()
+
+    def _ho_pack_dict_local(**kwargs: Any) -> Any:
+        def pack(fn: Any) -> Dict[str, Any]:
+            return {"f": fn}
+
+        return pack(lambda: kwargs.pop("use_cache", True))["f"]()
+
+    def _ho_pack_dict_mod(**kwargs: Any) -> Any:
+        return _r36_mod_pack_dict(lambda: kwargs.pop("use_cache", True))["f"]()
+
+    def _ho_pack_dict_cls(**kwargs: Any) -> Any:
+        return _R36HelperClass.pack_dict(lambda: kwargs.pop("use_cache", True))["f"]()
+
+    def _ho_call_ex_lit(**kwargs: Any) -> Any:
+        return _r36_mod_passthrough(**{"fn": lambda: kwargs.pop("use_cache", True)})()
+
+    def _ho_call_ex_dyn(**kwargs: Any) -> Any:
+        d_ex = {"fn": lambda: kwargs.pop("use_cache", True)}
+        return _r36_mod_passthrough(**d_ex)()
+
+    for ho_fn in (
+        _ho_invoke_local,
+        _ho_invoke_mod,
+        _ho_invoke_cls,
+        _ho_pack_tuple_local,
+        _ho_pack_tuple_mod,
+        _ho_pack_tuple_inst,
+        _ho_pack_dict_local,
+        _ho_pack_dict_mod,
+        _ho_pack_dict_cls,
+        _ho_call_ex_lit,
+        _ho_call_ex_dyn,
+    ):
+        assert _keys(ho_fn) == {"use_cache"}
+
+    def _ho_benign(**kwargs: Any) -> Any:
+        def invoke(fn: Callable[[], Any]) -> Any:
+            return fn()
+
+        return invoke(lambda: 42)
+
+    assert _keys(_ho_benign) == set()
+
+    class _R36InvokeModel(_R36StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(fn: Callable[[], Any]) -> Any:
+                return fn()
+
+            cached, rest = invoke(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R36PackTupleModel(_R36StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pack(fn: Any) -> Tuple[Any, ...]:
+                return (fn,)
+
+            cached, rest = pack(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))[0]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R36PackDictModel(_R36StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pack(fn: Any) -> Dict[str, Any]:
+                return {"f": fn}
+
+            cached, rest = pack(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))["f"]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R36CallExModel(_R36StrictPosModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r36_mod_passthrough(
+                **{"fn": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)}
+            )()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    for ho_cls in (_R36InvokeModel, _R36PackTupleModel, _R36PackDictModel, _R36CallExModel):
+        _assert_learn_rejected(ho_cls)
+
+    # ------------------------------------------------------------------
+    # R36-3: BoundedReviewFallback cutover ownership persists across recompilation.
+    # ------------------------------------------------------------------
+    def _trained_lc(n: int, milestones: Tuple[int, ...]) -> AutoCutoverLifecycle:
+        lc = AutoCutoverLifecycle(
+            _R36SimpleSchema(),
+            config=CutoverConfig(
+                milestones=milestones,
+                k_min=2,
+                canary_rate=1.0,
+                sparse_dim=128,
+                dense_dim=32,
+                enable_quarantine=False,
+            ),
+        )
+        for i in range(n):
+            prefix = "accept approve pleasant" if i % 2 == 0 else "reject deny dangerous"
+            lc.observe_teacher(
+                f"{prefix} detail number {i}",
+                {"f": "a" if i % 2 == 0 else "b"},
+            )
+        return lc
+
+    lc_f3 = _trained_lc(128, (128, 129))
+    pre_compile_engine = lc_f3.engine
+    calls_f3: List[Any] = []
+    fb_f3 = BoundedReviewFallback(
+        pre_compile_engine,
+        review_fn=lambda p: (calls_f3.append(p) or {"f": "b"}),
+        auto_compile_lifecycle=lc_f3,
+        auto_record_lessons=False,
+    )
+    lc_f3.observe_teacher("accept approve pleasant detail number 128", {"f": "a"})
+    assert (fb_f3.network is lc_f3.engine) is False
+    res_f3 = fb_f3.decide("accept approve pleasant detail number 0")
+    assert res_f3["used_fallback"] is True
+    assert res_f3["values"] == {"f": "b"}
+    assert len(calls_f3) == 1
+    assert len(lc_f3._pending_canaries) == 0
+
+    calls_f3_post: List[Any] = []
+    fb_f3_post = BoundedReviewFallback(
+        pre_compile_engine,
+        review_fn=lambda p: (calls_f3_post.append(p) or {"f": "b"}),
+        auto_compile_lifecycle=lc_f3,
+        auto_record_lessons=False,
+    )
+    assert (fb_f3_post.network is lc_f3.engine) is False
+    res_f3_post = fb_f3_post.decide("accept approve pleasant detail number 0")
+    assert res_f3_post["used_fallback"] is True
+    assert len(calls_f3_post) == 1
+    assert len(lc_f3._pending_canaries) == 0
+
+    # Negative control: external unrelated engine stays independent during cold start.
+    lc_collecting = AutoCutoverLifecycle(
+        _R36SimpleSchema(),
+        config=CutoverConfig(milestones=(64,), k_min=2, enable_quarantine=False),
+    )
+    assert lc_collecting.state == CutoverState.COLD_START_ABSTAIN
+    ext_calls: List[Any] = []
+    class _ExternalDecider:
+        def decide(self, prompt: Any) -> Dict[str, Any]:
+            return {"f": "a", "values": {"f": "a"}, "review": False}
+
+    fb_ext = BoundedReviewFallback(
+        _ExternalDecider(),
+        review_fn=lambda p: (ext_calls.append(p) or {"f": "b"}),
+        auto_compile_lifecycle=lc_collecting,
+        auto_record_lessons=False,
+    )
+    res_ext = fb_ext.decide("hello")
+    assert res_ext["used_fallback"] is False
+    assert res_ext["values"] == {"f": "a"}
+    assert len(ext_calls) == 0
+
+    # ------------------------------------------------------------------
+    # R36-4: Indicator-mode CRC compares unscaled costs without 1e-12 masking.
+    # ------------------------------------------------------------------
+    p_ind = np.tile([1.0, 0.0], (100, 1))
+    y_ind = np.ones(100, dtype=np.int64)
+    cal_dom = UtilityCalibrator(
+        [[0.0, 2.0], [1.0, 0.0], [1.0, 1.0], [1e13, 1e13]],
+        safe_action=2,
+        alpha=0.05,
+        loss_mode="indicator",
+    )
+    cal_dom.fit_crc(p_ind, y_ind)
+    acts_dom = cal_dom.predict(p_ind)
+    assert cal_dom.lam_crc == -1.0
+    assert cal_dom.is_vacuous is True
+    assert np.all(acts_dom == 2)
+    assert float(np.mean(cal_dom.cost_matrix[acts_dom, y_ind] > cal_dom.c_esc)) == 0.0
+
+    # ------------------------------------------------------------------
+    # R36-5: Per-key dictionary closure isolation (no cross-key leaks).
+    # ------------------------------------------------------------------
+    def _dict_subscr_live(**kwargs: Any) -> Any:
+        box = {"live": lambda: 42, "dead": lambda: kwargs.get("use_cache")}
+        return box["live"]()
+
+    def _dict_get_live(**kwargs: Any) -> Any:
+        box = {"live": lambda: 42, "dead": lambda: kwargs.get("use_cache")}
+        return box.get("live")()
+
+    def _dict_pop_live(**kwargs: Any) -> Any:
+        box = {"live": lambda: 42, "dead": lambda: kwargs.get("use_cache")}
+        return box.pop("live")()
+
+    def _dict_setdefault_live(**kwargs: Any) -> Any:
+        box = {"live": lambda: 42, "dead": lambda: kwargs.get("use_cache")}
+        return box.setdefault("live", lambda: 0)()
+
+    def _dict_ctor_live(**kwargs: Any) -> Any:
+        box = dict(live=lambda: 42, dead=lambda: kwargs.get("use_cache"))
+        return box["live"]()
+
+    def _dict_update_live(**kwargs: Any) -> Any:
+        box: Dict[str, Any] = {"live": lambda: 42}
+        box.update({"dead": lambda: kwargs.get("use_cache")})
+        return box["live"]()
+
+    def _dict_split_factory_live(**kwargs: Any) -> Any:
+        return _r36_mod_make_split(kwargs)["live"]()
+
+    def _dict_split_factory_get_live(**kwargs: Any) -> Any:
+        return _r36_mod_make_split(kwargs).get("live")()
+
+    for live_fn in (
+        _dict_subscr_live,
+        _dict_get_live,
+        _dict_pop_live,
+        _dict_setdefault_live,
+        _dict_ctor_live,
+        _dict_update_live,
+        _dict_split_factory_live,
+        _dict_split_factory_get_live,
+    ):
+        assert _keys(live_fn) == set()
+
+    def _dict_subscr_dead(**kwargs: Any) -> Any:
+        box = {"live": lambda: 42, "dead": lambda: kwargs.get("use_cache")}
+        return box["dead"]()
+
+    def _dict_split_factory_dead(**kwargs: Any) -> Any:
+        return _r36_mod_make_split(kwargs)["dead"]()
+
+    assert _keys(_dict_subscr_dead) == {"use_cache"}
+    assert _keys(_dict_split_factory_dead) == {"use_cache"}
+
+    class _R36DictLiveWrapModel(_R36StrictPosModel):
+        def forward_single(self, prompt: str, **kwargs: Any) -> Any:
+            box = {
+                "live": lambda: super(_R36DictLiveWrapModel, self).forward_single(prompt),
+                "dead": lambda: kwargs.get("use_cache"),
+            }
+            return box["live"]()
+
+    class _R36DictGetWrapModel(_R36StrictPosModel):
+        def forward_single(self, prompt: str, **kwargs: Any) -> Any:
+            box = {
+                "live": lambda: super(_R36DictGetWrapModel, self).forward_single(prompt),
+                "dead": lambda: kwargs.get("use_cache"),
+            }
+            return box.get("live")()
+
+    class _R36DictPopWrapModel(_R36StrictPosModel):
+        def forward_single(self, prompt: str, **kwargs: Any) -> Any:
+            box = {
+                "live": lambda: super(_R36DictPopWrapModel, self).forward_single(prompt),
+                "dead": lambda: kwargs.get("use_cache"),
+            }
+            return box.pop("live")()
+
+    class _R36DictSetDefaultWrapModel(_R36StrictPosModel):
+        def forward_single(self, prompt: str, **kwargs: Any) -> Any:
+            box = {
+                "live": lambda: super(_R36DictSetDefaultWrapModel, self).forward_single(prompt),
+                "dead": lambda: kwargs.get("use_cache"),
+            }
+            return box.setdefault("live", lambda: None)()
+
+    for live_cls in (
+        _R36DictLiveWrapModel,
+        _R36DictGetWrapModel,
+        _R36DictPopWrapModel,
+        _R36DictSetDefaultWrapModel,
+    ):
+        m_live = live_cls(_R36SimpleSchema(), 16)
+        assert _keys(m_live.forward_single) == set()
+        eng_live = SystemOneEngine(
+            _R36SimpleSchema(),
+            model=m_live,
+            use_cache=True,
+            strict_mode=True,
+            min_calibration_lessons=1_000_000,
+        )
+        assert eng_live.decide("hello").values == {"f": "a"}
+
+    # ------------------------------------------------------------------
+    # R36-6: BoundedReviewFallback per-request canary transactions (sync/async).
+    # ------------------------------------------------------------------
+    lc_f6_fail = _trained_lc(64, (64,))
+
+    def _raise_unavailable(prompt: Any) -> Any:
+        raise RuntimeError("teacher unavailable")
+
+    fb_f6_fail = BoundedReviewFallback(
+        lc_f6_fail.engine,
+        review_fn=_raise_unavailable,
+        auto_compile_lifecycle=lc_f6_fail,
+        auto_record_lessons=False,
+    )
+    res_f6_fail = fb_f6_fail.decide("accept approve pleasant detail number 0")
+    assert res_f6_fail["recovery_reason"] == "expert_failed"
+    assert (
+        lc_f6_fail.local_accept_eligible,
+        len(lc_f6_fail._pending_canaries),
+        lc_f6_fail.canary_checks,
+    ) == (0, 0, 0)
+
+    lc_f6_async_fail = _trained_lc(64, (64,))
+
+    async def _raise_unavailable_async(prompt: Any) -> Any:
+        await asyncio.sleep(0)
+        raise RuntimeError("teacher unavailable")
+
+    fb_f6_async_fail = BoundedReviewFallback(
+        lc_f6_async_fail.engine,
+        review_fn=_raise_unavailable_async,
+        auto_compile_lifecycle=lc_f6_async_fail,
+        auto_record_lessons=False,
+    )
+    async def _run_async_fail() -> Any:
+        return await fb_f6_async_fail.decide("accept approve pleasant detail number 0")
+
+    res_f6_afail = asyncio.run(_run_async_fail())
+    assert res_f6_afail["recovery_reason"] == "expert_failed"
+    assert (
+        lc_f6_async_fail.local_accept_eligible,
+        len(lc_f6_async_fail._pending_canaries),
+        lc_f6_async_fail.canary_checks,
+    ) == (0, 0, 0)
+
+    lc_f6_conc = _trained_lc(64, (64,))
+
+    async def _review_async_ok(prompt: Any) -> Dict[str, str]:
+        await asyncio.sleep(0)
+        return {"f": "a"}
+
+    fb_c1 = BoundedReviewFallback(
+        lc_f6_conc.engine,
+        review_fn=_review_async_ok,
+        auto_compile_lifecycle=lc_f6_conc,
+        auto_record_lessons=False,
+    )
+    fb_c2 = BoundedReviewFallback(
+        lc_f6_conc.engine,
+        review_fn=_review_async_ok,
+        auto_compile_lifecycle=lc_f6_conc,
+        auto_record_lessons=False,
+    )
+
+    async def _gather_two() -> Any:
+        return await asyncio.gather(
+            fb_c1.decide("accept approve pleasant detail number 0"),
+            fb_c2.decide("accept approve pleasant detail number 0"),
+        )
+
+    res_c1, res_c2 = asyncio.run(_gather_two())
+    assert res_c1["used_fallback"] is True and res_c2["used_fallback"] is True
+    assert (
+        lc_f6_conc.local_accept_eligible,
+        len(lc_f6_conc._pending_canaries),
+        lc_f6_conc.canary_checks,
+    ) == (2, 0, 2)
+
+
+
 
 

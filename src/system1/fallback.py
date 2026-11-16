@@ -237,6 +237,15 @@ class BoundedReviewFallback:
             )
         else:
             self.cutover_lifecycle = None
+        self._network_owned_by_cutover: bool = bool(
+            self.cutover_lifecycle is not None
+            and (
+                self.network is getattr(self.cutover_lifecycle, "engine", None)
+                or id(self.network) in getattr(self.cutover_lifecycle, "_owned_engine_ids", ())
+                or id(self.network)
+                in getattr(getattr(self.cutover_lifecycle, "lifecycle", None), "_owned_engine_ids", ())
+            )
+        )
         self._busy = False
         self._halted = False
         self._pending: Optional[asyncio.Task[Any]] = None
@@ -279,10 +288,28 @@ class BoundedReviewFallback:
             return _checked(self.is_done, context)
         return bool(getattr(context, "done", False))
 
-    def _run_local(self, context: Any) -> Dict[str, Any]:
+    def _rollback_cutover_tx(self, tx_pair: List[Any]) -> None:
+        if len(tx_pair) != 2 or tx_pair[0] is None or tx_pair[1] is None:
+            return
+        lc_obj, tx_tok = tx_pair[0], tx_pair[1]
+        tx_pair[0] = None
+        tx_pair[1] = None
+        if hasattr(lc_obj, "_rollback_local_tx"):
+            lc_obj._rollback_local_tx(tx_tok)
+
+    def _run_local(
+        self,
+        context: Any,
+        *,
+        _tx_out: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
         prompt = _checked_value(self.prompt_extractor, context) if self.prompt_extractor is not None else context
         if self.cutover_lifecycle is not None and isinstance(prompt, str):
-            local_vals = self.cutover_lifecycle.decide_local(prompt)
+            if _tx_out is not None and hasattr(self.cutover_lifecycle, "_decide_local_with_tx"):
+                local_vals, local_tx = self.cutover_lifecycle._decide_local_with_tx(prompt)
+                _tx_out[:] = [self.cutover_lifecycle, local_tx]
+            else:
+                local_vals = self.cutover_lifecycle.decide_local(prompt)
             if local_vals is not None:
                 if self.action_key in local_vals:
                     action_val: Any = local_vals[self.action_key]
@@ -304,7 +331,14 @@ class BoundedReviewFallback:
                 bool(getattr(self.cutover_lifecycle, "pending_recalibrate", False))
                 or lc_state == "DRIFT_RECALIBRATE"
             )
-            if lc_drifted or self.network is getattr(self.cutover_lifecycle, "engine", None):
+            net_is_lc_engine = (
+                self._network_owned_by_cutover
+                or self.network is getattr(self.cutover_lifecycle, "engine", None)
+                or id(self.network) in getattr(self.cutover_lifecycle, "_owned_engine_ids", ())
+                or id(self.network)
+                in getattr(getattr(self.cutover_lifecycle, "lifecycle", None), "_owned_engine_ids", ())
+            )
+            if lc_drifted or net_is_lc_engine:
                 return {
                     self.action_key: None,
                     "values": {},
@@ -463,6 +497,8 @@ class BoundedReviewFallback:
         context: Any,
         decision: Dict[str, Any],
         answer: Any,
+        *,
+        _tx_pair: Optional[List[Any]] = None,
     ) -> ReviewFallbackDecision:
         norm_answer = self._normalize_candidate_answer(answer)
         if isinstance(norm_answer, Mapping):
@@ -551,7 +587,20 @@ class BoundedReviewFallback:
                 self._reviewed = None
 
         if self.cutover_lifecycle is not None:
-            self.cutover_lifecycle.observe_teacher(prompt_text, resolved_values)
+            from system1.cutover import _bind_active_canary_tx
+
+            lc_target = self.cutover_lifecycle
+            active_tx = (
+                _tx_pair[1]
+                if (_tx_pair is not None and len(_tx_pair) == 2 and _tx_pair[0] is lc_target)
+                else None
+            )
+            if active_tx is not None:
+                with _bind_active_canary_tx(lc_target, tx_token=active_tx):
+                    lc_target.observe_teacher(prompt_text, resolved_values)
+                _tx_pair[:] = [None, None]
+            else:
+                lc_target.observe_teacher(prompt_text, resolved_values)
             self._reviewed = None
 
         if isinstance(answer, Mapping):
@@ -592,6 +641,7 @@ class BoundedReviewFallback:
         state: Any,
         decision: Dict[str, Any],
         awaitable_answer: Awaitable[Any],
+        tx_pair: Optional[List[Any]] = None,
     ) -> ReviewFallbackDecision:
         started = False
         dispatch_refusal: Optional[str] = None
@@ -656,7 +706,7 @@ class BoundedReviewFallback:
             if self._halted or _checked_value(self.observe_state, context) != state or time.monotonic() >= deadline:
                 return self._stop(decision, "validation_interrupted")
 
-            return self._build_validated_decision(context, decision, answer)
+            return self._build_validated_decision(context, decision, answer, _tx_pair=tx_pair)
         except asyncio.CancelledError:
             self.close()
             raise
@@ -668,6 +718,8 @@ class BoundedReviewFallback:
                     awaitable_answer.close()
                 elif hasattr(awaitable_answer, "cancel") and callable(awaitable_answer.cancel):
                     awaitable_answer.cancel()
+            if tx_pair is not None:
+                self._rollback_cutover_tx(tx_pair)
             self._busy = False
 
     def decide(self, context: Any) -> Any:
@@ -682,14 +734,16 @@ class BoundedReviewFallback:
         self._busy = True
         decision: Dict[str, Any] = {"review": True, "calls": None}
         delegated_async = False
+        tx_pair: List[Any] = [None, None]
         try:
             if self._check_done(context):
                 return self._stop({"review": True, "calls": 0}, "episode_finished")
             state = _checked_value(self.observe_state, context)
-            decision = self._run_local(context)
+            decision = self._run_local(context, _tx_out=tx_pair)
             if self._halted or _checked_value(self.observe_state, context) != state:
                 return self._stop(decision, "stale_context")
             if not decision.get("review", False):
+                tx_pair[:] = [None, None]
                 local_vals = decision.get("values")
                 if not isinstance(local_vals, Mapping) and self.action_key in decision:
                     local_vals = {self.action_key: decision[self.action_key]}
@@ -741,10 +795,10 @@ class BoundedReviewFallback:
 
                 if has_running_loop:
                     delegated_async = True
-                    return self._finish_async_decide(context, state, decision, raw_answer)
+                    return self._finish_async_decide(context, state, decision, raw_answer, tx_pair)
                 else:
                     delegated_async = True
-                    return asyncio.run(self._finish_async_decide(context, state, decision, raw_answer))
+                    return asyncio.run(self._finish_async_decide(context, state, decision, raw_answer, tx_pair))
 
             # Synchronous review_fn / expert completion path
             answer = raw_answer
@@ -765,11 +819,12 @@ class BoundedReviewFallback:
             if self._halted or _checked_value(self.observe_state, context) != state or time.monotonic() >= deadline:
                 return self._stop(decision, "validation_interrupted")
 
-            return self._build_validated_decision(context, decision, answer)
+            return self._build_validated_decision(context, decision, answer, _tx_pair=tx_pair)
         except Exception:
             return self._stop(decision, "callback_or_context_failed")
         finally:
             if not delegated_async:
+                self._rollback_cutover_tx(tx_pair)
                 self._busy = False
 
 

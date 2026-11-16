@@ -3053,6 +3053,7 @@ class UtilityCalibrator:
             self.L = np.zeros_like(self._scaled_cost_matrix, dtype=np.float64)
         else:
             self.L = np.maximum(0.0, self._scaled_cost_matrix - self._c_esc_scaled) / span_scaled
+        self._indicator_loss_matrix: np.ndarray = (self.cost_matrix > self.c_esc).astype(np.float64)
 
         self.lam_crc: float = -1.0
         self._is_fitted: bool = False
@@ -3207,10 +3208,11 @@ class UtilityCalibrator:
         if not bool(np.any(valid)):
             return acts
         v_idx = np.flatnonzero(valid)
+        policy_loss = self._indicator_loss_matrix if self.loss_mode == "indicator" else self.L
         with np.errstate(over="ignore", invalid="ignore"):
             p_norm = self._normalize_prob_rows(probs_2d[v_idx])
             costs_v = p_norm @ self._scaled_cost_matrix.T
-            eh_v = p_norm @ self.L.T
+            eh_v = p_norm @ policy_loss.T
         row_fin = np.all(np.isfinite(costs_v), axis=1) & np.all(np.isfinite(eh_v), axis=1)
         if not bool(np.any(row_fin)):
             return acts
@@ -3272,7 +3274,7 @@ class UtilityCalibrator:
             lam_f = float(lam)
             acts = self._apply_policy(p_cal, lam_f)
             if self.loss_mode == "indicator":
-                losses = (self._scaled_cost_matrix[acts, y_arr] > self._c_esc_scaled + 1e-12).astype(np.float64)
+                losses = (self.cost_matrix[acts, y_arr] > self.c_esc).astype(np.float64)
             else:
                 losses = self.L[acts, y_arr]
             env_losses = np.maximum(env_losses, losses)
