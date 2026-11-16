@@ -12791,6 +12791,7 @@ def test_astra_34_round21_regressions() -> None:
         BooleanField,
         ChoiceField,
         DecisionSchema,
+        DeterministicSemanticProjector,
         FastExplainer,
         GuardShield,
         ScoreField,
@@ -13164,3 +13165,412 @@ def test_astra_34_round21_regressions() -> None:
         )
         assert np.all(np.isfinite(ucr9.utility_calibrator.L))
     assert not any(issubclass(w.category, RuntimeWarning) for w in caught_u9)
+
+
+def test_astra_35_round22_regressions() -> None:
+    """Round-22 regressions R22-1..R22-9 covering v3 layout budget, fleet overrides, exemplar/cov layouts, recency, centroids, utility, score scale, and bias rank."""
+    import itertools
+    import json
+    import struct
+    import warnings
+    import numpy as np
+    import pytest
+
+    import system1.compiler as s1_compiler
+    from system1 import (
+        BooleanField,
+        ChoiceField,
+        DecisionSchema,
+        DeterministicSemanticProjector,
+        FastExplainer,
+        GuardShield,
+        ScoreField,
+        SystemOneEngine,
+    )
+    from system1.calibration import (
+        ConformalPredictor,
+        RegressionConformalPredictor,
+        UtilityCalibrator,
+        _safe_centroid_mean_f64,
+    )
+    from system1.compiler import CompiledHeadWeights, CompiledSystemOneModel, SystemOneCompiler
+    from system1.fleet import MultiTenantSkillFleet
+
+    class _R22Choice(DecisionSchema):
+        f = ChoiceField(options=("a", "b"))
+
+    class _R22Flag(DecisionSchema):
+        flag = BooleanField()
+
+    def _fresh(schema_cls: Any = _R22Choice, dim: int = 16, **kw: Any) -> SystemOneEngine:
+        return SystemOneEngine(
+            schema_cls,
+            dimension=dim,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=kw.pop("strict_mode", False),
+            **kw,
+        )
+
+    # ------------------------------------------------------------------
+    # R22-1: .s1m v2 & v3 tensor_layouts enforce complete allocation budget.
+    # ------------------------------------------------------------------
+    e1 = _fresh(_R22Choice, 16)
+    h1 = e1.model.heads["f"]
+    h1.set_weights(np.zeros((2, 16), dtype="f4"), np.zeros(2, dtype="f4"))
+    h1.restore_exemplar_state(
+        {
+            "arrays": {
+                "exemplar_centroids": np.ones((2, 16), dtype="f4"),
+                "exemplar_vectors": np.ones((100, 16), dtype="f4"),
+            },
+            "counts": {"exemplar_vectors": [50, 50]},
+        }
+    )
+    cm1 = e1.to_compiled_model()
+    blob_v3 = cm1.to_bytes(format_version=3, compact=False)
+    magic, hlen = struct.unpack("<8sQ", blob_v3[:16])
+    hdr_v3 = json.loads(blob_v3[16 : 16 + hlen])
+    hdr_v3["tensor_layouts"] = {"f_exemplar_vectors": [0, 128, 4]}
+    hdr_bytes = json.dumps(hdr_v3, sort_keys=True).encode("utf-8")
+    tam_v3 = bytearray(blob_v3)
+    assert 16 + len(hdr_bytes) <= (((16 + hlen + 16383) // 16384) * 16384)
+    struct.pack_into("<8sQ", tam_v3, 0, magic, len(hdr_bytes))
+    tam_v3[16 : 16 + len(hdr_bytes)] = hdr_bytes
+    tam_v3[16 + len(hdr_bytes) : (((16 + hlen + 16383) // 16384) * 16384)] = b"\x00" * (
+        (((16 + hlen + 16383) // 16384) * 16384) - (16 + len(hdr_bytes))
+    )
+    orig_v3_cap = s1_compiler.MAX_SKILL_RUNTIME_BYTES_V3
+    try:
+        s1_compiler.MAX_SKILL_RUNTIME_BYTES_V3 = 10_000
+        with pytest.raises(ValueError, match="memory budget"):
+            CompiledSystemOneModel.from_bytes(bytes(tam_v3), backend="numpy")
+    finally:
+        s1_compiler.MAX_SKILL_RUNTIME_BYTES_V3 = orig_v3_cap
+
+    # Production v3 budget check on 10 x (250000, 16) strided exemplar buffers.
+    _R22Ten = type("_R22Ten", (DecisionSchema,), {f"f{i}": ChoiceField(options=("a", "b")) for i in range(10)})
+    shapes10: Dict[str, Tuple[int, ...]] = {}
+    layouts10: Dict[str, List[int]] = {}
+    for fname10 in _R22Ten().fields:
+        shapes10.update(
+            {
+                f"{fname10}_w": (2, 16),
+                f"{fname10}_b": (2,),
+                f"{fname10}_exemplar_centroids": (2, 16),
+                f"{fname10}_exemplar_vectors": (250_000, 16),
+            }
+        )
+        layouts10[f"{fname10}_exemplar_vectors"] = [0, 256, 4]
+    _, extra10 = s1_compiler._validate_tensor_layouts_header(
+        {"tensor_layouts": layouts10}, shapes10, full_allocation=True
+    )
+    delta10 = s1_compiler._validate_skill_shapes_and_runtime_delta(_R22Ten(), 16, shapes10)
+    with pytest.raises(ValueError, match="memory budget"):
+        CompiledSystemOneModel._validate_projector_and_budget(
+            _R22Ten(),
+            16,
+            {"type": "deterministic", "dimension": 16, "recency_weighted": False},
+            cov_fields=0,
+            max_runtime_bytes=s1_compiler.MAX_SKILL_RUNTIME_BYTES_V3,
+            extra_runtime_bytes=extra10 + delta10,
+        )
+
+    # v2 tensor_layouts extra span is also charged against MAX_SKILL_RUNTIME_BYTES.
+    blob_v2 = cm1.to_bytes(format_version=2, compact=False)
+    h2_len = struct.unpack(">I", blob_v2[4:8])[0]
+    hdr_v2 = json.loads(blob_v2[8 : 8 + h2_len].decode("utf-8"))
+    hdr_v2["tensor_layouts"] = {"f_w": [0, 524_288, 4]}
+    hdr2_b = json.dumps(hdr_v2, sort_keys=True).encode("utf-8")
+    tam_v2 = blob_v2[:4] + struct.pack(">I", len(hdr2_b)) + hdr2_b + blob_v2[8 + h2_len :]
+    orig_v2_cap = s1_compiler.MAX_SKILL_RUNTIME_BYTES
+    try:
+        s1_compiler.MAX_SKILL_RUNTIME_BYTES = 100_000
+        with pytest.raises(ValueError, match="memory budget"):
+            CompiledSystemOneModel.from_bytes(tam_v2, backend="numpy")
+    finally:
+        s1_compiler.MAX_SKILL_RUNTIME_BYTES = orig_v2_cap
+
+    # ------------------------------------------------------------------
+    # R22-2: MultiTenantSkillFleet rejects models with learned_prompt_overrides on target field.
+    # ------------------------------------------------------------------
+    h2 = CompiledHeadWeights(
+        "flag",
+        "boolean",
+        np.asfortranarray(np.vstack([np.zeros(16), np.ones(16)])).astype("f4"),
+        np.zeros(1, dtype="f4"),
+        logit_adjustments=np.array([0.0, 10.0]),
+        score_method="lac",
+        calibration_scores=tuple([0.1] * 30),
+        conformal_quantile=0.1,
+    )
+    cm2 = CompiledSystemOneModel(
+        _R22Flag(),
+        {"flag": h2},
+        dimension=16,
+        use_cache=False,
+        metadata={"learned_prompt_overrides": {"override test": {"flag": False}}},
+    )
+    e2 = SystemOneEngine(_R22Flag, model=cm2, dimension=16, backend="numpy", use_cache=False, strict_mode=True)
+    assert e2.decide("override test", record_receipt=False).values["flag"] is False
+    with pytest.raises(ValueError, match="learned_prompt_overrides"):
+        MultiTenantSkillFleet.from_compiled_model(e2, "flag", num_tenants=1)
+    with pytest.raises(ValueError, match="learned_prompt_overrides"):
+        MultiTenantSkillFleet.from_compiled_model(cm2, "flag", num_tenants=1)
+
+    e2_live = _fresh(_R22Flag, 16)
+    e2_live.learn("live ov test", {"flag": False}, preserve_calibration=True)
+    with pytest.raises(ValueError, match="learned_prompt_overrides"):
+        MultiTenantSkillFleet.from_compiled_model(e2_live, "flag", num_tenants=1)
+
+    class _R22TwoFlags(DecisionSchema):
+        flag = BooleanField()
+        other = BooleanField()
+
+    e2_two = _fresh(_R22TwoFlags, 16)
+    e2_two.learn("other only ov", {"other": True}, preserve_calibration=True)
+    MultiTenantSkillFleet.from_compiled_model(e2_two, "flag", num_tenants=1)
+
+    # ------------------------------------------------------------------
+    # R22-3: Exemplar export preserves 2D strided & aligned layouts across compiled/.s1m v2 & v3.
+    # ------------------------------------------------------------------
+    e3 = _fresh(_R22Choice, 32)
+    h3 = e3.model.heads["f"]
+    p3 = "exemplar layout parity probe"
+    x3 = e3.model.projector._project_concept_aware(p3)
+    C3 = np.random.default_rng(1).normal(size=(2, 64)).astype("f4")[:, ::2]
+    C3 *= np.float32(1e8)
+    h3.set_weights(np.zeros((2, 32), dtype="f4"), -np.float32(2) * (x3 @ np.array(C3, copy=True).T))
+    h3.restore_exemplar_state(
+        {
+            "arrays": {
+                "exemplar_centroids": C3,
+                "exemplar_vectors": np.empty((0, 32), dtype="f4"),
+            },
+            "counts": {"exemplar_vectors": [0, 0]},
+        }
+    )
+    h3._initial_weights = C3
+    assert e3.decide(p3, record_receipt=False).values["f"] == "b"
+    cm3 = e3.to_compiled_model()
+    assert cm3.forward_single(p3).fields["f"].selected_value == "b"
+    assert cm3._field_heads["f"]._exemplar_bank[0].strides == C3.strides
+    assert cm3._field_heads["f"]._initial_weights.strides == C3.strides
+    for fmt_v in (2, 3):
+        re3 = CompiledSystemOneModel.from_bytes(cm3.to_bytes(format_version=fmt_v, compact=False), backend="numpy")
+        assert re3.forward_single(p3).fields["f"].selected_value == "b"
+        assert re3._field_heads["f"]._exemplar_bank[0].strides == C3.strides
+        assert int(re3._field_heads["f"]._exemplar_bank[0].ctypes.data % 64) == int(C3.ctypes.data % 64)
+        assert re3._field_heads["f"]._initial_weights.strides == C3.strides
+
+    # ------------------------------------------------------------------
+    # R22-4: Restored read-only covariance P & B preserve 2D strides across online_update.
+    # ------------------------------------------------------------------
+    for fmt_v in (2, 3):
+        e4 = _fresh(_R22Flag, 16)
+        h4 = e4.model.heads["flag"]
+        p4 = "covariance layout probe"
+        x4 = e4.model.encode(p4)
+        A4 = np.random.default_rng(2).normal(size=(17, 17)).astype("f4")
+        P4 = np.zeros((34, 34), dtype="f4")[::2, ::2]
+        P4[:] = A4 @ A4.T
+        xa4 = np.append(x4, np.float32(1))
+        g4 = float(xa4 @ (P4 @ xa4))
+        h4.set_weights(np.zeros((2, 16), dtype="f4"), np.array([-g4 / h4.forgetting_factor], dtype="f4"))
+        h4.init_covariance(P=P4)
+        cm4 = e4.to_compiled_model()
+        rr4 = CompiledSystemOneModel.from_bytes(
+            cm4.to_bytes(format_version=fmt_v, compact=False, include_covariance=True), backend="numpy"
+        )
+        orig_h4 = cm4._field_heads["flag"]
+        rest_h4 = rr4._field_heads["flag"]
+        orig_h4.online_update(x4, np.array([1.0], dtype="f4"))
+        rest_h4.online_update(x4, np.array([1.0], dtype="f4"))
+        ev_orig4 = cm4.forward_single(p4).fields["flag"]
+        ev_rest4 = rr4.forward_single(p4).fields["flag"]
+        assert ev_orig4.selected_value is False and ev_rest4.selected_value is False
+        assert np.array_equal(ev_orig4.logits, ev_rest4.logits)
+        assert rest_h4.covariance_inv.strides == P4.strides
+        assert int(rest_h4.covariance_inv.ctypes.data % 64) == int(P4.ctypes.data % 64)
+
+    # ------------------------------------------------------------------
+    # R22-5: to_compiled_model preserves _learned_prompt_override_recency in both branches.
+    # ------------------------------------------------------------------
+    e5 = _fresh(_R22Flag, 16, strict_mode=True, recency_weighted=False)
+    e5.model.heads["flag"].set_weights(np.zeros((2, 16), dtype="f4"), np.zeros(1, dtype="f4"))
+    e5.learn("override recency test", {"flag": False}, recency_weighted=True, preserve_calibration=True)
+    assert e5.decide("override recency test", alpha=1e-4, recency_weighted=False, record_receipt=False).is_ambiguous is True
+    assert e5.decide("override recency test", alpha=1e-4, recency_weighted=True, record_receipt=False).is_ambiguous is False
+    cm5_live = e5.to_compiled_model()
+    for fmt_v in (2, 3):
+        re5 = SystemOneEngine.from_bytes(
+            cm5_live.to_bytes(format_version=fmt_v, compact=False),
+            backend="numpy",
+            strict_mode=True,
+            use_cache=False,
+        )
+        assert re5.decide("override recency test", alpha=1e-4, recency_weighted=False, record_receipt=False).is_ambiguous is True
+        assert re5.decide("override recency test", alpha=1e-4, recency_weighted=True, record_receipt=False).is_ambiguous is False
+    # Existing-compiled-model branch in to_compiled_model() also preserves per-key recency.
+    re5_comp_m = CompiledSystemOneModel.from_bytes(cm5_live.to_bytes(format_version=3, compact=False), backend="numpy")
+    e5_wrap = SystemOneEngine(_R22Flag, model=re5_comp_m, dimension=16, backend="numpy", use_cache=False, strict_mode=True, recency_weighted=False)
+    e5_wrap.projector = DeterministicSemanticProjector(dimension=16)
+    e5_wrap.learn("second override rec", {"flag": False}, recency_weighted=True, preserve_calibration=True)
+    cm5_wrap = e5_wrap.to_compiled_model()
+    re5_wrap = SystemOneEngine.from_bytes(cm5_wrap.to_bytes(format_version=3, compact=False), backend="numpy", strict_mode=True, use_cache=False)
+    assert re5_wrap.decide("second override rec", alpha=1e-4, recency_weighted=False, record_receipt=False).is_ambiguous is True
+    assert re5_wrap.decide("second override rec", alpha=1e-4, recency_weighted=True, record_receipt=False).is_ambiguous is False
+
+    # ------------------------------------------------------------------
+    # R22-6: Centroid prototypes preserve 1e-300/1e-13 signals & permutation invariance.
+    # ------------------------------------------------------------------
+    with warnings.catch_warnings(record=True) as caught_p6:
+        warnings.simplefilter("always", RuntimeWarning)
+        for small6 in (1e-5, 1e-13, 1e-300):
+            X6 = np.array([[1e308, small6], [-1e308, small6], [small6, 1e308], [small6, -1e308]], dtype=np.float64)
+            cp6 = ConformalPredictor("f", ("a", "b"))
+            cp6.calibrate_prototypes(X6, ["a", "a", "b", "b"], alpha=0.5)
+            assert np.allclose(cp6.prototypes, np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32), atol=1e-6)
+            assert len(cp6.prototype_scores) == 4
+            comp6 = SystemOneCompiler._compute_class_prototypes(X6, np.array([[1, 0], [1, 0], [0, 1], [0, 1]]))
+            assert np.allclose(comp6, np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32), atol=1e-6)
+
+        cp6_uni = ConformalPredictor("f", ("a", "b"))
+        cp6_uni.calibrate_prototypes(np.array([[1e-300, 0.0], [1e-300, 0.0]], dtype=np.float64), ["a", "a"], alpha=0.5)
+        assert np.allclose(cp6_uni.prototypes[0], np.array([1.0, 0.0], dtype=np.float32), atol=1e-6)
+
+        rows_perm6 = [[1e308, 1.0], [1.0, 1.0], [-1e308, 1.0]]
+        for perm6 in itertools.permutations(rows_perm6):
+            m6 = _safe_centroid_mean_f64(list(perm6))
+            assert m6 is not None and np.allclose(m6, [1.0 / 3.0, 1.0], rtol=1e-15, atol=1e-15)
+            mw6 = _safe_centroid_mean_f64(list(perm6), weights=[1.0, 1.0, 1.0])
+            assert mw6 is not None and np.allclose(mw6, [1.0 / 3.0, 1.0], rtol=1e-15, atol=1e-15)
+        # Preserve small-norm similarity guard (<= 1e-12 returns 0.0).
+        assert cp6_uni.compute_prototype_similarity(np.array([1e-13, 0.0], dtype=np.float64)) == 0.0
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_p6)
+
+    # ------------------------------------------------------------------
+    # R22-7: Overflowing probability sums normalize cleanly in UtilityCalibrator.
+    # ------------------------------------------------------------------
+    with warnings.catch_warnings(record=True) as caught_u7:
+        warnings.simplefilter("always", RuntimeWarning)
+        cal7 = UtilityCalibrator([[1.0, 1.0], [0.1, 0.1]], safe_action=1, alpha=0.1).fit(
+            np.tile([0.5, 0.5], (30, 1)), np.zeros(30, dtype=int)
+        )
+        assert cal7.predict([0.5, 0.5]).tolist() == [1]
+        assert cal7.predict([1e308, 1e308]).tolist() == [1]
+        assert cal7.predict([1e308, 1e308], use_crc=False).tolist() == [1]
+        assert np.allclose(cal7.expected_costs([1e308, 1e308]), np.array([1.0, 0.1], dtype=np.float64), atol=1e-9)
+        cal7_t = UtilityCalibrator(
+            [[1.0, 1.0], [0.1, 0.1]], safe_action=1, alpha=0.1, fit_temperature=False, temperature=0.5
+        ).fit(np.tile([0.5, 0.5], (30, 1)), np.zeros(30, dtype=int))
+        assert np.allclose(
+            cal7_t.transform_probs([6e307, 1.2e308]),
+            cal7_t.transform_probs([1.0 / 3.0, 2.0 / 3.0]),
+            atol=1e-9,
+        )
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_u7)
+
+    # ------------------------------------------------------------------
+    # R22-8: ScoreField learning, target formatting, and override evaluation across extreme bounds.
+    # ------------------------------------------------------------------
+    with warnings.catch_warnings(record=True) as caught_s8:
+        warnings.simplefilter("always", RuntimeWarning)
+        for lo8, hi8, targ8, tol8 in (
+            (0.0, 1e-12, 9e-13, 1e-15),
+            (-1e308, 1e308, 0.0, 1e295),
+        ):
+            class _R22Score(DecisionSchema):
+                score = ScoreField(min_value=lo8, max_value=hi8)
+
+            cm8 = CompiledSystemOneModel(
+                _R22Score(),
+                {
+                    "score": CompiledHeadWeights(
+                        "score",
+                        "score",
+                        np.asfortranarray(np.vstack([np.zeros(16), np.ones(16)])).astype("f4"),
+                        np.zeros(1, dtype="f4"),
+                    )
+                },
+                dimension=16,
+                use_cache=False,
+                metadata={"learned_prompt_overrides": {"override test": {"score": targ8}}},
+            )
+            ev8 = cm8.forward_single("override test").fields["score"]
+            assert math.isfinite(ev8.selected_value) and abs(ev8.selected_value - targ8) <= tol8
+            for fmt_v in (2, 3):
+                e8 = SystemOneEngine.from_bytes(
+                    cm8.to_bytes(format_version=fmt_v, compact=False),
+                    backend="numpy",
+                    use_cache=False,
+                    strict_mode=False,
+                )
+                assert abs(e8.decide("override test", record_receipt=False).values["score"] - targ8) <= tol8
+                assert abs(e8.decide_batch(["override test"])[0].values["score"] - targ8) <= tol8
+                assert abs(e8.compile_callable()("override test").values["score"] - targ8) <= tol8
+                assert abs(float(e8.compile_packed_kernel().decide_prompt("override test")["s_val"][0, 0]) - targ8) <= tol8
+
+            rcp8 = RegressionConformalPredictor("score", min_value=lo8, max_value=hi8)
+            iv8 = rcp8.predict_interval(targ8, alpha=0.1, strict=False)
+            assert math.isfinite(iv8.margin)
+            h8_live = _fresh(_R22Score, 16).model.heads["score"]
+            z8_vec = h8_live.format_target_vector(targ8)
+            ev8_back = h8_live.evaluate_logits(z8_vec)
+            assert math.isfinite(ev8_back.selected_value) and abs(ev8_back.selected_value - targ8) <= tol8
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_s8)
+
+    # ------------------------------------------------------------------
+    # R22-9: All fast, compiled, shield, explainer, and fleet paths enforce 1D biases.
+    # ------------------------------------------------------------------
+    e9 = _fresh(_R22Choice, 16)
+    h9 = e9.model.heads["f"]
+    h9.set_weights(np.zeros((2, 16), dtype="f4"), np.array([0.0, 2.0], dtype="f4"))
+    for bad_b in (h9.biases.reshape(1, 2), np.array(1.0, dtype="f4")):
+        h9.biases = bad_b
+        for fn9 in (
+            lambda: e9.decide("p", record_receipt=False),
+            lambda: e9.decide_batch(["p"]),
+            lambda: e9.compile_packed_kernel(),
+            lambda: e9.compile_callable(),
+            lambda: e9.to_compiled_model(),
+            lambda: GuardShield(e9, field_name="f", unsafe_label="b"),
+            lambda: FastExplainer.from_engine(e9, "f"),
+            lambda: MultiTenantSkillFleet.from_compiled_model(e9, "f", num_tenants=1),
+        ):
+            with pytest.raises(ValueError):
+                fn9()
+
+    e9_b = _fresh(_R22Flag, 16)
+    h9_b = e9_b.model.heads["flag"]
+    h9_b.set_weights(np.zeros((2, 16), dtype="f4"), np.array([0.0, 2.0], dtype="f4"))
+    h9_b.biases = h9_b.biases.reshape(1, 2)
+    for fn9_b in (
+        lambda: e9_b.decide("p", record_receipt=False),
+        lambda: e9_b.decide_batch(["p"]),
+        lambda: e9_b.compile_packed_kernel(),
+        lambda: e9_b.compile_callable(),
+        lambda: e9_b.to_compiled_model(),
+        lambda: GuardShield(e9_b, field_name="flag", unsafe_label="True"),
+        lambda: FastExplainer.from_engine(e9_b, "flag"),
+        lambda: MultiTenantSkillFleet.from_compiled_model(e9_b, "flag", num_tenants=1),
+    ):
+        with pytest.raises(ValueError):
+            fn9_b()
+
+    class _R22ScoreSimple(DecisionSchema):
+        score = ScoreField(min_value=0.0, max_value=1.0)
+
+    e9_s = _fresh(_R22ScoreSimple, 16)
+    h9_s = e9_s.model.heads["score"]
+    h9_s.set_weights(np.zeros((2, 16), dtype="f4"), np.array([0.0, 2.0], dtype="f4"))
+    h9_s.biases = h9_s.biases.reshape(1, 2)
+    for fn9_s in (
+        lambda: e9_s.decide("p", record_receipt=False),
+        lambda: e9_s.compile_packed_kernel(),
+        lambda: e9_s.compile_callable(),
+        lambda: e9_s.to_compiled_model(),
+    ):
+        with pytest.raises(ValueError):
+            fn9_s()

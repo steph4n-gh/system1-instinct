@@ -255,7 +255,10 @@ def _extract_calibrated_head_params(
         raise ValueError(f"calibrator temperature must be finite and positive, got {raw_temp_obj!r}")
 
     w = np.asarray(head.weights, dtype=np.float64)
-    b = np.asarray(head.biases, dtype=np.float64).reshape(-1).copy()
+    raw_b_orig = np.asarray(head.biases)
+    if raw_b_orig.ndim != 1:
+        raise ValueError(f"Incompatible head bias shape biases={raw_b_orig.shape} for {fname!r}")
+    b = np.asarray(raw_b_orig, dtype=np.float64).copy()
     is_boolean = isinstance(f_def, BooleanField)
     if is_boolean:
         if w.ndim != 2 or w.shape[0] not in (1, 2) or b.size not in (1, w.shape[0]):

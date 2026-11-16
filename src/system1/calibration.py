@@ -21,6 +21,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 
+from system1.core.schema import _score_half_span
+
 
 def _normalize_rows_f32_safe(arr: Any) -> Tuple[np.ndarray, np.ndarray]:
     """L2-normalize 2D rows in scaled float64 without overflow, returning (unit_f32, valid_mask)."""
@@ -48,7 +50,11 @@ def _normalize_rows_f32_safe(arr: Any) -> Tuple[np.ndarray, np.ndarray]:
     return unit_64.astype(np.float32), valid
 
 
-def _normalize_vec_f32_safe(vec: Any) -> Tuple[np.ndarray, float, bool]:
+def _normalize_vec_f32_safe(
+    vec: Any,
+    *,
+    min_norm: float = 1e-12,
+) -> Tuple[np.ndarray, float, bool]:
     """L2-normalize a 1D vector in scaled float64, returning (unit_f32, norm_f64, is_valid)."""
     v64 = np.asarray(vec, dtype=np.float64).ravel()
     if v64.size == 0 or not np.all(np.isfinite(v64)):
@@ -62,14 +68,14 @@ def _normalize_vec_f32_safe(vec: Any) -> Tuple[np.ndarray, float, bool]:
         return np.zeros_like(v64, dtype=np.float32), float("nan"), False
     with np.errstate(over="ignore"):
         raw_norm = scale * scaled_norm
-    if scale < 1.0 and raw_norm <= 1e-12:
+    if min_norm > 0.0 and scale < 1.0 and raw_norm <= min_norm:
         return np.zeros_like(v64, dtype=np.float32), raw_norm, False
     unit = (scaled / scaled_norm).astype(np.float32)
     return unit, raw_norm, True
 
 
 def _safe_centroid_mean_f64(rows: Any, weights: Optional[Any] = None) -> Optional[np.ndarray]:
-    """Compute overflow-free, cancellation-safe centroid mean via per-column abs scaling."""
+    """Compute overflow-free, order-independent centroid mean via Shewchuk math.fsum."""
     r_arr = np.asarray(rows)
     if r_arr.ndim != 2 or r_arr.shape[0] == 0 or r_arr.shape[1] == 0:
         return None
@@ -78,7 +84,7 @@ def _safe_centroid_mean_f64(rows: Any, weights: Optional[Any] = None) -> Optiona
         return None
     sub = np.asarray(r_arr[fin], dtype=np.float64)
     w_unit: Optional[np.ndarray] = None
-    w_sum = 0.0
+    denom = float(sub.shape[0])
     if weights is not None:
         w_arr = np.asarray(weights, dtype=np.float64).reshape(-1)
         if w_arr.shape[0] != r_arr.shape[0]:
@@ -95,19 +101,45 @@ def _safe_centroid_mean_f64(rows: Any, weights: Optional[Any] = None) -> Optiona
         if not math.isfinite(w_max) or w_max <= 0.0:
             return None
         w_unit = w_pos / w_max
-        w_sum = float(np.sum(w_unit))
-        if not math.isfinite(w_sum) or w_sum <= 0.0:
+        denom = math.fsum(w_unit.tolist())
+        if not math.isfinite(denom) or denom <= 0.0:
             return None
-    col_scales = np.max(np.abs(sub), axis=0)
-    if not bool(np.any(col_scales > 0.0)):
-        return np.zeros(sub.shape[1], dtype=np.float64)
-    safe_scales = np.where(col_scales > 0.0, col_scales, 1.0)
-    scaled = sub / safe_scales[None, :]
-    if w_unit is not None:
-        mean_scaled = np.clip((w_unit @ scaled) / w_sum, -1.0, 1.0)
-    else:
-        mean_scaled = np.clip(np.mean(scaled, axis=0, dtype=np.float64), -1.0, 1.0)
-    return mean_scaled * col_scales
+    n_rows, n_cols = sub.shape
+    shift = max(32, int(math.ceil(math.log2(max(2, n_rows) + 1))) + 4)
+    out = np.zeros(n_cols, dtype=np.float64)
+    for j in range(n_cols):
+        col = sub[:, j]
+        col_max = float(np.max(np.abs(col)))
+        if col_max == 0.0:
+            out[j] = 0.0
+            continue
+        if w_unit is None:
+            if col_max <= 1e290:
+                out[j] = math.fsum(col.tolist()) / denom
+            else:
+                hi = [math.ldexp(float(v), -shift) for v in col if abs(float(v)) > 1e200]
+                lo = [float(v) for v in col if abs(float(v)) <= 1e200]
+                hi_mean = math.ldexp(math.fsum(hi) / denom, shift) if hi else 0.0
+                lo_mean = (math.fsum(lo) / denom) if lo else 0.0
+                out[j] = hi_mean + lo_mean
+        else:
+            if col_max <= 1e290:
+                out[j] = math.fsum((w_unit * col).tolist()) / denom
+            else:
+                hi = [
+                    float(w_unit[i]) * math.ldexp(float(col[i]), -shift)
+                    for i in range(n_rows)
+                    if abs(float(col[i])) > 1e200
+                ]
+                lo = [
+                    float(w_unit[i]) * float(col[i])
+                    for i in range(n_rows)
+                    if abs(float(col[i])) <= 1e200
+                ]
+                hi_mean = math.ldexp(math.fsum(hi) / denom, shift) if hi else 0.0
+                lo_mean = (math.fsum(lo) / denom) if lo else 0.0
+                out[j] = hi_mean + lo_mean
+    return out
 
 
 def _binom_cdf(k: int, n: int, p: float) -> float:
@@ -820,7 +852,7 @@ class ConformalPredictor:
                     if mask:
                         c_mean = _safe_centroid_mean_f64(arr[mask])
                         if c_mean is not None:
-                            u_vec, _, ok = _normalize_vec_f32_safe(c_mean)
+                            u_vec, _, ok = _normalize_vec_f32_safe(c_mean, min_norm=0.0)
                             if ok:
                                 protos[c_idx] = u_vec
                 self.prototypes = protos
@@ -1294,7 +1326,9 @@ class RegressionConformalPredictor:
         if not (0.0 < alpha < 1.0):
             raise ValueError(f"Significance level alpha must be in (0, 1), got {alpha}")
         y_hat = float(point_prediction)
-        val_range = self.max_value - self.min_value
+        with np.errstate(over="ignore", invalid="ignore"):
+            val_range = float(self.max_value) - float(self.min_value)
+        half_span = _score_half_span(self.min_value, self.max_value)
         n = len(self.residuals)
 
         if not self.is_calibrated or n == 0:
@@ -1303,7 +1337,7 @@ class RegressionConformalPredictor:
                 low = self.min_value
                 high = self.max_value
             else:
-                margin = val_range * ((1.0 - alpha) / 2.0)
+                margin = (1.0 - alpha) * half_span
                 low = max(self.min_value, y_hat - margin)
                 high = min(self.max_value, y_hat + margin)
         else:
@@ -3027,8 +3061,25 @@ class UtilityCalibrator:
         with np.errstate(over="ignore", invalid="ignore"):
             fin = np.all(np.isfinite(p2), axis=1)
             nonneg = np.all(p2 >= -1e-9, axis=1)
-            pos_sum = np.sum(p2, axis=1) > 0.0
+            safe_p = np.where(fin[:, None], p2, 0.0)
+            rmax = np.max(np.abs(safe_p), axis=1, keepdims=True)
+            safe_m = np.where(rmax > 0.0, rmax, 1.0)
+            pos_sum = (rmax[:, 0] > 0.0) & (np.sum(safe_p / safe_m, axis=1) > 0.0)
         return fin & nonneg & pos_sum
+
+    @staticmethod
+    def _normalize_prob_rows(p_rows: np.ndarray) -> np.ndarray:
+        if p_rows.size == 0:
+            return p_rows
+        with np.errstate(over="ignore", invalid="ignore"):
+            raw_sums = np.sum(p_rows, axis=1, keepdims=True)
+            already_unit = np.isfinite(raw_sums) & (np.abs(raw_sums - 1.0) <= 1e-9)
+            rmax = np.max(np.abs(p_rows), axis=1, keepdims=True)
+            safe_m = np.where(rmax > 0.0, rmax, 1.0)
+            scaled = p_rows / safe_m
+            scaled_sums = np.sum(scaled, axis=1, keepdims=True)
+            normed = scaled / np.where(scaled_sums > 0.0, scaled_sums, 1.0)
+            return np.where(already_unit, p_rows, normed)
 
     def _validate_cal_labels(self, y_raw: Any, n_rows: int) -> np.ndarray:
         if isinstance(y_raw, (str, bytes, bytearray, memoryview, Mapping, set, frozenset)):
@@ -3106,7 +3157,7 @@ class UtilityCalibrator:
         valid = self._valid_prob_rows(p2)
         scaled = np.full(p2.shape, np.nan, dtype=np.float64)
         if bool(np.any(valid)):
-            p_ok = p2[valid]
+            p_ok = self._normalize_prob_rows(p2[valid])
             if not math.isfinite(self.temperature) or self.temperature <= 0.0:
                 return scaled[0] if single else scaled
             if abs(self.temperature - 1.0) <= 1e-12:
@@ -3136,7 +3187,7 @@ class UtilityCalibrator:
         costs = np.full((p2.shape[0], self.n_actions), np.nan, dtype=np.float64)
         if bool(np.any(valid)):
             with np.errstate(over="ignore", invalid="ignore"):
-                c_ok = p2[valid] @ self.cost_matrix.T
+                c_ok = self._normalize_prob_rows(p2[valid]) @ self.cost_matrix.T
             c_fin = np.all(np.isfinite(c_ok), axis=1)
             if bool(np.any(c_fin)):
                 v_idx = np.flatnonzero(valid)[c_fin]
@@ -3153,9 +3204,7 @@ class UtilityCalibrator:
             return acts
         v_idx = np.flatnonzero(valid)
         with np.errstate(over="ignore", invalid="ignore"):
-            p_rows = probs_2d[v_idx]
-            row_sums = np.sum(p_rows, axis=1, keepdims=True)
-            p_norm = np.where(np.abs(row_sums - 1.0) > 1e-9, p_rows / row_sums, p_rows)
+            p_norm = self._normalize_prob_rows(probs_2d[v_idx])
             costs_v = p_norm @ self._scaled_cost_matrix.T
             eh_v = p_norm @ self.L.T
         row_fin = np.all(np.isfinite(costs_v), axis=1) & np.all(np.isfinite(eh_v), axis=1)
@@ -3302,9 +3351,7 @@ class UtilityCalibrator:
             if bool(np.any(valid)):
                 v_idx = np.flatnonzero(valid)
                 with np.errstate(over="ignore", invalid="ignore"):
-                    p_rows = p2[v_idx]
-                    row_sums = np.sum(p_rows, axis=1, keepdims=True)
-                    p_norm = np.where(np.abs(row_sums - 1.0) > 1e-9, p_rows / row_sums, p_rows)
+                    p_norm = self._normalize_prob_rows(p2[v_idx])
                     costs_v = p_norm @ self._scaled_cost_matrix.T
                 c_fin = np.all(np.isfinite(costs_v), axis=1)
                 if bool(np.any(c_fin)):

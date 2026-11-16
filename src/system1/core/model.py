@@ -34,6 +34,9 @@ from system1.core.schema import (
     DecisionSchema,
     MultiChoiceField,
     ScoreField,
+    _score_from_unit_prob,
+    _score_half_span,
+    _score_to_unit_ratio,
 )
 from system1.core.telemetry import TelemetryProjector
 
@@ -811,8 +814,10 @@ def _validate_head_weight_bias_shapes(
         )
 
 
-def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
-    """Return an owned read-only copy preserving 2D strides, base alignment, and Fortran contiguity."""
+def _clone_preserving_2d_layout(
+    arr: Any, dtype: Any = None, *, writeable: bool = False
+) -> np.ndarray:
+    """Return an owned copy preserving 2D strides, base alignment, and Fortran contiguity."""
     raw_in = np.asarray(arr)
     target = np.dtype(raw_in.dtype if dtype is None else dtype)
     if (
@@ -838,7 +843,8 @@ def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
                 span_bytes,
             )
             np.copyto(out, src)
-            out.setflags(write=False)
+            if not writeable:
+                out.setflags(write=False)
             return out
 
     is_f_2d = (
@@ -850,8 +856,14 @@ def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
     order = "F" if is_f_2d else "C"
     raw = raw_in if dtype is None else arr
     out = np.array(raw, dtype=target, order=order, copy=True)
-    out.setflags(write=False)
+    if not writeable:
+        out.setflags(write=False)
     return out
+
+
+def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
+    """Return an owned read-only copy preserving 2D strides, base alignment, and Fortran contiguity."""
+    return _clone_preserving_2d_layout(arr, dtype=dtype, writeable=False)
 
 
 def _pack_array_sig(
@@ -1669,7 +1681,7 @@ class DecisionFieldHead:
                 norms = np.where(norms < 1e-12, 1.0, norms)
                 self.weights = (W / norms).astype(np.float32)
 
-            self._initial_weights = self.weights.copy()
+            self._initial_weights = _owned_readonly_array(self.weights, dtype=np.float32)
             self.biases = np.zeros(num_options, dtype=np.float32)
 
         elif isinstance(self.field_def, BooleanField):
@@ -1808,10 +1820,34 @@ class DecisionFieldHead:
     ) -> None:
         """Configures two-stage coarse-to-fine hierarchical routing parameters."""
         with np.errstate(over="ignore", invalid="ignore"):
-            cw = np.asarray(coarse_weights, dtype=np.float32)
-            cb = np.asarray(coarse_biases, dtype=np.float32).flatten()
-            fw = np.asarray(fine_weights, dtype=np.float32) if fine_weights is not None else None
-            fb = np.asarray(fine_biases, dtype=np.float32).flatten() if fine_biases is not None else None
+            cw_in = np.asarray(coarse_weights)
+            cb_raw = np.asarray(coarse_biases)
+            if cb_raw.ndim != 1:
+                raise ValueError(f"coarse_biases must be 1D, got shape {cb_raw.shape}")
+            _validate_2d_layout_cloneable(cw_in, np.dtype(np.float32))
+            cw = (
+                cw_in.copy()
+                if (cw_in.dtype == np.dtype(np.float32) and cw_in.flags["C_CONTIGUOUS"] and cw_in.ctypes.data % 16 == 0)
+                else _clone_preserving_2d_layout(cw_in, dtype=np.float32, writeable=True)
+            )
+            cb = np.asarray(cb_raw, dtype=np.float32)
+            if fine_weights is not None:
+                fw_in = np.asarray(fine_weights)
+                _validate_2d_layout_cloneable(fw_in, np.dtype(np.float32))
+                fw = (
+                    fw_in.copy()
+                    if (fw_in.dtype == np.dtype(np.float32) and fw_in.flags["C_CONTIGUOUS"] and fw_in.ctypes.data % 16 == 0)
+                    else _clone_preserving_2d_layout(fw_in, dtype=np.float32, writeable=True)
+                )
+            else:
+                fw = None
+            if fine_biases is not None:
+                fb_raw = np.asarray(fine_biases)
+                if fb_raw.ndim != 1:
+                    raise ValueError(f"fine_biases must be 1D, got shape {fb_raw.shape}")
+                fb = np.asarray(fb_raw, dtype=np.float32)
+            else:
+                fb = None
         if (
             not bool(np.all(np.isfinite(cw)))
             or not bool(np.all(np.isfinite(cb)))
@@ -1845,12 +1881,26 @@ class DecisionFieldHead:
         self.regularization = max(1e-4, float(regularization))
         D = self.dimension
         if P is not None:
-            self.covariance_inv = np.asarray(P, dtype=np.float32)
+            p_raw = np.asarray(P)
+            p_f32 = (
+                p_raw
+                if p_raw.dtype == np.dtype(np.float32)
+                else _clone_preserving_2d_layout(p_raw, dtype=np.float32, writeable=True)
+            )
+            _validate_2d_layout_cloneable(p_f32, np.dtype(np.float32))
+            self.covariance_inv = p_f32
         else:
             self.covariance_inv = (1.0 / self.regularization) * np.eye(D + 1, dtype=np.float32)
 
         if B is not None:
-            self.cross_covariance = np.asarray(B, dtype=np.float32)
+            b_raw = np.asarray(B)
+            b_f32 = (
+                b_raw
+                if b_raw.dtype == np.dtype(np.float32)
+                else _clone_preserving_2d_layout(b_raw, dtype=np.float32, writeable=True)
+            )
+            _validate_2d_layout_cloneable(b_f32, np.dtype(np.float32))
+            self.cross_covariance = b_f32
         else:
             w_mat = self.weights  # shape (K, D)
             b_vec = np.broadcast_to(self.biases.reshape(-1, 1), (w_mat.shape[0], 1))  # shape (K, 1)
@@ -1873,10 +1923,10 @@ class DecisionFieldHead:
             return np.array([1.0 if val else -1.0], dtype=np.float32)
         elif isinstance(self.field_def, ScoreField):
             val = float(target_value)
-            val_range = max(1e-6, self.field_def.max_value - self.field_def.min_value)
             # Inverse sigmoid logit transformation matching _solve_ridge:
             # prob = sigmoid(z / 0.25) => z = 0.25 * ln(r / (1 - r))
-            r = float(np.clip((val - self.field_def.min_value) / val_range, 1e-4, 1.0 - 1e-4))
+            ratio = _score_to_unit_ratio(val, self.field_def.min_value, self.field_def.max_value)
+            r = float(np.clip(ratio, 1e-4, 1.0 - 1e-4))
             logit_target = 0.25 * math.log(r / (1.0 - r))
             return np.array([logit_target], dtype=np.float32)
         elif isinstance(self.field_def, MultiChoiceField):
@@ -1896,7 +1946,7 @@ class DecisionFieldHead:
         if self._exemplar_bank is None:
             return None
         centroids, banks = self._exemplar_bank
-        arrays = {"exemplar_centroids": centroids.copy()}
+        arrays = {"exemplar_centroids": _owned_readonly_array(centroids, dtype=np.float32)}
         counts: Dict[str, List[int]] = {}
         for key, groups in (("exemplar_vectors", banks), ("shots_p", self._online_shots_p), ("shots_c", self._online_shots_c)):
             if groups is not None:
@@ -1907,7 +1957,7 @@ class DecisionFieldHead:
         if self._exemplar_mean is not None:
             arrays["exemplar_mean"] = self._exemplar_mean.copy()
         if self._initial_weights is not None:
-            arrays["initial_w"] = self._initial_weights.copy()
+            arrays["initial_w"] = _owned_readonly_array(self._initial_weights, dtype=np.float32)
         return {"arrays": arrays, "counts": counts,
                 "online_shots_are_pseudo": bool(getattr(self, "_online_shots_are_pseudo", False))}
 
@@ -1948,6 +1998,8 @@ class DecisionFieldHead:
                 expected = (sum(sizes), self.dimension)
             if arr.shape != expected or not np.all(np.isfinite(arr)):
                 raise ValueError(f"Saved exemplar array {key!r} is invalid")
+            if arr.ndim == 2:
+                _validate_2d_layout_cloneable(arr, np.dtype(arr.dtype))
         groups: Dict[str, List[np.ndarray]] = {}
         for key in ("exemplar_vectors", "shots_p", "shots_c"):
             if key in arrays:
@@ -2036,7 +2088,7 @@ class DecisionFieldHead:
             c_unit = (c_vec / c_norm).astype(np.float32)
 
         w_cons, sub_banks = self._exemplar_bank
-        w_cons_new = w_cons.copy()
+        w_cons_new = _clone_preserving_2d_layout(w_cons, dtype=w_cons.dtype, writeable=True)
         w_blend = (1.0 - blend_rate) * w_cons_new[target_k] + blend_rate * c_unit
         wb_norm = float(np.linalg.norm(w_blend))
         if wb_norm > 1e-12:
@@ -2268,10 +2320,10 @@ class DecisionFieldHead:
         B = self.cross_covariance
         assert P is not None and B is not None
         if not P.flags.writeable:
-            P = P.copy()
+            P = _clone_preserving_2d_layout(P, dtype=P.dtype, writeable=True)
             self.covariance_inv = P
         if not B.flags.writeable:
-            B = B.copy()
+            B = _clone_preserving_2d_layout(B, dtype=B.dtype, writeable=True)
             self.cross_covariance = B
 
         eff_reward_scale = float(min(1.0, max(0.0, reward_scale)))
@@ -2514,7 +2566,7 @@ class DecisionFieldHead:
             elif isinstance(self.field_def, ScoreField):
                 scaled_logits = logits / 0.25
                 prob = float(_stable_sigmoid(scaled_logits, temperature=1.0)[0])
-                val = self.field_def.min_value + (self.field_def.max_value - self.field_def.min_value) * prob
+                val = _score_from_unit_prob(prob, self.field_def.min_value, self.field_def.max_value)
                 return RawFieldEvaluation(
                     field_name=self.field_def.name,
                     field_type=self.field_def.field_type,
@@ -3197,6 +3249,7 @@ class PackedMultiQuestionKernel:
         zero_emb_unit0: bool = False,
         c_k_gt_n: Optional[np.ndarray] = None,
         b_k_gt_n: Optional[np.ndarray] = None,
+        s_max: Optional[np.ndarray] = None,
     ) -> None:
         self.projector = projector
         self.dimension = dimension
@@ -3274,6 +3327,9 @@ class PackedMultiQuestionKernel:
         self.Q_s = len(score_names)
         self.s_min = _owned_readonly_array(s_min, dtype=np.float64)
         self.s_range = _owned_readonly_array(s_range, dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            eff_s_max = self.s_min + self.s_range if s_max is None else np.asarray(s_max, dtype=np.float64)
+        self.s_max = _owned_readonly_array(eff_s_max, dtype=np.float64)
         self.s_default = _owned_readonly_array(
             self.s_min if s_default is None else s_default,
             dtype=np.float64,
@@ -3656,6 +3712,7 @@ class PackedMultiQuestionKernel:
 
         score_names: List[str] = []
         s_min: List[float] = []
+        s_max: List[float] = []
         s_range: List[float] = []
         s_default: List[float] = []
         s_norm_margin: List[float] = []
@@ -3714,8 +3771,8 @@ class PackedMultiQuestionKernel:
                 if not math.isfinite(temp) or temp <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
                 raw_w_arr = np.asarray(head.weights)
-                raw_b_arr = np.asarray(head.biases).reshape(-1)
-                if raw_w_arr.ndim != 2 or raw_w_arr.shape != (K, dim) or raw_b_arr.shape != (K,):
+                raw_b_arr = np.asarray(head.biases)
+                if raw_w_arr.ndim != 2 or raw_w_arr.shape != (K, dim) or raw_b_arr.ndim != 1 or raw_b_arr.shape != (K,):
                     raise ValueError(
                         f"Choice head {fname!r} shape mismatch: expected ({K}, {dim}) and ({K},), got {raw_w_arr.shape} and {raw_b_arr.shape}"
                     )
@@ -3778,11 +3835,12 @@ class PackedMultiQuestionKernel:
                 if not math.isfinite(temp) or temp <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
                 raw_w_full = np.asarray(head.weights)
-                raw_b_full = np.asarray(head.biases).reshape(-1)
+                raw_b_full = np.asarray(head.biases)
                 if (
                     raw_w_full.ndim != 2
                     or raw_w_full.shape[0] not in (1, 2)
                     or raw_w_full.shape[1] != dim
+                    or raw_b_full.ndim != 1
                     or raw_b_full.shape[0] not in (1, raw_w_full.shape[0])
                 ):
                     raise ValueError(
@@ -3856,11 +3914,12 @@ class PackedMultiQuestionKernel:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {raw_t!r}")
                 temp = max(1e-4, raw_t)
                 raw_w_full = np.asarray(head.weights)
-                raw_b_full = np.asarray(head.biases).reshape(-1)
+                raw_b_full = np.asarray(head.biases)
                 if (
                     raw_w_full.ndim != 2
                     or raw_w_full.shape[0] not in (1, 2)
                     or raw_w_full.shape[1] != dim
+                    or raw_b_full.ndim != 1
                     or raw_b_full.shape[0] not in (1, raw_w_full.shape[0])
                 ):
                     raise ValueError(
@@ -3887,8 +3946,11 @@ class PackedMultiQuestionKernel:
                 W_cols.append(W.T)
                 b_cols.append(b)
                 s_raw_scale.append(temp)
-                rng_val = float(f_def.max_value - f_def.min_value)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    rng_val = float(f_def.max_value - f_def.min_value)
+                half_span = _score_half_span(f_def.min_value, f_def.max_value)
                 s_min.append(float(f_def.min_value))
+                s_max.append(float(f_def.max_value))
                 s_range.append(rng_val)
                 s_default.append(
                     float(f_def.default)
@@ -3901,10 +3963,14 @@ class PackedMultiQuestionKernel:
                 s_is_cal.append(cal_ok)
                 if cal_ok:
                     k_idx = math.ceil((n_res + 1) * (1.0 - eff_alpha))
-                    m = rng_val if k_idx > n_res else float(rcp.residuals[k_idx - 1])
+                    if k_idx > n_res:
+                        norm_m = 1.0
+                    else:
+                        m = float(rcp.residuals[k_idx - 1])
+                        norm_m = (0.5 * m) / half_span if (math.isfinite(m) and half_span > 0.0) else (1.0 if not math.isfinite(m) else 0.0)
                 else:
-                    m = rng_val if strict_mode else rng_val * ((1.0 - eff_alpha) / 2.0)
-                s_norm_margin.append(m / max(1e-6, rng_val))
+                    norm_m = 1.0 if strict_mode else (1.0 - eff_alpha) / 2.0
+                s_norm_margin.append(norm_m)
                 s_escalate.append(bool(getattr(f_def, "escalate_on_ambiguity", True)))
                 s_zero_head.append(bool(not np.any(raw_w_arr) and not np.any(raw_b_arr)))
 
@@ -3950,6 +4016,7 @@ class PackedMultiQuestionKernel:
             b_tau0=np.asarray(b_tau0, dtype=np.float64),
             score_names=tuple(score_names),
             s_min=np.asarray(s_min, dtype=np.float64),
+            s_max=np.asarray(s_max, dtype=np.float64),
             s_range=np.asarray(s_range, dtype=np.float64),
             s_norm_margin=np.asarray(s_norm_margin, dtype=np.float64),
             s_raw_scale=np.asarray(s_raw_scale, dtype=np.float64),
@@ -4064,8 +4131,8 @@ class PackedMultiQuestionKernel:
                 for si, fname in enumerate(self.score_names):
                     if fname in m_ov and (is_zero_r or bool(self.s_zero_head[si])):
                         val_f = float(m_ov[fname])
-                        rng_f = max(1e-6, float(self.s_range[si]))
-                        ratio = float(np.clip((val_f - float(self.s_min[si])) / rng_f, 1e-4, 1.0 - 1e-4))
+                        unit_r = _score_to_unit_ratio(val_f, float(self.s_min[si]), float(self.s_max[si]))
+                        ratio = float(np.clip(unit_r, 1e-4, 1.0 - 1e-4))
                         logit_t = float(np.float32(0.25 * math.log(ratio / (1.0 - ratio))))
                         logits[r, self.M_c + self.Q_b + si] = logit_t
                         s_model_ov[r, si] = True
@@ -4605,7 +4672,12 @@ class PackedMultiQuestionKernel:
                 scaled_zs = zs / 0.25
                 zs_cal = scaled_zs / self.s_raw_scale[None, :]
                 p_s = _stable_sigmoid(zs_cal)
-                s_val = self.s_min[None, :] + self.s_range[None, :] * p_s
+                fin_rng = np.isfinite(self.s_range[None, :])
+                s_val = np.where(
+                    fin_rng,
+                    self.s_min[None, :] + self.s_range[None, :] * p_s,
+                    (1.0 - p_s) * self.s_min[None, :] + p_s * self.s_max[None, :],
+                )
                 p_s_raw = _stable_sigmoid(scaled_zs)
                 s_conf = np.maximum(p_s_raw, 1.0 - p_s_raw)
             s_nonfin = (
@@ -4816,6 +4888,7 @@ class _BoundCallableState:
     b_offset: int
     s_names: Tuple[str, ...]
     s_min: Tuple[float, ...]
+    s_max: Tuple[float, ...]
     s_range: Tuple[float, ...]
     s_norm_margin: Tuple[float, ...]
     s_raw_scale: Tuple[float, ...]
@@ -4970,6 +5043,7 @@ class FastDecisionCallable:
             b_offset=kernel.M_c,
             s_names=tuple(kernel.score_names),
             s_min=tuple(float(x) for x in kernel.s_min),
+            s_max=tuple(float(x) for x in kernel.s_max),
             s_range=tuple(float(x) for x in kernel.s_range),
             s_norm_margin=tuple(float(x) for x in kernel.s_norm_margin),
             s_raw_scale=tuple(float(x) for x in kernel.s_raw_scale),
@@ -5660,7 +5734,11 @@ class FastDecisionCallable:
             else:
                 ez = exp(z_cal)
                 ps = ez / (1.0 + ez)
-            s_val = st.s_min[si] + st.s_range[si] * ps
+            s_val = (
+                st.s_min[si] + st.s_range[si] * ps
+                if isfinite(st.s_range[si])
+                else ((1.0 - ps) * st.s_min[si] + ps * st.s_max[si])
+            )
             if scaled_zs >= 0.0:
                 ps_raw = 1.0 / (1.0 + exp(-scaled_zs))
             else:

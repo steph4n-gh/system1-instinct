@@ -66,6 +66,9 @@ from system1.core.schema import (
     DecisionSchema,
     MultiChoiceField,
     ScoreField,
+    _score_from_unit_prob,
+    _score_half_span,
+    _score_to_unit_ratio,
 )
 from system1.calibration import (
     ConformalPredictor,
@@ -702,6 +705,7 @@ def _validate_tensor_layouts_header(
     shapes: Mapping[str, Tuple[int, ...]],
     *,
     non_f32_2d_names: AbstractSet[str] = frozenset(),
+    full_allocation: bool = False,
 ) -> Tuple[Dict[str, Tuple[int, int, int]], int]:
     """Validate optional serialized 2D stride/alignment metadata and return extra runtime bytes."""
     if "tensor_layouts" not in meta:
@@ -744,7 +748,7 @@ def _validate_tensor_layouts_header(
             aliased = (a1 // g) < K and (a0 // g) < D
         if aliased:
             raise ValueError(f"Saved skill tensor_layouts aliases elements for {tname!r}")
-        extra_bytes += (span_bytes - nbytes_f32) + 128
+        extra_bytes += (span_bytes + 128) if full_allocation else ((span_bytes - nbytes_f32) + 128)
         validated[tname] = (mod64, s0, s1)
     return validated, extra_bytes
 
@@ -1703,12 +1707,11 @@ class CompiledSystemOneModel:
                                 ch.conformal_quantile = q_init
                             elif ch.field_type == "score":
                                 f_def_sc = self.schema.fields.get(f_name)
-                                span = (
-                                    max(1e-6, float(f_def_sc.max_value - f_def_sc.min_value))
+                                q_init_sc = (
+                                    0.10 * _score_half_span(f_def_sc.min_value, f_def_sc.max_value)
                                     if isinstance(f_def_sc, ScoreField)
-                                    else 1.0
+                                    else 0.05
                                 )
-                                q_init_sc = 0.05 * span
                                 ch.calibration_scores = tuple(q_init_sc for _ in range(20))
                                 ch.conformal_quantile = q_init_sc
                         elif not preserve_calibration:
@@ -3603,6 +3606,7 @@ class CompiledSystemOneModel:
             meta,
             shapes_v3,
             non_f32_2d_names=idf_tensor_names | logit_adj_names | score_f64_names,
+            full_allocation=True,
         )
         extra_runtime_bytes += upcast_bytes_v3 + layout_extra_bytes_v3
 
@@ -4160,7 +4164,6 @@ class SystemOneCompiler:
                     field_samples.append((neg_text, ()))
 
             elif isinstance(f_def, ScoreField):
-                val_range = max(1e-6, f_def.max_value - f_def.min_value)
                 low_d = f_def.low_description
                 high_d = f_def.high_description
                 desc_mid = f_def.description or "Intermediate balanced condition"
@@ -4185,8 +4188,8 @@ class SystemOneCompiler:
                     (1.0, f"Maximum critical rating: {high_d}"),
                 ]
                 for fraction, prompt in score_levels:
-                    target_val = f_def.min_value + fraction * val_range
-                    field_samples.append((prompt, float(target_val)))
+                    target_val = float(_score_from_unit_prob(fraction, f_def.min_value, f_def.max_value))
+                    field_samples.append((prompt, target_val))
 
             exemplars[field_name] = field_samples
 
@@ -4405,7 +4408,7 @@ class SystemOneCompiler:
                 if np.any(mask):
                     vec = _safe_weighted_mean(X_mat[mask], sw[mask] if sw is not None else None)
                     if vec is not None:
-                        unit_v, _, ok = _normalize_vec_f32_safe(vec)
+                        unit_v, _, ok = _normalize_vec_f32_safe(vec, min_norm=0.0)
                         if ok:
                             protos[idx] = unit_v
             res = _roundtrip_unit_f16(protos)
@@ -4421,7 +4424,7 @@ class SystemOneCompiler:
             if np.any(mask):
                 vec = _safe_weighted_mean(X_mat[mask], sw[mask] if sw is not None else None)
                 if vec is not None:
-                    unit_v, _, ok = _normalize_vec_f32_safe(vec)
+                    unit_v, _, ok = _normalize_vec_f32_safe(vec, min_norm=0.0)
                     if ok:
                         protos[k] = unit_v
         res = _roundtrip_unit_f16(protos)
@@ -5415,17 +5418,21 @@ class SystemOneCompiler:
                         samples.append((p, lab))
 
                 elif isinstance(f_def, ScoreField):
-                    val_range = max(1e-6, f_def.max_value - f_def.min_value)
                     synth_all = self.generate_synthetic_exemplars(samples_per_choice=samples_per_choice)
                     synth_field = synth_all.get(field_name, [])
 
-                    low_synth = [s for s in synth_field if float(s[1]) <= f_def.min_value + 0.33 * val_range]
-                    mid_synth = [s for s in synth_field if f_def.min_value + 0.33 * val_range < float(s[1]) <= f_def.min_value + 0.67 * val_range]
-                    high_synth = [s for s in synth_field if float(s[1]) > f_def.min_value + 0.67 * val_range]
+                    def _sc_unit(sample_pair: Any) -> float:
+                        return float(
+                            _score_to_unit_ratio(float(sample_pair[1]), f_def.min_value, f_def.max_value)
+                        )
 
-                    low_real = [s for s in samples if float(s[1]) <= f_def.min_value + 0.33 * val_range]
-                    mid_real = [s for s in samples if f_def.min_value + 0.33 * val_range < float(s[1]) <= f_def.min_value + 0.67 * val_range]
-                    high_real = [s for s in samples if float(s[1]) > f_def.min_value + 0.67 * val_range]
+                    low_synth = [s for s in synth_field if _sc_unit(s) <= 0.33]
+                    mid_synth = [s for s in synth_field if 0.33 < _sc_unit(s) <= 0.67]
+                    high_synth = [s for s in synth_field if _sc_unit(s) > 0.67]
+
+                    low_real = [s for s in samples if _sc_unit(s) <= 0.33]
+                    mid_real = [s for s in samples if 0.33 < _sc_unit(s) <= 0.67]
+                    high_real = [s for s in samples if _sc_unit(s) > 0.67]
 
                     target_c = max(len(low_real), len(mid_real), len(high_real), samples_per_choice, 15)
 
@@ -6259,11 +6266,11 @@ class SystemOneCompiler:
                 )
 
             elif isinstance(f_def, ScoreField):
-                val_range = max(1e-6, f_def.max_value - f_def.min_value)
-                raw_floats = np.array([float(lab) for lab in raw_labels], dtype=np.float32).reshape(-1, 1)
+                raw_floats = np.array([float(lab) for lab in raw_labels], dtype=np.float64).reshape(-1, 1)
                 # Map target into logit space matching sigmoid evaluation: prob = sigmoid(z / 0.25) => z = 0.25 * ln(r / (1 - r))
-                r = np.clip((raw_floats - f_def.min_value) / val_range, 0.01, 0.99)
-                Z_all = (0.25 * np.log(r / (1.0 - r))).astype(np.float32)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    r = np.clip(_score_to_unit_ratio(raw_floats, f_def.min_value, f_def.max_value), 0.01, 0.99)
+                    Z_all = (0.25 * np.log(r / (1.0 - r))).astype(np.float32)
                 Z_train = Z_all[:num_train]
                 weights, biases, P_mat, B_mat = self._solve_ridge(
                     X_train, Z_train, self.regularization, regularize_bias=augment, return_covariance=True
@@ -6276,17 +6283,18 @@ class SystemOneCompiler:
                 # Calibrate residual bounds on X_calib
                 logits_calib = (X_calib @ weights.T + biases).flatten()
                 probs_calib = _stable_sigmoid(logits_calib, temperature=0.25)
-                pred_vals = f_def.min_value + val_range * probs_calib
+                pred_vals = _score_from_unit_prob(probs_calib, f_def.min_value, f_def.max_value)
                 true_calib_floats = raw_floats[num_train:].flatten()
                 residuals = [
-                    float(abs(pred_vals[i] - true_calib_floats[i]))
+                    float(abs(float(pred_vals[i]) - float(true_calib_floats[i])))
                     for i in range(len(pred_vals))
                 ]
                 sorted_residuals = np.sort(np.asarray(residuals, dtype=np.float64))
                 alpha = 0.05
                 n_res = len(sorted_residuals)
                 k = int(math.ceil((n_res + 1) * (1.0 - alpha)))
-                conformal_q = (float(val_range) if k > n_res else float(sorted_residuals[k - 1])) if n_res else 0.0
+                full_range = float(f_def.max_value) - float(f_def.min_value)
+                conformal_q = (full_range if k > n_res else float(sorted_residuals[k - 1])) if n_res else 0.0
 
                 compiled_heads[field_name] = CompiledHeadWeights(
                     field_name=field_name,

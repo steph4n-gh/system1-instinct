@@ -868,10 +868,34 @@ class MultiTenantSkillFleet:
             proto_cand = float(getattr(cand, "prototype_threshold", 0.0))
             if not math.isfinite(proto_cand) or proto_cand > 0.0:
                 raise ValueError(f"MultiTenantSkillFleet does not support prototype_threshold on {field_name!r}")
-        for container in (model, resolved):
+        containers = (model,) if resolved is model else (model, resolved)
+        for container in containers:
             sel_map = getattr(container, "selective_calibrators", None)
             if isinstance(sel_map, Mapping) and sel_map.get(field_name) is not None:
                 raise ValueError(f"MultiTenantSkillFleet does not support selective_calibrator on {field_name!r}")
+            ov_attr = getattr(container, "_learned_prompt_overrides", None)
+            if ov_attr is not None:
+                if not isinstance(ov_attr, Mapping):
+                    raise ValueError("Invalid _learned_prompt_overrides container")
+                for f_map in ov_attr.values():
+                    if not isinstance(f_map, Mapping):
+                        raise ValueError("Invalid _learned_prompt_overrides entry")
+                    if field_name in f_map:
+                        raise ValueError(
+                            f"MultiTenantSkillFleet does not support learned_prompt_overrides on {field_name!r}"
+                        )
+            meta_obj = getattr(container, "metadata", None)
+            meta_ov = meta_obj.get("learned_prompt_overrides") if isinstance(meta_obj, Mapping) else None
+            if meta_ov is not None:
+                if not isinstance(meta_ov, Mapping):
+                    raise ValueError("Invalid metadata learned_prompt_overrides container")
+                for f_map in meta_ov.values():
+                    if not isinstance(f_map, Mapping):
+                        raise ValueError("Invalid metadata learned_prompt_overrides entry")
+                    if field_name in f_map:
+                        raise ValueError(
+                            f"MultiTenantSkillFleet does not support learned_prompt_overrides on {field_name!r}"
+                        )
 
         calibrators = getattr(model, "calibrators", None)
         cal_obj = calibrators.get(field_name) if isinstance(calibrators, Mapping) else None
@@ -889,19 +913,19 @@ class MultiTenantSkillFleet:
             raise ValueError(f"Calibration logit_adjustments for {field_name!r} contain non-finite values")
 
         raw_w_in = np.asarray(head.weights)
-        raw_b_in = np.asarray(head.biases).reshape(-1)
+        raw_b_in = np.asarray(head.biases)
         w_dtype = np.float64 if raw_w_in.dtype == np.float64 else np.float32
         b_dtype = np.float64 if raw_b_in.dtype == np.float64 else np.float32
         raw_w_auth = _owned_readonly_array(raw_w_in, dtype=w_dtype)
         raw_b_auth = _owned_readonly_array(raw_b_in, dtype=b_dtype)
-        raw_w64 = np.asarray(raw_w_auth, dtype=np.float64)
-        raw_b64 = np.asarray(raw_b_auth, dtype=np.float64).reshape(-1)
-        if not (np.all(np.isfinite(raw_w64)) and np.all(np.isfinite(raw_b64))):
-            raise ValueError(f"Field head {field_name!r} contains non-finite weights or biases")
         if isinstance(f_def, (BooleanField, ChoiceField)):
             _validate_head_weight_bias_shapes(
                 f_def, raw_w_auth, raw_b_auth, int(resolved.dimension), field_name
             )
+        raw_w64 = np.asarray(raw_w_auth, dtype=np.float64)
+        raw_b64 = np.asarray(raw_b_auth, dtype=np.float64).reshape(-1)
+        if not (np.all(np.isfinite(raw_w64)) and np.all(np.isfinite(raw_b64))):
+            raise ValueError(f"Field head {field_name!r} contains non-finite weights or biases")
 
         is_bool_head = bool(isinstance(f_def, BooleanField) or raw_w64.shape[0] == 1)
         bool_threshold = float(getattr(f_def, "threshold", 0.5)) if is_bool_head else 0.5

@@ -351,7 +351,7 @@ class GuardShield:
         self.cal_adj = None if adj is None else adj.copy()
 
         raw_w_in = np.asarray(self.head.weights)
-        raw_b_in = np.asarray(self.head.biases).reshape(-1)
+        raw_b_in = np.asarray(self.head.biases)
         w_dtype = np.float64 if raw_w_in.dtype == np.float64 else np.float32
         b_dtype = np.float64 if raw_b_in.dtype == np.float64 else np.float32
         self.raw_W = _owned_readonly_array(raw_w_in, dtype=w_dtype)
@@ -438,7 +438,9 @@ class GuardShield:
         self._hier_dtype: Any = np.result_type(w_dtype, b_dtype)
         if self.is_hier:
             cw_in = np.asarray(self.head.coarse_weights)
-            cb_in = np.asarray(self.head.coarse_biases).reshape(-1)
+            cb_in = np.asarray(self.head.coarse_biases)
+            if cb_in.ndim != 1:
+                raise ValueError(f"Field head {self.field_name!r} coarse_biases must be 1D, got shape {cb_in.shape}")
             if not (np.all(np.isfinite(cw_in)) and np.all(np.isfinite(cb_in))):
                 raise ValueError(f"Field head {self.field_name!r} contains non-finite hierarchical coarse weights")
             c_assign = np.asarray(cluster_assign_raw, dtype=np.int64)
@@ -467,7 +469,9 @@ class GuardShield:
                 and getattr(self.head, "fine_biases", None) is not None
             ):
                 fw_in = np.asarray(self.head.fine_weights)
-                fb_in = np.asarray(self.head.fine_biases).reshape(-1)
+                fb_in = np.asarray(self.head.fine_biases)
+                if fb_in.ndim != 1:
+                    raise ValueError(f"Field head {self.field_name!r} fine_biases must be 1D, got shape {fb_in.shape}")
                 if not (np.all(np.isfinite(fw_in)) and np.all(np.isfinite(fb_in))):
                     raise ValueError(f"Field head {self.field_name!r} contains non-finite hierarchical fine weights")
                 if fw_in.shape != self.raw_W.shape or fb_in.shape != (self.raw_W.shape[0],):

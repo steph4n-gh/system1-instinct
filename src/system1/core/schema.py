@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -603,6 +604,38 @@ class DecisionSchema(metaclass=SchemaMeta):
         }
 
 
+def _score_half_span(min_value: float, max_value: float) -> float:
+    """Return 0.5 * (max_value - min_value) without overflow on wide float64 bounds."""
+    lo = float(min_value)
+    hi = float(max_value)
+    hs = 0.5 * hi - 0.5 * lo
+    return hs if hs > 0.0 else 0.5 * (hi - lo)
+
+
+def _score_to_unit_ratio(value: Any, min_value: float, max_value: float) -> Any:
+    """Normalize a scalar or array Score value into [0, 1] without span floor or overflow."""
+    lo = float(min_value)
+    hi = float(max_value)
+    span = hi - lo
+    if math.isfinite(span) and span > 0.0:
+        v = float(value) if isinstance(value, (int, float)) else value
+        return (v - lo) / span
+    hs = 0.5 * hi - 0.5 * lo
+    if isinstance(value, (int, float)):
+        return (0.5 * float(value) - 0.5 * lo) / hs
+    return (0.5 * value - 0.5 * lo) / hs
+
+
+def _score_from_unit_prob(prob: Any, min_value: float, max_value: float) -> Any:
+    """Map a unit probability in [0, 1] back into [min_value, max_value] without overflow."""
+    lo = float(min_value)
+    hi = float(max_value)
+    span = hi - lo
+    if math.isfinite(span):
+        return lo + span * prob
+    return (1.0 - prob) * lo + prob * hi
+
+
 # FieldDefinition alias for canonical DecisionField
 FieldDefinition = DecisionField
 
@@ -616,4 +649,7 @@ __all__ = [
     "SchemaMeta",
     "DecisionSchema",
     "_validate_field_name",
+    "_score_half_span",
+    "_score_to_unit_ratio",
+    "_score_from_unit_prob",
 ]

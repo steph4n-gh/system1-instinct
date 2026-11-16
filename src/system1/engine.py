@@ -72,6 +72,7 @@ from system1.core.model import (
     _validate_packed_engine_support,
 )
 from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
+from system1.core.schema import _score_from_unit_prob, _score_half_span, _score_to_unit_ratio
 from system1.core.embeddings import HybridProjector
 from system1.core.telemetry import TelemetryProjector
 from system1.core.text import PragmaticCompositeProjector
@@ -1103,7 +1104,7 @@ class SystemOneEngine:
                 elif isinstance(definition, MultiChoiceField):
                     targets = np.asarray([[int(opt in label) for opt in definition.options] for label in labels])
                 else:
-                    midpoint = (definition.min_value + definition.max_value) / 2
+                    midpoint = 0.5 * float(definition.min_value) + 0.5 * float(definition.max_value)
                     targets = np.asarray([int(label >= midpoint) for label in labels])
 
                 temp_logits = logits[:count]
@@ -1169,7 +1170,7 @@ class SystemOneEngine:
                     scores = predictor.calibration_scores
                 else:
                     probs = _stable_sigmoid(conf_logits.reshape(-1) / calibrator.temperature, temperature=1.0)
-                    predictions = definition.min_value + (definition.max_value - definition.min_value) * probs
+                    predictions = _score_from_unit_prob(probs, definition.min_value, definition.max_value)
                     predictor = self.regression_conformal_predictors[name]
                     predictor.calibrate(predictions, conf_labels)
                     scores = predictor.residuals
@@ -1194,7 +1195,11 @@ class SystemOneEngine:
                                 str(k): tuple(float(v) for v in vals) for k, vals in c_scores.items()
                             }
                     k = int(math.ceil((len(scores) + 1) * (1.0 - self.default_alpha)))
-                    upper = definition.max_value - definition.min_value if isinstance(definition, ScoreField) else 1.0
+                    upper = (
+                        float(definition.max_value) - float(definition.min_value)
+                        if isinstance(definition, ScoreField)
+                        else 1.0
+                    )
                     compiled.conformal_quantile = float(scores[k - 1]) if k <= len(scores) else upper
             self.model_version = max(self.model_version, int(getattr(self.model, "model_version", 1))) + 1
             if hasattr(self.model, "model_version"):
@@ -1360,13 +1365,17 @@ class SystemOneEngine:
                 calibrator = DecisionCalibrator(temperature=prev_temp)
                 if isinstance(definition, ScoreField):
                     calibrator.is_binary = False
-                    val_span = max(1e-6, float(definition.max_value - definition.min_value))
                     p_ratio = _stable_sigmoid(logits.flatten() / max(1e-4, prev_temp), temperature=1.0)
-                    y_ratio = np.clip(
-                        (np.asarray(labels, dtype=np.float64) - float(definition.min_value)) / val_span,
-                        0.0,
-                        1.0,
-                    )
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        y_ratio = np.clip(
+                            _score_to_unit_ratio(
+                                np.asarray(labels, dtype=np.float64),
+                                definition.min_value,
+                                definition.max_value,
+                            ),
+                            0.0,
+                            1.0,
+                        )
                     p_clip = np.clip(p_ratio, 1e-12, 1.0 - 1e-12)
                     init_ece = float(np.mean(np.abs(p_ratio - y_ratio))) if len(logits) > 0 else 0.0
                     init_brier = float(np.mean((p_ratio - y_ratio) ** 2)) if len(logits) > 0 else 0.0
@@ -1493,7 +1502,7 @@ class SystemOneEngine:
                     predictor.quantile = new_q
                 else:
                     probs = _stable_sigmoid(conf_logits.reshape(-1) / calibrator.temperature, temperature=1.0)
-                    predictions = definition.min_value + (definition.max_value - definition.min_value) * probs
+                    predictions = _score_from_unit_prob(probs, definition.min_value, definition.max_value)
                     predictor = self.regression_conformal_predictors[name]
                     predictor.calibrate(predictions, conf_labels)
                     scores = predictor.residuals
@@ -1799,7 +1808,7 @@ class SystemOneEngine:
                     set_size_i = float(len(c_set))
                     singleton_i = is_accepted
                 else:
-                    val_span = max(1e-6, float(f_def.max_value - f_def.min_value))
+                    half_span = _score_half_span(f_def.min_value, f_def.max_value)
                     covered_i = False
                     rcp = self.regression_conformal_predictors.get(fname)
                     if is_unfamiliar or not c_set:
@@ -1814,9 +1823,10 @@ class SystemOneEngine:
                             covered_i = (lo_v - 1e-4) <= float(gt_val) <= (hi_v + 1e-4)
                         except (ValueError, IndexError):
                             covered_i = False
+                    half_err = abs(0.5 * float(pred_val) - 0.5 * float(gt_val))
                     abs_err = abs(float(pred_val) - float(gt_val))
                     f_mae_sum += abs_err
-                    correct_i = abs_err <= 0.10 * val_span
+                    correct_i = half_err <= 0.10 * half_span if math.isfinite(half_span) and half_span > 0.0 else (float(pred_val) == float(gt_val))
                     set_size_i = float(len(c_set))
                     singleton_i = is_accepted
 
@@ -1880,7 +1890,6 @@ class SystemOneEngine:
                 f_brier = float(compute_brier_decomposition(probs_2d, targets_flat, n_bins=n_bins).empirical_brier)
                 f_nll = float(compute_nll(probs_2d, targets_flat))
             else:
-                val_span = max(1e-6, float(f_def.max_value - f_def.min_value))
                 probs_pos = np.clip(
                     np.asarray(
                         [float(res.probabilities.get(fname, {}).get("score_ratio", 0.5)) for _, res, _ in f_rows],
@@ -1891,7 +1900,7 @@ class SystemOneEngine:
                 )
                 y_ratio = np.clip(
                     np.asarray(
-                        [(float(gt_val) - float(f_def.min_value)) / val_span for _, _, gt_val in f_rows],
+                        [float(_score_to_unit_ratio(float(gt_val), f_def.min_value, f_def.max_value)) for _, _, gt_val in f_rows],
                         dtype=np.float64,
                     ),
                     0.0,
@@ -2563,7 +2572,7 @@ class SystemOneEngine:
                         raw_logit = float(raw_eval.logits[0])
                         scaled_logit = float(raw_logit / max(1e-4, calibrated_temp))
                         prob = float(_stable_sigmoid(np.array([scaled_logit]), temperature=1.0)[0])
-                        val = f_def.min_value + (f_def.max_value - f_def.min_value) * prob
+                        val = float(_score_from_unit_prob(prob, f_def.min_value, f_def.max_value))
                         conf = float(getattr(raw_eval, "confidence", max(prob, 1.0 - prob)))
                     logits_finite = math.isfinite(raw_logit) and math.isfinite(scaled_logit)
                     if not (emb_finite and logits_finite and math.isfinite(val) and math.isfinite(conf)):
@@ -2586,23 +2595,28 @@ class SystemOneEngine:
                     probabilities[name] = {"score_ratio": prob}
                     reg_conformal = self.regression_conformal_predictors.get(name)
                     is_uncalibrated = reg_conformal is None or not reg_conformal.is_calibrated
+                    half_span = _score_half_span(f_def.min_value, f_def.max_value)
                     if not is_uncalibrated and not has_learned_override:
                         interval = reg_conformal.predict_interval(val, alpha=alpha, strict=is_strict)
                         conformal_sets[name] = [interval.to_interval_string()]
                         interval_margin = interval.margin
                     else:
                         if is_strict and not has_learned_override:
-                            interval_margin = f_def.max_value - f_def.min_value
+                            interval_margin = float(f_def.max_value) - float(f_def.min_value)
                             low_b = f_def.min_value
                             high_b = f_def.max_value
                         else:
-                            interval_margin = (f_def.max_value - f_def.min_value) * ((1.0 - alpha) / 2.0) if not has_learned_override else 0.0
+                            interval_margin = (1.0 - alpha) * half_span if not has_learned_override else 0.0
                             low_b = max(f_def.min_value, val - interval_margin)
                             high_b = min(f_def.max_value, val + interval_margin)
                         conformal_sets[name] = [f"[{low_b:.4f}, {high_b:.4f}]"]
 
-                    score_range = max(1e-6, f_def.max_value - f_def.min_value)
-                    normalized_margin = interval_margin / score_range
+                    if has_learned_override or float(interval_margin) == 0.0:
+                        normalized_margin = 0.0
+                    elif math.isfinite(float(interval_margin)) and half_span > 0.0:
+                        normalized_margin = min(1.0, (0.5 * float(interval_margin)) / half_span)
+                    else:
+                        normalized_margin = 1.0
                     score_ambiguous = False
                     if is_strict and not has_learned_override:
                         eff_score_thresh = eff_m_thresh if (self.enable_margin_gating and eff_m_thresh is not None) else 0.5
@@ -3251,8 +3265,8 @@ class SystemOneEngine:
                         elif not rcp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
                             f_def_s = self.schema.fields[f_name]
                             if isinstance(f_def_s, ScoreField):
-                                span = max(1e-6, float(f_def_s.max_value - f_def_s.min_value))
-                                rcp.residuals = np.full(20, 0.05 * span, dtype=np.float64)
+                                half_span_s = _score_half_span(f_def_s.min_value, f_def_s.max_value)
+                                rcp.residuals = np.full(20, 0.10 * half_span_s, dtype=np.float64)
                                 rcp.is_calibrated = True
 
             self._packed_kernel_cache = None
@@ -3497,14 +3511,22 @@ class SystemOneEngine:
                         _validate_head_weight_bias_shapes(
                             f_def,
                             np.asarray(live_head.weights),
-                            np.asarray(live_head.biases).reshape(-1),
+                            np.asarray(live_head.biases),
                             self.dimension,
                             name,
                         )
                         ch.weights = _checked_f32_copy(live_head.weights, f"Head {name!r} weights")
                         ch.biases = _checked_f32_copy(live_head.biases, f"Head {name!r} biases")
-                        ch.P = live_head.covariance_inv
-                        ch.B = live_head.cross_covariance
+                        ch.P = (
+                            None
+                            if live_head.covariance_inv is None
+                            else _checked_f32_copy(live_head.covariance_inv, f"Head {name!r} P")
+                        )
+                        ch.B = (
+                            None
+                            if live_head.cross_covariance is None
+                            else _checked_f32_copy(live_head.cross_covariance, f"Head {name!r} B")
+                        )
                         ch.exemplar_state = live_head.export_exemplar_state()
                     if name in self.calibrators:
                         ch.temperature = float(self.calibrators[name].temperature)
@@ -3559,8 +3581,14 @@ class SystemOneEngine:
                             ch.calibration_scores = ()
                             ch.conformal_quantile = 0.0
                 if getattr(self, "_learned_prompt_overrides", None):
+                    eng_ov_rec = getattr(self, "_learned_prompt_override_recency", {})
                     for p_k, f_map in self._learned_prompt_overrides.items():
-                        self.model._learned_prompt_overrides.setdefault(p_k, {}).update(f_map)
+                        if isinstance(f_map, Mapping) and f_map:
+                            self.model._learned_prompt_overrides.setdefault(p_k, {}).update(f_map)
+                            if isinstance(eng_ov_rec, Mapping) and p_k in eng_ov_rec:
+                                self.model._learned_prompt_override_recency[p_k] = bool(eng_ov_rec[p_k])
+                            elif p_k not in self.model._learned_prompt_override_recency:
+                                self.model._learned_prompt_override_recency[p_k] = bool(self.recency_weighted)
                 self.model.metadata["strict_mode"] = bool(self.strict_mode)
                 self.model.metadata["default_alpha"] = float(self.default_alpha)
                 return self.model
@@ -3633,7 +3661,13 @@ class SystemOneEngine:
 
                 w_export = _checked_f32_copy(head.weights, f"Head {name!r} weights")
                 b_export = _checked_f32_copy(head.biases, f"Head {name!r} biases")
-                _validate_head_weight_bias_shapes(f_def, w_export, b_export.reshape(-1), self.dimension, name)
+                _validate_head_weight_bias_shapes(f_def, w_export, b_export, self.dimension, name)
+                raw_p = getattr(head, "covariance_inv", None)
+                raw_b_cov = getattr(head, "cross_covariance", None)
+                raw_cw = getattr(head, "coarse_weights", None)
+                raw_cb = getattr(head, "coarse_biases", None)
+                raw_fw = getattr(head, "fine_weights", None)
+                raw_fb = getattr(head, "fine_biases", None)
                 compiled_heads[name] = CompiledHeadWeights(
                     field_name=name,
                     field_type=f_def.field_type,
@@ -3643,8 +3677,8 @@ class SystemOneEngine:
                     logit_adjustments=logit_adj,
                     conformal_quantile=conf_q,
                     options=opts,
-                    P=getattr(head, "covariance_inv", None),
-                    B=getattr(head, "cross_covariance", None),
+                    P=None if raw_p is None else _checked_f32_copy(raw_p, f"Head {name!r} P"),
+                    B=None if raw_b_cov is None else _checked_f32_copy(raw_b_cov, f"Head {name!r} B"),
                     margin_threshold=eff_head_margin,
                     forgetting_factor=float(self.forgetting_factor),
                     relative_odds_ratio=float(self.relative_odds_ratio if self.relative_odds_ratio is not None else 1.5),
@@ -3660,10 +3694,10 @@ class SystemOneEngine:
                     prototype_scores=proto_scores,
                     hierarchical=bool(getattr(head, "hierarchical", False)),
                     cluster_assignments=tuple(getattr(head, "cluster_assignments", ())),
-                    coarse_weights=getattr(head, "coarse_weights", None),
-                    coarse_biases=getattr(head, "coarse_biases", None),
-                    fine_weights=getattr(head, "fine_weights", None),
-                    fine_biases=getattr(head, "fine_biases", None),
+                    coarse_weights=None if raw_cw is None else _checked_f32_copy(raw_cw, f"Head {name!r} coarse_weights"),
+                    coarse_biases=None if raw_cb is None else _checked_f32_copy(raw_cb, f"Head {name!r} coarse_biases"),
+                    fine_weights=None if raw_fw is None else _checked_f32_copy(raw_fw, f"Head {name!r} fine_weights"),
+                    fine_biases=None if raw_fb is None else _checked_f32_copy(raw_fb, f"Head {name!r} fine_biases"),
                     exemplar_state=head.export_exemplar_state(),
                 )
 
@@ -3681,9 +3715,18 @@ class SystemOneEngine:
                 forgetting_factor=self.forgetting_factor,
                 recency_weighted=self.recency_weighted,
             )
-            if getattr(self, "_learned_prompt_overrides", None):
-                for p_k, f_map in self._learned_prompt_overrides.items():
-                    compiled._learned_prompt_overrides[p_k] = dict(f_map)
+            for src_obj in (self.model, self):
+                src_ov = getattr(src_obj, "_learned_prompt_overrides", None)
+                src_rec = getattr(src_obj, "_learned_prompt_override_recency", {})
+                src_def_rec = bool(getattr(src_obj, "recency_weighted", self.recency_weighted))
+                if isinstance(src_ov, Mapping):
+                    for p_k, f_map in src_ov.items():
+                        if isinstance(f_map, Mapping) and f_map:
+                            compiled._learned_prompt_overrides.setdefault(p_k, {}).update(f_map)
+                            if isinstance(src_rec, Mapping) and p_k in src_rec:
+                                compiled._learned_prompt_override_recency[p_k] = bool(src_rec[p_k])
+                            elif p_k not in compiled._learned_prompt_override_recency:
+                                compiled._learned_prompt_override_recency[p_k] = src_def_rec
             return compiled
 
     def _packed_kernel_cache_key(self, storage_mode: str) -> Tuple[Any, ...]:
@@ -4046,7 +4089,7 @@ class SystemOneEngine:
                 k_opts = len(options)
 
                 raw_w_arr = np.asarray(head.weights)
-                raw_b_arr = np.asarray(head.biases).reshape(-1)
+                raw_b_arr = np.asarray(head.biases)
                 _validate_head_weight_bias_shapes(f_def, raw_w_arr, raw_b_arr, self.dimension, fname)
                 _validate_2d_layout_cloneable(
                     raw_w_arr,
@@ -4083,7 +4126,9 @@ class SystemOneEngine:
                 cluster_assign: Optional[np.ndarray] = None
                 if is_hier:
                     raw_coarse_w = np.asarray(head.coarse_weights)
-                    raw_coarse_b = np.asarray(head.coarse_biases).reshape(-1)
+                    raw_coarse_b = np.asarray(head.coarse_biases)
+                    if raw_coarse_b.ndim != 1:
+                        raise ValueError(f"Field head {fname!r} coarse_biases must be 1D, got shape {raw_coarse_b.shape}")
                     if not (np.all(np.isfinite(raw_coarse_w)) and np.all(np.isfinite(raw_coarse_b))):
                         raise ValueError(f"Field head {fname!r} contains non-finite hierarchical coarse weights")
                     cluster_assign = np.asarray(cluster_assign_raw, dtype=np.int64)
@@ -4100,7 +4145,9 @@ class SystemOneEngine:
                         raise ValueError(f"Field head {fname!r} has invalid hierarchical cluster configuration")
                     if getattr(head, "fine_weights", None) is not None and getattr(head, "fine_biases", None) is not None:
                         raw_fine_w = np.asarray(head.fine_weights)
-                        raw_fine_b = np.asarray(head.fine_biases).reshape(-1)
+                        raw_fine_b = np.asarray(head.fine_biases)
+                        if raw_fine_b.ndim != 1:
+                            raise ValueError(f"Field head {fname!r} fine_biases must be 1D, got shape {raw_fine_b.shape}")
                         if not (np.all(np.isfinite(raw_fine_w)) and np.all(np.isfinite(raw_fine_b))):
                             raise ValueError(f"Field head {fname!r} contains non-finite hierarchical fine weights")
                     with np.errstate(over="ignore", invalid="ignore"):
