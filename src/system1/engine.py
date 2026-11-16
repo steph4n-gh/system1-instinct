@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 import types
-from collections import OrderedDict, deque
+from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -132,11 +132,72 @@ def _collect_instance_slot_names(obj: Any) -> Tuple[str, ...]:
         if cls_slots is None:
             continue
         raw_slots = (cls_slots,) if isinstance(cls_slots, str) else cls_slots
+        cls_prefix = base_cls.__name__.lstrip("_")
         for s_name in raw_slots:
-            if isinstance(s_name, str) and s_name not in ("__dict__", "__weakref__") and s_name not in seen:
-                seen.add(s_name)
-                names.append(s_name)
+            if not isinstance(s_name, str) or s_name in ("__dict__", "__weakref__"):
+                continue
+            attr_name = s_name
+            if attr_name.startswith("__") and not attr_name.endswith("__") and cls_prefix:
+                attr_name = f"_{cls_prefix}{attr_name}"
+            if attr_name not in seen:
+                seen.add(attr_name)
+                names.append(attr_name)
     return tuple(names)
+
+
+def _snapshot_obj_dict_and_slots(
+    val: Any,
+    obj_id: int,
+    seen_ids: set[int],
+    state_snaps: List[Tuple[Any, Any]],
+    dict_snaps: List[Tuple[Any, Dict[str, Any]]],
+    slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]],
+    memo: Dict[int, Any],
+    skip_ids: Optional[set[int]] = None,
+    container_snaps: Optional[List[Tuple[Any, ...]]] = None,
+) -> bool:
+    inst_dict = getattr(val, "__dict__", None)
+    slot_names = _collect_instance_slot_names(val)
+    if type(inst_dict) is not dict and not slot_names:
+        return False
+    if obj_id not in seen_ids:
+        seen_ids.add(obj_id)
+        if type(inst_dict) is dict:
+            d_snap = {
+                k: _snapshot_duck_graph(
+                    v,
+                    seen_ids,
+                    state_snaps,
+                    dict_snaps,
+                    slot_snaps,
+                    memo,
+                    skip_ids,
+                    container_snaps,
+                )
+                for k, v in inst_dict.items()
+            }
+            dict_snaps.append((val, d_snap))
+        if slot_names:
+            s_snap = [
+                (
+                    s_name,
+                    _snapshot_duck_graph(
+                        getattr(val, s_name, _UNSET_SLOT),
+                        seen_ids,
+                        state_snaps,
+                        dict_snaps,
+                        slot_snaps,
+                        memo,
+                        skip_ids,
+                        container_snaps,
+                    )
+                    if hasattr(val, s_name)
+                    else _UNSET_SLOT,
+                )
+                for s_name in slot_names
+            ]
+            slot_snaps.append((val, s_snap))
+    return True
 
 
 def _snapshot_duck_graph(
@@ -147,6 +208,7 @@ def _snapshot_duck_graph(
     slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]],
     memo: Dict[int, Any],
     skip_ids: Optional[set[int]] = None,
+    container_snaps: Optional[List[Tuple[Any, ...]]] = None,
 ) -> Any:
     """Recursively snapshot mutable arrays, containers, nested heads, and duck objects."""
     if _is_immutable_or_non_state(val):
@@ -157,122 +219,289 @@ def _snapshot_duck_graph(
     if obj_id in memo:
         return memo[obj_id]
     if isinstance(val, np.ndarray):
+        memo[obj_id] = val
         try:
             cp = _clone_preserving_2d_layout(val, writeable=bool(val.flags.writeable))
         except ValueError:
             cp = np.array(val, copy=True)
             if not val.flags.writeable:
                 cp.setflags(write=False)
-        memo[obj_id] = cp
-        return cp
+        if container_snaps is not None:
+            container_snaps.append(("ndarray", val, cp, bool(val.flags.writeable)))
+        return val
     if isinstance(val, bytearray):
-        cp_ba = bytearray(val)
-        memo[obj_id] = cp_ba
-        return cp_ba
-    if isinstance(val, OrderedDict):
-        od_copy: OrderedDict[Any, Any] = OrderedDict()
-        memo[obj_id] = od_copy
-        for k, v in val.items():
-            od_copy[_snapshot_duck_graph(k, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)] = (
-                _snapshot_duck_graph(v, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+        memo[obj_id] = val
+        if container_snaps is not None:
+            container_snaps.append(("bytearray", val, bytes(val)))
+        return val
+    if isinstance(val, dict):
+        memo[obj_id] = val
+        has_df = isinstance(val, defaultdict)
+        df_snap = (
+            _snapshot_duck_graph(
+                val.default_factory,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
             )
-        return od_copy
-    if type(val) is dict:
-        d_copy: Dict[Any, Any] = {}
-        memo[obj_id] = d_copy
-        for k, v in val.items():
-            d_copy[_snapshot_duck_graph(k, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)] = (
-                _snapshot_duck_graph(v, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+            if (has_df and val.default_factory is not None)
+            else None
+        )
+        items_snap = [
+            (
+                _snapshot_duck_graph(
+                    k, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+                ),
+                _snapshot_duck_graph(
+                    v, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+                ),
             )
-        return d_copy
+            for k, v in val.items()
+        ]
+        if container_snaps is not None:
+            container_snaps.append(("dict", val, items_snap, has_df, df_snap))
+        if type(val) not in (dict, OrderedDict, defaultdict):
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
     if isinstance(val, list):
-        l_copy: List[Any] = []
-        memo[obj_id] = l_copy
-        l_copy.extend(
-            _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
-            for x in val
-        )
-        return l_copy
-    if isinstance(val, deque):
-        dq_copy: deque[Any] = deque(maxlen=val.maxlen)
-        memo[obj_id] = dq_copy
-        dq_copy.extend(
-            _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
-            for x in val
-        )
-        return dq_copy
-    if isinstance(val, tuple):
-        if hasattr(val, "_fields"):
-            t_items = tuple(
-                _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
-                for x in val
+        memo[obj_id] = val
+        items_snap = [
+            _snapshot_duck_graph(
+                x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
             )
-            nt_copy = type(val)(*t_items)
-            memo[obj_id] = nt_copy
-            return nt_copy
-        t_copy = tuple(
-            _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
             for x in val
-        )
-        memo[obj_id] = t_copy
-        return t_copy
+        ]
+        if container_snaps is not None:
+            container_snaps.append(("list", val, items_snap))
+        if type(val) is not list:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
+    if isinstance(val, deque):
+        memo[obj_id] = val
+        items_snap = [
+            _snapshot_duck_graph(
+                x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+            )
+            for x in val
+        ]
+        if container_snaps is not None:
+            container_snaps.append(("deque", val, items_snap))
+        if type(val) is not deque:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
     if isinstance(val, set):
-        s_copy = {
-            _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+        memo[obj_id] = val
+        items_snap = [
+            _snapshot_duck_graph(
+                x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+            )
             for x in val
-        }
-        memo[obj_id] = s_copy
-        return s_copy
+        ]
+        if container_snaps is not None:
+            container_snaps.append(("set", val, items_snap))
+        if type(val) is not set:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
+    if isinstance(val, (tuple, frozenset)):
+        memo[obj_id] = val
+        for x in val:
+            _snapshot_duck_graph(
+                x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+            )
+        if type(val) not in (tuple, frozenset) and not hasattr(val, "_fields"):
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
     if callable(getattr(val, "_snapshot_state", None)) and callable(getattr(val, "_restore_state", None)):
         memo[obj_id] = val
         if obj_id not in seen_ids:
             seen_ids.add(obj_id)
             state_snaps.append((val, val._snapshot_state()))
         return val
-    inst_dict = getattr(val, "__dict__", None)
-    slot_names = _collect_instance_slot_names(val)
-    if type(inst_dict) is dict or slot_names:
-        memo[obj_id] = val
-        if obj_id not in seen_ids:
-            seen_ids.add(obj_id)
-            if type(inst_dict) is dict:
-                d_snap = {
-                    k: _snapshot_duck_graph(
-                        v, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids
-                    )
-                    for k, v in inst_dict.items()
-                }
-                dict_snaps.append((val, d_snap))
-            if slot_names:
-                s_snap = [
-                    (
-                        s_name,
-                        _snapshot_duck_graph(
-                            getattr(val, s_name, _UNSET_SLOT),
-                            seen_ids,
-                            state_snaps,
-                            dict_snaps,
-                            slot_snaps,
-                            memo,
-                            skip_ids,
-                        )
-                        if hasattr(val, s_name)
-                        else _UNSET_SLOT,
-                    )
-                    for s_name in slot_names
-                ]
-                slot_snaps.append((val, s_snap))
-        return val
+    memo[obj_id] = val
+    _snapshot_obj_dict_and_slots(
+        val,
+        obj_id,
+        seen_ids,
+        state_snaps,
+        dict_snaps,
+        slot_snaps,
+        memo,
+        skip_ids,
+        container_snaps,
+    )
     return val
+
+
+def _restore_duck_containers(container_snaps: Sequence[Tuple[Any, ...]]) -> None:
+    for entry in container_snaps:
+        kind = entry[0]
+        if kind == "ndarray":
+            _, arr, cp, orig_w = entry
+            if arr.shape == cp.shape and arr.dtype == cp.dtype:
+                if orig_w:
+                    if not arr.flags.writeable:
+                        arr.setflags(write=True)
+                    np.copyto(arr, cp)
+                else:
+                    if not np.array_equal(arr, cp, equal_nan=True):
+                        try:
+                            arr.setflags(write=True)
+                            np.copyto(arr, cp)
+                            arr.setflags(write=False)
+                        except ValueError:
+                            pass
+                    elif arr.flags.writeable:
+                        try:
+                            arr.setflags(write=False)
+                        except ValueError:
+                            pass
+        elif kind == "bytearray":
+            _, ba, raw_b = entry
+            ba[:] = raw_b
+        elif kind == "dict":
+            _, dct, items_snap, has_df, df_snap = entry
+            dct.clear()
+            dct.update(items_snap)
+            if has_df:
+                dct.default_factory = df_snap
+        elif kind == "list":
+            _, lst, items_snap = entry
+            lst[:] = items_snap
+        elif kind == "deque":
+            _, dq, items_snap = entry
+            dq.clear()
+            dq.extend(items_snap)
+        elif kind == "set":
+            _, st, items_snap = entry
+            st.clear()
+            st.update(items_snap)
 
 
 def _clone_head_attr_value(val: Any) -> Any:
     """Shallow-copy arrays and standard mutable containers without choking on locks/callables."""
-    seen_ids: set[int] = set()
-    state_snaps: List[Tuple[Any, Any]] = []
-    dict_snaps: List[Tuple[Any, Dict[str, Any]]] = []
-    slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]] = []
-    return _snapshot_duck_graph(val, seen_ids, state_snaps, dict_snaps, slot_snaps, {})
+    if isinstance(val, np.ndarray):
+        try:
+            return _clone_preserving_2d_layout(val, writeable=bool(val.flags.writeable))
+        except ValueError:
+            cp = np.array(val, copy=True)
+            if not val.flags.writeable:
+                cp.setflags(write=False)
+            return cp
+    if isinstance(val, bytearray):
+        return bytearray(val)
+    if isinstance(val, dict):
+        return copy.copy(val)
+    if isinstance(val, list):
+        return list(val)
+    if isinstance(val, deque):
+        return deque(val, maxlen=val.maxlen)
+    if isinstance(val, set):
+        return set(val)
+    return copy.deepcopy(val)
+
+
+def _inspect_varkw_wrapper(
+    fn_obj: Any,
+    candidate_keys: frozenset[str],
+) -> Tuple[set[str], bool]:
+    """Return (referenced_candidate_keys, calls_super) for a **kwargs callable."""
+    unwrapped = inspect.unwrap(fn_obj)
+    code = getattr(unwrapped, "__code__", None)
+    if not isinstance(code, types.CodeType):
+        return set(), False
+
+    referenced: set[str] = set()
+    all_names: set[str] = set()
+    stack: List[types.CodeType] = [code]
+    seen_codes: set[int] = set()
+    while stack:
+        c = stack.pop()
+        cid = id(c)
+        if cid in seen_codes:
+            continue
+        seen_codes.add(cid)
+        all_names.update(c.co_names)
+        all_names.update(c.co_freevars)
+        for const in c.co_consts:
+            if isinstance(const, str):
+                if const in candidate_keys:
+                    referenced.add(const)
+            elif isinstance(const, types.CodeType):
+                stack.append(const)
+
+    fn_globals = getattr(unwrapped, "__globals__", None)
+    if isinstance(fn_globals, Mapping):
+        for n in all_names:
+            val_g = fn_globals.get(n)
+            if isinstance(val_g, str) and val_g in candidate_keys:
+                referenced.add(val_g)
+
+    fn_closure = getattr(unwrapped, "__closure__", None)
+    if fn_closure:
+        for cell in fn_closure:
+            try:
+                val_c = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(val_c, str) and val_c in candidate_keys:
+                referenced.add(val_c)
+
+    calls_super = "super" in all_names
+    return referenced, calls_super
 
 
 def _resolve_supported_kwargs(
@@ -293,9 +522,12 @@ def _resolve_supported_kwargs(
     }
     has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
     if has_var_kw:
+        cand_key_set = frozenset(candidate_kwargs)
+        ref_keys, calls_super = _inspect_varkw_wrapper(fn, cand_key_set)
+        explicit_names.update(ref_keys)
         owner_self = getattr(fn, "__self__", None)
         method_name = getattr(fn, "__name__", None)
-        if owner_self is not None and isinstance(method_name, str):
+        if calls_super and owner_self is not None and isinstance(method_name, str):
             for base_cls in type(owner_self).__mro__[1:]:
                 raw_attr = base_cls.__dict__.get(method_name)
                 if raw_attr is None:
@@ -317,6 +549,11 @@ def _resolve_supported_kwargs(
                 )
                 if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in base_params.values()):
                     has_var_kw = False
+                    break
+                sub_refs, sub_super = _inspect_varkw_wrapper(target_fn, cand_key_set)
+                explicit_names.update(sub_refs)
+                if not sub_super:
+                    has_var_kw = True
                     break
 
     kw_fset = frozenset(explicit_names)
@@ -3278,6 +3515,7 @@ class SystemOneEngine:
             model_state_snaps: List[Tuple[Any, Any]] = []
             model_dict_snaps: List[Tuple[Any, Dict[str, Any]]] = []
             model_slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]] = []
+            model_container_snaps: List[Tuple[Any, ...]] = []
             snap_memo: Dict[int, Any] = {}
             skip_snap_ids: set[int] = {id(self), id(model)}
             if self.projector is not None:
@@ -3285,8 +3523,15 @@ class SystemOneEngine:
             m_proj = getattr(model, "projector", None)
             if m_proj is not None:
                 skip_snap_ids.add(id(m_proj))
+            head_map_snaps: List[Tuple[str, bool, Any, Optional[List[Tuple[Any, Any]]]]] = []
             for attr_name in ("_field_heads", "heads"):
+                has_attr = hasattr(model, attr_name)
                 h_map = getattr(model, attr_name, None)
+                if has_attr:
+                    map_items = list(h_map.items()) if isinstance(h_map, dict) else None
+                    head_map_snaps.append((attr_name, True, h_map, map_items))
+                else:
+                    head_map_snaps.append((attr_name, False, None, None))
                 if isinstance(h_map, Mapping):
                     for h_obj in h_map.values():
                         _snapshot_duck_graph(
@@ -3297,25 +3542,23 @@ class SystemOneEngine:
                             model_slot_snaps,
                             snap_memo,
                             skip_snap_ids,
+                            model_container_snaps,
                         )
+            skip_model_attrs = frozenset({
+                "schema",
+                "projector",
+                "_lock",
+                "heads",
+                "_field_heads",
+                "model_version",
+                "_learned_prompt_overrides",
+                "_learned_prompt_override_recency",
+                "_online_prototype_bank",
+                "cache",
+            })
             orig_duck_model_keys: Optional[set[str]] = None
             duck_model_extra_snap: Optional[Dict[str, Any]] = None
-            if (
-                type(model).__name__ not in ("SystemOneModel", "CompiledSystemOneModel")
-                and type(getattr(model, "__dict__", None)) is dict
-            ):
-                skip_model_attrs = frozenset({
-                    "schema",
-                    "projector",
-                    "_lock",
-                    "heads",
-                    "_field_heads",
-                    "model_version",
-                    "_learned_prompt_overrides",
-                    "_learned_prompt_override_recency",
-                    "_online_prototype_bank",
-                    "cache",
-                })
+            if type(getattr(model, "__dict__", None)) is dict:
                 orig_duck_model_keys = set(model.__dict__.keys())
                 duck_model_extra_snap = {
                     mk: _snapshot_duck_graph(
@@ -3326,10 +3569,36 @@ class SystemOneEngine:
                         model_slot_snaps,
                         snap_memo,
                         skip_snap_ids,
+                        model_container_snaps,
                     )
                     for mk, mv in model.__dict__.items()
                     if mk not in skip_model_attrs
                 }
+            model_own_slots = [
+                s_n for s_n in _collect_instance_slot_names(model) if s_n not in skip_model_attrs
+            ]
+            if model_own_slots:
+                model_slot_snaps.append((
+                    model,
+                    [
+                        (
+                            s_n,
+                            _snapshot_duck_graph(
+                                getattr(model, s_n, _UNSET_SLOT),
+                                seen_head_ids,
+                                model_state_snaps,
+                                model_dict_snaps,
+                                model_slot_snaps,
+                                snap_memo,
+                                skip_snap_ids,
+                                model_container_snaps,
+                            )
+                            if hasattr(model, s_n)
+                            else _UNSET_SLOT,
+                        )
+                        for s_n in model_own_slots
+                    ],
+                ))
 
             has_model_ver = hasattr(model, "model_version")
             prev_model_ver = getattr(model, "model_version", None)
@@ -3651,6 +3920,7 @@ class SystemOneEngine:
                 for h_obj, dict_snap in model_dict_snaps:
                     h_obj.__dict__.clear()
                     h_obj.__dict__.update(dict_snap)
+                _restore_duck_containers(model_container_snaps)
                 for slot_obj, slot_vals in model_slot_snaps:
                     for s_name, s_val in slot_vals:
                         if s_val is _UNSET_SLOT:
@@ -3658,6 +3928,20 @@ class SystemOneEngine:
                                 delattr(slot_obj, s_name)
                         else:
                             setattr(slot_obj, s_name, s_val)
+                for attr_name, existed, orig_map, orig_items in head_map_snaps:
+                    if existed:
+                        if orig_items is not None and isinstance(orig_map, dict):
+                            orig_map.clear()
+                            orig_map.update(orig_items)
+                        try:
+                            setattr(model, attr_name, orig_map)
+                        except Exception:
+                            pass
+                    elif hasattr(model, attr_name):
+                        try:
+                            delattr(model, attr_name)
+                        except Exception:
+                            pass
                 if orig_duck_model_keys is not None and duck_model_extra_snap is not None:
                     for mk in list(model.__dict__):
                         if mk not in orig_duck_model_keys:
@@ -3743,6 +4027,8 @@ class SystemOneEngine:
         unlabeled inputs whose zero-shot probability margin exceeds ``margin_threshold``,
         bridging co-occurring domain vocabulary without requiring teacher calls.
         """
+        margin_threshold = _validate_real_scalar(margin_threshold, "margin_threshold")
+        learning_rate = _validate_real_scalar(learning_rate, "learning_rate")
         with self._lock, getattr(self.model, "_lock", nullcontext()):
             if hasattr(self.model, "adapt_zero_shot"):
                 res_info = self.model.adapt_zero_shot(
@@ -3873,7 +4159,8 @@ class SystemOneEngine:
 
         def _checked_f32_copy(arr: Any, label: str) -> np.ndarray:
             with np.errstate(over="ignore", invalid="ignore"):
-                arr_in = np.asarray(arr)
+                arr_chk = _assert_real_numeric_array_like(arr, label)
+                arr_in = np.asarray(arr_chk)
                 if (
                     arr_in.ndim == 2
                     and arr_in.size > 0
@@ -3886,13 +4173,14 @@ class SystemOneEngine:
 
                     out = _owned_readonly_array(arr_in, dtype=np.float32)
                 else:
-                    out = np.array(arr, dtype=np.float32, copy=True, order="K")
+                    out = np.array(arr_in, dtype=np.float32, copy=True, order="K")
             if not bool(np.all(np.isfinite(out))):
                 raise ValueError(f"{label} must be finite in float32 for compiled export")
             return out
 
         def _checked_unit_prototypes(arr: Any, label: str) -> np.ndarray:
-            raw_p = np.asarray(arr, dtype=np.float64)
+            raw_p_chk = _assert_real_numeric_array_like(arr, label)
+            raw_p = np.asarray(raw_p_chk, dtype=np.float64)
             if raw_p.ndim != 2 or not bool(np.all(np.isfinite(raw_p))):
                 raise ValueError(f"{label} must be finite 2D array for compiled export")
             unit_p, _ = _normalize_rows_f32_safe(raw_p)

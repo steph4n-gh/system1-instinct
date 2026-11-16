@@ -272,6 +272,15 @@ class AutoCutoverLifecycle:
         self.quarantined_total: int = 0
         self.compile_time_total_ms: float = 0.0
 
+    @property
+    def is_cutover(self) -> bool:
+        """Whether the lifecycle is actively promoted in SELECTIVE_HOT_SWAP."""
+        return (
+            self.state == CutoverState.SELECTIVE_HOT_SWAP.value
+            and bool(self.compiled_active)
+            and self.engine is not None
+        )
+
     def _coerce_teacher_values(self, teacher_output: Any) -> Dict[str, Any]:
         if hasattr(teacher_output, "values") and isinstance(getattr(teacher_output, "values", None), Mapping):
             raw = dict(teacher_output.values)

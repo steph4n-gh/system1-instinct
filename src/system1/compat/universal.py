@@ -256,6 +256,14 @@ def _validate_payload_tree(root: Any, *, max_depth: int = _MAX_JSON_NESTING_DEPT
                 )
             for v in node:
                 stack.append((v, depth + 1))
+        elif isinstance(node, str):
+            try:
+                node.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise InteropError(
+                    f"JSON string contains invalid unpaired UTF-16 surrogate: {exc}",
+                    status_code=400,
+                ) from exc
         elif isinstance(node, (float, np.floating)) and not isinstance(node, bool):
             if not math.isfinite(float(node)):
                 raise InteropError(f"Non-finite numeric value in payload: {node!r}", status_code=400)
@@ -297,6 +305,12 @@ def strict_json_dumps(payload: Any) -> bytes:
         return json.dumps(payload, allow_nan=False, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     except (TypeError, ValueError, RecursionError) as exc:
         raise InteropError(f"Unable to serialize JSON payload: {exc}", status_code=500) from exc
+
+
+def _safe_error_json_bytes(message: str) -> bytes:
+    """Serialize an error message safely to UTF-8 JSON even if the text contains surrogates."""
+    clean_msg = str(message).encode("utf-8", "backslashreplace").decode("utf-8")
+    return strict_json_dumps({"error": clean_msg})
 
 
 def parse_finite_float(value: Any, *, field_name: str = "value") -> float:
@@ -2069,6 +2083,19 @@ class UniversalDecisionService:
         if not isinstance(payload, Mapping):
             raise SchemaValidationError("Request payload must be a JSON object")
         _validate_payload_tree(payload)
+        if slot_hint is not None:
+            if not isinstance(slot_hint, str):
+                raise InteropError("slot_hint must be a string", status_code=400)
+            try:
+                slot_hint.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise InteropError(
+                    f"slot_hint contains invalid unpaired UTF-16 surrogate: {exc}",
+                    status_code=400,
+                ) from exc
+        raw_model = payload.get("model")
+        if raw_model is not None and not isinstance(raw_model, str):
+            raise SchemaValidationError("Request 'model' must be a string")
         wire_format = detect_wire_format(path, payload)
         semantic_text, _ = extract_semantic_text(payload)
         context_view = {
@@ -2112,11 +2139,12 @@ class UniversalDecisionService:
             )
             if local_answers is not None:
                 with self._lock:
-                    if lc_key in self._lifecycles:
-                        self._lifecycles.move_to_end(lc_key)
-                    self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
-                    drift_info = self._record_slot_schema_locked(slot_key, contract)
-                    self.stats["local_fastpath_requests"] += 1
+                    prev_c_loc = self._last_schema_by_slot.get(slot_key)
+                    preview_drift_loc = (
+                        diff_schemas(prev_c_loc, contract)
+                        if (prev_c_loc is not None and prev_c_loc.fingerprint != contract.fingerprint)
+                        else None
+                    )
                 body = format_provider_response(
                     wire_format=wire_format,
                     model_requested=str(payload.get("model") or ""),
@@ -2124,19 +2152,52 @@ class UniversalDecisionService:
                     input_tokens=est_input_tokens,
                     local_execution=True,
                     schema_fingerprint=contract.fingerprint,
-                    drift_info=drift_info,
+                    drift_info=preview_drift_loc,
                 )
+                strict_json_dumps(body)
+                with self._lock:
+                    if lc_key in self._lifecycles:
+                        self._lifecycles.move_to_end(lc_key)
+                    self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
+                    drift_info = self._record_slot_schema_locked(slot_key, contract)
+                    self.stats["local_fastpath_requests"] += 1
+                if drift_info != preview_drift_loc:
+                    body = format_provider_response(
+                        wire_format=wire_format,
+                        model_requested=str(payload.get("model") or ""),
+                        answers=local_answers,
+                        input_tokens=est_input_tokens,
+                        local_execution=True,
+                        schema_fingerprint=contract.fingerprint,
+                        drift_info=drift_info,
+                    )
                 return 200, body
 
         upstream_raw = self._call_upstream(wire_format, payload, semantic_text, contract)
         lifecycle_vals, soft_targets, clean_answers = parse_teacher_answers(upstream_raw, contract)
         in_tok = self._extract_upstream_input_tokens(upstream_raw, est_input_tokens)
         model_requested = str(payload.get("model") or "")
+        with self._lock:
+            prev_c = self._last_schema_by_slot.get(slot_key)
+            preview_drift = (
+                diff_schemas(prev_c, contract)
+                if (prev_c is not None and prev_c.fingerprint != contract.fingerprint)
+                else None
+            )
+        preview_body = format_provider_response(
+            wire_format=wire_format,
+            model_requested=model_requested,
+            answers=clean_answers,
+            input_tokens=in_tok,
+            local_execution=False,
+            schema_fingerprint=contract.fingerprint,
+            drift_info=preview_drift,
+        )
         try:
-            strict_json_dumps(clean_answers)
+            strict_json_dumps(preview_body)
         except Exception as exc:
             raise InteropError(
-                f"Upstream response answers contain invalid strict JSON values: {exc}",
+                f"Upstream response contains invalid strict JSON values: {exc}",
                 status_code=502,
             ) from exc
         if not is_frozen:
@@ -2240,7 +2301,7 @@ class UniversalDecisionsHTTPServer:
             def do_POST(self_h) -> None:
                 clean_path = self_h.path.split("?", 1)[0]
                 if clean_path not in _GATEWAY_POST_ROUTES:
-                    err = strict_json_dumps({"error": f"Unknown route: {clean_path}"})
+                    err = _safe_error_json_bytes(f"Unknown route: {clean_path}")
                     self_h.send_response(404)
                     self_h.send_header("Content-Type", "application/json")
                     self_h.send_header("Content-Length", str(len(err)))
@@ -2273,18 +2334,18 @@ class UniversalDecisionsHTTPServer:
                         headers=req_headers,
                         raw_body=raw_body,
                     )
+                    encoded = strict_json_dumps(body)
                 except InteropError as exc:
                     if not body_consumed:
                         self_h.close_connection = True
                     status = exc.status_code
-                    body = {"error": str(exc)}
+                    encoded = _safe_error_json_bytes(str(exc))
                 except ZeroEgressViolationError as exc:
                     status = 403
-                    body = {"error": str(exc)}
+                    encoded = _safe_error_json_bytes(str(exc))
                 except Exception as exc:
                     status = 500
-                    body = {"error": f"Internal error: {exc}"}
-                encoded = strict_json_dumps(body)
+                    encoded = _safe_error_json_bytes(f"Internal error: {exc}")
                 self_h.send_response(status)
                 self_h.send_header("Content-Type", "application/json")
                 self_h.send_header("Content-Length", str(len(encoded)))
@@ -2334,8 +2395,7 @@ class UniversalDecisionASGIApp:
         self.fallback_app = fallback_app
 
     @staticmethod
-    async def _send_json(send: Callable, status: int, payload: Mapping[str, Any]) -> None:
-        encoded = strict_json_dumps(dict(payload))
+    async def _send_raw_json(send: Callable, status: int, encoded: bytes) -> None:
         await send(
             {
                 "type": "http.response.start",
@@ -2347,6 +2407,11 @@ class UniversalDecisionASGIApp:
             }
         )
         await send({"type": "http.response.body", "body": encoded, "more_body": False})
+
+    @staticmethod
+    async def _send_json(send: Callable, status: int, payload: Mapping[str, Any]) -> None:
+        encoded = strict_json_dumps(dict(payload))
+        await UniversalDecisionASGIApp._send_raw_json(send, status, encoded)
 
     async def __call__(self, scope: Mapping[str, Any], receive: Callable, send: Callable) -> None:
         if scope.get("type") != "http":
@@ -2365,7 +2430,7 @@ class UniversalDecisionASGIApp:
             if self.fallback_app is not None:
                 await self.fallback_app(scope, receive, send)
             else:
-                await self._send_json(send, 404, {"error": f"Unknown route: {path}"})
+                await self._send_raw_json(send, 404, _safe_error_json_bytes(f"Unknown route: {path}"))
             return
 
         raw_headers = {
@@ -2377,10 +2442,10 @@ class UniversalDecisionASGIApp:
         try:
             self.service.preflight_http_headers(raw_headers)
         except InteropError as exc:
-            await self._send_json(send, exc.status_code, {"error": str(exc)})
+            await self._send_raw_json(send, exc.status_code, _safe_error_json_bytes(str(exc)))
             return
         except ZeroEgressViolationError as exc:
-            await self._send_json(send, 403, {"error": str(exc)})
+            await self._send_raw_json(send, 403, _safe_error_json_bytes(str(exc)))
             return
 
         chunks: List[bytes] = []
@@ -2408,16 +2473,17 @@ class UniversalDecisionASGIApp:
                 headers=raw_headers,
                 raw_body=b"".join(chunks),
             )
+            encoded = strict_json_dumps(dict(body))
         except InteropError as exc:
             status = exc.status_code
-            body = {"error": str(exc)}
+            encoded = _safe_error_json_bytes(str(exc))
         except ZeroEgressViolationError as exc:
             status = 403
-            body = {"error": str(exc)}
+            encoded = _safe_error_json_bytes(str(exc))
         except Exception as exc:
             status = 500
-            body = {"error": f"Internal error: {exc}"}
-        await self._send_json(send, status, body)
+            encoded = _safe_error_json_bytes(f"Internal error: {exc}")
+        await self._send_raw_json(send, status, encoded)
 
 
 def add_universal_decisions_gateway(app: Any, service: UniversalDecisionService) -> None:
@@ -2446,14 +2512,15 @@ def add_universal_decisions_gateway(app: Any, service: UniversalDecisionService)
                 headers=raw_headers,
                 raw_body=b"".join(chunks),
             )
+            encoded = strict_json_dumps(payload)
         except InteropError as exc:
             status = exc.status_code
-            payload = {"error": str(exc)}
+            encoded = _safe_error_json_bytes(str(exc))
         except ZeroEgressViolationError as exc:
             status = 403
-            payload = {"error": str(exc)}
+            encoded = _safe_error_json_bytes(str(exc))
         return _StarletteResponse(
-            content=strict_json_dumps(payload),
+            content=encoded,
             status_code=status,
             media_type="application/json",
         )

@@ -596,6 +596,12 @@ class FastExplainer:
         self._choice_raw_base_scale = 4.0
         self._choice_cal_temp = 1.0
         self._choice_cal_adj: Optional[np.ndarray] = None
+        if _bool_raw_meta is not None:
+            for meta_k in ("raw_w", "raw_b", "cal_adj_2", "cal_adj_choice"):
+                if _bool_raw_meta.get(meta_k) is not None:
+                    _assert_real_numeric_array_like(
+                        _bool_raw_meta[meta_k], f"_bool_raw_meta[{meta_k!r}]"
+                    )
         if self._is_boolean:
             if _bool_raw_meta is not None and w_f64.shape[0] == 1:
                 self._bool_has_scalar_raw = True

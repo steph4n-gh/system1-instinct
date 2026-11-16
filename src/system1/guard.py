@@ -41,6 +41,7 @@ from system1.core import (
 )
 from system1.core.model import (
     _accepts_recency_weighted,
+    _assert_real_numeric_array_like,
     _coerce_inference_array_f32_or_f64,
     _compute_hierarchical_logits_np,
     _encode_projector_batch,
@@ -48,6 +49,7 @@ from system1.core.model import (
     _model_zero_unit0,
     _owned_readonly_array,
     _validate_head_weight_bias_shapes,
+    _validate_real_scalar,
 )
 from system1.core.text import PragmaticCompositeProjector, TfidfProjector
 
@@ -335,17 +337,34 @@ class GuardShield:
         calibrators = getattr(model, "calibrators", None)
         cal_obj = calibrators.get(self.field_name) if isinstance(calibrators, Mapping) else None
         if cal_obj is not None:
-            temp = float(getattr(cal_obj, "temperature", 1.0))
+            raw_t_val = getattr(cal_obj, "temperature", 1.0)
+            temp = _validate_real_scalar(raw_t_val, f"Calibration temperature for {self.field_name!r}")
             raw_adj = getattr(cal_obj, "logit_adjustments", None)
         else:
             src_meta = ch if ch is not None else self.head
-            temp = float(getattr(src_meta, "temperature", 1.0) or 1.0)
+            raw_t_val = getattr(src_meta, "temperature", None)
+            temp = (
+                1.0
+                if raw_t_val is None
+                else _validate_real_scalar(raw_t_val, f"Calibration temperature for {self.field_name!r}")
+            )
             raw_adj = getattr(src_meta, "logit_adjustments", None)
         if not math.isfinite(temp) or temp <= 0.0:
             raise ValueError(
                 f"Calibration temperature for {self.field_name!r} must be positive and finite, got {temp!r}"
             )
-        adj = None if raw_adj is None else np.asarray(raw_adj, dtype=np.float64).reshape(-1)
+        exp_adj_len = 2 if isinstance(f_def, BooleanField) else len(f_def.options)
+        if raw_adj is None:
+            adj = None
+        else:
+            adj_chk = _assert_real_numeric_array_like(
+                raw_adj, f"Calibration logit_adjustments for {self.field_name!r}"
+            )
+            if adj_chk.ndim != 1 or adj_chk.shape != (exp_adj_len,):
+                raise ValueError(
+                    f"Calibration logit_adjustments for {self.field_name!r} shape {adj_chk.shape} != expected ({exp_adj_len},)"
+                )
+            adj = np.asarray(adj_chk, dtype=np.float64)
         if adj is not None and not bool(np.all(np.isfinite(adj))):
             raise ValueError(f"Calibration logit_adjustments for {self.field_name!r} contain non-finite values")
         self.cal_temp = temp
@@ -456,6 +475,21 @@ class GuardShield:
                 raise ValueError(f"Field head {self.field_name!r} coarse_biases must be 1D, got shape {cb_in.shape}")
             if not (np.all(np.isfinite(cw_in)) and np.all(np.isfinite(cb_in))):
                 raise ValueError(f"Field head {self.field_name!r} contains non-finite hierarchical coarse weights")
+            if isinstance(cluster_assign_raw, np.ndarray):
+                if cluster_assign_raw.dtype == np.bool_ or cluster_assign_raw.dtype.kind not in ("i", "u"):
+                    raise ValueError(
+                        f"Field head {self.field_name!r} cluster_assignments must have integer dtype, got {cluster_assign_raw.dtype}"
+                    )
+            elif isinstance(cluster_assign_raw, (str, bytes, bytearray, Mapping, bool, np.bool_)):
+                raise ValueError(
+                    f"Field head {self.field_name!r} has invalid hierarchical cluster configuration"
+                )
+            else:
+                for ca_el in cluster_assign_raw:
+                    if isinstance(ca_el, (bool, np.bool_)) or not isinstance(ca_el, (int, np.integer)):
+                        raise ValueError(
+                            f"Field head {self.field_name!r} cluster_assignments entries must be integers, got {ca_el!r}"
+                        )
             c_assign = np.asarray(cluster_assign_raw, dtype=np.int64)
             if (
                 cw_in.ndim != 2

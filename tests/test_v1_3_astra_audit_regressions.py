@@ -15979,3 +15979,501 @@ def test_astra_40_round27_regressions() -> None:
     assert sum(1 for v in svc_d2._lifecycles.values() if not v.is_cutover) == 1
     assert promoted_keys[-1] in svc_d2._lifecycles
     assert svc_d2._lifecycles[promoted_keys[-1]].lifecycle.state == "DRIFT_RECALIBRATE"
+
+
+def test_astra_41_round28_regressions() -> None:
+    """In-memory Round-28 adversarial regressions for R28-1 through R28-6 and sister paths."""
+    import collections
+    import urllib.request
+    from types import SimpleNamespace
+    from typing import Optional, Tuple
+    from system1.calibration import DecisionCalibrator
+    from system1.compat.typesafe import TypeSafeClient, _build_dynamic_schema
+    from system1.compat.universal import (
+        InteropError,
+        UniversalDecisionASGIApp,
+        UniversalDecisionService,
+        UniversalDecisionsHTTPServer,
+        _canonical_structured_key,
+        compile_questions_contract,
+    )
+    from system1.core.model import DecisionFieldHead, PackedMultiQuestionKernel, SystemOneModel
+    from system1.cutover import AutoCutoverLifecycle
+    from system1.guard import GuardShield
+
+    # ------------------------------------------------------------------
+    # R28-1: **kwargs forward_single wrapper consuming use_cache still
+    # receives use_cache=False during post-update validation in learn().
+    # ------------------------------------------------------------------
+    class _R28CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="First choice")
+        g = ChoiceField(options=("a", "b"), description="Second choice")
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return values
+
+    class _R28CachedModel(SystemOneModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            use_cache = kwargs.pop("use_cache", True)
+            if use_cache and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    class _R28DuckNoCacheBase:
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            self._inner = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            )
+            for h in self._inner.heads.values():
+                h.set_weights(np.zeros((2, dim), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+            self.schema = self._inner.schema
+            self.dimension = dim
+            self.projector = self._inner.projector
+            self.heads = self._inner.heads
+            self.recency_weighted = False
+            self.forgetting_factor = 0.995
+            self.model_version = 1
+
+        def encode(self, prompt: str, telemetry: Any = None, recency_weighted: Any = None) -> np.ndarray:
+            return self._inner.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
+
+        def forward_single(
+            self, prompt: str, telemetry: Any = None, embedding: Any = None, recency_weighted: Any = None
+        ) -> Any:
+            return self._inner.forward_single(
+                prompt, telemetry=telemetry, embedding=embedding, recency_weighted=recency_weighted
+            )
+
+    class _R28CachedDuck(_R28DuckNoCacheBase):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            use_cache = kwargs.pop("use_cache", True)
+            if use_cache and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    x_ones = np.ones(16, dtype=np.float32)
+    for use_c in (True, False):
+        m_sub = _R28CachedModel(
+            _R28CoupledSchema, dimension=16, backend="numpy", contrastive_whitening=False
+        )
+        for h_sub in m_sub.heads.values():
+            h_sub.set_weights(np.zeros((2, 16), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+        eng_sub = SystemOneEngine(
+            _R28CoupledSchema,
+            model=m_sub,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=use_c,
+            strict_mode=False,
+        )
+        # Warm m_sub.last via uncached decide first.
+        d_warm = eng_sub.decide("p", embedding=x_ones, record_receipt=False, use_cache=False)
+        assert d_warm.values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_sub.learn("p", {"f": "b"}, embedding=x_ones)
+        assert eng_sub.model_version == 1
+        assert m_sub.forward_single("p", embedding=x_ones, use_cache=False).fields["f"].selected_value == "a"
+        assert eng_sub.decide("p", embedding=x_ones, record_receipt=False, use_cache=False).values == {
+            "f": "a",
+            "g": "a",
+        }
+
+        m_duck = _R28CachedDuck(_R28CoupledSchema(), 16)
+        eng_duck = SystemOneEngine(
+            _R28CoupledSchema,
+            model=m_duck,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=use_c,
+            strict_mode=False,
+        )
+        assert eng_duck.decide("p", embedding=x_ones, record_receipt=False, use_cache=False).values == {
+            "f": "a",
+            "g": "a",
+        }
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_duck.learn("p", {"f": "b"}, embedding=x_ones)
+        assert eng_duck.model_version == 1
+        assert eng_duck.decide("p", embedding=x_ones, record_receipt=False, use_cache=False).values == {
+            "f": "a",
+            "g": "a",
+        }
+
+    # ------------------------------------------------------------------
+    # R28-2: Injected ready lifecycle must respect schema digest isolation.
+    # ------------------------------------------------------------------
+    q_allow = {"act": {"type": "choice", "instructions": "Allow this request", "criteria": ["allow", "block"]}}
+    q_block = {"act": {"type": "choice", "instructions": "Block this request", "criteria": ["allow", "block"]}}
+    s_allow = _build_dynamic_schema(q_allow)
+    s_block = _build_dynamic_schema(q_block)
+    assert s_allow.schema_digest() != s_block.schema_digest()
+
+    lc_allow = AutoCutoverLifecycle(s_allow, config=CutoverConfig(dense_dim=16))
+    lc_allow.state = "SELECTIVE_HOT_SWAP"
+    lc_allow.compiled_active = True
+    lc_allow.active_tau = 0.0
+    lc_allow.clean_cache["probe"] = {"act": "allow"}
+
+    iso_teacher_calls = [0]
+
+    def _iso_teacher(state_arg: Any, q_arg: Any) -> Dict[str, Any]:
+        iso_teacher_calls[0] += 1
+        return {"answers": {"act": {"type": "choice", "choice": "block"}}}
+
+    ts_iso = TypeSafeClient(
+        api_key="tok-r28",
+        mode="auto_cutover",
+        auto_cutover_lifecycle=lc_allow,
+        zero_egress=True,
+        baseline_handler=_iso_teacher,
+    )
+    resp_allow = ts_iso.decide("probe", q_allow)
+    assert resp_allow["local_execution"] is True
+    assert resp_allow["is_cutover"] is True
+    assert resp_allow["answers"]["act"]["choice"] == "allow"
+    assert iso_teacher_calls[0] == 0
+
+    resp_block = ts_iso.decide("probe", q_block)
+    assert not resp_block.get("local_execution", False)
+    assert resp_block["is_cutover"] is False
+    assert resp_block["answers"]["act"]["choice"] == "block"
+    assert iso_teacher_calls[0] == 1
+    assert len(ts_iso._cutover_lifecycles) == 2
+    assert ts_iso._cutover_lifecycles[s_allow.schema_digest()] is lc_allow
+    assert ts_iso._cutover_lifecycles[s_block.schema_digest()] is not lc_allow
+    # First schema stays locally served after unseen second schema escalated.
+    resp_allow2 = ts_iso.decide("probe", q_allow)
+    assert resp_allow2["local_execution"] is True
+    assert resp_allow2["answers"]["act"]["choice"] == "allow"
+    assert iso_teacher_calls[0] == 1
+
+    # Duck-typed schema-less injected ready lifecycle only binds to its first digest.
+    class _R28DuckReady:
+        compiled_active = True
+        state = "SELECTIVE_HOT_SWAP"
+
+        def decide_local(self, encoded_state: str) -> Optional[Dict[str, Any]]:
+            return {"act": "allow"}
+
+        def observe_teacher(self, encoded_state: str, vals: Dict[str, Any]) -> bool:
+            return True
+
+    duck_calls = [0]
+
+    def _duck_teacher(state_arg: Any, q_arg: Any) -> Dict[str, Any]:
+        duck_calls[0] += 1
+        return {"answers": {"act": {"type": "choice", "choice": "block"}}}
+
+    duck_ready = _R28DuckReady()
+    ts_duck_iso = TypeSafeClient(
+        api_key="tok-r28",
+        mode="auto_cutover",
+        auto_cutover_lifecycle=duck_ready,
+        zero_egress=True,
+        baseline_handler=_duck_teacher,
+    )
+    assert ts_duck_iso.decide("probe", q_allow)["answers"]["act"]["choice"] == "allow"
+    assert duck_calls[0] == 0
+    r_duck_blk = ts_duck_iso.decide("probe", q_block)
+    assert not r_duck_blk.get("local_execution", False)
+    assert r_duck_blk["answers"]["act"]["choice"] == "block"
+    assert duck_calls[0] == 1
+    assert ts_duck_iso._cutover_lifecycles[s_allow.schema_digest()] is duck_ready
+    assert ts_duck_iso._cutover_lifecycles[s_block.schema_digest()] is not duck_ready
+
+    # ------------------------------------------------------------------
+    # R28-3: Recursive rollback covers mangled __slots__, defaultdict,
+    # cyclic tuple->list->tuple identity, and replaced model.heads mapping.
+    # ------------------------------------------------------------------
+    class _R28Choice1(DecisionSchema):
+        f = ChoiceField(options=("safe", "unsafe"), description="Single choice")
+
+    class _R28PrivSlots:
+        __slots__ = ("__n",)
+
+        def __init__(self) -> None:
+            self.__n = 0
+
+        def inc(self) -> None:
+            self.__n += 1
+
+        def get(self) -> int:
+            return self.__n
+
+    class _R28RollbackModel(SystemOneModel):
+        def __init__(self) -> None:
+            super().__init__(
+                _R28Choice1, dimension=16, backend="numpy", contrastive_whitening=False
+            )
+            self.priv = _R28PrivSlots()
+            self.counts: collections.defaultdict[str, int] = collections.defaultdict(int)
+            cyc_list: List[Any] = []
+            self.cyclic = (cyc_list,)
+            cyc_list.append(self.cyclic)
+
+        def learn_from_tier2(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+            super().learn_from_tier2(*args, **kwargs)
+            self.priv.inc()
+            self.counts["b"] += 1
+            self.cyclic[0].append("extra")
+            self.heads = {}
+            raise RuntimeError("boom after mutations")
+
+    rb_mdl = _R28RollbackModel()
+    rb_eng = SystemOneEngine(
+        _R28Choice1,
+        model=rb_mdl,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+    )
+    orig_heads_dict = rb_mdl.heads
+    with pytest.raises(RuntimeError, match="boom after mutations"):
+        rb_eng.learn("probe", {"f": "unsafe"}, embedding=x_ones)
+    assert rb_mdl.priv.get() == 0
+    assert isinstance(rb_mdl.counts, collections.defaultdict)
+    assert rb_mdl.counts.default_factory is int
+    assert dict(rb_mdl.counts) == {}
+    assert rb_mdl.heads is orig_heads_dict and len(rb_mdl.heads) == 1
+    assert len(rb_mdl.cyclic[0]) == 1
+    assert rb_mdl.cyclic[0][0] is rb_mdl.cyclic
+
+    # ------------------------------------------------------------------
+    # R28-4: Drifted TypeSafe lifecycles report is_cutover=False and are
+    # evicted under max_unpromoted_lifecycles.
+    # ------------------------------------------------------------------
+    ts_drift = TypeSafeClient(
+        api_key="tok-r28",
+        mode="auto_cutover",
+        zero_egress=True,
+        max_unpromoted_lifecycles=1,
+        auto_cutover_lifecycle=CutoverConfig(dense_dim=16, canary_rate=0.2),
+        baseline_handler=lambda s, q: {"answers": {"act": {"type": "choice", "choice": "b"}}},
+    )
+    drift_qs: List[Dict[str, Any]] = []
+    drift_digests: List[str] = []
+    for idx_d in range(3):
+        qd = {
+            "act": {
+                "type": "choice",
+                "criteria": ["a", "b"],
+                "instructions": f"ts drift {idx_d}",
+            }
+        }
+        sd = _build_dynamic_schema(qd)
+        dd = sd.schema_digest()
+        lcd = AutoCutoverLifecycle(sd, config=ts_drift.auto_cutover_lifecycle)
+        lcd.state = "SELECTIVE_HOT_SWAP"
+        lcd.compiled_active = True
+        lcd.active_tau = 0.0
+        lcd.clean_cache["probe"] = {"act": "a"}
+        lcd.local_accept_eligible = 4
+        lcd.canary_window.extend([1] * 11)
+        ts_drift._cutover_lifecycles[dd] = lcd
+        drift_qs.append(qd)
+        drift_digests.append(dd)
+    assert all(ts_drift._is_lifecycle_promoted(ts_drift._cutover_lifecycles[d]) for d in drift_digests)
+
+    for qd, dd in zip(drift_qs, drift_digests):
+        r_d = ts_drift.decide("probe", qd)
+        assert not r_d.get("local_execution", False)
+        assert r_d["cutover_state"] == "DRIFT_RECALIBRATE"
+        assert r_d["is_cutover"] is False
+        unprom_ts = sum(
+            1 for v in ts_drift._cutover_lifecycles.values() if not ts_drift._is_lifecycle_promoted(v)
+        )
+        assert unprom_ts <= 1
+    assert len(ts_drift._cutover_lifecycles) == 1
+    assert drift_digests[-1] in ts_drift._cutover_lifecycles
+    assert ts_drift._cutover_lifecycles[drift_digests[-1]].is_cutover is False
+
+    # ------------------------------------------------------------------
+    # R28-5: Numeric validation on adapt_zero_shot, fleet, guard, packed,
+    # to_compiled_model, DecisionCalibrator, and FastExplainer meta.
+    # ------------------------------------------------------------------
+    h_az = DecisionFieldHead(
+        ChoiceField(options=("a", "b")),
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+    )
+    w_az = np.vstack([np.ones(16, dtype="f4"), -np.ones(16, dtype="f4")])
+    h_az.set_weights(w_az, np.zeros(2, dtype="f4"))
+    w_az_before = h_az.weights.copy()
+
+    proj_r28 = SystemOneEngine(
+        _R28Choice1, dimension=16, backend="numpy", contrastive_whitening=False, use_cache=False
+    ).projector
+    fl_az = MultiTenantSkillFleet(
+        projector=proj_r28,
+        classes=["a", "b"],
+        W_base=w_az,
+        b_base=np.zeros(2, dtype="f4"),
+        num_tenants=2,
+        r_sub=16,
+    )
+    dw_before = fl_az.dW_q.copy()
+    p_before = fl_az.P_blk.copy()
+
+    bad_feats_list: List[Any] = [
+        [[True] + [0.0] * 15],
+        [["1"] + [0.0] * 15],
+        np.array([[1 + 2j] + [0] * 15]),
+    ]
+    for bad_x in bad_feats_list:
+        with pytest.raises(ValueError):
+            h_az.adapt_zero_shot(bad_x)
+        with pytest.raises(ValueError):
+            fl_az.adapt_tenant_batch(0, ["probe"], ["a"], precomputed_x=bad_x)
+        with pytest.raises(ValueError):
+            fl_az.compute_component_logits(0, "probe", x=bad_x[0])
+    assert np.array_equal(h_az.weights, w_az_before)
+    assert np.array_equal(fl_az.dW_q, dw_before)
+    assert np.array_equal(fl_az.P_blk, p_before)
+
+    for bad_q in ([True, 0.5], ["0.5", "0.5"], np.array([0.5 + 1j, 0.5]), [[0.5, 0.5]]):
+        with pytest.raises(ValueError):
+            MultiTenantSkillFleet(
+                projector=proj_r28,
+                classes=["a", "b"],
+                W_base=w_az,
+                b_base=np.zeros(2, dtype="f4"),
+                num_tenants=1,
+                r_sub=16,
+                q_init=bad_q,  # type: ignore[arg-type]
+            )
+
+    class _R28CalChoice(DecisionSchema):
+        c = ChoiceField(options=("safe", "unsafe"), description="c")
+
+    for bad_adj in (
+        [True, 0.0],
+        ["2", "0"],
+        np.array([1 + 2j, 0j]),
+        np.array([0.0]),
+    ):
+        eng_adj_bad = SystemOneEngine(
+            _R28CalChoice, dimension=16, backend="numpy", contrastive_whitening=False, use_cache=False
+        )
+        eng_adj_bad.calibrators["c"].logit_adjustments = bad_adj  # type: ignore[assignment]
+        with pytest.raises(ValueError):
+            eng_adj_bad.to_compiled_model()
+        with pytest.raises(ValueError):
+            MultiTenantSkillFleet.from_compiled_model(eng_adj_bad, field_name="c", num_tenants=1, r_sub=16)
+        with pytest.raises(ValueError):
+            GuardShield(eng_adj_bad, field_name="c", unsafe_label="unsafe")
+        with pytest.raises(ValueError):
+            PackedMultiQuestionKernel.from_engine(eng_adj_bad)
+        with pytest.raises(ValueError):
+            eng_adj_bad.calibrators["c"].calibrate_logits(np.array([0.1, 0.2]))
+
+    cal_bad = DecisionCalibrator()
+    for bad_logits in ([True, 0.0], ["1", "0"], np.array([1 + 2j, 0j])):
+        with pytest.raises(ValueError):
+            cal_bad.calibrate_logits(bad_logits)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # R28-6: Reject lone UTF-16 surrogates in request/upstream payloads
+    # before mutating lifecycles or slot schemas across ASGI and HTTP.
+    # ------------------------------------------------------------------
+    q_u28 = {"act": {"type": "choice", "options": ["a", "b"]}}
+    svc_sur = UniversalDecisionService(
+        upstream_handlers={
+            "jev": lambda s, p, c: {"answers": {"act": {"choice": "a"}}, "usage": {"input_tokens": 2}}
+        },
+        bearer_token="tok-r28",
+        allowed_origins=(),
+    )
+    asgi_sur = UniversalDecisionASGIApp(svc_sur)
+    raw_sur_req = (
+        b'{"state":"probe","questions":{"act":{"type":"choice","options":["a","b"]}},"model":"\\ud800"}'
+    )
+
+    async def _send_asgi(app_obj: UniversalDecisionASGIApp, body_bytes: bytes) -> Tuple[int, Dict[str, Any]]:
+        sent: List[Dict[str, Any]] = []
+        done = [False]
+
+        async def _recv() -> Dict[str, Any]:
+            if not done[0]:
+                done[0] = True
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+            return {"type": "http.disconnect"}
+
+        async def _send(msg: Dict[str, Any]) -> None:
+            sent.append(msg)
+
+        await app_obj(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/decisions",
+                "headers": [
+                    (b"authorization", b"Bearer tok-r28"),
+                    (b"content-type", b"application/json"),
+                ],
+            },
+            _recv,
+            _send,
+        )
+        return int(sent[0]["status"]), json.loads(sent[1]["body"].decode("utf-8"))
+
+    st_asgi_bad, err_asgi_bad = asyncio.run(_send_asgi(asgi_sur, raw_sur_req))
+    assert st_asgi_bad == 400 and "error" in err_asgi_bad
+    assert svc_sur.stats["upstream_teacher_calls"] == 0
+    assert len(svc_sur._lifecycles) == 0
+    assert len(svc_sur._last_schema_by_slot) == 0
+
+    with UniversalDecisionsHTTPServer(svc_sur, port=0) as http_srv:
+        req_http = urllib.request.Request(
+            f"{http_srv.base_url}/v1/decisions",
+            data=raw_sur_req,
+            method="POST",
+            headers={
+                "Authorization": "Bearer tok-r28",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            urllib.request.urlopen(req_http, timeout=2.0)
+            raise AssertionError("Expected HTTP 400 for lone surrogate model")
+        except urllib.error.HTTPError as http_err:
+            assert http_err.code == 400
+            err_body = json.loads(http_err.read().decode("utf-8"))
+            assert "error" in err_body
+    assert len(svc_sur._lifecycles) == 0
+    assert len(svc_sur._last_schema_by_slot) == 0
+
+    with pytest.raises(InteropError):
+        svc_sur.process_payload(
+            path="/v1/decisions",
+            payload={"state": "probe", "questions": q_u28, "model": "\ud800"},
+        )
+    assert len(svc_sur._lifecycles) == 0
+
+    # Upstream emitting an unserializable surrogate also fails before committing state.
+    svc_up_sur = UniversalDecisionService(
+        upstream_handlers={
+            "jev": lambda s, p, c: {"answers": {"act": {"choice": "a\ud800"}}, "usage": {"input_tokens": 2}}
+        },
+        bearer_token="tok-r28",
+        allowed_origins=(),
+    )
+    st_up_bad, _ = asyncio.run(
+        _send_asgi(
+            UniversalDecisionASGIApp(svc_up_sur),
+            json.dumps({"state": "probe", "questions": q_u28}).encode("utf-8"),
+        )
+    )
+    assert st_up_bad >= 400
+    assert len(svc_up_sur._lifecycles) == 0
+    assert len(svc_up_sur._last_schema_by_slot) == 0
+
+    with pytest.raises(ValueError, match="surrogate"):
+        ts_iso.decide("probe", q_allow, model="\ud800")

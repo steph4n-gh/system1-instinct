@@ -27,6 +27,7 @@ from system1.core.model import (
     _owned_readonly_array,
     _reconstruct_2d_layout_array,
     _validate_head_weight_bias_shapes,
+    _validate_real_scalar,
 )
 from system1.core.schema import BooleanField, ChoiceField
 from system1.core.text import PragmaticCompositeProjector, TfidfProjector
@@ -437,10 +438,15 @@ class MultiTenantSkillFleet:
         if base_tok_df is None:
             self.base_tok_df = np.zeros(self.BASE_HASH_SIZE, dtype=np.uint16)
         else:
-            df_arr = np.asarray(base_tok_df, dtype=np.uint16).reshape(-1)
-            if df_arr.shape[0] != self.BASE_HASH_SIZE:
-                raise ValueError(f"base_tok_df length {df_arr.shape[0]} != {self.BASE_HASH_SIZE}")
-            self.base_tok_df = df_arr
+            df_chk = _assert_real_numeric_array_like(base_tok_df, "base_tok_df")
+            df_f64 = np.asarray(df_chk, dtype=np.float64)
+            if df_f64.ndim != 1 or df_f64.shape[0] != self.BASE_HASH_SIZE:
+                raise ValueError(f"base_tok_df length {df_f64.shape} != ({self.BASE_HASH_SIZE},)")
+            if not bool(np.all(np.isfinite(df_f64))) or bool(
+                np.any((df_f64 < 0) | (df_f64 > 65535) | (df_f64 != np.floor(df_f64)))
+            ):
+                raise ValueError("base_tok_df entries must be integers in [0, 65535]")
+            self.base_tok_df = np.asarray(df_f64, dtype=np.uint16)
 
         if isinstance(m_sparse, bool) or not isinstance(m_sparse, (int, np.integer)):
             raise ValueError(
@@ -492,7 +498,13 @@ class MultiTenantSkillFleet:
         self.ex_cls = np.full((N, self.m_exemplars), -1, dtype=np.int16)
         self.ex_len = np.zeros(N, dtype=np.uint8)
 
-        q0_f64 = np.full(K, 0.5, dtype=np.float64) if q_init is None else np.asarray(q_init, dtype=np.float64).reshape(-1)
+        if q_init is None:
+            q0_f64 = np.full(K, 0.5, dtype=np.float64)
+        else:
+            q_chk = _assert_real_numeric_array_like(q_init, "q_init")
+            if q_chk.ndim != 1:
+                raise ValueError(f"q_init must be 1D with length {K}, got shape {q_chk.shape}")
+            q0_f64 = np.asarray(q_chk, dtype=np.float64)
         if q0_f64.shape[0] != K:
             raise ValueError(f"q_init length {q0_f64.shape[0]} != num_classes {K}")
         if not bool(np.all(np.isfinite(q0_f64))):
@@ -710,8 +722,10 @@ class MultiTenantSkillFleet:
         if not math.isfinite(cal_t) or cal_t <= 0.0:
             raise ValueError(f"_raw_source_head cal_temp must be positive and finite, got {raw_cal_t!r}")
 
-        raw_w_arr = np.asarray(raw_w_in)
-        raw_b_arr = np.asarray(raw_b_in)
+        raw_w_chk = _assert_real_numeric_array_like(raw_w_in, "_raw_source_head weights")
+        raw_b_chk = _assert_real_numeric_array_like(raw_b_in, "_raw_source_head biases")
+        raw_w_arr = np.asarray(raw_w_chk)
+        raw_b_arr = np.asarray(raw_b_chk)
         allowed_raw_dtypes = (np.dtype(np.float32), np.dtype(np.float64))
         if raw_w_arr.dtype not in allowed_raw_dtypes or raw_b_arr.dtype not in allowed_raw_dtypes:
             raise ValueError(
@@ -737,7 +751,8 @@ class MultiTenantSkillFleet:
 
         adj_frozen: Optional[np.ndarray] = None
         if raw_cal_adj is not None:
-            raw_adj_arr = np.asarray(raw_cal_adj)
+            raw_adj_chk = _assert_real_numeric_array_like(raw_cal_adj, "_raw_source_head cal_adj")
+            raw_adj_arr = np.asarray(raw_adj_chk)
             if raw_adj_arr.dtype == np.dtype(np.bool_) or raw_adj_arr.dtype.kind not in ("i", "u", "f"):
                 raise ValueError(
                     f"_raw_source_head cal_adj must have numeric dtype, got {raw_adj_arr.dtype}"
@@ -899,15 +914,32 @@ class MultiTenantSkillFleet:
         calibrators = getattr(model, "calibrators", None)
         cal_obj = calibrators.get(field_name) if isinstance(calibrators, Mapping) else None
         if cal_obj is not None:
-            temp = float(getattr(cal_obj, "temperature", 1.0))
+            raw_t_val = getattr(cal_obj, "temperature", 1.0)
+            temp = _validate_real_scalar(raw_t_val, f"Calibration temperature for {field_name!r}")
             raw_adj = getattr(cal_obj, "logit_adjustments", None)
         else:
             src_meta = ch if ch is not None else head
-            temp = float(getattr(src_meta, "temperature", 1.0) or 1.0)
+            raw_t_val = getattr(src_meta, "temperature", None)
+            temp = (
+                1.0
+                if raw_t_val is None
+                else _validate_real_scalar(raw_t_val, f"Calibration temperature for {field_name!r}")
+            )
             raw_adj = getattr(src_meta, "logit_adjustments", None)
         if not math.isfinite(temp) or temp <= 0.0:
             raise ValueError(f"Calibration temperature for {field_name!r} must be positive and finite, got {temp!r}")
-        adj = None if raw_adj is None else np.asarray(raw_adj, dtype=np.float64).reshape(-1)
+        exp_adj_len = 2 if isinstance(f_def, BooleanField) else len(f_def.options)
+        if raw_adj is None:
+            adj = None
+        else:
+            adj_chk = _assert_real_numeric_array_like(
+                raw_adj, f"Calibration logit_adjustments for {field_name!r}"
+            )
+            if adj_chk.ndim != 1 or adj_chk.shape != (exp_adj_len,):
+                raise ValueError(
+                    f"Calibration logit_adjustments for {field_name!r} shape {adj_chk.shape} != expected ({exp_adj_len},)"
+                )
+            adj = np.asarray(adj_chk, dtype=np.float64)
         if adj is not None and not bool(np.all(np.isfinite(adj))):
             raise ValueError(f"Calibration logit_adjustments for {field_name!r} contain non-finite values")
 
@@ -1032,6 +1064,10 @@ class MultiTenantSkillFleet:
             raw_q = getattr(score_src, "conformal_quantile", getattr(score_src, "quantile", None))
             has_fallback_q = False
             fallback_q = 1.0
+            for v in cal_scores:
+                _validate_real_scalar(v, f"calibration_scores for {field_name!r}")
+            if raw_q is not None and len(cal_scores) == 0:
+                _validate_real_scalar(raw_q, f"conformal_quantile for {field_name!r}")
             if len(cal_scores) > 0:
                 cal_sorted = sorted(float(v) for v in cal_scores)
                 n_s = len(cal_sorted)
@@ -1050,6 +1086,11 @@ class MultiTenantSkillFleet:
             is_mondrian = bool(getattr(score_src, "mondrian", False))
             cls_scores = (getattr(score_src, "class_calibration_scores", {}) or {}) if is_mondrian else {}
             shrink = max(1.0, float(getattr(score_src, "mondrian_shrinkage", 10.0)))
+            for c_name in classes:
+                c_vals_chk = cls_scores.get(c_name)
+                if c_vals_chk is not None:
+                    for v in c_vals_chk:
+                        _validate_real_scalar(v, f"class_calibration_scores[{c_name!r}] for {field_name!r}")
             has_any_cls_scores = any(
                 (cls_scores.get(c_name) is not None and len(cls_scores.get(c_name)) > 0)
                 for c_name in classes
@@ -1122,16 +1163,19 @@ class MultiTenantSkillFleet:
     ) -> None:
         """Adapt tenant `tid` in-place from a batch of few-shot labeled overrides or jargon."""
         tid = self._validate_tid(tid)
+        if isinstance(epochs, (bool, np.bool_)) or not isinstance(epochs, (int, np.integer)) or int(epochs) < 1:
+            raise ValueError(f"epochs must be a positive integer, got {epochs!r}")
         if len(texts) != len(labels):
             raise ValueError("texts and labels must have equal length")
         if not texts:
             return
         y_indices = [self._resolve_class_idx(lbl) for lbl in labels]
-        X = (
-            np.asarray(precomputed_x, dtype=np.float32)
-            if precomputed_x is not None
-            else self._project_batch(texts)
-        )
+        if precomputed_x is not None:
+            raw_x = _assert_real_numeric_array_like(precomputed_x, "precomputed_x")
+            with np.errstate(over="ignore", invalid="ignore"):
+                X = np.asarray(raw_x, dtype=np.float32)
+        else:
+            X = self._project_batch(texts)
         if (
             X.ndim != 2
             or X.shape != (len(texts), self.W_base.shape[1])
@@ -1371,7 +1415,12 @@ class MultiTenantSkillFleet:
             if x is None:
                 x_in = self._encode_one(text)
             else:
-                x_in = np.asarray(x, dtype=np.float32).reshape(-1)
+                raw_x = _assert_real_numeric_array_like(x, "x")
+                if raw_x.ndim != 1 or raw_x.shape != (self.W_base.shape[1],):
+                    raise ValueError(
+                        f"Expected 1D feature vector of shape ({self.W_base.shape[1]},), got {raw_x.shape}"
+                    )
+                x_in = np.asarray(raw_x, dtype=np.float32)
             dW_qt, dW_st, sp_ht, sp_ct, sp_wt, n_sp, ex_vt, ex_st, ex_ct, n_ex, _ = (
                 self._snapshot_views(tid)
             )

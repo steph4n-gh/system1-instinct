@@ -1541,6 +1541,7 @@ class TypeSafeClient:
         self.background_compile = bool(kwargs.get("background_compile", background_compile))
         self.auto_cutover_lifecycle = auto_cutover_lifecycle
         self._cutover_lifecycles: collections.OrderedDict[str, Any] = collections.OrderedDict()
+        self._injected_lc_digest: Optional[str] = None
         raw_max_unprom = kwargs.get("max_unpromoted_lifecycles", 256)
         if isinstance(raw_max_unprom, (bool, np.bool_)) or not isinstance(raw_max_unprom, int) or raw_max_unprom < 1:
             raise ValueError(f"max_unpromoted_lifecycles must be a positive int, got {raw_max_unprom!r}")
@@ -2312,12 +2313,39 @@ class TypeSafeClient:
             raise ValueError(f"egress_bytes must be non-negative, got {val}")
         return val
 
+    @staticmethod
+    def _is_lifecycle_promoted(lc: Any) -> bool:
+        if hasattr(lc, "is_cutover"):
+            return bool(lc.is_cutover)
+        st = getattr(lc, "state", None)
+        if st is not None:
+            return bool(getattr(lc, "compiled_active", False)) and str(st) == "SELECTIVE_HOT_SWAP"
+        return bool(getattr(lc, "compiled_active", False))
+
+    def _matches_injected_lifecycle_locked(self, schema: DecisionSchema, digest: str) -> bool:
+        lc_inj = self.auto_cutover_lifecycle
+        inj_schema = getattr(lc_inj, "schema", None)
+        if inj_schema is None and hasattr(lc_inj, "lifecycle"):
+            inj_schema = getattr(lc_inj.lifecycle, "schema", None)
+        if isinstance(inj_schema, DecisionSchema):
+            if inj_schema.schema_digest() == digest:
+                return self._injected_lc_digest is None or self._injected_lc_digest == digest
+            if inj_schema.schema_name != "TypeSafeDynamicSchema" and schema.schema_name == "TypeSafeDynamicSchema":
+                return (
+                    (self._injected_lc_digest is None or self._injected_lc_digest == digest)
+                    and inj_schema.description == schema.description
+                    and {k: f.to_dict() for k, f in sorted(inj_schema.fields.items())}
+                    == {k: f.to_dict() for k, f in sorted(schema.fields.items())}
+                )
+            return False
+        return self._injected_lc_digest is None or self._injected_lc_digest == digest
+
     def _enforce_unpromoted_cutover_cap_locked(self, *, reserve_for_new: bool = False) -> None:
         limit = max(0, self.max_unpromoted_lifecycles - (1 if reserve_for_new else 0))
         unpromoted = [
             k
             for k, v in self._cutover_lifecycles.items()
-            if not bool(getattr(v, "is_cutover", False) or getattr(v, "compiled_active", False))
+            if not self._is_lifecycle_promoted(v)
         ]
         while len(unpromoted) > limit:
             evict_key = unpromoted.pop(0)
@@ -2345,6 +2373,11 @@ class TypeSafeClient:
             if kwargs.get(option) is not None:
                 raise NotImplementedError(f"The local adapter does not implement {option!r}")
         model = model or self.default_model
+        try:
+            encoded_state.encode("utf-8")
+            str(model).encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("State or model contains invalid unpaired UTF-16 surrogate") from exc
 
         # Passthrough Mode: Always forward to TypeSafe AI
         if self.mode == "passthrough":
@@ -2369,20 +2402,21 @@ class TypeSafeClient:
             digest = schema.schema_digest()
 
             if self.auto_cutover_lifecycle:
-                from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+                from system1.cutover import AutoCutoverLifecycle, CutoverConfig, CutoverState
 
-                is_injected_lc = hasattr(self.auto_cutover_lifecycle, "decide_local") and hasattr(
+                raw_is_injected_lc = hasattr(self.auto_cutover_lifecycle, "decide_local") and hasattr(
                     self.auto_cutover_lifecycle, "observe_teacher"
                 )
                 with self._engine_lock:
                     existing_lc = self._cutover_lifecycles.get(digest)
+                    is_injected_lc = raw_is_injected_lc and self._matches_injected_lifecycle_locked(schema, digest)
 
                 cand_lc = (
                     existing_lc
                     if existing_lc is not None
                     else (self.auto_cutover_lifecycle if is_injected_lc else None)
                 )
-                if cand_lc is not None:
+                if cand_lc is not None and getattr(cand_lc, "state", None) != CutoverState.DRIFT_RECALIBRATE.value:
                     t_local = time.perf_counter()
                     local_vals = cand_lc.decide_local(encoded_state)
                     if local_vals is not None:
@@ -2393,8 +2427,12 @@ class TypeSafeClient:
                             schema=schema,
                         )
                         with self._engine_lock:
+                            if digest not in self._cutover_lifecycles:
+                                self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
                             self._cutover_lifecycles[digest] = cand_lc
                             self._cutover_lifecycles.move_to_end(digest)
+                            if raw_is_injected_lc and cand_lc is self.auto_cutover_lifecycle:
+                                self._injected_lc_digest = digest
                             self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                             self._call_count[digest] += 1
                         return SystemOneResponse({
@@ -2413,7 +2451,7 @@ class TypeSafeClient:
                             "receipt": None,
                             "is_ambiguous": False,
                             "auto_cutover_active": True,
-                            "is_cutover": True,
+                            "is_cutover": self._is_lifecycle_promoted(cand_lc),
                             "cutover_state": cand_lc.state,
                         })
 
@@ -2449,19 +2487,28 @@ class TypeSafeClient:
                     teacher_vals[name] = validated
 
                 created_new_lc = False
+                prev_inj_digest: Optional[str] = None
+                bound_inj_digest = False
                 with self._engine_lock:
                     lc = self._cutover_lifecycles.get(digest)
                     if lc is None:
                         created_new_lc = True
                         self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
+                        is_injected_lc = raw_is_injected_lc and self._matches_injected_lifecycle_locked(
+                            schema, digest
+                        )
                         if is_injected_lc:
                             lc = self.auto_cutover_lifecycle
+                            prev_inj_digest = self._injected_lc_digest
+                            self._injected_lc_digest = digest
+                            bound_inj_digest = True
                         else:
                             lc_cfg = (
                                 self.auto_cutover_lifecycle
                                 if isinstance(self.auto_cutover_lifecycle, CutoverConfig)
-                                else None
+                                else getattr(self.auto_cutover_lifecycle, "config", None)
                             )
+                            lc_cfg = lc_cfg if isinstance(lc_cfg, CutoverConfig) else None
                             lc = AutoCutoverLifecycle(schema, teacher=None, config=lc_cfg)
                         self._cutover_lifecycles[digest] = lc
                     else:
@@ -2478,6 +2525,8 @@ class TypeSafeClient:
                         ):
                             if self._cutover_lifecycles.get(digest) is lc:
                                 self._cutover_lifecycles.pop(digest, None)
+                            if bound_inj_digest:
+                                self._injected_lc_digest = prev_inj_digest
                         self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                     raise
                 with self._engine_lock:
@@ -2485,7 +2534,7 @@ class TypeSafeClient:
                     self._call_count[digest] += 1
                     self._teacher_sample_count[digest] += 1
                 cloud_resp["auto_cutover_active"] = True
-                cloud_resp["is_cutover"] = bool(lc.compiled_active)
+                cloud_resp["is_cutover"] = self._is_lifecycle_promoted(lc)
                 cloud_resp["cutover_state"] = lc.state
                 cloud_resp["egress_bytes"] = egress_bytes
                 return cloud_resp

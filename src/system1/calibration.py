@@ -21,6 +21,10 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 
+from system1.core.model import (
+    _assert_real_numeric_array_like,
+    _validate_real_scalar,
+)
 from system1.core.schema import (
     _f64_to_exact_2m1074,
     _format_score_interval,
@@ -498,9 +502,22 @@ class DecisionCalibrator:
 
     def calibrate_logits(self, logits: np.ndarray) -> np.ndarray:
         """Applies learned logit adjustment and temperature scaling to raw logits."""
-        arr = np.asarray(logits, dtype=np.float64)
-        temp = self.temperature
-        adj = self.logit_adjustments
+        logits_chk = _assert_real_numeric_array_like(logits, "logits")
+        arr = np.asarray(logits_chk, dtype=np.float64)
+        temp = _validate_real_scalar(self.temperature, "DecisionCalibrator temperature")
+        if not math.isfinite(temp) or temp <= 0.0:
+            raise ValueError(f"DecisionCalibrator temperature must be positive and finite, got {temp!r}")
+        raw_adj = self.logit_adjustments
+        if raw_adj is None:
+            adj = None
+        else:
+            adj_chk = _assert_real_numeric_array_like(raw_adj, "DecisionCalibrator logit_adjustments")
+            adj = np.asarray(adj_chk, dtype=np.float64)
+            exp_adj_len = 2 if (arr.ndim == 0 or self.is_binary or (arr.ndim == 1 and len(arr) == 1)) else arr.shape[-1]
+            if adj.ndim != 1 or adj.shape != (exp_adj_len,) or not bool(np.all(np.isfinite(adj))):
+                raise ValueError(
+                    f"DecisionCalibrator logit_adjustments must be finite with shape ({exp_adj_len},), got {adj.shape}"
+                )
 
         def _single_binary_logit(z: float) -> np.ndarray:
             if not math.isfinite(z):

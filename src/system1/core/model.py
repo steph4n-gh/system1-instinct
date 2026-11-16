@@ -2761,9 +2761,20 @@ class DecisionFieldHead:
         unlabeled inputs whose zero-shot probability margin exceeds ``margin_threshold``,
         bridging co-occurring domain vocabulary without requiring teacher calls.
         """
-        embs = np.asarray(embeddings, dtype=np.float32)
+        margin_th_f = _validate_real_scalar(margin_threshold, "margin_threshold")
+        _ = _validate_real_scalar(learning_rate, "learning_rate")
+        margin_threshold = margin_th_f
+        raw_embs = _assert_real_numeric_array_like(embeddings, "embeddings")
+        with np.errstate(over="ignore", invalid="ignore"):
+            embs = np.asarray(raw_embs, dtype=np.float32)
         if embs.ndim == 1:
             embs = embs.reshape(1, -1)
+        elif embs.ndim != 2:
+            raise ValueError(f"Expected 1D or 2D embeddings in adapt_zero_shot, got shape {embs.shape}")
+        if not bool(np.all(np.isfinite(embs))):
+            raise ValueError("embeddings in adapt_zero_shot must contain only finite values")
+        if embs.size > 0 and embs.shape[1] != self.dimension:
+            raise ValueError(f"Expected embeddings width {self.dimension}, got {embs.shape[1]}")
         if embs.size == 0 or not isinstance(self.field_def, ChoiceField):
             return {"adapted_samples": 0, "class_counts": {}}
 
@@ -3289,7 +3300,8 @@ class DecisionFieldHead:
 
     def evaluate_logits(self, logits: np.ndarray) -> RawFieldEvaluation:
         """Constructs a RawFieldEvaluation from precomputed logits."""
-        logits = np.asarray(logits, dtype=np.float64).flatten()
+        logits_chk = _assert_real_numeric_array_like(logits, "logits")
+        logits = np.asarray(logits_chk, dtype=np.float64).flatten()
         with np.errstate(over="ignore", invalid="ignore"):
             if isinstance(self.field_def, ChoiceField):
                 scaled_logits = logits / 0.25
@@ -3633,8 +3645,10 @@ class SystemOneModel:
         recency_weighted: Optional[bool] = None,
         *,
         concept_embedding: Optional[np.ndarray] = None,
+        use_cache: Optional[bool] = None,
     ) -> ModelInferenceResult:
         """Executes a single non-autoregressive forward pass over the schema."""
+        _ = use_cache
         start_t = time.perf_counter()
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         raw_norm: Optional[float] = None
@@ -3689,6 +3703,8 @@ class SystemOneModel:
         telemetry: Optional[Any] = None,
         embedding: Optional[np.ndarray] = None,
         recency_weighted: Optional[bool] = None,
+        *,
+        use_cache: Optional[bool] = None,
     ) -> ModelInferenceResult:
         """Alias for forward_single with optional continuous telemetry vector and precomputed embedding."""
         return self.forward_single(
@@ -3696,6 +3712,7 @@ class SystemOneModel:
             telemetry=telemetry,
             embedding=embedding,
             recency_weighted=recency_weighted,
+            use_cache=use_cache,
         )
 
     def learn_from_tier2(
@@ -3808,6 +3825,8 @@ class SystemOneModel:
         recency_weighted: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Unsupervised test-time zero-shot prototype and exemplar adaptation across schema heads."""
+        margin_th_f = _validate_real_scalar(margin_threshold, "margin_threshold")
+        lr_f = _validate_real_scalar(learning_rate, "learning_rate")
         with self._lock:
             t0 = time.perf_counter()
             if isinstance(prompts, str):
@@ -4576,9 +4595,15 @@ class PackedMultiQuestionKernel:
                 K = len(f_def.options)
                 c_K.append(K)
                 cal = eng.calibrators[fname]
-                temp = float(cal.temperature)
+                temp = _validate_real_scalar(cal.temperature, f"Calibrator temperature for {fname!r}")
                 if not math.isfinite(temp) or temp <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
+                _coerce_inference_array_f32_or_f64(
+                    head.weights, f"Choice head {fname!r} weights"
+                )
+                _coerce_inference_array_f32_or_f64(
+                    head.biases, f"Choice head {fname!r} biases"
+                )
                 raw_w_arr = np.asarray(head.weights)
                 raw_b_arr = np.asarray(head.biases)
                 if raw_w_arr.ndim != 2 or raw_w_arr.shape != (K, dim) or raw_b_arr.ndim != 1 or raw_b_arr.shape != (K,):
@@ -4603,8 +4628,11 @@ class PackedMultiQuestionKernel:
                 )
                 raw_adj = getattr(cal, "logit_adjustments", None)
                 if raw_adj is not None:
-                    adj_vec = np.asarray(raw_adj, dtype=np.float64).reshape(-1)
-                    if adj_vec.shape[0] != K or not np.all(np.isfinite(adj_vec)):
+                    adj_chk = _assert_real_numeric_array_like(
+                        raw_adj, f"Calibrator logit_adjustments for {fname!r}"
+                    )
+                    adj_vec = np.asarray(adj_chk, dtype=np.float64)
+                    if adj_vec.ndim != 1 or adj_vec.shape != (K,) or not np.all(np.isfinite(adj_vec)):
                         raise ValueError(f"Invalid calibrator logit_adjustments for {fname!r}")
                 else:
                     adj_vec = np.zeros(K, dtype=np.float64)
@@ -4640,9 +4668,15 @@ class PackedMultiQuestionKernel:
                 cp = _validate_cp(fname)
                 bool_names.append(fname)
                 cal = eng.calibrators[fname]
-                temp = float(cal.temperature)
+                temp = _validate_real_scalar(cal.temperature, f"Calibrator temperature for {fname!r}")
                 if not math.isfinite(temp) or temp <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {temp!r}")
+                _coerce_inference_array_f32_or_f64(
+                    head.weights, f"Boolean head {fname!r} weights", active_first_only=True
+                )
+                _coerce_inference_array_f32_or_f64(
+                    head.biases, f"Boolean head {fname!r} biases", active_first_only=True
+                )
                 raw_w_full = np.asarray(head.weights)
                 raw_b_full = np.asarray(head.biases)
                 if (
@@ -4674,17 +4708,15 @@ class PackedMultiQuestionKernel:
                     )
                 )
                 adj = getattr(cal, "logit_adjustments", None)
-                if adj is not None and len(adj) == 2:
-                    adj0_val = float(adj[0])
-                    adj1_val = float(adj[1])
-                    if not (math.isfinite(adj0_val) and math.isfinite(adj1_val)):
+                if adj is not None:
+                    adj_chk = _assert_real_numeric_array_like(
+                        adj, f"Calibrator logit_adjustments for {fname!r}"
+                    )
+                    adj_arr = np.asarray(adj_chk, dtype=np.float64)
+                    if adj_arr.ndim != 1 or adj_arr.shape != (2,) or not np.all(np.isfinite(adj_arr)):
                         raise ValueError(f"Invalid calibrator logit_adjustments for {fname!r}")
-                elif adj is not None and len(adj) != 0:
-                    adj_arr = np.asarray(adj, dtype=np.float64).reshape(-1)
-                    if not np.all(np.isfinite(adj_arr)):
-                        raise ValueError(f"Invalid calibrator logit_adjustments for {fname!r}")
-                    adj0_val = 0.0
-                    adj1_val = 0.0
+                    adj0_val = float(adj_arr[0])
+                    adj1_val = float(adj_arr[1])
                 else:
                     adj0_val = 0.0
                     adj1_val = 0.0
@@ -4718,10 +4750,20 @@ class PackedMultiQuestionKernel:
                 head = _validate_head(fname)
                 score_names.append(fname)
                 cal = eng.calibrators[fname]
-                raw_t = float(cal.temperature)
+                raw_t = _validate_real_scalar(cal.temperature, f"Calibrator temperature for {fname!r}")
                 if not math.isfinite(raw_t) or raw_t <= 0.0:
                     raise ValueError(f"Invalid calibrator temperature for {fname!r}: {raw_t!r}")
+                if getattr(cal, "logit_adjustments", None) is not None:
+                    raise ValueError(
+                        f"Field {fname!r} of type ScoreField does not support logit_adjustments"
+                    )
                 temp = max(1e-4, raw_t)
+                _coerce_inference_array_f32_or_f64(
+                    head.weights, f"Score head {fname!r} weights", active_first_only=True
+                )
+                _coerce_inference_array_f32_or_f64(
+                    head.biases, f"Score head {fname!r} biases", active_first_only=True
+                )
                 raw_w_full = np.asarray(head.weights)
                 raw_b_full = np.asarray(head.biases)
                 if (

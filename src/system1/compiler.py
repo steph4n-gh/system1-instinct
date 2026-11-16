@@ -1370,6 +1370,8 @@ class CompiledSystemOneModel:
         telemetry: Optional[Any] = None,
         embedding: Optional[np.ndarray] = None,
         recency_weighted: Optional[bool] = None,
+        *,
+        use_cache: Optional[bool] = None,
     ) -> ModelInferenceResult:
         """Alias for forward_single with optional continuous telemetry vector and precomputed embedding."""
         return self.forward_single(
@@ -1377,6 +1379,7 @@ class CompiledSystemOneModel:
             telemetry=telemetry,
             embedding=embedding,
             recency_weighted=recency_weighted,
+            use_cache=use_cache,
         )
 
     def learn_from_tier2(
@@ -1833,6 +1836,8 @@ class CompiledSystemOneModel:
         recency_weighted: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Unsupervised test-time zero-shot prototype and exemplar adaptation across schema heads."""
+        margin_threshold = _validate_real_scalar(margin_threshold, "margin_threshold")
+        learning_rate = _validate_real_scalar(learning_rate, "learning_rate")
         with self._lock:
             t0 = time.perf_counter()
             if isinstance(prompts, str):
