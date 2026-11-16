@@ -21446,6 +21446,553 @@ def test_astra_49_round36_regressions() -> None:
     ) == (2, 0, 2)
 
 
+def _r37_mod_def_cb(**kw: Any) -> Tuple[bool, Dict[str, Any]]:
+    copied = dict(kw)
+    return bool(copied.pop("use_cache", True)), copied
+
+
+def _r37_mod_def_invoke(
+    kw: Dict[str, Any],
+    fn: Callable[..., Tuple[bool, Dict[str, Any]]] = _r37_mod_def_cb,
+) -> Tuple[bool, Dict[str, Any]]:
+    return fn(**kw)
+
+
+def _r37_mod_kwdef_invoke(
+    kw: Dict[str, Any],
+    *,
+    fn: Callable[..., Tuple[bool, Dict[str, Any]]] = _r37_mod_def_cb,
+) -> Tuple[bool, Dict[str, Any]]:
+    return fn(**kw)
+
+
+def test_astra_50_round37_regressions() -> None:
+    """Round-37 regressions R37-1..R37-5 covering UtilityCalibrator subnormal scale, flow gaps, TypeSafe keys, fallback cleanup, and weakref ownership."""
+    import asyncio
+    import gc
+    import json
+    import warnings
+    import weakref
+    import numpy as np
+    import pytest
+    from system1 import UtilityCalibrator
+    from system1.compat.typesafe import AsyncTypeSafeClient, Choice, TypeSafeClient
+    from system1.compat.universal import SoftDistillingLifecycle, compile_questions_contract
+    from system1.core.model import SystemOneModel
+    from system1.core.schema import ChoiceField, DecisionSchema
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.engine import SystemOneEngine, _inspect_varkw_wrapper
+    from system1.fallback import BoundedReviewFallback
+
+    # ------------------------------------------------------------------
+    # R37-1: UtilityCalibrator preserves unscaled L and expected policy costs
+    # when raw_span is finite even if an unrelated cell has extreme magnitude.
+    # ------------------------------------------------------------------
+    lo = 210000000000.0
+    hi = float(np.nextafter(lo, np.inf))
+    C_sub = np.array([[hi, hi], [lo, lo], [-1e308, lo]], dtype=np.float64)
+    p_sub = np.tile([0.0, 1.0], (100, 1))
+    y_sub = np.ones(100, dtype=int)
+    with warnings.catch_warnings(record=True) as caught_u:
+        warnings.simplefilter("always", RuntimeWarning)
+        for mode in ("normalized_excess", "indicator"):
+            cal_sub = UtilityCalibrator(C_sub, safe_action=1, alpha=0.05, loss_mode=mode).fit(p_sub, y_sub)
+            assert np.allclose(cal_sub.L[0], [1.0, 1.0], atol=1e-12)
+            assert np.allclose(cal_sub.L[1], [0.0, 0.0], atol=1e-12)
+            acts_crc = cal_sub.predict(p_sub)
+            acts_bayes = cal_sub.predict(p_sub, use_crc=False)
+            assert np.unique(acts_crc).tolist() == [1]
+            assert np.unique(acts_bayes).tolist() == [1]
+            realized = float(np.mean(np.maximum(C_sub[acts_crc, y_sub] - cal_sub.c_esc, 0.0) / (cal_sub.B - cal_sub.c_esc)))
+            assert realized == 0.0
+
+        # Overflowing (B - c_esc) still scales safely without RuntimeWarning.
+        C_ovf = np.array([[1e308, 1e308], [-1e308, -1e308]], dtype=np.float64)
+        cal_ovf = UtilityCalibrator(C_ovf, safe_action=1, alpha=0.05).fit(p_sub, y_sub)
+        assert np.all(np.isfinite(cal_ovf.L))
+        assert np.allclose(cal_ovf.L[0], [1.0, 1.0], atol=1e-12)
+        assert cal_ovf.predict([1.0, 0.0]).tolist() == [1]
+        assert cal_ovf.predict([0.5, 0.5], use_crc=False).tolist() == [1]
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_u)
+
+    # ------------------------------------------------------------------
+    # R37-2: _analyze_code_kw_flow / _inspect_varkw_wrapper covers dict_arg,
+    # nested_dict_return, delete_subscr/delete_slice, FOR_ITER, and defaults.
+    # ------------------------------------------------------------------
+    class _R37CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"))
+        g = ChoiceField(options=("a", "b"))
+
+        def validate_decision(self, values: Mapping[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return dict(values)
+
+    class _R37BaseModel:
+        def __init__(self) -> None:
+            self._inner = SystemOneModel(
+                _R37CoupledSchema(),
+                dimension=16,
+                backend="numpy",
+                contrastive_whitening=False,
+            )
+            for hd in self._inner.heads.values():
+                hd.set_weights(np.zeros((2, 16), dtype=np.float32), np.array([2.0, -2.0], dtype=np.float32))
+            for attr_n in ("schema", "projector", "dimension", "heads"):
+                setattr(self, attr_n, getattr(self._inner, attr_n))
+
+        def encode(self, prompt: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
+            return self._inner.encode(prompt, recency_weighted=recency_weighted)
+
+        def forward_single(self, prompt: str, embedding: Optional[np.ndarray] = None) -> Any:
+            return self._inner.forward_single(prompt, embedding=embedding)
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Optional[np.ndarray] = None,
+            **kwargs: Any,
+        ) -> Dict[str, Any]:
+            return self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+
+    class _R37DictArgModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                return box["f"]()
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37NestedDictArgModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                return box["outer"]["f"]()
+
+            cached, rest = invoke({"outer": {"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)}})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37NestedDictReturnModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pack(fn: Callable[[], Any]) -> Dict[str, Any]:
+                return {"outer": {"f": fn}}
+
+            cached, rest = pack(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))["outer"]["f"]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37DeleteSubscrModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq = [lambda: None, lambda: (bool(kwargs.pop("use_cache", True)), kwargs)]
+            del seq[0]
+            cached, rest = seq[0]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37DeleteSliceModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq = [lambda: None, lambda: (bool(kwargs.pop("use_cache", True)), kwargs)]
+            lo_idx, hi_idx = 0, 1
+            del seq[lo_idx:hi_idx]
+            cached, rest = seq[0]()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37CallbackDefaultModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(
+                fn: Callable[[], Any] = lambda: (bool(kwargs.pop("use_cache", True)), kwargs),
+            ) -> Any:
+                return fn()
+
+            cached, rest = invoke()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37KwCallbackDefaultModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(
+                *,
+                fn: Callable[[], Any] = lambda: (bool(kwargs.pop("use_cache", True)), kwargs),
+            ) -> Any:
+                return fn()
+
+            cached, rest = invoke()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37ExtDefPosModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r37_mod_def_invoke(kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37ExtDefKwModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r37_mod_kwdef_invoke(kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37ForIterParamModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(seq: Sequence[Callable[[], Any]]) -> Any:
+                out: Any = (True, kwargs)
+                for fn in seq:
+                    out = fn()
+                return out
+
+            cached, rest = invoke([lambda: (bool(kwargs.pop("use_cache", True)), kwargs)])
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    for pos_cls in (
+        _R37DictArgModel,
+        _R37NestedDictArgModel,
+        _R37NestedDictReturnModel,
+        _R37DeleteSubscrModel,
+        _R37DeleteSliceModel,
+        _R37CallbackDefaultModel,
+        _R37KwCallbackDefaultModel,
+        _R37ExtDefPosModel,
+        _R37ExtDefKwModel,
+        _R37ForIterParamModel,
+    ):
+        m_pos = pos_cls()
+        assert _inspect_varkw_wrapper(m_pos.forward_single, frozenset({"use_cache"}))[0] == {"use_cache"}
+        eng_pos = SystemOneEngine(
+            _R37CoupledSchema(),
+            model=m_pos,
+            use_cache=False,
+            strict_mode=True,
+            min_calibration_lessons=1_000_000,
+        )
+        assert eng_pos.decide("p", use_cache=False).values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_pos.learn("p", {"f": "b"})
+        assert eng_pos.model_version == 1
+        assert eng_pos.decide("p", use_cache=False).values == {"f": "a", "g": "a"}
+
+    class _R37NegDefaultOverrideModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(
+                fn: Callable[[], Any] = lambda: (bool(kwargs.pop("use_cache", True)), kwargs),
+            ) -> Any:
+                return fn()
+
+            cached, rest = invoke(lambda: (False, dict(kwargs)))
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R37NegDictSiblingModel(_R37BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                return box["live"]()
+
+            res = invoke({"live": lambda: 1, "dead": lambda: kwargs.get("use_cache")})
+            return super().forward_single(*args, **kwargs) if res else None
+
+    for neg_cls in (_R37NegDefaultOverrideModel, _R37NegDictSiblingModel):
+        m_neg = neg_cls()
+        assert _inspect_varkw_wrapper(m_neg.forward_single, frozenset({"use_cache"}))[0] == set()
+
+    # ------------------------------------------------------------------
+    # R37-3: TypeSafeClient & AsyncTypeSafeClient preserve structured and
+    # case-sensitive cache keys in auto_cutover mode.
+    # ------------------------------------------------------------------
+    def _trained_lc(canary_rate: float = 1e-9) -> AutoCutoverLifecycle:
+        class _S(DecisionSchema):
+            f = ChoiceField(options=("a", "b"))
+
+        lc = AutoCutoverLifecycle(
+            _S(),
+            config=CutoverConfig(
+                milestones=(64,),
+                k_min=2,
+                canary_rate=canary_rate,
+                sparse_dim=128,
+                dense_dim=32,
+                enable_quarantine=False,
+            ),
+        )
+        for i in range(64):
+            lc.observe_teacher(
+                ("accept approve pleasant" if i % 2 == 0 else "reject deny dangerous") + f" detail number {i}",
+                {"f": "a" if i % 2 == 0 else "b"},
+            )
+        return lc
+
+    lc_ts = _trained_lc(1e-9)
+    ts_calls: List[Any] = []
+
+    def _ts_teacher(state_arg: Any, questions_arg: Any) -> Dict[str, Any]:
+        ts_calls.append(state_arg)
+        is_a = (isinstance(state_arg, dict) and state_arg.get("approved") is True) or (
+            isinstance(state_arg, str) and state_arg == "exact lowercase key"
+        )
+        return {
+            "answers": {"f": {"value": "a" if is_a else "b"}},
+            "egress_bytes": 0,
+        }
+
+    client_ts = TypeSafeClient(
+        mode="auto_cutover",
+        auto_cutover_lifecycle=lc_ts,
+        baseline_handler=_ts_teacher,
+    )
+    q_ts = {"f": Choice(options=["a", "b"])}
+    state_ts = {"approved": True, "id": "different explicit json input"}
+    assert client_ts.systemone(state_ts, q_ts)["answers"]["f"]["value"] == "a"
+    assert client_ts.systemone(state_ts, q_ts)["answers"]["f"]["value"] == "a"
+    seed_n = len(ts_calls)
+    assert client_ts.systemone(state_ts, q_ts)["answers"]["f"]["value"] == "a"
+    assert len(ts_calls) == seed_n
+    for altered in (
+        {"APPROVED": True, "id": state_ts["id"]},
+        json.dumps(state_ts, sort_keys=True, separators=(",", ":")),
+    ):
+        before_n = len(ts_calls)
+        r_alt = client_ts.systemone(altered, q_ts)
+        assert len(ts_calls) == before_n + 1
+        assert r_alt["answers"]["f"]["value"] == "b"
+        assert r_alt.get("local_execution") is not True
+
+    async def _run_async_ts() -> None:
+        ac = AsyncTypeSafeClient(
+            mode="auto_cutover",
+            auto_cutover_lifecycle=_trained_lc(1e-9),
+            baseline_handler=_ts_teacher,
+        )
+        assert (await ac.systemone(state_ts, q_ts))["answers"]["f"]["value"] == "a"
+        assert (await ac.systemone(state_ts, q_ts))["answers"]["f"]["value"] == "a"
+        r_upper = await ac.systemone({"APPROVED": True, "id": state_ts["id"]}, q_ts)
+        assert r_upper["answers"]["f"]["value"] == "b"
+        assert (await ac.systemone("exact lowercase key", q_ts))["answers"]["f"]["value"] == "a"
+        assert (await ac.systemone("exact lowercase key", q_ts))["answers"]["f"]["value"] == "a"
+        assert (await ac.systemone("EXACT LOWERCASE KEY", q_ts))["answers"]["f"]["value"] == "b"
+        await ac.close()
+
+    asyncio.run(_run_async_ts())
+
+    # ------------------------------------------------------------------
+    # R37-4a: External local network acceptance rolls back cutover canary
+    # tx without leaking pending canaries in sync or async decide().
+    # ------------------------------------------------------------------
+    class _ExternalDecider:
+        def decide(self, prompt: str) -> Dict[str, Any]:
+            return {"values": {"f": "a"}, "review": False}
+
+    lc_ext = _trained_lc(1.0)
+    ext_calls: List[str] = []
+    fb_ext = BoundedReviewFallback(
+        _ExternalDecider(),
+        review_fn=lambda p: (ext_calls.append(p) or {"f": "b"}),
+        auto_compile_lifecycle=lc_ext,
+    )
+    for _ in range(10):
+        r_sync_ext = fb_ext.decide("accept approve pleasant detail number 0")
+        assert r_sync_ext["recovery_reason"] == "local_accepted"
+    assert (
+        lc_ext.local_accept_eligible,
+        lc_ext.canary_checks,
+        len(lc_ext._pending_canaries),
+        sum(map(len, lc_ext._pending_canary_stack.values())),
+        len(ext_calls),
+    ) == (0, 0, 0, 0, 0)
+
+    async def _run_ext_async() -> None:
+        for _ in range(10):
+            r_as_ext = await fb_ext.decide("accept approve pleasant detail number 0")
+            assert r_as_ext["recovery_reason"] == "local_accepted"
+
+    asyncio.run(_run_ext_async())
+    assert (
+        lc_ext.local_accept_eligible,
+        lc_ext.canary_checks,
+        len(lc_ext._pending_canaries),
+        sum(map(len, lc_ext._pending_canary_stack.values())),
+        len(ext_calls),
+    ) == (0, 0, 0, 0, 0)
+
+    # ------------------------------------------------------------------
+    # R37-4b: Cancelling, closing, or halting an unstarted async decide()
+    # releases _busy, raw_answer, and pending canary transactions cleanly.
+    # ------------------------------------------------------------------
+    async def _slow_expert(prompt: Any) -> Dict[str, str]:
+        await asyncio.sleep(0.05)
+        return {"f": "b"}
+
+    with warnings.catch_warnings(record=True) as caught_async_w:
+        warnings.simplefilter("always", RuntimeWarning)
+
+        async def _verify_unstarted_cleanup() -> None:
+            p0 = "accept approve pleasant detail number 0"
+            p2 = "accept approve pleasant detail number 2"
+
+            lc_cancel = _trained_lc(1.0)
+            fb_cancel = BoundedReviewFallback(
+                lc_cancel.engine,
+                review_fn=_slow_expert,
+                auto_compile_lifecycle=lc_cancel,
+                auto_record_lessons=False,
+            )
+            t_cancel = asyncio.create_task(fb_cancel.decide(p0))
+            t_cancel.cancel()
+            res_cancel = await asyncio.gather(t_cancel, return_exceptions=True)
+            assert isinstance(res_cancel[0], asyncio.CancelledError)
+            assert fb_cancel._busy is False
+            assert lc_cancel.local_accept_eligible == 0
+            assert lc_cancel._pending_canaries == {}
+            assert sum(map(len, lc_cancel._pending_canary_stack.values())) == 0
+
+            lc_close = _trained_lc(1.0)
+            fb_close = BoundedReviewFallback(
+                lc_close.engine,
+                review_fn=_slow_expert,
+                auto_compile_lifecycle=lc_close,
+                auto_record_lessons=False,
+            )
+            coro_close = fb_close.decide(p0)
+            coro_close.close()
+            assert fb_close._busy is False
+            assert fb_close._halted is False
+            assert lc_close.local_accept_eligible == 0
+            assert lc_close._pending_canaries == {}
+            r_after = await fb_close.decide(p2)
+            assert r_after["used_fallback"] is True
+            assert (
+                lc_close.local_accept_eligible,
+                lc_close.canary_checks,
+                len(lc_close._pending_canaries),
+            ) == (1, 1, 0)
+
+            lc_halt = _trained_lc(1.0)
+            fb_halt = BoundedReviewFallback(
+                lc_halt.engine,
+                review_fn=_slow_expert,
+                auto_compile_lifecycle=lc_halt,
+                auto_record_lessons=False,
+            )
+            coro_halt = fb_halt.decide(p0)
+            fb_halt.close()
+            r_halt = await coro_halt
+            assert r_halt["recovery_reason"] == "runner_stopped"
+            assert fb_halt._busy is False
+            assert lc_halt.local_accept_eligible == 0
+            assert lc_halt._pending_canaries == {}
+
+            lc_gc = _trained_lc(1.0)
+            fb_gc = BoundedReviewFallback(
+                lc_gc.engine,
+                review_fn=_slow_expert,
+                auto_compile_lifecycle=lc_gc,
+                auto_record_lessons=False,
+            )
+            coro_gc = fb_gc.decide(p0)
+            del coro_gc
+            gc.collect()
+            assert fb_gc._busy is False
+            assert lc_gc.local_accept_eligible == 0
+            assert lc_gc._pending_canaries == {}
+
+        asyncio.run(_verify_unstarted_cleanup())
+        gc.collect()
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_async_w)
+
+    # ------------------------------------------------------------------
+    # R37-5: Weakref cutover engine ownership prevents GC address reuse
+    # from misclassifying external networks (and via SoftDistillingLifecycle).
+    # ------------------------------------------------------------------
+    lc_own = _trained_lc(1e-9)
+    assert not hasattr(lc_own, "_owned_engine_ids")
+    ext_net = _ExternalDecider()
+    live_eng = lc_own.engine
+    assert lc_own._is_owned_engine(live_eng) is True
+
+    class _DisposableObj:
+        pass
+
+    disposable = _DisposableObj()
+    lc_own._owned_engine_refs[id(ext_net)] = weakref.ref(disposable)
+    del disposable
+    gc.collect()
+    assert lc_own._is_owned_engine(ext_net) is False
+
+    fb_own = BoundedReviewFallback(
+        ext_net,
+        review_fn=lambda p: {"f": "b"},
+        auto_compile_lifecycle=lc_own,
+    )
+    assert fb_own._network_owned_by_cutover is False
+    r_ext_out = fb_own.decide("totally unrelated uncertain gibberish")
+    assert r_ext_out["used_fallback"] is False
+    assert r_ext_out["values"] == {"f": "a"}
+
+    # Sister path: SoftDistillingLifecycle delegates _is_owned_engine.
+    q_soft = {"f": {"type": "choice", "options": ["a", "b"], "instructions": "r37-5 soft"}}
+    contract_soft = compile_questions_contract(q_soft)
+    soft_lc = SoftDistillingLifecycle(
+        contract_soft,
+        config=CutoverConfig(
+            milestones=(64,),
+            k_min=2,
+            canary_rate=1e-9,
+            sparse_dim=128,
+            dense_dim=32,
+            enable_quarantine=False,
+        ),
+    )
+    soft_iname = contract_soft.contracts[0].internal_name
+    for i in range(64):
+        soft_lc.observe_teacher(
+            ("accept approve pleasant" if i % 2 == 0 else "reject deny dangerous") + f" soft {i}",
+            {soft_iname: "a" if i % 2 == 0 else "b"},
+        )
+    soft_live_eng = soft_lc.lifecycle.engine
+    assert soft_lc._is_owned_engine(soft_live_eng) is True
+    disposable_s = _DisposableObj()
+    soft_lc.lifecycle._owned_engine_refs[id(ext_net)] = weakref.ref(disposable_s)
+    del disposable_s
+    gc.collect()
+    assert soft_lc._is_owned_engine(ext_net) is False
+    fb_soft_ext = BoundedReviewFallback(
+        ext_net,
+        review_fn=lambda p: {"f": "b"},
+        auto_compile_lifecycle=soft_lc,
+    )
+    assert fb_soft_ext._network_owned_by_cutover is False
+    fb_soft_owned = BoundedReviewFallback(
+        soft_live_eng,
+        review_fn=lambda p: {"f": "b"},
+        auto_compile_lifecycle=soft_lc,
+    )
+    assert fb_soft_owned._network_owned_by_cutover is True
+
+
+
 
 
 

@@ -646,6 +646,7 @@ def _analyze_code_kw_flow(
     outer_code_defs: Optional[Mapping[str, types.CodeType]] = None,
     known_code_called_params: Optional[Mapping[int, frozenset[Tuple[str, Any, bool, int]]]] = None,
     ext_target_codes: Optional[Mapping[Any, Tuple[types.CodeType, int]]] = None,
+    known_code_def_slots: Optional[Mapping[Tuple[int, str], Tuple[int, frozenset[Tuple[str, Any]]]]] = None,
 ) -> Tuple[
     set[str],
     set[Tuple[str, str]],
@@ -665,6 +666,7 @@ def _analyze_code_kw_flow(
     Dict[int, Tuple[types.CodeType, bool]],
     Tuple[set[str], set[Tuple[str, str]], set[str]],
     frozenset[Tuple[str, Any, bool, int]],
+    Dict[Tuple[int, str], Tuple[int, frozenset[Tuple[str, Any]]]],
 ]:
     """Analyze bytecode callable targets, mutated container taint, and active constants."""
     unpacked_names: set[str] = set()
@@ -677,6 +679,7 @@ def _analyze_code_kw_flow(
     unpacked_codes: Dict[int, types.CodeType] = {}
     tainted_codes: Dict[int, Tuple[types.CodeType, bool]] = {}
     def_tainted_params: Dict[int, frozenset[str]] = {}
+    def_param_slots: Dict[Tuple[int, str], Tuple[int, frozenset[Tuple[str, Any]]]] = {}
     called_closure_names: set[str] = set()
     returned_slots: set[Tuple[str, Any]] = set()
     invoked_local_codes: Dict[int, Tuple[types.CodeType, bool]] = {}
@@ -684,6 +687,7 @@ def _analyze_code_kw_flow(
     ret_invoked_names: set[str] = set()
     ret_invoked_owner_attrs: set[Tuple[str, str]] = set()
     ret_invoked_leaf_attrs: set[str] = set()
+    _BASE_PARAM_KINDS = ("param_idx", "param_name", "varargs_from", "varkw_any", "param_sub")
 
     tainted_boxes: set[int] = set()
     unpacked_boxes: set[int] = set()
@@ -895,8 +899,36 @@ def _analyze_code_kw_flow(
             "param_dep",
             "seq_items",
             "seq_items_ex",
+            "nested_ret_dict",
+            "nested_ret_elems",
         }
     )
+
+    def _param_sub_depth(tag: Tuple[str, Any]) -> int:
+        if tag[0] == "param_sub" and isinstance(tag[1], tuple) and len(tag[1]) == 2:
+            base_t = tag[1][0]
+            if isinstance(base_t, tuple) and len(base_t) == 2:
+                return 1 + _param_sub_depth(base_t)
+            return 1
+        return 0
+
+    def _project_slot_param_subs(
+        cont_slot: set[Tuple[str, Any]],
+        ckeys_p: Optional[frozenset[Any]],
+    ) -> set[Tuple[str, Any]]:
+        base_tags: set[Tuple[str, Any]] = {
+            (k, v) for k, v in cont_slot if k in _BASE_PARAM_KINDS
+        }
+        for pk, pv in cont_slot:
+            if pk == "recv_var" and isinstance(pv, str) and pv in locals_env:
+                for lk, lv in locals_env[pv]:
+                    if lk in _BASE_PARAM_KINDS:
+                        base_tags.add((lk, lv))
+        out_ps: set[Tuple[str, Any]] = set()
+        for bt in base_tags:
+            if _param_sub_depth(bt) < 6:
+                out_ps.add(("param_sub", (bt, ckeys_p)))
+        return out_ps
 
     def _record_called_params_from_slots(
         slots: Sequence[set[Tuple[str, Any]]],
@@ -906,7 +938,7 @@ def _analyze_code_kw_flow(
     ) -> None:
         for sl in slots:
             for k, v in sl:
-                if k in ("param_idx", "param_name", "varargs_from", "varkw_any"):
+                if k in _BASE_PARAM_KINDS:
                     called_params.add((k, v, is_unpacked, taint_mode))
 
     def _record_ret_invoked(slots: Sequence[set[Tuple[str, Any]]]) -> None:
@@ -1028,8 +1060,14 @@ def _analyze_code_kw_flow(
                         box_tainted_keys.setdefault(dst_bid, set()).update(box_tainted_keys[sb])
                     if sb in box_unk_tainted:
                         box_unk_tainted.add(dst_bid)
-            if not copied_dict and _slot_is_tainted(src_slot):
-                box_unk_tainted.add(dst_bid)
+            if not copied_dict:
+                proj_m = _project_slot_param_subs(src_slot, None)
+                if ("varkw_param", None) in src_slot:
+                    proj_m.add(("varkw_any", None))
+                if proj_m:
+                    box_unk_key_elems.setdefault(dst_bid, set()).update(proj_m)
+                if _slot_is_tainted(src_slot):
+                    box_unk_tainted.add(dst_bid)
 
     def _lookup_keyed_elems(
         cont_slot: set[Tuple[str, Any]],
@@ -1092,6 +1130,11 @@ def _analyze_code_kw_flow(
                     is_t_read = True
         if not bids_lk and not param_items and _slot_is_tainted(cont_slot):
             is_t_read = True
+        proj_ps = _project_slot_param_subs(cont_slot, ckeys_lk)
+        if proj_ps:
+            out_tags.update(proj_ps)
+            if _slot_is_tainted(cont_slot):
+                is_t_read = True
         if (key_slot is not None and _slot_is_tainted(key_slot)) or _slot_is_tainted(set(out_tags)):
             is_t_read = True
         return frozenset(out_tags), is_t_read
@@ -1208,7 +1251,7 @@ def _analyze_code_kw_flow(
 
         def _collect_fs(fs: frozenset[Tuple[str, Any]]) -> None:
             for k_f, v_f in fs:
-                if k_f in ("param_idx", "param_name", "varargs_from", "varkw_any"):
+                if k_f in _BASE_PARAM_KINDS:
                     out_pt.add((k_f, v_f))
                 elif k_f == "varargs_param":
                     out_pt.add(("varargs_from", v_f))
@@ -1256,12 +1299,91 @@ def _analyze_code_kw_flow(
         is_seq_ctor = False
         is_dict_ctor = False
 
+        synth_box_seq = 0
+
+        def _materialize_nested_box_in_caller(
+            kind_nb: str,
+            val_nb: Any,
+            cv_m: types.CodeType,
+            boff_m: int,
+            depth_m: int,
+            *,
+            allow_param_subst: bool,
+        ) -> int:
+            nonlocal synth_box_seq
+            synth_box_seq += 1
+            sub_bid = -(ret_bid * 4096 + synth_box_seq)
+            if kind_nb == "nested_ret_dict" and isinstance(val_nb, tuple) and len(val_nb) == 2:
+                dict_boxes.add(sub_bid)
+                for rk_d, rv_d in sorted(val_nb[0], key=lambda item: (type(item[0]).__name__, repr(item[0]))):
+                    sub_vd = _subst_slot_fset(
+                        cv_m,
+                        boff_m,
+                        rv_d,
+                        depth_m + 1,
+                        allow_param_subst=allow_param_subst,
+                    )
+                    if sub_vd:
+                        box_key_elems.setdefault(sub_bid, {}).setdefault(rk_d, set()).update(sub_vd)
+                    if any(k_x == "kw_taint" and v_x for k_x, v_x in sub_vd):
+                        box_tainted_keys.setdefault(sub_bid, set()).add(rk_d)
+                        tainted_boxes.add(sub_bid)
+                if val_nb[1]:
+                    sub_ud = _subst_slot_fset(
+                        cv_m,
+                        boff_m,
+                        val_nb[1],
+                        depth_m + 1,
+                        allow_param_subst=allow_param_subst,
+                    )
+                    if sub_ud:
+                        box_unk_key_elems.setdefault(sub_bid, set()).update(sub_ud)
+                    if any(k_x == "kw_taint" and v_x for k_x, v_x in sub_ud):
+                        box_unk_tainted.add(sub_bid)
+                        tainted_boxes.add(sub_bid)
+            elif kind_nb == "nested_ret_elems" and isinstance(val_nb, frozenset):
+                sub_el = _subst_slot_fset(
+                    cv_m,
+                    boff_m,
+                    val_nb,
+                    depth_m + 1,
+                    allow_param_subst=allow_param_subst,
+                )
+                if sub_el:
+                    box_elem_tags.setdefault(sub_bid, set()).update(sub_el)
+                if any(k_x == "kw_taint" and v_x for k_x, v_x in sub_el):
+                    tainted_boxes.add(sub_bid)
+            return sub_bid
+
+        def _lookup_default_slot(cid_d: int, pname_d: str) -> frozenset[Tuple[str, Any]]:
+            key_d = (cid_d, pname_d)
+            out_d: set[Tuple[str, Any]] = set()
+            for entry_d in (
+                def_param_slots.get(key_d),
+                known_code_def_slots.get(key_d) if known_code_def_slots is not None else None,
+            ):
+                if entry_d is None:
+                    continue
+                owner_cid, ser_fset = entry_d
+                if owner_cid == id(code):
+                    out_d.update(ser_fset)
+                else:
+                    out_d.update((k_x, v_x) for k_x, v_x in ser_fset if k_x not in _BASE_PARAM_KINDS)
+            return frozenset(out_d)
+
+        def _materialize_def_slot_fset(
+            df_fset: frozenset[Tuple[str, Any]],
+            cv_m: types.CodeType,
+            boff_m: int,
+        ) -> set[Tuple[str, Any]]:
+            return set(_subst_slot_fset(cv_m, boff_m, df_fset, 0, allow_param_subst=False))
+
         def _copy_ret_src_slot(arg_src: set[Tuple[str, Any]]) -> None:
             if _slot_is_tainted(arg_src):
                 tainted_boxes.add(ret_bid)
                 ret_slot.add(("kw_taint", True))
             for ak, av in arg_src:
-                if ak in _RET_COPY_KEYS or ak in ("param_idx", "param_name", "varargs_from", "varkw_any"):
+                if ak in _RET_COPY_KEYS or ak in _BASE_PARAM_KINDS:
                     ret_slot.add((ak, av))
                 elif ak in ("box_id", "recv_box"):
                     ret_slot.add(("recv_box", av))
@@ -1284,22 +1406,43 @@ def _analyze_code_kw_flow(
                 eff_idx = pv - bound_off
                 if eff_idx < 0:
                     return out_srcs
+                supplied_pos = False
                 if allow_pos_arg_fwd and 0 <= eff_idx < len(arg_slots_rev):
                     out_srcs.append(arg_slots_rev[len(arg_slots_rev) - 1 - eff_idx])
+                    supplied_pos = True
+                elif (
+                    kw_arg_map
+                    and cv_po <= pv < cv_c.co_argcount
+                    and str(cv_c.co_varnames[pv]) in kw_arg_map
+                ):
+                    out_srcs.append(kw_arg_map[str(cv_c.co_varnames[pv])])
+                    supplied_pos = True
                 elif not allow_pos_arg_fwd and star_pos_slot:
                     out_srcs.append(star_pos_slot)
+                if not supplied_pos and 0 <= pv < cv_c.co_argcount:
+                    p_nm_d = str(cv_c.co_varnames[pv])
+                    d_fset = _lookup_default_slot(id(cv_c), p_nm_d)
+                    if d_fset:
+                        out_srcs.append(_materialize_def_slot_fset(d_fset, cv_c, bound_off))
             elif pk == "param_name" and isinstance(pv, str):
+                supplied_kw = False
                 if kw_arg_map and pv in kw_arg_map:
                     out_srcs.append(kw_arg_map[pv])
+                    supplied_kw = True
                 elif allow_pos_arg_fwd and pv in cv_pos_names_r:
                     eff_i = cv_po + cv_pos_names_r.index(pv) - bound_off
                     if 0 <= eff_i < len(arg_slots_rev):
                         out_srcs.append(arg_slots_rev[len(arg_slots_rev) - 1 - eff_i])
+                        supplied_kw = True
                 elif not allow_pos_arg_fwd and star_pos_slot and pv in cv_pos_names_r:
                     if (cv_po + cv_pos_names_r.index(pv) - bound_off) >= 0:
                         out_srcs.append(star_pos_slot)
                 elif unk_kw_slot and pv in cv_kw_names_r:
                     out_srcs.append(unk_kw_slot)
+                if not supplied_kw:
+                    d_fset = _lookup_default_slot(id(cv_c), pv)
+                    if d_fset:
+                        out_srcs.append(_materialize_def_slot_fset(d_fset, cv_c, bound_off))
             elif pk == "varargs_from" and isinstance(pv, int):
                 eff_va = max(0, pv - bound_off)
                 if allow_pos_arg_fwd:
@@ -1314,6 +1457,50 @@ def _analyze_code_kw_flow(
                             out_srcs.append(kw_v)
                 if unk_kw_slot:
                     out_srcs.append(unk_kw_slot)
+            elif pk == "param_sub" and isinstance(pv, tuple) and len(pv) == 2:
+                base_tag, ckeys_p = pv
+                if isinstance(base_tag, tuple) and len(base_tag) == 2:
+                    parent_srcs = _resolve_param_sources(cv_c, bound_off, base_tag[0], base_tag[1])
+                    synth_key_slot = (
+                        {("const_key", ck) for ck in ckeys_p}
+                        if ckeys_p is not None
+                        else None
+                    )
+                    for p_src in parent_srcs:
+                        proj_slot: set[Tuple[str, Any]] = set()
+                        p_bids = _container_bids(p_src)
+                        has_dict_p = any(b in dict_boxes for b in p_bids)
+                        has_seq_p = False
+                        seq_rep_p = _unpack_seq_with_boxes(p_src)
+                        if seq_rep_p is not None and not has_dict_p:
+                            has_seq_p = True
+                            pref_sp, hs_sp, _, _ = seq_rep_p
+                            if (
+                                ckeys_p is not None
+                                and not hs_sp
+                                and all(isinstance(ck, int) and not isinstance(ck, bool) for ck in ckeys_p)
+                            ):
+                                for idx_sp in ckeys_p:
+                                    eff_sp = idx_sp if idx_sp >= 0 else len(pref_sp) + idx_sp
+                                    if 0 <= eff_sp < len(pref_sp):
+                                        proj_slot.update(pref_sp[eff_sp])
+                            else:
+                                proj_slot.update(_collect_rep_elem_tags(seq_rep_p))
+                            if any(b in tainted_boxes for b in p_bids) or _slot_is_tainted(proj_slot):
+                                proj_slot.add(("kw_taint", True))
+                        if not has_seq_p or has_dict_p or any(
+                            k in _BASE_PARAM_KINDS or k in ("varkw_param", "varargs_param")
+                            for k, _ in p_src
+                        ):
+                            lk_p, lk_pt = _lookup_keyed_elems(p_src, synth_key_slot)
+                            proj_slot.update(lk_p)
+                            if lk_pt:
+                                proj_slot.add(("kw_taint", True))
+                        for k_co, v_co in p_src:
+                            if k_co == "call_origin":
+                                proj_slot.add((k_co, v_co))
+                        if proj_slot:
+                            out_srcs.append(proj_slot)
             return out_srcs
 
         def _lookup_ext_target(ak: str, av: Any) -> Tuple[Optional[types.CodeType], int]:
@@ -1334,7 +1521,7 @@ def _analyze_code_kw_flow(
             out_kv: set[Tuple[str, Any]] = set()
             had_resolved_param = False
             for rk_s, rv_s in slot_fset:
-                if rk_s in ("param_idx", "param_name", "varargs_from", "varkw_any"):
+                if rk_s in _BASE_PARAM_KINDS:
                     if not allow_param_subst:
                         continue
                     srcs = _resolve_param_sources(cv_c, bound_off, rk_s, rv_s)
@@ -1344,7 +1531,7 @@ def _analyze_code_kw_flow(
                             if _slot_is_tainted(arg_src):
                                 out_kv.add(("kw_taint", True))
                             for ak, av in arg_src:
-                                if ak in _RET_COPY_KEYS or ak in ("param_idx", "param_name", "varargs_from", "varkw_any"):
+                                if ak in _RET_COPY_KEYS or ak in _BASE_PARAM_KINDS:
                                     out_kv.add((ak, av))
                                 elif ak in ("box_id", "recv_box"):
                                     out_kv.add(("recv_box", av))
@@ -1352,6 +1539,18 @@ def _analyze_code_kw_flow(
                                         out_kv.add(("kw_taint", True))
                     elif depth > 0:
                         out_kv.add((rk_s, rv_s))
+                elif rk_s in ("nested_ret_dict", "nested_ret_elems") and depth < 8:
+                    sub_bid = _materialize_nested_box_in_caller(
+                        rk_s,
+                        rv_s,
+                        cv_c,
+                        bound_off,
+                        depth,
+                        allow_param_subst=allow_param_subst,
+                    )
+                    out_kv.add(("box_id", sub_bid))
+                    if sub_bid in tainted_boxes:
+                        out_kv.add(("kw_taint", True))
                 elif rk_s == "call_param_ret" and isinstance(rv_s, frozenset) and depth < 8:
                     if not allow_param_subst:
                         continue
@@ -1360,7 +1559,7 @@ def _analyze_code_kw_flow(
                             resid_cp = {
                                 (ak, av)
                                 for ak, av in arg_src
-                                if ak in ("param_idx", "param_name", "varargs_from", "varkw_any")
+                                if ak in _BASE_PARAM_KINDS
                             }
                             if resid_cp:
                                 out_kv.add(("call_param_ret", frozenset(resid_cp)))
@@ -1467,7 +1666,7 @@ def _analyze_code_kw_flow(
             if depth_r >= 8:
                 return
             for rk, rv in ret_fset:
-                if rk in ("param_idx", "param_name", "varargs_from", "varkw_any"):
+                if rk in _BASE_PARAM_KINDS:
                     if not allow_param_subst:
                         continue
                     for src_s in _resolve_param_sources(cv_e, boff_e, rk, rv):
@@ -1480,7 +1679,7 @@ def _analyze_code_kw_flow(
                             resid_cp = {
                                 (ak_r, av_r)
                                 for ak_r, av_r in src_s
-                                if ak_r in ("param_idx", "param_name", "varargs_from", "varkw_any")
+                                if ak_r in _BASE_PARAM_KINDS
                             }
                             if resid_cp:
                                 ret_slot.add(("call_param_ret", frozenset(resid_cp)))
@@ -1509,9 +1708,38 @@ def _analyze_code_kw_flow(
                             allow_param_subst=allow_param_subst,
                         )
                     )
+                elif rk == "nested_ret_dict" and isinstance(rv, tuple) and len(rv) == 2:
+                    sub_nb_id = _materialize_nested_box_in_caller(
+                        "nested_ret_dict",
+                        rv,
+                        cv_e,
+                        boff_e,
+                        depth_r,
+                        allow_param_subst=allow_param_subst,
+                    )
+                    dict_boxes.add(sub_nb_id)
+                    if sub_nb_id in tainted_boxes:
+                        tainted_boxes.add(ret_bid)
+                        ret_slot.add(("kw_taint", True))
+                    ret_slot.add(("recv_box", sub_nb_id))
+                    _merge_dict_into(ret_slot, {("box_id", sub_nb_id)})
+                elif rk == "nested_ret_elems" and isinstance(rv, frozenset):
+                    sub_ne_id = _materialize_nested_box_in_caller(
+                        "nested_ret_elems",
+                        rv,
+                        cv_e,
+                        boff_e,
+                        depth_r,
+                        allow_param_subst=allow_param_subst,
+                    )
+                    if sub_ne_id in tainted_boxes:
+                        tainted_boxes.add(ret_bid)
+                        ret_slot.add(("kw_taint", True))
+                    ret_slot.add(("recv_box", sub_ne_id))
+                    box_elem_tags.setdefault(ret_bid, set()).update(box_elem_tags.get(sub_ne_id, ()))
                 elif rk == "ret_dict" and isinstance(rv, tuple) and len(rv) == 2:
                     dict_boxes.add(ret_bid)
-                    for rk_d, rv_d in rv[0]:
+                    for rk_d, rv_d in sorted(rv[0], key=lambda item: (type(item[0]).__name__, repr(item[0]))):
                         sub_vd = _subst_slot_fset(
                             cv_e,
                             boff_e,
@@ -1723,31 +1951,120 @@ def _analyze_code_kw_flow(
 
     local_varnames_fset = frozenset(str(v) for v in code.co_varnames)
 
-    def _strip_local_names_fset(
+    def _serialize_dict_box(
+        d_bid: int,
+        seen_bids: frozenset[int],
+        depth: int,
+    ) -> Tuple[frozenset[Tuple[Any, frozenset[Tuple[str, Any]]]], frozenset[Tuple[str, Any]]]:
+        k_map_r = box_key_elems.get(d_bid, {})
+        t_keys_r = box_tainted_keys.get(d_bid, set())
+        rv_k_items: List[Tuple[Any, frozenset[Tuple[str, Any]]]] = []
+        for dk_r in set(k_map_r.keys()) | set(t_keys_r):
+            dv_clean = set(
+                _serialize_ret_slot_fset(frozenset(k_map_r.get(dk_r, ())), seen_bids, depth)
+            )
+            if dk_r in t_keys_r:
+                dv_clean.add(("kw_taint", True))
+            if dv_clean:
+                rv_k_items.append((dk_r, frozenset(dv_clean)))
+        rv_unk_set = set(
+            _serialize_ret_slot_fset(frozenset(box_unk_key_elems.get(d_bid, ())), seen_bids, depth)
+        )
+        if d_bid in box_unk_tainted:
+            rv_unk_set.add(("kw_taint", True))
+        return (frozenset(rv_k_items), frozenset(rv_unk_set))
+
+    def _serialize_ret_slot_fset(
         sf: frozenset[Tuple[str, Any]],
+        seen_bids: frozenset[int] = frozenset(),
         depth: int = 0,
     ) -> frozenset[Tuple[str, Any]]:
         out_s: set[Tuple[str, Any]] = set()
         for k_l, v_l in sf:
             if k_l == "name" and v_l in local_varnames_fset:
                 continue
-            if k_l == "seq_items" and isinstance(v_l, tuple) and depth < 8:
-                out_s.add(("seq_items", tuple(_strip_local_names_fset(el, depth + 1) for el in v_l)))
-            elif k_l == "seq_items_ex" and isinstance(v_l, tuple) and len(v_l) == 4 and depth < 8:
+            if k_l in ("box_id", "recv_box") and isinstance(v_l, int):
+                if v_l in tainted_boxes and v_l not in dict_boxes:
+                    out_s.add(("kw_taint", True))
+                if depth < 6 and v_l not in seen_bids:
+                    if v_l in dict_boxes:
+                        out_s.add(("nested_ret_dict", _serialize_dict_box(v_l, seen_bids | {v_l}, depth + 1)))
+                    elif v_l in box_elem_tags:
+                        sub_el = _serialize_ret_slot_fset(
+                            frozenset(box_elem_tags[v_l]),
+                            seen_bids | {v_l},
+                            depth + 1,
+                        )
+                        if v_l in tainted_boxes:
+                            sub_el = sub_el | frozenset({("kw_taint", True)})
+                        if sub_el:
+                            out_s.add(("nested_ret_elems", sub_el))
+                continue
+            if k_l == "seq_items" and isinstance(v_l, tuple) and depth < 6:
+                out_s.add(
+                    ("seq_items", tuple(_serialize_ret_slot_fset(el, seen_bids, depth + 1) for el in v_l))
+                )
+            elif k_l == "seq_items_ex" and isinstance(v_l, tuple) and len(v_l) == 4 and depth < 6:
                 out_s.add(
                     (
                         "seq_items_ex",
                         (
-                            tuple(_strip_local_names_fset(el, depth + 1) for el in v_l[0]),
+                            tuple(_serialize_ret_slot_fset(el, seen_bids, depth + 1) for el in v_l[0]),
                             v_l[1],
-                            _strip_local_names_fset(v_l[2], depth + 1),
-                            tuple(_strip_local_names_fset(el, depth + 1) for el in v_l[3]),
+                            _serialize_ret_slot_fset(v_l[2], seen_bids, depth + 1),
+                            tuple(_serialize_ret_slot_fset(el, seen_bids, depth + 1) for el in v_l[3]),
                         ),
                     )
                 )
             else:
                 out_s.add((k_l, v_l))
         return frozenset(out_s)
+
+    def _record_pos_def_param_slots(
+        sub_code: Optional[types.CodeType],
+        def_slot: set[Tuple[str, Any]],
+    ) -> None:
+        if not isinstance(sub_code, types.CodeType):
+            return
+        seq_rep_d = _unpack_seq_with_boxes(def_slot)
+        if seq_rep_d is None or seq_rep_d[1]:
+            return
+        defs_t = seq_rep_d[0]
+        pos_params = sub_code.co_varnames[: sub_code.co_argcount]
+        start_d = max(0, len(pos_params) - len(defs_t))
+        for i_d, d_el in enumerate(defs_t):
+            if 0 <= start_d + i_d < len(pos_params):
+                p_name_d = str(pos_params[start_d + i_d])
+                ser_d = _serialize_ret_slot_fset(d_el)
+                if ser_d:
+                    key_d = (id(sub_code), p_name_d)
+                    prev_e = def_param_slots.get(key_d)
+                    prev_fs = prev_e[1] if prev_e is not None else frozenset()
+                    def_param_slots[key_d] = (id(code), prev_fs | ser_d)
+
+    def _record_kw_def_param_slots(
+        sub_code: Optional[types.CodeType],
+        kwdef_slot: set[Tuple[str, Any]],
+    ) -> None:
+        if not isinstance(sub_code, types.CodeType):
+            return
+        for bid_kd in _container_bids(kwdef_slot):
+            if bid_kd not in dict_boxes:
+                continue
+            k_map_kd = box_key_elems.get(bid_kd, {})
+            t_keys_kd = box_tainted_keys.get(bid_kd, set())
+            for dk_p in set(k_map_kd.keys()) | set(t_keys_kd):
+                if not isinstance(dk_p, str):
+                    continue
+                dv_raw = set(k_map_kd.get(dk_p, ()))
+                if dk_p in t_keys_kd:
+                    dv_raw.add(("kw_taint", True))
+                ser_kd = _serialize_ret_slot_fset(frozenset(dv_raw))
+                if ser_kd:
+                    key_d = (id(sub_code), dk_p)
+                    prev_e = def_param_slots.get(key_d)
+                    prev_fs = prev_e[1] if prev_e is not None else frozenset()
+                    def_param_slots[key_d] = (id(code), prev_fs | ser_kd)
 
     def _slots_have_param(slots: Sequence[set[Tuple[str, Any]]]) -> bool:
         return bool(_collect_slot_param_tags(slots))
@@ -1908,8 +2225,10 @@ def _analyze_code_kw_flow(
                         mf_p_deps.update(_collect_slot_param_tags([sm]))
                     if r_bit == 0x01:
                         tp_names.update(_extract_pos_def_tainted_params(sub_code_mf, sm))
+                        _record_pos_def_param_slots(sub_code_mf, sm)
                     elif r_bit == 0x02:
                         tp_names.update(_extract_kw_def_tainted_params(sub_code_mf, sm))
+                        _record_kw_def_param_slots(sub_code_mf, sm)
                     for kind, val in sm:
                         if kind == "code" and mf_idx == 0:
                             fn_slot.add(("code", val))
@@ -1982,6 +2301,10 @@ def _analyze_code_kw_flow(
                         else frozenset()
                     )
                 )
+                if arg_int == 0x01:
+                    _record_pos_def_param_slots(sub_code_sfa, attr_slot)
+                elif arg_int == 0x02:
+                    _record_kw_def_param_slots(sub_code_sfa, attr_slot)
                 prev_tp = [v for k, v in new_fn_slot if k == "fn_tainted_params" and v]
                 merged_tp = new_tp.union(*prev_tp) if (new_tp or prev_tp) else frozenset()
                 if merged_tp:
@@ -2233,7 +2556,13 @@ def _analyze_code_kw_flow(
                                 m_pref, m_hs, m_se, m_suff = _concat_seq_reps(dst_rep, it_rep)
                                 _set_seq_repr(dst_seq_s, m_pref, m_hs, m_se, m_suff)
                             else:
-                                it_tag = frozenset({("kw_taint", True)}) if _slot_is_tainted(item_s) else frozenset()
+                                it_tag_set: set[Tuple[str, Any]] = set(_project_slot_param_subs(item_s, None))
+                                for k_va, v_va in item_s:
+                                    if k_va == "varargs_param" and isinstance(v_va, int):
+                                        it_tag_set.add(("varargs_from", v_va))
+                                if _slot_is_tainted(item_s):
+                                    it_tag_set.add(("kw_taint", True))
+                                it_tag = frozenset(it_tag_set)
                                 if not d_hs:
                                     _set_seq_repr(dst_seq_s, d_pref, True, it_tag, ())
                                 else:
@@ -2282,18 +2611,60 @@ def _analyze_code_kw_flow(
                     else:
                         _record_container_elem(cont_s, val_s, seq_mut=True)
                 continue
+            if op == "DELETE_SUBSCR":
+                key_s = stack.pop() if stack else set()
+                cont_s = stack.pop() if stack else set()
+                _flush_consts(key_s, cont_s)
+                if _slot_is_tainted(key_s):
+                    _taint_receiver_slot(cont_s)
+                for b_ds in _container_bids(cont_s):
+                    if b_ds not in dict_boxes:
+                        mutated_seq_boxes.add(b_ds)
+                continue
+            if op == "DELETE_SLICE":
+                stop_s = stack.pop() if stack else set()
+                start_s = stack.pop() if stack else set()
+                cont_s = stack.pop() if stack else set()
+                _flush_consts(stop_s, start_s, cont_s)
+                if _slot_is_tainted(start_s) or _slot_is_tainted(stop_s):
+                    _taint_receiver_slot(cont_s)
+                for b_dsl in _container_bids(cont_s):
+                    if b_dsl not in dict_boxes:
+                        mutated_seq_boxes.add(b_dsl)
+                continue
             if op == "GET_ITER":
                 if stack:
                     top_it = stack[-1]
                     _flush_consts(top_it)
-                    if _slot_is_tainted(top_it):
-                        stack[-1] = {("kw_taint", True), ("iter_taint", True)}
-                    else:
-                        stack[-1] = set()
+                    has_dict_it = any(b in dict_boxes for b in _container_bids(top_it))
+                    it_rep = None if has_dict_it else _unpack_seq_with_boxes(top_it)
+                    it_elems_raw = (
+                        _collect_rep_elem_tags(it_rep)
+                        if it_rep is not None
+                        else (frozenset() if has_dict_it else _lookup_container_elems(top_it))
+                    )
+                    it_elems = frozenset(
+                        kv for kv in (it_elems_raw | frozenset(_project_slot_param_subs(top_it, None)))
+                        if kv[0] != "iter_elems"
+                    )
+                    nxt_it: set[Tuple[str, Any]] = (
+                        {("kw_taint", True), ("iter_taint", True)}
+                        if _slot_is_tainted(top_it)
+                        else set()
+                    )
+                    if it_elems:
+                        nxt_it.add(("iter_elems", it_elems))
+                    stack[-1] = nxt_it
                 continue
             if op == "FOR_ITER":
                 iter_s = stack[-1] if stack else set()
-                stack.append({("kw_taint", True)} if _slot_is_tainted(iter_s) else set())
+                pushed_fi: set[Tuple[str, Any]] = (
+                    {("kw_taint", True)} if _slot_is_tainted(iter_s) else set()
+                )
+                for k_ie, v_ie in iter_s:
+                    if k_ie == "iter_elems" and isinstance(v_ie, frozenset):
+                        pushed_fi.update(v_ie)
+                stack.append(pushed_fi)
                 continue
             if op == "UNPACK_SEQUENCE":
                 top = stack.pop() if stack else set()
@@ -2333,8 +2704,12 @@ def _analyze_code_kw_flow(
                 else:
                     recv_fb = {kv for kv in top if kv[0] in ("recv_box", "recv_var", "call_origin")}
                     recv_fb.update(_lookup_container_elems(top))
-                    for _ in range(arg_int):
+                    va_bases = [v for k, v in top if k == "varargs_param" and isinstance(v, int)]
+                    for idx_u in reversed(range(arg_int)):
                         fb_s = set(recv_fb)
+                        fb_s.update(_project_slot_param_subs(top, frozenset({idx_u})))
+                        for va_b in va_bases:
+                            fb_s.add(("param_idx", int(va_b) + idx_u))
                         if has_t:
                             fb_s.add(("kw_taint", True))
                         stack.append(fb_s)
@@ -2401,6 +2776,7 @@ def _analyze_code_kw_flow(
                     n_push = before + 1 + after
                     recv_fb_ex = {kv for kv in top if kv[0] in ("recv_box", "recv_var", "call_origin")}
                     recv_fb_ex.update(_lookup_container_elems(top))
+                    recv_fb_ex.update(_project_slot_param_subs(top, None))
                     pushed_ex = []
                     for _ in range(n_push):
                         fb_ex = set(recv_fb_ex)
@@ -2426,6 +2802,7 @@ def _analyze_code_kw_flow(
                     _set_seq_repr(res_lt, *tup_rep)
                 else:
                     res_lt.update(_lookup_container_elems(top_lt))
+                    res_lt.update(_project_slot_param_subs(top_lt, None))
                 stack.append(res_lt)
                 continue
             if op == "CALL_FUNCTION_EX":
@@ -2585,7 +2962,7 @@ def _analyze_code_kw_flow(
                     (k_p, v_p)
                     for cs in callable_slots
                     for k_p, v_p in cs
-                    if k_p in ("param_idx", "param_name", "varargs_from", "varkw_any")
+                    if k_p in _BASE_PARAM_KINDS
                 }
                 if c_p_tags_ex:
                     ret_slot.add(("call_param_ret", frozenset(c_p_tags_ex)))
@@ -2797,7 +3174,7 @@ def _analyze_code_kw_flow(
                     (k_p, v_p)
                     for cs in callable_slots
                     for k_p, v_p in cs
-                    if k_p in ("param_idx", "param_name", "varargs_from", "varkw_any")
+                    if k_p in _BASE_PARAM_KINDS
                 }
                 if c_p_tags:
                     ret_slot.add(("call_param_ret", frozenset(c_p_tags)))
@@ -2805,6 +3182,17 @@ def _analyze_code_kw_flow(
                     for tgt_cp in callable_slots:
                         if any(b in dict_boxes for b in _container_bids(tgt_cp)):
                             _merge_dict_into(ret_slot, tgt_cp)
+                if "values" in call_method_names and not pos_rev_slots and not kw_arg_map:
+                    for tgt_v in callable_slots:
+                        el_v, t_v = _lookup_keyed_elems(tgt_v, None)
+                        if el_v:
+                            ret_el_v = _freeze_elem_slot(set(el_v))
+                            if ret_el_v:
+                                box_elem_tags.setdefault(ret_bid, set()).update(ret_el_v)
+                            ret_slot.update(el_v)
+                        if t_v:
+                            tainted_boxes.add(ret_bid)
+                            ret_slot.add(("kw_taint", True))
                 handled_dict_ret = False
                 if call_method_names & {"get", "pop", "setdefault"}:
                     is_unbound_dict_lk = any(
@@ -2844,7 +3232,8 @@ def _analyze_code_kw_flow(
                                 kv
                                 for kv in lk_tags
                                 if kv[0] in _RET_COPY_KEYS
-                                or kv[0] in ("box_id", "param_idx", "param_name", "varargs_from", "varkw_any")
+                                or kv[0] == "box_id"
+                                or kv[0] in _BASE_PARAM_KINDS
                             )
                     if def_lk_slot is not None:
                         ret_slot.update(_freeze_elem_slot(def_lk_slot))
@@ -2880,8 +3269,8 @@ def _analyze_code_kw_flow(
                     if rk == "name" and rv in local_varnames_fset:
                         continue
                     if rk in ("seq_items", "seq_items_ex"):
-                        returned_slots.update(_strip_local_names_fset(frozenset({(rk, rv)})))
-                    elif rk in _RET_COPY_KEYS or rk in ("param_idx", "param_name", "varargs_from", "varkw_any"):
+                        returned_slots.update(_serialize_ret_slot_fset(frozenset({(rk, rv)})))
+                    elif rk in _RET_COPY_KEYS or rk in _BASE_PARAM_KINDS:
                         returned_slots.add((rk, rv))
                     elif rk == "box_id" and rv in tainted_boxes:
                         returned_slots.add(("kw_taint", True))
@@ -2890,21 +3279,9 @@ def _analyze_code_kw_flow(
                 for r_bid in ret_bids_rv:
                     if r_bid in dict_boxes:
                         has_dict_rv = True
-                        k_map_r = box_key_elems.get(r_bid, {})
-                        t_keys_r = box_tainted_keys.get(r_bid, set())
-                        rv_k_items: List[Tuple[Any, frozenset[Tuple[str, Any]]]] = []
-                        for dk_r in set(k_map_r.keys()) | set(t_keys_r):
-                            dv_clean = set(_strip_local_names_fset(frozenset(k_map_r.get(dk_r, ()))))
-                            if dk_r in t_keys_r:
-                                dv_clean.add(("kw_taint", True))
-                            if dv_clean:
-                                rv_k_items.append((dk_r, frozenset(dv_clean)))
-                        rv_unk_set = set(_strip_local_names_fset(frozenset(box_unk_key_elems.get(r_bid, ()))))
-                        if r_bid in box_unk_tainted:
-                            rv_unk_set.add(("kw_taint", True))
-                        returned_slots.add(("ret_dict", (frozenset(rv_k_items), frozenset(rv_unk_set))))
+                        returned_slots.add(("ret_dict", _serialize_dict_box(r_bid, frozenset({r_bid}), 0)))
                 if not has_dict_rv:
-                    ret_el_fset = _strip_local_names_fset(_lookup_container_elems(ret_top))
+                    ret_el_fset = _serialize_ret_slot_fset(_lookup_container_elems(ret_top))
                     if ret_el_fset:
                         returned_slots.add(("ret_elems", ret_el_fset))
                 continue
@@ -2914,6 +3291,7 @@ def _analyze_code_kw_flow(
                 "END_FOR",
                 "POP_ITER",
                 "STORE_ATTR",
+                "DELETE_ATTR",
             ):
                 for _ in range(max(0, -eff)):
                     if stack:
@@ -3050,6 +3428,7 @@ def _analyze_code_kw_flow(
             frozenset((k, v[1]) for k, v in tainted_codes.items()),
             frozenset((vn, frozenset(sl)) for vn, sl in locals_env.items()),
             frozenset(def_tainted_params.items()),
+            frozenset(def_param_slots.items()),
             frozenset(called_closure_names),
             frozenset(returned_slots),
             frozenset(invoked_local_codes.items()),
@@ -3113,6 +3492,7 @@ def _analyze_code_kw_flow(
         invoked_local_codes,
         (ret_invoked_names, ret_invoked_owner_attrs, ret_invoked_leaf_attrs),
         frozenset(called_params),
+        def_param_slots,
     )
 
 
@@ -3283,6 +3663,7 @@ def _inspect_varkw_wrapper(
             set[str],
             set[Tuple[str, str]],
             set[str],
+            Dict[str, Any],
         ],
     ] = {}
 
@@ -3554,9 +3935,44 @@ def _inspect_varkw_wrapper(
                         rn_q.append(const_rn)
 
             ext_target_codes: Dict[Any, Tuple[types.CodeType, int]] = {}
+            ext_synth_callables: Dict[str, Any] = {}
+            known_code_def_slots: Dict[Tuple[int, str], Tuple[int, frozenset[Tuple[str, Any]]]] = {}
+
+            def _reg_fn_defaults(fn_d: Any, code_d: types.CodeType) -> None:
+                defs_d = getattr(fn_d, "__defaults__", None)
+                if isinstance(defs_d, tuple) and defs_d:
+                    pos_p_d = code_d.co_varnames[: code_d.co_argcount]
+                    start_pd = max(0, len(pos_p_d) - len(defs_d))
+                    for idx_pd, val_pd in enumerate(defs_d):
+                        if (
+                            0 <= start_pd + idx_pd < len(pos_p_d)
+                            and not isinstance(val_pd, type)
+                            and callable(val_pd)
+                        ):
+                            pn_pd = str(pos_p_d[start_pd + idx_pd])
+                            s_nm_pd = f"__ext_def_{id(code_d)}_{pn_pd}"
+                            if s_nm_pd not in ext_synth_callables and len(ext_target_codes) < 256:
+                                ext_synth_callables[s_nm_pd] = val_pd
+                                _reg_ext(("name", s_nm_pd), val_pd, None)
+                                known_code_def_slots[(id(code_d), pn_pd)] = (
+                                    id(code_d),
+                                    frozenset({("name", s_nm_pd)}),
+                                )
+                kwdefs_d = getattr(fn_d, "__kwdefaults__", None)
+                if isinstance(kwdefs_d, Mapping) and kwdefs_d:
+                    for pn_kd, val_kd in kwdefs_d.items():
+                        if isinstance(pn_kd, str) and not isinstance(val_kd, type) and callable(val_kd):
+                            s_nm_kd = f"__ext_def_{id(code_d)}_{pn_kd}"
+                            if s_nm_kd not in ext_synth_callables and len(ext_target_codes) < 256:
+                                ext_synth_callables[s_nm_kd] = val_kd
+                                _reg_ext(("name", s_nm_kd), val_kd, None)
+                                known_code_def_slots[(id(code_d), pn_kd)] = (
+                                    id(code_d),
+                                    frozenset({("name", s_nm_kd)}),
+                                )
 
             def _reg_ext(tag_key: Any, raw_obj: Any, def_owner: Any) -> None:
-                if len(ext_target_codes) >= 256 or raw_obj is None:
+                if tag_key in ext_target_codes or len(ext_target_codes) >= 256 or raw_obj is None:
                     return
                 cur_p = raw_obj
                 partial_pos_cnt = 0
@@ -3573,6 +3989,7 @@ def _inspect_varkw_wrapper(
                     u_code,
                     (1 if u_own is not None else 0) + partial_pos_cnt,
                 )
+                _reg_fn_defaults(u_fn, u_code)
 
             def _reg_ext_attrs(prefix_name: str, holder: Any) -> None:
                 if (
@@ -3683,6 +4100,7 @@ def _inspect_varkw_wrapper(
                         _reg_ext(("leaf_attr", n_o), raw_attr_e, attr_own_e)
                     _reg_ext_attrs(n_o, raw_attr_e)
 
+            _reg_fn_defaults(unwrapped, code)
             known_code_returns: Dict[int, frozenset[Tuple[str, Any]]] = {}
             known_code_called_params: Dict[int, frozenset[Tuple[str, Any, bool, int]]] = {}
             cross_tainted_cells: set[Tuple[int, str]] = set()
@@ -3690,6 +4108,7 @@ def _inspect_varkw_wrapper(
                 prev_kcr = dict(known_code_returns)
                 prev_kccp = dict(known_code_called_params)
                 prev_cells = set(cross_tainted_cells)
+                prev_kcds = dict(known_code_def_slots)
                 c_local_names: set[str] = set()
                 c_u_names: set[str] = set()
                 c_u_oattrs: set[Tuple[str, str]] = set()
@@ -3745,6 +4164,7 @@ def _inspect_varkw_wrapper(
                         invoked_c,
                         (ri_n_c, ri_oa_c, ri_la_c),
                         called_params_c,
+                        def_ps_c,
                     ) = _analyze_code_kw_flow(
                         c,
                         c_taint,
@@ -3754,7 +4174,14 @@ def _inspect_varkw_wrapper(
                         outer_code_defs=local_code_defs,
                         known_code_called_params=known_code_called_params,
                         ext_target_codes=ext_target_codes,
+                        known_code_def_slots=known_code_def_slots,
                     )
+                    for k_dps, v_dps in def_ps_c.items():
+                        if k_dps in known_code_def_slots:
+                            _, prev_fs = known_code_def_slots[k_dps]
+                            known_code_def_slots[k_dps] = (v_dps[0], prev_fs | v_dps[1])
+                        else:
+                            known_code_def_slots[k_dps] = v_dps
                     if ret_slot_c:
                         known_code_returns[id(c)] = known_code_returns.get(id(c), frozenset()) | ret_slot_c
                     if called_params_c:
@@ -3794,21 +4221,25 @@ def _inspect_varkw_wrapper(
                     all_taint_codes: Dict[int, Tuple[types.CodeType, bool]] = dict(taint_codes_c)
                     if depth >= 1 and c is code and u_id in invoked_ret_fn_ids and ret_slot_c:
                         ret_scan_slots: List[frozenset[Tuple[str, Any]]] = [ret_slot_c]
-                        for rk_s, rv_s in ret_slot_c:
-                            if rk_s == "seq_items" and isinstance(rv_s, tuple):
-                                ret_scan_slots.extend(rv_s)
-                            elif rk_s == "seq_items_ex" and isinstance(rv_s, tuple) and len(rv_s) == 4:
-                                ret_scan_slots.extend(rv_s[0])
-                                if rv_s[2]:
-                                    ret_scan_slots.append(rv_s[2])
-                                ret_scan_slots.extend(rv_s[3])
-                            elif rk_s == "ret_elems" and isinstance(rv_s, frozenset):
-                                ret_scan_slots.append(rv_s)
-                            elif rk_s == "ret_dict" and isinstance(rv_s, tuple) and len(rv_s) == 2:
-                                for _, dv_s in rv_s[0]:
-                                    ret_scan_slots.append(dv_s)
-                                if rv_s[1]:
-                                    ret_scan_slots.append(rv_s[1])
+                        idx_rs = 0
+                        while idx_rs < len(ret_scan_slots) and len(ret_scan_slots) < 128:
+                            cur_rs = ret_scan_slots[idx_rs]
+                            idx_rs += 1
+                            for rk_s, rv_s in cur_rs:
+                                if rk_s == "seq_items" and isinstance(rv_s, tuple):
+                                    ret_scan_slots.extend(rv_s)
+                                elif rk_s == "seq_items_ex" and isinstance(rv_s, tuple) and len(rv_s) == 4:
+                                    ret_scan_slots.extend(rv_s[0])
+                                    if rv_s[2]:
+                                        ret_scan_slots.append(rv_s[2])
+                                    ret_scan_slots.extend(rv_s[3])
+                                elif rk_s in ("ret_elems", "nested_ret_elems") and isinstance(rv_s, frozenset):
+                                    ret_scan_slots.append(rv_s)
+                                elif rk_s in ("ret_dict", "nested_ret_dict") and isinstance(rv_s, tuple) and len(rv_s) == 2:
+                                    for _, dv_s in rv_s[0]:
+                                        ret_scan_slots.append(dv_s)
+                                    if rv_s[1]:
+                                        ret_scan_slots.append(rv_s[1])
                         for sl_ret in ret_scan_slots:
                             for rk, rv in sl_ret:
                                 if rk == "code" and isinstance(rv, types.CodeType):
@@ -3853,6 +4284,23 @@ def _inspect_varkw_wrapper(
                         loc_c = local_code_defs.get(fn_var)
                         if loc_c is not None and id(loc_c) not in all_taint_codes:
                             all_taint_codes[id(loc_c)] = (loc_c, False)
+                    active_inv_cells = cross_tainted_cells | round_tainted_cells | round_closure_cells
+                    ext_code_ids = {id(ec) for ec, _ in ext_target_codes.values()}
+                    for cid_inv, (sub_inv_c, inv_t) in invoked_c.items():
+                        if cid_inv == id(code) or cid_inv in ext_code_ids:
+                            continue
+                        sub_inv_map = cell_owner_by_code.get(cid_inv, {})
+                        has_inv_taint_fv = any(
+                            sub_inv_map.get(str(fv)) is not None
+                            and (sub_inv_map[str(fv)], str(fv)) in active_inv_cells
+                            for fv in sub_inv_c.co_freevars
+                        )
+                        if inv_t or cid_inv in local_code_def_taints or has_inv_taint_fv:
+                            prev_it = all_taint_codes.get(cid_inv)
+                            all_taint_codes[cid_inv] = (
+                                sub_inv_c,
+                                (prev_it[1] if prev_it is not None else False) or inv_t,
+                            )
                     for unp_c in all_unp_codes.values():
                         pos_only_n = getattr(unp_c, "co_posonlyargcount", 0)
                         kw_cap_n = unp_c.co_argcount + unp_c.co_kwonlyargcount
@@ -3918,8 +4366,15 @@ def _inspect_varkw_wrapper(
                         outer_code_defs=peek_outer_defs,
                         known_code_called_params=known_code_called_params,
                         ext_target_codes=ext_target_codes,
+                        known_code_def_slots=known_code_def_slots,
                     )
                     peek_outer_defs.update(p_res[10])
+                    for k_dps, v_dps in p_res[18].items():
+                        if k_dps in known_code_def_slots:
+                            _, prev_fs = known_code_def_slots[k_dps]
+                            known_code_def_slots[k_dps] = (v_dps[0], prev_fs | v_dps[1])
+                        else:
+                            known_code_def_slots[k_dps] = v_dps
                     for cid_dt, tp_dt in p_res[11].items():
                         local_code_def_taints[cid_dt] = (
                             local_code_def_taints.get(cid_dt, frozenset()) | tp_dt
@@ -3946,7 +4401,14 @@ def _inspect_varkw_wrapper(
                         outer_code_defs=peek_outer_defs,
                         known_code_called_params=known_code_called_params,
                         ext_target_codes=ext_target_codes,
+                        known_code_def_slots=known_code_def_slots,
                     )
+                    for k_dps, v_dps in p_res[18].items():
+                        if k_dps in known_code_def_slots:
+                            _, prev_fs = known_code_def_slots[k_dps]
+                            known_code_def_slots[k_dps] = (v_dps[0], prev_fs | v_dps[1])
+                        else:
+                            known_code_def_slots[k_dps] = v_dps
                     for cid_dt, tp_dt in p_res[11].items():
                         local_code_def_taints[cid_dt] = (
                             local_code_def_taints.get(cid_dt, frozenset()) | tp_dt
@@ -3963,6 +4425,7 @@ def _inspect_varkw_wrapper(
                     known_code_returns == prev_kcr
                     and known_code_called_params == prev_kccp
                     and cross_tainted_cells == prev_cells
+                    and known_code_def_slots == prev_kcds
                 ):
                     break
             cached_ci = (
@@ -3977,6 +4440,7 @@ def _inspect_varkw_wrapper(
                 c_ri_names,
                 c_ri_oattrs,
                 c_ri_lattrs,
+                dict(ext_synth_callables),
             )
             code_info_cache[cache_key_ci] = cached_ci
         (
@@ -3991,6 +4455,7 @@ def _inspect_varkw_wrapper(
             c_ri_names,
             c_ri_oattrs,
             c_ri_lattrs,
+            cur_ext_synth_callables,
         ) = cached_ci
         referenced.update(c_consts)
 
@@ -4023,6 +4488,28 @@ def _inspect_varkw_wrapper(
                         ret_invoked_leaf_attrs=c_ri_lattrs,
                         is_root_code=(depth == 0),
                     )
+        for s_name, s_val in cur_ext_synth_callables.items():
+            if s_name in u_names or s_name in a_names or s_name in c_ri_names:
+                is_unp = s_name in u_names
+                is_ri = s_name in c_ri_names
+                _consider_val(
+                    s_val,
+                    None,
+                    local_names,
+                    nxt_depth,
+                    edge_unpacked=is_unp,
+                    edge_can_fwd=(is_unp or is_ri or s_name in a_names),
+                    ret_invoked=is_ri,
+                    via_name=s_name,
+                    unpacked_owner_attrs=u_oattrs,
+                    unpacked_leaf_attrs=u_lattrs,
+                    arg_owner_attrs=a_oattrs,
+                    arg_leaf_attrs=a_lattrs,
+                    ret_invoked_names=c_ri_names,
+                    ret_invoked_owner_attrs=c_ri_oattrs,
+                    ret_invoked_leaf_attrs=c_ri_lattrs,
+                    is_root_code=(depth == 0),
+                )
 
         fn_closure = getattr(unwrapped, "__closure__", None)
         if fn_closure:

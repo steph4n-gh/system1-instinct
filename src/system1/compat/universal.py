@@ -1812,6 +1812,9 @@ class SoftDistillingLifecycle:
             with self._lock:
                 self._frozen_eligible_counter = max(0, self._frozen_eligible_counter - df)
 
+    def _is_owned_engine(self, obj: Any) -> bool:
+        return bool(self.lifecycle._is_owned_engine(obj))
+
     def decide_local(
         self,
         prompt: str,

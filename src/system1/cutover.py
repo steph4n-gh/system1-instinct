@@ -18,6 +18,7 @@ import math
 import re
 import threading
 import time
+import weakref
 from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union
 
 import numpy as np
@@ -261,7 +262,8 @@ class AutoCutoverLifecycle:
             min_calibration_lessons=1_000_000,
             min_override_corroborations=2,
         )
-        self._owned_engine_ids: Set[int] = {id(self.engine)}
+        self._owned_engine_refs: Dict[int, weakref.ref[Any]] = {}
+        self._register_owned_engine(self.engine)
         self.aci = AdaptiveConformalTracker(
             alpha_target=self.config.alpha_target,
             gamma=0.025,
@@ -321,6 +323,25 @@ class AutoCutoverLifecycle:
         self.recalibrate_events: List[Dict[str, Any]] = []
         self.quarantined_total: int = 0
         self.compile_time_total_ms: float = 0.0
+
+    def _register_owned_engine(self, eng: Any) -> None:
+        if eng is None:
+            return
+        try:
+            self._owned_engine_refs[id(eng)] = weakref.ref(eng)
+        except TypeError:
+            pass
+        dead_keys = [k for k, ref in self._owned_engine_refs.items() if ref() is None]
+        for k in dead_keys:
+            self._owned_engine_refs.pop(k, None)
+
+    def _is_owned_engine(self, obj: Any) -> bool:
+        if obj is None:
+            return False
+        if obj is self.engine:
+            return True
+        ref = self._owned_engine_refs.get(id(obj))
+        return ref is not None and ref() is obj
 
     @property
     def is_cutover(self) -> bool:
@@ -922,7 +943,7 @@ class AutoCutoverLifecycle:
         self.eta_hat = next_eta_hat
         sub_eng.aci_tracker = self.aci
         self.engine = sub_eng
-        self._owned_engine_ids.add(id(sub_eng))
+        self._register_owned_engine(sub_eng)
         self.selective_cal = sel_cal
         self.active_tau = tau
         self.tau_source = tau_src
@@ -1249,7 +1270,7 @@ class AutoCutoverLifecycle:
             "cutover_events": [dict(ev) for ev in self.cutover_events],
             "recalibrate_events": [dict(ev) for ev in self.recalibrate_events],
             "compile_time_total_ms": self.compile_time_total_ms,
-            "_owned_engine_ids": set(self._owned_engine_ids),
+            "_owned_engine_refs": dict(self._owned_engine_refs),
         }
 
     def _restore_mutation_state_locked(self, snap: Dict[str, Any]) -> None:
@@ -1316,7 +1337,10 @@ class AutoCutoverLifecycle:
         self.cutover_events = snap["cutover_events"]
         self.recalibrate_events = snap["recalibrate_events"]
         self.compile_time_total_ms = snap["compile_time_total_ms"]
-        self._owned_engine_ids = snap["_owned_engine_ids"]
+        self._owned_engine_refs = {
+            k: ref for k, ref in snap["_owned_engine_refs"].items() if ref() is not None
+        }
+        self._register_owned_engine(self.engine)
 
     def observe_teacher(
         self,

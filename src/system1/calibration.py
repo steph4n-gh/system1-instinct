@@ -3040,8 +3040,6 @@ class UtilityCalibrator:
         self.c_esc = float(np.max(self.cost_matrix[self.safe_action]))
         self.B = float(np.max(self.cost_matrix))
         self._c_esc_scaled: float = float(np.max(self._scaled_cost_matrix[self.safe_action]))
-        b_scaled = float(np.max(self._scaled_cost_matrix))
-        span_scaled = b_scaled - self._c_esc_scaled
         with np.errstate(over="ignore", invalid="ignore"):
             raw_span = self.B - self.c_esc
         self.denom = (
@@ -3049,10 +3047,28 @@ class UtilityCalibrator:
             if (math.isfinite(raw_span) and raw_span > 1e-9)
             else (float("inf") if not math.isfinite(raw_span) else max(1e-9, float(raw_span)))
         )
-        if span_scaled <= 0.0:
-            self.L = np.zeros_like(self._scaled_cost_matrix, dtype=np.float64)
-        else:
-            self.L = np.maximum(0.0, self._scaled_cost_matrix - self._c_esc_scaled) / span_scaled
+        self.L = np.zeros_like(self.cost_matrix, dtype=np.float64)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            pos_mask = self.cost_matrix > self.c_esc
+            if math.isfinite(raw_span):
+                if raw_span > 0.0 and bool(np.any(pos_mask)):
+                    self.L[pos_mask] = np.clip(
+                        (self.cost_matrix[pos_mask] - self.c_esc) / raw_span,
+                        0.0,
+                        1.0,
+                    )
+            else:
+                span_scale = max(abs(self.B), abs(self.c_esc))
+                if span_scale > 0.0 and bool(np.any(pos_mask)):
+                    c_sp = self.cost_matrix / span_scale
+                    esc_sp = self.c_esc / span_scale
+                    denom_sp = (self.B / span_scale) - esc_sp
+                    if math.isfinite(denom_sp) and denom_sp > 0.0:
+                        self.L[pos_mask] = np.clip(
+                            (c_sp[pos_mask] - esc_sp) / denom_sp,
+                            0.0,
+                            1.0,
+                        )
         self._indicator_loss_matrix: np.ndarray = (self.cost_matrix > self.c_esc).astype(np.float64)
 
         self.lam_crc: float = -1.0
@@ -3199,6 +3215,15 @@ class UtilityCalibrator:
                 costs[v_idx] = c_ok[c_fin]
         return costs[0] if single else costs
 
+    def _expected_policy_costs(self, p_norm: np.ndarray) -> np.ndarray:
+        """Evaluate expected costs using raw costs when finite, falling back per-row to scaled costs."""
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            costs = p_norm @ self.cost_matrix.T
+            bad_rows = ~np.all(np.isfinite(costs), axis=1)
+            if bool(np.any(bad_rows)):
+                costs[bad_rows] = p_norm[bad_rows] @ self._scaled_cost_matrix.T
+        return costs
+
     def _apply_policy(self, probs_2d: np.ndarray, lam: float) -> np.ndarray:
         n = probs_2d.shape[0]
         acts = np.full(n, self.safe_action, dtype=np.int64)
@@ -3209,9 +3234,9 @@ class UtilityCalibrator:
             return acts
         v_idx = np.flatnonzero(valid)
         policy_loss = self._indicator_loss_matrix if self.loss_mode == "indicator" else self.L
-        with np.errstate(over="ignore", invalid="ignore"):
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
             p_norm = self._normalize_prob_rows(probs_2d[v_idx])
-            costs_v = p_norm @ self._scaled_cost_matrix.T
+            costs_v = self._expected_policy_costs(p_norm)
             eh_v = p_norm @ policy_loss.T
         row_fin = np.all(np.isfinite(costs_v), axis=1) & np.all(np.isfinite(eh_v), axis=1)
         if not bool(np.any(row_fin)):
@@ -3356,9 +3381,9 @@ class UtilityCalibrator:
             valid = self._valid_prob_rows(p2)
             if bool(np.any(valid)):
                 v_idx = np.flatnonzero(valid)
-                with np.errstate(over="ignore", invalid="ignore"):
+                with np.errstate(over="ignore", under="ignore", invalid="ignore"):
                     p_norm = self._normalize_prob_rows(p2[v_idx])
-                    costs_v = p_norm @ self._scaled_cost_matrix.T
+                    costs_v = self._expected_policy_costs(p_norm)
                 c_fin = np.all(np.isfinite(costs_v), axis=1)
                 if bool(np.any(c_fin)):
                     out[v_idx[c_fin]] = np.argmin(costs_v[c_fin], axis=1).astype(np.int64)

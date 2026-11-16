@@ -630,6 +630,31 @@ def _content_text(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
+def _typesafe_state_cache_key(state: Union[str, Dict[str, Any], List[Any]]) -> str:
+    """Return a bijective cache key for TypeSafe states while preserving normalized string keys."""
+    if isinstance(state, str) and state != "" and state == " ".join(state.casefold().split()):
+        return state
+    from system1.compat.universal import _canonical_structured_key
+
+    return _canonical_structured_key(state)
+
+
+def _accepts_cache_key_kwarg(fn: Any) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    for name, param in sig.parameters.items():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if name == "cache_key" and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
 def _teaching_target(field: DecisionField, value: Any) -> Any:
     if field.metadata.get("typesafe_score_levels"):
         number = float(value)
@@ -2483,6 +2508,7 @@ class TypeSafeClient:
             if self.auto_cutover_lifecycle:
                 from system1.cutover import AutoCutoverLifecycle, CutoverConfig, CutoverState
 
+                state_cache_key = _typesafe_state_cache_key(state)
                 raw_is_injected_lc = hasattr(self.auto_cutover_lifecycle, "decide_local") and hasattr(
                     self.auto_cutover_lifecycle, "observe_teacher"
                 )
@@ -2505,9 +2531,19 @@ class TypeSafeClient:
                     if cand_lc is not None and self._lifecycle_state_str(cand_lc) != CutoverState.DRIFT_RECALIBRATE.value:
                         t_local = time.perf_counter()
                         if hasattr(cand_lc, "_decide_local_with_tx"):
-                            local_vals, local_tx = cand_lc._decide_local_with_tx(encoded_state)
+                            dl_kw = (
+                                {"cache_key": state_cache_key}
+                                if _accepts_cache_key_kwarg(cand_lc._decide_local_with_tx)
+                                else {}
+                            )
+                            local_vals, local_tx = cand_lc._decide_local_with_tx(encoded_state, **dl_kw)
                         else:
-                            local_vals = cand_lc.decide_local(encoded_state)
+                            dl_kw = (
+                                {"cache_key": state_cache_key}
+                                if _accepts_cache_key_kwarg(cand_lc.decide_local)
+                                else {}
+                            )
+                            local_vals = cand_lc.decide_local(encoded_state, **dl_kw)
                         if local_vals is not None:
                             latency_ms = (time.perf_counter() - t_local) * 1000.0
                             try:
@@ -2669,11 +2705,16 @@ class TypeSafeClient:
                         obs_canary_tx = local_tx
 
                     try:
+                        obs_kw = (
+                            {"cache_key": state_cache_key}
+                            if _accepts_cache_key_kwarg(lc.observe_teacher)
+                            else {}
+                        )
                         with _bind_active_canary_tx(
                             lc,
                             tx_token=(obs_canary_tx if obs_canary_tx is not None else (0, 0, 0, "", None)),
                         ):
-                            lc.observe_teacher(encoded_state, teacher_vals)
+                            lc.observe_teacher(encoded_state, teacher_vals, **obs_kw)
                     except BaseException:
                         with self._engine_lock:
                             rem_in = self._lc_inflight_obs.get(id(lc), 0) - 1

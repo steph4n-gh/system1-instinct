@@ -9,6 +9,7 @@ budget. Any invariant violation fails closed and halts the runner.
 from __future__ import annotations
 
 import asyncio
+import collections.abc
 from hashlib import sha256
 import inspect
 import json
@@ -35,6 +36,126 @@ def _checked_value(callback: Callable[..., Any], *args: Any) -> Any:
             result.close()
         raise TypeError("State observation callbacks must be synchronous")
     return result
+
+
+def _cutover_owns_network(lc_obj: Any, net: Any) -> bool:
+    if lc_obj is None or net is None:
+        return False
+    if net is getattr(lc_obj, "engine", None):
+        return True
+    checker = getattr(lc_obj, "_is_owned_engine", None)
+    if callable(checker) and bool(checker(net)):
+        return True
+    inner_lc = getattr(lc_obj, "lifecycle", None)
+    if inner_lc is not None:
+        if net is getattr(inner_lc, "engine", None):
+            return True
+        inner_checker = getattr(inner_lc, "_is_owned_engine", None)
+        if callable(inner_checker) and bool(inner_checker(net)):
+            return True
+    return False
+
+
+class _TrackedAwaitIterator:
+    """Iterator adapter routing awaitable protocol operations through _TrackedDecisionCoroutine."""
+
+    def __init__(self, parent: "_TrackedDecisionCoroutine") -> None:
+        self._parent = parent
+
+    def __iter__(self) -> "_TrackedAwaitIterator":
+        return self
+
+    def __next__(self) -> Any:
+        return self._parent.send(None)
+
+    def send(self, value: Any) -> Any:
+        return self._parent.send(value)
+
+    def throw(self, *args: Any) -> Any:
+        return self._parent.throw(*args)
+
+    def close(self) -> None:
+        self._parent.close()
+
+
+class _TrackedDecisionCoroutine(collections.abc.Coroutine):
+    """Coroutine wrapper that releases unstarted async fallback/canary state on close or pre-start cancel."""
+
+    def __init__(
+        self,
+        runner: "BoundedReviewFallback",
+        coro: Any,
+        raw_answer: Any,
+        tx_pair: Optional[List[Any]],
+    ) -> None:
+        self._runner = runner
+        self._coro = coro
+        self._raw_answer = raw_answer
+        self._tx_pair = tx_pair
+        self._started_inner = False
+        self._cleaned = False
+
+    def _cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        if not self._started_inner:
+            if inspect.iscoroutine(self._raw_answer):
+                self._raw_answer.close()
+            elif hasattr(self._raw_answer, "cancel") and callable(self._raw_answer.cancel):
+                self._raw_answer.cancel()
+            if self._tx_pair is not None:
+                self._runner._rollback_cutover_tx(self._tx_pair)
+            self._runner._busy = False
+            if inspect.iscoroutine(self._coro):
+                try:
+                    self._coro.close()
+                except Exception:
+                    pass
+
+    def send(self, value: Any) -> Any:
+        if not self._started_inner and value is None:
+            self._started_inner = True
+        try:
+            return self._coro.send(value)
+        except BaseException:
+            self._cleanup()
+            raise
+
+    def throw(self, typ: Any, val: Any = None, tb: Any = None) -> Any:
+        if not self._started_inner:
+            is_cancel = (
+                (isinstance(typ, type) and issubclass(typ, asyncio.CancelledError))
+                or isinstance(typ, asyncio.CancelledError)
+                or isinstance(val, asyncio.CancelledError)
+            )
+            if is_cancel:
+                self._runner.close()
+        try:
+            if val is None and tb is None:
+                return self._coro.throw(typ)
+            if tb is None:
+                return self._coro.throw(typ, val)
+            return self._coro.throw(typ, val, tb)
+        except BaseException:
+            self._cleanup()
+            raise
+
+    def close(self) -> None:
+        try:
+            self._coro.close()
+        finally:
+            self._cleanup()
+
+    def __await__(self) -> _TrackedAwaitIterator:
+        return _TrackedAwaitIterator(self)
+
+    def __del__(self) -> None:
+        if not getattr(self, "_cleaned", True):
+            try:
+                self.close()
+            except Exception:
+                pass
 
 
 def default_observed_state(context: Any) -> bytes:
@@ -237,14 +358,8 @@ class BoundedReviewFallback:
             )
         else:
             self.cutover_lifecycle = None
-        self._network_owned_by_cutover: bool = bool(
-            self.cutover_lifecycle is not None
-            and (
-                self.network is getattr(self.cutover_lifecycle, "engine", None)
-                or id(self.network) in getattr(self.cutover_lifecycle, "_owned_engine_ids", ())
-                or id(self.network)
-                in getattr(getattr(self.cutover_lifecycle, "lifecycle", None), "_owned_engine_ids", ())
-            )
+        self._network_owned_by_cutover: bool = _cutover_owns_network(
+            self.cutover_lifecycle, self.network
         )
         self._busy = False
         self._halted = False
@@ -333,10 +448,7 @@ class BoundedReviewFallback:
             )
             net_is_lc_engine = (
                 self._network_owned_by_cutover
-                or self.network is getattr(self.cutover_lifecycle, "engine", None)
-                or id(self.network) in getattr(self.cutover_lifecycle, "_owned_engine_ids", ())
-                or id(self.network)
-                in getattr(getattr(self.cutover_lifecycle, "lifecycle", None), "_owned_engine_ids", ())
+                or _cutover_owns_network(self.cutover_lifecycle, self.network)
             )
             if lc_drifted or net_is_lc_engine:
                 return {
@@ -743,7 +855,10 @@ class BoundedReviewFallback:
             if self._halted or _checked_value(self.observe_state, context) != state:
                 return self._stop(decision, "stale_context")
             if not decision.get("review", False):
-                tx_pair[:] = [None, None]
+                if bool(decision.get("auto_compiled", False)):
+                    tx_pair[:] = [None, None]
+                else:
+                    self._rollback_cutover_tx(tx_pair)
                 local_vals = decision.get("values")
                 if not isinstance(local_vals, Mapping) and self.action_key in decision:
                     local_vals = {self.action_key: decision[self.action_key]}
@@ -795,7 +910,12 @@ class BoundedReviewFallback:
 
                 if has_running_loop:
                     delegated_async = True
-                    return self._finish_async_decide(context, state, decision, raw_answer, tx_pair)
+                    return _TrackedDecisionCoroutine(
+                        self,
+                        self._finish_async_decide(context, state, decision, raw_answer, tx_pair),
+                        raw_answer,
+                        tx_pair,
+                    )
                 else:
                     delegated_async = True
                     return asyncio.run(self._finish_async_decide(context, state, decision, raw_answer, tx_pair))
