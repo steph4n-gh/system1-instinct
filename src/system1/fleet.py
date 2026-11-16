@@ -18,6 +18,7 @@ import numpy as np
 from system1.core.model import (
     _2d_matmul_layout_sig,
     _accepts_recency_weighted,
+    _assert_real_numeric_array_like,
     _coerce_inference_array_f32_or_f64,
     _encode_projector_batch,
     _encode_projector_one,
@@ -386,9 +387,12 @@ class MultiTenantSkillFleet:
         self._batch_accepts_recency = _accepts_recency_weighted(
             getattr(self.projector, "project_batch", None)
         )
+        w_base_chk = _assert_real_numeric_array_like(W_base, "W_base")
+        b_base_chk = _assert_real_numeric_array_like(b_base, "b_base")
+        u_shared_chk = _assert_real_numeric_array_like(U_shared, "U_shared") if U_shared is not None else None
         with np.errstate(over="ignore", invalid="ignore"):
-            self.W_base = np.asarray(W_base, dtype=np.float32)
-            self.b_base = np.asarray(b_base, dtype=np.float32).reshape(-1)
+            self.W_base = np.asarray(w_base_chk, dtype=np.float32)
+            self.b_base = np.asarray(b_base_chk, dtype=np.float32).reshape(-1)
         if self.W_base.ndim != 2 or self.W_base.shape[0] != self.num_classes or self.W_base.shape[1] < 1:
             raise ValueError(f"W_base shape {self.W_base.shape} must be ({self.num_classes}, >=1)")
         if self.b_base.shape[0] != self.num_classes:
@@ -422,8 +426,8 @@ class MultiTenantSkillFleet:
         with np.errstate(over="ignore", invalid="ignore"):
             self.U_shared = (
                 _prepare_shared_subspace(self.W_base, self.r_sub)
-                if U_shared is None
-                else _adapt_subspace_width(U_shared, self.W_base, self.r_sub)
+                if u_shared_chk is None
+                else _adapt_subspace_width(u_shared_chk, self.W_base, self.r_sub)
             )
         if (
             self.U_shared.size > 0

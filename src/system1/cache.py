@@ -135,9 +135,13 @@ def _validate_cache_inputs(
             raise ValueError("telemetry array contains NaN or infinite values")
 
     if embedding is not None:
-        if not isinstance(embedding, (np.ndarray, Sequence)):
+        if not isinstance(embedding, (np.ndarray, Sequence)) or isinstance(embedding, (str, bytes, bytearray)):
             raise TypeError(f"embedding must be a sequence or ndarray, got {type(embedding).__name__}")
-        emb_arr = np.asarray(embedding, dtype=np.float32)
+        from system1.core.model import _assert_real_numeric_array_like
+
+        raw_emb = _assert_real_numeric_array_like(embedding, "embedding")
+        with np.errstate(over="ignore", invalid="ignore"):
+            emb_arr = np.asarray(raw_emb, dtype=np.float32)
         if emb_arr.ndim > 2 or (emb_arr.ndim == 2 and emb_arr.shape[0] != 1 and emb_arr.shape[1] != 1):
             raise ValueError(f"embedding must be a 1D vector, got shape {emb_arr.shape}")
         if not np.all(np.isfinite(emb_arr)):

@@ -15401,3 +15401,581 @@ def test_astra_39_round26_regressions() -> None:
     with pytest.raises(RuntimeError, match="baseline unavailable"):
         ts_client.decide(state="probe", questions={"act": {"type": "choice", "criteria": ["a", "b"]}})
     assert len(ts_client._cutover_lifecycles) == 0
+
+
+def test_astra_40_round27_regressions() -> None:
+    """Round-27 regressions R27-1..R27-8: recursive duck rollback, uncached learn validation, single-dispatch signature inspection, pre-coercion nested real-sequence validation, TypeSafe injected lifecycle first-call hit, atomic gateway usage validation, and drift-demotion lifecycle bounds."""
+    import json
+    import warnings
+    from types import SimpleNamespace
+    import numpy as np
+    import pytest
+
+    from system1 import (
+        ChoiceField,
+        CompiledSystemOneModel,
+        DecisionSchema,
+        MultiTenantSkillFleet,
+        SystemOneCompiler,
+        SystemOneEngine,
+        SystemOneModel,
+        UniversalDecisionService,
+    )
+    from system1.cache import SemanticSystemOneCache
+    from system1.compat.typesafe import TypeSafeClient
+    from system1.compat.universal import InteropError, _canonical_structured_key
+    from system1.compiler import _validate_compiled_logit_adj
+    from system1.core.model import DecisionFieldHead, _coerce_real_1d_f32
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.engine import _validated_head_logit_adjustments
+    from system1.explain import FastExplainer
+
+    class _R27CoupledSchema(DecisionSchema):
+        first = ChoiceField(options=("a", "b"))
+        second = ChoiceField(options=("a", "b"))
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            clean = super().validate_decision(values)
+            if clean["first"] != clean["second"]:
+                raise ValueError(f"Coupled fields disagree: {clean}")
+            return clean
+
+    class _R27Choice2(DecisionSchema):
+        f = ChoiceField(options=("safe", "unsafe"))
+
+    class _R27TrackerHelper:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.history: List[str] = []
+            self.buf = np.zeros(4, dtype=np.float32)
+
+    class _R27SlottedState:
+        __slots__ = ("step", "tag")
+
+        def __init__(self) -> None:
+            self.step = 0
+            self.tag = "init"
+
+    class _R27DuckHead:
+        def __init__(self, field_def: ChoiceField, dim: int = 16) -> None:
+            self.field_def = field_def
+            self.dimension = dim
+            self.weights = np.zeros((2, dim), dtype="f4")
+            self.biases = np.array([2.0, -2.0], dtype="f4")
+            self.covariance_inv: Any = None
+            self.logit_adjustments: Any = np.array([0.1, -0.1], dtype="f4")
+            self._delegate = DecisionFieldHead(
+                field_def, dimension=dim, backend="numpy", contrastive_whitening=False
+            )
+            self._delegate.set_weights(self.weights, self.biases)
+            self._helper = _R27TrackerHelper()
+            self._slot_helper = _R27SlottedState()
+            box = [0]
+            self._proto_get = lambda: box[0]
+            self._proto_bump = lambda: box.__setitem__(0, box[0] + 1)
+
+            class _ClosureSnap:
+                __slots__ = ()
+
+                def _snapshot_state(self_inner) -> int:
+                    return box[0]
+
+                def _restore_state(self_inner, snap: int) -> None:
+                    box[0] = snap
+
+            self._proto_helper = _ClosureSnap()
+
+        def format_target_vector(self, val: Any) -> np.ndarray:
+            return self._delegate.format_target_vector(val)
+
+        def online_update(self, x_aug: np.ndarray, y_target: np.ndarray, **kw: Any) -> float:
+            self._helper.calls += 1
+            self._helper.history.append("step")
+            self._helper.buf += 1.0
+            self._slot_helper.step += 1
+            self._slot_helper.tag = "mutated"
+            self._proto_bump()
+            dt = self._delegate.online_update(x_aug, y_target, **kw)
+            self.weights = self._delegate.weights.copy()
+            self.biases = self._delegate.biases.copy()
+            self.covariance_inv = self._delegate.covariance_inv.copy()
+            return dt
+
+        def forward(self, emb: np.ndarray, prompt: Any = None) -> Any:
+            return self._delegate.evaluate_logits(emb @ self.weights.T + self.biases)
+
+    class _R27DuckModel:
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            self.schema = schema
+            self.dimension = dim
+            self.backend = "numpy"
+            self.contrastive_whitening = False
+            self.recency_weighted = False
+            self.forgetting_factor = 0.995
+            self.projector = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            ).projector
+            self.model_version = 1
+            self.heads = {
+                k: _R27DuckHead(f, dim) for k, f in schema.fields.items()  # type: ignore[arg-type]
+            }
+
+        def encode(self, prompt: str, telemetry: Any = None, recency_weighted: Any = None) -> np.ndarray:
+            return self.projector.project(prompt)
+
+        def forward_single(
+            self, prompt: str, telemetry: Any = None, embedding: Any = None, recency_weighted: Any = None
+        ) -> Any:
+            from system1.core.model import ModelInferenceResult
+
+            emb = np.asarray(embedding, dtype="f4").ravel() if embedding is not None else self.encode(prompt)
+            fields = {k: h.forward(emb) for k, h in self.heads.items()}
+            return ModelInferenceResult(prompt=prompt, embedding=emb, fields=fields, inference_latency_ms=0.1)
+
+    emb_p = np.ones(16, dtype="f4")
+
+    # ------------------------------------------------------------------
+    # R27-1: Recursive duck-object & delegate _snapshot_state rollback.
+    # Failed learn() must leave nested _delegate, __dict__, & __slots__
+    # state untouched so subsequent valid lessons match a clean control.
+    # ------------------------------------------------------------------
+    dm_bad = _R27DuckModel(_R27CoupledSchema(), 16)
+    dm_ctrl = _R27DuckModel(_R27CoupledSchema(), 16)
+    e_bad = SystemOneEngine(
+        _R27CoupledSchema,
+        model=dm_bad,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=True,
+        strict_mode=False,
+    )
+    e_ctrl = SystemOneEngine(
+        _R27CoupledSchema,
+        model=dm_ctrl,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=True,
+        strict_mode=False,
+    )
+    with pytest.raises(ValueError, match="Coupled fields disagree"):
+        e_bad.learn("p", {"first": "b"}, embedding=emb_p)
+
+    dh_first = dm_bad.heads["first"]
+    assert dh_first._delegate.covariance_inv is None
+    assert dh_first._delegate.cross_covariance is None
+    assert np.array_equal(dh_first._delegate.weights, np.zeros((2, 16), dtype="f4"))
+    assert np.array_equal(dh_first._delegate.biases, np.array([2.0, -2.0], dtype="f4"))
+    assert dh_first._helper.calls == 0
+    assert dh_first._helper.history == []
+    assert np.all(dh_first._helper.buf == 0.0)
+    assert dh_first._slot_helper.step == 0 and dh_first._slot_helper.tag == "init"
+    assert dh_first._proto_get() == 0
+
+    e_bad.learn("p", {"first": "b", "second": "b"}, embedding=emb_p)
+    e_ctrl.learn("p", {"first": "b", "second": "b"}, embedding=emb_p)
+    assert np.array_equal(dm_bad.heads["first"]._delegate.weights, dm_ctrl.heads["first"]._delegate.weights)
+    assert np.array_equal(dm_bad.heads["first"]._delegate.biases, dm_ctrl.heads["first"]._delegate.biases)
+    d_after_bad = e_bad.decide("p", embedding=emb_p, record_receipt=False, use_cache=False)
+    d_after_ctrl = e_ctrl.decide("p", embedding=emb_p, record_receipt=False, use_cache=False)
+    assert d_after_bad.probabilities == d_after_ctrl.probabilities
+
+    # ------------------------------------------------------------------
+    # R27-2: use_cache=False must still run post-update schema validation
+    # and roll back on Coupled fields disagree.
+    # ------------------------------------------------------------------
+    for pres_cal2 in (False, True):
+        e2 = SystemOneEngine(
+            _R27CoupledSchema,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        for h2 in e2.model.heads.values():
+            h2.set_weights(np.zeros((2, 16), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+        w2_0 = e2.model.heads["first"].weights.copy()
+        b2_0 = e2.model.heads["first"].biases.copy()
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            e2.learn("p", {"first": "b"}, embedding=emb_p, preserve_calibration=pres_cal2)
+        assert e2.model_version == 1
+        assert e2._online_lesson_count == 0
+        assert np.array_equal(e2.model.heads["first"].weights, w2_0)
+        assert np.array_equal(e2.model.heads["first"].biases, b2_0)
+        assert e2.model.heads["first"].covariance_inv is None
+        d2_ok = e2.decide("p", embedding=emb_p, record_receipt=False)
+        assert d2_ok.values == {"first": "a", "second": "a"}
+
+    # ------------------------------------------------------------------
+    # R27-3: Internal TypeError during learn_from_tier2 / online_update
+    # executes once (never retried by except TypeError) and rolls back.
+    # ------------------------------------------------------------------
+    calls_sub = [0]
+
+    class _R27TypeErrorSubModel(SystemOneModel):
+        def learn_from_tier2(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+            calls_sub[0] += 1
+            res = super().learn_from_tier2(*args, **kwargs)
+            if calls_sub[0] == 1:
+                raise TypeError("internal failure AFTER updating")
+            return res
+
+    sm3 = _R27TypeErrorSubModel(
+        _R27Choice2, dimension=16, backend="numpy", contrastive_whitening=False
+    )
+    sm3.heads["f"].set_weights(np.zeros((2, 16), dtype="f4"), np.zeros(2, dtype="f4"))
+    eng3 = SystemOneEngine(
+        _R27Choice2,
+        model=sm3,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+    )
+    with pytest.raises(TypeError, match="internal failure AFTER updating"):
+        eng3.learn_from_tier2("p", {"f": "unsafe"}, embedding=emb_p)
+    assert calls_sub[0] == 1
+    assert getattr(eng3, "_online_lesson_count", 0) == 0
+    assert eng3.model_version == 1
+    assert sm3.heads["f"].covariance_inv is None
+    assert np.all(sm3.heads["f"].weights == 0.0)
+
+    head_calls = [0]
+
+    class _R27TypeErrorHead(_R27DuckHead):
+        def online_update(
+            self,
+            x_aug: np.ndarray,
+            y_target: np.ndarray,
+            forgetting_factor: float = 0.995,
+            preserve_calibration: bool = False,
+            reward_scale: float = 1.0,
+        ) -> float:
+            head_calls[0] += 1
+            self.weights = np.ones_like(self.weights)
+            raise TypeError("head failure AFTER updating")
+
+    class _R27HeadModel:
+        def __init__(self, schema: DecisionSchema) -> None:
+            self.schema = schema
+            self.dimension = 16
+            self.backend = "numpy"
+            self.contrastive_whitening = False
+            self.recency_weighted = False
+            self.forgetting_factor = 0.995
+            self.projector = SystemOneModel(
+                schema, dimension=16, backend="numpy", contrastive_whitening=False
+            ).projector
+            self.model_version = 1
+            self.heads = {"f": _R27TypeErrorHead(schema.fields["f"], 16)}  # type: ignore[arg-type]
+
+        def encode(self, prompt: str, telemetry: Any = None, recency_weighted: Any = None) -> np.ndarray:
+            return self.projector.project(prompt)
+
+        def forward_single(
+            self, prompt: str, telemetry: Any = None, embedding: Any = None, recency_weighted: Any = None
+        ) -> Any:
+            from system1.core.model import ModelInferenceResult
+
+            emb = np.asarray(embedding, dtype="f4").ravel() if embedding is not None else self.encode(prompt)
+            fields = {k: h.forward(emb) for k, h in self.heads.items()}
+            return ModelInferenceResult(prompt=prompt, embedding=emb, fields=fields, inference_latency_ms=0.1)
+
+    hm3 = _R27HeadModel(_R27Choice2())
+    eng3_h = SystemOneEngine(
+        _R27Choice2,
+        model=hm3,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+    )
+    with pytest.raises(TypeError, match="head failure AFTER updating"):
+        eng3_h.learn_from_tier2("p", {"f": "unsafe"}, embedding=emb_p)
+    assert head_calls[0] == 1
+    assert getattr(eng3_h, "_online_lesson_count", 0) == 0
+    assert eng3_h.model_version == 1
+    assert np.all(hm3.heads["f"].weights == 0.0)
+
+    # ------------------------------------------------------------------
+    # R27-4 & R27-5: Pre-coercion validation rejects bool, mixed bool/float,
+    # strings, complex, & complex-object arrays with zero ComplexWarnings.
+    # ------------------------------------------------------------------
+    e4 = SystemOneEngine(_R27Choice2, dimension=16, backend="numpy", contrastive_whitening=False)
+    e4.model.heads["f"].set_weights(np.zeros((2, 16), dtype="f4"), np.zeros(2, dtype="f4"))
+    cm4 = SystemOneCompiler(_R27Choice2, dimension=16, projector=e4.projector).compile(
+        {"f": [("safe prompt", "safe"), ("unsafe prompt", "unsafe")] * 4},
+        calibration_split=0.0,
+        augment=False,
+    )
+    e4_cm = SystemOneEngine(_R27Choice2, compiled_model=cm4, dimension=16, backend="numpy", use_cache=False)
+    k4 = e4_cm.compile_packed_kernel()
+    c4 = e4_cm.compile_callable()
+    cache4 = SemanticSystemOneCache()
+
+    bad_2_vals = (
+        [True, False],
+        [True, 0.0],
+        [np.bool_(False), 0.0],
+        ["1", "0"],
+        np.array([1 + 2j, 0], dtype=np.complex64),
+        np.array([np.complex64(1 + 2j), 0], dtype=object),
+    )
+    bad_16_vals = (
+        [True] + [0.0] * 15,
+        [np.bool_(False)] + [0.0] * 15,
+        ["1"] + ["0"] * 15,
+        np.array([1 + 2j] + [0] * 15, dtype=np.complex64),
+        np.array([np.complex64(1 + 2j)] + [0] * 15, dtype=object),
+    )
+    w_zero_2 = np.zeros((2, 16), dtype="f4")
+    b_zero_2 = np.zeros(2, dtype="f4")
+    c_def = e4.schema.fields["f"]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", Warning)
+        for bad2 in bad_2_vals:
+            with pytest.raises(ValueError):
+                e4.model.heads["f"].set_weights(w_zero_2, bad2)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                _coerce_real_1d_f32(bad2, "probe")
+            with pytest.raises(ValueError):
+                _validate_compiled_logit_adj(bad2, c_def, "f")
+            with pytest.raises(ValueError):
+                _validated_head_logit_adjustments(bad2, c_def, "f")
+            with pytest.raises(ValueError):
+                FastExplainer(
+                    projector=e4.projector,
+                    weights=w_zero_2,
+                    biases=bad2,  # type: ignore[arg-type]
+                    options=("safe", "unsafe"),
+                )
+            with pytest.raises(ValueError):
+                MultiTenantSkillFleet(
+                    e4.projector,
+                    ["safe", "unsafe"],
+                    w_zero_2,
+                    bad2,  # type: ignore[arg-type]
+                )
+        with pytest.raises(ValueError):
+            e4.model.heads["f"].set_weights([[True] + [0.0] * 15, [0.0] * 16], b_zero_2)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            e4.model.heads["f"].set_hierarchical_weights(
+                cluster_assignments=(True, 1),  # type: ignore[arg-type]
+                coarse_weights=w_zero_2,
+                coarse_biases=b_zero_2,
+            )
+        with pytest.raises(ValueError):
+            e4.model.heads["f"].init_covariance(regularization=True)  # type: ignore[arg-type]
+
+        for bad16 in bad_16_vals:
+            with pytest.raises(ValueError):
+                e4.decide("p", embedding=bad16, record_receipt=False)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                e4.learn_from_tier2("p", {"f": "unsafe"}, embedding=bad16)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                e4.model.forward_single("p", embedding=bad16)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                cm4.forward_single("p", embedding=bad16)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                e4.model.heads["f"].compute_logits(bad16)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                k4.forward_embeddings(bad16)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                c4("p", embedding=bad16)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                cache4.get("p", embedding=bad16)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # R27-6: Injected ready auto_cutover_lifecycle runs locally on first call.
+    # ------------------------------------------------------------------
+    ts_teacher_calls = [0]
+    lc_decide_calls = [0]
+
+    def _boom_ts_baseline(state_arg: Any, q_arg: Any) -> Dict[str, Any]:
+        ts_teacher_calls[0] += 1
+        raise RuntimeError("teacher unavailable")
+
+    class _R27ReadyLifecycle:
+        compiled_active = True
+        state = "SELECTIVE_HOT_SWAP"
+
+        def decide_local(self, encoded_state: str) -> Optional[Dict[str, Any]]:
+            lc_decide_calls[0] += 1
+            return {"act": "a"}
+
+        def observe_teacher(self, encoded_state: str, vals: Dict[str, Any]) -> bool:
+            raise AssertionError("teacher should not be called")
+
+    ready_lc = _R27ReadyLifecycle()
+    ts_ready = TypeSafeClient(
+        api_key="tok-r27",
+        mode="auto_cutover",
+        auto_cutover_lifecycle=ready_lc,
+        zero_egress=True,
+        baseline_handler=_boom_ts_baseline,
+    )
+    q_choice2 = {"act": {"type": "choice", "criteria": ["a", "b"]}}
+    resp_ts = ts_ready.decide(state="probe", questions=q_choice2)
+    assert resp_ts["local_execution"] is True
+    assert resp_ts["is_cutover"] is True
+    assert resp_ts["cutover_state"] == "SELECTIVE_HOT_SWAP"
+    assert resp_ts["answers"]["act"]["choice"] == "a"
+    assert lc_decide_calls[0] == 1
+    assert ts_teacher_calls[0] == 0
+
+    class _R27ColdInjectedLifecycle:
+        compiled_active = False
+        state = "SHADOW_CALIBRATE"
+
+        def decide_local(self, encoded_state: str) -> Optional[Dict[str, Any]]:
+            return None
+
+        def observe_teacher(self, encoded_state: str, vals: Dict[str, Any]) -> bool:
+            return False
+
+    ts_cold = TypeSafeClient(
+        api_key="tok-r27",
+        mode="auto_cutover",
+        auto_cutover_lifecycle=_R27ColdInjectedLifecycle(),
+        zero_egress=True,
+        baseline_handler=_boom_ts_baseline,
+    )
+    with pytest.raises(RuntimeError, match="teacher unavailable"):
+        ts_cold.decide(state="probe", questions=q_choice2)
+    assert len(ts_cold._cutover_lifecycles) == 0
+
+    # ------------------------------------------------------------------
+    # R27-7: Malformed upstream usage fails closed before retaining state.
+    # ------------------------------------------------------------------
+    bad_usage_payloads: List[Any] = [
+        {"input_tokens": "bad"},
+        {"input_tokens": True},
+        {"input_tokens": -1},
+        {"input_tokens": 1.5},
+        {"input_tokens": float("inf")},
+        "not-a-mapping",
+    ]
+    for idx_u, bad_u in enumerate(bad_usage_payloads):
+        svc_u = UniversalDecisionService(
+            upstream_handlers={
+                "jev": lambda s, p, c, u=bad_u: {"answers": {"act": {"choice": "a"}}, "usage": u}
+            },
+            bearer_token="tok-r27",
+        )
+        with pytest.raises(InteropError) as exc_u:
+            svc_u.handle_request(
+                path="/v1/decisions",
+                headers={"Authorization": "Bearer tok-r27", "Content-Type": "application/json"},
+                raw_body=json.dumps(
+                    {
+                        "state": f"usage probe {idx_u}",
+                        "questions": {"act": {"type": "choice", "options": ["a", "b"]}},
+                        "slot": "s",
+                    }
+                ).encode("utf-8"),
+            )
+        assert exc_u.value.status_code == 502
+        assert len(svc_u._lifecycles) == 0
+        assert len(svc_u._last_schema_by_slot) == 0
+
+    # ------------------------------------------------------------------
+    # R27-8: Drift demotion from SELECTIVE_HOT_SWAP -> DRIFT_RECALIBRATE
+    # enforces max_unpromoted_lifecycles across all transitions.
+    # ------------------------------------------------------------------
+    svc_d = UniversalDecisionService(
+        upstream_handlers={
+            "jev": lambda s, p, c: {"answers": {"act": {"choice": "b"}}, "usage": {"input_tokens": 4}}
+        },
+        bearer_token="tok-r27",
+        max_unpromoted_lifecycles=1,
+    )
+    for idx_d in range(3):
+        st_d, _ = svc_d.handle_request(
+            path="/v1/decisions",
+            headers={"Authorization": "Bearer tok-r27", "Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": f"init req {idx_d}",
+                    "questions": {
+                        "act": {
+                            "type": "choice",
+                            "options": ["a", "b"],
+                            "instructions": f"drift schema {idx_d}",
+                        }
+                    },
+                    "slot": f"slot_d_{idx_d}",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_d == 200
+    assert len(svc_d._lifecycles) <= 1
+
+    # Manually populate 3 promoted lifecycles (is_cutover=True), seed 11 failed
+    # canary checks each, then trigger the 12th canary contradiction via process_payload.
+    from system1.compat.universal import SoftDistillingLifecycle, compile_questions_contract
+
+    svc_d2 = UniversalDecisionService(
+        upstream_handlers={
+            "jev": lambda s, p, c: {"answers": {"act": {"choice": "b"}}, "usage": {"input_tokens": 4}}
+        },
+        bearer_token="tok-r27",
+        max_unpromoted_lifecycles=1,
+        cutover_config=CutoverConfig(dense_dim=16, canary_rate=0.2),
+    )
+    promoted_keys: List[str] = []
+    for idx_p in range(3):
+        q_p = {
+            "act": {
+                "type": "choice",
+                "options": ["a", "b"],
+                "instructions": f"prom drift {idx_p}",
+            }
+        }
+        contract_p = compile_questions_contract(q_p)
+        lc_p = SoftDistillingLifecycle(contract_p, config=svc_d2.cutover_config)
+        inner_p = lc_p.lifecycle
+        inner_p.state = "SELECTIVE_HOT_SWAP"
+        inner_p.compiled_active = True
+        inner_p.active_tau = 0.0
+        inner_p.engine = SimpleNamespace()
+        payload_p = {"state": f"canary trigger {idx_p}", "questions": q_p, "slot": f"slot_p_{idx_p}"}
+        ctx_p = {"state": payload_p["state"]}
+        ck_p = _canonical_structured_key(ctx_p)
+        struct_p = lc_p._has_structure_support_locked
+        assert struct_p is not None
+        inner_p.clean_cache[ck_p] = {"act": "a"}
+        inner_p.local_accept_eligible = 4
+        inner_p.canary_window.extend([1] * 11)
+        k_p = f"slot_p_{idx_p}:{contract_p.fingerprint}"
+        svc_d2._lifecycles[k_p] = lc_p
+        promoted_keys.append(k_p)
+    assert all(svc_d2._lifecycles[k].is_cutover for k in promoted_keys)
+
+    for idx_p in range(3):
+        st_tr, body_tr = svc_d2.handle_request(
+            path="/v1/decisions",
+            headers={"Authorization": "Bearer tok-r27", "Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": f"canary trigger {idx_p}",
+                    "questions": {
+                        "act": {
+                            "type": "choice",
+                            "options": ["a", "b"],
+                            "instructions": f"prom drift {idx_p}",
+                        }
+                    },
+                    "slot": f"slot_p_{idx_p}",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_tr == 200
+        assert body_tr["local_execution"] is False
+        unprom_cnt = sum(1 for v in svc_d2._lifecycles.values() if not v.is_cutover)
+        assert unprom_cnt <= 1
+    assert sum(1 for v in svc_d2._lifecycles.values() if not v.is_cutover) == 1
+    assert promoted_keys[-1] in svc_d2._lifecycles
+    assert svc_d2._lifecycles[promoted_keys[-1]].lifecycle.state == "DRIFT_RECALIBRATE"

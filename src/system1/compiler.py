@@ -31,6 +31,8 @@ from system1.core.model import (
     SystemOneModel,
     _MAX_STRIDED_CLONE_SPAN_BYTES,
     _accepts_recency_weighted,
+    _assert_real_numeric_array_like,
+    _check_nested_real_seq,
     _coerce_real_1d_f32,
     _is_active_zero_head,
     _is_native_scalar_projector,
@@ -192,6 +194,8 @@ def _validate_compiled_logit_adj(raw_adj: Any, definition: Any, name: str) -> Op
         raise ValueError(
             f"Saved head {name!r} of type {type(definition).__name__} does not support logit_adj"
         )
+    if not isinstance(raw_adj, np.ndarray):
+        _check_nested_real_seq(raw_adj, f"Saved head {name!r} logit_adj")
     arr = np.asarray(raw_adj)
     if arr.dtype == np.dtype(np.bool_) or arr.dtype.kind not in ("i", "u", "f"):
         raise ValueError(f"Saved head {name!r} logit_adj must have numeric dtype, got {arr.dtype}")
@@ -1265,7 +1269,13 @@ class CompiledSystemOneModel:
         eff_use_cache = self.use_cache if use_cache is None else bool(use_cache)
         raw_norm: Optional[float] = None
         if embedding is not None:
-            emb = np.asarray(embedding, dtype=np.float32).flatten()
+            raw_emb = _assert_real_numeric_array_like(embedding, "embedding")
+            with np.errstate(over="ignore", invalid="ignore"):
+                emb = np.asarray(raw_emb, dtype=np.float32).flatten()
+            if emb.shape[0] != self.dimension:
+                raise ValueError(
+                    f"embedding dimension mismatch: expected {self.dimension}, got {emb.shape[0]}"
+                )
         else:
             emb, raw_norm = self._encode_with_norm(prompt, telemetry=telemetry, recency_weighted=use_recency)
 

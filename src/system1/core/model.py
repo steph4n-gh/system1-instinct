@@ -899,6 +899,41 @@ def _is_real_scalar_elem(v: Any) -> bool:
     return not isinstance(v, (bool, np.bool_)) and isinstance(v, (int, float, np.integer, np.floating))
 
 
+def _check_nested_real_seq(val: Any, label: str) -> None:
+    """Validate nested sequences contain only real integer or float elements before NumPy promotion."""
+    if isinstance(val, np.ndarray):
+        _assert_real_numeric_array_like(val, label)
+        return
+    if isinstance(val, (str, bytes, bytearray, Mapping)):
+        raise ValueError(f"{label} must contain only real numbers")
+    if isinstance(val, memoryview):
+        _check_nested_real_seq(val.tolist(), label)
+        return
+    if isinstance(val, Sequence):
+        for item in val:
+            _check_nested_real_seq(item, label)
+        return
+    if _is_real_scalar_elem(val):
+        return
+    raise ValueError(f"{label} must contain only real numbers, got {type(val).__name__}")
+
+
+def _assert_real_numeric_array_like(val: Any, label: str) -> np.ndarray:
+    """Reject booleans, complex values, strings, and non-real objects before numeric array conversion."""
+    if not isinstance(val, np.ndarray):
+        _check_nested_real_seq(val, label)
+    arr = np.asarray(val)
+    if (
+        arr.dtype == np.bool_
+        or np.issubdtype(arr.dtype, np.complexfloating)
+        or arr.dtype.kind not in ("i", "u", "f", "O")
+    ):
+        raise ValueError(f"{label} must be a real numeric array")
+    if arr.dtype == np.object_ and not all(_is_real_scalar_elem(v) for v in arr.flat):
+        raise ValueError(f"{label} must be a real numeric array")
+    return arr
+
+
 def _validate_real_scalar(value: Any, name: str) -> float:
     """Validate that value is a finite real scalar before numeric conversion."""
     if not _is_real_scalar_elem(value):
@@ -931,6 +966,8 @@ def _validate_forgetting_factor(value: Any) -> float:
 
 def _coerce_real_1d_f32(vec: Any, label: str) -> np.ndarray:
     """Validate real numeric array-like input (including object elements) and coerce to finite 1D float32."""
+    if not isinstance(vec, np.ndarray):
+        _check_nested_real_seq(vec, label)
     raw = np.asarray(vec)
     if (
         raw.dtype == np.bool_
@@ -1016,6 +1053,8 @@ def _coerce_inference_array_f32_or_f64(
     active_first_only: bool = False,
 ) -> np.ndarray:
     """Validate and coerce an inference array while preserving finite float32/float64 tensors."""
+    if not isinstance(arr, np.ndarray):
+        _check_nested_real_seq(arr, label)
     arr_in = np.asarray(arr)
     if (
         arr_in.dtype == np.bool_
@@ -2137,10 +2176,10 @@ class DecisionFieldHead:
         clear_exemplar_bank: bool = True,
     ) -> None:
         """Updates head weights and biases, synchronizing MLX buffers if active."""
-        raw_w_in = np.asarray(weights)
+        raw_w_in = _assert_real_numeric_array_like(weights, "Head weights")
         default_rows = raw_w_in.shape[0] if raw_w_in.ndim == 2 else 1
         raw_b_in = (
-            np.asarray(biases)
+            _assert_real_numeric_array_like(biases, "Head biases")
             if biases is not None
             else np.zeros(default_rows, dtype=np.float32)
         )
@@ -2201,20 +2240,25 @@ class DecisionFieldHead:
         fine_biases: Optional[np.ndarray] = None,
     ) -> None:
         """Configures two-stage coarse-to-fine hierarchical routing parameters."""
+        if (fine_weights is None) != (fine_biases is None):
+            raise ValueError("fine_weights and fine_biases must both be provided or both be None")
+        if any(
+            isinstance(c, (bool, np.bool_)) or not isinstance(c, (int, np.integer))
+            for c in cluster_assignments
+        ):
+            raise ValueError("cluster_assignments must contain integer indices")
+        cw_in = _assert_real_numeric_array_like(coarse_weights, "coarse_weights")
+        cb_raw = _assert_real_numeric_array_like(coarse_biases, "coarse_biases")
+        fw_in = _assert_real_numeric_array_like(fine_weights, "fine_weights") if fine_weights is not None else None
+        fb_raw = _assert_real_numeric_array_like(fine_biases, "fine_biases") if fine_biases is not None else None
         with np.errstate(over="ignore", invalid="ignore"):
-            cw_in = np.asarray(coarse_weights)
-            cb_raw = np.asarray(coarse_biases)
             if cb_raw.ndim != 1:
                 raise ValueError(f"coarse_biases must be 1D, got shape {cb_raw.shape}")
             f32_dt = np.dtype(np.float32)
             _validate_2d_layout_cloneable(cw_in, f32_dt)
             cw = cw_in if cw_in.dtype == f32_dt else _clone_preserving_2d_layout(cw_in, dtype=f32_dt, writeable=True)
             cb = np.asarray(cb_raw, dtype=f32_dt)
-            if (fine_weights is None) != (fine_biases is None):
-                raise ValueError("fine_weights and fine_biases must both be provided or both be None")
-            if fine_weights is not None and fine_biases is not None:
-                fw_in = np.asarray(fine_weights)
-                fb_raw = np.asarray(fine_biases)
+            if fw_in is not None and fb_raw is not None:
                 if fb_raw.ndim != 1:
                     raise ValueError(f"fine_biases must be 1D, got shape {fb_raw.shape}")
                 _validate_2d_layout_cloneable(fw_in, f32_dt)
@@ -2256,16 +2300,16 @@ class DecisionFieldHead:
         If P is None, initializes P = (1/lambda) * I_(D+1) and B = lambda * [W, b]^T,
         so (P B)^T == [W, b] identically reproducing existing weights.
         """
-        reg_raw = float(regularization)
-        if not math.isfinite(reg_raw):
-            raise ValueError(f"regularization must be finite, got {regularization!r}")
+        reg_raw = _validate_real_scalar(regularization, "regularization")
         eff_reg = max(1e-4, reg_raw)
         D = self.dimension
         K = self.weights.shape[0]
         f32_dt = np.dtype(np.float32)
+        p_in = _assert_real_numeric_array_like(P, "Covariance matrix P") if P is not None else None
+        b_in = _assert_real_numeric_array_like(B, "Cross-covariance matrix B") if B is not None else None
         with np.errstate(over="ignore", invalid="ignore"):
-            if P is not None:
-                p_raw = np.asarray(P)
+            if p_in is not None:
+                p_raw = p_in
                 if p_raw.ndim != 2 or p_raw.shape != (D + 1, D + 1):
                     raise ValueError(f"Covariance matrix P must have shape ({D + 1}, {D + 1}), got {p_raw.shape}")
                 _validate_2d_layout_cloneable(p_raw, f32_dt)
@@ -2275,8 +2319,8 @@ class DecisionFieldHead:
             if not bool(np.all(np.isfinite(p_f32))):
                 raise ValueError("Covariance matrix P must be finite in float32")
 
-            if B is not None:
-                b_raw = np.asarray(B)
+            if b_in is not None:
+                b_raw = b_in
                 if b_raw.ndim != 2 or b_raw.shape != (D + 1, K):
                     raise ValueError(f"Cross-covariance matrix B must have shape ({D + 1}, {K}), got {b_raw.shape}")
                 _validate_2d_layout_cloneable(b_raw, f32_dt)
@@ -2399,6 +2443,7 @@ class DecisionFieldHead:
             for key, arr in arrays.items():
                 if not isinstance(arr, np.ndarray):
                     raise ValueError(f"Saved exemplar array {key!r} must be a numpy ndarray")
+                _assert_real_numeric_array_like(arr, f"Saved exemplar array {key!r}")
                 expected = (self.dimension,) if key == "exemplar_mean" else (width, self.dimension)
                 if key in allowed_count_keys:
                     sizes = counts.get(key)
@@ -3336,7 +3381,12 @@ class DecisionFieldHead:
             getattr(self.field_def, "name", ""),
         )
         _validate_2d_layout_cloneable(w_cur, np.dtype(w_cur.dtype))
-        emb = np.asarray(embedding, dtype=np.float32)
+        if isinstance(embedding, np.ndarray) and embedding.dtype == np.float32:
+            emb = embedding
+        else:
+            raw_emb = _assert_real_numeric_array_like(embedding, "embedding")
+            with np.errstate(over="ignore", invalid="ignore"):
+                emb = np.asarray(raw_emb, dtype=np.float32)
         single = emb.ndim == 1
         if single:
             emb = emb.reshape(1, -1)
@@ -3359,7 +3409,11 @@ class DecisionFieldHead:
                 if self._exemplar_bank is not None and not self.hierarchical:
                     w_cons, sub_banks = self._exemplar_bank
                     if concept_embedding is not None:
-                        c_emb = np.asarray(concept_embedding, dtype=np.float32)
+                        if isinstance(concept_embedding, np.ndarray) and concept_embedding.dtype == np.float32:
+                            c_emb = concept_embedding
+                        else:
+                            raw_c_emb = _assert_real_numeric_array_like(concept_embedding, "concept_embedding")
+                            c_emb = np.asarray(raw_c_emb, dtype=np.float32)
                         if c_emb.ndim == 1:
                             c_emb = c_emb.reshape(1, -1)
                     elif prompts is not None and self._exemplar_projector is not None:
@@ -3584,9 +3638,19 @@ class SystemOneModel:
         start_t = time.perf_counter()
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         raw_norm: Optional[float] = None
-        c_emb: Optional[np.ndarray] = concept_embedding
+        c_emb: Optional[np.ndarray] = (
+            _assert_real_numeric_array_like(concept_embedding, "concept_embedding")
+            if concept_embedding is not None
+            else None
+        )
         if embedding is not None:
-            emb = np.asarray(embedding, dtype=np.float32).flatten()
+            raw_emb = _assert_real_numeric_array_like(embedding, "embedding")
+            with np.errstate(over="ignore", invalid="ignore"):
+                emb = np.asarray(raw_emb, dtype=np.float32).flatten()
+            if emb.shape[0] != self.dimension:
+                raise ValueError(
+                    f"embedding dimension mismatch: expected {self.dimension}, got {emb.shape[0]}"
+                )
         elif (
             telemetry is None
             and type(self.projector) is DeterministicSemanticProjector
@@ -4802,6 +4866,8 @@ class PackedMultiQuestionKernel:
         self, X: np.ndarray, *, prompts: Optional[Sequence[str]] = None
     ) -> Dict[str, Any]:
         """Single contiguous BLAS GEMV (B=1) / GEMM (B>1) + vectorized postprocessing."""
+        if not (isinstance(X, np.ndarray) and X.dtype in (np.float32, np.float64, np.float16)):
+            X = _assert_real_numeric_array_like(X, "embeddings")
         is_1d = X.ndim == 1
         B_in = 1 if is_1d else int(X.shape[0])
         if B_in == 0:
@@ -5951,11 +6017,15 @@ class FastDecisionCallable:
                 raise ValueError("Either prompt or embedding must be provided")
             emb = st.kernel.encode_one(prompt)
         else:
+            if isinstance(embedding, np.ndarray) and embedding.dtype == np.float32:
+                raw_emb = embedding
+            else:
+                raw_emb = _assert_real_numeric_array_like(embedding, "embedding")
             with np.errstate(over="ignore", invalid="ignore"):
                 emb = (
-                    embedding
-                    if isinstance(embedding, np.ndarray) and embedding.dtype == np.float32
-                    else np.asarray(embedding, dtype=np.float32)
+                    raw_emb
+                    if isinstance(raw_emb, np.ndarray) and raw_emb.dtype == np.float32
+                    else np.asarray(raw_emb, dtype=np.float32)
                 )
             if emb.ndim != 1:
                 emb = emb.ravel()

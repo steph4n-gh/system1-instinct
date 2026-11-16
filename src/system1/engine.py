@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import math
 import secrets
@@ -16,6 +17,8 @@ import statistics
 import sys
 import threading
 import time
+import types
+from collections import OrderedDict, deque
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -59,6 +62,9 @@ from system1.core.model import (
     FastDecisionCallable,
     PackedMultiQuestionKernel,
     _accepts_recency_weighted,
+    _assert_real_numeric_array_like,
+    _check_nested_real_seq,
+    _clone_preserving_2d_layout,
     _coerce_inference_array_f32_or_f64,
     _coerce_real_1d_f32,
     _compute_engine_inference_signature,
@@ -102,19 +108,221 @@ from system1.receipt import (
 )
 
 
+_UNSET_SLOT = object()
+
+
+def _is_immutable_or_non_state(val: Any) -> bool:
+    if val is None or isinstance(
+        val,
+        (bool, int, float, complex, str, bytes, type, types.ModuleType, DecisionSchema, DecisionField),
+    ):
+        return True
+    if inspect.isroutine(val):
+        return True
+    if hasattr(val, "acquire") and hasattr(val, "release"):
+        return True
+    return False
+
+
+def _collect_instance_slot_names(obj: Any) -> Tuple[str, ...]:
+    names: List[str] = []
+    seen: set[str] = set()
+    for base_cls in type(obj).__mro__:
+        cls_slots = base_cls.__dict__.get("__slots__")
+        if cls_slots is None:
+            continue
+        raw_slots = (cls_slots,) if isinstance(cls_slots, str) else cls_slots
+        for s_name in raw_slots:
+            if isinstance(s_name, str) and s_name not in ("__dict__", "__weakref__") and s_name not in seen:
+                seen.add(s_name)
+                names.append(s_name)
+    return tuple(names)
+
+
+def _snapshot_duck_graph(
+    val: Any,
+    seen_ids: set[int],
+    state_snaps: List[Tuple[Any, Any]],
+    dict_snaps: List[Tuple[Any, Dict[str, Any]]],
+    slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]],
+    memo: Dict[int, Any],
+    skip_ids: Optional[set[int]] = None,
+) -> Any:
+    """Recursively snapshot mutable arrays, containers, nested heads, and duck objects."""
+    if _is_immutable_or_non_state(val):
+        return val
+    obj_id = id(val)
+    if skip_ids is not None and obj_id in skip_ids:
+        return val
+    if obj_id in memo:
+        return memo[obj_id]
+    if isinstance(val, np.ndarray):
+        try:
+            cp = _clone_preserving_2d_layout(val, writeable=bool(val.flags.writeable))
+        except ValueError:
+            cp = np.array(val, copy=True)
+            if not val.flags.writeable:
+                cp.setflags(write=False)
+        memo[obj_id] = cp
+        return cp
+    if isinstance(val, bytearray):
+        cp_ba = bytearray(val)
+        memo[obj_id] = cp_ba
+        return cp_ba
+    if isinstance(val, OrderedDict):
+        od_copy: OrderedDict[Any, Any] = OrderedDict()
+        memo[obj_id] = od_copy
+        for k, v in val.items():
+            od_copy[_snapshot_duck_graph(k, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)] = (
+                _snapshot_duck_graph(v, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+            )
+        return od_copy
+    if type(val) is dict:
+        d_copy: Dict[Any, Any] = {}
+        memo[obj_id] = d_copy
+        for k, v in val.items():
+            d_copy[_snapshot_duck_graph(k, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)] = (
+                _snapshot_duck_graph(v, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+            )
+        return d_copy
+    if isinstance(val, list):
+        l_copy: List[Any] = []
+        memo[obj_id] = l_copy
+        l_copy.extend(
+            _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+            for x in val
+        )
+        return l_copy
+    if isinstance(val, deque):
+        dq_copy: deque[Any] = deque(maxlen=val.maxlen)
+        memo[obj_id] = dq_copy
+        dq_copy.extend(
+            _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+            for x in val
+        )
+        return dq_copy
+    if isinstance(val, tuple):
+        if hasattr(val, "_fields"):
+            t_items = tuple(
+                _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+                for x in val
+            )
+            nt_copy = type(val)(*t_items)
+            memo[obj_id] = nt_copy
+            return nt_copy
+        t_copy = tuple(
+            _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+            for x in val
+        )
+        memo[obj_id] = t_copy
+        return t_copy
+    if isinstance(val, set):
+        s_copy = {
+            _snapshot_duck_graph(x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids)
+            for x in val
+        }
+        memo[obj_id] = s_copy
+        return s_copy
+    if callable(getattr(val, "_snapshot_state", None)) and callable(getattr(val, "_restore_state", None)):
+        memo[obj_id] = val
+        if obj_id not in seen_ids:
+            seen_ids.add(obj_id)
+            state_snaps.append((val, val._snapshot_state()))
+        return val
+    inst_dict = getattr(val, "__dict__", None)
+    slot_names = _collect_instance_slot_names(val)
+    if type(inst_dict) is dict or slot_names:
+        memo[obj_id] = val
+        if obj_id not in seen_ids:
+            seen_ids.add(obj_id)
+            if type(inst_dict) is dict:
+                d_snap = {
+                    k: _snapshot_duck_graph(
+                        v, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids
+                    )
+                    for k, v in inst_dict.items()
+                }
+                dict_snaps.append((val, d_snap))
+            if slot_names:
+                s_snap = [
+                    (
+                        s_name,
+                        _snapshot_duck_graph(
+                            getattr(val, s_name, _UNSET_SLOT),
+                            seen_ids,
+                            state_snaps,
+                            dict_snaps,
+                            slot_snaps,
+                            memo,
+                            skip_ids,
+                        )
+                        if hasattr(val, s_name)
+                        else _UNSET_SLOT,
+                    )
+                    for s_name in slot_names
+                ]
+                slot_snaps.append((val, s_snap))
+        return val
+    return val
+
+
 def _clone_head_attr_value(val: Any) -> Any:
     """Shallow-copy arrays and standard mutable containers without choking on locks/callables."""
-    if isinstance(val, np.ndarray):
-        return val.copy()
-    if isinstance(val, dict):
-        return {k: _clone_head_attr_value(v) for k, v in val.items()}
-    if isinstance(val, list):
-        return [_clone_head_attr_value(v) for v in val]
-    if isinstance(val, tuple):
-        return tuple(_clone_head_attr_value(v) for v in val)
-    if isinstance(val, set):
-        return {_clone_head_attr_value(v) for v in val}
-    return val
+    seen_ids: set[int] = set()
+    state_snaps: List[Tuple[Any, Any]] = []
+    dict_snaps: List[Tuple[Any, Dict[str, Any]]] = []
+    slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]] = []
+    return _snapshot_duck_graph(val, seen_ids, state_snaps, dict_snaps, slot_snaps, {})
+
+
+def _resolve_supported_kwargs(
+    fn: Any,
+    candidate_kwargs: Dict[str, Any],
+) -> Tuple[Dict[str, Any], frozenset[str]]:
+    """Inspect a callable (unwrapping MRO **kwargs overrides) to filter supported kwargs upfront."""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return {}, frozenset()
+
+    params = sig.parameters
+    explicit_names: set[str] = {
+        name
+        for name, p in params.items()
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    if has_var_kw:
+        owner_self = getattr(fn, "__self__", None)
+        method_name = getattr(fn, "__name__", None)
+        if owner_self is not None and isinstance(method_name, str):
+            for base_cls in type(owner_self).__mro__[1:]:
+                raw_attr = base_cls.__dict__.get(method_name)
+                if raw_attr is None:
+                    continue
+                target_fn = (
+                    raw_attr.__func__
+                    if isinstance(raw_attr, (staticmethod, classmethod))
+                    else raw_attr
+                )
+                try:
+                    base_sig = inspect.signature(target_fn)
+                except (TypeError, ValueError):
+                    continue
+                base_params = base_sig.parameters
+                explicit_names.update(
+                    name
+                    for name, p in base_params.items()
+                    if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                )
+                if not any(p.kind == inspect.Parameter.VAR_KEYWORD for p in base_params.values()):
+                    has_var_kw = False
+                    break
+
+    kw_fset = frozenset(explicit_names)
+    if has_var_kw:
+        return dict(candidate_kwargs), frozenset(candidate_kwargs)
+    return {k: v for k, v in candidate_kwargs.items() if k in kw_fset}, kw_fset
 
 
 @dataclass(frozen=True)
@@ -403,6 +611,8 @@ def _validated_head_logit_adjustments(
         raise ValueError(
             f"Field {field_name!r} of type {type(definition).__name__} does not support logit_adjustments"
         )
+    if not isinstance(raw_adj, np.ndarray):
+        _check_nested_real_seq(raw_adj, f"logit_adjustments for {field_name!r}")
     arr = np.asarray(raw_adj)
     if arr.dtype == np.dtype(np.bool_) or arr.dtype.kind not in ("i", "u", "f"):
         raise ValueError(f"logit_adjustments for {field_name!r} must have numeric dtype, got {arr.dtype}")
@@ -1066,10 +1276,12 @@ class SystemOneEngine:
         """Encodes prompt into semantic embedding vector."""
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         if hasattr(self.model, "encode"):
-            try:
-                return self.model.encode(prompt, telemetry=telemetry, recency_weighted=use_recency)
-            except TypeError:
-                return self.model.encode(prompt, telemetry=telemetry)
+            encode_fn = self.model.encode
+            enc_kw, _ = _resolve_supported_kwargs(
+                encode_fn,
+                {"telemetry": telemetry, "recency_weighted": use_recency},
+            )
+            return encode_fn(prompt, **enc_kw)
         if self.projector is not None:
             return _encode_projector_one(
                 self.projector,
@@ -2119,7 +2331,9 @@ class SystemOneEngine:
             if embedding is not None:
                 if not isinstance(embedding, (np.ndarray, list, tuple)):
                     raise TypeError(f"embedding must be array-like, got {type(embedding).__name__}")
-                arr_emb = np.asarray(embedding, dtype=np.float32).flatten()
+                raw_emb = _assert_real_numeric_array_like(embedding, "embedding")
+                with np.errstate(over="ignore", invalid="ignore"):
+                    arr_emb = np.asarray(raw_emb, dtype=np.float32).flatten()
                 if not np.all(np.isfinite(arr_emb)):
                     raise ValueError("embedding must contain only finite numbers (no NaN or Inf)")
                 if arr_emb.shape[0] != self.dimension:
@@ -2263,28 +2477,17 @@ class SystemOneEngine:
 
             with self._lock:
                 user_emb = query_emb if embedding is not None else None
-                try:
-                    raw_result = self.model.forward_single(
-                        prompt,
-                        telemetry=telemetry,
-                        embedding=user_emb,
-                        recency_weighted=recency_weighted,
-                        use_cache=False,
-                    )
-                except TypeError:
-                    try:
-                        raw_result = self.model.forward_single(
-                            prompt,
-                            telemetry=telemetry,
-                            embedding=user_emb,
-                            recency_weighted=recency_weighted,
-                        )
-                    except TypeError:
-                        raw_result = self.model.forward_single(
-                            prompt,
-                            telemetry=telemetry,
-                            embedding=user_emb,
-                        )
+                fwd_fn = self.model.forward_single
+                fwd_kw, _ = _resolve_supported_kwargs(
+                    fwd_fn,
+                    {
+                        "telemetry": telemetry,
+                        "embedding": user_emb,
+                        "recency_weighted": recency_weighted,
+                        "use_cache": False,
+                    },
+                )
+                raw_result = fwd_fn(prompt, **fwd_kw)
 
             values: Dict[str, Any] = {}
             confidences: Dict[str, float] = {}
@@ -2424,19 +2627,20 @@ class SystemOneEngine:
                         and (is_zero_emb or selected_choice == learned_overrides.get(name))
                     )
                     if conformal is not None and not override_matched:
-                        try:
-                            cset = conformal.predict_set(
-                                calibrated_p,
-                                alpha=alpha,
-                                margin_threshold=eff_m_thresh if (self.enable_margin_gating and not is_strict) else 0.0,
-                                relative_odds_ratio=eff_gamma if not is_strict else None,
-                                confidence_floor_tau0=eff_tau0 if not is_strict else None,
-                                strict=is_strict,
-                                familiarity_score=(None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
-                                prototype_similarity=(None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
-                            )
-                        except TypeError:
-                            cset = conformal.predict_set(calibrated_p, alpha=alpha)
+                        ps_fn = conformal.predict_set
+                        ps_kw, _ = _resolve_supported_kwargs(
+                            ps_fn,
+                            {
+                                "alpha": alpha,
+                                "margin_threshold": eff_m_thresh if (self.enable_margin_gating and not is_strict) else 0.0,
+                                "relative_odds_ratio": eff_gamma if not is_strict else None,
+                                "confidence_floor_tau0": eff_tau0 if not is_strict else None,
+                                "strict": is_strict,
+                                "familiarity_score": (None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
+                                "prototype_similarity": (None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
+                            },
+                        )
+                        cset = ps_fn(calibrated_p, **ps_kw)
                         conformal_sets[name] = list(cset.prediction_set)
                         margins[name] = getattr(cset, "margin", 1.0)
                         margin_thresholds[name] = getattr(cset, "margin_threshold", 0.0)
@@ -2499,19 +2703,20 @@ class SystemOneEngine:
                         and (is_zero_emb or val == bool(learned_overrides.get(name)))
                     )
                     if conformal is not None and not override_matched:
-                        try:
-                            cset = conformal.predict_set(
-                                calibrated_p,
-                                alpha=alpha,
-                                margin_threshold=eff_m_thresh if (self.enable_margin_gating and not is_strict) else 0.0,
-                                relative_odds_ratio=eff_gamma if not is_strict else None,
-                                confidence_floor_tau0=eff_tau0 if not is_strict else None,
-                                strict=is_strict,
-                                familiarity_score=(None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
-                                prototype_similarity=(None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
-                            )
-                        except TypeError:
-                            cset = conformal.predict_set(calibrated_p, alpha=alpha)
+                        ps_fn = conformal.predict_set
+                        ps_kw, _ = _resolve_supported_kwargs(
+                            ps_fn,
+                            {
+                                "alpha": alpha,
+                                "margin_threshold": eff_m_thresh if (self.enable_margin_gating and not is_strict) else 0.0,
+                                "relative_odds_ratio": eff_gamma if not is_strict else None,
+                                "confidence_floor_tau0": eff_tau0 if not is_strict else None,
+                                "strict": is_strict,
+                                "familiarity_score": (None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
+                                "prototype_similarity": (None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
+                            },
+                        )
+                        cset = ps_fn(calibrated_p, **ps_kw)
                         conformal_sets[name] = list(cset.prediction_set)
                         margins[name] = getattr(cset, "margin", 1.0)
                         margin_thresholds[name] = getattr(cset, "margin_threshold", 0.0)
@@ -3017,6 +3222,8 @@ class SystemOneEngine:
         ``preserve_calibration=True`` is specified.
         """
         with self._lock, getattr(self.model, "_lock", nullcontext()):
+            if not isinstance(prompt, str):
+                raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
             recency_weighted = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
             target = self.schema.validate_lesson(target, allow_unknown=True)
             eff_forgetting = _validate_forgetting_factor(
@@ -3070,19 +3277,59 @@ class SystemOneEngine:
             seen_head_ids: set[int] = set()
             model_state_snaps: List[Tuple[Any, Any]] = []
             model_dict_snaps: List[Tuple[Any, Dict[str, Any]]] = []
+            model_slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]] = []
+            snap_memo: Dict[int, Any] = {}
+            skip_snap_ids: set[int] = {id(self), id(model)}
+            if self.projector is not None:
+                skip_snap_ids.add(id(self.projector))
+            m_proj = getattr(model, "projector", None)
+            if m_proj is not None:
+                skip_snap_ids.add(id(m_proj))
             for attr_name in ("_field_heads", "heads"):
                 h_map = getattr(model, attr_name, None)
                 if isinstance(h_map, Mapping):
                     for h_obj in h_map.values():
-                        if id(h_obj) in seen_head_ids:
-                            continue
-                        seen_head_ids.add(id(h_obj))
-                        if hasattr(h_obj, "_snapshot_state") and hasattr(h_obj, "_restore_state"):
-                            model_state_snaps.append((h_obj, h_obj._snapshot_state()))
-                        elif hasattr(h_obj, "__dict__"):
-                            model_dict_snaps.append(
-                                (h_obj, {k: _clone_head_attr_value(v) for k, v in h_obj.__dict__.items()})
-                            )
+                        _snapshot_duck_graph(
+                            h_obj,
+                            seen_head_ids,
+                            model_state_snaps,
+                            model_dict_snaps,
+                            model_slot_snaps,
+                            snap_memo,
+                            skip_snap_ids,
+                        )
+            orig_duck_model_keys: Optional[set[str]] = None
+            duck_model_extra_snap: Optional[Dict[str, Any]] = None
+            if (
+                type(model).__name__ not in ("SystemOneModel", "CompiledSystemOneModel")
+                and type(getattr(model, "__dict__", None)) is dict
+            ):
+                skip_model_attrs = frozenset({
+                    "schema",
+                    "projector",
+                    "_lock",
+                    "heads",
+                    "_field_heads",
+                    "model_version",
+                    "_learned_prompt_overrides",
+                    "_learned_prompt_override_recency",
+                    "_online_prototype_bank",
+                    "cache",
+                })
+                orig_duck_model_keys = set(model.__dict__.keys())
+                duck_model_extra_snap = {
+                    mk: _snapshot_duck_graph(
+                        mv,
+                        seen_head_ids,
+                        model_state_snaps,
+                        model_dict_snaps,
+                        model_slot_snaps,
+                        snap_memo,
+                        skip_snap_ids,
+                    )
+                    for mk, mv in model.__dict__.items()
+                    if mk not in skip_model_attrs
+                }
 
             has_model_ver = hasattr(model, "model_version")
             prev_model_ver = getattr(model, "model_version", None)
@@ -3146,66 +3393,27 @@ class SystemOneEngine:
 
             try:
                 if hasattr(self.model, "learn_from_tier2"):
-                    model_emb = (
-                        emb
-                        if getattr(self.model, "projector", None) is self.projector
-                        else emb
-                    )
-                    try:
-                        res_dict = self.model.learn_from_tier2(
-                            prompt,
-                            target,
-                            telemetry=telemetry,
-                            embedding=model_emb,
-                            forgetting_factor=eff_forgetting,
-                            recency_weighted=recency_weighted,
-                            preserve_calibration=preserve_calibration,
-                            reward_scale=eff_reward_scale,
-                            concept_embedding=c_emb,
-                            allow_prompt_for_head=allow_prompt_for_head,
-                        )
-                    except TypeError:
-                        try:
-                            res_dict = self.model.learn_from_tier2(
-                                prompt,
-                                target,
-                                telemetry=telemetry,
-                                embedding=None if (embedding is None and getattr(self.model, "projector", None) is self.projector) else emb,
-                                forgetting_factor=eff_forgetting,
-                                recency_weighted=recency_weighted,
-                                preserve_calibration=preserve_calibration,
-                                reward_scale=eff_reward_scale,
-                            )
-                        except TypeError:
-                            try:
-                                res_dict = self.model.learn_from_tier2(
-                                    prompt,
-                                    target,
-                                    telemetry=telemetry,
-                                    embedding=model_emb,
-                                    forgetting_factor=eff_forgetting,
-                                    recency_weighted=recency_weighted,
-                                    preserve_calibration=preserve_calibration,
-                                )
-                            except TypeError:
-                                try:
-                                    res_dict = self.model.learn_from_tier2(
-                                        prompt,
-                                        target,
-                                        telemetry=telemetry,
-                                        embedding=model_emb,
-                                        forgetting_factor=eff_forgetting,
-                                        recency_weighted=recency_weighted,
-                                    )
-                                except TypeError:
-                                    try:
-                                        res_dict = self.model.learn_from_tier2(
-                                            prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
-                                        )
-                                    except TypeError:
-                                        res_dict = self.model.learn_from_tier2(
-                                            prompt, target, telemetry=telemetry, embedding=model_emb
-                                        )
+                    learn_fn = self.model.learn_from_tier2
+                    candidate_learn_kw = {
+                        "telemetry": telemetry,
+                        "embedding": emb,
+                        "forgetting_factor": eff_forgetting,
+                        "recency_weighted": recency_weighted,
+                        "preserve_calibration": preserve_calibration,
+                        "reward_scale": eff_reward_scale,
+                        "concept_embedding": c_emb,
+                        "allow_prompt_for_head": allow_prompt_for_head,
+                    }
+                    learn_kw, explicit_learn_names = _resolve_supported_kwargs(learn_fn, candidate_learn_kw)
+                    if (
+                        "embedding" in learn_kw
+                        and embedding is None
+                        and getattr(self.model, "projector", None) is self.projector
+                        and "reward_scale" in explicit_learn_names
+                        and "allow_prompt_for_head" not in explicit_learn_names
+                    ):
+                        learn_kw["embedding"] = None
+                    res_dict = learn_fn(prompt, target, **learn_kw)
                     updated_fields = res_dict.get("updated_fields", [])
                     rank1_ms = res_dict.get("update_latency_ms", 0.0)
                 else:
@@ -3237,19 +3445,16 @@ class SystemOneEngine:
                                         )
                                         self._learned_prompt_override_recency[norm_key] = bool(recency_weighted)
                                 else:
-                                    try:
-                                        dt = head.online_update(
-                                            x_aug,
-                                            y_target,
-                                            forgetting_factor=eff_forgetting,
-                                            preserve_calibration=preserve_calibration,
-                                            reward_scale=eff_reward_scale,
-                                        )
-                                    except TypeError:
-                                        try:
-                                            dt = head.online_update(x_aug, y_target, forgetting_factor=eff_forgetting)
-                                        except TypeError:
-                                            dt = head.online_update(x_aug, y_target)
+                                    ou_fn = head.online_update
+                                    ou_kw, _ = _resolve_supported_kwargs(
+                                        ou_fn,
+                                        {
+                                            "forgetting_factor": eff_forgetting,
+                                            "preserve_calibration": preserve_calibration,
+                                            "reward_scale": eff_reward_scale,
+                                        },
+                                    )
+                                    dt = ou_fn(x_aug, y_target, **ou_kw)
                                 update_durations_ms.append(dt)
                                 updated_fields.append(f_name)
 
@@ -3389,17 +3594,17 @@ class SystemOneEngine:
                                     rcp.is_calibrated = True
 
                 self._packed_kernel_cache = None
-                if self.use_cache and self.cache is not None:
-                    res = self.decide(
-                        prompt,
-                        telemetry=telemetry,
-                        embedding=embedding,
-                        record_receipt=False,
-                        recency_weighted=recency_weighted,
-                        strict=self.strict_mode,
-                        policy_scope=self.policy_scope,
-                        use_cache=False,
-                    )
+                res = self.decide(
+                    prompt,
+                    telemetry=telemetry,
+                    embedding=(emb if embedding is not None else None),
+                    record_receipt=False,
+                    recency_weighted=recency_weighted,
+                    strict=self.strict_mode,
+                    policy_scope=self.policy_scope,
+                    fail_closed_ledger=False,
+                    use_cache=False,
+                )
 
                 if hasattr(self, "_explainer_cache"):
                     self._explainer_cache.clear()
@@ -3446,6 +3651,19 @@ class SystemOneEngine:
                 for h_obj, dict_snap in model_dict_snaps:
                     h_obj.__dict__.clear()
                     h_obj.__dict__.update(dict_snap)
+                for slot_obj, slot_vals in model_slot_snaps:
+                    for s_name, s_val in slot_vals:
+                        if s_val is _UNSET_SLOT:
+                            if hasattr(slot_obj, s_name):
+                                delattr(slot_obj, s_name)
+                        else:
+                            setattr(slot_obj, s_name, s_val)
+                if orig_duck_model_keys is not None and duck_model_extra_snap is not None:
+                    for mk in list(model.__dict__):
+                        if mk not in orig_duck_model_keys:
+                            delattr(model, mk)
+                    for mk, mv in duck_model_extra_snap.items():
+                        setattr(model, mk, mv)
                 if has_model_ver:
                     model.model_version = prev_model_ver
                 if has_m_ov and m_ov_snap is not None:

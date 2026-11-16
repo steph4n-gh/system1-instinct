@@ -43,6 +43,7 @@ from typing import (
 )
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+import numpy as np
 
 from system1.engine import DecisionResult, SystemOneEngine
 from system1.ledger import ActionLedger
@@ -1539,7 +1540,11 @@ class TypeSafeClient:
         self.fallback_baseline = bool(kwargs.get("fallback_baseline", fallback_baseline))
         self.background_compile = bool(kwargs.get("background_compile", background_compile))
         self.auto_cutover_lifecycle = auto_cutover_lifecycle
-        self._cutover_lifecycles: Dict[str, Any] = {}
+        self._cutover_lifecycles: collections.OrderedDict[str, Any] = collections.OrderedDict()
+        raw_max_unprom = kwargs.get("max_unpromoted_lifecycles", 256)
+        if isinstance(raw_max_unprom, (bool, np.bool_)) or not isinstance(raw_max_unprom, int) or raw_max_unprom < 1:
+            raise ValueError(f"max_unpromoted_lifecycles must be a positive int, got {raw_max_unprom!r}")
+        self.max_unpromoted_lifecycles: int = int(raw_max_unprom)
         self.promotion_policy = promotion_policy or kwargs.get("promotion_policy", None)
         self._drift_detector = drift_detector or kwargs.get("drift_detector", None) or DriftDetector()
         self._drift_detectors: Dict[str, DriftDetector] = {}
@@ -2290,6 +2295,34 @@ class TypeSafeClient:
                 self._distill_and_cutover_locked(questions)
             return self._has_cutover or (digest in self._has_cutover_schemas)
 
+    @staticmethod
+    def _parse_nonneg_egress_bytes(raw_val: Any) -> int:
+        if isinstance(raw_val, (bool, np.bool_)):
+            raise ValueError(f"Invalid egress_bytes in teacher response: {raw_val!r}")
+        if isinstance(raw_val, (int, np.integer)):
+            val = int(raw_val)
+        elif isinstance(raw_val, (float, np.floating)):
+            f_val = float(raw_val)
+            if not math.isfinite(f_val) or not f_val.is_integer():
+                raise ValueError(f"Invalid egress_bytes in teacher response: {raw_val!r}")
+            val = int(f_val)
+        else:
+            raise ValueError(f"Invalid egress_bytes in teacher response: {raw_val!r}")
+        if val < 0:
+            raise ValueError(f"egress_bytes must be non-negative, got {val}")
+        return val
+
+    def _enforce_unpromoted_cutover_cap_locked(self, *, reserve_for_new: bool = False) -> None:
+        limit = max(0, self.max_unpromoted_lifecycles - (1 if reserve_for_new else 0))
+        unpromoted = [
+            k
+            for k, v in self._cutover_lifecycles.items()
+            if not bool(getattr(v, "is_cutover", False) or getattr(v, "compiled_active", False))
+        ]
+        while len(unpromoted) > limit:
+            evict_key = unpromoted.pop(0)
+            self._cutover_lifecycles.pop(evict_key, None)
+
     def systemone(
         self,
         state: Union[str, Dict[str, Any], List[Any]],
@@ -2338,12 +2371,20 @@ class TypeSafeClient:
             if self.auto_cutover_lifecycle:
                 from system1.cutover import AutoCutoverLifecycle, CutoverConfig
 
+                is_injected_lc = hasattr(self.auto_cutover_lifecycle, "decide_local") and hasattr(
+                    self.auto_cutover_lifecycle, "observe_teacher"
+                )
                 with self._engine_lock:
                     existing_lc = self._cutover_lifecycles.get(digest)
 
-                if existing_lc is not None:
+                cand_lc = (
+                    existing_lc
+                    if existing_lc is not None
+                    else (self.auto_cutover_lifecycle if is_injected_lc else None)
+                )
+                if cand_lc is not None:
                     t_local = time.perf_counter()
-                    local_vals = existing_lc.decide_local(encoded_state)
+                    local_vals = cand_lc.decide_local(encoded_state)
                     if local_vals is not None:
                         latency_ms = (time.perf_counter() - t_local) * 1000.0
                         local_answers = self._build_answers_from_values(
@@ -2352,6 +2393,9 @@ class TypeSafeClient:
                             schema=schema,
                         )
                         with self._engine_lock:
+                            self._cutover_lifecycles[digest] = cand_lc
+                            self._cutover_lifecycles.move_to_end(digest)
+                            self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                             self._call_count[digest] += 1
                         return SystemOneResponse({
                             "model": model,
@@ -2370,12 +2414,14 @@ class TypeSafeClient:
                             "is_ambiguous": False,
                             "auto_cutover_active": True,
                             "is_cutover": True,
-                            "cutover_state": existing_lc.state,
+                            "cutover_state": cand_lc.state,
                         })
 
                 if self.baseline_handler is not None:
                     cloud_resp = TypeSafeResponse(self.baseline_handler(state, questions))
-                    egress_bytes = int(cloud_resp.get("egress_bytes", 0 if self.zero_egress else 800))
+                    egress_bytes = self._parse_nonneg_egress_bytes(
+                        cloud_resp.get("egress_bytes", 0 if self.zero_egress else 800)
+                    )
                 else:
                     if self.zero_egress:
                         raise ZeroEgressViolationError(
@@ -2391,6 +2437,7 @@ class TypeSafeClient:
                         fallback_baseline=fb,
                         zero_egress=False,
                     )
+                    egress_bytes = self._parse_nonneg_egress_bytes(egress_bytes)
 
                 teacher_vals = {}
                 for name, definition in schema.fields.items():
@@ -2406,9 +2453,8 @@ class TypeSafeClient:
                     lc = self._cutover_lifecycles.get(digest)
                     if lc is None:
                         created_new_lc = True
-                        if hasattr(self.auto_cutover_lifecycle, "decide_local") and hasattr(
-                            self.auto_cutover_lifecycle, "observe_teacher"
-                        ):
+                        self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
+                        if is_injected_lc:
                             lc = self.auto_cutover_lifecycle
                         else:
                             lc_cfg = (
@@ -2418,20 +2464,24 @@ class TypeSafeClient:
                             )
                             lc = AutoCutoverLifecycle(schema, teacher=None, config=lc_cfg)
                         self._cutover_lifecycles[digest] = lc
+                    else:
+                        self._cutover_lifecycles.move_to_end(digest)
 
                 try:
                     lc.observe_teacher(encoded_state, teacher_vals)
                 except BaseException:
-                    if created_new_lc and (
-                        not getattr(lc, "admitted_keys", ())
-                        and not getattr(lc, "quarantine", ())
-                        and not getattr(lc, "teacher_key_labels", {})
-                    ):
-                        with self._engine_lock:
+                    with self._engine_lock:
+                        if created_new_lc and (
+                            not getattr(lc, "admitted_keys", ())
+                            and not getattr(lc, "quarantine", ())
+                            and not getattr(lc, "teacher_key_labels", {})
+                        ):
                             if self._cutover_lifecycles.get(digest) is lc:
                                 self._cutover_lifecycles.pop(digest, None)
+                        self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                     raise
                 with self._engine_lock:
+                    self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                     self._call_count[digest] += 1
                     self._teacher_sample_count[digest] += 1
                 cloud_resp["auto_cutover_active"] = True
@@ -2446,7 +2496,9 @@ class TypeSafeClient:
             if not already_cutover:
                 if self.baseline_handler is not None:
                     cloud_resp = TypeSafeResponse(self.baseline_handler(state, questions))
-                    egress_bytes = int(cloud_resp.get("egress_bytes", 0 if self.zero_egress else 800))
+                    egress_bytes = self._parse_nonneg_egress_bytes(
+                        cloud_resp.get("egress_bytes", 0 if self.zero_egress else 800)
+                    )
                 else:
                     if self.zero_egress:
                         raise ZeroEgressViolationError(
@@ -2462,6 +2514,7 @@ class TypeSafeClient:
                         fallback_baseline=fb,
                         zero_egress=False,
                     )
+                    egress_bytes = self._parse_nonneg_egress_bytes(egress_bytes)
 
                 answers = {}
                 for name, definition in schema.fields.items():

@@ -25,6 +25,8 @@ from system1.core.embeddings import (
 )
 from system1.core.model import (
     _accepts_recency_weighted,
+    _assert_real_numeric_array_like,
+    _coerce_inference_array_f32_or_f64,
     _has_custom_validate_decision,
     _normalize_raw_projection,
     _owned_readonly_array,
@@ -72,8 +74,10 @@ def _normalize_head_weights_and_options(
     temperature_scale: float = 4.0,
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...]]:
     """Normalize ChoiceField or BooleanField (1, D) head into a multi-class matrix pair."""
-    w = np.asarray(weights, dtype=np.float64)
-    b_raw = np.asarray(biases)
+    w_chk = _assert_real_numeric_array_like(weights, "Head weights")
+    b_chk = _assert_real_numeric_array_like(biases, "Head biases")
+    w = np.asarray(w_chk, dtype=np.float64)
+    b_raw = b_chk
     if w.ndim != 2:
         raise ValueError(f"Expected 2D weight matrix, got shape {w.shape}")
     if b_raw.ndim != 1:
@@ -259,12 +263,18 @@ def _extract_calibrated_head_params(
     if not math.isfinite(temp) or temp <= 0.0:
         raise ValueError(f"calibrator temperature must be finite and positive, got {raw_temp_obj!r}")
 
-    w = np.asarray(head.weights, dtype=np.float64)
-    raw_b_orig = np.asarray(head.biases)
+    is_boolean = isinstance(f_def, BooleanField)
+    w_checked = _coerce_inference_array_f32_or_f64(
+        head.weights, f"Head weights for {fname!r}", active_first_only=is_boolean
+    )
+    b_checked = _coerce_inference_array_f32_or_f64(
+        head.biases, f"Head biases for {fname!r}", active_first_only=is_boolean
+    )
+    w = np.asarray(w_checked, dtype=np.float64)
+    raw_b_orig = b_checked
     if raw_b_orig.ndim != 1:
         raise ValueError(f"Incompatible head bias shape biases={raw_b_orig.shape} for {fname!r}")
     b = np.asarray(raw_b_orig, dtype=np.float64).copy()
-    is_boolean = isinstance(f_def, BooleanField)
     if is_boolean:
         if w.ndim != 2 or w.shape[0] not in (1, 2) or b.size not in (1, w.shape[0]):
             raise ValueError(f"Incompatible BooleanField head shapes weights={w.shape}, biases={b.shape} for {fname!r}")
@@ -279,11 +289,11 @@ def _extract_calibrated_head_params(
         b = b[:1].copy()
 
     is_zero_head = bool(not np.any(w) and not np.any(b))
-    raw_w_src = np.asarray(head.weights)
+    raw_w_src = w_checked
     raw_w_dt = raw_w_src.dtype if raw_w_src.dtype in (np.float32, np.float64) else np.float32
     raw_w = _owned_readonly_array(raw_w_src, dtype=raw_w_dt)
 
-    raw_b_src = np.asarray(head.biases).reshape(-1)
+    raw_b_src = b_checked.reshape(-1)
     raw_b_dt = raw_b_src.dtype if raw_b_src.dtype in (np.float32, np.float64) else np.float32
     raw_b = _owned_readonly_array(raw_b_src, dtype=raw_b_dt)
 
@@ -292,7 +302,8 @@ def _extract_calibrated_head_params(
     cal_adj_choice: Optional[np.ndarray] = None
 
     if adj_raw is not None:
-        adj = np.asarray(adj_raw, dtype=np.float64).reshape(-1)
+        adj_checked = _assert_real_numeric_array_like(adj_raw, f"logit_adjustments for {fname!r}")
+        adj = np.asarray(adj_checked, dtype=np.float64).reshape(-1)
         if not bool(np.all(np.isfinite(adj))):
             raise ValueError(f"logit_adjustments contains non-finite values for field {fname!r}")
         if is_boolean or w.shape[0] == 1:
@@ -443,8 +454,8 @@ class FastExplainer:
             if _bool_raw_meta is not None
             else zero_emb_unit0
         )
-        w_in = np.asarray(weights)
-        b_in = np.asarray(biases)
+        w_in = _assert_real_numeric_array_like(weights, "Head weights")
+        b_in = _assert_real_numeric_array_like(biases, "Head biases")
         if w_in.ndim != 2:
             raise ValueError(f"Expected 2D weight matrix, got shape {w_in.shape}")
         if (
@@ -489,7 +500,8 @@ class FastExplainer:
 
         adj_eff_in: Optional[np.ndarray] = None
         if adj_eff is not None:
-            adj_eff_in = np.asarray(adj_eff, dtype=np.float64).reshape(-1)
+            adj_eff_chk = _assert_real_numeric_array_like(adj_eff, "adj_eff")
+            adj_eff_in = np.asarray(adj_eff_chk, dtype=np.float64).reshape(-1)
             if not bool(np.all(np.isfinite(adj_eff_in))):
                 raise ValueError("adj_eff contains non-finite values")
 

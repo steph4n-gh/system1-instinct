@@ -1962,9 +1962,47 @@ class UniversalDecisionService:
             self._last_schema_by_slot.popitem(last=False)
         return drift_info
 
-    def _evict_unpromoted_lifecycles_if_needed_locked(self) -> None:
+    @staticmethod
+    def _extract_upstream_input_tokens(upstream_raw: Any, default_tokens: int) -> int:
+        raw_usage = upstream_raw.get("usage") if isinstance(upstream_raw, Mapping) else None
+        if raw_usage is None:
+            return default_tokens
+        if not isinstance(raw_usage, Mapping):
+            raise InteropError("Upstream response 'usage' must be a JSON object", status_code=502)
+        if "input_tokens" not in raw_usage or raw_usage["input_tokens"] is None:
+            return default_tokens
+        raw_tok = raw_usage["input_tokens"]
+        if isinstance(raw_tok, (bool, np.bool_)):
+            raise InteropError(
+                "Upstream response 'usage.input_tokens' must be a non-negative integer",
+                status_code=502,
+            )
+        if isinstance(raw_tok, (int, np.integer)):
+            tok = int(raw_tok)
+        elif isinstance(raw_tok, (float, np.floating)):
+            f_tok = float(raw_tok)
+            if not math.isfinite(f_tok) or not f_tok.is_integer():
+                raise InteropError(
+                    "Upstream response 'usage.input_tokens' must be a finite integer",
+                    status_code=502,
+                )
+            tok = int(f_tok)
+        else:
+            raise InteropError(
+                "Upstream response 'usage.input_tokens' must be a non-negative integer",
+                status_code=502,
+            )
+        if tok < 0:
+            raise InteropError(
+                f"Upstream response 'usage.input_tokens' must be non-negative, got {tok}",
+                status_code=502,
+            )
+        return tok
+
+    def _enforce_unpromoted_lifecycle_cap_locked(self, *, reserve_for_new: bool = False) -> None:
+        limit = max(0, self.max_unpromoted_lifecycles - (1 if reserve_for_new else 0))
         unpromoted_keys = [k for k, v in self._lifecycles.items() if not v.is_cutover]
-        while len(unpromoted_keys) >= self.max_unpromoted_lifecycles:
+        while len(unpromoted_keys) > limit:
             evict_key = unpromoted_keys.pop(0)
             self._lifecycles.pop(evict_key, None)
 
@@ -1977,7 +2015,7 @@ class UniversalDecisionService:
             drift_info = self._record_slot_schema_locked(slot_key, contract)
             lc_key = f"{slot_key}:{contract.fingerprint}"
             if lc_key not in self._lifecycles:
-                self._evict_unpromoted_lifecycles_if_needed_locked()
+                self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=True)
                 self._lifecycles[lc_key] = SoftDistillingLifecycle(
                     contract,
                     distill_mode=self.distill_mode,
@@ -1986,6 +2024,7 @@ class UniversalDecisionService:
                 )
             else:
                 self._lifecycles.move_to_end(lc_key)
+                self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
             return self._lifecycles[lc_key], drift_info
 
     def handle_request(
@@ -2075,6 +2114,7 @@ class UniversalDecisionService:
                 with self._lock:
                     if lc_key in self._lifecycles:
                         self._lifecycles.move_to_end(lc_key)
+                    self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
                     drift_info = self._record_slot_schema_locked(slot_key, contract)
                     self.stats["local_fastpath_requests"] += 1
                 body = format_provider_response(
@@ -2090,13 +2130,22 @@ class UniversalDecisionService:
 
         upstream_raw = self._call_upstream(wire_format, payload, semantic_text, contract)
         lifecycle_vals, soft_targets, clean_answers = parse_teacher_answers(upstream_raw, contract)
+        in_tok = self._extract_upstream_input_tokens(upstream_raw, est_input_tokens)
+        model_requested = str(payload.get("model") or "")
+        try:
+            strict_json_dumps(clean_answers)
+        except Exception as exc:
+            raise InteropError(
+                f"Upstream response answers contain invalid strict JSON values: {exc}",
+                status_code=502,
+            ) from exc
         if not is_frozen:
             created_new = False
             with self._lock:
                 lc = self._lifecycles.get(lc_key)
                 if lc is None:
                     created_new = True
-                    self._evict_unpromoted_lifecycles_if_needed_locked()
+                    self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=True)
                     lc = SoftDistillingLifecycle(
                         contract,
                         distill_mode=self.distill_mode,
@@ -2115,30 +2164,28 @@ class UniversalDecisionService:
                     structure_sig=req_struct_sig,
                 )
             except BaseException:
-                if created_new:
-                    inner_lc = lc.lifecycle
-                    if (
-                        not inner_lc.admitted_keys
-                        and not inner_lc.quarantine
-                        and not inner_lc.teacher_key_labels
-                    ):
-                        with self._lock:
+                with self._lock:
+                    if created_new:
+                        inner_lc = lc.lifecycle
+                        if (
+                            not inner_lc.admitted_keys
+                            and not inner_lc.quarantine
+                            and not inner_lc.teacher_key_labels
+                        ):
                             if self._lifecycles.get(lc_key) is lc:
                                 self._lifecycles.pop(lc_key, None)
+                    self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
                 raise
 
         with self._lock:
+            if lc_key in self._lifecycles:
+                self._lifecycles.move_to_end(lc_key)
+            self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
             drift_info = self._record_slot_schema_locked(slot_key, contract)
 
-        upstream_usage = upstream_raw.get("usage") if isinstance(upstream_raw, Mapping) else None
-        in_tok = (
-            int(upstream_usage.get("input_tokens", est_input_tokens))
-            if isinstance(upstream_usage, Mapping)
-            else est_input_tokens
-        )
         body = format_provider_response(
             wire_format=wire_format,
-            model_requested=str(payload.get("model") or ""),
+            model_requested=model_requested,
             answers=clean_answers,
             input_tokens=in_tok,
             local_execution=False,
