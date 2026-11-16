@@ -18642,3 +18642,446 @@ def test_astra_44_round31_regressions() -> None:
         assert st_can_u6 == 200
     assert obs_inner_u6.canary_checks == 1
     assert obs_inner_u6._pending_canaries == {}
+
+
+def test_astra_45_round32_regressions() -> None:
+    """In-memory Round-32 adversarial regressions for R32-1 through R32-4 and sister paths."""
+    from concurrent.futures import ThreadPoolExecutor
+    from typing import Tuple
+    from unittest.mock import patch
+
+    from system1.compat.typesafe import TypeSafeClient, _build_dynamic_schema
+    from system1.core import ChoiceField
+    from system1.core.model import SystemOneModel
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.engine import _inspect_varkw_wrapper
+
+    class _R32CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="First")
+        g = ChoiceField(options=("a", "b"), description="Second")
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return values
+
+    class _R32SimpleSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="Single")
+
+    class _R32BaseModel:
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            self._inner = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            )
+            for h in self._inner.heads.values():
+                h.set_weights(np.zeros((2, dim), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+            self.schema = self._inner.schema
+            self.projector = self._inner.projector
+            self.dimension = self._inner.dimension
+            self.heads = self._inner.heads
+
+        def encode(self, prompt: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
+            return self._inner.encode(prompt, recency_weighted=recency_weighted)
+
+        def forward_single(self, prompt: str, embedding: Any = None) -> Any:
+            return self._inner.forward_single(prompt, embedding=embedding)
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            return self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+
+    class _R32SplitHelper:
+        @staticmethod
+        def split(*, use_cache: bool = True, **rest: Any) -> Tuple[bool, Dict[str, Any]]:
+            return use_cache, rest
+
+    # ------------------------------------------------------------------
+    # R32-1: dict.update(), aliased dict update, |=, and item loop copies
+    # preserve **kwargs taint so post-learning validation rolls back.
+    # ------------------------------------------------------------------
+    class _R32DictUpdateModel(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            forwarded.update(kwargs)
+            cached, rest = _R32SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R32AliasDictUpdateModel(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            a_map: Dict[str, Any] = {}
+            b_map = a_map
+            b_map.update(kwargs)
+            cached, rest = _R32SplitHelper.split(**a_map)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R32DictClassUpdateModel(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            dict.update(forwarded, kwargs)
+            cached, rest = _R32SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R32IorModel(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            forwarded |= kwargs
+            cached, rest = _R32SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R32LoopSubscrModel(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            for k_kw, v_kw in kwargs.items():
+                forwarded[k_kw] = v_kw
+            cached, rest = _R32SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R32DictKwUpdateModel(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            forwarded.update(**kwargs)
+            cached, rest = _R32SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R32DictClassKwUpdateModel(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            dict.update(forwarded, **kwargs)
+            cached, rest = _R32SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    x_ones = np.ones(16, dtype=np.float32)
+    for mdl_cls in (
+        _R32DictUpdateModel,
+        _R32AliasDictUpdateModel,
+        _R32DictClassUpdateModel,
+        _R32IorModel,
+        _R32LoopSubscrModel,
+        _R32DictKwUpdateModel,
+        _R32DictClassKwUpdateModel,
+    ):
+        mdl_r1 = mdl_cls(_R32CoupledSchema(), 16)
+        eng_r1 = SystemOneEngine(
+            _R32CoupledSchema,
+            model=mdl_r1,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        assert eng_r1.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_r1.learn("p", {"f": "b"}, embedding=x_ones)
+        assert eng_r1.model_version == 1
+        delattr(mdl_r1, "last")
+        assert eng_r1.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+
+    # ------------------------------------------------------------------
+    # R32-2: Unrelated nested helpers/kwdefaults do not leak kwargs, while
+    # nested helpers/closures/genexprs receiving kwargs still forward them.
+    # ------------------------------------------------------------------
+    class _R32NestedAuditNegDuck(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def audit(prompt: Any) -> Dict[str, bool]:
+                return {"use_cache": False}
+
+            audit(args[0])
+            return super().forward_single(*args, **kwargs)
+
+    class _R32NestedKwDefaultNegDuck(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def audit_kw(prompt: Any, *, use_cache: bool = False) -> Any:
+                return prompt
+
+            audit_kw(args[0])
+            return super().forward_single(*args, **kwargs)
+
+    class _R32SelfMethodNegDuck(_R32BaseModel):
+        def _audit_log(self, kw: Mapping[str, Any]) -> int:
+            return len(kw)
+
+        def _stats(self) -> Dict[str, bool]:
+            return {"use_cache": False}
+
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _ = self._audit_log(kwargs)
+            _ = self._stats()
+            return super().forward_single(*args, **kwargs)
+
+    for neg_cls in (_R32NestedAuditNegDuck, _R32NestedKwDefaultNegDuck, _R32SelfMethodNegDuck):
+        eng_r2_neg = SystemOneEngine(
+            _R32SimpleSchema,
+            model=neg_cls(_R32SimpleSchema(), 16),
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        assert eng_r2_neg.decide("p neg", embedding=x_ones, record_receipt=False).values == {"f": "a"}
+        eng_r2_neg.learn("p neg", {"f": "b"}, embedding=x_ones)
+        assert eng_r2_neg.decide("p neg", embedding=x_ones, record_receipt=False).values == {"f": "b"}
+
+    class _R32NestedSplitPos(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def local_split(*, use_cache: bool = True, **rest: Any) -> Tuple[bool, Dict[str, Any]]:
+                return use_cache, rest
+
+            cached, rest = local_split(**kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R32NestedClosurePos(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pop_closure() -> bool:
+                return bool(kwargs.pop("use_cache", True))
+
+            if pop_closure() and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **kwargs)
+            return self.last
+
+    class _R32GenexprPos(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            had_cache = kwargs.get("use_cache", True)
+            rest = dict((k_i, v_i) for k_i, v_i in kwargs.items() if k_i != "use_cache")
+            if had_cache and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    # Direct wrapper inspection check excluding literal 'use_cache' inside forward_single body.
+    class _R32GenexprPure:
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def _take_kw(d: Dict[str, Any]) -> bool:
+                return bool(d.pop("use_cache", True))
+
+            rest = dict((k_i, _take_kw(kwargs) if k_i == "k" else v_i) for k_i, v_i in kwargs.items())
+            return args, rest
+
+    ref_gen, _ = _inspect_varkw_wrapper(_R32GenexprPure().forward_single, frozenset({"use_cache"}))
+    assert "use_cache" in ref_gen
+
+    for pos_cls in (_R32NestedSplitPos, _R32NestedClosurePos, _R32GenexprPos):
+        mdl_r2p = pos_cls(_R32CoupledSchema(), 16)
+        eng_r2p = SystemOneEngine(
+            _R32CoupledSchema,
+            model=mdl_r2p,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        assert eng_r2p.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_r2p.learn("p", {"f": "b"}, embedding=x_ones)
+        assert eng_r2p.model_version == 1
+
+    # ------------------------------------------------------------------
+    # R32-3: post_compile_hook failure inside step() & observe_teacher()
+    # rolls back local_accept_eligible, canary_checks, admission, & milestones.
+    # ------------------------------------------------------------------
+    class _R32ChoiceOnlySchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="Binary")
+
+    def _r32_teacher(prompt: str) -> Dict[str, str]:
+        return {"f": "a" if "billing" in prompt else "b"}
+
+    fail_at_101 = False
+
+    def _build_r32_lifecycle() -> AutoCutoverLifecycle:
+        lc = AutoCutoverLifecycle(
+            _R32ChoiceOnlySchema(),
+            teacher=_r32_teacher,
+            post_compile_hook=lambda eng, pairs: (_ for _ in ()).throw(
+                RuntimeError("post compile hook fail")
+            )
+            if (fail_at_101 and len(lc.admitted_keys) >= 101)
+            else None,
+            config=CutoverConfig(
+                milestones=(100, 101),
+                k_min=2,
+                canary_rate=0.5,
+                sparse_dim=128,
+                dense_dim=32,
+                enable_quarantine=False,
+            ),
+        )
+        for i in range(100):
+            if i % 2 == 0:
+                p_i = f"billing invoice payment charge account ticket number {i}"
+                v_i = {"f": "a"}
+            else:
+                p_i = f"password login reset access security ticket number {i}"
+                v_i = {"f": "b"}
+            lc.observe_teacher(p_i, v_i)
+        assert lc.state == "SELECTIVE_HOT_SWAP"
+        return lc
+
+    # 1. Closed-loop step() reproduction.
+    fail_at_101 = True
+    lc_s = _build_r32_lifecycle()
+    r1000 = lc_s.step("billing invoice payment charge account ticket number 1000")
+    assert r1000.used_teacher is False and r1000.is_canary is False
+    assert lc_s.local_accept_eligible == 1
+    assert lc_s.canary_checks == 0
+    assert lc_s.next_milestone_idx == 1
+
+    with pytest.raises(RuntimeError, match="post compile hook fail"):
+        lc_s.step("billing invoice payment charge account ticket number 1001")
+    assert lc_s.local_accept_eligible == 1
+    assert lc_s.canary_checks == 0
+    assert len(lc_s.admitted_keys) == 100
+    assert lc_s.next_milestone_idx == 1
+
+    # Retrying with failure still active must fail identically rather than skip the canary.
+    with pytest.raises(RuntimeError, match="post compile hook fail"):
+        lc_s.step("billing invoice payment charge account ticket number 1001")
+    assert lc_s.local_accept_eligible == 1
+    assert lc_s.canary_checks == 0
+
+    fail_at_101 = False
+    r1001 = lc_s.step("billing invoice payment charge account ticket number 1001")
+    assert r1001.used_teacher is True
+    assert r1001.is_canary is True
+    assert r1001.compile_triggered is True
+    assert lc_s.canary_checks == 1
+    assert lc_s.local_accept_eligible == 2
+    assert len(lc_s.admitted_keys) == 101
+
+    # 2. Sister path: decide_local() + observe_teacher() under the same failure.
+    fail_at_101 = True
+    lc_o = _build_r32_lifecycle()
+    assert lc_o.decide_local("billing invoice payment charge account ticket number 1000") == {"f": "a"}
+    assert lc_o.local_accept_eligible == 1
+    assert lc_o.decide_local("billing invoice payment charge account ticket number 1001") is None
+    assert lc_o.local_accept_eligible == 2
+    with pytest.raises(RuntimeError, match="post compile hook fail"):
+        lc_o.observe_teacher("billing invoice payment charge account ticket number 1001", {"f": "a"})
+    assert lc_o.local_accept_eligible == 1
+    assert lc_o.canary_checks == 0
+    assert len(lc_o.admitted_keys) == 100
+    assert lc_o.next_milestone_idx == 1
+    assert lc_o._pending_canaries == {}
+    assert lc_o._untracked_canaries == {}
+    assert lc_o._untracked_canary_de == {}
+
+    fail_at_101 = False
+    assert lc_o.decide_local("billing invoice payment charge account ticket number 1001") is None
+    assert lc_o.observe_teacher("billing invoice payment charge account ticket number 1001", {"f": "a"}) is True
+    assert lc_o.canary_checks == 1
+    assert lc_o.local_accept_eligible == 2
+    assert len(lc_o.admitted_keys) == 101
+
+    # ------------------------------------------------------------------
+    # R32-4: Delayed TypeSafeClient local response does not overwrite an
+    # evicted or replacement lifecycle under max_unpromoted_lifecycles=1.
+    # ------------------------------------------------------------------
+    q_ts_a = {"act": {"type": "choice", "instructions": "r32-4 A", "criteria": ["a", "b"]}}
+    q_ts_b = {"act": {"type": "choice", "instructions": "r32-4 B", "criteria": ["a", "b"]}}
+    digest_a = _build_dynamic_schema(q_ts_a).schema_digest()
+
+    client_r4 = TypeSafeClient(
+        api_key="tok-r32",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=CutoverConfig(
+            milestones=(36,),
+            k_min=2,
+            canary_rate=0.5,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+        max_unpromoted_lifecycles=1,
+        baseline_handler=lambda s, q: {
+            "answers": {
+                "act": {
+                    "type": "choice",
+                    "choice": "b" if "reject" in str(s) else "a",
+                    "value": "b" if "reject" in str(s) else "a",
+                }
+            }
+        },
+    )
+    for i in range(36):
+        p_t = (
+            f"accept approve pleasant detail number {i}"
+            if (i % 2 == 0)
+            else f"reject deny dangerous detail number {i}"
+        )
+        client_r4.decide(p_t, q_ts_a)
+
+    old_lc_a = client_r4._cutover_lifecycles[digest_a]
+    assert not client_r4._is_lifecycle_promoted(old_lc_a)
+    assert len(old_lc_a.clean_cache) > 0
+    cached_key_a = next(iter(old_lc_a.clean_cache))
+    cached_prompt_a = next(
+        f"accept approve pleasant detail number {i}"
+        for i in range(0, 36, 2)
+        if f"accept approve pleasant detail number {i}" in old_lc_a.clean_cache
+    ) if any(f"accept approve pleasant detail number {i}" in old_lc_a.clean_cache for i in range(0, 36, 2)) else cached_key_a
+
+    paused_entered = threading.Event()
+    paused_release = threading.Event()
+    orig_decide_tx = AutoCutoverLifecycle._decide_local_with_tx
+
+    def _pause_after_local_hit(self_lc: AutoCutoverLifecycle, prompt: str, *args: Any, **kwargs: Any) -> Any:
+        out = orig_decide_tx(self_lc, prompt, *args, **kwargs)
+        if self_lc is old_lc_a and out[0] is not None and prompt == cached_prompt_a:
+            paused_entered.set()
+            assert paused_release.wait(timeout=5.0)
+        return out
+
+    with ThreadPoolExecutor(max_workers=2) as pool_r4:
+        with patch.object(AutoCutoverLifecycle, "_decide_local_with_tx", _pause_after_local_hit):
+            fut_delayed = pool_r4.submit(client_r4.decide, cached_prompt_a, q_ts_a)
+            assert paused_entered.wait(timeout=5.0)
+        # Schema B evicts old_lc_a; new schema A request creates a replacement lifecycle with "new committed".
+        client_r4.decide("schema B evicts A", q_ts_b)
+        assert digest_a not in client_r4._cutover_lifecycles
+        client_r4.decide("new committed", q_ts_a)
+        new_lc_a = client_r4._cutover_lifecycles[digest_a]
+        assert new_lc_a is not old_lc_a
+        assert "new committed" in new_lc_a.admitted_keys
+
+        paused_release.set()
+        delayed_resp = fut_delayed.result(timeout=5.0)
+        assert delayed_resp["local_execution"] is True
+
+    assert client_r4._cutover_lifecycles[digest_a] is new_lc_a
+    assert "new committed" in client_r4._cutover_lifecycles[digest_a].admitted_keys
+    assert len(client_r4._cutover_lifecycles) <= 1
+    assert len(client_r4._lc_committed_ops) <= 1
+    assert client_r4._lc_pending_new_bind == {}
+

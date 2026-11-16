@@ -2523,16 +2523,26 @@ class TypeSafeClient:
                                         else:
                                             self._injected_lc_digest = digest
                                     if commit_local:
-                                        if digest not in self._cutover_lifecycles:
+                                        cur_reg_lc = self._cutover_lifecycles.get(digest)
+                                        if cur_reg_lc is cand_lc:
+                                            self._cutover_lifecycles.move_to_end(digest)
+                                            self._lc_committed_ops[id(cand_lc)] += 1
+                                            pend_b = self._lc_pending_new_bind.get(digest)
+                                            if pend_b is not None and pend_b[0] is cand_lc:
+                                                self._lc_pending_new_bind.pop(digest, None)
+                                        elif used_injected_cand and cur_reg_lc is None and existing_lc is None:
                                             self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
-                                        self._cutover_lifecycles[digest] = cand_lc
-                                        self._cutover_lifecycles.move_to_end(digest)
-                                        self._lc_committed_ops[id(cand_lc)] += 1
-                                        self._lc_pending_new_bind.pop(digest, None)
+                                            self._cutover_lifecycles[digest] = cand_lc
+                                            self._cutover_lifecycles.move_to_end(digest)
+                                            self._lc_committed_ops[id(cand_lc)] += 1
+                                            self._lc_pending_new_bind.pop(digest, None)
                                         self._call_count[digest] += 1
                                         self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
-                                        if digest not in self._cutover_lifecycles:
+                                        if digest not in self._cutover_lifecycles and not (
+                                            cand_lc is self.auto_cutover_lifecycle and self._injected_lc_digest == digest
+                                        ):
                                             self._retire_evicted_schema_bookkeeping_locked(digest)
+                                        self._prune_orphaned_lc_bookkeeping_locked()
                                 if commit_local:
                                     local_tx = None
                                     return SystemOneResponse({

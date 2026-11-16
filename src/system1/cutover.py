@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import copy
 import dataclasses
 from dataclasses import dataclass
 from enum import Enum
@@ -693,11 +694,12 @@ class AutoCutoverLifecycle:
         ):
             return False
 
+        next_milestone_idx = self.next_milestone_idx
         while (
-            self.next_milestone_idx < len(self.config.milestones)
-            and n_adm >= self.config.milestones[self.next_milestone_idx]
+            next_milestone_idx < len(self.config.milestones)
+            and n_adm >= self.config.milestones[next_milestone_idx]
         ):
-            self.next_milestone_idx += 1
+            next_milestone_idx += 1
 
         active_list = sorted(
             c
@@ -705,6 +707,7 @@ class AutoCutoverLifecycle:
             if len(tr) >= 2 and len(self.calib_by_class.get(c, ())) >= 1
         )
         if len(active_list) < 2:
+            self.next_milestone_idx = next_milestone_idx
             return False
 
         tr_pairs = [x for c in active_list for x in self.train_by_class[c]]
@@ -718,6 +721,7 @@ class AutoCutoverLifecycle:
             else:
                 cal_keys.extend(_normalize_cache_key(p_c) for p_c, _ in cls_pairs)
         if len(tr_pairs) < 24 or len(cal_pairs) < 12:
+            self.next_milestone_idx = next_milestone_idx
             return False
 
         t0 = time.perf_counter()
@@ -791,13 +795,14 @@ class AutoCutoverLifecycle:
             augment=False,
         )
 
-        self.eta_hat = self._estimate_noise_rate(proj, tr_pairs, active_list)
+        next_eta_hat = self._estimate_noise_rate(proj, tr_pairs, active_list)
+        aci_stage = copy.deepcopy(self.aci)
         sub_eng = SystemOneEngine(
             active_schema,
             model=compiled,
             strict_mode=True,
             use_cache=False,
-            aci_tracker=self.aci,
+            aci_tracker=aci_stage,
         )
         sub_eng.default_alpha = self.config.alpha_target
         if self.post_compile_hook is not None and self.post_compile_hook(sub_eng, tr_pairs):
@@ -846,7 +851,7 @@ class AutoCutoverLifecycle:
         alpha_calib = min(
             0.18,
             self.config.alpha_target
-            + self.eta_hat * (1.0 - self.config.alpha_target * k_act / max(1, k_act - 1)),
+            + next_eta_hat * (1.0 - self.config.alpha_target * k_act / max(1, k_act - 1)),
         )
         sel_cal = SelectiveRiskCalibrator(
             score_name="margin",
@@ -863,24 +868,29 @@ class AutoCutoverLifecycle:
             tau = float(sel_cal.threshold)
             tau_src = "ltt_bonferroni"
         else:
-            tau = self._select_shadow_threshold_locked(margins_cal, correct_cal, self.eta_hat, k_act)
+            tau = self._select_shadow_threshold_locked(margins_cal, correct_cal, next_eta_hat, k_act)
             tau_src = "debiased_shadow" if tau is not None else "none"
 
         by_c: Dict[str, List[np.ndarray]] = {}
         for v, lbl in zip(self.admitted_vecs, self.admitted_labels):
             by_c.setdefault(lbl, []).append(v)
-        self.class_centroids = {}
-        self.class_sim_floors = {}
+        new_class_centroids: Dict[str, np.ndarray] = {}
+        new_class_sim_floors: Dict[str, float] = {}
         for c, vs in by_c.items():
             mat = np.stack(vs, axis=0)
             cent = np.mean(mat, axis=0)
             cent = cent / max(1e-8, float(np.linalg.norm(cent)))
-            self.class_centroids[c] = cent
+            new_class_centroids[c] = cent
             sims = mat @ cent
-            self.class_sim_floors[c] = (
+            new_class_sim_floors[c] = (
                 float(np.quantile(sims, self.config.cls_sim_q)) if len(sims) >= 5 else 0.30
             )
 
+        self.class_centroids = new_class_centroids
+        self.class_sim_floors = new_class_sim_floors
+        self.next_milestone_idx = next_milestone_idx
+        self.eta_hat = next_eta_hat
+        sub_eng.aci_tracker = self.aci
         self.engine = sub_eng
         self.selective_cal = sel_cal
         self.active_tau = tau
@@ -1120,6 +1130,95 @@ class AutoCutoverLifecycle:
         )
         return vals
 
+    def _snapshot_mutation_state_locked(self) -> Dict[str, Any]:
+        return {
+            "local_accept_eligible": self.local_accept_eligible,
+            "step_count": self.step_count,
+            "local_hits": self.local_hits,
+            "canary_checks": self.canary_checks,
+            "canary_window": collections.deque(self.canary_window, maxlen=self.canary_window.maxlen),
+            "aci": copy.deepcopy(self.aci),
+            "drift_monitor": copy.deepcopy(self.drift_monitor),
+            "n_adm": len(self.admitted_vecs),
+            "admitted_keys": set(self.admitted_keys),
+            "ng_df": dict(self.ng_df),
+            "class_counts": dict(self.class_counts),
+            "train_by_class": {k: list(v) for k, v in self.train_by_class.items()},
+            "calib_by_class": {k: list(v) for k, v in self.calib_by_class.items()},
+            "_calib_cache_keys": {k: list(v) for k, v in self._calib_cache_keys.items()},
+            "quarantine": list(self.quarantine),
+            "quarantined_total": self.quarantined_total,
+            "state": self.state,
+            "compiled_active": self.compiled_active,
+            "active_classes": set(self.active_classes),
+            "mature_classes": set(self.mature_classes),
+            "selective_cal": self.selective_cal,
+            "engine": self.engine,
+            "active_tau": self.active_tau,
+            "tau_source": self.tau_source,
+            "eta_hat": self.eta_hat,
+            "last_compile_n": self.last_compile_n,
+            "next_milestone_idx": self.next_milestone_idx,
+            "pending_recalibrate": self.pending_recalibrate,
+            "class_centroids": dict(self.class_centroids),
+            "class_sim_floors": dict(self.class_sim_floors),
+            "teacher_key_labels": {k: dict(v) for k, v in self.teacher_key_labels.items()},
+            "clean_cache": {k: dict(v) for k, v in self.clean_cache.items()},
+            "_conflicted_cache_keys": set(self._conflicted_cache_keys),
+            "recent_unseen_window": collections.deque(
+                self.recent_unseen_window, maxlen=self.recent_unseen_window.maxlen
+            ),
+            "cutover_events": list(self.cutover_events),
+            "recalibrate_events": list(self.recalibrate_events),
+            "compile_time_total_ms": self.compile_time_total_ms,
+        }
+
+    def _restore_mutation_state_locked(self, snap: Dict[str, Any]) -> None:
+        self.local_accept_eligible = snap["local_accept_eligible"]
+        self.step_count = snap["step_count"]
+        self.local_hits = snap["local_hits"]
+        self.canary_checks = snap["canary_checks"]
+        self.canary_window = snap["canary_window"]
+        self.aci = snap["aci"]
+        if getattr(self, "engine", None) is not snap["engine"]:
+            self.engine = snap["engine"]
+        if self.engine is not None and hasattr(self.engine, "aci_tracker"):
+            self.engine.aci_tracker = self.aci
+        self.drift_monitor = snap["drift_monitor"]
+        n_adm = snap["n_adm"]
+        del self.admitted_vecs[n_adm:]
+        del self.admitted_labels[n_adm:]
+        del self.admitted_values[n_adm:]
+        del self.admitted_lengths[n_adm:]
+        self.admitted_keys = snap["admitted_keys"]
+        self.ng_df = snap["ng_df"]
+        self.class_counts = snap["class_counts"]
+        self.train_by_class = snap["train_by_class"]
+        self.calib_by_class = snap["calib_by_class"]
+        self._calib_cache_keys = snap["_calib_cache_keys"]
+        self.quarantine = snap["quarantine"]
+        self.quarantined_total = snap["quarantined_total"]
+        self.state = snap["state"]
+        self.compiled_active = snap["compiled_active"]
+        self.active_classes = snap["active_classes"]
+        self.mature_classes = snap["mature_classes"]
+        self.selective_cal = snap["selective_cal"]
+        self.active_tau = snap["active_tau"]
+        self.tau_source = snap["tau_source"]
+        self.eta_hat = snap["eta_hat"]
+        self.last_compile_n = snap["last_compile_n"]
+        self.next_milestone_idx = snap["next_milestone_idx"]
+        self.pending_recalibrate = snap["pending_recalibrate"]
+        self.class_centroids = snap["class_centroids"]
+        self.class_sim_floors = snap["class_sim_floors"]
+        self.teacher_key_labels = snap["teacher_key_labels"]
+        self.clean_cache = snap["clean_cache"]
+        self._conflicted_cache_keys = snap["_conflicted_cache_keys"]
+        self.recent_unseen_window = snap["recent_unseen_window"]
+        self.cutover_events = snap["cutover_events"]
+        self.recalibrate_events = snap["recalibrate_events"]
+        self.compile_time_total_ms = snap["compile_time_total_ms"]
+
     def observe_teacher(
         self,
         prompt: str,
@@ -1140,46 +1239,63 @@ class AutoCutoverLifecycle:
             raise
         with self._lock:
             key = _resolve_cache_key(prompt, cache_key)
-            pending: Optional[Tuple[Dict[str, Any], float, bool]] = None
-            if has_bound or eff_canary_tx is not None:
-                tx_tok = (
-                    eff_canary_tx[4]
-                    if (isinstance(eff_canary_tx, tuple) and len(eff_canary_tx) >= 5)
-                    else None
-                )
-                if tx_tok is _UNTRACKED_CANARY_SENTINEL:
+            obs_snap = self._snapshot_mutation_state_locked()
+            stack_snap = {k: list(v) for k, v in self._pending_canary_stack.items()}
+            untr_snap = dict(self._untracked_canaries)
+            untr_de_snap = dict(self._untracked_canary_de)
+            try:
+                pending: Optional[Tuple[Dict[str, Any], float, bool]] = None
+                if has_bound or eff_canary_tx is not None:
+                    tx_tok = (
+                        eff_canary_tx[4]
+                        if (isinstance(eff_canary_tx, tuple) and len(eff_canary_tx) >= 5)
+                        else None
+                    )
+                    if tx_tok is _UNTRACKED_CANARY_SENTINEL:
+                        pending = self._untracked_canaries.pop(key, None)
+                        self._untracked_canary_de.pop(key, None)
+                        self._sync_pending_canary_locked(key)
+                    elif tx_tok is not None:
+                        stack = self._pending_canary_stack.get(key)
+                        if stack is not None:
+                            new_stack: List[Tuple[object, Tuple[Dict[str, Any], float, bool]]] = []
+                            for pair in stack:
+                                if pending is None and pair[0] is tx_tok:
+                                    pending = pair[1]
+                                else:
+                                    new_stack.append(pair)
+                            self._pending_canary_stack[key] = new_stack
+                            self._sync_pending_canary_locked(key)
+                else:
                     pending = self._untracked_canaries.pop(key, None)
                     self._untracked_canary_de.pop(key, None)
+                    if pending is None and key in self._pending_canaries and key not in self._pending_canary_stack:
+                        pending = self._pending_canaries.pop(key, None)
                     self._sync_pending_canary_locked(key)
-                elif tx_tok is not None:
-                    stack = self._pending_canary_stack.get(key)
-                    if stack is not None:
-                        new_stack: List[Tuple[object, Tuple[Dict[str, Any], float, bool]]] = []
-                        for pair in stack:
-                            if pending is None and pair[0] is tx_tok:
-                                pending = pair[1]
-                            else:
-                                new_stack.append(pair)
-                        self._pending_canary_stack[key] = new_stack
-                        self._sync_pending_canary_locked(key)
-            else:
-                pending = self._untracked_canaries.pop(key, None)
-                self._untracked_canary_de.pop(key, None)
-                if pending is None and key in self._pending_canaries and key not in self._pending_canary_stack:
-                    pending = self._pending_canaries.pop(key, None)
+                if pending is not None:
+                    pred_vals, margin, from_cache = pending
+                    self._record_canary_check_locked(
+                        pred_vals,
+                        validated,
+                        margin=margin,
+                        from_cache=from_cache,
+                    )
+                quarantined = self._try_admit_or_quarantine_locked(prompt, validated, cache_key=key)
+                self._maybe_micro_compile_locked()
+                self.step_count += 1
+                return not quarantined
+            except BaseException:
+                self._restore_mutation_state_locked(obs_snap)
+                self._pending_canary_stack = stack_snap
+                self._untracked_canaries = untr_snap
+                self._untracked_canary_de = untr_de_snap
+                if not has_bound and eff_canary_tx is None:
+                    self._untracked_canaries.pop(key, None)
+                    prev_de = self._untracked_canary_de.pop(key, 0)
+                    if prev_de:
+                        self.local_accept_eligible = max(0, self.local_accept_eligible - prev_de)
                 self._sync_pending_canary_locked(key)
-            if pending is not None:
-                pred_vals, margin, from_cache = pending
-                self._record_canary_check_locked(
-                    pred_vals,
-                    validated,
-                    margin=margin,
-                    from_cache=from_cache,
-                )
-            quarantined = self._try_admit_or_quarantine_locked(prompt, validated, cache_key=key)
-            self._maybe_micro_compile_locked()
-            self.step_count += 1
-            return not quarantined
+                raise
 
     def step(self, prompt: str) -> CutoverStepResult:
         """Execute one closed-loop step against ``self.teacher``."""
@@ -1190,9 +1306,9 @@ class AutoCutoverLifecycle:
             )
 
         with self._lock:
-            compile_triggered = self._maybe_micro_compile_locked()
-            e0 = self.local_accept_eligible
+            step_snap = self._snapshot_mutation_state_locked()
             try:
+                compile_triggered = self._maybe_micro_compile_locked()
                 accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(prompt)
                 if accepted and vals is not None:
                     self.step_count += 1
@@ -1209,28 +1325,28 @@ class AutoCutoverLifecycle:
 
                 teacher_raw = self.teacher(prompt)
                 validated = self._coerce_teacher_values(teacher_raw)
-            except BaseException:
-                self.local_accept_eligible = e0
-                raise
-            if is_canary and vals is not None:
-                self._record_canary_check_locked(
-                    vals,
-                    validated,
+                if is_canary and vals is not None:
+                    self._record_canary_check_locked(
+                        vals,
+                        validated,
+                        margin=margin,
+                        from_cache=from_cache,
+                    )
+                quarantined = self._try_admit_or_quarantine_locked(prompt, validated)
+                compile_triggered = self._maybe_micro_compile_locked() or compile_triggered
+                self.step_count += 1
+                return CutoverStepResult(
+                    values=validated,
+                    used_teacher=True,
+                    state=self.state,
+                    is_canary=is_canary,
+                    quarantined=quarantined,
                     margin=margin,
-                    from_cache=from_cache,
+                    compile_triggered=compile_triggered,
                 )
-            quarantined = self._try_admit_or_quarantine_locked(prompt, validated)
-            compile_triggered = self._maybe_micro_compile_locked() or compile_triggered
-            self.step_count += 1
-            return CutoverStepResult(
-                values=validated,
-                used_teacher=True,
-                state=self.state,
-                is_canary=is_canary,
-                quarantined=quarantined,
-                margin=margin,
-                compile_triggered=compile_triggered,
-            )
+            except BaseException:
+                self._restore_mutation_state_locked(step_snap)
+                raise
 
     def summary(self) -> Dict[str, Any]:
         """Return diagnostic snapshot of reservoirs, lifecycle state, and drift events."""

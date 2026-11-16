@@ -622,22 +622,104 @@ def _safe_stack_effect(ins: Any, *, default: int = 0) -> int:
         return default
 
 
-def _extract_kw_unpack_targets(
+def _analyze_code_kw_flow(
     code: types.CodeType,
     taint_vars: Optional[frozenset[str]] = None,
-) -> Tuple[set[str], set[Tuple[str, str]], set[str], set[str], set[Tuple[str, str]], set[str]]:
-    """Return bytecode callable targets for CALL_FUNCTION_EX (**kwargs) and non-zero-arg CALLs."""
+    candidate_keys: frozenset[str] = frozenset(),
+) -> Tuple[
+    set[str],
+    set[Tuple[str, str]],
+    set[str],
+    set[str],
+    set[Tuple[str, str]],
+    set[str],
+    set[str],
+    Dict[int, types.CodeType],
+    Dict[int, Tuple[types.CodeType, bool]],
+    frozenset[str],
+    Dict[str, types.CodeType],
+]:
+    """Analyze bytecode callable targets, mutated dict taint, and active constants."""
     unpacked_names: set[str] = set()
     unpacked_owner_attrs: set[Tuple[str, str]] = set()
     unpacked_leaf_attrs: set[str] = set()
     arg_names: set[str] = set()
     arg_owner_attrs: set[Tuple[str, str]] = set()
     arg_leaf_attrs: set[str] = set()
+    active_consts: set[str] = set()
+    unpacked_codes: Dict[int, types.CodeType] = {}
+    tainted_codes: Dict[int, Tuple[types.CodeType, bool]] = {}
 
-    stack: List[set[Tuple[str, Any]]] = []
+    tainted_boxes: set[int] = set()
+    unpacked_boxes: set[int] = set()
     locals_env: Dict[str, set[Tuple[str, Any]]] = {
         vn: {("kw_taint", True)} for vn in (taint_vars or ())
     }
+    _mut_dict_methods = frozenset({"update", "setdefault"})
+
+    def _collect_val_consts(val: Any, dst: set[str], depth: int = 0) -> None:
+        if isinstance(val, types.CodeType):
+            return
+        if isinstance(val, str):
+            if val in candidate_keys:
+                dst.add(val)
+            return
+        if depth >= 3:
+            return
+        if isinstance(val, (tuple, list, set, frozenset)):
+            for item in val:
+                _collect_val_consts(item, dst, depth + 1)
+        elif isinstance(val, Mapping):
+            for k_item, v_item in val.items():
+                _collect_val_consts(k_item, dst, depth + 1)
+                _collect_val_consts(v_item, dst, depth + 1)
+
+    def _slot_is_tainted(slot: set[Tuple[str, Any]]) -> bool:
+        if taint_vars is None or ("kw_taint", True) in slot:
+            return True
+        return any(k == "box_id" and v in tainted_boxes for k, v in slot)
+
+    def _slot_consts(slot: set[Tuple[str, Any]]) -> frozenset[str]:
+        parts = [v for k, v in slot if k == "consts" and v]
+        return frozenset().union(*parts) if parts else frozenset()
+
+    def _flush_consts(*slots: set[Tuple[str, Any]]) -> None:
+        for sl in slots:
+            for k, v in sl:
+                if k == "consts" and v:
+                    active_consts.update(v)
+
+    def _taint_receiver_slot(slot: set[Tuple[str, Any]]) -> None:
+        for kind, val in slot:
+            if kind in ("name", "recv_var") and isinstance(val, str) and val != "self":
+                ent = locals_env.setdefault(val, set())
+                ent.add(("kw_taint", True))
+                ent.discard(("lit_map", None))
+                for ek, ev in list(ent):
+                    if ek == "box_id":
+                        tainted_boxes.add(ev)
+                        unpacked_boxes.add(ev)
+            elif kind in ("box_id", "recv_box"):
+                tainted_boxes.add(val)
+                unpacked_boxes.add(val)
+
+    def _activate_nested_slots(
+        slots: Sequence[set[Tuple[str, Any]]],
+        *,
+        is_unpacked: bool,
+        with_tainted_args: bool,
+    ) -> None:
+        for sl in slots:
+            for kind, val in sl:
+                if kind == "fn_def_consts" and val:
+                    active_consts.update(val)
+                elif kind == "code" and isinstance(val, types.CodeType):
+                    cid_s = id(val)
+                    if is_unpacked:
+                        unpacked_codes[cid_s] = val
+                    prev_entry = tainted_codes.get(cid_s)
+                    prev_flag = prev_entry[1] if prev_entry is not None else False
+                    tainted_codes[cid_s] = (val, prev_flag or with_tainted_args or is_unpacked)
 
     def _record(slot: set[Tuple[str, Any]], *, unpacked: bool) -> None:
         names_dst = unpacked_names if unpacked else arg_names
@@ -655,198 +737,429 @@ def _extract_kw_unpack_targets(
         slot = (set(locals_env[varname]) if varname in locals_env else set()) | {("name", varname)}
         if taint_vars is None or varname in taint_vars:
             slot.add(("kw_taint", True))
+        if any(k == "box_id" and v in tainted_boxes for k, v in slot):
+            slot.add(("kw_taint", True))
+            slot.discard(("lit_map", None))
         return slot
 
-    for ins in dis.get_instructions(code):
-        op = ins.opname
-        arg_int = ins.arg if isinstance(ins.arg, int) else 0
-        if op == "PUSH_NULL":
-            stack.append({("null", None)})
-            continue
-        if op == "LOAD_GLOBAL":
-            if arg_int & 1:
-                stack.append({("null", None)})
-            stack.append({("name", str(ins.argval))})
-            continue
-        if op in (
-            "LOAD_NAME",
-            "LOAD_DEREF",
-            "LOAD_CLOSURE",
-            "LOAD_FAST",
-            "LOAD_FAST_BORROW",
-            "LOAD_FAST_CHECK",
-            "LOAD_FAST_AND_CLEAR",
-        ):
-            stack.append(_load_var_slot(str(ins.argval)))
-            continue
-        if op in ("LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW") and (
-            isinstance(ins.argval, tuple) and len(ins.argval) == 2
-        ):
-            for vn in ins.argval:
-                stack.append(_load_var_slot(str(vn)))
-            continue
-        if op == "LOAD_ATTR":
-            base = stack.pop() if stack else set()
-            attr_name = str(ins.argval)
-            derived: set[Tuple[str, Any]] = {("leaf_attr", attr_name)}
-            for kind, val in base:
-                if kind == "name":
-                    derived.add(("attr", (val, attr_name)))
-                elif kind == "attr":
-                    derived.add(("attr", (val[1], attr_name)))
-            if ("kw_taint", True) in base:
-                derived.add(("kw_taint", True))
-            if arg_int & 1:
-                stack.append(derived)
-                stack.append({("null", None)})
-            else:
-                stack.append(derived)
-            continue
-        if op == "LOAD_SUPER_ATTR":
-            # Pops self, class, super; pushes method (+ optional self/NULL).
-            base = stack[-1] if stack else set()
-            eff = _safe_stack_effect(ins, default=-2)
-            pops = 3
-            for _ in range(pops):
-                if stack:
-                    stack.pop()
-            push_cnt = eff + pops
-            derived_sup: set[Tuple[str, Any]] = {("leaf_attr", str(ins.argval)), ("attr", ("super", str(ins.argval)))}
-            for kind, val in base:
-                if kind == "name":
-                    derived_sup.add(("attr", (val, str(ins.argval))))
-            if ("kw_taint", True) in base:
-                derived_sup.add(("kw_taint", True))
-            for j in range(max(0, push_cnt)):
-                stack.append(derived_sup if j == 0 else {("null", None)})
-            continue
-        if op in ("STORE_FAST", "STORE_NAME", "STORE_DEREF"):
-            top = stack.pop() if stack else set()
-            locals_env.setdefault(str(ins.argval), set()).update(top)
-            continue
-        if op == "STORE_FAST_STORE_FAST" and isinstance(ins.argval, tuple) and len(ins.argval) == 2:
-            t1 = stack.pop() if stack else set()
-            t2 = stack.pop() if stack else set()
-            locals_env.setdefault(str(ins.argval[0]), set()).update(t1)
-            locals_env.setdefault(str(ins.argval[1]), set()).update(t2)
-            continue
-        if op == "STORE_FAST_LOAD_FAST" and isinstance(ins.argval, tuple) and len(ins.argval) == 2:
-            t1 = stack.pop() if stack else set()
-            locals_env.setdefault(str(ins.argval[0]), set()).update(t1)
-            stack.append(_load_var_slot(str(ins.argval[1])))
-            continue
-        if op == "SWAP":
-            if 1 <= arg_int <= len(stack):
-                stack[-1], stack[-arg_int] = stack[-arg_int], stack[-1]
-            continue
-        if op == "COPY":
-            stack.append(set(stack[-arg_int]) if 1 <= arg_int <= len(stack) else set())
-            continue
-        if op == "BUILD_MAP":
-            had_t = False
-            for _ in range(2 * arg_int):
-                s = stack.pop() if stack else set()
-                if ("kw_taint", True) in s:
-                    had_t = True
-            res_map: set[Tuple[str, Any]] = {("lit_map", None)}
-            if had_t:
-                res_map.add(("kw_taint", True))
-            stack.append(res_map)
-            continue
-        if op == "BUILD_CONST_KEY_MAP":
-            had_t = False
-            for _ in range(arg_int + 1):
-                s = stack.pop() if stack else set()
-                if ("kw_taint", True) in s:
-                    had_t = True
-            res_ckm: set[Tuple[str, Any]] = {("lit_map", None)}
-            if had_t:
-                res_ckm.add(("kw_taint", True))
-            stack.append(res_ckm)
-            continue
-        if op in ("DICT_MERGE", "DICT_UPDATE"):
-            src_map = stack.pop() if stack else set()
-            if 1 <= arg_int <= len(stack):
-                dst_map = stack[-arg_int]
-                dst_map.discard(("lit_map", None))
-                dst_map.discard(("null", None))
-                dst_map.add(("kw_unpack", None))
-                if ("kw_taint", True) in src_map:
-                    dst_map.add(("kw_taint", True))
-            continue
-        if op == "UNPACK_SEQUENCE":
-            top = stack.pop() if stack else set()
-            has_t = ("kw_taint", True) in top
-            for _ in range(arg_int):
-                stack.append({("kw_taint", True)} if has_t else set())
-            continue
-        if op == "CALL_FUNCTION_EX":
-            eff = _safe_stack_effect(
-                ins,
-                default=(-3 if ins.arg is None else (-2 - (1 if (arg_int & 1) else 0))),
-            )
-            total_pop = max(0, 1 - eff)
-            popped = [stack.pop() if stack else set() for _ in range(total_pop)]
-            if ins.arg is None or (arg_int & 1):
-                kw_slot = popped[0] if len(popped) >= 1 else set()
-                pos_slot = popped[1] if len(popped) >= 2 else set()
-                callable_slots = popped[2:]
-                has_kw_map = (
-                    bool(kw_slot)
-                    and ("null", None) not in kw_slot
-                    and kw_slot != {("lit_map", None)}
-                )
-            else:
-                kw_slot = set()
-                pos_slot = popped[0] if len(popped) >= 1 else set()
-                callable_slots = popped[1:]
-                has_kw_map = False
-            kw_tainted = (taint_vars is None) or (("kw_taint", True) in kw_slot)
-            any_tainted = (
-                kw_tainted
-                or (("kw_taint", True) in pos_slot)
-                or any(("kw_taint", True) in s for s in callable_slots)
-            )
-            for slot in callable_slots:
-                if has_kw_map and kw_tainted:
-                    _record(slot, unpacked=True)
-                    _record(slot, unpacked=False)
-                elif any_tainted:
-                    _record(slot, unpacked=False)
-            stack.append({("kw_taint", True)} if any_tainted else set())
-            continue
-        if op in ("CALL", "CALL_KW"):
-            eff = _safe_stack_effect(ins, default=-(arg_int + 1))
-            total_pop = max(0, 1 - eff)
-            popped = [stack.pop() if stack else set() for _ in range(total_pop)]
-            kw_names_cnt = 1 if op == "CALL_KW" else 0
-            arg_slots = popped[kw_names_cnt : kw_names_cnt + arg_int]
-            callable_slots = popped[kw_names_cnt + arg_int :]
-            args_tainted = arg_int > 0 and (
-                (taint_vars is None) or any(("kw_taint", True) in s for s in arg_slots)
-            )
-            any_tainted = args_tainted or any(("kw_taint", True) in s for s in callable_slots)
-            if args_tainted:
-                for slot in callable_slots:
-                    _record(slot, unpacked=False)
-            stack.append({("kw_taint", True)} if any_tainted else set())
-            continue
-        eff = _safe_stack_effect(ins, default=0)
-        if op in ("POP_TOP", "STORE_ATTR", "STORE_SUBSCR", "LIST_APPEND", "MAP_ADD", "SET_ADD"):
-            for _ in range(max(0, -eff)):
-                if stack:
-                    stack.pop()
-        elif eff < 0:
-            popped_f = [stack.pop() if stack else set() for _ in range(max(1, 1 - eff))]
-            had_t_f = any(("kw_taint", True) in s for s in popped_f)
-            stack.append({("kw_taint", True)} if had_t_f else set())
-        elif eff > 0:
-            for _ in range(eff):
-                stack.append(set())
-        elif op.startswith(("UNARY_", "GET_", "TO_")) and stack:
-            if ("kw_taint", True) in stack[-1]:
-                stack[-1] = {("kw_taint", True)}
+    ins_list = list(dis.get_instructions(code))
 
+    def _run_pass() -> None:
+        stack: List[set[Tuple[str, Any]]] = []
+        box_seq = 0
+        for ins in ins_list:
+            op = ins.opname
+            arg_int = ins.arg if isinstance(ins.arg, int) else 0
+            if op == "PUSH_NULL":
+                stack.append({("null", None)})
+                continue
+            if op == "LOAD_GLOBAL":
+                if arg_int & 1:
+                    stack.append({("null", None)})
+                stack.append({("name", str(ins.argval))})
+                continue
+            if op == "LOAD_CONST":
+                c_slot: set[Tuple[str, Any]] = set()
+                if isinstance(ins.argval, types.CodeType):
+                    c_slot.add(("code", ins.argval))
+                elif candidate_keys:
+                    c_strs: set[str] = set()
+                    _collect_val_consts(ins.argval, c_strs)
+                    if c_strs:
+                        c_slot.add(("consts", frozenset(c_strs)))
+                stack.append(c_slot)
+                continue
+            if op in (
+                "LOAD_NAME",
+                "LOAD_DEREF",
+                "LOAD_CLOSURE",
+                "LOAD_FAST",
+                "LOAD_FAST_BORROW",
+                "LOAD_FAST_CHECK",
+                "LOAD_FAST_AND_CLEAR",
+            ):
+                stack.append(_load_var_slot(str(ins.argval)))
+                continue
+            if op in ("LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW") and (
+                isinstance(ins.argval, tuple) and len(ins.argval) == 2
+            ):
+                for vn in ins.argval:
+                    stack.append(_load_var_slot(str(vn)))
+                continue
+            if op == "LOAD_ATTR":
+                base = stack.pop() if stack else set()
+                _flush_consts(base)
+                attr_name = str(ins.argval)
+                derived: set[Tuple[str, Any]] = {("leaf_attr", attr_name)}
+                for kind, val in base:
+                    if kind == "name":
+                        derived.add(("attr", (val, attr_name)))
+                        derived.add(("recv_var", val))
+                    elif kind == "attr":
+                        derived.add(("attr", (val[1], attr_name)))
+                    elif kind == "box_id":
+                        derived.add(("recv_box", val))
+                if _slot_is_tainted(base):
+                    derived.add(("kw_taint", True))
+                if arg_int & 1:
+                    stack.append(derived)
+                    stack.append({("null", None)})
+                else:
+                    stack.append(derived)
+                continue
+            if op == "LOAD_SUPER_ATTR":
+                # Pops self, class, super; pushes method (+ optional self/NULL).
+                base = stack[-1] if stack else set()
+                eff = _safe_stack_effect(ins, default=-2)
+                pops = 3
+                for _ in range(pops):
+                    if stack:
+                        _flush_consts(stack.pop())
+                push_cnt = eff + pops
+                derived_sup: set[Tuple[str, Any]] = {("leaf_attr", str(ins.argval)), ("attr", ("super", str(ins.argval)))}
+                for kind, val in base:
+                    if kind == "name":
+                        derived_sup.add(("attr", (val, str(ins.argval))))
+                if _slot_is_tainted(base):
+                    derived_sup.add(("kw_taint", True))
+                for j in range(max(0, push_cnt)):
+                    stack.append(derived_sup if j == 0 else {("null", None)})
+                continue
+            if op == "MAKE_FUNCTION":
+                pops = 1 if ins.arg is None else max(1, 1 - _safe_stack_effect(ins, default=0))
+                popped_mf = [stack.pop() if stack else set() for _ in range(pops)]
+                fn_slot: set[Tuple[str, Any]] = set()
+                def_c: set[str] = set()
+                has_ct = False
+                for mf_idx, sm in enumerate(popped_mf):
+                    for kind, val in sm:
+                        if kind == "code" and mf_idx == 0:
+                            fn_slot.add(("code", val))
+                        elif kind == "fn_def_consts" and val:
+                            def_c.update(val)
+                        elif kind == "consts" and val:
+                            def_c.update(val)
+                        elif kind in ("closure_taint", "kw_taint"):
+                            has_ct = True
+                        elif kind == "box_id" and val in tainted_boxes:
+                            has_ct = True
+                if def_c:
+                    fn_slot.add(("fn_def_consts", frozenset(def_c)))
+                if has_ct:
+                    fn_slot.add(("closure_taint", True))
+                stack.append(fn_slot)
+                continue
+            if op == "SET_FUNCTION_ATTRIBUTE":
+                fn_slot = stack.pop() if stack else set()
+                attr_slot = stack.pop() if stack else set()
+                new_fn_slot = set(fn_slot)
+                attr_c = _slot_consts(attr_slot)
+                if attr_c:
+                    prev_dc = [v for k, v in new_fn_slot if k == "fn_def_consts" and v]
+                    new_fn_slot = {kv for kv in new_fn_slot if kv[0] != "fn_def_consts"}
+                    new_fn_slot.add(("fn_def_consts", attr_c.union(*prev_dc)))
+                if _slot_is_tainted(attr_slot) or ("closure_taint", True) in attr_slot:
+                    new_fn_slot.add(("closure_taint", True))
+                stack.append(new_fn_slot)
+                continue
+            if op in ("STORE_FAST", "STORE_NAME", "STORE_DEREF"):
+                top = stack.pop() if stack else set()
+                _flush_consts(top)
+                locals_env.setdefault(str(ins.argval), set()).update(
+                    {kv for kv in top if kv[0] != "consts"}
+                )
+                continue
+            if op == "STORE_FAST_STORE_FAST" and isinstance(ins.argval, tuple) and len(ins.argval) == 2:
+                t1 = stack.pop() if stack else set()
+                t2 = stack.pop() if stack else set()
+                _flush_consts(t1, t2)
+                locals_env.setdefault(str(ins.argval[0]), set()).update(
+                    {kv for kv in t1 if kv[0] != "consts"}
+                )
+                locals_env.setdefault(str(ins.argval[1]), set()).update(
+                    {kv for kv in t2 if kv[0] != "consts"}
+                )
+                continue
+            if op == "STORE_FAST_LOAD_FAST" and isinstance(ins.argval, tuple) and len(ins.argval) == 2:
+                t1 = stack.pop() if stack else set()
+                _flush_consts(t1)
+                locals_env.setdefault(str(ins.argval[0]), set()).update(
+                    {kv for kv in t1 if kv[0] != "consts"}
+                )
+                stack.append(_load_var_slot(str(ins.argval[1])))
+                continue
+            if op == "SWAP":
+                if 1 <= arg_int <= len(stack):
+                    stack[-1], stack[-arg_int] = stack[-arg_int], stack[-1]
+                continue
+            if op == "COPY":
+                stack.append(set(stack[-arg_int]) if 1 <= arg_int <= len(stack) else set())
+                continue
+            if op in ("BUILD_TUPLE", "BUILD_LIST", "BUILD_SET"):
+                popped_seq = [stack.pop() if stack else set() for _ in range(arg_int)]
+                res_seq: set[Tuple[str, Any]] = set()
+                seq_c = frozenset().union(*(_slot_consts(s) for s in popped_seq)) if popped_seq else frozenset()
+                if seq_c:
+                    res_seq.add(("consts", seq_c))
+                if any(_slot_is_tainted(s) or ("closure_taint", True) in s for s in popped_seq):
+                    res_seq.add(("kw_taint", True))
+                for s in popped_seq:
+                    for k, v in s:
+                        if k in ("code", "fn_def_consts", "closure_taint"):
+                            res_seq.add((k, v))
+                        elif k in ("box_id", "recv_box"):
+                            res_seq.add(("recv_box", v))
+                        elif k in ("name", "recv_var") and v != "self":
+                            res_seq.add(("recv_var", v))
+                stack.append(res_seq)
+                continue
+            if op == "BUILD_MAP":
+                box_seq += 1
+                bid = box_seq
+                popped_bm = [stack.pop() if stack else set() for _ in range(2 * arg_int)]
+                had_t = any(_slot_is_tainted(s) for s in popped_bm)
+                bm_c = frozenset().union(*(_slot_consts(s) for s in popped_bm)) if popped_bm else frozenset()
+                res_map: set[Tuple[str, Any]] = {("box_id", bid)}
+                if bid in unpacked_boxes:
+                    res_map.add(("kw_unpack", None))
+                else:
+                    res_map.add(("lit_map", None))
+                if had_t or bid in tainted_boxes:
+                    tainted_boxes.add(bid)
+                    res_map.add(("kw_taint", True))
+                if bm_c:
+                    res_map.add(("consts", bm_c))
+                stack.append(res_map)
+                continue
+            if op == "BUILD_CONST_KEY_MAP":
+                box_seq += 1
+                bid = box_seq
+                popped_ckm = [stack.pop() if stack else set() for _ in range(arg_int + 1)]
+                had_t = any(_slot_is_tainted(s) for s in popped_ckm)
+                ckm_c = frozenset().union(*(_slot_consts(s) for s in popped_ckm)) if popped_ckm else frozenset()
+                res_ckm: set[Tuple[str, Any]] = {("box_id", bid)}
+                if bid in unpacked_boxes:
+                    res_ckm.add(("kw_unpack", None))
+                else:
+                    res_ckm.add(("lit_map", None))
+                if had_t or bid in tainted_boxes:
+                    tainted_boxes.add(bid)
+                    res_ckm.add(("kw_taint", True))
+                if ckm_c:
+                    res_ckm.add(("consts", ckm_c))
+                stack.append(res_ckm)
+                continue
+            if op in ("DICT_MERGE", "DICT_UPDATE"):
+                src_map = stack.pop() if stack else set()
+                _flush_consts(src_map)
+                if 1 <= arg_int <= len(stack):
+                    dst_map = stack[-arg_int]
+                    _flush_consts(dst_map)
+                    dst_map.discard(("lit_map", None))
+                    dst_map.discard(("null", None))
+                    dst_map.add(("kw_unpack", None))
+                    if _slot_is_tainted(src_map):
+                        dst_map.add(("kw_taint", True))
+                        _taint_receiver_slot(dst_map)
+                continue
+            if op == "MAP_ADD":
+                val_s = stack.pop() if stack else set()
+                key_s = stack.pop() if stack else set()
+                _flush_consts(val_s, key_s)
+                if 1 <= arg_int <= len(stack) and (_slot_is_tainted(val_s) or _slot_is_tainted(key_s)):
+                    dst_map = stack[-arg_int]
+                    dst_map.discard(("lit_map", None))
+                    dst_map.add(("kw_taint", True))
+                    _taint_receiver_slot(dst_map)
+                continue
+            if op == "STORE_SUBSCR":
+                key_s = stack.pop() if stack else set()
+                cont_s = stack.pop() if stack else set()
+                val_s = stack.pop() if stack else set()
+                _flush_consts(key_s, cont_s, val_s)
+                if _slot_is_tainted(val_s) or _slot_is_tainted(key_s):
+                    _taint_receiver_slot(cont_s)
+                continue
+            if op == "GET_ITER":
+                if stack:
+                    top_it = stack[-1]
+                    _flush_consts(top_it)
+                    if _slot_is_tainted(top_it):
+                        stack[-1] = {("kw_taint", True), ("iter_taint", True)}
+                    else:
+                        stack[-1] = set()
+                continue
+            if op == "FOR_ITER":
+                iter_s = stack[-1] if stack else set()
+                stack.append({("kw_taint", True)} if _slot_is_tainted(iter_s) else set())
+                continue
+            if op == "UNPACK_SEQUENCE":
+                top = stack.pop() if stack else set()
+                _flush_consts(top)
+                has_t = _slot_is_tainted(top)
+                for _ in range(arg_int):
+                    stack.append({("kw_taint", True)} if has_t else set())
+                continue
+            if op == "CALL_FUNCTION_EX":
+                eff = _safe_stack_effect(
+                    ins,
+                    default=(-3 if ins.arg is None else (-2 - (1 if (arg_int & 1) else 0))),
+                )
+                total_pop = max(0, 1 - eff)
+                popped = [stack.pop() if stack else set() for _ in range(total_pop)]
+                _flush_consts(*popped)
+                if ins.arg is None or (arg_int & 1):
+                    kw_slot = popped[0] if len(popped) >= 1 else set()
+                    pos_slot = popped[1] if len(popped) >= 2 else set()
+                    callable_slots = popped[2:]
+                    is_plain_lit_map = (
+                        ("lit_map", None) in kw_slot
+                        and not _slot_is_tainted(kw_slot)
+                        and not any(
+                            k == "kw_unpack" or (k == "box_id" and v in unpacked_boxes)
+                            for k, v in kw_slot
+                        )
+                    )
+                    has_kw_map = (
+                        bool(kw_slot)
+                        and ("null", None) not in kw_slot
+                        and not is_plain_lit_map
+                    )
+                else:
+                    kw_slot = set()
+                    pos_slot = popped[0] if len(popped) >= 1 else set()
+                    callable_slots = popped[1:]
+                    has_kw_map = False
+                kw_tainted = _slot_is_tainted(kw_slot)
+                pos_tainted = _slot_is_tainted(pos_slot)
+                closure_tainted = any(
+                    ("closure_taint", True) in s or ("iter_taint", True) in s
+                    for s in callable_slots
+                )
+                recv_tainted = any(_slot_is_tainted(s) for s in callable_slots)
+                any_tainted = kw_tainted or pos_tainted or closure_tainted or recv_tainted
+                for slot in callable_slots:
+                    if has_kw_map and kw_tainted:
+                        _record(slot, unpacked=True)
+                        _record(slot, unpacked=False)
+                    elif kw_tainted or pos_tainted:
+                        _record(slot, unpacked=False)
+                if kw_tainted or pos_tainted:
+                    is_mut_dict_call_ex = any(
+                        (k == "leaf_attr" and v in _mut_dict_methods)
+                        or (k == "name" and v in _mut_dict_methods)
+                        for s in callable_slots
+                        for k, v in s
+                    )
+                    if is_mut_dict_call_ex:
+                        for s in callable_slots:
+                            _taint_receiver_slot(s)
+                        if any(
+                            k in ("leaf_attr", "name") and v == "update"
+                            for s in callable_slots
+                            for k, v in s
+                        ):
+                            _taint_receiver_slot(pos_slot)
+                if any_tainted:
+                    _activate_nested_slots(
+                        callable_slots + [pos_slot, kw_slot],
+                        is_unpacked=bool(has_kw_map and kw_tainted),
+                        with_tainted_args=bool(kw_tainted or pos_tainted),
+                    )
+                box_seq += 1
+                ret_bid = box_seq
+                ret_slot: set[Tuple[str, Any]] = {("box_id", ret_bid)}
+                if any_tainted:
+                    tainted_boxes.add(ret_bid)
+                    ret_slot.add(("kw_taint", True))
+                stack.append(ret_slot)
+                continue
+            if op in ("CALL", "CALL_KW"):
+                eff = _safe_stack_effect(ins, default=-(arg_int + 1))
+                total_pop = max(0, 1 - eff)
+                popped = [stack.pop() if stack else set() for _ in range(total_pop)]
+                _flush_consts(*popped)
+                kw_names_cnt = 1 if op == "CALL_KW" else 0
+                arg_slots = popped[kw_names_cnt : kw_names_cnt + arg_int]
+                callable_slots = popped[kw_names_cnt + arg_int :]
+                args_tainted = arg_int > 0 and any(_slot_is_tainted(s) for s in arg_slots)
+                nested_call_tainted = args_tainted or any(
+                    ("closure_taint", True) in s or ("iter_taint", True) in s
+                    for s in callable_slots
+                )
+                recv_tainted = any(_slot_is_tainted(s) for s in callable_slots)
+                any_tainted = args_tainted or nested_call_tainted or recv_tainted
+                if args_tainted:
+                    is_mut_dict_call = any(
+                        (k == "leaf_attr" and v in _mut_dict_methods)
+                        or (k == "name" and v in _mut_dict_methods)
+                        for s in callable_slots
+                        for k, v in s
+                    )
+                    if is_mut_dict_call:
+                        for s in callable_slots:
+                            _taint_receiver_slot(s)
+                        if any(
+                            (k == "leaf_attr" and v == "update")
+                            or (k == "name" and v == "update")
+                            for s in callable_slots
+                            for k, v in s
+                        ) and len(arg_slots) >= 2:
+                            for a_s in arg_slots:
+                                _taint_receiver_slot(a_s)
+                    for slot in callable_slots:
+                        _record(slot, unpacked=False)
+                if nested_call_tainted:
+                    iter_t = any(("iter_taint", True) in s for s in callable_slots + arg_slots)
+                    _activate_nested_slots(
+                        callable_slots + arg_slots,
+                        is_unpacked=False,
+                        with_tainted_args=bool(args_tainted or iter_t),
+                    )
+                box_seq += 1
+                ret_bid = box_seq
+                ret_slot = {("box_id", ret_bid)}
+                if any_tainted or ret_bid in tainted_boxes:
+                    tainted_boxes.add(ret_bid)
+                    ret_slot.add(("kw_taint", True))
+                stack.append(ret_slot)
+                continue
+            eff = _safe_stack_effect(ins, default=0)
+            if op in (
+                "POP_TOP",
+                "END_FOR",
+                "POP_ITER",
+                "RETURN_VALUE",
+                "STORE_ATTR",
+                "LIST_APPEND",
+                "SET_ADD",
+            ):
+                for _ in range(max(0, -eff)):
+                    if stack:
+                        _flush_consts(stack.pop())
+            elif eff < 0:
+                popped_f = [stack.pop() if stack else set() for _ in range(max(1, 1 - eff))]
+                _flush_consts(*popped_f)
+                had_t_f = any(_slot_is_tainted(s) for s in popped_f)
+                stack.append({("kw_taint", True)} if had_t_f else set())
+            elif eff > 0:
+                for _ in range(eff):
+                    stack.append(set())
+            elif op.startswith(("UNARY_", "GET_", "TO_")) and stack:
+                _flush_consts(stack[-1])
+                if _slot_is_tainted(stack[-1]):
+                    stack[-1] = {("kw_taint", True)}
+        _flush_consts(*stack)
+
+    _run_pass()
+    _run_pass()
+
+    tainted_local_names = frozenset(vn for vn, sl in locals_env.items() if _slot_is_tainted(sl))
+    local_code_defs: Dict[str, types.CodeType] = {}
+    for vn, sl in locals_env.items():
+        for kind, val in sl:
+            if kind == "code" and isinstance(val, types.CodeType):
+                local_code_defs[vn] = val
     return (
         unpacked_names,
         unpacked_owner_attrs,
@@ -854,7 +1167,20 @@ def _extract_kw_unpack_targets(
         arg_names,
         arg_owner_attrs,
         arg_leaf_attrs,
+        active_consts,
+        unpacked_codes,
+        tainted_codes,
+        tainted_local_names,
+        local_code_defs,
     )
+
+
+def _extract_kw_unpack_targets(
+    code: types.CodeType,
+    taint_vars: Optional[frozenset[str]] = None,
+) -> Tuple[set[str], set[Tuple[str, str]], set[str], set[str], set[Tuple[str, str]], set[str]]:
+    """Return bytecode callable targets for CALL_FUNCTION_EX (**kwargs) and non-zero-arg CALLs."""
+    return _analyze_code_kw_flow(code, taint_vars)[:6]
 
 
 def _inspect_varkw_wrapper(
@@ -908,7 +1234,11 @@ def _inspect_varkw_wrapper(
                 cur = call_attr
         return cur, cur_owner, partial_kw
 
-    def _extract_taint_var_names(fn_target: Any, depth: int) -> Optional[frozenset[str]]:
+    def _extract_taint_var_names(
+        fn_target: Any,
+        fn_owner: Any,
+        depth: int,
+    ) -> Optional[frozenset[str]]:
         code_t = getattr(fn_target, "__code__", None)
         if not isinstance(code_t, types.CodeType):
             return None
@@ -936,7 +1266,8 @@ def _inspect_varkw_wrapper(
             + (1 if (code_t.co_flags & inspect.CO_VARARGS) else 0)
             + (1 if (code_t.co_flags & inspect.CO_VARKEYWORDS) else 0)
         )
-        return frozenset(str(v) for v in code_t.co_varnames[:n_params])
+        start_p = 1 if (fn_owner is not None and code_t.co_argcount >= 1) else 0
+        return frozenset(str(v) for v in code_t.co_varnames[start_p:n_params])
 
     def _collect_explicit_params(fn_target: Any) -> None:
         try:
@@ -1172,7 +1503,7 @@ def _inspect_varkw_wrapper(
         if not isinstance(code, types.CodeType):
             continue
 
-        taint_here = _extract_taint_var_names(unwrapped, depth)
+        taint_here = _extract_taint_var_names(unwrapped, cur_owner, depth)
         cache_key_ci = (id(code), taint_here)
         cached_ci = code_info_cache.get(cache_key_ci)
         if cached_ci is None:
@@ -1184,36 +1515,72 @@ def _inspect_varkw_wrapper(
             c_a_oattrs: set[Tuple[str, str]] = set()
             c_a_lattrs: set[str] = set()
             c_consts: set[str] = set()
-            seen_sub_codes: set[int] = set()
+            seen_sub_codes: set[Tuple[int, Optional[frozenset[str]]]] = set()
+            local_code_defs: Dict[str, types.CodeType] = {}
             code_stack: List[Tuple[types.CodeType, Optional[frozenset[str]]]] = [(code, taint_here)]
             while code_stack:
                 c, c_taint = code_stack.pop()
-                sub_cid = id(c)
-                if sub_cid in seen_sub_codes:
+                sub_key = (id(c), c_taint)
+                if sub_key in seen_sub_codes:
                     continue
-                seen_sub_codes.add(sub_cid)
+                seen_sub_codes.add(sub_key)
                 c_local_names.update(c.co_names)
                 c_local_names.update(c.co_freevars)
-                un_c, uo_c, ul_c, an_c, ao_c, al_c = _extract_kw_unpack_targets(c, c_taint)
+                (
+                    un_c,
+                    uo_c,
+                    ul_c,
+                    an_c,
+                    ao_c,
+                    al_c,
+                    act_consts_c,
+                    unp_codes_c,
+                    taint_codes_c,
+                    taint_locals_c,
+                    loc_codes_c,
+                ) = _analyze_code_kw_flow(c, c_taint, candidate_keys)
                 c_u_names.update(un_c)
                 c_u_oattrs.update(uo_c)
                 c_u_lattrs.update(ul_c)
                 c_a_names.update(an_c)
                 c_a_oattrs.update(ao_c)
                 c_a_lattrs.update(al_c)
-                for const in c.co_consts:
-                    if isinstance(const, types.CodeType):
-                        sub_n_p = (
-                            const.co_argcount
-                            + const.co_kwonlyargcount
-                            + (1 if (const.co_flags & inspect.CO_VARARGS) else 0)
-                            + (1 if (const.co_flags & inspect.CO_VARKEYWORDS) else 0)
-                        )
-                        sub_p = frozenset(str(v) for v in const.co_varnames[:sub_n_p])
-                        next_taint = (c_taint | sub_p) if c_taint is not None else sub_p
-                        code_stack.append((const, next_taint))
-                    else:
-                        _collect_const_strings(const, c_consts)
+                c_consts.update(act_consts_c)
+                local_code_defs.update(loc_codes_c)
+                all_unp_codes: Dict[int, types.CodeType] = dict(unp_codes_c)
+                all_taint_codes: Dict[int, Tuple[types.CodeType, bool]] = dict(taint_codes_c)
+                for fn_var in c_u_names:
+                    loc_c = local_code_defs.get(fn_var)
+                    if loc_c is not None:
+                        all_unp_codes[id(loc_c)] = loc_c
+                        all_taint_codes[id(loc_c)] = (loc_c, True)
+                for fn_var in c_a_names:
+                    loc_c = local_code_defs.get(fn_var)
+                    if loc_c is not None:
+                        all_taint_codes[id(loc_c)] = (loc_c, True)
+                for unp_c in all_unp_codes.values():
+                    pos_only_n = getattr(unp_c, "co_posonlyargcount", 0)
+                    kw_cap_n = unp_c.co_argcount + unp_c.co_kwonlyargcount
+                    for pname in unp_c.co_varnames[pos_only_n:kw_cap_n]:
+                        if pname in candidate_keys:
+                            c_consts.add(pname)
+                for sub_c, called_t in all_taint_codes.values():
+                    sub_n_p = (
+                        sub_c.co_argcount
+                        + sub_c.co_kwonlyargcount
+                        + (1 if (sub_c.co_flags & inspect.CO_VARARGS) else 0)
+                        + (1 if (sub_c.co_flags & inspect.CO_VARKEYWORDS) else 0)
+                    )
+                    sub_p = (
+                        frozenset(str(v) for v in sub_c.co_varnames[:sub_n_p])
+                        if called_t
+                        else frozenset()
+                    )
+                    free_t = (
+                        frozenset(str(fv) for fv in sub_c.co_freevars) & taint_locals_c
+                    )
+                    next_taint = (sub_p | free_t) if c_taint is not None else sub_p
+                    code_stack.append((sub_c, next_taint))
             cached_ci = (c_local_names, c_u_names, c_u_oattrs, c_u_lattrs, c_a_names, c_a_oattrs, c_a_lattrs, c_consts)
             code_info_cache[cache_key_ci] = cached_ci
         local_names, u_names, u_oattrs, u_lattrs, a_names, a_oattrs, a_lattrs, c_consts = cached_ci
