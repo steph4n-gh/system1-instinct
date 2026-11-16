@@ -18,6 +18,7 @@ import numpy as np
 from system1.core.model import (
     _2d_matmul_layout_sig,
     _accepts_recency_weighted,
+    _coerce_inference_array_f32_or_f64,
     _encode_projector_batch,
     _encode_projector_one,
     _model_zero_unit0,
@@ -905,6 +906,14 @@ class MultiTenantSkillFleet:
         adj = None if raw_adj is None else np.asarray(raw_adj, dtype=np.float64).reshape(-1)
         if adj is not None and not bool(np.all(np.isfinite(adj))):
             raise ValueError(f"Calibration logit_adjustments for {field_name!r} contain non-finite values")
+
+        is_bool_fdef = isinstance(f_def, BooleanField)
+        _coerce_inference_array_f32_or_f64(
+            head.weights, f"Field head {field_name!r} weights", active_first_only=is_bool_fdef
+        )
+        _coerce_inference_array_f32_or_f64(
+            head.biases, f"Field head {field_name!r} biases", active_first_only=is_bool_fdef
+        )
 
         raw_w_in = np.asarray(head.weights)
         raw_b_in = np.asarray(head.biases)

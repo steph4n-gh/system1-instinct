@@ -60,6 +60,7 @@ from system1.core.model import (
     PackedMultiQuestionKernel,
     _accepts_recency_weighted,
     _coerce_inference_array_f32_or_f64,
+    _coerce_real_1d_f32,
     _compute_engine_inference_signature,
     _compute_hierarchical_logits_np,
     _encode_projector_one,
@@ -70,12 +71,15 @@ from system1.core.model import (
     _resolve_authoritative_head,
     _stable_sigmoid,
     _validate_2d_layout_cloneable,
+    _validate_forgetting_factor,
     _validate_head_weight_bias_shapes,
     _validate_packed_engine_support,
+    _validate_real_scalar,
 )
 from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
 from system1.core.schema import (
     _f64_to_exact_2m1074,
+    _format_score_interval,
     _score_abs_diff_clamped,
     _score_abs_diff_exact_2m1074,
     _score_from_unit_prob,
@@ -96,6 +100,21 @@ from system1.receipt import (
     create_decision_receipt,
     public_key_fingerprint,
 )
+
+
+def _clone_head_attr_value(val: Any) -> Any:
+    """Shallow-copy arrays and standard mutable containers without choking on locks/callables."""
+    if isinstance(val, np.ndarray):
+        return val.copy()
+    if isinstance(val, dict):
+        return {k: _clone_head_attr_value(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_clone_head_attr_value(v) for v in val]
+    if isinstance(val, tuple):
+        return tuple(_clone_head_attr_value(v) for v in val)
+    if isinstance(val, set):
+        return {_clone_head_attr_value(v) for v in val}
+    return val
 
 
 @dataclass(frozen=True)
@@ -745,7 +764,7 @@ class SystemOneEngine:
         )
         self.enable_margin_gating = bool(enable_margin_gating)
         self.margin_threshold = margin_threshold
-        self.forgetting_factor = float(forgetting_factor)
+        self.forgetting_factor = _validate_forgetting_factor(forgetting_factor)
         self.relative_odds_ratio = (
             float(relative_odds_ratio) if relative_odds_ratio is not None else None
         )
@@ -2628,7 +2647,7 @@ class SystemOneEngine:
                         else:
                             interval_margin = (1.0 - alpha) * half_span if not has_learned_override else 0.0
                             low_b, high_b = _score_interval_bounds(val, interval_margin, f_def.min_value, f_def.max_value)
-                        conformal_sets[name] = [f"[{low_b:.4f}, {high_b:.4f}]"]
+                        conformal_sets[name] = [_format_score_interval(low_b, high_b)]
 
                     if has_learned_override:
                         normalized_margin = 0.0
@@ -3000,10 +3019,11 @@ class SystemOneEngine:
         with self._lock, getattr(self.model, "_lock", nullcontext()):
             recency_weighted = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
             target = self.schema.validate_lesson(target, allow_unknown=True)
-            eff_forgetting = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
-            if not math.isfinite(eff_forgetting) or not (0.0 < eff_forgetting <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_forgetting}")
-            eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
+            eff_forgetting = _validate_forgetting_factor(
+                forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+            )
+            eff_reward_scale_in = _validate_real_scalar(reward_scale, "reward_scale")
+            eff_reward_scale = float(np.clip(eff_reward_scale_in, 0.0, 1.0))
             t0 = time.perf_counter()
 
             c_emb: Optional[np.ndarray] = None
@@ -3011,7 +3031,7 @@ class SystemOneEngine:
                 embedding is None and isinstance(prompt, str) and bool(prompt.strip())
             )
             if embedding is not None:
-                emb = np.asarray(embedding, dtype=np.float32).flatten()
+                emb = _coerce_real_1d_f32(embedding, "embedding")
             else:
                 from system1.core.model import DeterministicSemanticProjector
 
@@ -3046,36 +3066,103 @@ class SystemOneEngine:
                 raise ValueError("embedding contains NaN or Inf non-finite values")
             x_aug = np.append(emb, 1.0).astype(np.float32)
 
-            if hasattr(self.model, "learn_from_tier2"):
-                model_emb = (
-                    emb
-                    if getattr(self.model, "projector", None) is self.projector
-                    else emb
-                )
-                try:
-                    res_dict = self.model.learn_from_tier2(
-                        prompt,
-                        target,
-                        telemetry=telemetry,
-                        embedding=model_emb,
-                        forgetting_factor=eff_forgetting,
-                        recency_weighted=recency_weighted,
-                        preserve_calibration=preserve_calibration,
-                        reward_scale=eff_reward_scale,
-                        concept_embedding=c_emb,
-                        allow_prompt_for_head=allow_prompt_for_head,
+            model = self.model
+            seen_head_ids: set[int] = set()
+            model_state_snaps: List[Tuple[Any, Any]] = []
+            model_dict_snaps: List[Tuple[Any, Dict[str, Any]]] = []
+            for attr_name in ("_field_heads", "heads"):
+                h_map = getattr(model, attr_name, None)
+                if isinstance(h_map, Mapping):
+                    for h_obj in h_map.values():
+                        if id(h_obj) in seen_head_ids:
+                            continue
+                        seen_head_ids.add(id(h_obj))
+                        if hasattr(h_obj, "_snapshot_state") and hasattr(h_obj, "_restore_state"):
+                            model_state_snaps.append((h_obj, h_obj._snapshot_state()))
+                        elif hasattr(h_obj, "__dict__"):
+                            model_dict_snaps.append(
+                                (h_obj, {k: _clone_head_attr_value(v) for k, v in h_obj.__dict__.items()})
+                            )
+
+            has_model_ver = hasattr(model, "model_version")
+            prev_model_ver = getattr(model, "model_version", None)
+            has_m_ov = hasattr(model, "_learned_prompt_overrides")
+            m_ov_snap = (
+                {k: dict(v) for k, v in model._learned_prompt_overrides.items()}
+                if has_m_ov
+                else None
+            )
+            has_m_ov_rec = hasattr(model, "_learned_prompt_override_recency")
+            m_ov_rec_snap = (
+                dict(model._learned_prompt_override_recency)
+                if has_m_ov_rec
+                else None
+            )
+            has_m_proto = hasattr(model, "_online_prototype_bank")
+            m_proto_snap = (
+                {k: [arr.copy() if isinstance(arr, np.ndarray) else _clone_head_attr_value(arr) for arr in v] for k, v in model._online_prototype_bank.items()}
+                if has_m_proto
+                else None
+            )
+            m_cache = getattr(model, "cache", None)
+            m_cache_snap = (
+                m_cache._snapshot_state()
+                if (m_cache is not None and hasattr(m_cache, "_snapshot_state"))
+                else None
+            )
+
+            prev_eng_ver = self.model_version
+            has_lesson_cnt = "_online_lesson_count" in self.__dict__
+            prev_lesson_cnt = self.__dict__.get("_online_lesson_count", 0)
+            has_eng_ov = hasattr(self, "_learned_prompt_overrides")
+            eng_ov_snap = (
+                {k: dict(v) for k, v in self._learned_prompt_overrides.items()}
+                if has_eng_ov
+                else None
+            )
+            has_eng_ov_rec = hasattr(self, "_learned_prompt_override_recency")
+            eng_ov_rec_snap = (
+                dict(self._learned_prompt_override_recency)
+                if has_eng_ov_rec
+                else None
+            )
+            has_eng_ov_cnt = hasattr(self, "_override_counts")
+            eng_ov_cnt_snap = (
+                {k: dict(v) for k, v in self._override_counts.items()}
+                if has_eng_ov_cnt
+                else None
+            )
+            cal_snap = {k: copy.deepcopy(v) for k, v in self.calibrators.items()}
+            cp_snap = {k: copy.deepcopy(v) for k, v in self.conformal_predictors.items()}
+            rcp_snap = {k: copy.deepcopy(v) for k, v in self.regression_conformal_predictors.items()}
+            prev_packed_kernel = getattr(self, "_packed_kernel_cache", None)
+            has_exp_cache = hasattr(self, "_explainer_cache")
+            exp_cache_snap = dict(self._explainer_cache) if has_exp_cache else None
+            eng_cache_snap = (
+                self.cache._snapshot_state()
+                if (self.cache is not None and hasattr(self.cache, "_snapshot_state"))
+                else None
+            )
+
+            try:
+                if hasattr(self.model, "learn_from_tier2"):
+                    model_emb = (
+                        emb
+                        if getattr(self.model, "projector", None) is self.projector
+                        else emb
                     )
-                except TypeError:
                     try:
                         res_dict = self.model.learn_from_tier2(
                             prompt,
                             target,
                             telemetry=telemetry,
-                            embedding=None if (embedding is None and getattr(self.model, "projector", None) is self.projector) else emb,
+                            embedding=model_emb,
                             forgetting_factor=eff_forgetting,
                             recency_weighted=recency_weighted,
                             preserve_calibration=preserve_calibration,
                             reward_scale=eff_reward_scale,
+                            concept_embedding=c_emb,
+                            allow_prompt_for_head=allow_prompt_for_head,
                         )
                     except TypeError:
                         try:
@@ -3083,10 +3170,11 @@ class SystemOneEngine:
                                 prompt,
                                 target,
                                 telemetry=telemetry,
-                                embedding=model_emb,
+                                embedding=None if (embedding is None and getattr(self.model, "projector", None) is self.projector) else emb,
                                 forgetting_factor=eff_forgetting,
                                 recency_weighted=recency_weighted,
                                 preserve_calibration=preserve_calibration,
+                                reward_scale=eff_reward_scale,
                             )
                         except TypeError:
                             try:
@@ -3097,44 +3185,41 @@ class SystemOneEngine:
                                     embedding=model_emb,
                                     forgetting_factor=eff_forgetting,
                                     recency_weighted=recency_weighted,
+                                    preserve_calibration=preserve_calibration,
                                 )
                             except TypeError:
                                 try:
                                     res_dict = self.model.learn_from_tier2(
-                                        prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
+                                        prompt,
+                                        target,
+                                        telemetry=telemetry,
+                                        embedding=model_emb,
+                                        forgetting_factor=eff_forgetting,
+                                        recency_weighted=recency_weighted,
                                     )
                                 except TypeError:
-                                    res_dict = self.model.learn_from_tier2(
-                                        prompt, target, telemetry=telemetry, embedding=model_emb
-                                    )
-                updated_fields = res_dict.get("updated_fields", [])
-                rank1_ms = res_dict.get("update_latency_ms", 0.0)
-            else:
-                target_dict = dict(target)
+                                    try:
+                                        res_dict = self.model.learn_from_tier2(
+                                            prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
+                                        )
+                                    except TypeError:
+                                        res_dict = self.model.learn_from_tier2(
+                                            prompt, target, telemetry=telemetry, embedding=model_emb
+                                        )
+                    updated_fields = res_dict.get("updated_fields", [])
+                    rank1_ms = res_dict.get("update_latency_ms", 0.0)
+                else:
+                    target_dict = dict(target)
 
-                updated_fields = []
-                update_durations_ms: List[float] = []
-                is_zero_emb = not bool(np.any(emb))
-                norm_key = (
-                    " ".join(prompt.strip().casefold().split())
-                    if (embedding is None and is_zero_emb and telemetry is None and isinstance(prompt, str) and prompt.strip())
-                    else None
-                )
-                heads_dict = getattr(self.model, "_field_heads", getattr(self.model, "heads", {}))
-                head_snaps = {
-                    fn: heads_dict[fn]._snapshot_state()
-                    for fn in target_dict
-                    if fn in heads_dict and hasattr(heads_dict[fn], "_snapshot_state")
-                }
-                has_ov = hasattr(self, "_learned_prompt_overrides")
-                ov_snap = (
-                    {k: dict(v) for k, v in self._learned_prompt_overrides.items()}
-                    if has_ov
-                    else None
-                )
-                has_ov_rec = hasattr(self, "_learned_prompt_override_recency")
-                ov_rec_snap = dict(self._learned_prompt_override_recency) if has_ov_rec else None
-                try:
+                    updated_fields = []
+                    update_durations_ms: List[float] = []
+                    is_zero_emb = not bool(np.any(emb))
+                    norm_key = (
+                        " ".join(prompt.strip().casefold().split())
+                        if (embedding is None and is_zero_emb and telemetry is None and isinstance(prompt, str) and prompt.strip())
+                        else None
+                    )
+                    heads_dict = getattr(self.model, "_field_heads", getattr(self.model, "heads", {}))
                     for f_name, target_val in target_dict.items():
                         if f_name in heads_dict:
                             head = heads_dict[f_name]
@@ -3167,184 +3252,169 @@ class SystemOneEngine:
                                             dt = head.online_update(x_aug, y_target)
                                 update_durations_ms.append(dt)
                                 updated_fields.append(f_name)
-                except BaseException:
-                    for fn, snap in head_snaps.items():
-                        heads_dict[fn]._restore_state(snap)
-                    if has_ov and ov_snap is not None:
-                        self._learned_prompt_overrides.clear()
-                        self._learned_prompt_overrides.update(ov_snap)
-                    elif hasattr(self, "_learned_prompt_overrides"):
-                        delattr(self, "_learned_prompt_overrides")
-                    if has_ov_rec and ov_rec_snap is not None:
-                        self._learned_prompt_override_recency.clear()
-                        self._learned_prompt_override_recency.update(ov_rec_snap)
-                    elif hasattr(self, "_learned_prompt_override_recency"):
-                        delattr(self, "_learned_prompt_override_recency")
-                    raise
 
-                rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
+                    rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
 
-            # Atomic version increment and cache invalidation AFTER weights are updated
-            self.model_version += 1
-            self._online_lesson_count = getattr(self, "_online_lesson_count", 0) + 1
-            if hasattr(self.model, "model_version"):
-                self.model.model_version = self.model_version
+                self.model_version += 1
+                self._online_lesson_count = getattr(self, "_online_lesson_count", 0) + 1
+                if hasattr(self.model, "model_version"):
+                    self.model.model_version = self.model_version
 
-            min_cal_lessons = getattr(self, "min_calibration_lessons", 0)
-            min_corrob = max(1, int(getattr(self, "min_override_corroborations", 1)))
+                min_cal_lessons = getattr(self, "min_calibration_lessons", 0)
+                min_corrob = max(1, int(getattr(self, "min_override_corroborations", 1)))
 
-            if not preserve_calibration:
-                norm_key_clear = (
-                    " ".join(prompt.strip().casefold().split())
-                    if (embedding is None and bool(np.any(emb)) and telemetry is None and isinstance(prompt, str) and prompt.strip())
-                    else None
-                )
-                for f_name in updated_fields:
-                    if norm_key_clear is not None:
-                        if getattr(self, "_override_counts", None) and norm_key_clear in self._override_counts:
-                            self._override_counts[norm_key_clear].pop(f_name, None)
-                            if not self._override_counts[norm_key_clear]:
-                                self._override_counts.pop(norm_key_clear, None)
-                        if getattr(self, "_learned_prompt_overrides", None) and norm_key_clear in self._learned_prompt_overrides:
-                            self._learned_prompt_overrides[norm_key_clear].pop(f_name, None)
-                            if not self._learned_prompt_overrides[norm_key_clear]:
-                                self._learned_prompt_overrides.pop(norm_key_clear, None)
-                                if hasattr(self, "_learned_prompt_override_recency"):
-                                    self._learned_prompt_override_recency.pop(norm_key_clear, None)
-                    if f_name in self.calibrators:
-                        self.calibrators[f_name] = DecisionCalibrator()
-                    if (
-                        hasattr(self.model, "heads")
-                        and isinstance(self.model.heads, Mapping)
-                        and f_name in self.model.heads
-                    ):
-                        self.model.heads[f_name].logit_adjustments = None
-                    if f_name in self.conformal_predictors:
-                        cp_reset = self.conformal_predictors[f_name]
-                        cp_reset.is_calibrated = False
-                        cp_reset.familiarity_threshold = 0.0
-                        cp_reset.prototype_threshold = 0.0
-                        cp_reset.familiarity_scores = np.array([], dtype=np.float64)
-                        cp_reset.prototype_scores = np.array([], dtype=np.float64)
-                        cp_reset.class_calibration_scores = {}
-                    if f_name in self.regression_conformal_predictors:
-                        self.regression_conformal_predictors[f_name].is_calibrated = False
-            else:
-                target_dict_for_override: Dict[str, Any] = dict(target)
-                norm_key_override = (
-                    " ".join(prompt.strip().casefold().split())
-                    if (embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip())
-                    else None
-                )
-                for f_name in updated_fields:
-                    if (
-                        eff_reward_scale >= 0.5
-                        and norm_key_override is not None
-                        and f_name in target_dict_for_override
-                        and f_name in self.schema.fields
-                    ):
-                        validated_val = self.schema.fields[f_name].validate_value(target_dict_for_override[f_name])
-                        if not hasattr(self, "_override_counts"):
-                            self._override_counts = {}
-                        field_counts = self._override_counts.setdefault(norm_key_override, {})
-                        prev_entry = field_counts.get(f_name)
-                        if prev_entry is not None and prev_entry[0] == validated_val:
-                            corrob_count = prev_entry[1] + 1
-                        else:
-                            corrob_count = 1
-                        field_counts[f_name] = (validated_val, corrob_count)
+                if not preserve_calibration:
+                    norm_key_clear = (
+                        " ".join(prompt.strip().casefold().split())
+                        if (embedding is None and bool(np.any(emb)) and telemetry is None and isinstance(prompt, str) and prompt.strip())
+                        else None
+                    )
+                    for f_name in updated_fields:
+                        if norm_key_clear is not None:
+                            if getattr(self, "_override_counts", None) and norm_key_clear in self._override_counts:
+                                self._override_counts[norm_key_clear].pop(f_name, None)
+                                if not self._override_counts[norm_key_clear]:
+                                    self._override_counts.pop(norm_key_clear, None)
+                            if getattr(self, "_learned_prompt_overrides", None) and norm_key_clear in self._learned_prompt_overrides:
+                                self._learned_prompt_overrides[norm_key_clear].pop(f_name, None)
+                                if not self._learned_prompt_overrides[norm_key_clear]:
+                                    self._learned_prompt_overrides.pop(norm_key_clear, None)
+                                    if hasattr(self, "_learned_prompt_override_recency"):
+                                        self._learned_prompt_override_recency.pop(norm_key_clear, None)
+                        if f_name in self.calibrators:
+                            self.calibrators[f_name] = DecisionCalibrator()
+                        if (
+                            hasattr(self.model, "heads")
+                            and isinstance(self.model.heads, Mapping)
+                            and f_name in self.model.heads
+                        ):
+                            self.model.heads[f_name].logit_adjustments = None
+                        if f_name in self.conformal_predictors:
+                            cp_reset = self.conformal_predictors[f_name]
+                            cp_reset.is_calibrated = False
+                            cp_reset.familiarity_threshold = 0.0
+                            cp_reset.prototype_threshold = 0.0
+                            cp_reset.familiarity_scores = np.array([], dtype=np.float64)
+                            cp_reset.prototype_scores = np.array([], dtype=np.float64)
+                            cp_reset.class_calibration_scores = {}
+                        if f_name in self.regression_conformal_predictors:
+                            self.regression_conformal_predictors[f_name].is_calibrated = False
+                else:
+                    target_dict_for_override: Dict[str, Any] = dict(target)
+                    norm_key_override = (
+                        " ".join(prompt.strip().casefold().split())
+                        if (embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip())
+                        else None
+                    )
+                    for f_name in updated_fields:
+                        if (
+                            eff_reward_scale >= 0.5
+                            and norm_key_override is not None
+                            and f_name in target_dict_for_override
+                            and f_name in self.schema.fields
+                        ):
+                            validated_val = self.schema.fields[f_name].validate_value(target_dict_for_override[f_name])
+                            if not hasattr(self, "_override_counts"):
+                                self._override_counts = {}
+                            field_counts = self._override_counts.setdefault(norm_key_override, {})
+                            prev_entry = field_counts.get(f_name)
+                            if prev_entry is not None and prev_entry[0] == validated_val:
+                                corrob_count = prev_entry[1] + 1
+                            else:
+                                corrob_count = 1
+                            field_counts[f_name] = (validated_val, corrob_count)
 
-                        if not hasattr(self, "_learned_prompt_overrides"):
-                            self._learned_prompt_overrides = {}
-                        if not hasattr(self, "_learned_prompt_override_recency"):
-                            self._learned_prompt_override_recency = {}
-                        if corrob_count >= min_corrob:
-                            while len(self._learned_prompt_overrides) >= 4096 and norm_key_override not in self._learned_prompt_overrides:
-                                oldest_k = next(iter(self._learned_prompt_overrides))
-                                del self._learned_prompt_overrides[oldest_k]
-                                self._learned_prompt_override_recency.pop(oldest_k, None)
-                                self._override_counts.pop(oldest_k, None)
-                            self._learned_prompt_overrides.setdefault(norm_key_override, {})[f_name] = validated_val
-                            self._learned_prompt_override_recency[norm_key_override] = bool(recency_weighted)
-                        elif norm_key_override in self._learned_prompt_overrides:
-                            self._learned_prompt_overrides[norm_key_override].pop(f_name, None)
-                            if not self._learned_prompt_overrides[norm_key_override]:
-                                self._learned_prompt_overrides.pop(norm_key_override, None)
-                                self._learned_prompt_override_recency.pop(norm_key_override, None)
-                    ch = getattr(self.model, "heads", {}).get(f_name)
-                    cp = self.conformal_predictors.get(f_name)
-                    if cp is not None:
-                        if ch is not None and hasattr(ch, "calibration_scores"):
-                            cp.score_method = getattr(ch, "score_method", cp.score_method)
-                            protos = getattr(ch, "prototypes", None)
-                            if protos is not None:
-                                cp.prototypes = np.asarray(protos, dtype=np.float32)
-                            cp.prototype_threshold = float(getattr(ch, "prototype_threshold", 0.0))
-                            cp.familiarity_threshold = float(getattr(ch, "familiarity_threshold", 0.0))
-                            cal_scores = getattr(ch, "calibration_scores", ())
-                            if cal_scores:
-                                cp.calibration_scores = np.sort(np.asarray(cal_scores, dtype=np.float64))
+                            if not hasattr(self, "_learned_prompt_overrides"):
+                                self._learned_prompt_overrides = {}
+                            if not hasattr(self, "_learned_prompt_override_recency"):
+                                self._learned_prompt_override_recency = {}
+                            if corrob_count >= min_corrob:
+                                while len(self._learned_prompt_overrides) >= 4096 and norm_key_override not in self._learned_prompt_overrides:
+                                    oldest_k = next(iter(self._learned_prompt_overrides))
+                                    del self._learned_prompt_overrides[oldest_k]
+                                    self._learned_prompt_override_recency.pop(oldest_k, None)
+                                    self._override_counts.pop(oldest_k, None)
+                                self._learned_prompt_overrides.setdefault(norm_key_override, {})[f_name] = validated_val
+                                self._learned_prompt_override_recency[norm_key_override] = bool(recency_weighted)
+                            elif norm_key_override in self._learned_prompt_overrides:
+                                self._learned_prompt_overrides[norm_key_override].pop(f_name, None)
+                                if not self._learned_prompt_overrides[norm_key_override]:
+                                    self._learned_prompt_overrides.pop(norm_key_override, None)
+                                    self._learned_prompt_override_recency.pop(norm_key_override, None)
+                        ch = getattr(self.model, "heads", {}).get(f_name)
+                        cp = self.conformal_predictors.get(f_name)
+                        if cp is not None:
+                            if ch is not None and hasattr(ch, "calibration_scores"):
+                                cp.score_method = getattr(ch, "score_method", cp.score_method)
+                                protos = getattr(ch, "prototypes", None)
+                                if protos is not None:
+                                    cp.prototypes = np.asarray(protos, dtype=np.float32)
+                                cp.prototype_threshold = float(getattr(ch, "prototype_threshold", 0.0))
+                                cp.familiarity_threshold = float(getattr(ch, "familiarity_threshold", 0.0))
+                                cal_scores = getattr(ch, "calibration_scores", ())
+                                if cal_scores:
+                                    cp.calibration_scores = np.sort(np.asarray(cal_scores, dtype=np.float64))
+                                    cp.is_calibrated = True
+                                cls_scores = getattr(ch, "class_calibration_scores", None)
+                                if cls_scores:
+                                    cp.class_calibration_scores = {
+                                        str(k): np.sort(np.asarray(v, dtype=np.float64))
+                                        for k, v in cls_scores.items()
+                                        if len(v) > 0
+                                    }
+                            else:
+                                if getattr(cp, "prototypes", None) is not None and len(emb) == cp.prototypes.shape[1]:
+                                    e_norm = float(np.linalg.norm(emb))
+                                    if e_norm > 1e-12:
+                                        emb_u = emb / e_norm
+                                        sim_after = float(np.max(cp.prototypes @ emb_u))
+                                        if eff_reward_scale >= 0.5 and cp.prototype_threshold > 0.0 and sim_after < cp.prototype_threshold:
+                                            cp.prototype_threshold = max(0.0, sim_after - 1e-4)
+                            if not cp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
+                                k_opts = max(2, len(cp.options))
+                                q_init = float((k_opts - 1.0) / (3.5 + k_opts))
+                                cp.score_method = "lac"
+                                cp.calibration_scores = np.full(20, q_init, dtype=np.float64)
                                 cp.is_calibrated = True
-                            cls_scores = getattr(ch, "class_calibration_scores", None)
-                            if cls_scores:
-                                cp.class_calibration_scores = {
-                                    str(k): np.sort(np.asarray(v, dtype=np.float64))
-                                    for k, v in cls_scores.items()
-                                    if len(v) > 0
-                                }
-                        else:
-                            if getattr(cp, "prototypes", None) is not None and len(emb) == cp.prototypes.shape[1]:
-                                e_norm = float(np.linalg.norm(emb))
-                                if e_norm > 1e-12:
-                                    emb_u = emb / e_norm
-                                    sim_after = float(np.max(cp.prototypes @ emb_u))
-                                    if eff_reward_scale >= 0.5 and cp.prototype_threshold > 0.0 and sim_after < cp.prototype_threshold:
-                                        cp.prototype_threshold = max(0.0, sim_after - 1e-4)
-                        if not cp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
-                            k_opts = max(2, len(cp.options))
-                            q_init = float((k_opts - 1.0) / (3.5 + k_opts))
-                            cp.score_method = "lac"
-                            cp.calibration_scores = np.full(20, q_init, dtype=np.float64)
-                            cp.is_calibrated = True
-                    rcp = self.regression_conformal_predictors.get(f_name)
-                    if rcp is not None and f_name in self.schema.fields:
-                        if ch is not None and getattr(ch, "calibration_scores", ()):
-                            rcp.residuals = np.sort(np.asarray(ch.calibration_scores, dtype=np.float64))
-                            rcp.is_calibrated = True
-                        elif not rcp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
-                            f_def_s = self.schema.fields[f_name]
-                            if isinstance(f_def_s, ScoreField):
-                                half_span_s = _score_half_span(f_def_s.min_value, f_def_s.max_value)
-                                rcp.residuals = np.full(20, 0.10 * half_span_s, dtype=np.float64)
+                        rcp = self.regression_conformal_predictors.get(f_name)
+                        if rcp is not None and f_name in self.schema.fields:
+                            if ch is not None and getattr(ch, "calibration_scores", ()):
+                                rcp.residuals = np.sort(np.asarray(ch.calibration_scores, dtype=np.float64))
                                 rcp.is_calibrated = True
+                            elif not rcp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
+                                f_def_s = self.schema.fields[f_name]
+                                if isinstance(f_def_s, ScoreField):
+                                    half_span_s = _score_half_span(f_def_s.min_value, f_def_s.max_value)
+                                    rcp.residuals = np.full(20, 0.10 * half_span_s, dtype=np.float64)
+                                    rcp.is_calibrated = True
 
-            self._packed_kernel_cache = None
-            if hasattr(self, "_explainer_cache"):
-                self._explainer_cache.clear()
-            if self.use_cache and self.cache is not None:
-                if embedding is None:
-                    self.cache.evict_prompt(prompt)
-                self.cache.invalidate_prior_versions(self.model_version)
+                self._packed_kernel_cache = None
+                if self.use_cache and self.cache is not None:
+                    res = self.decide(
+                        prompt,
+                        telemetry=telemetry,
+                        embedding=embedding,
+                        record_receipt=False,
+                        recency_weighted=recency_weighted,
+                        strict=self.strict_mode,
+                        policy_scope=self.policy_scope,
+                        use_cache=False,
+                    )
 
-            if hasattr(self.model, "cache") and self.model.cache is not None:
-                if embedding is None and hasattr(self.model.cache, "evict_prompt"):
-                    self.model.cache.evict_prompt(prompt)
-                if hasattr(self.model.cache, "invalidate_prior_versions"):
-                    self.model.cache.invalidate_prior_versions(self.model_version)
+                if hasattr(self, "_explainer_cache"):
+                    self._explainer_cache.clear()
+                if self.use_cache and self.cache is not None:
+                    if embedding is None:
+                        self.cache.evict_prompt(prompt)
+                    self.cache.invalidate_prior_versions(self.model_version)
 
-            # Re-evaluate and populate cache only when caching is active
-            if self.use_cache and self.cache is not None:
-                res = self.decide(
-                    prompt,
-                    telemetry=telemetry,
-                    embedding=embedding,
-                    record_receipt=False,
-                    recency_weighted=recency_weighted,
-                    strict=self.strict_mode,
-                    policy_scope=self.policy_scope,
-                )
+                if hasattr(self.model, "cache") and self.model.cache is not None:
+                    if embedding is None and hasattr(self.model.cache, "evict_prompt"):
+                        self.model.cache.evict_prompt(prompt)
+                    if hasattr(self.model.cache, "invalidate_prior_versions"):
+                        self.model.cache.invalidate_prior_versions(self.model_version)
 
-                if not res.is_ambiguous or not self.strict_mode:
+                if self.use_cache and self.cache is not None and (not res.is_ambiguous or not self.strict_mode):
                     eff_m_thresh = self.margin_threshold
                     m_dig = self._model_digest()
                     p_dig = self._projector_digest()
@@ -3370,6 +3440,67 @@ class SystemOneEngine:
                         policy_epoch=self.policy_epoch,
                         explicit_embedding=(embedding is not None),
                     )
+            except BaseException:
+                for h_obj, snap in model_state_snaps:
+                    h_obj._restore_state(snap)
+                for h_obj, dict_snap in model_dict_snaps:
+                    h_obj.__dict__.clear()
+                    h_obj.__dict__.update(dict_snap)
+                if has_model_ver:
+                    model.model_version = prev_model_ver
+                if has_m_ov and m_ov_snap is not None:
+                    model._learned_prompt_overrides.clear()
+                    model._learned_prompt_overrides.update(m_ov_snap)
+                elif hasattr(model, "_learned_prompt_overrides"):
+                    delattr(model, "_learned_prompt_overrides")
+                if has_m_ov_rec and m_ov_rec_snap is not None:
+                    model._learned_prompt_override_recency.clear()
+                    model._learned_prompt_override_recency.update(m_ov_rec_snap)
+                elif hasattr(model, "_learned_prompt_override_recency"):
+                    delattr(model, "_learned_prompt_override_recency")
+                if has_m_proto and m_proto_snap is not None:
+                    model._online_prototype_bank.clear()
+                    model._online_prototype_bank.update(m_proto_snap)
+                elif hasattr(model, "_online_prototype_bank"):
+                    delattr(model, "_online_prototype_bank")
+                if m_cache is not None and m_cache_snap is not None:
+                    m_cache._restore_state(m_cache_snap)
+
+                self.model_version = prev_eng_ver
+                if has_lesson_cnt:
+                    self._online_lesson_count = prev_lesson_cnt
+                else:
+                    self.__dict__.pop("_online_lesson_count", None)
+                if has_eng_ov and eng_ov_snap is not None:
+                    self._learned_prompt_overrides.clear()
+                    self._learned_prompt_overrides.update(eng_ov_snap)
+                elif hasattr(self, "_learned_prompt_overrides"):
+                    delattr(self, "_learned_prompt_overrides")
+                if has_eng_ov_rec and eng_ov_rec_snap is not None:
+                    self._learned_prompt_override_recency.clear()
+                    self._learned_prompt_override_recency.update(eng_ov_rec_snap)
+                elif hasattr(self, "_learned_prompt_override_recency"):
+                    delattr(self, "_learned_prompt_override_recency")
+                if has_eng_ov_cnt and eng_ov_cnt_snap is not None:
+                    self._override_counts.clear()
+                    self._override_counts.update(eng_ov_cnt_snap)
+                elif hasattr(self, "_override_counts"):
+                    delattr(self, "_override_counts")
+                self.calibrators.clear()
+                self.calibrators.update(cal_snap)
+                self.conformal_predictors.clear()
+                self.conformal_predictors.update(cp_snap)
+                self.regression_conformal_predictors.clear()
+                self.regression_conformal_predictors.update(rcp_snap)
+                self._packed_kernel_cache = prev_packed_kernel
+                if has_exp_cache and exp_cache_snap is not None:
+                    self._explainer_cache.clear()
+                    self._explainer_cache.update(exp_cache_snap)
+                elif hasattr(self, "_explainer_cache"):
+                    delattr(self, "_explainer_cache")
+                if self.cache is not None and eng_cache_snap is not None:
+                    self.cache._restore_state(eng_cache_snap)
+                raise
 
             total_ms = (time.perf_counter() - t0) * 1000.0
             return {
@@ -3441,15 +3572,11 @@ class SystemOneEngine:
         preserve split-conformal coverage; use independent recalibration for it.
         """
         if forgetting_factor is not None:
-            ff_val = float(forgetting_factor)
-            if not math.isfinite(ff_val) or not (0.0 < ff_val <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_val}")
+            _validate_forgetting_factor(forgetting_factor)
         eff_ff = forgetting_factor
         eff_reward_scale = 1.0
         if reward is not None:
-            r_val = float(reward)
-            if not math.isfinite(r_val):
-                raise ValueError("reward must be a finite number")
+            r_val = _validate_real_scalar(reward, "reward")
             if r_val <= 0.0:
                 skipped: Dict[str, Any] = {
                     "status": "skipped_non_positive_reward",
@@ -3463,7 +3590,9 @@ class SystemOneEngine:
                 return skipped
             eff_reward_scale = float(np.clip(r_val, 0.0, 1.0))
             if r_val != 1.0:
-                base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+                base_ff = _validate_forgetting_factor(
+                    forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+                )
                 eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
 
         resolved_target = target

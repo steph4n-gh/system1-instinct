@@ -232,7 +232,7 @@ class AutoCutoverLifecycle:
         self.admitted_vecs: List[np.ndarray] = []
         self.admitted_labels: List[str] = []
         self.admitted_values: List[Dict[str, Any]] = []
-        self._vec_buf = np.zeros((2500, self.config.dense_dim), dtype=np.float32)
+        self._vec_buf = np.empty((0, self.config.dense_dim), dtype=np.float32)
         self.ng_df: Dict[str, int] = {}
         self.admitted_lengths: List[int] = []
 
@@ -393,9 +393,12 @@ class AutoCutoverLifecycle:
             return
         idx = len(self.admitted_vecs)
         if idx >= self._vec_buf.shape[0]:
-            self._vec_buf = np.vstack(
-                [self._vec_buf, np.zeros((1000, self.config.dense_dim), dtype=np.float32)]
-            )
+            cur_cap = self._vec_buf.shape[0]
+            grow = 64 if cur_cap == 0 else max(64, min(1000, cur_cap))
+            new_buf = np.zeros((cur_cap + grow, self.config.dense_dim), dtype=np.float32)
+            if cur_cap > 0:
+                new_buf[:cur_cap] = self._vec_buf
+            self._vec_buf = new_buf
         self._vec_buf[idx] = vec
         self.admitted_keys.add(key)
         self.admitted_vecs.append(vec)

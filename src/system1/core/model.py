@@ -894,6 +894,120 @@ def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
     return _clone_preserving_2d_layout(arr, dtype=dtype, writeable=False)
 
 
+def _is_real_scalar_elem(v: Any) -> bool:
+    """Return True iff v is a real integer or floating scalar (excluding booleans, complex, strings)."""
+    return not isinstance(v, (bool, np.bool_)) and isinstance(v, (int, float, np.integer, np.floating))
+
+
+def _validate_real_scalar(value: Any, name: str) -> float:
+    """Validate that value is a finite real scalar before numeric conversion."""
+    if not _is_real_scalar_elem(value):
+        raise ValueError(f"{name} must be a finite real number, got {value!r}")
+    try:
+        val_f = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be a finite real number, got {value!r}") from exc
+    if not math.isfinite(val_f):
+        raise ValueError(f"{name} must be a finite real number, got {value!r}")
+    return val_f
+
+
+def _validate_forgetting_factor(value: Any) -> float:
+    """Validate forgetting_factor type, range (0, 1.0], and float32 reciprocal finiteness."""
+    lam_f = _validate_real_scalar(value, "Forgetting factor lambda_f")
+    if not (0.0 < lam_f <= 1.0):
+        raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {lam_f}")
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        lam_f32 = np.float32(lam_f)
+        inv_lam_f32 = np.float32(1.0 / lam_f)
+    if lam_f != 1.0 and (
+        not bool(np.isfinite(inv_lam_f32))
+        or not bool(np.isfinite(lam_f32))
+        or float(lam_f32) <= 0.0
+    ):
+        raise ValueError(f"Forgetting factor lambda_f={lam_f} overflows float32 covariance update")
+    return lam_f
+
+
+def _coerce_real_1d_f32(vec: Any, label: str) -> np.ndarray:
+    """Validate real numeric array-like input (including object elements) and coerce to finite 1D float32."""
+    raw = np.asarray(vec)
+    if (
+        raw.dtype == np.bool_
+        or np.issubdtype(raw.dtype, np.complexfloating)
+        or raw.dtype.kind not in ("i", "u", "f", "O")
+    ):
+        raise ValueError(f"{label} must be a finite real numeric vector")
+    if raw.dtype == np.object_ and not all(_is_real_scalar_elem(v) for v in raw.flat):
+        raise ValueError(f"{label} must be a finite real numeric vector")
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            out = np.asarray(raw, dtype=np.float32).ravel()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} contains invalid or non-numeric values") from exc
+    if not bool(np.all(np.isfinite(out))):
+        raise ValueError(f"{label} contains NaN or Inf non-finite values")
+    return out
+
+
+def _center_and_normalize_f32_safe(
+    vec: Any, mean: Optional[np.ndarray] = None
+) -> Optional[np.ndarray]:
+    """Mean-center and L2-normalize a 1D vector in scaled float64 without float32 overflow/underflow."""
+    v_in = np.asarray(vec)
+    if v_in.ndim != 1:
+        raise ValueError(f"Expected 1D vector for exemplar normalization, got shape {v_in.shape}")
+    v64 = np.asarray(v_in, dtype=np.float64)
+    if not bool(np.all(np.isfinite(v64))):
+        raise ValueError("Vector contains non-finite values during exemplar normalization")
+    if mean is not None:
+        m64 = np.asarray(mean, dtype=np.float64).ravel()
+        if len(m64) == len(v64):
+            if not bool(np.all(np.isfinite(m64))):
+                raise ValueError("Exemplar mean contains non-finite values")
+            v64 = v64 - m64
+            if not bool(np.all(np.isfinite(v64))):
+                raise ValueError("Centered vector overflows float64")
+    if v64.size == 0:
+        return None
+    max_abs = float(np.max(np.abs(v64)))
+    if not math.isfinite(max_abs):
+        raise ValueError("Vector magnitude overflows float64")
+    if max_abs == 0.0:
+        return None
+    scaled = v64 / max_abs
+    norm_scaled = float(np.linalg.norm(scaled))
+    if not math.isfinite(norm_scaled) or norm_scaled == 0.0:
+        return None
+    if max_abs <= 1e-12 and (max_abs * norm_scaled) <= 1e-12:
+        return None
+    out = (scaled / norm_scaled).astype(np.float32)
+    if not bool(np.all(np.isfinite(out))) or float(np.linalg.norm(out.astype(np.float64))) <= 0.5:
+        raise ValueError("Normalized vector failed float32 finiteness check")
+    return out
+
+
+def _normalize_rows_2d_f32_safe_keep_small(mat: np.ndarray) -> np.ndarray:
+    """Row-normalize a 2D array in scaled float64, keeping rows with norm < 1e-12 unscaled."""
+    m64 = np.asarray(mat, dtype=np.float64)
+    if not bool(np.all(np.isfinite(m64))):
+        raise ValueError("Sub-bank rows contain non-finite values")
+    if m64.ndim != 2 or m64.shape[0] == 0 or m64.shape[1] == 0:
+        return m64.astype(np.float32)
+    scales = np.max(np.abs(m64), axis=1, keepdims=True)
+    pos = scales[:, 0] > 0.0
+    denom_s = np.where(pos[:, None], scales, 1.0)
+    scaled = m64 / denom_s
+    s_norms = np.linalg.norm(scaled, axis=1, keepdims=True)
+    small = (~pos) | ((scales[:, 0] <= 1e-12) & ((scales[:, 0] * s_norms[:, 0]) < 1e-12))
+    denom_n = np.where(small[:, None] | (s_norms == 0.0), 1.0, s_norms)
+    normed64 = np.where(small[:, None], m64, scaled / denom_n)
+    out = normed64.astype(np.float32)
+    if not bool(np.all(np.isfinite(out))):
+        raise ValueError("Row-normalized sub-bank overflowed float32")
+    return out
+
+
 def _coerce_inference_array_f32_or_f64(
     arr: Any,
     label: str,
@@ -909,7 +1023,7 @@ def _coerce_inference_array_f32_or_f64(
         or arr_in.dtype.kind not in ("i", "u", "f", "O")
     ):
         raise ValueError(f"{label} must be a real numeric array")
-    if arr_in.dtype == np.object_ and any(isinstance(v, (bool, np.bool_, complex)) for v in arr_in.flat):
+    if arr_in.dtype == np.object_ and not all(_is_real_scalar_elem(v) for v in arr_in.flat):
         raise ValueError(f"{label} must be a real numeric array")
     if expected_ndim is not None and arr_in.ndim != expected_ndim:
         raise ValueError(f"{label} must be {expected_ndim}D, got shape {arr_in.shape}")
@@ -1735,7 +1849,7 @@ class DecisionFieldHead:
         self.backend = backend
         self.projector = projector
         self.contrastive_whitening = contrastive_whitening
-        self.forgetting_factor = float(forgetting_factor)
+        self.forgetting_factor = _validate_forgetting_factor(forgetting_factor)
         self.weights: np.ndarray
         self.biases: np.ndarray
         self.mx_weights: Any = None
@@ -2397,6 +2511,8 @@ class DecisionFieldHead:
             "_shots_c_layout": self._shots_c_layout,
             "_has_online_shots_are_pseudo": "_online_shots_are_pseudo" in self.__dict__,
             "_online_shots_are_pseudo": self.__dict__.get("_online_shots_are_pseudo", False),
+            "_has_logit_adjustments": "logit_adjustments" in self.__dict__,
+            "logit_adjustments": self.__dict__.get("logit_adjustments", None),
         }
 
     def _restore_state(self, snap: Dict[str, Any]) -> None:
@@ -2447,6 +2563,10 @@ class DecisionFieldHead:
             self._online_shots_are_pseudo = snap["_online_shots_are_pseudo"]
         else:
             self.__dict__.pop("_online_shots_are_pseudo", None)
+        if snap["_has_logit_adjustments"]:
+            self.logit_adjustments = snap["logit_adjustments"]
+        else:
+            self.__dict__.pop("logit_adjustments", None)
 
     def _update_exemplar_bank_entry(
         self,
@@ -2467,21 +2587,22 @@ class DecisionFieldHead:
             return
         if self._exemplar_bank is None:
             return
+        mean_arr = (
+            self._exemplar_mean
+            if (self._exemplar_mean is not None and len(self._exemplar_mean) == D)
+            else None
+        )
         if (concept_embedding is not None or prompt is not None) and self._exemplar_projector is not None:
             if concept_embedding is not None:
-                with np.errstate(over="ignore", invalid="ignore"):
-                    c_vec = np.asarray(concept_embedding, dtype=np.float32).ravel()
-                if len(c_vec) != D or not bool(np.all(np.isfinite(c_vec))):
+                c_vec = _coerce_real_1d_f32(concept_embedding, "concept_embedding")
+                if len(c_vec) != D:
                     raise ValueError(f"concept_embedding must be a finite vector of length {D}")
             else:
                 assert prompt is not None
                 c_vec = self._exemplar_projector._project_concept_aware(prompt)
-            if self._exemplar_mean is not None and len(self._exemplar_mean) == D:
-                c_vec = (c_vec - self._exemplar_mean).astype(np.float32)
-            c_norm = float(np.linalg.norm(c_vec))
-            if c_norm <= 1e-12:
+            c_full = _center_and_normalize_f32_safe(c_vec, mean_arr)
+            if c_full is None:
                 return
-            c_full = (c_vec / c_norm).astype(np.float32)
             if prompt is not None:
                 # Boost novel co-occurring vocabulary not already present in the initial description of target_k
                 if target_k < len(self._known_stems_per_option):
@@ -2503,14 +2624,11 @@ class DecisionFieldHead:
                 ]
                 if novel_words and len(novel_words) < len(words):
                     c_nov_raw = self._exemplar_projector._project_concept_aware(" ".join(novel_words))
-                    if self._exemplar_mean is not None and len(self._exemplar_mean) == D:
-                        c_nov_raw = (c_nov_raw - self._exemplar_mean).astype(np.float32)
-                    cn_norm = float(np.linalg.norm(c_nov_raw))
-                    if cn_norm > 1e-12:
-                        c_nov = (c_nov_raw / cn_norm).astype(np.float32)
-                        c_mix = 0.45 * c_full + 0.55 * c_nov
-                        cm_norm = float(np.linalg.norm(c_mix))
-                        c_unit = (c_mix / (cm_norm if cm_norm > 1e-12 else 1.0)).astype(np.float32)
+                    c_nov = _center_and_normalize_f32_safe(c_nov_raw, mean_arr)
+                    if c_nov is not None:
+                        c_mix = 0.45 * c_full.astype(np.float64) + 0.55 * c_nov.astype(np.float64)
+                        c_mixed_unit = _center_and_normalize_f32_safe(c_mix)
+                        c_unit = c_mixed_unit if c_mixed_unit is not None else c_full
                     else:
                         c_unit = c_full
                 else:
@@ -2518,20 +2636,18 @@ class DecisionFieldHead:
             else:
                 c_unit = c_full
         else:
-            c_vec = np.asarray(emb_feat, dtype=np.float32).flatten()[:D].copy()
-            if self._exemplar_mean is not None and len(self._exemplar_mean) == D:
-                c_vec = (c_vec - self._exemplar_mean).astype(np.float32)
-            c_norm = float(np.linalg.norm(c_vec))
-            if c_norm <= 1e-12:
+            c_raw = _coerce_real_1d_f32(emb_feat, "emb_feat")[:D].copy()
+            c_unit_opt = _center_and_normalize_f32_safe(c_raw, mean_arr)
+            if c_unit_opt is None:
                 return
-            c_unit = (c_vec / c_norm).astype(np.float32)
+            c_unit = c_unit_opt
 
         w_cons, sub_banks = self._exemplar_bank
         w_cons_new = _clone_preserving_2d_layout(w_cons, dtype=w_cons.dtype, writeable=True)
-        w_blend = (1.0 - blend_rate) * w_cons_new[target_k] + blend_rate * c_unit
-        wb_norm = float(np.linalg.norm(w_blend))
-        if wb_norm > 1e-12:
-            w_cons_new[target_k] = (w_blend / wb_norm).astype(np.float32)
+        w_blend = (1.0 - float(blend_rate)) * w_cons_new[target_k].astype(np.float64) + float(blend_rate) * c_unit.astype(np.float64)
+        w_blend_unit = _center_and_normalize_f32_safe(w_blend)
+        if w_blend_unit is not None:
+            w_cons_new[target_k] = w_blend_unit
 
         sim_w_thresh = 0.35 if K > 8 else 0.15
         sim_b_thresh = 0.42 if K > 8 else 0.20
@@ -2546,22 +2662,24 @@ class DecisionFieldHead:
                     updated_bank = c_unit.reshape(1, -1).astype(np.float32)
                 new_sub_banks[k_idx] = updated_bank
             elif attenuate_competitors:
-                sim_w = float(w_cons_new[k_idx] @ c_unit)
+                sim_w = float(w_cons_new[k_idx].astype(np.float64) @ c_unit.astype(np.float64))
                 if sim_w > sim_w_thresh:
-                    w_orth = w_cons_new[k_idx] - 0.35 * sim_w * c_unit
-                    wo_norm = float(np.linalg.norm(w_orth))
-                    if wo_norm > 1e-12:
-                        w_cons_new[k_idx] = (w_orth / wo_norm).astype(np.float32)
+                    w_orth = w_cons_new[k_idx].astype(np.float64) - 0.35 * sim_w * c_unit.astype(np.float64)
+                    w_orth_unit = _center_and_normalize_f32_safe(w_orth)
+                    if w_orth_unit is not None:
+                        w_cons_new[k_idx] = w_orth_unit
                 bank_k = new_sub_banks[k_idx]
                 if bank_k.size > 0:
-                    sims_b = bank_k @ c_unit
+                    sims_b = bank_k.astype(np.float64) @ c_unit.astype(np.float64)
                     mask_high = sims_b > sim_b_thresh
                     if np.any(mask_high):
-                        b_mod = bank_k.copy()
-                        b_mod[mask_high] = b_mod[mask_high] - 0.45 * np.outer(sims_b[mask_high], c_unit)
-                        b_norms = np.linalg.norm(b_mod, axis=1, keepdims=True)
-                        b_norms = np.where(b_norms < 1e-12, 1.0, b_norms)
-                        new_sub_banks[k_idx] = (b_mod / b_norms).astype(np.float32)
+                        b_mod = bank_k.astype(np.float64)
+                        b_mod[mask_high] = b_mod[mask_high] - 0.45 * np.outer(sims_b[mask_high], c_unit.astype(np.float64))
+                        new_sub_banks[k_idx] = _normalize_rows_2d_f32_safe_keep_small(b_mod)
+        if not bool(np.all(np.isfinite(w_cons_new))) or not all(
+            bool(np.all(np.isfinite(sb))) for sb in new_sub_banks
+        ):
+            raise ValueError("Exemplar bank update produced non-finite vectors")
         eff_bank_hint = self._exemplar_vectors_layout
         if eff_bank_hint is None:
             for prev_b in new_sub_banks:
@@ -2652,14 +2770,14 @@ class DecisionFieldHead:
                     class_counts[opt_name] = len(selected)
                     adapted_samples += len(selected)
                     for i in selected:
-                        vp = embs[i]
-                        np_n = float(np.linalg.norm(vp))
-                        if np_n > 1e-12:
-                            shots_p[k_idx].append((vp / np_n).astype(np.float32))
-                        vc = self._exemplar_projector._project_concept_aware(prompt_list[i])
-                        nc_n = float(np.linalg.norm(vc))
-                        if nc_n > 1e-12:
-                            shots_c[k_idx].append((vc / nc_n).astype(np.float32))
+                        vp = _center_and_normalize_f32_safe(embs[i])
+                        if vp is not None:
+                            shots_p[k_idx].append(vp)
+                        vc = _center_and_normalize_f32_safe(
+                            self._exemplar_projector._project_concept_aware(prompt_list[i])
+                        )
+                        if vc is not None:
+                            shots_c[k_idx].append(vc)
             if adapted_samples > 0 and (
                 self._online_shots_p is None or getattr(self, "_online_shots_are_pseudo", False)
             ):
@@ -2672,11 +2790,15 @@ class DecisionFieldHead:
                 self._online_shots_are_pseudo = True
             return {"adapted_samples": adapted_samples, "class_counts": class_counts}
 
-        mu_bg = np.mean(self.weights, axis=0)
+        mu_bg = np.mean(self.weights.astype(np.float64), axis=0)
         if N >= 4:
-            valid_embs = [embs[i] for i in range(N) if float(np.linalg.norm(embs[i])) > 1e-12]
+            valid_embs = [
+                embs[i].astype(np.float64)
+                for i in range(N)
+                if _center_and_normalize_f32_safe(embs[i]) is not None
+            ]
             if len(valid_embs) >= 4:
-                mu_bg = (0.70 * mu_bg + 0.30 * np.mean(valid_embs, axis=0)).astype(np.float32)
+                mu_bg = 0.70 * mu_bg + 0.30 * np.mean(valid_embs, axis=0)
 
         class_vecs: Dict[int, List[np.ndarray]] = {}
         class_weights_map: Dict[int, List[float]] = {}
@@ -2685,7 +2807,7 @@ class DecisionFieldHead:
 
         for i in range(N):
             emb_i = embs[i]
-            if float(np.linalg.norm(emb_i)) <= 1e-12:
+            if _center_and_normalize_f32_safe(emb_i) is None:
                 continue
             p_i = probs[i]
             sorted_p = np.sort(p_i)
@@ -2696,10 +2818,8 @@ class DecisionFieldHead:
             conf_w = float(
                 min(1.0, (margin - margin_threshold) / max(0.1, 1.0 - margin_threshold) + 0.35)
             )
-            u_i = emb_i - mu_bg
-            u_norm = float(np.linalg.norm(u_i))
-            if u_norm > 1e-12:
-                u_unit = (u_i / u_norm).astype(np.float32)
+            u_unit = _center_and_normalize_f32_safe(emb_i, mu_bg)
+            if u_unit is not None:
                 class_vecs.setdefault(k_best, []).append(u_unit)
                 class_weights_map.setdefault(k_best, []).append(conf_w)
                 opt_name = self.field_def.options[k_best]
@@ -2717,16 +2837,15 @@ class DecisionFieldHead:
         if adapted_samples > 0:
             new_W = self.weights.copy()
             for k_idx, vecs in class_vecs.items():
-                ws = np.asarray(class_weights_map[k_idx], dtype=np.float32).reshape(-1, 1)
-                pseudo_proto = np.sum(np.stack(vecs, axis=0) * ws, axis=0) / max(1e-6, float(np.sum(ws)))
-                p_norm = float(np.linalg.norm(pseudo_proto))
-                if p_norm > 1e-12:
-                    pseudo_unit = (pseudo_proto / p_norm).astype(np.float32)
+                ws = np.asarray(class_weights_map[k_idx], dtype=np.float64).reshape(-1, 1)
+                pseudo_proto = np.sum(np.stack(vecs, axis=0).astype(np.float64) * ws, axis=0) / max(1e-6, float(np.sum(ws)))
+                pseudo_unit = _center_and_normalize_f32_safe(pseudo_proto)
+                if pseudo_unit is not None:
                     eff_lr = float(min(0.45, learning_rate * min(1.5, 0.7 + 0.15 * len(vecs))))
-                    w_blended = (1.0 - eff_lr) * new_W[k_idx] + eff_lr * pseudo_unit
-                    wb_norm = float(np.linalg.norm(w_blended))
-                    if wb_norm > 1e-12:
-                        new_W[k_idx] = (w_blended / wb_norm).astype(np.float32)
+                    w_blended = (1.0 - eff_lr) * new_W[k_idx].astype(np.float64) + eff_lr * pseudo_unit.astype(np.float64)
+                    wb_unit = _center_and_normalize_f32_safe(w_blended)
+                    if wb_unit is not None:
+                        new_W[k_idx] = wb_unit
             self.set_weights(new_W, self.biases, clear_exemplar_bank=False)
 
         return {"adapted_samples": adapted_samples, "class_counts": class_counts}
@@ -2749,62 +2868,35 @@ class DecisionFieldHead:
         W_{t+1} = (P_{t+1} B_{t+1})^T
         """
         t0 = time.perf_counter()
-        if isinstance(forgetting_factor, (bool, np.bool_)):
-            raise ValueError(f"Forgetting factor lambda_f must be a real float in (0, 1.0], got {forgetting_factor!r}")
-        if isinstance(reward_scale, (bool, np.bool_)):
-            raise ValueError(f"reward_scale must be a finite real number, got {reward_scale!r}")
-        lam_f = float(
+        lam_f = _validate_forgetting_factor(
             forgetting_factor if forgetting_factor is not None else self.forgetting_factor
         )
-        if not math.isfinite(lam_f) or not (0.0 < lam_f <= 1.0):
-            raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {lam_f}")
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             lam_f32 = np.float32(lam_f)
             inv_lam_f32 = np.float32(1.0 / lam_f)
-        if lam_f != 1.0 and (
-            not bool(np.isfinite(inv_lam_f32))
-            or not bool(np.isfinite(lam_f32))
-            or float(lam_f32) <= 0.0
-        ):
-            raise ValueError(f"Forgetting factor lambda_f={lam_f} overflows float32 covariance update")
 
         D = self.dimension
         K = self.weights.shape[0]
-        reward_scale_f = float(reward_scale)
-        if not math.isfinite(reward_scale_f):
-            raise ValueError(f"reward_scale must be finite, got {reward_scale!r}")
+        reward_scale_f = _validate_real_scalar(reward_scale, "reward_scale")
 
         ce_arr: Optional[np.ndarray] = None
-        with np.errstate(over="ignore", invalid="ignore"):
-            x = np.asarray(x_aug, dtype=np.float32).ravel()
-            if len(x) == D:
-                # If prompt embedding without bias 1, augment
-                x = np.append(x, np.float32(1.0))
-            elif len(x) != D + 1:
-                raise ValueError(f"Expected x_aug of length {D} or {D+1}, got {len(x)}")
+        x = _coerce_real_1d_f32(x_aug, "x_aug")
+        if len(x) == D:
+            # If prompt embedding without bias 1, augment
+            x = np.append(x, np.float32(1.0))
+        elif len(x) != D + 1:
+            raise ValueError(f"Expected x_aug of length {D} or {D+1}, got {len(x)}")
 
-            if not np.all(np.isfinite(x)):
-                raise ValueError("x_aug contains NaN or Inf non-finite values")
+        y = _coerce_real_1d_f32(y_target, "y_target")
+        if isinstance(self.field_def, (BooleanField, ScoreField)) and len(y) == 1 and K == 2:
+            y = np.array([y[0], -y[0] if isinstance(self.field_def, BooleanField) else 0.0], dtype=np.float32)
+        if len(y) != K:
+            raise ValueError(f"Expected target vector y of length {K}, got {len(y)}")
 
-            y = np.asarray(y_target, dtype=np.float32).ravel()
-            if not np.all(np.isfinite(y)):
-                raise ValueError("y_target contains NaN or Inf non-finite values")
-            if isinstance(self.field_def, (BooleanField, ScoreField)) and len(y) == 1 and K == 2:
-                y = np.array([y[0], -y[0] if isinstance(self.field_def, BooleanField) else 0.0], dtype=np.float32)
-            if len(y) != K:
-                raise ValueError(f"Expected target vector y of length {K}, got {len(y)}")
-
-            if concept_embedding is not None:
-                ce_raw = np.asarray(concept_embedding)
-                if (
-                    ce_raw.dtype == np.bool_
-                    or np.issubdtype(ce_raw.dtype, np.complexfloating)
-                    or ce_raw.dtype.kind not in ("i", "u", "f", "O")
-                ):
-                    raise ValueError(f"concept_embedding must be a finite real vector of length {D}")
-                ce_arr = np.asarray(ce_raw, dtype=np.float32).ravel()
-                if len(ce_arr) != D or not bool(np.all(np.isfinite(ce_arr))):
-                    raise ValueError(f"concept_embedding must be a finite vector of length {D}")
+        if concept_embedding is not None:
+            ce_arr = _coerce_real_1d_f32(concept_embedding, "concept_embedding")
+            if len(ce_arr) != D or not bool(np.all(np.isfinite(ce_arr))):
+                raise ValueError(f"concept_embedding must be a finite vector of length {D}")
 
         f32_dt = np.dtype(np.float32)
         w_cur = np.asarray(self.weights)
@@ -2922,7 +3014,7 @@ class DecisionFieldHead:
 
             v: Optional[np.ndarray] = None
             z_curr_dir: Optional[np.ndarray] = None
-            if preserve_calibration and float(np.linalg.norm(x[:D])) > 1e-12:
+            if preserve_calibration and float(np.linalg.norm(x[:D].astype(np.float64))) > 1e-12:
                 x_step = np.empty(D + 1, dtype=f32_dt)
                 x_step[:D] = x[:D]
                 x_step[D] = 0.0
@@ -3121,10 +3213,9 @@ class DecisionFieldHead:
                                 self._online_shots_p = [[] for _ in range(K)]
                                 self._online_shots_c = [[] for _ in range(K)]
                                 self._online_shots_are_pseudo = False
-                            xp = x[:D].copy()
-                            np_norm = float(np.linalg.norm(xp))
-                            if np_norm > 1e-12:
-                                self._online_shots_p[target_k].append((xp / np_norm).astype(f32_dt))
+                            xp_u = _center_and_normalize_f32_safe(x[:D])
+                            if xp_u is not None:
+                                self._online_shots_p[target_k].append(xp_u)
                                 self._shots_p_raw = None
                                 self._shots_p_row_ids = ()
                             if (ce_arr is not None or prompt is not None) and self._exemplar_projector is not None:
@@ -3133,9 +3224,9 @@ class DecisionFieldHead:
                                     if ce_arr is not None
                                     else self._exemplar_projector._project_concept_aware(prompt or "")
                                 )
-                                nc_norm = float(np.linalg.norm(xc))
-                                if nc_norm > 1e-12:
-                                    self._online_shots_c[target_k].append((xc / nc_norm).astype(f32_dt))
+                                xc_u = _center_and_normalize_f32_safe(xc)
+                                if xc_u is not None:
+                                    self._online_shots_c[target_k].append(xc_u)
                                     self._shots_c_raw = None
                                     self._shots_c_row_ids = ()
 
@@ -3378,7 +3469,7 @@ class SystemOneModel:
         self.dimension = dimension
         self.backend = self._resolve_backend(backend)
         self.contrastive_whitening = contrastive_whitening
-        self.forgetting_factor = float(forgetting_factor)
+        self.forgetting_factor = _validate_forgetting_factor(forgetting_factor)
         self.recency_weighted = bool(recency_weighted)
         if projector is not None:
             self.projector = projector
@@ -3560,9 +3651,10 @@ class SystemOneModel:
         """Closed-form rank-1 Sherman-Morrison online update on the metal (<0.1ms)."""
         with self._lock:
             target_dict = self.schema.validate_lesson(target, allow_unknown=True)
-            eff_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
-            if not math.isfinite(eff_ff) or not (0.0 < eff_ff <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_ff}")
+            eff_ff = _validate_forgetting_factor(
+                forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+            )
+            _validate_real_scalar(reward_scale, "reward_scale")
             t0 = time.perf_counter()
             c_emb = concept_embedding
             needs_concept = any(
@@ -3572,7 +3664,7 @@ class SystemOneModel:
                 for f_name in target_dict
             )
             if embedding is not None:
-                emb = np.asarray(embedding, dtype=np.float32).flatten()
+                emb = _coerce_real_1d_f32(embedding, "embedding")
             elif (
                 needs_concept
                 and telemetry is None
@@ -3703,15 +3795,11 @@ class SystemOneModel:
     ) -> Dict[str, Any]:
         """First-class online teaching method that preserves calibration by default."""
         if forgetting_factor is not None:
-            ff_check = float(forgetting_factor)
-            if not math.isfinite(ff_check) or not (0.0 < ff_check <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_check}")
+            _validate_forgetting_factor(forgetting_factor)
         eff_ff = forgetting_factor
         eff_reward_scale = 1.0
         if reward is not None:
-            r_val = float(reward)
-            if not math.isfinite(r_val):
-                raise ValueError("reward must be a finite number")
+            r_val = _validate_real_scalar(reward, "reward")
             if r_val <= 0.0:
                 skipped: Dict[str, Any] = {
                     "status": "skipped_non_positive_reward",
@@ -3725,7 +3813,9 @@ class SystemOneModel:
                 return skipped
             eff_reward_scale = float(np.clip(r_val, 0.0, 1.0))
             if r_val != 1.0:
-                base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+                base_ff = _validate_forgetting_factor(
+                    forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+                )
                 eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
 
         resolved_target = target
@@ -5330,10 +5420,26 @@ class PackedMultiQuestionKernel:
                 zs_cal = scaled_zs / self.s_raw_scale[None, :]
                 p_s = _stable_sigmoid(zs_cal)
                 fin_rng = np.isfinite(self.s_range[None, :])
-                s_val = np.where(
+                s_lo = self.s_min[None, :]
+                s_hi = self.s_max[None, :]
+                s_rng_safe = np.where(fin_rng, self.s_range[None, :], 0.0)
+                s_interp = np.where(
                     fin_rng,
-                    self.s_min[None, :] + self.s_range[None, :] * p_s,
-                    (1.0 - p_s) * self.s_min[None, :] + p_s * self.s_max[None, :],
+                    s_lo + s_rng_safe * p_s,
+                    (1.0 - p_s) * s_lo + p_s * s_hi,
+                )
+                s_val = np.where(
+                    p_s <= 0.0,
+                    np.broadcast_to(s_lo, p_s.shape),
+                    np.where(
+                        p_s >= 1.0,
+                        np.broadcast_to(s_hi, p_s.shape),
+                        np.where(
+                            s_interp < s_lo,
+                            s_lo,
+                            np.where(s_interp > s_hi, s_hi, s_interp),
+                        ),
+                    ),
                 )
                 p_s_raw = _stable_sigmoid(scaled_zs)
                 s_conf = np.maximum(p_s_raw, 1.0 - p_s_raw)
@@ -6391,11 +6497,22 @@ class FastDecisionCallable:
             else:
                 ez = exp(z_cal)
                 ps = ez / (1.0 + ez)
-            s_val = (
-                st.s_min[si] + st.s_range[si] * ps
-                if isfinite(st.s_range[si])
-                else ((1.0 - ps) * st.s_min[si] + ps * st.s_max[si])
-            )
+            s_lo = st.s_min[si]
+            s_hi = st.s_max[si]
+            if ps <= 0.0:
+                s_val = s_lo
+            elif ps >= 1.0:
+                s_val = s_hi
+            else:
+                s_val = (
+                    s_lo + st.s_range[si] * ps
+                    if isfinite(st.s_range[si])
+                    else ((1.0 - ps) * s_lo + ps * s_hi)
+                )
+                if s_val < s_lo:
+                    s_val = s_lo
+                elif s_val > s_hi:
+                    s_val = s_hi
             if scaled_zs >= 0.0:
                 ps_raw = 1.0 / (1.0 + exp(-scaled_zs))
             else:

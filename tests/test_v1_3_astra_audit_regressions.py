@@ -14467,6 +14467,10 @@ def test_astra_38_round25_regressions() -> None:
     assert e1_sys.model_version == v_s1_0
     assert np.array_equal(e1_sys.model.heads["first"].weights, w_s1_0)
     assert e1_sys.model.heads["first"].covariance_inv is None
+    with pytest.raises(ValueError):
+        e1_sys.model.learn("p", {"first": "b", "second": "a"}, embedding=emb1)
+    assert np.array_equal(e1_sys.model.heads["first"].weights, w_s1_0)
+    assert e1_sys.model.heads["first"].covariance_inv is None
 
     # ------------------------------------------------------------------
     # R25-2: online_update stages covariance & weights atomically (tiny
@@ -14551,6 +14555,12 @@ def test_astra_38_round25_regressions() -> None:
                 0,
                 concept_embedding=np.ones((16, 1), dtype="f4"),
             )
+            with pytest.raises(ValueError):
+                h2_ex._update_exemplar_bank_entry(
+                    np.ones(16, dtype="f4"),
+                    0,
+                    concept_embedding=np.zeros((15, 1), dtype="f4"),
+                )
         p_ex_ref = h2_ex.covariance_inv.copy()
         b_ex_ref = h2_ex.cross_covariance.copy()
         w_ex_ref = h2_ex.weights.copy()
@@ -14723,3 +14733,671 @@ def test_astra_38_round25_regressions() -> None:
         assert m6_hi["per_class"]["high"]["count"] == 1
         if lo6 != 1.0:
             assert m6["per_class"]["low"]["count"] == 1
+
+
+def test_astra_39_round26_regressions() -> None:
+    """Round-26 regressions R26-1..R26-7 across engine transaction rollback, pre-coercion scalar/vector validation, float64 exemplar centering/normalization, fast-path Score endpoint clamping, lossless interval formatting, and deferred/bounded gateway lifecycles."""
+    import math
+    import warnings
+    import numpy as np
+    import pytest
+
+    from system1 import (
+        ChoiceField,
+        CompiledSystemOneModel,
+        DecisionSchema,
+        GuardShield,
+        MultiTenantSkillFleet,
+        ScoreField,
+        SystemOneCompiler,
+        SystemOneEngine,
+        SystemOneModel,
+        UniversalDecisionService,
+    )
+    from system1.compat.typesafe import TypeSafeClient, ZeroEgressViolationError
+    from system1.compat.universal import InteropError
+    from system1.core.model import DecisionFieldHead, _coerce_inference_array_f32_or_f64
+    from system1.core.schema import _score_from_unit_prob
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.teaching import TeachingSession
+
+    class _R26CoupledSchema(DecisionSchema):
+        first = ChoiceField(options=("a", "b"))
+        second = ChoiceField(options=("a", "b"))
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            clean = super().validate_decision(values)
+            if clean["first"] != clean["second"]:
+                raise ValueError(f"Coupled fields disagree: {clean}")
+            return clean
+
+    class _R26Choice2(DecisionSchema):
+        f = ChoiceField(options=("safe", "unsafe"))
+
+    class _R26DuckHead:
+        def __init__(self, field_def: ChoiceField, dim: int = 16) -> None:
+            self.field_def = field_def
+            self.dimension = dim
+            self.weights = np.zeros((2, dim), dtype=np.float32)
+            self.biases = np.array([2.0, -2.0], dtype=np.float32)
+            self.covariance_inv: Any = None
+            self.logit_adjustments: Any = np.array([0.1, -0.1], dtype=np.float32)
+            self._delegate = DecisionFieldHead(field_def, dimension=dim, backend="numpy", contrastive_whitening=False)
+            self._delegate.set_weights(self.weights, self.biases)
+
+        def format_target_vector(self, val: Any) -> np.ndarray:
+            return self._delegate.format_target_vector(val)
+
+        def online_update(self, x_aug: np.ndarray, y_target: np.ndarray, **kw: Any) -> float:
+            dt = self._delegate.online_update(x_aug, y_target, **kw)
+            self.weights = self._delegate.weights.copy()
+            self.biases = self._delegate.biases.copy()
+            self.covariance_inv = self._delegate.covariance_inv.copy()
+            return dt
+
+        def forward(self, emb: np.ndarray, prompt: Any = None) -> Any:
+            return self._delegate.evaluate_logits(emb @ self.weights.T + self.biases)
+
+    class _R26DuckModel:
+        def __init__(self, schema: DecisionSchema, dim: int = 16, *, use_duck_head: bool = False) -> None:
+            self.schema = schema
+            self.dimension = dim
+            self.backend = "numpy"
+            self.contrastive_whitening = False
+            self.recency_weighted = False
+            self.forgetting_factor = 0.995
+            self.projector = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            ).projector
+            self.model_version = 1
+            if use_duck_head:
+                self.heads = {
+                    k: _R26DuckHead(f, dim) for k, f in schema.fields.items()  # type: ignore[arg-type]
+                }
+            else:
+                self.heads = {
+                    k: DecisionFieldHead(f, dimension=dim, backend="numpy", contrastive_whitening=False)
+                    for k, f in schema.fields.items()
+                }
+                for h in self.heads.values():
+                    h.set_weights(np.zeros((2, dim), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+                    h.logit_adjustments = np.array([0.1, -0.1], dtype="f4")
+
+        def encode(self, prompt: str, telemetry: Any = None, recency_weighted: Any = None) -> np.ndarray:
+            return self.projector.project(prompt)
+
+        def forward_single(self, prompt: str, telemetry: Any = None, embedding: Any = None, recency_weighted: Any = None) -> Any:
+            from system1.core.model import ModelInferenceResult
+
+            emb = np.asarray(embedding, dtype="f4").ravel() if embedding is not None else self.encode(prompt)
+            fields = {k: h.forward(emb) for k, h in self.heads.items()}
+            return ModelInferenceResult(prompt=prompt, embedding=emb, fields=fields, inference_latency_ms=0.1)
+
+    def _fresh(schema_cls: Any, dim: int = 16, **kw: Any) -> SystemOneEngine:
+        e = SystemOneEngine(
+            schema_cls,
+            dimension=dim,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=kw.pop("use_cache", False),
+            strict_mode=kw.pop("strict_mode", False),
+            **kw,
+        )
+        for h in e.model.heads.values():
+            h.set_weights(np.zeros_like(h.weights), np.zeros_like(h.biases))
+        return e
+
+    # ------------------------------------------------------------------
+    # R26-1: Failed engine learn_from_tier2 / learn rolls back ALL state
+    # (weights, covariance, model_version, lesson count, overrides, and cache)
+    # when post-update decide() raises across SystemOneModel, compiled, & custom.
+    # ------------------------------------------------------------------
+    emb_p = np.ones(16, dtype="f4")
+    for pres_cal in (True, False):
+        e1 = SystemOneEngine(
+            _R26CoupledSchema,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=True,
+            strict_mode=False,
+        )
+        for h1 in e1.model.heads.values():
+            h1.set_weights(np.zeros((2, 16), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+            h1.logit_adjustments = np.array([0.1, -0.1], dtype="f4")
+        for fn in e1.calibrators:
+            e1.calibrators[fn].temperature = 1.7
+            e1.calibrators[fn].logit_adjustments = np.array([0.1, -0.1], dtype=np.float64)
+        e1.conformal_predictors["first"].calibration_scores = np.full(25, 0.85, dtype=np.float64)
+        e1.conformal_predictors["first"].is_calibrated = True
+
+        warm1 = e1.decide("p", embedding=emb_p, record_receipt=False)
+        assert warm1.values == {"first": "a", "second": "a"}
+        assert warm1.is_ambiguous is False
+        assert len(e1.cache) == 1
+        w1_0 = e1.model.heads["first"].weights.copy()
+        b1_0 = e1.model.heads["first"].biases.copy()
+        v1_0 = e1.model_version
+
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            e1.learn("p", {"first": "b"}, embedding=emb_p, preserve_calibration=pres_cal)
+
+        assert e1.model_version == v1_0
+        assert getattr(e1.model, "model_version", v1_0) == v1_0
+        assert e1._online_lesson_count == 0
+        assert np.array_equal(e1.model.heads["first"].weights, w1_0)
+        assert np.array_equal(e1.model.heads["first"].biases, b1_0)
+        assert e1.model.heads["first"].covariance_inv is None
+        assert e1.model.heads["first"].cross_covariance is None
+        assert np.array_equal(e1.model.heads["first"].logit_adjustments, np.array([0.1, -0.1], dtype="f4"))
+        assert e1.calibrators["first"].temperature == 1.7
+        assert e1.conformal_predictors["first"].is_calibrated is True
+        assert len(e1.cache) == 1
+        hit1 = e1.decide("p", embedding=emb_p, record_receipt=False)
+        assert hit1.is_cache_hit is True and hit1.values == {"first": "a", "second": "a"}
+
+        # Compiled model with both model.cache and engine.cache enabled
+        base_c = _fresh(_R26CoupledSchema, 16, use_cache=False)
+        for h_c in base_c.model.heads.values():
+            h_c.set_weights(np.zeros((2, 16), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+        cm_r1 = base_c.to_compiled_model()
+        cm_r1.use_cache = True
+        cm_r1.forward_single("p", embedding=emb_p)
+        e_cm = SystemOneEngine(
+            _R26CoupledSchema,
+            model=cm_r1,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=True,
+            strict_mode=False,
+        )
+        e_cm.decide("p", embedding=emb_p, record_receipt=False)
+        assert len(e_cm.cache) == 1 and len(cm_r1.cache) == 1
+        wc_0 = cm_r1.heads["first"].weights.copy()
+        wfc_0 = cm_r1._field_heads["first"].weights.copy()
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            e_cm.learn("p", {"first": "b"}, embedding=emb_p, preserve_calibration=pres_cal)
+        assert e_cm.model_version == 1 and cm_r1.model_version == 1
+        assert e_cm._online_lesson_count == 0
+        assert np.array_equal(cm_r1.heads["first"].weights, wc_0)
+        assert np.array_equal(cm_r1._field_heads["first"].weights, wfc_0)
+        assert cm_r1._field_heads["first"].covariance_inv is None
+        assert len(e_cm.cache) == 1 and len(cm_r1.cache) == 1
+        assert all(ent.model_version == 1 for ent in cm_r1.cache._exact_index.values())
+        assert e_cm.decide("p", embedding=emb_p, record_receipt=False).is_cache_hit is True
+
+        # Custom duck-typed models (with _snapshot_state heads and plain __dict__ heads)
+        for use_duck_h in (False, True):
+            dm = _R26DuckModel(_R26CoupledSchema(), 16, use_duck_head=use_duck_h)
+            e_dk = SystemOneEngine(
+                _R26CoupledSchema,
+                model=dm,
+                dimension=16,
+                backend="numpy",
+                contrastive_whitening=False,
+                use_cache=True,
+                strict_mode=False,
+            )
+            e_dk.decide("p", embedding=emb_p, record_receipt=False)
+            assert len(e_dk.cache) == 1
+            wd_0 = dm.heads["first"].weights.copy()
+            with pytest.raises(ValueError, match="Coupled fields disagree"):
+                e_dk.learn("p", {"first": "b"}, embedding=emb_p, preserve_calibration=pres_cal)
+            assert e_dk.model_version == 1 and dm.model_version == 1
+            assert e_dk._online_lesson_count == 0
+            assert np.array_equal(dm.heads["first"].weights, wd_0)
+            assert dm.heads["first"].covariance_inv is None
+            assert np.array_equal(dm.heads["first"].logit_adjustments, np.array([0.1, -0.1], dtype="f4"))
+            assert len(e_dk.cache) == 1
+            assert e_dk.decide("p", embedding=emb_p, record_receipt=False).is_cache_hit is True
+
+    e1_pf = SystemOneEngine(
+        _R26CoupledSchema,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=True,
+        strict_mode=False,
+    )
+    for h_pf in e1_pf.model.heads.values():
+        h_pf.set_weights(np.zeros((2, 16), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+    e1_pf.decide("p", embedding=emb_p, record_receipt=False)
+    assert len(e1_pf.cache) == 1
+
+    def _boom_put(*a: Any, **kw: Any) -> Any:
+        raise RuntimeError("cache put boom")
+
+    e1_pf.cache.put = _boom_put  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="cache put boom"):
+        e1_pf.learn("p", {"first": "b", "second": "b"}, embedding=emb_p)
+    assert e1_pf.model_version == 1
+    assert len(e1_pf.cache) == 1
+    assert e1_pf.model.heads["first"].covariance_inv is None
+    assert bool(np.all(e1_pf.model.heads["first"].weights == 0.0))
+
+    # ------------------------------------------------------------------
+    # R26-2: Validate forgetting_factor, reward_scale, and reward before float()
+    # across head, model, compiled, engine, and constructors (no bool/complex/str).
+    # ------------------------------------------------------------------
+    bad_ff_vals = (
+        True,
+        False,
+        np.bool_(True),
+        complex(0.5, 1.0),
+        np.complex64(0.5 + 1j),
+        np.complex128(0.5 + 1j),
+        "0.5",
+        1e-45,
+        0.0,
+        1.5,
+        float("nan"),
+        float("inf"),
+    )
+    bad_reward_vals = (True, False, np.bool_(True), np.complex64(0.5 + 1j), np.complex128(0.5 + 1j), "0.5", float("nan"))
+
+    e2 = _fresh(_R26Choice2, 16)
+    h2 = e2.model.heads["f"]
+    m2 = e2.model
+    cm2 = _fresh(_R26Choice2, 16).to_compiled_model()
+    w2_ref = h2.weights.copy()
+    wcm2_ref = cm2.heads["f"].weights.copy()
+    with warnings.catch_warnings(record=True) as caught2:
+        warnings.simplefilter("always")
+        for bad_ff in bad_ff_vals:
+            with pytest.raises(ValueError):
+                DecisionFieldHead(e2.schema.fields["f"], dimension=16, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                SystemOneModel(_R26Choice2, dimension=16, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                SystemOneCompiler(_R26Choice2, dimension=16, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                SystemOneEngine(_R26Choice2, dimension=16, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                CompiledSystemOneModel(
+                    schema=cm2.schema, heads=cm2.heads, dimension=16, forgetting_factor=bad_ff  # type: ignore[arg-type]
+                )
+            with pytest.raises(ValueError):
+                h2.online_update(emb_p, np.array([1.0, 0.0], dtype="f4"), forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                m2.learn_from_tier2("p", {"f": "safe"}, embedding=emb_p, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                m2.learn("p", {"f": "safe"}, embedding=emb_p, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                cm2.learn_from_tier2("p", {"f": "safe"}, embedding=emb_p, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                cm2.learn("p", {"f": "safe"}, embedding=emb_p, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                e2.learn_from_tier2("p", {"f": "safe"}, embedding=emb_p, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                e2.learn("p", {"f": "safe"}, embedding=emb_p, forgetting_factor=bad_ff)  # type: ignore[arg-type]
+
+        for bad_rw in bad_reward_vals:
+            with pytest.raises(ValueError):
+                h2.online_update(emb_p, np.array([1.0, 0.0], dtype="f4"), reward_scale=bad_rw)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                m2.learn_from_tier2("p", {"f": "safe"}, embedding=emb_p, reward_scale=bad_rw)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                m2.learn("p", {"f": "safe"}, embedding=emb_p, reward=bad_rw)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                cm2.learn_from_tier2("p", {"f": "safe"}, embedding=emb_p, reward_scale=bad_rw)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                cm2.learn("p", {"f": "safe"}, embedding=emb_p, reward=bad_rw)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                e2.learn_from_tier2("p", {"f": "safe"}, embedding=emb_p, reward_scale=bad_rw)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                e2.learn("p", {"f": "safe"}, embedding=emb_p, reward=bad_rw)  # type: ignore[arg-type]
+    assert not any(issubclass(w.category, Warning) for w in caught2)
+    assert np.array_equal(h2.weights, w2_ref) and h2.covariance_inv is None
+    assert np.array_equal(cm2.heads["f"].weights, wcm2_ref) and cm2._field_heads["f"].covariance_inv is None
+    assert e2.model_version == 1
+
+    # ------------------------------------------------------------------
+    # R26-3: Scaled float64 centering & unit normalization for huge finite
+    # concept_embedding / x_aug across K=2, K=9, extreme negative/positive
+    # means, and adapt_zero_shot (zero warnings, unit norms, finite logits).
+    # ------------------------------------------------------------------
+    with warnings.catch_warnings(record=True) as caught3:
+        warnings.simplefilter("always")
+        for k3 in (2, 9):
+            ks3 = DecisionSchema(fields={"f": ChoiceField(options=tuple(str(i) for i in range(k3)))})
+            h3 = _fresh(ks3, 16).model.heads["f"]
+            arr3: Dict[str, Any] = {
+                "exemplar_centroids": np.zeros((k3, 16), dtype="f4"),
+                "exemplar_vectors": np.zeros((k3, 16), dtype="f4"),
+                "exemplar_mean": np.zeros(16, dtype="f4"),
+            }
+            cnt3: Dict[str, List[int]] = {"exemplar_vectors": [1] * k3}
+            if k3 > 8:
+                arr3["shots_p"] = np.zeros((k3, 16), dtype="f4")
+                arr3["shots_c"] = np.zeros((k3, 16), dtype="f4")
+                cnt3["shots_p"] = [1] * k3
+                cnt3["shots_c"] = [1] * k3
+            h3.restore_exemplar_state({"arrays": arr3, "counts": cnt3})
+            t3 = np.zeros(k3, dtype="f4")
+            t3[0] = 1.0
+            h3.online_update(emb_p, t3, concept_embedding=np.full(16, 1e30, dtype="f4"))
+            if k3 <= 8:
+                stored_v = h3._exemplar_bank[1][0][-1]
+            else:
+                stored_v = h3._online_shots_c[0][-1]
+            assert bool(np.all(np.isfinite(stored_v)))
+            assert float(np.linalg.norm(stored_v)) == pytest.approx(1.0, rel=1e-5)
+
+            if k3 > 8:
+                h3_p = _fresh(ks3, 16).model.heads["f"]
+                h3_p.restore_exemplar_state({"arrays": arr3, "counts": cnt3})
+                h3_p.covariance_inv = np.full((17, 17), np.float32(0.0), dtype="f4")
+                np.fill_diagonal(h3_p.covariance_inv, np.float32(1e-34))
+                h3_p.cross_covariance = np.zeros((17, k3), dtype="f4")
+                h3_p.online_update(
+                    np.append(np.full(16, 1e30, dtype="f4"), np.float32(1.0)),
+                    np.zeros(k3, dtype="f4") + np.eye(1, k3, dtype="f4")[0],
+                    preserve_calibration=False,
+                )
+                stored_xp = h3_p._online_shots_p[0][-1]
+                assert bool(np.all(np.isfinite(stored_xp)))
+                assert float(np.linalg.norm(stored_xp)) == pytest.approx(1.0, rel=1e-5)
+
+        h3_ext = _fresh(DecisionSchema(fields={"f": ChoiceField(options=("0", "1"))}), 16).model.heads["f"]
+        h3_ext.restore_exemplar_state(
+            {
+                "arrays": {
+                    "exemplar_centroids": np.zeros((2, 16), dtype="f4"),
+                    "exemplar_vectors": np.zeros((2, 16), dtype="f4"),
+                    "exemplar_mean": np.full(16, -3e38, dtype="f4"),
+                },
+                "counts": {"exemplar_vectors": [1, 1]},
+            }
+        )
+        h3_ext.online_update(
+            emb_p,
+            np.array([1.0, 0.0], dtype="f4"),
+            concept_embedding=np.full(16, 3e38, dtype="f4"),
+        )
+        ex_vec_ext = h3_ext._exemplar_bank[1][0][-1]
+        assert bool(np.all(np.isfinite(ex_vec_ext)))
+        assert float(np.linalg.norm(ex_vec_ext)) == pytest.approx(1.0, rel=1e-5)
+        lg_ext = h3_ext.compute_logits(emb_p)
+        assert bool(np.all(np.isfinite(lg_ext)))
+
+        # adapt_zero_shot handles 1e30 embeddings safely
+        h3_az = _fresh(_R26Choice2, 16).model.heads["f"]
+        h3_az.set_weights(
+            np.vstack([np.full((1, 16), 0.25, dtype="f4"), np.full((1, 16), -0.25, dtype="f4")]),
+            np.zeros(2, dtype="f4"),
+        )
+        h3_az._build_concept_aware_exemplar_bank()
+        h3_az._exemplar_projector = None
+        h3_az._exemplar_bank = None
+        az_info = h3_az.adapt_zero_shot(np.full((4, 16), 1e30, dtype="f4"), margin_threshold=0.05)
+        assert az_info["adapted_samples"] > 0
+        assert bool(np.all(np.isfinite(h3_az.weights))) and bool(np.all(np.isfinite(h3_az._exemplar_bank[0])))
+
+        # Non-finite _exemplar_mean raises cleanly & rolls back covariance
+        h3_nan = _fresh(DecisionSchema(fields={"f": ChoiceField(options=("0", "1"))}), 16).model.heads["f"]
+        h3_nan.restore_exemplar_state(
+            {
+                "arrays": {
+                    "exemplar_centroids": np.zeros((2, 16), dtype="f4"),
+                    "exemplar_vectors": np.zeros((2, 16), dtype="f4"),
+                    "exemplar_mean": np.zeros(16, dtype="f4"),
+                },
+                "counts": {"exemplar_vectors": [1, 1]},
+            }
+        )
+        h3_nan.init_covariance()
+        p3_0 = h3_nan.covariance_inv.copy()
+        w3_0 = h3_nan.weights.copy()
+        h3_nan._exemplar_mean = np.full(16, float("nan"), dtype="f4")
+        with pytest.raises(ValueError):
+            h3_nan.online_update(emb_p, np.array([1.0, 0.0], dtype="f4"), concept_embedding=emb_p)
+        assert np.array_equal(h3_nan.covariance_inv, p3_0)
+        assert np.array_equal(h3_nan.weights, w3_0)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught3)
+
+    # ------------------------------------------------------------------
+    # R26-4: Strict real-element checking in object arrays across inference
+    # validator, GuardShield, Fleet, online_update, and learn_from_tier2.
+    # ------------------------------------------------------------------
+    bad_obj_vecs = (
+        np.array([np.complex64(1 + 2j), 0], dtype=object),
+        np.array([np.complex128(1 + 2j), 0], dtype=object),
+        np.array([1 + 2j, 0], dtype=object),
+        np.array(["1.0", "0.0"], dtype=object),
+        np.array([True, 0], dtype=object),
+        np.array([np.bool_(False), 0], dtype=object),
+    )
+    with warnings.catch_warnings(record=True) as caught4:
+        warnings.simplefilter("always")
+        for bv in bad_obj_vecs:
+            with pytest.raises(ValueError):
+                _coerce_inference_array_f32_or_f64(bv, "probe")
+
+        obj_c64 = np.array([np.complex64(1 + 2j), 0], dtype=object)
+        e4_hier = _fresh(_R26Choice2, 16)
+        h4_hier = e4_hier.model.heads["f"]
+        h4_hier.set_hierarchical_weights(
+            cluster_assignments=(0, 1),
+            coarse_weights=np.zeros((2, 16), dtype="f4"),
+            coarse_biases=np.zeros(2, dtype="f4"),
+            fine_weights=np.zeros((2, 16), dtype="f4"),
+            fine_biases=np.zeros(2, dtype="f4"),
+        )
+        h4_hier.coarse_biases = obj_c64
+        with pytest.raises(ValueError):
+            e4_hier.decide("probe", record_receipt=False)
+        with pytest.raises(ValueError):
+            e4_hier.decide_batch(["probe"], record_receipt=False)
+        with pytest.raises(ValueError):
+            GuardShield(e4_hier, field_name="f", unsafe_label="unsafe")
+
+        e4_fl = _fresh(_R26Choice2, 32)
+        e4_fl.model.heads["f"]._exemplar_bank = None
+        e4_fl.model.heads["f"].biases = obj_c64
+        with pytest.raises(ValueError, match="real numeric"):
+            MultiTenantSkillFleet.from_compiled_model(e4_fl, "f")
+
+        e4_up = _fresh(_R26Choice2, 16)
+        obj_16 = np.array([np.complex64(1 + 2j)] + [0.0] * 15, dtype=object)
+        with pytest.raises(ValueError):
+            e4_up.model.heads["f"].online_update(obj_16, np.array([1.0, 0.0], dtype="f4"))
+        with pytest.raises(ValueError):
+            e4_up.model.heads["f"].online_update(emb_p, obj_c64)
+        with pytest.raises(ValueError):
+            e4_up.model.heads["f"].online_update(emb_p, np.array([1.0, 0.0], dtype="f4"), concept_embedding=obj_16)
+        with pytest.raises(ValueError):
+            e4_up.learn_from_tier2("p", {"f": "safe"}, embedding=obj_16)
+        assert e4_up.model.heads["f"].covariance_inv is None
+        assert e4_up.model_version == 1
+    assert not any(issubclass(w.category, Warning) for w in caught4)
+
+    # ------------------------------------------------------------------
+    # R26-5: Score endpoint preservation & clamping across helper, decide,
+    # decide_batch, packed kernel, and compiled callable.
+    # ------------------------------------------------------------------
+    for lo5, hi5 in ((-10.0, -0.1), (-3.0, -0.1), (-1.1, 0.2), (-0.1, 10.0), (-1e308, 1e308)):
+        class _R26Score(DecisionSchema):
+            f = ScoreField(min_value=lo5, max_value=hi5)
+
+        for b5, exp5 in ((100.0, hi5), (-100.0, lo5)):
+            e5 = _fresh(_R26Score, 16, use_cache=False, strict_mode=False)
+            e5.model.heads["f"].set_weights(np.zeros((1, 16), dtype="f4"), np.array([b5], dtype="f4"))
+            d5 = e5.decide("p", record_receipt=False)
+            b5_res = e5.decide_batch(["p"], record_receipt=False)[0]
+            k5 = e5.compile_packed_kernel().decide_prompt("p")
+            c5 = e5.compile_callable()("p")
+            assert d5.values["f"] == exp5 and d5.confidences["f"] == 1.0 and d5.is_ambiguous is False
+            assert b5_res.values["f"] == exp5 and b5_res.confidences["f"] == 1.0 and b5_res.is_ambiguous is False
+            assert float(k5["s_val"][0, 0]) == exp5 and float(k5["s_conf"][0, 0]) == 1.0 and bool(k5["is_ambiguous"][0]) is False
+            assert c5.values["f"] == exp5 and c5.confidences["f"] == 1.0 and c5.is_ambiguous is False
+
+    assert _score_from_unit_prob(np.float32(1.0), -10.0, -0.1) == -0.1
+    assert _score_from_unit_prob(np.array(1.0), -10.0, -0.1) == -0.1
+    for dt5 in (np.float32, np.float64):
+        arr5 = _score_from_unit_prob(np.array([0.0, 0.5, 1.0, np.nan], dtype=dt5), -10.0, -0.1)
+        assert arr5[0] == -10.0 and arr5[2] == -0.1 and np.isnan(arr5[3])
+        assert -10.0 <= float(arr5[1]) <= -0.1
+
+    # ------------------------------------------------------------------
+    # R26-6: Lossless precision-preserving interval formatting on narrow
+    # ScoreField [0, 1e-6] across evaluation and TeachingSession.
+    # ------------------------------------------------------------------
+    class _R26NarrowScore(DecisionSchema):
+        f = ScoreField(min_value=0.0, max_value=1e-6)
+
+    e6 = _fresh(_R26NarrowScore, 16, strict_mode=False)
+    ev6_uncal = e6.evaluate([("p", {"f": 5e-7})])
+    assert ev6_uncal.fields["f"].accuracy == 1.0
+    assert ev6_uncal.fields["f"].conformal_coverage == 1.0
+
+    e6.regression_conformal_predictors["f"].calibrate([5e-7] * 30, [5e-7] * 30)
+    res6 = e6.decide("p", record_receipt=False)
+    assert res6.values["f"] == pytest.approx(5e-7)
+    assert res6.conformal_sets["f"] == ["[5e-07, 5e-07]"]
+    sess6 = TeachingSession.__new__(TeachingSession)
+    sess6.schema = _R26NarrowScore()
+    sess6.field_name = "f"
+    assert sess6._score_field_outcome("f", sess6.schema.fields["f"], res6, 5e-7)["correct"] is True
+    assert sess6._score_field_outcome("f", sess6.schema.fields["f"], res6, 9e-7)["correct"] is False
+
+    # ------------------------------------------------------------------
+    # R26-7: Defer gateway lifecycle creation until teacher/local success,
+    # bound unpromoted lifecycles, and lazily allocate AutoCutover buffer.
+    # ------------------------------------------------------------------
+    fail_calls = 0
+
+    def _fail_jev(semantic_text: str, raw_payload: Dict[str, Any], contract: Any) -> Dict[str, Any]:
+        nonlocal fail_calls
+        fail_calls += 1
+        raise InteropError("upstream unavailable", status_code=502)
+
+    for freeze_flag in (True, False):
+        fail_calls = 0
+        svc7 = UniversalDecisionService(
+            upstream_handlers={"jev": _fail_jev},
+            bearer_token="tok-r26",
+            freeze_learning=freeze_flag,
+        )
+        for i7 in range(8):
+            with pytest.raises(InteropError) as exc7:
+                svc7.handle_request(
+                    path="/v1/decisions",
+                    headers={"Authorization": "Bearer tok-r26", "Content-Type": "application/json"},
+                    raw_body=json.dumps(
+                        {
+                            "state": f"req {i7}",
+                            "questions": {
+                                "act": {
+                                    "type": "choice",
+                                    "options": ["a", "b"],
+                                    "instructions": f"distinct instructions {i7}",
+                                }
+                            },
+                            "slot": "s",
+                        }
+                    ).encode("utf-8"),
+                )
+            assert exc7.value.status_code == 502
+        assert fail_calls == 8
+        assert len(svc7._lifecycles) == 0
+        assert len(svc7._last_schema_by_slot) == 0
+
+    svc7_ok_frozen = UniversalDecisionService(
+        upstream_handlers={"jev": _mock_universal_handler},
+        bearer_token="tok-r26",
+        freeze_learning=True,
+    )
+    for i7 in range(8):
+        st_f, body_f = svc7_ok_frozen.handle_request(
+            path="/v1/decisions",
+            headers={"Authorization": "Bearer tok-r26", "Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": f"req {i7}",
+                    "questions": {
+                        "act": {
+                            "type": "choice",
+                            "options": ["a", "b"],
+                            "instructions": f"distinct frozen ok {i7}",
+                        }
+                    },
+                    "slot": "s",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_f == 200
+        assert body_f["schema_drift_detected"] is (i7 > 0)
+    assert len(svc7_ok_frozen._lifecycles) == 0
+
+    svc7_cap = UniversalDecisionService(
+        upstream_handlers={"jev": _mock_universal_handler},
+        bearer_token="tok-r26",
+        max_unpromoted_lifecycles=3,
+    )
+    for i7 in range(6):
+        st_c, _ = svc7_cap.handle_request(
+            path="/v1/decisions",
+            headers={"Authorization": "Bearer tok-r26", "Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": f"cap req {i7}",
+                    "questions": {
+                        "act": {
+                            "type": "choice",
+                            "options": ["a", "b"],
+                            "instructions": f"cap instructions {i7}",
+                        }
+                    },
+                    "slot": f"slot_{i7}",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_c == 200
+    assert len(svc7_cap._lifecycles) == 3
+
+    # Promoted lifecycles (is_cutover == True) are never evicted when unpromoted schemas arrive.
+    from types import SimpleNamespace
+
+    prom_key, prom_lc = next(iter(svc7_cap._lifecycles.items()))
+    prom_lc.lifecycle.state = "SELECTIVE_HOT_SWAP"
+    prom_lc.lifecycle.engine = SimpleNamespace()
+    assert prom_lc.is_cutover is True
+    for i7 in range(6, 12):
+        st_p, _ = svc7_cap.handle_request(
+            path="/v1/decisions",
+            headers={"Authorization": "Bearer tok-r26", "Content-Type": "application/json"},
+            raw_body=json.dumps(
+                {
+                    "state": f"prom cap req {i7}",
+                    "questions": {
+                        "act": {
+                            "type": "choice",
+                            "options": ["a", "b"],
+                            "instructions": f"prom cap instructions {i7}",
+                        }
+                    },
+                    "slot": f"slot_p_{i7}",
+                }
+            ).encode("utf-8"),
+        )
+        assert st_p == 200
+    assert prom_key in svc7_cap._lifecycles
+    assert len([v for v in svc7_cap._lifecycles.values() if not v.is_cutover]) <= 3
+
+    fresh_lc = AutoCutoverLifecycle(_R26Choice2, config=CutoverConfig(dense_dim=16))
+    assert fresh_lc._vec_buf.nbytes == 0
+
+    def _fail_ts_baseline(state_arg: Any, q_arg: Any) -> Dict[str, Any]:
+        raise RuntimeError("baseline unavailable")
+
+    ts_client = TypeSafeClient(
+        api_key="tok-r26",
+        mode="auto_cutover",
+        auto_cutover_lifecycle=True,
+        zero_egress=True,
+        baseline_handler=_fail_ts_baseline,
+    )
+    with pytest.raises(RuntimeError, match="baseline unavailable"):
+        ts_client.decide(state="probe", questions={"act": {"type": "choice", "criteria": ["a", "b"]}})
+    assert len(ts_client._cutover_lifecycles) == 0

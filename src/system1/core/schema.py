@@ -630,13 +630,52 @@ def _score_to_unit_ratio(value: Any, min_value: float, max_value: float) -> Any:
 
 
 def _score_from_unit_prob(prob: Any, min_value: float, max_value: float) -> Any:
-    """Map a unit probability in [0, 1] back into [min_value, max_value] without overflow."""
+    """Map a unit probability in [0, 1] back into [min_value, max_value] without overflow or bound overshoot."""
     lo = float(min_value)
     hi = float(max_value)
     span = hi - lo
-    if math.isfinite(span):
-        return lo + span * prob
-    return (1.0 - prob) * lo + prob * hi
+    if isinstance(prob, (int, float)) or getattr(prob, "ndim", 0) == 0:
+        p = float(prob)
+        if math.isnan(p):
+            return p
+        if p <= 0.0:
+            return lo
+        if p >= 1.0:
+            return hi
+        val = (lo + span * p) if math.isfinite(span) else ((1.0 - p) * lo + p * hi)
+        if math.isnan(val):
+            return val
+        if val < lo:
+            return lo
+        if val > hi:
+            return hi
+        return val
+    p_arr = prob.astype(float) if hasattr(prob, "astype") else prob
+    out = (lo + span * p_arr) if math.isfinite(span) else ((1.0 - p_arr) * lo + p_arr * hi)
+    if hasattr(out, "__setitem__"):
+        out = out.copy() if hasattr(out, "copy") else out
+        out[p_arr <= 0.0] = lo
+        out[p_arr >= 1.0] = hi
+        out[out < lo] = lo
+        out[out > hi] = hi
+    return out
+
+
+def _format_score_bound(value: float) -> str:
+    """Format a ScoreField interval bound cleanly while preserving exact float64 round-trip precision."""
+    fv = float(value)
+    if fv == 0.0:
+        return "0.0000"
+    if math.isfinite(fv) and abs(fv) < 1e12:
+        s4 = f"{fv:.4f}"
+        if float(s4) == fv:
+            return s4
+    return repr(fv)
+
+
+def _format_score_interval(lower_bound: float, upper_bound: float) -> str:
+    """Format a closed [lower_bound, upper_bound] ScoreField interval without losing bound precision."""
+    return f"[{_format_score_bound(lower_bound)}, {_format_score_bound(upper_bound)}]"
 
 
 def _score_full_span_clamped(min_value: float, max_value: float) -> float:
@@ -800,4 +839,6 @@ __all__ = [
     "_score_mae_from_int_sum",
     "_score_rmse_from_int_diffs",
     "_score_interval_bounds",
+    "_format_score_bound",
+    "_format_score_interval",
 ]

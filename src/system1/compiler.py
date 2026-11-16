@@ -31,6 +31,7 @@ from system1.core.model import (
     SystemOneModel,
     _MAX_STRIDED_CLONE_SPAN_BYTES,
     _accepts_recency_weighted,
+    _coerce_real_1d_f32,
     _is_active_zero_head,
     _is_native_scalar_projector,
     _needs_2d_layout_preservation,
@@ -40,6 +41,8 @@ from system1.core.model import (
     _stable_sigmoid,
     _stable_softmax,
     _validate_2d_layout_cloneable,
+    _validate_forgetting_factor,
+    _validate_real_scalar,
 )
 
 
@@ -963,7 +966,7 @@ class CompiledSystemOneModel:
         self.backend = backend
         self.metadata = metadata or {}
         self.created_at = float(self.metadata.get("created_at", 0.0))
-        self.forgetting_factor = float(forgetting_factor)
+        self.forgetting_factor = _validate_forgetting_factor(forgetting_factor)
         self.recency_weighted = bool(recency_weighted)
         if type(projector) is TfidfProjector and self.recency_weighted:
             raise ValueError("TF-IDF does not support recency weighting")
@@ -1384,15 +1387,16 @@ class CompiledSystemOneModel:
         examples and recompiling is the simplest reproducible update workflow."""
         with self._lock:
             target_dict = self.schema.validate_lesson(target, allow_unknown=True)
-            eff_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
-            if not math.isfinite(eff_ff) or not (0.0 < eff_ff <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_ff}")
-            eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
+            eff_ff = _validate_forgetting_factor(
+                forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+            )
+            eff_reward_scale_in = _validate_real_scalar(reward_scale, "reward_scale")
+            eff_reward_scale = float(np.clip(eff_reward_scale_in, 0.0, 1.0))
             t0 = time.perf_counter()
             use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
 
             if embedding is not None:
-                emb = np.asarray(embedding, dtype=np.float32).flatten()
+                emb = _coerce_real_1d_f32(embedding, "embedding")
             else:
                 emb = self.encode(prompt, telemetry=telemetry, recency_weighted=use_recency)
             if len(emb) != self.dimension:
@@ -1882,15 +1886,11 @@ class CompiledSystemOneModel:
     ) -> Dict[str, Any]:
         """Online teaching with retained heuristic gates, not preserved coverage."""
         if forgetting_factor is not None:
-            ff_val = float(forgetting_factor)
-            if not math.isfinite(ff_val) or not (0.0 < ff_val <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_val}")
+            _validate_forgetting_factor(forgetting_factor)
         eff_ff = forgetting_factor
         eff_reward_scale = 1.0
         if reward is not None:
-            r_val = float(reward)
-            if not math.isfinite(r_val):
-                raise ValueError("reward must be a finite number")
+            r_val = _validate_real_scalar(reward, "reward")
             if r_val <= 0.0:
                 skipped: Dict[str, Any] = {
                     "status": "skipped_non_positive_reward",
@@ -1904,7 +1904,9 @@ class CompiledSystemOneModel:
                 return skipped
             eff_reward_scale = float(np.clip(r_val, 0.0, 1.0))
             if r_val != 1.0:
-                base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+                base_ff = _validate_forgetting_factor(
+                    forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+                )
                 eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
 
         resolved_target = target
@@ -3118,15 +3120,17 @@ class CompiledSystemOneModel:
         if not isinstance(saved_meta, dict):
             raise ValueError("Saved skill metadata must be a mapping")
         is_cold_skill = _strict_header_bool(saved_meta, "cold_start", False, "Saved skill metadata")
-        meta_ff = _strict_header_float(
-            saved_meta,
-            "forgetting_factor",
-            0.995,
-            "Saved skill metadata",
-            min_val=0.0,
-            min_inclusive=False,
-            max_val=1.0,
-            max_inclusive=True,
+        meta_ff = _validate_forgetting_factor(
+            _strict_header_float(
+                saved_meta,
+                "forgetting_factor",
+                0.995,
+                "Saved skill metadata",
+                min_val=0.0,
+                min_inclusive=False,
+                max_val=1.0,
+                max_inclusive=True,
+            )
         )
         meta_rw = _strict_header_bool(saved_meta, "recency_weighted", False, "Saved skill metadata")
         meta_created_at = _strict_header_float(
@@ -3318,15 +3322,17 @@ class CompiledSystemOneModel:
             margin_t = _strict_header_float(
                 h_info, "margin_threshold", 0.20, ctx, min_val=0.0, min_inclusive=True
             )
-            head_ff = _strict_header_float(
-                h_info,
-                "forgetting_factor",
-                0.995,
-                ctx,
-                min_val=0.0,
-                min_inclusive=False,
-                max_val=1.0,
-                max_inclusive=True,
+            head_ff = _validate_forgetting_factor(
+                _strict_header_float(
+                    h_info,
+                    "forgetting_factor",
+                    0.995,
+                    ctx,
+                    min_val=0.0,
+                    min_inclusive=False,
+                    max_val=1.0,
+                    max_inclusive=True,
+                )
             )
             rel_odds = _strict_header_float(
                 h_info, "relative_odds_ratio", 1.5, ctx, min_val=0.0, min_inclusive=False
@@ -3938,7 +3944,7 @@ class SystemOneCompiler:
             raise ValueError("noise_robust must be a boolean")
         self.noise_robust = resolved_noise_robust
         self.backend = backend
-        self.forgetting_factor = float(forgetting_factor)
+        self.forgetting_factor = _validate_forgetting_factor(forgetting_factor)
         self.relative_odds_ratio = float(relative_odds_ratio)
         self.confidence_floor_tau0 = float(confidence_floor_tau0)
         self.recency_weighted = bool(recency_weighted)

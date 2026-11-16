@@ -23,6 +23,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -1811,6 +1812,7 @@ class UniversalDecisionService:
         soft_blend: float = 0.5,
         cutover_config: Optional[CutoverConfig] = None,
         freeze_learning: bool = False,
+        max_unpromoted_lifecycles: int = 256,
     ) -> None:
         self.upstream_handlers = dict(upstream_handlers or {})
         self.upstream_urls = dict(upstream_urls or {})
@@ -1838,8 +1840,13 @@ class UniversalDecisionService:
         self.soft_blend = float(soft_blend)
         self.cutover_config = cutover_config
         self.freeze_learning = bool(freeze_learning)
-        self._lifecycles: Dict[str, SoftDistillingLifecycle] = {}
-        self._last_schema_by_slot: Dict[str, CompiledContractSchema] = {}
+        if isinstance(max_unpromoted_lifecycles, bool) or not isinstance(max_unpromoted_lifecycles, int) or max_unpromoted_lifecycles < 1:
+            raise ValueError(
+                f"max_unpromoted_lifecycles must be a positive int, got {max_unpromoted_lifecycles!r}"
+            )
+        self.max_unpromoted_lifecycles: int = int(max_unpromoted_lifecycles)
+        self._lifecycles: OrderedDict[str, SoftDistillingLifecycle] = OrderedDict()
+        self._last_schema_by_slot: OrderedDict[str, CompiledContractSchema] = OrderedDict()
         self._lock = threading.RLock()
         self.stats: Dict[str, int] = {
             "total_requests": 0,
@@ -1939,27 +1946,46 @@ class UniversalDecisionService:
         except InteropError as exc:
             raise InteropError(f"Invalid upstream teacher JSON: {exc}", status_code=502) from exc
 
+    def _record_slot_schema_locked(
+        self,
+        slot_key: str,
+        contract: CompiledContractSchema,
+    ) -> Optional[Dict[str, Any]]:
+        prev_contract = self._last_schema_by_slot.get(slot_key)
+        drift_info: Optional[Dict[str, Any]] = None
+        if prev_contract is not None and prev_contract.fingerprint != contract.fingerprint:
+            drift_info = diff_schemas(prev_contract, contract)
+            self.stats["schema_drift_events"] += 1
+        self._last_schema_by_slot[slot_key] = contract
+        self._last_schema_by_slot.move_to_end(slot_key)
+        while len(self._last_schema_by_slot) > 1024:
+            self._last_schema_by_slot.popitem(last=False)
+        return drift_info
+
+    def _evict_unpromoted_lifecycles_if_needed_locked(self) -> None:
+        unpromoted_keys = [k for k, v in self._lifecycles.items() if not v.is_cutover]
+        while len(unpromoted_keys) >= self.max_unpromoted_lifecycles:
+            evict_key = unpromoted_keys.pop(0)
+            self._lifecycles.pop(evict_key, None)
+
     def _get_or_create_lifecycle(
         self,
         slot_key: str,
         contract: CompiledContractSchema,
     ) -> Tuple[SoftDistillingLifecycle, Optional[Dict[str, Any]]]:
         with self._lock:
-            prev_contract = self._last_schema_by_slot.get(slot_key)
-            drift_info: Optional[Dict[str, Any]] = None
-            if prev_contract is not None and prev_contract.fingerprint != contract.fingerprint:
-                drift_info = diff_schemas(prev_contract, contract)
-                self.stats["schema_drift_events"] += 1
-            self._last_schema_by_slot[slot_key] = contract
-
+            drift_info = self._record_slot_schema_locked(slot_key, contract)
             lc_key = f"{slot_key}:{contract.fingerprint}"
             if lc_key not in self._lifecycles:
+                self._evict_unpromoted_lifecycles_if_needed_locked()
                 self._lifecycles[lc_key] = SoftDistillingLifecycle(
                     contract,
                     distill_mode=self.distill_mode,
                     soft_blend=self.soft_blend,
                     config=self.cutover_config,
                 )
+            else:
+                self._lifecycles.move_to_end(lc_key)
             return self._lifecycles[lc_key], drift_info
 
     def handle_request(
@@ -2030,16 +2056,16 @@ class UniversalDecisionService:
         contract = compile_questions_contract(payload.get("questions"))
         slot_key = str(slot_hint or payload.get("slot") or wire_format)
         is_frozen = self.freeze_learning if freeze_learning is None else bool(freeze_learning)
-
-        lc, drift_info = self._get_or_create_lifecycle(slot_key, contract)
+        lc_key = f"{slot_key}:{contract.fingerprint}"
         est_input_tokens = max(1, len(semantic_text.split()))
 
         with self._lock:
             self.stats["total_requests"] += 1
+            existing_lc = self._lifecycles.get(lc_key)
 
         force_teacher = bool(payload.get("force_teacher", False))
-        if not force_teacher:
-            local_answers = lc.decide_local(
+        if not force_teacher and existing_lc is not None:
+            local_answers = existing_lc.decide_local(
                 semantic_text,
                 freeze=is_frozen,
                 cache_key=req_cache_key,
@@ -2047,6 +2073,9 @@ class UniversalDecisionService:
             )
             if local_answers is not None:
                 with self._lock:
+                    if lc_key in self._lifecycles:
+                        self._lifecycles.move_to_end(lc_key)
+                    drift_info = self._record_slot_schema_locked(slot_key, contract)
                     self.stats["local_fastpath_requests"] += 1
                 body = format_provider_response(
                     wire_format=wire_format,
@@ -2062,13 +2091,44 @@ class UniversalDecisionService:
         upstream_raw = self._call_upstream(wire_format, payload, semantic_text, contract)
         lifecycle_vals, soft_targets, clean_answers = parse_teacher_answers(upstream_raw, contract)
         if not is_frozen:
-            lc.observe_teacher(
-                semantic_text,
-                lifecycle_vals,
-                soft_targets=soft_targets,
-                cache_key=req_cache_key,
-                structure_sig=req_struct_sig,
-            )
+            created_new = False
+            with self._lock:
+                lc = self._lifecycles.get(lc_key)
+                if lc is None:
+                    created_new = True
+                    self._evict_unpromoted_lifecycles_if_needed_locked()
+                    lc = SoftDistillingLifecycle(
+                        contract,
+                        distill_mode=self.distill_mode,
+                        soft_blend=self.soft_blend,
+                        config=self.cutover_config,
+                    )
+                    self._lifecycles[lc_key] = lc
+                else:
+                    self._lifecycles.move_to_end(lc_key)
+            try:
+                lc.observe_teacher(
+                    semantic_text,
+                    lifecycle_vals,
+                    soft_targets=soft_targets,
+                    cache_key=req_cache_key,
+                    structure_sig=req_struct_sig,
+                )
+            except BaseException:
+                if created_new:
+                    inner_lc = lc.lifecycle
+                    if (
+                        not inner_lc.admitted_keys
+                        and not inner_lc.quarantine
+                        and not inner_lc.teacher_key_labels
+                    ):
+                        with self._lock:
+                            if self._lifecycles.get(lc_key) is lc:
+                                self._lifecycles.pop(lc_key, None)
+                raise
+
+        with self._lock:
+            drift_info = self._record_slot_schema_locked(slot_key, contract)
 
         upstream_usage = upstream_raw.get("usage") if isinstance(upstream_raw, Mapping) else None
         in_tok = (

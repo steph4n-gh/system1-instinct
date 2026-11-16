@@ -2339,51 +2339,39 @@ class TypeSafeClient:
                 from system1.cutover import AutoCutoverLifecycle, CutoverConfig
 
                 with self._engine_lock:
-                    lc = self._cutover_lifecycles.get(digest)
-                    if lc is None:
-                        if hasattr(self.auto_cutover_lifecycle, "decide_local") and hasattr(
-                            self.auto_cutover_lifecycle, "observe_teacher"
-                        ):
-                            lc = self.auto_cutover_lifecycle
-                        else:
-                            lc_cfg = (
-                                self.auto_cutover_lifecycle
-                                if isinstance(self.auto_cutover_lifecycle, CutoverConfig)
-                                else None
-                            )
-                            lc = AutoCutoverLifecycle(schema, teacher=None, config=lc_cfg)
-                        self._cutover_lifecycles[digest] = lc
+                    existing_lc = self._cutover_lifecycles.get(digest)
 
-                t_local = time.perf_counter()
-                local_vals = lc.decide_local(encoded_state)
-                if local_vals is not None:
-                    latency_ms = (time.perf_counter() - t_local) * 1000.0
-                    local_answers = self._build_answers_from_values(
-                        questions,
-                        local_vals,
-                        schema=schema,
-                    )
-                    with self._engine_lock:
-                        self._call_count[digest] += 1
-                    return SystemOneResponse({
-                        "model": model,
-                        "state": state,
-                        "answers": local_answers,
-                        "usage": Usage({
-                            "input_tokens": 0,
-                            "output_tokens": 0,
-                            "total_tokens": 0,
-                        }),
-                        "latency_ms": round(latency_ms, 3),
-                        "local_execution": True,
-                        "egress_bytes": 0,
-                        "conformal_alpha": alpha,
-                        "receipt": None,
-                        "is_ambiguous": False,
-                        "auto_cutover_active": True,
-                        "is_cutover": True,
-                        "cutover_state": lc.state,
-                    })
+                if existing_lc is not None:
+                    t_local = time.perf_counter()
+                    local_vals = existing_lc.decide_local(encoded_state)
+                    if local_vals is not None:
+                        latency_ms = (time.perf_counter() - t_local) * 1000.0
+                        local_answers = self._build_answers_from_values(
+                            questions,
+                            local_vals,
+                            schema=schema,
+                        )
+                        with self._engine_lock:
+                            self._call_count[digest] += 1
+                        return SystemOneResponse({
+                            "model": model,
+                            "state": state,
+                            "answers": local_answers,
+                            "usage": Usage({
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 0,
+                            }),
+                            "latency_ms": round(latency_ms, 3),
+                            "local_execution": True,
+                            "egress_bytes": 0,
+                            "conformal_alpha": alpha,
+                            "receipt": None,
+                            "is_ambiguous": False,
+                            "auto_cutover_active": True,
+                            "is_cutover": True,
+                            "cutover_state": existing_lc.state,
+                        })
 
                 if self.baseline_handler is not None:
                     cloud_resp = TypeSafeResponse(self.baseline_handler(state, questions))
@@ -2413,7 +2401,36 @@ class TypeSafeClient:
                     validated = definition.validate_value(_teaching_target(definition, value))
                     teacher_vals[name] = validated
 
-                lc.observe_teacher(encoded_state, teacher_vals)
+                created_new_lc = False
+                with self._engine_lock:
+                    lc = self._cutover_lifecycles.get(digest)
+                    if lc is None:
+                        created_new_lc = True
+                        if hasattr(self.auto_cutover_lifecycle, "decide_local") and hasattr(
+                            self.auto_cutover_lifecycle, "observe_teacher"
+                        ):
+                            lc = self.auto_cutover_lifecycle
+                        else:
+                            lc_cfg = (
+                                self.auto_cutover_lifecycle
+                                if isinstance(self.auto_cutover_lifecycle, CutoverConfig)
+                                else None
+                            )
+                            lc = AutoCutoverLifecycle(schema, teacher=None, config=lc_cfg)
+                        self._cutover_lifecycles[digest] = lc
+
+                try:
+                    lc.observe_teacher(encoded_state, teacher_vals)
+                except BaseException:
+                    if created_new_lc and (
+                        not getattr(lc, "admitted_keys", ())
+                        and not getattr(lc, "quarantine", ())
+                        and not getattr(lc, "teacher_key_labels", {})
+                    ):
+                        with self._engine_lock:
+                            if self._cutover_lifecycles.get(digest) is lc:
+                                self._cutover_lifecycles.pop(digest, None)
+                    raise
                 with self._engine_lock:
                     self._call_count[digest] += 1
                     self._teacher_sample_count[digest] += 1

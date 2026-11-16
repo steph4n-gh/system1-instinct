@@ -23,6 +23,7 @@ import numpy as np
 
 from system1.core.schema import (
     _f64_to_exact_2m1074,
+    _format_score_interval,
     _score_abs_diff_clamped,
     _score_full_span_clamped,
     _score_half_span,
@@ -1272,7 +1273,7 @@ class RegressionConformalInterval:
     is_calibrated: bool
 
     def to_interval_string(self) -> str:
-        return f"[{self.lower_bound:.4f}, {self.upper_bound:.4f}]"
+        return _format_score_interval(self.lower_bound, self.upper_bound)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
