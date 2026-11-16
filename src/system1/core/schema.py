@@ -606,11 +606,13 @@ class DecisionSchema(metaclass=SchemaMeta):
 
 
 def _score_half_span(min_value: float, max_value: float) -> float:
-    """Return 0.5 * (max_value - min_value) without overflow on wide float64 bounds."""
+    """Return 0.5 * (max_value - min_value) preserving subnormals and wide float64 bounds."""
     lo = float(min_value)
     hi = float(max_value)
-    hs = 0.5 * hi - 0.5 * lo
-    return hs if hs > 0.0 else 0.5 * (hi - lo)
+    span = hi - lo
+    if math.isfinite(span):
+        return 0.5 * span
+    return 0.5 * hi - 0.5 * lo
 
 
 def _score_to_unit_ratio(value: Any, min_value: float, max_value: float) -> Any:
@@ -638,29 +640,75 @@ def _score_from_unit_prob(prob: Any, min_value: float, max_value: float) -> Any:
 
 
 def _score_full_span_clamped(min_value: float, max_value: float) -> float:
-    """Return finite min(sys.float_info.max, max_value - min_value) without overflow."""
+    """Return finite min(sys.float_info.max, max_value - min_value) preserving subnormals."""
     lo = float(min_value)
     hi = float(max_value)
-    if (hi >= 0.0 and lo >= 0.0) or (hi <= 0.0 and lo <= 0.0):
-        return hi - lo
-    hs = 0.5 * hi - 0.5 * lo
-    if hs >= 0.5 * sys.float_info.max:
-        return sys.float_info.max
-    return 2.0 * hs
+    span = hi - lo
+    if math.isfinite(span):
+        return span
+    return sys.float_info.max if hi > lo else -sys.float_info.max
 
 
 def _score_abs_diff_clamped(a: float, b: float) -> float:
-    """Return finite min(sys.float_info.max, |a - b|) without overflow or subnormal loss."""
+    """Return finite min(sys.float_info.max, |a - b|) preserving subnormals."""
     fa = float(a)
     fb = float(b)
     if not (math.isfinite(fa) and math.isfinite(fb)):
         return math.nan
-    if (fa >= 0.0 and fb >= 0.0) or (fa <= 0.0 and fb <= 0.0):
-        return abs(fa - fb)
+    diff = abs(fa - fb)
+    return diff if math.isfinite(diff) else sys.float_info.max
+
+
+def _score_normalized_margin(margin: float, min_value: float, max_value: float) -> float:
+    """Normalize a nonnegative ScoreField interval margin into [0, 1] without overflow or subnormal loss."""
+    lo = float(min_value)
+    hi = float(max_value)
+    m = float(margin)
+    if m == 0.0:
+        return 0.0
+    if not math.isfinite(m) or m < 0.0:
+        return 1.0 if not math.isfinite(m) else 0.0
+    span = hi - lo
+    if math.isfinite(span):
+        if span <= 0.0:
+            return 1.0
+        return min(1.0, m / span)
+    if m >= sys.float_info.max:
+        return 1.0
+    hs = 0.5 * hi - 0.5 * lo
+    return min(1.0, (0.5 * m) / hs) if hs > 0.0 else 1.0
+
+
+def _score_within_rel_tolerance(
+    a: float, b: float, min_value: float, max_value: float, rel_tol: float
+) -> bool:
+    """Return True when |a - b| <= rel_tol * (max_value - min_value) without overflow or subnormal loss."""
+    fa = float(a)
+    fb = float(b)
+    lo = float(min_value)
+    hi = float(max_value)
+    tol = float(rel_tol)
+    if not (math.isfinite(fa) and math.isfinite(fb)):
+        return False
+    span = hi - lo
+    if span <= 0.0:
+        return fa == fb
+    diff = abs(fa - fb)
+    if math.isfinite(span) and math.isfinite(diff):
+        return diff <= tol * span
+    hs = _score_half_span(lo, hi)
     hd = abs(0.5 * fa - 0.5 * fb)
-    if hd >= 0.5 * sys.float_info.max:
-        return sys.float_info.max
-    return 2.0 * hd
+    return hd <= tol * hs
+
+
+def _f64_to_exact_2m1074(v: float) -> int:
+    """Convert a finite float64 exactly into an integer multiple of 2^-1074."""
+    if v == 0.0:
+        return 0
+    m, e = math.frexp(v)
+    if e >= -1021:
+        return int(math.ldexp(m, 53)) << (e + 1021)
+    return int(math.ldexp(v, 1074))
 
 
 def _score_interval_bounds(
@@ -707,5 +755,8 @@ __all__ = [
     "_score_from_unit_prob",
     "_score_full_span_clamped",
     "_score_abs_diff_clamped",
+    "_score_normalized_margin",
+    "_score_within_rel_tolerance",
+    "_f64_to_exact_2m1074",
     "_score_interval_bounds",
 ]

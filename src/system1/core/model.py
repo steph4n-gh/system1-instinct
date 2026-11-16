@@ -37,6 +37,7 @@ from system1.core.schema import (
     ScoreField,
     _score_from_unit_prob,
     _score_half_span,
+    _score_normalized_margin,
     _score_to_unit_ratio,
 )
 from system1.core.telemetry import TelemetryProjector
@@ -907,6 +908,22 @@ def _preserve_2d_layout_update(prev: np.ndarray, updated: np.ndarray) -> np.ndar
     return up_f32
 
 
+def _extract_2d_layout_hint(arr: Any) -> Optional[Tuple[int, int, int, bool]]:
+    """Return (mod64, s0, s1, is_f_2d) layout hint for non-C/F strided, unaligned, or Fortran 2D arrays."""
+    if (
+        not isinstance(arr, np.ndarray)
+        or arr.ndim != 2
+        or arr.size == 0
+        or arr.dtype.kind not in ("b", "i", "u", "f", "c")
+    ):
+        return None
+    if _needs_2d_layout_preservation(arr):
+        return (int(arr.ctypes.data % 64), int(arr.strides[0]), int(arr.strides[1]), False)
+    if arr.flags["F_CONTIGUOUS"] and not arr.flags["C_CONTIGUOUS"]:
+        return (0, 4, int(arr.strides[1]), True)
+    return None
+
+
 def _concat_exemplar_groups_preserving_layout(
     groups: Sequence[Any],
     dimension: int,
@@ -914,6 +931,7 @@ def _concat_exemplar_groups_preserving_layout(
     cached_ids: Tuple[Any, ...] = (),
     *,
     is_2d_groups: bool = True,
+    layout_hint: Optional[Tuple[int, int, int, bool]] = None,
 ) -> np.ndarray:
     """Concatenate exemplar/shot groups along axis 0 while preserving 2D strided/aligned layouts."""
     cur_ids = (
@@ -923,6 +941,58 @@ def _concat_exemplar_groups_preserving_layout(
     )
     if cached_raw is not None and cached_ids == cur_ids:
         return cached_raw
+
+    if layout_hint is not None:
+        chunks = [
+            np.asarray(g, dtype=np.float32).reshape(-1, dimension)
+            for g in groups
+            if len(g) > 0
+        ]
+        stacked = (
+            np.concatenate(chunks, axis=0)
+            if chunks
+            else np.empty((0, dimension), dtype=np.float32)
+        )
+        total_rows = int(stacked.shape[0])
+        if total_rows == 0:
+            return _owned_readonly_array(stacked, dtype=np.float32)
+        mod64, s0_h, s1_h, is_f = layout_hint
+        if is_f:
+            return _owned_readonly_array(np.asfortranarray(stacked, dtype=np.float32), dtype=np.float32)
+        eff_s1 = 0 if dimension == 1 else int(s1_h)
+        eff_s0 = (dimension * max(4, abs(eff_s1))) if (total_rows > 1 and s0_h == 0) else (0 if total_rows == 1 else int(s0_h))
+        if (eff_s0 % 4) == 0 and (eff_s1 % 4) == 0 and (dimension != 1 or eff_s1 == 0):
+            a0, a1 = abs(eff_s0), abs(eff_s1)
+            aliased = (total_rows > 1 and a0 == 0) or (dimension > 1 and a1 == 0)
+            if not aliased and total_rows > 1 and dimension > 1:
+                g_gcd = math.gcd(a0, a1)
+                aliased = (a1 // g_gcd) < total_rows and (a0 // g_gcd) < dimension
+            if aliased and total_rows > 1 and dimension > 1:
+                if 0 < a0 <= a1:
+                    eff_s1 = (1 if eff_s1 >= 0 else -1) * total_rows * a0
+                elif 0 < a1 < a0:
+                    eff_s0 = (1 if eff_s0 >= 0 else -1) * dimension * a1
+                a0, a1 = abs(eff_s0), abs(eff_s1)
+                g_gcd = math.gcd(a0, a1)
+                aliased = (a0 == 0) or (a1 == 0) or ((a1 // g_gcd) < total_rows and (a0 // g_gcd) < dimension)
+            min_off = min(0, (total_rows - 1) * eff_s0) + min(0, (dimension - 1) * eff_s1)
+            max_off = max(0, (total_rows - 1) * eff_s0) + max(0, (dimension - 1) * eff_s1)
+            span_bytes = (max_off - min_off) + 4
+            nbytes_dst = total_rows * dimension * 4
+            max_allowed_span = min(_MAX_STRIDED_CLONE_SPAN_BYTES, max(1 << 20, 64 * nbytes_dst))
+            if not aliased and nbytes_dst <= span_bytes <= max_allowed_span:
+                out = _alloc_strided_2d_array(
+                    (total_rows, dimension),
+                    np.dtype(np.float32),
+                    mod64,
+                    eff_s0,
+                    eff_s1,
+                    min_off,
+                    span_bytes,
+                )
+                np.copyto(out, stacked)
+                out.setflags(write=False)
+                return out
 
     if is_2d_groups:
         non_empty = [np.asarray(g) for g in groups if np.asarray(g).size > 0]
@@ -1353,7 +1423,7 @@ def _validate_packed_engine_support(eng: Any) -> None:
         exec_h, meta_h = _resolve_authoritative_head(model, fname)
         candidates = (exec_h,) if (meta_h is None or meta_h is exec_h) else (exec_h, meta_h)
         for cand in candidates:
-            if getattr(cand, "hierarchical", False) and getattr(cand, "coarse_weights", None) is not None:
+            if not isinstance(f_def, BooleanField) and getattr(cand, "hierarchical", False):
                 raise ValueError(f"PackedMultiQuestionKernel does not support hierarchical head {fname!r}")
             if getattr(cand, "_exemplar_bank", None) is not None:
                 raise ValueError(f"PackedMultiQuestionKernel does not support exemplar bank on {fname!r}")
@@ -1642,10 +1712,13 @@ class DecisionFieldHead:
         self._online_shots_c: Optional[List[List[np.ndarray]]] = None
         self._exemplar_vectors_raw: Optional[np.ndarray] = None
         self._exemplar_vectors_bank_ids: Tuple[int, ...] = ()
+        self._exemplar_vectors_layout: Optional[Tuple[int, int, int, bool]] = None
         self._shots_p_raw: Optional[np.ndarray] = None
         self._shots_p_row_ids: Tuple[Tuple[int, ...], ...] = ()
+        self._shots_p_layout: Optional[Tuple[int, int, int, bool]] = None
         self._shots_c_raw: Optional[np.ndarray] = None
         self._shots_c_row_ids: Tuple[Tuple[int, ...], ...] = ()
+        self._shots_c_layout: Optional[Tuple[int, int, int, bool]] = None
         self._p_tmp_buf: Optional[np.ndarray] = None
         self._b_tmp_buf: Optional[np.ndarray] = None
         self._known_stems_per_option: List[Set[str]] = []
@@ -1946,10 +2019,13 @@ class DecisionFieldHead:
             self._online_shots_c = None
             self._exemplar_vectors_raw = None
             self._exemplar_vectors_bank_ids = ()
+            self._exemplar_vectors_layout = None
             self._shots_p_raw = None
             self._shots_p_row_ids = ()
+            self._shots_p_layout = None
             self._shots_c_raw = None
             self._shots_c_row_ids = ()
+            self._shots_c_layout = None
         self.weights = w_f32
         self.biases = b_f32
         if self.backend == "mlx" and HAS_MLX and mx is not None:
@@ -2021,34 +2097,42 @@ class DecisionFieldHead:
         If P is None, initializes P = (1/lambda) * I_(D+1) and B = lambda * [W, b]^T,
         so (P B)^T == [W, b] identically reproducing existing weights.
         """
-        self.regularization = max(1e-4, float(regularization))
+        reg_raw = float(regularization)
+        if not math.isfinite(reg_raw):
+            raise ValueError(f"regularization must be finite, got {regularization!r}")
+        eff_reg = max(1e-4, reg_raw)
         D = self.dimension
-        if P is not None:
-            p_raw = np.asarray(P)
-            p_f32 = (
-                p_raw
-                if p_raw.dtype == np.dtype(np.float32)
-                else _clone_preserving_2d_layout(p_raw, dtype=np.float32, writeable=True)
-            )
-            _validate_2d_layout_cloneable(p_f32, np.dtype(np.float32))
-            self.covariance_inv = p_f32
-        else:
-            self.covariance_inv = (1.0 / self.regularization) * np.eye(D + 1, dtype=np.float32)
+        K = self.weights.shape[0]
+        f32_dt = np.dtype(np.float32)
+        with np.errstate(over="ignore", invalid="ignore"):
+            if P is not None:
+                p_raw = np.asarray(P)
+                if p_raw.ndim != 2 or p_raw.shape != (D + 1, D + 1):
+                    raise ValueError(f"Covariance matrix P must have shape ({D + 1}, {D + 1}), got {p_raw.shape}")
+                _validate_2d_layout_cloneable(p_raw, f32_dt)
+                p_f32 = p_raw if p_raw.dtype == f32_dt else _clone_preserving_2d_layout(p_raw, dtype=f32_dt, writeable=True)
+            else:
+                p_f32 = ((1.0 / eff_reg) * np.eye(D + 1, dtype=np.float32)).astype(np.float32)
+            if not bool(np.all(np.isfinite(p_f32))):
+                raise ValueError("Covariance matrix P must be finite in float32")
 
-        if B is not None:
-            b_raw = np.asarray(B)
-            b_f32 = (
-                b_raw
-                if b_raw.dtype == np.dtype(np.float32)
-                else _clone_preserving_2d_layout(b_raw, dtype=np.float32, writeable=True)
-            )
-            _validate_2d_layout_cloneable(b_f32, np.dtype(np.float32))
-            self.cross_covariance = b_f32
-        else:
-            w_mat = self.weights  # shape (K, D)
-            b_vec = np.broadcast_to(self.biases.reshape(-1, 1), (w_mat.shape[0], 1))  # shape (K, 1)
-            w_aug = np.hstack([w_mat, b_vec])  # shape (K, D+1)
-            self.cross_covariance = (self.regularization * w_aug.T).astype(np.float32)
+            if B is not None:
+                b_raw = np.asarray(B)
+                if b_raw.ndim != 2 or b_raw.shape != (D + 1, K):
+                    raise ValueError(f"Cross-covariance matrix B must have shape ({D + 1}, {K}), got {b_raw.shape}")
+                _validate_2d_layout_cloneable(b_raw, f32_dt)
+                b_f32 = b_raw if b_raw.dtype == f32_dt else _clone_preserving_2d_layout(b_raw, dtype=f32_dt, writeable=True)
+            else:
+                w_mat = self.weights  # shape (K, D)
+                b_vec = np.broadcast_to(self.biases.reshape(-1, 1), (w_mat.shape[0], 1))  # shape (K, 1)
+                w_aug = np.hstack([w_mat, b_vec])  # shape (K, D+1)
+                b_f32 = (eff_reg * w_aug.T).astype(np.float32)
+            if not bool(np.all(np.isfinite(b_f32))):
+                raise ValueError("Cross-covariance matrix B must be finite in float32")
+
+        self.regularization = eff_reg
+        self.covariance_inv = p_f32
+        self.cross_covariance = b_f32
 
     def format_target_vector(self, target_value: Any) -> np.ndarray:
         """Converts high-level field target value into numeric regression target vector y*."""
@@ -2092,11 +2176,11 @@ class DecisionFieldHead:
         arrays = {"exemplar_centroids": _owned_readonly_array(centroids, dtype=np.float32)}
         counts: Dict[str, List[int]] = {}
         group_specs = (
-            ("exemplar_vectors", banks, self._exemplar_vectors_raw, self._exemplar_vectors_bank_ids, True),
-            ("shots_p", self._online_shots_p, self._shots_p_raw, self._shots_p_row_ids, False),
-            ("shots_c", self._online_shots_c, self._shots_c_raw, self._shots_c_row_ids, False),
+            ("exemplar_vectors", banks, self._exemplar_vectors_raw, self._exemplar_vectors_bank_ids, True, self._exemplar_vectors_layout),
+            ("shots_p", self._online_shots_p, self._shots_p_raw, self._shots_p_row_ids, False, self._shots_p_layout),
+            ("shots_c", self._online_shots_c, self._shots_c_raw, self._shots_c_row_ids, False, self._shots_c_layout),
         )
-        for key, groups, cached_raw, cached_ids, is_2d_groups in group_specs:
+        for key, groups, cached_raw, cached_ids, is_2d_groups, layout_hint in group_specs:
             if groups is not None:
                 counts[key] = [len(group) for group in groups]
                 arrays[key] = _concat_exemplar_groups_preserving_layout(
@@ -2105,6 +2189,7 @@ class DecisionFieldHead:
                     cached_raw,
                     cached_ids,
                     is_2d_groups=is_2d_groups,
+                    layout_hint=layout_hint,
                 )
         if self._exemplar_mean is not None:
             arrays["exemplar_mean"] = self._exemplar_mean.copy()
@@ -2138,29 +2223,47 @@ class DecisionFieldHead:
         width = len(self.field_def.options) if isinstance(self.field_def, ChoiceField) else 0
         if not width or self.hierarchical or "exemplar_centroids" not in arrays or "exemplar_vectors" not in arrays:
             raise ValueError("Saved exemplar state requires a non-hierarchical choice head")
+        allowed_array_keys = {
+            "exemplar_centroids",
+            "exemplar_vectors",
+            "shots_p",
+            "shots_c",
+            "exemplar_mean",
+            "initial_w",
+        }
+        allowed_count_keys = {"exemplar_vectors", "shots_p", "shots_c"}
+        if not set(arrays.keys()) <= allowed_array_keys or not set(counts.keys()) <= allowed_count_keys:
+            raise ValueError("Saved exemplar state contains unexpected keys")
         norm_arrays: Dict[str, np.ndarray] = {}
         f32_dt = np.dtype(np.float32)
-        for key, arr in arrays.items():
-            if not isinstance(arr, np.ndarray):
-                raise ValueError(f"Saved exemplar array {key!r} must be a numpy ndarray")
-            expected = (self.dimension,) if key == "exemplar_mean" else (width, self.dimension)
-            if key in ("exemplar_vectors", "shots_p", "shots_c"):
-                sizes = counts.get(key)
-                if (not isinstance(sizes, (list, tuple)) or len(sizes) != width
-                        or any(type(n) is not int or n < 0 for n in sizes)):
-                    raise ValueError("Saved exemplar group counts are invalid")
-                expected = (sum(sizes), self.dimension)
-            if arr.shape != expected or not np.all(np.isfinite(arr)):
-                raise ValueError(f"Saved exemplar array {key!r} is invalid")
-            if arr.ndim == 2:
-                _validate_2d_layout_cloneable(arr, f32_dt)
-                norm_arrays[key] = (
-                    arr
-                    if (arr.dtype == f32_dt and not arr.flags.writeable)
-                    else _owned_readonly_array(arr, dtype=f32_dt)
-                )
-            else:
-                norm_arrays[key] = np.array(arr, dtype=f32_dt, copy=True)
+        with np.errstate(over="ignore", invalid="ignore"):
+            for key, arr in arrays.items():
+                if not isinstance(arr, np.ndarray):
+                    raise ValueError(f"Saved exemplar array {key!r} must be a numpy ndarray")
+                expected = (self.dimension,) if key == "exemplar_mean" else (width, self.dimension)
+                if key in allowed_count_keys:
+                    sizes = counts.get(key)
+                    if (
+                        not isinstance(sizes, (list, tuple))
+                        or len(sizes) != width
+                        or any(type(n) is not int or n < 0 for n in sizes)
+                    ):
+                        raise ValueError("Saved exemplar group counts are invalid")
+                    expected = (sum(sizes), self.dimension)
+                if arr.shape != expected or not bool(np.all(np.isfinite(arr))):
+                    raise ValueError(f"Saved exemplar array {key!r} is invalid")
+                if arr.ndim == 2:
+                    _validate_2d_layout_cloneable(arr, f32_dt)
+                    norm_arr = (
+                        arr
+                        if (arr.dtype == f32_dt and not arr.flags.writeable)
+                        else _owned_readonly_array(arr, dtype=f32_dt)
+                    )
+                else:
+                    norm_arr = np.array(arr, dtype=f32_dt, copy=True)
+                if not bool(np.all(np.isfinite(norm_arr))):
+                    raise ValueError(f"Saved exemplar array {key!r} overflows float32")
+                norm_arrays[key] = norm_arr
         groups: Dict[str, List[np.ndarray]] = {}
         for key in ("exemplar_vectors", "shots_p", "shots_c"):
             if key in norm_arrays:
@@ -2168,6 +2271,7 @@ class DecisionFieldHead:
         self._exemplar_bank = (norm_arrays["exemplar_centroids"], groups["exemplar_vectors"])
         self._exemplar_vectors_raw = norm_arrays["exemplar_vectors"]
         self._exemplar_vectors_bank_ids = tuple(id(g) for g in groups["exemplar_vectors"])
+        self._exemplar_vectors_layout = _extract_2d_layout_hint(norm_arrays["exemplar_vectors"])
         self._exemplar_mean = norm_arrays.get("exemplar_mean")
         self._initial_weights = norm_arrays.get("initial_w")
         if "shots_p" in groups:
@@ -2175,19 +2279,23 @@ class DecisionFieldHead:
             self._online_shots_p = shots_p_lists
             self._shots_p_raw = norm_arrays["shots_p"]
             self._shots_p_row_ids = tuple(tuple(id(v) for v in g) for g in shots_p_lists)
+            self._shots_p_layout = _extract_2d_layout_hint(norm_arrays["shots_p"])
         else:
             self._online_shots_p = None
             self._shots_p_raw = None
             self._shots_p_row_ids = ()
+            self._shots_p_layout = None
         if "shots_c" in groups:
             shots_c_lists = [list(group) for group in groups["shots_c"]]
             self._online_shots_c = shots_c_lists
             self._shots_c_raw = norm_arrays["shots_c"]
             self._shots_c_row_ids = tuple(tuple(id(v) for v in g) for g in shots_c_lists)
+            self._shots_c_layout = _extract_2d_layout_hint(norm_arrays["shots_c"])
         else:
             self._online_shots_c = None
             self._shots_c_raw = None
             self._shots_c_row_ids = ()
+            self._shots_c_layout = None
         self._online_shots_are_pseudo = online_shots_are_pseudo
         self._exemplar_projector = DeterministicSemanticProjector(dimension=self.dimension)
 
@@ -2302,9 +2410,27 @@ class DecisionFieldHead:
                         b_norms = np.linalg.norm(b_mod, axis=1, keepdims=True)
                         b_norms = np.where(b_norms < 1e-12, 1.0, b_norms)
                         new_sub_banks[k_idx] = (b_mod / b_norms).astype(np.float32)
+        eff_bank_hint = self._exemplar_vectors_layout
+        if eff_bank_hint is None:
+            for prev_b in new_sub_banks:
+                eff_bank_hint = _extract_2d_layout_hint(prev_b)
+                if eff_bank_hint is not None:
+                    break
+        if eff_bank_hint is not None:
+            concat_raw = _concat_exemplar_groups_preserving_layout(
+                new_sub_banks,
+                D,
+                is_2d_groups=True,
+                layout_hint=eff_bank_hint,
+            )
+            new_sub_banks = list(np.split(concat_raw, np.cumsum([len(b) for b in new_sub_banks])[:-1]))
+            self._exemplar_vectors_layout = eff_bank_hint
+            self._exemplar_vectors_raw = concat_raw
+            self._exemplar_vectors_bank_ids = tuple(id(g) for g in new_sub_banks)
+        else:
+            self._exemplar_vectors_raw = None
+            self._exemplar_vectors_bank_ids = ()
         self._exemplar_bank = (w_cons_new, new_sub_banks)
-        self._exemplar_vectors_raw = None
-        self._exemplar_vectors_bank_ids = ()
 
     def adapt_zero_shot(
         self,
@@ -2387,6 +2513,10 @@ class DecisionFieldHead:
             ):
                 self._online_shots_p = shots_p
                 self._online_shots_c = shots_c
+                self._shots_p_raw = None
+                self._shots_p_row_ids = ()
+                self._shots_c_raw = None
+                self._shots_c_row_ids = ()
                 self._online_shots_are_pseudo = True
             return {"adapted_samples": adapted_samples, "class_counts": class_counts}
 
@@ -2475,24 +2605,100 @@ class DecisionFieldHead:
 
         D = self.dimension
         K = self.weights.shape[0]
+        reward_scale_f = float(reward_scale)
+        if not math.isfinite(reward_scale_f):
+            raise ValueError(f"reward_scale must be finite, got {reward_scale!r}")
 
-        x = np.asarray(x_aug, dtype=np.float32).ravel()
-        if len(x) == D:
-            # If prompt embedding without bias 1, augment
-            x = np.append(x, np.float32(1.0))
-        elif len(x) != D + 1:
-            raise ValueError(f"Expected x_aug of length {D} or {D+1}, got {len(x)}")
+        with np.errstate(over="ignore", invalid="ignore"):
+            x = np.asarray(x_aug, dtype=np.float32).ravel()
+            if len(x) == D:
+                # If prompt embedding without bias 1, augment
+                x = np.append(x, np.float32(1.0))
+            elif len(x) != D + 1:
+                raise ValueError(f"Expected x_aug of length {D} or {D+1}, got {len(x)}")
 
-        if not np.all(np.isfinite(x)):
-            raise ValueError("x_aug contains NaN or Inf non-finite values")
+            if not np.all(np.isfinite(x)):
+                raise ValueError("x_aug contains NaN or Inf non-finite values")
 
-        y = np.asarray(y_target, dtype=np.float32).ravel()
-        if not np.all(np.isfinite(y)):
-            raise ValueError("y_target contains NaN or Inf non-finite values")
-        if isinstance(self.field_def, (BooleanField, ScoreField)) and len(y) == 1 and K == 2:
-            y = np.array([y[0], -y[0] if isinstance(self.field_def, BooleanField) else 0.0], dtype=np.float32)
-        if len(y) != K:
-            raise ValueError(f"Expected target vector y of length {K}, got {len(y)}")
+            y = np.asarray(y_target, dtype=np.float32).ravel()
+            if not np.all(np.isfinite(y)):
+                raise ValueError("y_target contains NaN or Inf non-finite values")
+            if isinstance(self.field_def, (BooleanField, ScoreField)) and len(y) == 1 and K == 2:
+                y = np.array([y[0], -y[0] if isinstance(self.field_def, BooleanField) else 0.0], dtype=np.float32)
+            if len(y) != K:
+                raise ValueError(f"Expected target vector y of length {K}, got {len(y)}")
+
+            if concept_embedding is not None:
+                ce_arr = np.asarray(concept_embedding, dtype=np.float32).ravel()
+                if len(ce_arr) != D or not bool(np.all(np.isfinite(ce_arr))):
+                    raise ValueError(f"concept_embedding must be a finite vector of length {D}")
+
+        f32_dt = np.dtype(np.float32)
+        w_cur = np.asarray(self.weights)
+        b_cur = np.asarray(self.biases)
+        _validate_head_weight_bias_shapes(
+            self.field_def,
+            w_cur,
+            b_cur,
+            D,
+            getattr(self.field_def, "name", ""),
+        )
+        _validate_2d_layout_cloneable(w_cur, f32_dt)
+        if not (bool(np.all(np.isfinite(w_cur))) and bool(np.all(np.isfinite(b_cur)))):
+            raise ValueError("Head weights and biases must be finite before online_update")
+
+        if self.covariance_inv is not None:
+            p_cur = np.asarray(self.covariance_inv)
+            if p_cur.ndim != 2 or p_cur.shape != (D + 1, D + 1) or not bool(np.all(np.isfinite(p_cur))):
+                raise ValueError(f"Covariance matrix P must be finite with shape ({D + 1}, {D + 1})")
+            _validate_2d_layout_cloneable(p_cur, np.dtype(p_cur.dtype))
+        if self.cross_covariance is not None:
+            b_cov_cur = np.asarray(self.cross_covariance)
+            if b_cov_cur.ndim != 2 or b_cov_cur.shape != (D + 1, K) or not bool(np.all(np.isfinite(b_cov_cur))):
+                raise ValueError(f"Cross-covariance matrix B must be finite with shape ({D + 1}, {K})")
+            _validate_2d_layout_cloneable(b_cov_cur, np.dtype(b_cov_cur.dtype))
+
+        is_hier_update = bool(not isinstance(self.field_def, BooleanField) and self.hierarchical)
+        cw_h: Optional[np.ndarray] = None
+        cb_h: Optional[np.ndarray] = None
+        fw_h: Optional[np.ndarray] = None
+        fb_h: Optional[np.ndarray] = None
+        assign_h: Tuple[int, ...] = ()
+        if is_hier_update:
+            if self.coarse_weights is None or self.coarse_biases is None:
+                raise ValueError("Hierarchical head missing coarse_weights/coarse_biases in online_update")
+            cw_h = np.asarray(self.coarse_weights)
+            cb_h = np.asarray(self.coarse_biases)
+            if (
+                cw_h.ndim != 2
+                or cw_h.shape[0] < 1
+                or cw_h.shape[1] != D
+                or cb_h.ndim != 1
+                or cb_h.shape != (cw_h.shape[0],)
+            ):
+                raise ValueError(
+                    f"Hierarchical coarse shape mismatch in online_update: got {cw_h.shape} and {cb_h.shape}"
+                )
+            _validate_2d_layout_cloneable(cw_h, np.dtype(cw_h.dtype))
+            if not (bool(np.all(np.isfinite(cw_h))) and bool(np.all(np.isfinite(cb_h)))):
+                raise ValueError("Hierarchical coarse weights and biases must be finite in online_update")
+            assign_h = tuple(int(c) for c in self.cluster_assignments)
+            if len(assign_h) != K or any(c < 0 or c >= cw_h.shape[0] for c in assign_h):
+                raise ValueError("Invalid hierarchical cluster_assignments in online_update")
+            has_fw_u = self.fine_weights is not None
+            has_fb_u = self.fine_biases is not None
+            if has_fw_u != has_fb_u:
+                raise ValueError("Hierarchical fine_weights and fine_biases must both be provided or both be None")
+            if has_fw_u and has_fb_u:
+                fw_h = np.asarray(self.fine_weights)
+                fb_h = np.asarray(self.fine_biases)
+                if fw_h.ndim != 2 or fw_h.shape != (K, D) or fb_h.ndim != 1 or fb_h.shape != (K,):
+                    raise ValueError(
+                        f"Hierarchical fine shape mismatch in online_update: got {fw_h.shape} and {fb_h.shape}"
+                    )
+                _validate_2d_layout_cloneable(fw_h, np.dtype(fw_h.dtype))
+                if not (bool(np.all(np.isfinite(fw_h))) and bool(np.all(np.isfinite(fb_h)))):
+                    raise ValueError("Hierarchical fine weights and biases must be finite in online_update")
 
         if self.covariance_inv is None or self.cross_covariance is None:
             self.init_covariance(regularization=self.regularization)
@@ -2654,33 +2860,10 @@ class DecisionFieldHead:
                                 self._shots_c_row_ids = ()
 
         # Also update coarse cluster router and fine cluster specialist weights if hierarchical routing is active
-        if (
-            self.hierarchical
-            and self.coarse_weights is not None
-            and self.coarse_biases is not None
-            and len(self.cluster_assignments) == K
-        ):
-            cw_h = np.asarray(self.coarse_weights)
-            cb_h = np.asarray(self.coarse_biases)
-            if cw_h.ndim != 2 or cw_h.shape[1] != D or cb_h.ndim != 1 or cb_h.shape != (cw_h.shape[0],):
-                raise ValueError(
-                    f"Hierarchical coarse shape mismatch in online_update: got {cw_h.shape} and {cb_h.shape}"
-                )
-            _validate_2d_layout_cloneable(cw_h, np.dtype(cw_h.dtype))
-            has_fine = self.fine_weights is not None or self.fine_biases is not None
-            if has_fine:
-                if self.fine_weights is None or self.fine_biases is None:
-                    raise ValueError("Hierarchical fine_weights and fine_biases must both be provided or both be None")
-                fw_h = np.asarray(self.fine_weights)
-                fb_h = np.asarray(self.fine_biases)
-                if fw_h.ndim != 2 or fw_h.shape != (K, D) or fb_h.ndim != 1 or fb_h.shape != (K,):
-                    raise ValueError(
-                        f"Hierarchical fine shape mismatch in online_update: got {fw_h.shape} and {fb_h.shape}"
-                    )
-                _validate_2d_layout_cloneable(fw_h, np.dtype(fw_h.dtype))
+        if is_hier_update and cw_h is not None and cb_h is not None:
             target_k = int(np.argmax(y))
             if 0 <= target_k < K and float(y[target_k]) > 0.0:
-                target_c = self.cluster_assignments[target_k]
+                target_c = assign_h[target_k]
                 if 0 <= target_c < cw_h.shape[0]:
                     x_feat = x[:D]
                     c_logits = cw_h @ x_feat + cb_h
@@ -2694,9 +2877,7 @@ class DecisionFieldHead:
                     self.coarse_weights = _preserve_2d_layout_update(
                         cw_h, (cw_h + step * np.outer(err_c, x_feat)).astype(np.float32)
                     )
-                    if has_fine and self.fine_weights is not None and self.fine_biases is not None:
-                        fw_h = self.fine_weights
-                        fb_h = self.fine_biases
+                    if fw_h is not None and fb_h is not None:
                         f_logits = fw_h @ x_feat + fb_h
                         err_f = np.zeros_like(f_logits)
                         if f_logits[target_k] < 1.5:
@@ -2879,13 +3060,9 @@ class DecisionFieldHead:
                             alpha = min(0.65, 0.28 * avg_shots / (1.0 + 0.25 * avg_shots))
                             base_logits = ((1.0 - alpha) * base_logits + alpha * shot_logits).astype(np.float32)
                     logits = base_logits
-                elif (
-                    not isinstance(self.field_def, BooleanField)
-                    and self.hierarchical
-                    and self.coarse_weights is not None
-                    and self.coarse_biases is not None
-                    and len(self.cluster_assignments) == self.weights.shape[0]
-                ):
+                elif not isinstance(self.field_def, BooleanField) and self.hierarchical:
+                    if self.coarse_weights is None or self.coarse_biases is None:
+                        raise ValueError("Hierarchical head missing coarse_weights/coarse_biases")
                     logits = _compute_hierarchical_logits_np(
                         emb,
                         logits,
@@ -3929,10 +4106,11 @@ class PackedMultiQuestionKernel:
         s_raw_b: List[np.ndarray] = []
 
         def _validate_head(fname: str) -> Any:
+            f_def = fields[fname]
             exec_h, meta_h = _resolve_authoritative_head(model, fname)
             candidates = (exec_h,) if (meta_h is None or meta_h is exec_h) else (exec_h, meta_h)
             for cand in candidates:
-                if getattr(cand, "hierarchical", False) and getattr(cand, "coarse_weights", None) is not None:
+                if not isinstance(f_def, BooleanField) and getattr(cand, "hierarchical", False):
                     raise ValueError(f"PackedMultiQuestionKernel does not support hierarchical head {fname!r}")
                 if getattr(cand, "_exemplar_bank", None) is not None:
                     raise ValueError(f"PackedMultiQuestionKernel does not support exemplar bank on {fname!r}")
@@ -4153,7 +4331,6 @@ class PackedMultiQuestionKernel:
                 s_raw_scale.append(temp)
                 with np.errstate(over="ignore", invalid="ignore"):
                     rng_val = float(f_def.max_value - f_def.min_value)
-                half_span = _score_half_span(f_def.min_value, f_def.max_value)
                 s_min.append(float(f_def.min_value))
                 s_max.append(float(f_def.max_value))
                 s_range.append(rng_val)
@@ -4171,13 +4348,11 @@ class PackedMultiQuestionKernel:
                     if k_idx > n_res:
                         norm_m = 1.0
                     else:
-                        m = float(rcp.residuals[k_idx - 1])
-                        if not math.isfinite(m) or m >= sys.float_info.max:
-                            norm_m = 1.0
-                        elif half_span > 0.0:
-                            norm_m = min(1.0, (0.5 * m) / half_span)
-                        else:
-                            norm_m = 0.0 if m == 0.0 else 1.0
+                        norm_m = _score_normalized_margin(
+                            float(rcp.residuals[k_idx - 1]),
+                            f_def.min_value,
+                            f_def.max_value,
+                        )
                 else:
                     norm_m = 1.0 if strict_mode else (1.0 - eff_alpha) / 2.0
                 s_norm_margin.append(norm_m)

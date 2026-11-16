@@ -74,12 +74,15 @@ from system1.core.model import (
 )
 from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
 from system1.core.schema import (
+    _f64_to_exact_2m1074,
     _score_abs_diff_clamped,
     _score_from_unit_prob,
     _score_full_span_clamped,
     _score_half_span,
     _score_interval_bounds,
+    _score_normalized_margin,
     _score_to_unit_ratio,
+    _score_within_rel_tolerance,
 )
 from system1.core.embeddings import HybridProjector
 from system1.core.telemetry import TelemetryProjector
@@ -1757,7 +1760,7 @@ class SystemOneEngine:
             f_covered = 0
             f_set_size_sum = 0.0
             f_singleton = 0
-            f_mae_sum = 0.0
+            f_mae_int_sum = 0
             f_reasons: Dict[str, int] = {}
 
             for row_idx, res, gt_val in f_rows:
@@ -1816,25 +1819,32 @@ class SystemOneEngine:
                     set_size_i = float(len(c_set))
                     singleton_i = is_accepted
                 else:
-                    half_span = _score_half_span(f_def.min_value, f_def.max_value)
+                    full_span_s = _score_full_span_clamped(f_def.min_value, f_def.max_value)
+                    cov_slack = min(1e-6, 1e-6 * full_span_s) if full_span_s > 0.0 else 0.0
+                    str_slack = min(1e-4, 1e-4 * full_span_s) if full_span_s > 0.0 else 0.0
                     covered_i = False
                     rcp = self.regression_conformal_predictors.get(fname)
                     if is_unfamiliar or not c_set:
                         covered_i = False
                     elif rcp is not None and rcp.is_calibrated:
                         interval = rcp.predict_interval(float(pred_val), alpha=eff_alpha, strict=eff_strict)
-                        covered_i = (interval.lower_bound - 1e-6) <= float(gt_val) <= (interval.upper_bound + 1e-6)
+                        covered_i = (interval.lower_bound - cov_slack) <= float(gt_val) <= (interval.upper_bound + cov_slack)
                     elif isinstance(c_set[0], str) and c_set[0].startswith("[") and c_set[0].endswith("]"):
                         try:
                             parts = c_set[0][1:-1].split(",")
                             lo_v, hi_v = float(parts[0].strip()), float(parts[1].strip())
-                            covered_i = (lo_v - 1e-4) <= float(gt_val) <= (hi_v + 1e-4)
+                            covered_i = (lo_v - str_slack) <= float(gt_val) <= (hi_v + str_slack)
                         except (ValueError, IndexError):
                             covered_i = False
-                    half_err = abs(0.5 * float(pred_val) - 0.5 * float(gt_val))
                     abs_err = _score_abs_diff_clamped(float(pred_val), float(gt_val))
-                    f_mae_sum += abs_err / float(n_f)
-                    correct_i = half_err <= 0.10 * half_span if math.isfinite(half_span) and half_span > 0.0 else (float(pred_val) == float(gt_val))
+                    f_mae_int_sum += _f64_to_exact_2m1074(abs_err)
+                    correct_i = _score_within_rel_tolerance(
+                        float(pred_val),
+                        float(gt_val),
+                        f_def.min_value,
+                        f_def.max_value,
+                        0.10,
+                    )
                     set_size_i = float(len(c_set))
                     singleton_i = is_accepted
 
@@ -1943,7 +1953,7 @@ class SystemOneEngine:
                 abstain_rate=f_abs_rate,
                 unfamiliar_rate=f_unf_rate,
                 abstention_reasons=f_reasons,
-                mae=float(f_mae_sum) if isinstance(f_def, ScoreField) else 0.0,
+                mae=float(f_mae_int_sum / (n_f << 1074)) if (isinstance(f_def, ScoreField) and n_f > 0) else 0.0,
             )
 
             total_field_evals += n_f
@@ -2618,14 +2628,14 @@ class SystemOneEngine:
                             low_b, high_b = _score_interval_bounds(val, interval_margin, f_def.min_value, f_def.max_value)
                         conformal_sets[name] = [f"[{low_b:.4f}, {high_b:.4f}]"]
 
-                    if has_learned_override or float(interval_margin) == 0.0:
+                    if has_learned_override:
                         normalized_margin = 0.0
-                    elif not math.isfinite(float(interval_margin)) or float(interval_margin) >= sys.float_info.max:
-                        normalized_margin = 1.0
-                    elif half_span > 0.0:
-                        normalized_margin = min(1.0, (0.5 * float(interval_margin)) / half_span)
                     else:
-                        normalized_margin = 1.0
+                        normalized_margin = _score_normalized_margin(
+                            float(interval_margin),
+                            f_def.min_value,
+                            f_def.max_value,
+                        )
                     score_ambiguous = False
                     if is_strict and not has_learned_override:
                         eff_score_thresh = eff_m_thresh if (self.enable_margin_gating and eff_m_thresh is not None) else 0.5
@@ -4177,13 +4187,7 @@ class SystemOneEngine:
                     b_vec = np.asarray(raw_b_arr[:1] if is_bool else raw_b_arr, dtype=np.float32)
 
                 cluster_assign_raw = getattr(head, "cluster_assignments", ()) or ()
-                is_hier = bool(
-                    not is_bool
-                    and getattr(head, "hierarchical", False)
-                    and getattr(head, "coarse_weights", None) is not None
-                    and getattr(head, "coarse_biases", None) is not None
-                    and len(cluster_assign_raw) == w_mat.shape[0]
-                )
+                is_hier = bool(not is_bool and getattr(head, "hierarchical", False))
                 raw_coarse_w: Optional[np.ndarray] = None
                 raw_coarse_b: Optional[np.ndarray] = None
                 raw_fine_w: Optional[np.ndarray] = None
@@ -4194,6 +4198,10 @@ class SystemOneEngine:
                 fine_b: Optional[np.ndarray] = None
                 cluster_assign: Optional[np.ndarray] = None
                 if is_hier:
+                    if getattr(head, "coarse_weights", None) is None or getattr(head, "coarse_biases", None) is None:
+                        raise ValueError(
+                            f"Field head {fname!r} hierarchical weights missing coarse_weights/coarse_biases"
+                        )
                     raw_coarse_w = np.asarray(head.coarse_weights)
                     raw_coarse_b = np.asarray(head.coarse_biases)
                     if raw_coarse_b.ndim != 1:
@@ -4203,7 +4211,9 @@ class SystemOneEngine:
                     cluster_assign = np.asarray(cluster_assign_raw, dtype=np.int64)
                     if (
                         raw_coarse_w.ndim != 2
-                        or raw_coarse_b.shape[0] != raw_coarse_w.shape[0]
+                        or raw_coarse_w.shape[0] < 1
+                        or raw_coarse_w.shape[1] != self.dimension
+                        or raw_coarse_b.shape != (raw_coarse_w.shape[0],)
                         or cluster_assign.ndim != 1
                         or cluster_assign.size != raw_w_arr.shape[0]
                         or (
@@ -4212,11 +4222,25 @@ class SystemOneEngine:
                         )
                     ):
                         raise ValueError(f"Field head {fname!r} has invalid hierarchical cluster configuration")
-                    if getattr(head, "fine_weights", None) is not None and getattr(head, "fine_biases", None) is not None:
+                    _validate_2d_layout_cloneable(raw_coarse_w, np.dtype(np.float32))
+                    has_fw = getattr(head, "fine_weights", None) is not None
+                    has_fb = getattr(head, "fine_biases", None) is not None
+                    if has_fw != has_fb:
+                        raise ValueError(
+                            f"Field head {fname!r} fine_weights and fine_biases must both be provided or both be None"
+                        )
+                    if has_fw and has_fb:
                         raw_fine_w = np.asarray(head.fine_weights)
                         raw_fine_b = np.asarray(head.fine_biases)
                         if raw_fine_b.ndim != 1:
                             raise ValueError(f"Field head {fname!r} fine_biases must be 1D, got shape {raw_fine_b.shape}")
+                        if (
+                            raw_fine_w.ndim != 2
+                            or raw_fine_w.shape != (raw_w_arr.shape[0], self.dimension)
+                            or raw_fine_b.shape != (raw_w_arr.shape[0],)
+                        ):
+                            raise ValueError(f"Field head {fname!r} hierarchical fine tensor shape mismatch")
+                        _validate_2d_layout_cloneable(raw_fine_w, np.dtype(np.float32))
                         if not (np.all(np.isfinite(raw_fine_w)) and np.all(np.isfinite(raw_fine_b))):
                             raise ValueError(f"Field head {fname!r} contains non-finite hierarchical fine weights")
                     with np.errstate(over="ignore", invalid="ignore"):
@@ -4226,6 +4250,8 @@ class SystemOneEngine:
                             raw_coarse_b = raw_coarse_b.astype(np.float32)
                         coarse_w = np.asarray(raw_coarse_w, dtype=np.float32)
                         coarse_b = np.asarray(raw_coarse_b, dtype=np.float32)
+                        if not (bool(np.all(np.isfinite(coarse_w))) and bool(np.all(np.isfinite(coarse_b)))):
+                            raise ValueError(f"Field head {fname!r} hierarchical coarse weights overflow float32")
                         if raw_fine_w is not None and raw_fine_b is not None:
                             if raw_fine_w.dtype not in (np.float32, np.float64):
                                 raw_fine_w = raw_fine_w.astype(np.float32)
@@ -4233,6 +4259,8 @@ class SystemOneEngine:
                                 raw_fine_b = raw_fine_b.astype(np.float32)
                             fine_w = np.asarray(raw_fine_w, dtype=np.float32)
                             fine_b = np.asarray(raw_fine_b, dtype=np.float32)
+                            if not (bool(np.all(np.isfinite(fine_w))) and bool(np.all(np.isfinite(fine_b)))):
+                                raise ValueError(f"Field head {fname!r} hierarchical fine weights overflow float32")
 
                 fam_t = max(
                     float(getattr(head, "familiarity_threshold", 0.0)),

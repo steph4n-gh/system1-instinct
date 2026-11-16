@@ -380,9 +380,6 @@ class GuardShield:
         self.is_hier = bool(
             (not self.is_boolean)
             and getattr(self.head, "hierarchical", False)
-            and getattr(self.head, "coarse_weights", None) is not None
-            and getattr(self.head, "coarse_biases", None) is not None
-            and len(cluster_assign_raw) == self.raw_W.shape[0]
         )
         if (
             not self.is_hier
@@ -437,6 +434,10 @@ class GuardShield:
         self._cluster_assign: Optional[np.ndarray] = None
         self._hier_dtype: Any = np.result_type(w_dtype, b_dtype)
         if self.is_hier:
+            if getattr(self.head, "coarse_weights", None) is None or getattr(self.head, "coarse_biases", None) is None:
+                raise ValueError(
+                    f"Field head {self.field_name!r} hierarchical weights missing coarse_weights/coarse_biases"
+                )
             cw_in = np.asarray(self.head.coarse_weights)
             cb_in = np.asarray(self.head.coarse_biases)
             if cb_in.ndim != 1:
@@ -446,6 +447,7 @@ class GuardShield:
             c_assign = np.asarray(cluster_assign_raw, dtype=np.int64)
             if (
                 cw_in.ndim != 2
+                or cw_in.shape[0] < 1
                 or cw_in.shape[1] != self.raw_W.shape[1]
                 or cb_in.shape[0] != cw_in.shape[0]
                 or c_assign.ndim != 1
@@ -455,19 +457,24 @@ class GuardShield:
                 raise ValueError(f"Field head {self.field_name!r} has invalid hierarchical cluster configuration")
             cw_dtype = np.float64 if cw_in.dtype == np.float64 else np.float32
             cb_dtype = np.float64 if cb_in.dtype == np.float64 else np.float32
-            self._raw_coarse_w = _owned_readonly_array(cw_in, dtype=cw_dtype)
-            self._raw_coarse_b = _owned_readonly_array(cb_in, dtype=cb_dtype)
-            self._cluster_assign = c_assign
+            with np.errstate(over="ignore", invalid="ignore"):
+                raw_coarse_w = _owned_readonly_array(cw_in, dtype=cw_dtype)
+                raw_coarse_b = _owned_readonly_array(cb_in, dtype=cb_dtype)
+            if not (bool(np.all(np.isfinite(raw_coarse_w))) and bool(np.all(np.isfinite(raw_coarse_b)))):
+                raise ValueError(f"Field head {self.field_name!r} hierarchical coarse weights overflow target dtype")
+            has_fw = getattr(self.head, "fine_weights", None) is not None
+            has_fb = getattr(self.head, "fine_biases", None) is not None
+            if has_fw != has_fb:
+                raise ValueError(
+                    f"Field head {self.field_name!r} fine_weights and fine_biases must both be provided or both be None"
+                )
             has_f64_h = (
                 (w_dtype == np.float64)
                 or (b_dtype == np.float64)
                 or (cw_dtype == np.float64)
                 or (cb_dtype == np.float64)
             )
-            if (
-                getattr(self.head, "fine_weights", None) is not None
-                and getattr(self.head, "fine_biases", None) is not None
-            ):
+            if has_fw and has_fb:
                 fw_in = np.asarray(self.head.fine_weights)
                 fb_in = np.asarray(self.head.fine_biases)
                 if fb_in.ndim != 1:
@@ -478,9 +485,17 @@ class GuardShield:
                     raise ValueError(f"Field head {self.field_name!r} hierarchical fine tensor shape mismatch")
                 fw_dtype = np.float64 if fw_in.dtype == np.float64 else np.float32
                 fb_dtype = np.float64 if fb_in.dtype == np.float64 else np.float32
-                self._raw_fine_w = _owned_readonly_array(fw_in, dtype=fw_dtype)
-                self._raw_fine_b = _owned_readonly_array(fb_in, dtype=fb_dtype)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    raw_fine_w = _owned_readonly_array(fw_in, dtype=fw_dtype)
+                    raw_fine_b = _owned_readonly_array(fb_in, dtype=fb_dtype)
+                if not (bool(np.all(np.isfinite(raw_fine_w))) and bool(np.all(np.isfinite(raw_fine_b)))):
+                    raise ValueError(f"Field head {self.field_name!r} hierarchical fine weights overflow target dtype")
+                self._raw_fine_w = raw_fine_w
+                self._raw_fine_b = raw_fine_b
                 has_f64_h = has_f64_h or (fw_dtype == np.float64) or (fb_dtype == np.float64)
+            self._raw_coarse_w = raw_coarse_w
+            self._raw_coarse_b = raw_coarse_b
+            self._cluster_assign = c_assign
             self._hier_dtype = np.float64 if has_f64_h else np.float32
 
         resolved_unsafe = _normalize_unsafe_label_arg(unsafe_label, unsafe_labels)

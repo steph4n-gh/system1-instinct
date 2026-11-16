@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 from system1.core.schema import (
+    _f64_to_exact_2m1074,
     _score_abs_diff_clamped,
     _score_full_span_clamped,
     _score_half_span,
@@ -77,16 +78,6 @@ def _normalize_vec_f32_safe(
         return np.zeros_like(v64, dtype=np.float32), raw_norm, False
     unit = (scaled / scaled_norm).astype(np.float32)
     return unit, raw_norm, True
-
-
-def _f64_to_exact_2m1074(v: float) -> int:
-    """Convert a finite float64 exactly into an integer multiple of 2^-1074."""
-    if v == 0.0:
-        return 0
-    m, e = math.frexp(v)
-    if e >= -1021:
-        return int(math.ldexp(m, 53)) << (e + 1021)
-    return int(math.ldexp(v, 1074))
 
 
 def _safe_centroid_mean_f64(rows: Any, weights: Optional[Any] = None) -> Optional[np.ndarray]:

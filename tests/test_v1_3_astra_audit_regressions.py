@@ -13979,3 +13979,388 @@ def test_astra_36_round23_regressions() -> None:
     assert not np.allclose(cm8_learned.heads["f"].coarse_weights, cw_before8)
     assert cm8_learned.heads["f"].coarse_weights.strides == cw_init8.strides
     assert cm8_learned.heads["f"].fine_weights.strides == fw_init8.strides
+
+
+def test_astra_37_round24_regressions(tmp_path: Path) -> None:
+    """Round-24 regressions R24-1..R24-8 across incomplete hierarchy, v2 class-score budget, subnormal Score math, wide-score MAE/RMSE, online exemplar/shot strides, post-cast exemplar/cov overflow, FastExplainer raw_b length, and atomic online_update validation."""
+    import json
+    import math
+    import sys
+    import warnings
+    import numpy as np
+    import pytest
+
+    import system1.compiler as s1_compiler
+    from system1 import (
+        ChoiceField,
+        DecisionSchema,
+        DeterministicSemanticProjector,
+        FastExplainer,
+        GuardShield,
+        MultiTenantSkillFleet,
+        ScoreField,
+        SystemOneEngine,
+    )
+    from system1.calibration import RegressionConformalPredictor
+    from system1.compiler import CompiledHeadWeights, CompiledSystemOneModel
+    from system1.core.model import PackedMultiQuestionKernel
+    from system1.core.schema import (
+        _score_abs_diff_clamped,
+        _score_full_span_clamped,
+        _score_half_span,
+        _score_normalized_margin,
+        _score_within_rel_tolerance,
+    )
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.teaching import TeachingSession
+
+    class _R24GuardSchema(DecisionSchema):
+        f = ChoiceField(options=("safe", "unsafe"))
+
+    def _fresh(schema_cls: Any = _R24GuardSchema, dim: int = 16, **kw: Any) -> SystemOneEngine:
+        return SystemOneEngine(
+            schema_cls,
+            dimension=dim,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=kw.pop("strict_mode", False),
+            **kw,
+        )
+
+    # ------------------------------------------------------------------
+    # R24-1: Incomplete hierarchy fails closed across all live, batch, compiled, guard, kernel, and fleet paths.
+    # ------------------------------------------------------------------
+    e1 = _fresh(_R24GuardSchema, 16)
+    h1 = e1.model.heads["f"]
+    h1.set_weights(np.zeros((2, 16), dtype="f4"), np.array([1.0, 0.0], dtype="f4"))
+    h1.set_hierarchical_weights(
+        cluster_assignments=(0, 1),
+        coarse_weights=np.zeros((2, 16), dtype="f4"),
+        coarse_biases=np.zeros(2, dtype="f4"),
+        fine_weights=np.zeros((2, 16), dtype="f4"),
+        fine_biases=np.array([0.0, 10.0], dtype="f4"),
+    )
+    assert e1.decide("probe", record_receipt=False).values["f"] == "unsafe"
+    assert GuardShield(e1, field_name="f", unsafe_label="unsafe").evaluate_single("probe").is_unsafe is True
+
+    corrupted_states = [
+        ("fine_weights", None),
+        ("fine_biases", None),
+        ("coarse_weights", None),
+        ("cluster_assignments", (0,)),
+    ]
+    for attr_name, bad_val in corrupted_states:
+        orig_val = getattr(h1, attr_name)
+        setattr(h1, attr_name, bad_val)
+        try:
+            for fn1 in (
+                lambda: e1.decide("probe", record_receipt=False),
+                lambda: e1.decide_batch(["probe"], record_receipt=False),
+                lambda: e1.to_compiled_model(),
+                lambda: GuardShield(e1, field_name="f", unsafe_label="unsafe"),
+                lambda: PackedMultiQuestionKernel.from_engine(e1),
+                lambda: MultiTenantSkillFleet.from_compiled_model(e1, "f", num_tenants=1),
+            ):
+                with pytest.raises(ValueError):
+                    fn1()
+        finally:
+            setattr(h1, attr_name, orig_val)
+
+    bad_ch1 = CompiledHeadWeights(
+        "f",
+        "choice",
+        np.zeros((2, 16), dtype="f4"),
+        np.zeros(2, dtype="f4"),
+        options=("safe", "unsafe"),
+        hierarchical=True,
+        cluster_assignments=(0, 1),
+        coarse_weights=None,
+        coarse_biases=None,
+    )
+    with pytest.raises(ValueError):
+        CompiledSystemOneModel(_R24GuardSchema(), {"f": bad_ch1}, dimension=16, backend="numpy", use_cache=False)
+
+    bad_export_ch1 = CompiledHeadWeights(
+        "f",
+        "choice",
+        np.zeros((2, 16), dtype="f4"),
+        np.zeros(2, dtype="f4"),
+        options=("safe", "unsafe"),
+        hierarchical=True,
+        cluster_assignments=(0, 1),
+        coarse_weights=np.zeros((2, 16), dtype="f4"),
+        coarse_biases=np.zeros(2, dtype="f4"),
+    )
+    cm1_bad = CompiledSystemOneModel(_R24GuardSchema(), {"f": bad_export_ch1}, dimension=16, backend="numpy", use_cache=False)
+    cm1_bad.heads["f"].fine_weights = np.zeros((2, 16), dtype="f4")
+    cm1_bad.heads["f"].fine_biases = None
+    with pytest.raises(ValueError):
+        cm1_bad.to_bytes(format_version=3, compact=False)
+
+    # ------------------------------------------------------------------
+    # R24-2: v2 & v3 memory budgets account for class_calibration_scores tuples.
+    # ------------------------------------------------------------------
+    class _R24AB(DecisionSchema):
+        f = ChoiceField(options=("a", "b"))
+
+    head2 = CompiledHeadWeights(
+        "f",
+        "choice",
+        np.zeros((2, 16), dtype="f4"),
+        np.zeros(2, dtype="f4"),
+        options=("a", "b"),
+        mondrian=True,
+        class_calibration_scores={"a": tuple(i / 1000 for i in range(1000))},
+    )
+    m2 = CompiledSystemOneModel(_R24AB(), {"f": head2}, dimension=16, backend="numpy", use_cache=False)
+    for fmt_v, cap_attr in ((2, "MAX_SKILL_RUNTIME_BYTES"), (3, "MAX_SKILL_RUNTIME_BYTES_V3")):
+        blob2 = m2.to_bytes(format_version=fmt_v, compact=False)
+        orig_cap = getattr(s1_compiler, cap_attr)
+        try:
+            setattr(s1_compiler, cap_attr, 8_000)
+            with pytest.raises(ValueError, match="memory budget"):
+                CompiledSystemOneModel.from_bytes(blob2, backend="numpy")
+            setattr(s1_compiler, cap_attr, 64_000)
+            re2 = CompiledSystemOneModel.from_bytes(blob2, backend="numpy")
+            assert len(re2.heads["f"].class_calibration_scores["a"]) == 1000
+        finally:
+            setattr(s1_compiler, cap_attr, orig_cap)
+
+    # ------------------------------------------------------------------
+    # R24-3: Opposite-sign subnormal ScoreField precision & cross-path ambiguity parity.
+    # ------------------------------------------------------------------
+    s_ulp = math.ulp(0.0)
+    assert _score_full_span_clamped(-s_ulp, s_ulp) == 2.0 * s_ulp
+    assert _score_abs_diff_clamped(-s_ulp, s_ulp) == 2.0 * s_ulp
+    assert _score_half_span(-s_ulp, s_ulp) == s_ulp
+    assert _score_normalized_margin(s_ulp, -s_ulp, s_ulp) == pytest.approx(0.5)
+    assert _score_within_rel_tolerance(-s_ulp, s_ulp, -s_ulp, s_ulp, 0.1) is False
+    assert _score_within_rel_tolerance(-s_ulp, s_ulp, -s_ulp, s_ulp, 1.0) is True
+
+    rcp3 = RegressionConformalPredictor("f", -s_ulp, s_ulp)
+    rcp3.calibrate([-s_ulp] * 10, [s_ulp] * 10)
+    assert all(r == 2.0 * s_ulp for r in rcp3.residuals)
+    iv3 = rcp3.predict_interval(-s_ulp, alpha=0.2)
+    assert iv3.lower_bound <= -s_ulp and iv3.upper_bound >= s_ulp
+
+    class _R24SubnormalScore(DecisionSchema):
+        f = ScoreField(min_value=-s_ulp, max_value=s_ulp)
+
+    with warnings.catch_warnings(record=True) as caught_s3:
+        warnings.simplefilter("always", RuntimeWarning)
+        e3 = _fresh(_R24SubnormalScore, 16, strict_mode=True)
+        e3.model.heads["f"].set_weights(np.zeros((1, 16), dtype="f4"), np.zeros(1, dtype="f4"))
+        e3.calibrate([("p0", {"f": s_ulp}), ("p1", {"f": -s_ulp})])
+        d3 = e3.decide("p", record_receipt=False)
+        b3 = e3.decide_batch(["p"], record_receipt=False)[0]
+        fc3 = e3.compile_callable()("p")
+        pk3 = e3.compile_packed_kernel().decide_prompt("p")
+        assert d3.ambiguous_fields == ["f"]
+        assert b3.ambiguous_fields == ["f"]
+        assert fc3.is_ambiguous is True
+        assert bool(pk3["is_ambiguous"][0]) is True
+
+        e3_20 = _fresh(_R24SubnormalScore, 16, strict_mode=True)
+        e3_20.model.heads["f"].set_weights(np.zeros((1, 16), dtype="f4"), np.zeros(1, dtype="f4"))
+        cal3_20 = [(f"p{i}", {"f": s_ulp if i % 2 == 0 else -s_ulp}) for i in range(20)]
+        e3_20.calibrate(cal3_20)
+        assert e3_20.decide("p", record_receipt=False).ambiguous_fields == ["f"]
+        assert e3_20.decide_batch(["p"], record_receipt=False)[0].ambiguous_fields == ["f"]
+        assert e3_20.compile_callable()("p").is_ambiguous is True
+        assert bool(e3_20.compile_packed_kernel().decide_prompt("p")["is_ambiguous"][0]) is True
+        ev3_20 = e3_20.evaluate([("p0", {"f": s_ulp})])
+        assert ev3_20.fields["f"].conformal_coverage == 1.0
+
+        # AutoCutoverLifecycle & TeachingSession subnormal agreement
+        lc3 = AutoCutoverLifecycle(
+            _R24SubnormalScore,
+            CutoverConfig(score_tolerance=0.1, alpha_target=0.05),
+        )
+        assert lc3._values_match({"f": -s_ulp}, {"f": s_ulp}) is False
+        assert lc3._values_match({"f": -s_ulp}, {"f": -s_ulp}) is True
+        sess3 = TeachingSession(tmp_path / "teach_sub", _R24SubnormalScore)
+        out3 = sess3._score_field_outcome(
+            "f",
+            sess3.schema.fields["f"],
+            e3.decide("p", record_receipt=False),
+            s_ulp,
+        )
+        assert out3["correct"] is False
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_s3)
+
+    # ------------------------------------------------------------------
+    # R24-4: Wide-score evaluation & TeachingSession MAE/RMSE remain finite across odd sample counts.
+    # ------------------------------------------------------------------
+    class _R24WideScore(DecisionSchema):
+        f = ScoreField(min_value=-1e308, max_value=1e308)
+
+    with warnings.catch_warnings(record=True) as caught_s4:
+        warnings.simplefilter("always", RuntimeWarning)
+        e4 = _fresh(_R24WideScore, 16, strict_mode=True)
+        e4.model.heads["f"].set_weights(np.zeros((1, 16), dtype="f4"), np.array([100.0], dtype="f4"))
+        for n4 in (1, 2, 3, 4, 6, 7, 11):
+            rep4 = e4.evaluate([(f"p{i}", {"f": -1e308}) for i in range(n4)])
+            assert math.isfinite(rep4.fields["f"].mae)
+            assert rep4.fields["f"].mae == pytest.approx(sys.float_info.max, rel=1e-12)
+            assert json.dumps(rep4.to_dict(), allow_nan=False)
+
+        sess4 = TeachingSession(tmp_path / "teach_wide", _R24WideScore)
+        sum4 = sess4._summarize_field_metrics(
+            "f",
+            sess4.schema.fields["f"],
+            [{"input": f"p{i}", "label": {"f": -1e308}} for i in range(3)],
+            [{"predicted": 1e308, "review": False, "correct": False, "prediction_set": []} for _ in range(3)],
+        )
+        assert math.isfinite(sum4["mae"]) and math.isfinite(sum4["rmse"])
+        assert sum4["mae"] == pytest.approx(sys.float_info.max, rel=1e-12)
+        assert sum4["rmse"] == pytest.approx(sys.float_info.max, rel=1e-12)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_s4)
+
+    # ------------------------------------------------------------------
+    # R24-5: Online updates preserve 2D exemplar & shot strides across k <= 8 and k > 8.
+    # ------------------------------------------------------------------
+    for k5 in (2, 9):
+        class_schema = DecisionSchema(fields={"f": ChoiceField(options=tuple(str(i) for i in range(k5)))})
+        e5 = SystemOneEngine(
+            class_schema,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        h5 = e5.model.heads["f"]
+        h5.set_weights(np.zeros((k5, 16), dtype="f4"), np.zeros(k5, dtype="f4"))
+        v5 = np.arange(1, k5 * 32 + 1, dtype="f4").reshape(k5, 32)[:, ::2]
+        v5 /= np.float32(k5 * 32)
+        keys5 = ("exemplar_vectors", "shots_p", "shots_c")
+        h5.restore_exemplar_state(
+            {
+                "arrays": {
+                    "exemplar_centroids": np.zeros((k5, 16), dtype="f4"),
+                    **{key: v5 for key in keys5},
+                },
+                "counts": {key: [1] * k5 for key in keys5},
+            }
+        )
+        targ5 = np.zeros(k5, dtype="f4")
+        targ5[0] = 1.0
+        h5.online_update(np.ones(16, dtype="f4"), targ5, concept_embedding=np.ones(16, dtype="f4"))
+        exp5 = h5.export_exemplar_state()
+        assert exp5 is not None
+        for key in keys5:
+            assert exp5["arrays"][key].strides == (128, 8)
+            assert int(exp5["arrays"][key].ctypes.data % 64) == int(v5.ctypes.data % 64)
+        if k5 <= 8 and h5._exemplar_bank is not None:
+            assert all(b.strides == (128, 8) for b in h5._exemplar_bank[1])
+
+        cm5 = e5.to_compiled_model()
+        for fmt_v in (2, 3):
+            re5 = CompiledSystemOneModel.from_bytes(cm5.to_bytes(format_version=fmt_v, compact=False), backend="numpy")
+            assert re5.heads["f"].exemplar_state is not None
+            for key in keys5:
+                assert re5.heads["f"].exemplar_state["arrays"][key].strides == (128, 8)
+
+    # ------------------------------------------------------------------
+    # R24-6: Exemplar restoration & init_covariance reject float32 narrowing overflow atomically.
+    # ------------------------------------------------------------------
+    e6 = _fresh(_R24AB, 16)
+    h6 = e6.model.heads["f"]
+    a6 = np.full((2, 16), 1e300, dtype=np.float64)
+    with warnings.catch_warnings(record=True) as caught_s6:
+        warnings.simplefilter("always", RuntimeWarning)
+        with pytest.raises(ValueError, match="float32"):
+            h6.restore_exemplar_state(
+                {
+                    "arrays": {"exemplar_centroids": a6, "exemplar_vectors": a6},
+                    "counts": {"exemplar_vectors": [1, 1]},
+                }
+            )
+        assert h6._exemplar_bank is None
+        h6.init_covariance()
+        p6_before = h6.covariance_inv.copy()
+        b6_before = h6.cross_covariance.copy()
+        with pytest.raises(ValueError, match="float32"):
+            h6.init_covariance(P=np.full((17, 17), 1e300, dtype=np.float64))
+        assert np.array_equal(h6.covariance_inv, p6_before)
+        assert np.array_equal(h6.cross_covariance, b6_before)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_s6)
+
+    # ------------------------------------------------------------------
+    # R24-7: FastExplainer _bool_raw_meta enforces exact raw_b and raw_w shapes.
+    # ------------------------------------------------------------------
+    proj16 = DeterministicSemanticProjector(dimension=16)
+    for bad_rb in (np.array([], dtype="f4"), np.array([2.0, 999.0], dtype="f4")):
+        with pytest.raises(ValueError):
+            FastExplainer(
+                projector=proj16,
+                weights=np.zeros((1, 16), dtype="f4"),
+                biases=np.array([2.0], dtype="f4"),
+                _bool_raw_meta={
+                    "raw_w": np.zeros((1, 16), dtype="f4"),
+                    "raw_b": bad_rb,
+                    "base_scale": 4.0,
+                    "cal_temp": 1.0,
+                },
+            )
+    for bad_c_rb in (np.array([], dtype="f4"), np.array([1.0, 2.0, 3.0], dtype="f4")):
+        with pytest.raises(ValueError):
+            FastExplainer(
+                projector=proj16,
+                weights=np.zeros((2, 16), dtype="f4"),
+                biases=np.array([0.0, 2.0], dtype="f4"),
+                options=("a", "b"),
+                _bool_raw_meta={
+                    "raw_w": np.zeros((2, 16), dtype="f4"),
+                    "raw_b": bad_c_rb,
+                    "base_scale": 4.0,
+                    "cal_temp": 1.0,
+                },
+            )
+
+    # ------------------------------------------------------------------
+    # R24-8: Rejected hierarchical online_update / learn_from_tier2 leaves covariance/model_version untouched.
+    # ------------------------------------------------------------------
+    e8 = _fresh(_R24AB, 16)
+    h8 = e8.model.heads["f"]
+    h8.set_weights(np.zeros((2, 16), dtype="f4"), np.zeros(2, dtype="f4"))
+    h8.set_hierarchical_weights(
+        cluster_assignments=(0, 1),
+        coarse_weights=np.zeros((2, 16), dtype="f4"),
+        coarse_biases=np.zeros(2, dtype="f4"),
+    )
+    h8.init_covariance()
+    p8_0 = h8.covariance_inv.copy()
+    b8_0 = h8.cross_covariance.copy()
+    w8_0 = h8.weights.copy()
+
+    e8_clean = _fresh(_R24AB, 16)
+    h8_clean = e8_clean.model.heads["f"]
+    h8_clean.set_weights(np.zeros((2, 16), dtype="f4"), np.zeros(2, dtype="f4"))
+    h8_clean.set_hierarchical_weights(
+        cluster_assignments=(0, 1),
+        coarse_weights=np.zeros((2, 16), dtype="f4"),
+        coarse_biases=np.zeros(2, dtype="f4"),
+    )
+    h8_clean.init_covariance()
+
+    h8.coarse_biases = h8.coarse_biases.reshape(1, 2)
+    with pytest.raises(ValueError):
+        h8.online_update(np.ones(16, dtype="f4"), np.array([1.0, 0.0], dtype="f4"))
+    assert np.array_equal(h8.covariance_inv, p8_0)
+    assert np.array_equal(h8.cross_covariance, b8_0)
+    assert np.array_equal(h8.weights, w8_0)
+
+    h8.coarse_biases = h8.coarse_biases.reshape(2)
+    h8.online_update(np.ones(16, dtype="f4"), np.array([1.0, 0.0], dtype="f4"))
+    h8_clean.online_update(np.ones(16, dtype="f4"), np.array([1.0, 0.0], dtype="f4"))
+    assert np.array_equal(h8.weights, h8_clean.weights)
+    assert np.array_equal(h8.covariance_inv, h8_clean.covariance_inv)
+
+    cm8 = e8.to_compiled_model()
+    ver_before8 = cm8.model_version
+    cm8._field_heads["f"].coarse_biases = cm8._field_heads["f"].coarse_biases.reshape(1, 2)
+    with pytest.raises(ValueError):
+        cm8.learn_from_tier2("probe", {"f": "a"})
+    assert cm8.model_version == ver_before8

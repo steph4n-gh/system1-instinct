@@ -589,30 +589,83 @@ class FastExplainer:
                 self._bool_has_scalar_raw = True
                 rw_src = np.asarray(_bool_raw_meta["raw_w"])
                 rb_raw = np.asarray(_bool_raw_meta["raw_b"])
-                if rb_raw.ndim != 1:
-                    raise ValueError(f"Expected 1D raw_b vector, got shape {rb_raw.shape}")
+                if rw_src.ndim != 2 or rw_src.shape[0] not in (1, 2) or rw_src.shape[1] != self.dimension:
+                    raise ValueError(
+                        f"Expected 2D raw_w of shape ((1|2), {self.dimension}), got {rw_src.shape}"
+                    )
+                if rb_raw.ndim != 1 or rb_raw.shape not in ((1,), (rw_src.shape[0],)):
+                    raise ValueError(
+                        f"Expected 1D raw_b of shape (1,) or ({rw_src.shape[0]},), got {rb_raw.shape}"
+                    )
                 rb_src = rb_raw
-                self._bool_raw_w = _owned_readonly_array(
-                    rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
-                )
-                self._bool_raw_b = _owned_readonly_array(
-                    rb_src, dtype=rb_src.dtype if rb_src.dtype in (np.float32, np.float64) else np.float32
-                )
-                self._bool_raw_base_scale = float(_bool_raw_meta["base_scale"])
-                self._bool_cal_temp = float(_bool_raw_meta["cal_temp"])
+                with np.errstate(over="ignore", invalid="ignore"):
+                    self._bool_raw_w = _owned_readonly_array(
+                        rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
+                    )
+                    self._bool_raw_b = _owned_readonly_array(
+                        rb_src, dtype=rb_src.dtype if rb_src.dtype in (np.float32, np.float64) else np.float32
+                    )
+                if not (bool(np.all(np.isfinite(self._bool_raw_w))) and bool(np.all(np.isfinite(self._bool_raw_b)))):
+                    raise ValueError("raw_w and raw_b must be finite in float32/float64")
+                raw_bs = _bool_raw_meta["base_scale"]
+                raw_ct = _bool_raw_meta["cal_temp"]
+                if (
+                    isinstance(raw_bs, bool)
+                    or not isinstance(raw_bs, (int, float, np.integer, np.floating))
+                    or not math.isfinite(float(raw_bs))
+                    or float(raw_bs) <= 0.0
+                ):
+                    raise ValueError(f"base_scale must be finite and positive, got {raw_bs!r}")
+                if (
+                    isinstance(raw_ct, bool)
+                    or not isinstance(raw_ct, (int, float, np.integer, np.floating))
+                    or not math.isfinite(float(raw_ct))
+                    or float(raw_ct) <= 0.0
+                ):
+                    raise ValueError(f"cal_temp must be finite and positive, got {raw_ct!r}")
+                self._bool_raw_base_scale = float(raw_bs)
+                self._bool_cal_temp = float(raw_ct)
                 raw_c_adj = _bool_raw_meta.get("cal_adj_2")
-                self._bool_cal_adj_2 = (
-                    None
-                    if raw_c_adj is None
-                    else _owned_readonly_array(np.asarray(raw_c_adj, dtype=np.float64).reshape(2), dtype=np.float64)
-                )
+                if raw_c_adj is not None:
+                    adj2_arr = np.asarray(raw_c_adj, dtype=np.float64)
+                    if adj2_arr.ndim != 1 or adj2_arr.shape != (2,) or not bool(np.all(np.isfinite(adj2_arr))):
+                        raise ValueError(f"Expected finite 1D (2,) cal_adj_2, got shape {adj2_arr.shape}")
+                    self._bool_cal_adj_2 = _owned_readonly_array(adj2_arr, dtype=np.float64)
+                else:
+                    self._bool_cal_adj_2 = None
             elif _bool_raw_meta is not None:
+                if "raw_w" in _bool_raw_meta:
+                    rw_src = np.asarray(_bool_raw_meta["raw_w"])
+                    if rw_src.ndim != 2 or rw_src.shape != (w_f64.shape[0], self.dimension):
+                        raise ValueError(
+                            f"Expected 2D raw_w of shape ({w_f64.shape[0]}, {self.dimension}), got {rw_src.shape}"
+                        )
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        rw_chk = np.asarray(
+                            rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
+                        )
+                    if not bool(np.all(np.isfinite(rw_chk))):
+                        raise ValueError("raw_w must be finite in float32/float64")
+                if "raw_b" in _bool_raw_meta:
+                    rb_raw = np.asarray(_bool_raw_meta["raw_b"])
+                    if rb_raw.ndim != 1 or rb_raw.shape not in ((1,), (w_f64.shape[0],)):
+                        raise ValueError(
+                            f"Expected 1D raw_b of shape (1,) or ({w_f64.shape[0]},), got {rb_raw.shape}"
+                        )
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        rb_chk = np.asarray(
+                            rb_raw, dtype=rb_raw.dtype if rb_raw.dtype in (np.float32, np.float64) else np.float32
+                        )
+                    if not bool(np.all(np.isfinite(rb_chk))):
+                        raise ValueError("raw_b must be finite in float32/float64")
                 raw_c_adj = _bool_raw_meta.get("cal_adj_2")
-                self._bool_cal_adj_2 = (
-                    None
-                    if raw_c_adj is None
-                    else _owned_readonly_array(np.asarray(raw_c_adj, dtype=np.float64).reshape(2), dtype=np.float64)
-                )
+                if raw_c_adj is not None:
+                    adj2_arr = np.asarray(raw_c_adj, dtype=np.float64)
+                    if adj2_arr.ndim != 1 or adj2_arr.shape != (2,) or not bool(np.all(np.isfinite(adj2_arr))):
+                        raise ValueError(f"Expected finite 1D (2,) cal_adj_2, got shape {adj2_arr.shape}")
+                    self._bool_cal_adj_2 = _owned_readonly_array(adj2_arr, dtype=np.float64)
+                else:
+                    self._bool_cal_adj_2 = None
             elif _bool_raw_meta is None and w_in.ndim == 2 and w_in.shape[0] == 1:
                 self._bool_has_scalar_raw = True
                 rw_dt = w_in.dtype if w_in.dtype in (np.float32, np.float64) else np.float32
@@ -639,21 +692,50 @@ class FastExplainer:
                 rb_raw = np.asarray(_bool_raw_meta["raw_b"])
                 if rb_raw.ndim != 1:
                     raise ValueError(f"Expected 1D raw_b vector, got shape {rb_raw.shape}")
+                if rw_src.ndim != 2 or rw_src.shape != (self.num_classes, self.dimension):
+                    raise ValueError(
+                        f"Expected 2D raw_w of shape ({self.num_classes}, {self.dimension}), got {rw_src.shape}"
+                    )
+                if rb_raw.shape != (self.num_classes,):
+                    raise ValueError(f"Expected 1D raw_b of shape ({self.num_classes},), got {rb_raw.shape}")
                 rb_src = rb_raw
-                self._choice_raw_w = _owned_readonly_array(
-                    rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
-                )
-                self._choice_raw_b = _owned_readonly_array(
-                    rb_src, dtype=rb_src.dtype if rb_src.dtype in (np.float32, np.float64) else np.float32
-                )
-                self._choice_raw_base_scale = float(_bool_raw_meta["base_scale"])
-                self._choice_cal_temp = float(_bool_raw_meta["cal_temp"])
+                with np.errstate(over="ignore", invalid="ignore"):
+                    self._choice_raw_w = _owned_readonly_array(
+                        rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
+                    )
+                    self._choice_raw_b = _owned_readonly_array(
+                        rb_src, dtype=rb_src.dtype if rb_src.dtype in (np.float32, np.float64) else np.float32
+                    )
+                if not (bool(np.all(np.isfinite(self._choice_raw_w))) and bool(np.all(np.isfinite(self._choice_raw_b)))):
+                    raise ValueError("raw_w and raw_b must be finite in float32/float64")
+                raw_bs_c = _bool_raw_meta["base_scale"]
+                raw_ct_c = _bool_raw_meta["cal_temp"]
+                if (
+                    isinstance(raw_bs_c, bool)
+                    or not isinstance(raw_bs_c, (int, float, np.integer, np.floating))
+                    or not math.isfinite(float(raw_bs_c))
+                    or float(raw_bs_c) <= 0.0
+                ):
+                    raise ValueError(f"base_scale must be finite and positive, got {raw_bs_c!r}")
+                if (
+                    isinstance(raw_ct_c, bool)
+                    or not isinstance(raw_ct_c, (int, float, np.integer, np.floating))
+                    or not math.isfinite(float(raw_ct_c))
+                    or float(raw_ct_c) <= 0.0
+                ):
+                    raise ValueError(f"cal_temp must be finite and positive, got {raw_ct_c!r}")
+                self._choice_raw_base_scale = float(raw_bs_c)
+                self._choice_cal_temp = float(raw_ct_c)
                 raw_c_adj_c = _bool_raw_meta.get("cal_adj_choice")
-                self._choice_cal_adj = (
-                    None
-                    if raw_c_adj_c is None
-                    else _owned_readonly_array(np.asarray(raw_c_adj_c, dtype=np.float64).reshape(-1), dtype=np.float64)
-                )
+                if raw_c_adj_c is not None:
+                    adjc_arr = np.asarray(raw_c_adj_c, dtype=np.float64)
+                    if adjc_arr.ndim != 1 or adjc_arr.shape != (self.num_classes,) or not bool(np.all(np.isfinite(adjc_arr))):
+                        raise ValueError(
+                            f"Expected finite 1D ({self.num_classes},) cal_adj_choice, got shape {adjc_arr.shape}"
+                        )
+                    self._choice_cal_adj = _owned_readonly_array(adjc_arr, dtype=np.float64)
+                else:
+                    self._choice_cal_adj = None
             else:
                 self._choice_has_raw = True
                 rw_dt = w_in.dtype if w_in.dtype in (np.float32, np.float64) else np.float32

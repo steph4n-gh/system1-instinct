@@ -28,8 +28,12 @@ from system1.core.schema import (
     DecisionSchema,
     MultiChoiceField,
     ScoreField,
+    _f64_to_exact_2m1074,
+    _score_abs_diff_clamped,
     _score_from_unit_prob,
+    _score_full_span_clamped,
     _score_half_span,
+    _score_within_rel_tolerance,
 )
 from system1.core.model import _accepts_recency_weighted
 from system1.core.text import MAX_FEATURES, MAX_TEXT_LENGTH, TfidfProjector
@@ -752,9 +756,15 @@ class TeachingSession:
         elif isinstance(f_def, MultiChoiceField):
             correct = bool(set(pred) == set(target))
         elif isinstance(f_def, ScoreField):
-            half_span = _score_half_span(f_def.min_value, f_def.max_value)
-            half_err = abs(0.5 * float(pred) - 0.5 * float(target))
-            tol_ok = bool(half_err <= 0.15 * half_span if math.isfinite(half_span) and half_span > 0.0 else float(pred) == float(target))
+            tol_ok = _score_within_rel_tolerance(
+                float(pred),
+                float(target),
+                f_def.min_value,
+                f_def.max_value,
+                0.15,
+            )
+            full_span_t = _score_full_span_clamped(f_def.min_value, f_def.max_value)
+            slack_t = min(1e-4, 1e-4 * full_span_t) if full_span_t > 0.0 else 0.0
             interval_ok = True
             if (
                 not f_review
@@ -766,7 +776,7 @@ class TeachingSession:
                 try:
                     lb_s, ub_s = cset[0][1:-1].split(",", 1)
                     lb, ub = float(lb_s.strip()), float(ub_s.strip())
-                    interval_ok = (lb - 1e-4) <= float(target) <= (ub + 1e-4)
+                    interval_ok = (lb - slack_t) <= float(target) <= (ub + slack_t)
                 except (ValueError, TypeError):
                     pass
             correct = bool(tol_ok and interval_ok)
@@ -865,11 +875,20 @@ class TeachingSession:
         }
         if isinstance(f_def, ScoreField):
             errs = [
-                abs(float(o["predicted"]) - float(self._field_label(r["label"], fname)))
+                _score_abs_diff_clamped(float(o["predicted"]), float(self._field_label(r["label"], fname)))
                 for r, o in zip(checks, field_outcomes)
             ]
-            summary["mae"] = float(sum(errs) / len(errs)) if errs else 0.0
-            summary["rmse"] = float(math.sqrt(sum(e * e for e in errs) / len(errs))) if errs else 0.0
+            summary["mae"] = (
+                float(sum(_f64_to_exact_2m1074(e) for e in errs) / (len(errs) << 1074))
+                if errs
+                else 0.0
+            )
+            max_e = max(errs) if errs else 0.0
+            summary["rmse"] = (
+                float(max_e * math.sqrt(sum((e / max_e) ** 2 for e in errs) / len(errs)))
+                if max_e > 0.0
+                else 0.0
+            )
         return summary
 
     def _measure(self, engine, checks):

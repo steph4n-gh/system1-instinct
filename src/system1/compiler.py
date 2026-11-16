@@ -686,7 +686,7 @@ def _validate_skill_shapes_and_runtime_delta(
                         total_cls_scores += len(c_vals)
                         if total_cls_scores > MAX_SKILL_CALIBRATION_SCORES:
                             raise ValueError(f"Saved head {name!r} class_calibration_scores exceeds limit")
-                    runtime_delta += 32 * total_cls_scores
+                    runtime_delta += 56 * len(raw_cls_scores) + 32 * total_cls_scores
         for suffix in EXEMPLAR_ARRAYS:
             shape = shapes.get(_k(suffix))
             if shape is None:
@@ -834,6 +834,7 @@ def _read_skill_arrays(
             schema,
             dimension,
             shapes,
+            heads_meta=meta.get("heads") if isinstance(meta, Mapping) else None,
             namespaced=namespaced,
         )
         _, layout_extra_bytes = _validate_tensor_layouts_header(meta or {}, shapes)
@@ -1028,12 +1029,13 @@ class CompiledSystemOneModel:
                 head.set_weights(ch.weights, ch.biases)
                 if ch.exemplar_state is not None:
                     head.restore_exemplar_state(ch.exemplar_state)
-                if (
-                    getattr(ch, "hierarchical", False)
-                    and ch.coarse_weights is not None
-                    and ch.coarse_biases is not None
-                    and len(ch.cluster_assignments) == ch.weights.shape[0]
-                ):
+                if not isinstance(f_def, BooleanField) and getattr(ch, "hierarchical", False):
+                    if (
+                        ch.coarse_weights is None
+                        or ch.coarse_biases is None
+                        or len(ch.cluster_assignments) != ch.weights.shape[0]
+                    ):
+                        raise ValueError(f"Compiled head {name!r} has incomplete hierarchical parameters")
                     head.set_hierarchical_weights(
                         cluster_assignments=ch.cluster_assignments,
                         coarse_weights=ch.coarse_weights,
@@ -1399,14 +1401,6 @@ class CompiledSystemOneModel:
                 raise ValueError("embedding contains NaN or Inf non-finite values")
             x_aug = np.append(emb, 1.0).astype(np.float32)
 
-            # Bump model_version and evict prompt only after all inputs are validated
-            self.model_version = getattr(self, "model_version", 1) + 1
-            if self.use_cache and self.cache is not None:
-                if embedding is None and hasattr(self.cache, "evict_prompt"):
-                    self.cache.evict_prompt(prompt)
-                if hasattr(self.cache, "invalidate_prior_versions"):
-                    self.cache.invalidate_prior_versions(self.model_version)
-
             updated_fields: List[str] = []
             update_durations_ms: List[float] = []
             is_zero_emb = not bool(np.any(emb))
@@ -1728,6 +1722,13 @@ class CompiledSystemOneModel:
                             ch.logit_adjustments = None
                     updated_fields.append(f_name)
 
+            self.model_version = getattr(self, "model_version", 1) + 1
+            if self.use_cache and self.cache is not None:
+                if embedding is None and hasattr(self.cache, "evict_prompt"):
+                    self.cache.evict_prompt(prompt)
+                if hasattr(self.cache, "invalidate_prior_versions"):
+                    self.cache.invalidate_prior_versions(self.model_version)
+
             rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
             total_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -2036,7 +2037,15 @@ class CompiledSystemOneModel:
             proto_thresh = float(getattr(ch, "prototype_threshold", 0.0))
             if proto_thresh > 0.0:
                 h_entry["prototype_threshold"] = proto_thresh
-            if getattr(ch, "hierarchical", False) and getattr(ch, "cluster_assignments", ()):
+            f_def_h = self.schema.fields.get(name)
+            if not isinstance(f_def_h, BooleanField) and getattr(ch, "hierarchical", False):
+                if (
+                    ch.coarse_weights is None
+                    or ch.coarse_biases is None
+                    or len(getattr(ch, "cluster_assignments", ()) or ()) != ch.weights.shape[0]
+                    or (ch.fine_weights is None) != (ch.fine_biases is None)
+                ):
+                    raise ValueError(f"Head {name!r} has incomplete hierarchical parameters")
                 h_entry["hierarchical"] = True
                 h_entry["cluster_assignments"] = [int(c) for c in ch.cluster_assignments]
             state = exemplar_states.get(name)

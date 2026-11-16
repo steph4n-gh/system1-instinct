@@ -853,13 +853,7 @@ class MultiTenantSkillFleet:
             raise ValueError(f"Model has no head for field {field_name!r}")
         candidates = (head,) if (ch is None or ch is head) else (head, ch)
         for cand in candidates:
-            if (
-                not isinstance(f_def, BooleanField)
-                and getattr(cand, "hierarchical", False)
-                and getattr(cand, "coarse_weights", None) is not None
-                and getattr(cand, "coarse_biases", None) is not None
-                and len(getattr(cand, "cluster_assignments", ()) or ()) == np.asarray(cand.weights).shape[0]
-            ):
+            if not isinstance(f_def, BooleanField) and getattr(cand, "hierarchical", False):
                 raise ValueError(f"MultiTenantSkillFleet does not support hierarchical head {field_name!r}")
             if getattr(cand, "_exemplar_bank", None) is not None:
                 raise ValueError(f"MultiTenantSkillFleet does not support exemplar-bank head {field_name!r}")

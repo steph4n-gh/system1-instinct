@@ -37,6 +37,9 @@ from system1.core.schema import (
     DecisionField,
     DecisionSchema,
     ScoreField,
+    _score_half_span,
+    _score_normalized_margin,
+    _score_within_rel_tolerance,
 )
 from system1.engine import SystemOneEngine
 
@@ -319,12 +322,13 @@ class AutoCutoverLifecycle:
                     return False
                 if not (math.isfinite(p_f) and math.isfinite(t_f)):
                     return False
-                half_span = 0.5 * float(f_def.max_value) - 0.5 * float(f_def.min_value)
-                half_diff = abs(0.5 * p_f - 0.5 * t_f)
-                if half_span <= 0.0:
-                    if p_f != t_f:
-                        return False
-                elif half_diff > float(self.config.score_tolerance) * half_span:
+                if not _score_within_rel_tolerance(
+                    p_f,
+                    t_f,
+                    f_def.min_value,
+                    f_def.max_value,
+                    float(self.config.score_tolerance),
+                ):
                     return False
             elif isinstance(f_def, BooleanField):
                 if bool(p_val) != bool(t_val):
@@ -349,7 +353,7 @@ class AutoCutoverLifecycle:
                 continue
             f_def = self.schema.fields.get(fname)
             if isinstance(f_def, ScoreField):
-                half_span = 0.5 * float(f_def.max_value) - 0.5 * float(f_def.min_value)
+                half_span = _score_half_span(f_def.min_value, f_def.max_value)
                 conf = float(res.confidences.get(fname, 0.0))
                 rcp = reg_preds.get(fname)
                 alpha_eff = max(1e-6, float(getattr(res, "alpha", self.config.alpha_target)))
@@ -360,9 +364,9 @@ class AutoCutoverLifecycle:
                     and len(getattr(rcp, "residuals", ())) >= math.ceil(1.0 / alpha_eff) - 1
                 ):
                     iv = rcp.predict_interval(float(res.values[fname]), alpha=alpha_eff)
-                    half_iv = 0.5 * float(iv.margin)
-                    half_w_margin = max(0.0, 1.0 - 0.5 * (half_iv / half_span))
-                    margins.append(min(conf, half_w_margin) if half_iv < half_span else conf)
+                    ratio = _score_normalized_margin(float(iv.margin), f_def.min_value, f_def.max_value)
+                    half_w_margin = max(0.0, 1.0 - ratio)
+                    margins.append(min(conf, half_w_margin) if ratio < 1.0 else conf)
                 else:
                     margins.append(conf)
             else:
