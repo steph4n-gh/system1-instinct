@@ -1415,203 +1415,34 @@ class CompiledSystemOneModel:
                 else None
             )
 
-            for f_name, target_val in target_dict.items():
-                if f_name in self._field_heads:
-                    head = self._field_heads[f_name]
-                    y_target = head.format_target_vector(target_val)
-                    is_cold_head = head._exemplar_bank is not None or is_cold_skill
-                    skip_field = False
-                    if is_zero_emb:
-                        dt = 0.0
-                        if norm_key is not None and eff_reward_scale >= 0.5:
-                            if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
-                                oldest_key = next(iter(self._learned_prompt_overrides))
-                                self._learned_prompt_overrides.pop(oldest_key, None)
-                                self._learned_prompt_override_recency.pop(oldest_key, None)
-                            self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
-                                self.schema.fields[f_name].validate_value(target_val)
-                            )
-                            self._learned_prompt_override_recency[norm_key] = bool(use_recency)
-                    elif is_cold_head:
-                        if preserve_calibration and eff_reward_scale >= 0.5:
-                            if norm_key is not None:
-                                if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
-                                    oldest_key = next(iter(self._learned_prompt_overrides))
-                                    self._learned_prompt_overrides.pop(oldest_key, None)
-                                    self._learned_prompt_override_recency.pop(oldest_key, None)
-                                self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
-                                    self.schema.fields[f_name].validate_value(target_val)
-                                )
-                                self._learned_prompt_override_recency[norm_key] = bool(use_recency)
-                        elif not preserve_calibration:
-                            if norm_key is not None and norm_key in self._learned_prompt_overrides:
-                                self._learned_prompt_overrides[norm_key].pop(f_name, None)
-                                if not self._learned_prompt_overrides[norm_key]:
-                                    self._learned_prompt_overrides.pop(norm_key, None)
-                                    self._learned_prompt_override_recency.pop(norm_key, None)
-                        dt = head.online_update(
-                            x_aug,
-                            y_target,
-                            forgetting_factor=eff_ff,
-                            prompt=prompt_for_head,
-                            preserve_calibration=preserve_calibration,
-                            reward_scale=eff_reward_scale,
-                        )
-                    else:
-                        if preserve_calibration:
-                            if head.covariance_inv is None or head.cross_covariance is None:
-                                head.init_covariance(regularization=max(4.0, float(getattr(head, "regularization", 1.0))))
-                            x_step = np.append(emb, 0.0).astype(np.float32)
-                            step_ff = 1.0 if eff_ff >= 0.95 else eff_ff
-                            ch_ref = self.heads.get(f_name)
-                            f_type = getattr(ch_ref, "field_type", None) or getattr(getattr(head, "definition", None), "field_type", "choice")
-                            ch_temp = max(0.05, float(getattr(ch_ref, "temperature", 1.0))) if ch_ref is not None else 1.0
-                            score_method = getattr(ch_ref, "score_method", "lac") if ch_ref is not None else "lac"
-                            raw_cal_scores = getattr(ch_ref, "calibration_scores", ()) if ch_ref is not None else ()
-                            ch_q = float(getattr(ch_ref, "conformal_quantile", 0.05)) if ch_ref is not None else 0.05
-                            if score_method == "lac":
-                                pos_scores = [float(s) for s in raw_cal_scores if 1e-6 < float(s) < 0.99]
-                                eff_lac_q = max(ch_q if ch_q < 0.99 else 0.01, min(pos_scores) if pos_scores else 0.01)
-                                q_goal = max(1e-4, min(0.035, eff_lac_q * 0.65))
-                            else:
-                                q_goal = 0.02
-                            target_top_p = min(0.999, max(0.95, 1.0 - q_goal))
-                            hier_scale = 1.45 if getattr(head, "hierarchical", False) else 1.0
-                            wx0 = (head.weights @ emb).astype(np.float32)
-                            b0 = np.asarray(head.biases, dtype=np.float32).flatten()
-                            if f_type == "choice":
-                                target_idx = int(np.argmax(y_target))
-                                z0 = wx0 + b0
-                                z_desired = z0.copy()
-                                for k_idx in range(len(z_desired)):
-                                    if k_idx != target_idx and z_desired[k_idx] > 0.10:
-                                        z_desired[k_idx] = -0.15
-                                other_scaled = np.array(
-                                    [z_desired[k_idx] / (0.25 * ch_temp) for k_idx in range(len(z_desired)) if k_idx != target_idx],
-                                    dtype=np.float64,
-                                )
-                                if len(other_scaled) > 0:
-                                    m_other = float(np.max(other_scaled))
-                                    log_sum_other = m_other + math.log(float(np.sum(np.exp(other_scaled - m_other))))
-                                else:
-                                    log_sum_other = 0.0
-                                req_target_scaled = log_sum_other + math.log(max(2.0, (1.0 - q_goal) / max(1e-6, q_goal)))
-                                req_target_raw = float(np.clip(0.25 * ch_temp * req_target_scaled * hier_scale + 0.15, 1.8, 7.5))
-                                z_desired[target_idx] = max(float(z0[target_idx]), req_target_raw)
-                                y_desired = (z_desired - b0).astype(np.float32)
-                            elif f_type == "boolean":
-                                req_scaled_mag = math.log((1.0 - q_goal) / max(1e-6, q_goal))
-                                req_raw_mag = float(np.clip(0.25 * req_scaled_mag * hier_scale, 2.0, 6.0))
-                                want_true = float(y_target[0]) > 0.0
-                                b_val = float(b0[0]) if len(b0) > 0 else 0.0
-                                y_desired = np.array([(req_raw_mag if want_true else -req_raw_mag) - b_val], dtype=np.float32)
-                            elif f_type in ("multi_choice", "multichoice"):
-                                ev_mc0 = head.forward(emb, prompt=prompt_for_eval)
-                                probs_mc0 = np.asarray(ev_mc0.raw_probabilities, dtype=np.float64)
-                                y_desired = wx0.copy()
-                                z_mag = float(np.clip(0.25 * math.log((1.0 - q_goal) / max(1e-6, q_goal)), 1.8, 5.5))
-                                for k_idx in range(len(y_target)):
-                                    want_pos = float(y_target[k_idx]) > 0.0
-                                    p_k = float(probs_mc0[k_idx]) if k_idx < len(probs_mc0) else 0.5
-                                    err_k = (1.0 - p_k) if want_pos else p_k
-                                    if err_k > q_goal:
-                                        desired_logit = (z_mag if want_pos else -z_mag) - float(b0[k_idx])
-                                        y_desired[k_idx] = np.float32(np.clip(desired_logit, -5.5, 5.5))
-                            elif f_type == "score":
-                                b_val = float(b0[0]) if len(b0) > 0 else 0.0
-                                y_desired = np.array([float(y_target[0]) - b_val], dtype=np.float32)
-                            else:
-                                y_desired = y_target
+            head_snaps = {
+                fn: self._field_heads[fn]._snapshot_state()
+                for fn in target_dict
+                if fn in self._field_heads and hasattr(self._field_heads[fn], "_snapshot_state")
+            }
+            ch_snaps = {
+                fn: dict(self.heads[fn].__dict__)
+                for fn in target_dict
+                if fn in self.heads
+            }
+            ov_snap = {k: dict(v) for k, v in self._learned_prompt_overrides.items()}
+            ov_rec_snap = dict(self._learned_prompt_override_recency)
+            has_proto_bank = hasattr(self, "_online_prototype_bank")
+            proto_bank_snap = (
+                {k: list(v) for k, v in self._online_prototype_bank.items()}
+                if has_proto_bank
+                else None
+            )
 
-                            if eff_reward_scale < 1.0:
-                                y_desired = (wx0 + eff_reward_scale * (y_desired - wx0)).astype(np.float32)
-
+            try:
+                for f_name, target_val in target_dict.items():
+                    if f_name in self._field_heads:
+                        head = self._field_heads[f_name]
+                        y_target = head.format_target_vector(target_val)
+                        is_cold_head = head._exemplar_bank is not None or is_cold_skill
+                        skip_field = False
+                        if is_zero_emb:
                             dt = 0.0
-                            if len(self._field_heads) > 1:
-                                ev_pre = head.forward(emb, prompt=prompt_for_eval)
-                                logits_pre = np.asarray(ev_pre.logits, dtype=np.float64) / ch_temp
-                                eff_q_skip = ch_q if 0.0 < ch_q < 0.90 else 0.04
-                                if f_type == "choice" and len(logits_pre) >= 2:
-                                    shifted_pre = logits_pre - np.max(logits_pre)
-                                    exp_pre = np.exp(shifted_pre)
-                                    probs_c_pre = exp_pre / np.sum(exp_pre)
-                                    pred_idx_pre = int(np.argmax(probs_c_pre))
-                                    p_top_pre = float(probs_c_pre[pred_idx_pre])
-                                    if pred_idx_pre == target_idx and (1.0 - p_top_pre) <= max(1e-3, eff_q_skip) and p_top_pre >= 0.95:
-                                        skip_field = True
-                                elif f_type in ("multi_choice", "multichoice"):
-                                    probs_pre = np.asarray(ev_pre.raw_probabilities, dtype=np.float64)
-                                    s_pre = float(np.max(np.minimum(probs_pre, 1.0 - probs_pre))) if len(probs_pre) > 0 else 0.0
-                                    if set(ev_pre.selected_value) == set(target_val) and s_pre <= max(0.04, eff_q_skip):
-                                        skip_field = True
-                                elif f_type == "boolean":
-                                    p_sel_pre = float(ev_pre.confidence)
-                                    if bool(ev_pre.selected_value) == bool(target_val) and (1.0 - p_sel_pre) <= max(0.04, eff_q_skip) and p_sel_pre >= 0.95:
-                                        skip_field = True
-                                elif f_type == "score":
-                                    if abs(float(ev_pre.selected_value) - float(target_val)) <= min(0.04, max(0.01, eff_q_skip * 0.8)):
-                                        skip_field = True
-                            if not skip_field:
-                                # Exact Sherman-Morrison directional gain scaling so W_next @ emb == y_desired in 1 step
-                                p_mat = head.covariance_inv
-                                g_val = float(x_step @ (p_mat @ x_step)) if p_mat is not None else 0.0
-                                if g_val > 1e-6:
-                                    y_step = ((step_ff + g_val) * y_desired - step_ff * wx0) / g_val
-                                    y_step = np.clip(y_step, -40.0, 40.0).astype(np.float32)
-                                else:
-                                    y_step = y_desired
-                                dt = head.online_update(
-                                    x_step,
-                                    y_step,
-                                    forgetting_factor=step_ff,
-                                    prompt=prompt_for_head,
-                                )
-                                if eff_reward_scale >= 0.5:
-                                    for step_i in range(4):
-                                        ev = head.forward(emb, prompt=prompt_for_eval)
-                                        logits_ev = np.asarray(ev.logits, dtype=np.float64) / ch_temp
-                                        if f_type == "choice" and len(logits_ev) >= 2:
-                                            shifted_ev = logits_ev - np.max(logits_ev)
-                                            exp_ev = np.exp(shifted_ev)
-                                            probs_cal = exp_ev / np.sum(exp_ev)
-                                            s_p = np.sort(probs_cal)
-                                            if (
-                                                ev.selected_value == target_val
-                                                and float(s_p[-1]) >= target_top_p
-                                                and float(s_p[-1] - s_p[-2]) >= 0.55
-                                            ):
-                                                break
-                                        elif f_type in ("multi_choice", "multichoice"):
-                                            probs_mc = np.asarray(ev.raw_probabilities, dtype=np.float64)
-                                            max_err_mc = float(np.max(np.minimum(probs_mc, 1.0 - probs_mc))) if len(probs_mc) > 0 else 0.0
-                                            if (
-                                                set(ev.selected_value) == set(target_val)
-                                                and max_err_mc <= max(0.03, ch_q * 0.9)
-                                            ):
-                                                break
-                                        elif f_type == "score":
-                                            if abs(float(ev.selected_value) - float(target_val)) <= 0.02:
-                                                break
-                                        elif f_type == "boolean":
-                                            p_sel = float(ev.confidence)
-                                            if bool(ev.selected_value) == bool(target_val) and p_sel >= target_top_p:
-                                                break
-                                        elif bool(ev.selected_value) == bool(target_val) and ev.confidence >= 0.90:
-                                            break
-                                        wx_curr = (head.weights @ emb).astype(np.float32)
-                                        p_curr = head.covariance_inv
-                                        g_curr = float(x_step @ (p_curr @ x_step)) if p_curr is not None else 0.0
-                                        if g_curr > 1e-6:
-                                            y_refine = ((step_ff + g_curr) * y_desired - step_ff * wx_curr) / g_curr
-                                            y_refine = np.clip(y_refine, -40.0, 40.0).astype(np.float32)
-                                        else:
-                                            y_refine = y_desired
-                                        dt += head.online_update(
-                                            x_step,
-                                            y_refine,
-                                            forgetting_factor=step_ff,
-                                            prompt=prompt_for_head,
-                                        )
                             if norm_key is not None and eff_reward_scale >= 0.5:
                                 if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
                                     oldest_key = next(iter(self._learned_prompt_overrides))
@@ -1621,106 +1452,329 @@ class CompiledSystemOneModel:
                                     self.schema.fields[f_name].validate_value(target_val)
                                 )
                                 self._learned_prompt_override_recency[norm_key] = bool(use_recency)
-                        else:
-                            if norm_key is not None and norm_key in self._learned_prompt_overrides:
-                                self._learned_prompt_overrides[norm_key].pop(f_name, None)
-                                if not self._learned_prompt_overrides[norm_key]:
-                                    self._learned_prompt_overrides.pop(norm_key, None)
-                                    self._learned_prompt_override_recency.pop(norm_key, None)
+                        elif is_cold_head:
+                            if preserve_calibration and eff_reward_scale >= 0.5:
+                                if norm_key is not None:
+                                    if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
+                                        oldest_key = next(iter(self._learned_prompt_overrides))
+                                        self._learned_prompt_overrides.pop(oldest_key, None)
+                                        self._learned_prompt_override_recency.pop(oldest_key, None)
+                                    self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
+                                        self.schema.fields[f_name].validate_value(target_val)
+                                    )
+                                    self._learned_prompt_override_recency[norm_key] = bool(use_recency)
+                            elif not preserve_calibration:
+                                if norm_key is not None and norm_key in self._learned_prompt_overrides:
+                                    self._learned_prompt_overrides[norm_key].pop(f_name, None)
+                                    if not self._learned_prompt_overrides[norm_key]:
+                                        self._learned_prompt_overrides.pop(norm_key, None)
+                                        self._learned_prompt_override_recency.pop(norm_key, None)
                             dt = head.online_update(
                                 x_aug,
                                 y_target,
                                 forgetting_factor=eff_ff,
                                 prompt=prompt_for_head,
+                                preserve_calibration=preserve_calibration,
+                                reward_scale=eff_reward_scale,
                             )
-                    update_durations_ms.append(dt)
+                        else:
+                            if preserve_calibration:
+                                if head.covariance_inv is None or head.cross_covariance is None:
+                                    head.init_covariance(regularization=max(4.0, float(getattr(head, "regularization", 1.0))))
+                                x_step = np.append(emb, 0.0).astype(np.float32)
+                                step_ff = 1.0 if eff_ff >= 0.95 else eff_ff
+                                ch_ref = self.heads.get(f_name)
+                                f_type = getattr(ch_ref, "field_type", None) or getattr(getattr(head, "definition", None), "field_type", "choice")
+                                ch_temp = max(0.05, float(getattr(ch_ref, "temperature", 1.0))) if ch_ref is not None else 1.0
+                                score_method = getattr(ch_ref, "score_method", "lac") if ch_ref is not None else "lac"
+                                raw_cal_scores = getattr(ch_ref, "calibration_scores", ()) if ch_ref is not None else ()
+                                ch_q = float(getattr(ch_ref, "conformal_quantile", 0.05)) if ch_ref is not None else 0.05
+                                if score_method == "lac":
+                                    pos_scores = [float(s) for s in raw_cal_scores if 1e-6 < float(s) < 0.99]
+                                    eff_lac_q = max(ch_q if ch_q < 0.99 else 0.01, min(pos_scores) if pos_scores else 0.01)
+                                    q_goal = max(1e-4, min(0.035, eff_lac_q * 0.65))
+                                else:
+                                    q_goal = 0.02
+                                target_top_p = min(0.999, max(0.95, 1.0 - q_goal))
+                                hier_scale = 1.45 if getattr(head, "hierarchical", False) else 1.0
+                                wx0 = (head.weights @ emb).astype(np.float32)
+                                b0 = np.asarray(head.biases, dtype=np.float32).flatten()
+                                if f_type == "choice":
+                                    target_idx = int(np.argmax(y_target))
+                                    z0 = wx0 + b0
+                                    z_desired = z0.copy()
+                                    for k_idx in range(len(z_desired)):
+                                        if k_idx != target_idx and z_desired[k_idx] > 0.10:
+                                            z_desired[k_idx] = -0.15
+                                    other_scaled = np.array(
+                                        [z_desired[k_idx] / (0.25 * ch_temp) for k_idx in range(len(z_desired)) if k_idx != target_idx],
+                                        dtype=np.float64,
+                                    )
+                                    if len(other_scaled) > 0:
+                                        m_other = float(np.max(other_scaled))
+                                        log_sum_other = m_other + math.log(float(np.sum(np.exp(other_scaled - m_other))))
+                                    else:
+                                        log_sum_other = 0.0
+                                    req_target_scaled = log_sum_other + math.log(max(2.0, (1.0 - q_goal) / max(1e-6, q_goal)))
+                                    req_target_raw = float(np.clip(0.25 * ch_temp * req_target_scaled * hier_scale + 0.15, 1.8, 7.5))
+                                    z_desired[target_idx] = max(float(z0[target_idx]), req_target_raw)
+                                    y_desired = (z_desired - b0).astype(np.float32)
+                                elif f_type == "boolean":
+                                    req_scaled_mag = math.log((1.0 - q_goal) / max(1e-6, q_goal))
+                                    req_raw_mag = float(np.clip(0.25 * req_scaled_mag * hier_scale, 2.0, 6.0))
+                                    want_true = float(y_target[0]) > 0.0
+                                    b_val = float(b0[0]) if len(b0) > 0 else 0.0
+                                    y_desired = np.array([(req_raw_mag if want_true else -req_raw_mag) - b_val], dtype=np.float32)
+                                elif f_type in ("multi_choice", "multichoice"):
+                                    ev_mc0 = head.forward(emb, prompt=prompt_for_eval)
+                                    probs_mc0 = np.asarray(ev_mc0.raw_probabilities, dtype=np.float64)
+                                    y_desired = wx0.copy()
+                                    z_mag = float(np.clip(0.25 * math.log((1.0 - q_goal) / max(1e-6, q_goal)), 1.8, 5.5))
+                                    for k_idx in range(len(y_target)):
+                                        want_pos = float(y_target[k_idx]) > 0.0
+                                        p_k = float(probs_mc0[k_idx]) if k_idx < len(probs_mc0) else 0.5
+                                        err_k = (1.0 - p_k) if want_pos else p_k
+                                        if err_k > q_goal:
+                                            desired_logit = (z_mag if want_pos else -z_mag) - float(b0[k_idx])
+                                            y_desired[k_idx] = np.float32(np.clip(desired_logit, -5.5, 5.5))
+                                elif f_type == "score":
+                                    b_val = float(b0[0]) if len(b0) > 0 else 0.0
+                                    y_desired = np.array([float(y_target[0]) - b_val], dtype=np.float32)
+                                else:
+                                    y_desired = y_target
 
-                    # Sync back to compiled head weights
-                    if f_name in self.heads:
-                        ch = self.heads[f_name]
-                        ch.weights = head.weights
-                        ch.biases = head.biases
-                        ch.P = head.covariance_inv
-                        ch.B = head.cross_covariance
-                        ch.exemplar_state = head.export_exemplar_state()
-                        if head.hierarchical:
-                            ch.coarse_weights = head.coarse_weights
-                            ch.coarse_biases = head.coarse_biases
-                            ch.fine_weights = head.fine_weights
-                            ch.fine_biases = head.fine_biases
-                        if not is_zero_emb and ch.prototypes is not None and ch.prototypes.shape[1] == len(emb):
-                            e_norm = float(np.linalg.norm(emb))
-                            if e_norm > 1e-12:
-                                emb_u = emb / e_norm
-                                proto_idx: Optional[int] = None
-                                if ch.field_type == "choice" and len(y_target) == ch.prototypes.shape[0]:
-                                    proto_idx = int(np.argmax(y_target))
-                                elif ch.field_type == "boolean" and ch.prototypes.shape[0] == 2:
-                                    proto_idx = 1 if float(y_target[0]) > 0.0 else 0
-                                if not skip_field and proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
-                                    cur_p = ch.prototypes[proto_idx]
-                                    sim_before = float(np.max(ch.prototypes @ emb_u)) if np.any(cur_p) else 0.0
-                                    if not preserve_calibration or ch.prototype_threshold <= 0.0 or not np.any(cur_p):
-                                        blend = (0.25 if preserve_calibration else 0.15) * eff_reward_scale
-                                        updated_p = emb_u if not np.any(cur_p) else ((1.0 - blend) * cur_p + blend * emb_u)
-                                        up_norm = float(np.linalg.norm(updated_p))
-                                        if up_norm > 1e-12:
-                                            ch.prototypes = ch.prototypes.copy()
-                                            ch.prototypes[proto_idx] = (updated_p / up_norm).astype(np.float32)
-                                    elif eff_reward_scale >= 0.5 and sim_before < ch.prototype_threshold:
-                                        if not hasattr(self, "_online_prototype_bank"):
-                                            self._online_prototype_bank = {}
-                                        bank = self._online_prototype_bank.setdefault(f_name, [])
-                                        if len(bank) >= 256:
-                                            bank.pop(0)
-                                        bank.append(emb_u.astype(np.float32))
-                                if preserve_calibration and eff_reward_scale >= 0.5 and ch.prototype_threshold > 0.0:
-                                    sim_after = self.compute_prototype_similarity(f_name, emb_u)
-                                    if sim_after is not None and sim_after < ch.prototype_threshold:
-                                        ch.prototype_threshold = max(0.0, sim_after - 1e-4)
-                        if (
-                            preserve_calibration
-                            and eff_reward_scale >= 0.5
-                            and ch.familiarity_threshold > 0.0
-                            and isinstance(prompt, str)
-                            and prompt.strip()
-                        ):
-                            p_raw_norm = _extract_projector_raw_norm(
-                                self.projector, prompt, recency_weighted=use_recency
-                            )
-                            if (
-                                p_raw_norm is not None
-                                and math.isfinite(p_raw_norm)
-                                and 0.0 < p_raw_norm < ch.familiarity_threshold
-                            ):
-                                ch.familiarity_threshold = max(0.0, p_raw_norm - 1e-4)
-                        if preserve_calibration and not ch.calibration_scores:
-                            if ch.field_type in ("choice", "boolean", "multi_choice", "multichoice"):
-                                k_opts = max(2, len(ch.options))
-                                q_init = float((k_opts - 1.0) / (3.5 + k_opts))
-                                ch.score_method = "lac"
-                                ch.calibration_scores = tuple(q_init for _ in range(20))
-                                ch.conformal_quantile = q_init
-                            elif ch.field_type == "score":
-                                f_def_sc = self.schema.fields.get(f_name)
-                                q_init_sc = (
-                                    0.10 * _score_half_span(f_def_sc.min_value, f_def_sc.max_value)
-                                    if isinstance(f_def_sc, ScoreField)
-                                    else 0.05
+                                if eff_reward_scale < 1.0:
+                                    y_desired = (wx0 + eff_reward_scale * (y_desired - wx0)).astype(np.float32)
+
+                                dt = 0.0
+                                if len(self._field_heads) > 1:
+                                    ev_pre = head.forward(emb, prompt=prompt_for_eval)
+                                    logits_pre = np.asarray(ev_pre.logits, dtype=np.float64) / ch_temp
+                                    eff_q_skip = ch_q if 0.0 < ch_q < 0.90 else 0.04
+                                    if f_type == "choice" and len(logits_pre) >= 2:
+                                        shifted_pre = logits_pre - np.max(logits_pre)
+                                        exp_pre = np.exp(shifted_pre)
+                                        probs_c_pre = exp_pre / np.sum(exp_pre)
+                                        pred_idx_pre = int(np.argmax(probs_c_pre))
+                                        p_top_pre = float(probs_c_pre[pred_idx_pre])
+                                        if pred_idx_pre == target_idx and (1.0 - p_top_pre) <= max(1e-3, eff_q_skip) and p_top_pre >= 0.95:
+                                            skip_field = True
+                                    elif f_type in ("multi_choice", "multichoice"):
+                                        probs_pre = np.asarray(ev_pre.raw_probabilities, dtype=np.float64)
+                                        s_pre = float(np.max(np.minimum(probs_pre, 1.0 - probs_pre))) if len(probs_pre) > 0 else 0.0
+                                        if set(ev_pre.selected_value) == set(target_val) and s_pre <= max(0.04, eff_q_skip):
+                                            skip_field = True
+                                    elif f_type == "boolean":
+                                        p_sel_pre = float(ev_pre.confidence)
+                                        if bool(ev_pre.selected_value) == bool(target_val) and (1.0 - p_sel_pre) <= max(0.04, eff_q_skip) and p_sel_pre >= 0.95:
+                                            skip_field = True
+                                    elif f_type == "score":
+                                        if abs(float(ev_pre.selected_value) - float(target_val)) <= min(0.04, max(0.01, eff_q_skip * 0.8)):
+                                            skip_field = True
+                                if not skip_field:
+                                    # Exact Sherman-Morrison directional gain scaling so W_next @ emb == y_desired in 1 step
+                                    p_mat = head.covariance_inv
+                                    g_val = float(x_step @ (p_mat @ x_step)) if p_mat is not None else 0.0
+                                    if g_val > 1e-6:
+                                        y_step = ((step_ff + g_val) * y_desired - step_ff * wx0) / g_val
+                                        y_step = np.clip(y_step, -40.0, 40.0).astype(np.float32)
+                                    else:
+                                        y_step = y_desired
+                                    dt = head.online_update(
+                                        x_step,
+                                        y_step,
+                                        forgetting_factor=step_ff,
+                                        prompt=prompt_for_head,
+                                    )
+                                    if eff_reward_scale >= 0.5:
+                                        for step_i in range(4):
+                                            ev = head.forward(emb, prompt=prompt_for_eval)
+                                            logits_ev = np.asarray(ev.logits, dtype=np.float64) / ch_temp
+                                            if f_type == "choice" and len(logits_ev) >= 2:
+                                                shifted_ev = logits_ev - np.max(logits_ev)
+                                                exp_ev = np.exp(shifted_ev)
+                                                probs_cal = exp_ev / np.sum(exp_ev)
+                                                s_p = np.sort(probs_cal)
+                                                if (
+                                                    ev.selected_value == target_val
+                                                    and float(s_p[-1]) >= target_top_p
+                                                    and float(s_p[-1] - s_p[-2]) >= 0.55
+                                                ):
+                                                    break
+                                            elif f_type in ("multi_choice", "multichoice"):
+                                                probs_mc = np.asarray(ev.raw_probabilities, dtype=np.float64)
+                                                max_err_mc = float(np.max(np.minimum(probs_mc, 1.0 - probs_mc))) if len(probs_mc) > 0 else 0.0
+                                                if (
+                                                    set(ev.selected_value) == set(target_val)
+                                                    and max_err_mc <= max(0.03, ch_q * 0.9)
+                                                ):
+                                                    break
+                                            elif f_type == "score":
+                                                if abs(float(ev.selected_value) - float(target_val)) <= 0.02:
+                                                    break
+                                            elif f_type == "boolean":
+                                                p_sel = float(ev.confidence)
+                                                if bool(ev.selected_value) == bool(target_val) and p_sel >= target_top_p:
+                                                    break
+                                            elif bool(ev.selected_value) == bool(target_val) and ev.confidence >= 0.90:
+                                                break
+                                            wx_curr = (head.weights @ emb).astype(np.float32)
+                                            p_curr = head.covariance_inv
+                                            g_curr = float(x_step @ (p_curr @ x_step)) if p_curr is not None else 0.0
+                                            if g_curr > 1e-6:
+                                                y_refine = ((step_ff + g_curr) * y_desired - step_ff * wx_curr) / g_curr
+                                                y_refine = np.clip(y_refine, -40.0, 40.0).astype(np.float32)
+                                            else:
+                                                y_refine = y_desired
+                                            dt += head.online_update(
+                                                x_step,
+                                                y_refine,
+                                                forgetting_factor=step_ff,
+                                                prompt=prompt_for_head,
+                                            )
+                                if norm_key is not None and eff_reward_scale >= 0.5:
+                                    if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
+                                        oldest_key = next(iter(self._learned_prompt_overrides))
+                                        self._learned_prompt_overrides.pop(oldest_key, None)
+                                        self._learned_prompt_override_recency.pop(oldest_key, None)
+                                    self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
+                                        self.schema.fields[f_name].validate_value(target_val)
+                                    )
+                                    self._learned_prompt_override_recency[norm_key] = bool(use_recency)
+                            else:
+                                if norm_key is not None and norm_key in self._learned_prompt_overrides:
+                                    self._learned_prompt_overrides[norm_key].pop(f_name, None)
+                                    if not self._learned_prompt_overrides[norm_key]:
+                                        self._learned_prompt_overrides.pop(norm_key, None)
+                                        self._learned_prompt_override_recency.pop(norm_key, None)
+                                dt = head.online_update(
+                                    x_aug,
+                                    y_target,
+                                    forgetting_factor=eff_ff,
+                                    prompt=prompt_for_head,
                                 )
-                                ch.calibration_scores = tuple(q_init_sc for _ in range(20))
-                                ch.conformal_quantile = q_init_sc
-                        elif not preserve_calibration:
-                            # Old evidence describes the previous weights, including on disk.
-                            ch.calibration_scores = ()
-                            ch.class_calibration_scores = {}
-                            ch.familiarity_threshold = 0.0
-                            ch.prototype_threshold = 0.0
-                            ch.prototype_scores = ()
-                            ch.conformal_quantile = 0.0
-                            ch.temperature = 1.0
-                            ch.logit_adjustments = None
-                    updated_fields.append(f_name)
+                        update_durations_ms.append(dt)
+
+                        # Sync back to compiled head weights
+                        if f_name in self.heads:
+                            ch = self.heads[f_name]
+                            ch.weights = head.weights
+                            ch.biases = head.biases
+                            ch.P = head.covariance_inv
+                            ch.B = head.cross_covariance
+                            ch.exemplar_state = head.export_exemplar_state()
+                            if head.hierarchical:
+                                ch.coarse_weights = head.coarse_weights
+                                ch.coarse_biases = head.coarse_biases
+                                ch.fine_weights = head.fine_weights
+                                ch.fine_biases = head.fine_biases
+                            if not is_zero_emb and ch.prototypes is not None and ch.prototypes.shape[1] == len(emb):
+                                e_norm = float(np.linalg.norm(emb))
+                                if e_norm > 1e-12:
+                                    emb_u = emb / e_norm
+                                    proto_idx: Optional[int] = None
+                                    if ch.field_type == "choice" and len(y_target) == ch.prototypes.shape[0]:
+                                        proto_idx = int(np.argmax(y_target))
+                                    elif ch.field_type == "boolean" and ch.prototypes.shape[0] == 2:
+                                        proto_idx = 1 if float(y_target[0]) > 0.0 else 0
+                                    if not skip_field and proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
+                                        cur_p = ch.prototypes[proto_idx]
+                                        sim_before = float(np.max(ch.prototypes @ emb_u)) if np.any(cur_p) else 0.0
+                                        if not preserve_calibration or ch.prototype_threshold <= 0.0 or not np.any(cur_p):
+                                            blend = (0.25 if preserve_calibration else 0.15) * eff_reward_scale
+                                            updated_p = emb_u if not np.any(cur_p) else ((1.0 - blend) * cur_p + blend * emb_u)
+                                            up_norm = float(np.linalg.norm(updated_p))
+                                            if up_norm > 1e-12:
+                                                ch.prototypes = ch.prototypes.copy()
+                                                ch.prototypes[proto_idx] = (updated_p / up_norm).astype(np.float32)
+                                        elif eff_reward_scale >= 0.5 and sim_before < ch.prototype_threshold:
+                                            if not hasattr(self, "_online_prototype_bank"):
+                                                self._online_prototype_bank = {}
+                                            bank = self._online_prototype_bank.setdefault(f_name, [])
+                                            if len(bank) >= 256:
+                                                bank.pop(0)
+                                            bank.append(emb_u.astype(np.float32))
+                                    if preserve_calibration and eff_reward_scale >= 0.5 and ch.prototype_threshold > 0.0:
+                                        sim_after = self.compute_prototype_similarity(f_name, emb_u)
+                                        if sim_after is not None and sim_after < ch.prototype_threshold:
+                                            ch.prototype_threshold = max(0.0, sim_after - 1e-4)
+                            if (
+                                preserve_calibration
+                                and eff_reward_scale >= 0.5
+                                and ch.familiarity_threshold > 0.0
+                                and isinstance(prompt, str)
+                                and prompt.strip()
+                            ):
+                                p_raw_norm = _extract_projector_raw_norm(
+                                    self.projector, prompt, recency_weighted=use_recency
+                                )
+                                if (
+                                    p_raw_norm is not None
+                                    and math.isfinite(p_raw_norm)
+                                    and 0.0 < p_raw_norm < ch.familiarity_threshold
+                                ):
+                                    ch.familiarity_threshold = max(0.0, p_raw_norm - 1e-4)
+                            if preserve_calibration and not ch.calibration_scores:
+                                if ch.field_type in ("choice", "boolean", "multi_choice", "multichoice"):
+                                    k_opts = max(2, len(ch.options))
+                                    q_init = float((k_opts - 1.0) / (3.5 + k_opts))
+                                    ch.score_method = "lac"
+                                    ch.calibration_scores = tuple(q_init for _ in range(20))
+                                    ch.conformal_quantile = q_init
+                                elif ch.field_type == "score":
+                                    f_def_sc = self.schema.fields.get(f_name)
+                                    q_init_sc = (
+                                        0.10 * _score_half_span(f_def_sc.min_value, f_def_sc.max_value)
+                                        if isinstance(f_def_sc, ScoreField)
+                                        else 0.05
+                                    )
+                                    ch.calibration_scores = tuple(q_init_sc for _ in range(20))
+                                    ch.conformal_quantile = q_init_sc
+                            elif not preserve_calibration:
+                                # Old evidence describes the previous weights, including on disk.
+                                ch.calibration_scores = ()
+                                ch.class_calibration_scores = {}
+                                ch.familiarity_threshold = 0.0
+                                ch.prototype_threshold = 0.0
+                                ch.prototype_scores = ()
+                                ch.conformal_quantile = 0.0
+                                ch.temperature = 1.0
+                                ch.logit_adjustments = None
+                        updated_fields.append(f_name)
+
+                rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
+                total_ms = (time.perf_counter() - t0) * 1000.0
+
+                # Evaluate model to get fresh result before committing version and cache updates
+                override_map = None
+                if norm_key is not None and self._learned_prompt_override_recency.get(norm_key, bool(self.recency_weighted)) == bool(use_recency):
+                    override_map = self._learned_prompt_overrides.get(norm_key)
+                evals: Dict[str, RawFieldEvaluation] = {}
+                for name, head in self._field_heads.items():
+                    if (
+                        override_map is not None
+                        and name in override_map
+                        and (is_zero_emb or _is_active_zero_head(head.field_def, head.weights, head.biases))
+                    ):
+                        evals[name] = self._build_override_eval(head, override_map[name])
+                    else:
+                        evals[name] = head.forward(emb, prompt=prompt_for_eval)
+            except BaseException:
+                for fn, h_snap in head_snaps.items():
+                    self._field_heads[fn]._restore_state(h_snap)
+                for fn, ch_snap in ch_snaps.items():
+                    self.heads[fn].__dict__.clear()
+                    self.heads[fn].__dict__.update(ch_snap)
+                self._learned_prompt_overrides.clear()
+                self._learned_prompt_overrides.update(ov_snap)
+                self._learned_prompt_override_recency.clear()
+                self._learned_prompt_override_recency.update(ov_rec_snap)
+                if has_proto_bank and proto_bank_snap is not None:
+                    self._online_prototype_bank.clear()
+                    self._online_prototype_bank.update(proto_bank_snap)
+                elif hasattr(self, "_online_prototype_bank"):
+                    delattr(self, "_online_prototype_bank")
+                raise
 
             self.model_version = getattr(self, "model_version", 1) + 1
             if self.use_cache and self.cache is not None:
@@ -1729,23 +1783,6 @@ class CompiledSystemOneModel:
                 if hasattr(self.cache, "invalidate_prior_versions"):
                     self.cache.invalidate_prior_versions(self.model_version)
 
-            rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
-            total_ms = (time.perf_counter() - t0) * 1000.0
-
-            # Evaluate model to get fresh result and store in Tier 0 cache
-            override_map = None
-            if norm_key is not None and self._learned_prompt_override_recency.get(norm_key, bool(self.recency_weighted)) == bool(use_recency):
-                override_map = self._learned_prompt_overrides.get(norm_key)
-            evals: Dict[str, RawFieldEvaluation] = {}
-            for name, head in self._field_heads.items():
-                if (
-                    override_map is not None
-                    and name in override_map
-                    and (is_zero_emb or _is_active_zero_head(head.field_def, head.weights, head.biases))
-                ):
-                    evals[name] = self._build_override_eval(head, override_map[name])
-                else:
-                    evals[name] = head.forward(emb, prompt=prompt_for_eval)
             inference_res = ModelInferenceResult(
                 prompt=prompt,
                 embedding=emb,

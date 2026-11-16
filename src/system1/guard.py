@@ -41,6 +41,7 @@ from system1.core import (
 )
 from system1.core.model import (
     _accepts_recency_weighted,
+    _coerce_inference_array_f32_or_f64,
     _compute_hierarchical_logits_np,
     _encode_projector_batch,
     _is_active_zero_head,
@@ -350,8 +351,13 @@ class GuardShield:
         self.cal_temp = temp
         self.cal_adj = None if adj is None else adj.copy()
 
-        raw_w_in = np.asarray(self.head.weights)
-        raw_b_in = np.asarray(self.head.biases)
+        is_bool_def = isinstance(f_def, BooleanField)
+        raw_w_in = _coerce_inference_array_f32_or_f64(
+            self.head.weights, f"Field head {self.field_name!r} weights", active_first_only=is_bool_def
+        )
+        raw_b_in = _coerce_inference_array_f32_or_f64(
+            self.head.biases, f"Field head {self.field_name!r} biases", active_first_only=is_bool_def
+        )
         w_dtype = np.float64 if raw_w_in.dtype == np.float64 else np.float32
         b_dtype = np.float64 if raw_b_in.dtype == np.float64 else np.float32
         self.raw_W = _owned_readonly_array(raw_w_in, dtype=w_dtype)
@@ -359,7 +365,9 @@ class GuardShield:
         _validate_head_weight_bias_shapes(
             f_def, self.raw_W, self.raw_b, int(resolved.dimension), self.field_name
         )
-        if not (np.all(np.isfinite(self.raw_W)) and np.all(np.isfinite(self.raw_b))):
+        raw_w_chk = self.raw_W[:1] if is_bool_def else self.raw_W
+        raw_b_chk = self.raw_b[:1] if is_bool_def else self.raw_b
+        if not (np.all(np.isfinite(raw_w_chk)) and np.all(np.isfinite(raw_b_chk))):
             raise ValueError(f"Field head {self.field_name!r} contains invalid or non-finite weights or biases")
         self.W = self.raw_W
         self.b = self.raw_b
@@ -438,8 +446,12 @@ class GuardShield:
                 raise ValueError(
                     f"Field head {self.field_name!r} hierarchical weights missing coarse_weights/coarse_biases"
                 )
-            cw_in = np.asarray(self.head.coarse_weights)
-            cb_in = np.asarray(self.head.coarse_biases)
+            cw_in = _coerce_inference_array_f32_or_f64(
+                self.head.coarse_weights, f"Field head {self.field_name!r} hierarchical coarse weights"
+            )
+            cb_in = _coerce_inference_array_f32_or_f64(
+                self.head.coarse_biases, f"Field head {self.field_name!r} hierarchical coarse biases"
+            )
             if cb_in.ndim != 1:
                 raise ValueError(f"Field head {self.field_name!r} coarse_biases must be 1D, got shape {cb_in.shape}")
             if not (np.all(np.isfinite(cw_in)) and np.all(np.isfinite(cb_in))):
@@ -475,8 +487,12 @@ class GuardShield:
                 or (cb_dtype == np.float64)
             )
             if has_fw and has_fb:
-                fw_in = np.asarray(self.head.fine_weights)
-                fb_in = np.asarray(self.head.fine_biases)
+                fw_in = _coerce_inference_array_f32_or_f64(
+                    self.head.fine_weights, f"Field head {self.field_name!r} hierarchical fine weights"
+                )
+                fb_in = _coerce_inference_array_f32_or_f64(
+                    self.head.fine_biases, f"Field head {self.field_name!r} hierarchical fine biases"
+                )
                 if fb_in.ndim != 1:
                     raise ValueError(f"Field head {self.field_name!r} fine_biases must be 1D, got shape {fb_in.shape}")
                 if not (np.all(np.isfinite(fw_in)) and np.all(np.isfinite(fb_in))):

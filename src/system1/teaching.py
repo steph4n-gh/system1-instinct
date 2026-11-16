@@ -30,9 +30,12 @@ from system1.core.schema import (
     ScoreField,
     _f64_to_exact_2m1074,
     _score_abs_diff_clamped,
+    _score_abs_diff_exact_2m1074,
     _score_from_unit_prob,
     _score_full_span_clamped,
     _score_half_span,
+    _score_mae_from_int_sum,
+    _score_rmse_from_int_diffs,
     _score_within_rel_tolerance,
 )
 from system1.core.model import _accepts_recency_weighted
@@ -841,12 +844,22 @@ class TeachingSession:
                     "review": len(selected) - len(local),
                 }
         elif isinstance(f_def, ScoreField):
-            for bucket_name, lo_f, hi_f in (("low", 0.0, 1.0 / 3.0), ("medium", 1.0 / 3.0, 2.0 / 3.0), ("high", 2.0 / 3.0, 1.01)):
-                lo_v = float(_score_from_unit_prob(lo_f, f_def.min_value, f_def.max_value))
-                hi_v = float(_score_from_unit_prob(hi_f, f_def.min_value, f_def.max_value))
+            b0 = float(f_def.min_value)
+            b3 = float(f_def.max_value)
+            b1 = min(b3, max(b0, float(_score_from_unit_prob(1.0 / 3.0, b0, b3))))
+            b2 = min(b3, max(b1, float(_score_from_unit_prob(2.0 / 3.0, b0, b3))))
+            for bucket_name, lo_v, hi_v, inclusive_hi in (
+                ("low", b0, b1, False),
+                ("medium", b1, b2, False),
+                ("high", b2, b3, True),
+            ):
                 selected = [
                     outcome for row, outcome in zip(checks, field_outcomes)
-                    if lo_v <= float(self._field_label(row["label"], fname)) < hi_v
+                    if (
+                        lo_v <= float(self._field_label(row["label"], fname)) <= hi_v
+                        if inclusive_hi
+                        else lo_v <= float(self._field_label(row["label"], fname)) < hi_v
+                    )
                 ]
                 local = [outcome for outcome in selected if not outcome["review"]]
                 per_class[bucket_name] = {
@@ -874,21 +887,12 @@ class TeachingSession:
             "per_class": per_class,
         }
         if isinstance(f_def, ScoreField):
-            errs = [
-                _score_abs_diff_clamped(float(o["predicted"]), float(self._field_label(r["label"], fname)))
+            err_ints = [
+                _score_abs_diff_exact_2m1074(float(o["predicted"]), float(self._field_label(r["label"], fname)))
                 for r, o in zip(checks, field_outcomes)
             ]
-            summary["mae"] = (
-                float(sum(_f64_to_exact_2m1074(e) for e in errs) / (len(errs) << 1074))
-                if errs
-                else 0.0
-            )
-            max_e = max(errs) if errs else 0.0
-            summary["rmse"] = (
-                float(max_e * math.sqrt(sum((e / max_e) ** 2 for e in errs) / len(errs)))
-                if max_e > 0.0
-                else 0.0
-            )
+            summary["mae"] = _score_mae_from_int_sum(sum(err_ints), len(err_ints))
+            summary["rmse"] = _score_rmse_from_int_diffs(err_ints)
         return summary
 
     def _measure(self, engine, checks):

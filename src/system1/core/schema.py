@@ -679,28 +679,6 @@ def _score_normalized_margin(margin: float, min_value: float, max_value: float) 
     return min(1.0, (0.5 * m) / hs) if hs > 0.0 else 1.0
 
 
-def _score_within_rel_tolerance(
-    a: float, b: float, min_value: float, max_value: float, rel_tol: float
-) -> bool:
-    """Return True when |a - b| <= rel_tol * (max_value - min_value) without overflow or subnormal loss."""
-    fa = float(a)
-    fb = float(b)
-    lo = float(min_value)
-    hi = float(max_value)
-    tol = float(rel_tol)
-    if not (math.isfinite(fa) and math.isfinite(fb)):
-        return False
-    span = hi - lo
-    if span <= 0.0:
-        return fa == fb
-    diff = abs(fa - fb)
-    if math.isfinite(span) and math.isfinite(diff):
-        return diff <= tol * span
-    hs = _score_half_span(lo, hi)
-    hd = abs(0.5 * fa - 0.5 * fb)
-    return hd <= tol * hs
-
-
 def _f64_to_exact_2m1074(v: float) -> int:
     """Convert a finite float64 exactly into an integer multiple of 2^-1074."""
     if v == 0.0:
@@ -709,6 +687,66 @@ def _f64_to_exact_2m1074(v: float) -> int:
     if e >= -1021:
         return int(math.ldexp(m, 53)) << (e + 1021)
     return int(math.ldexp(v, 1074))
+
+
+def _score_within_rel_tolerance(
+    a: float, b: float, min_value: float, max_value: float, rel_tol: float
+) -> bool:
+    """Return True when |a - b| <= rel_tol * (max_value - min_value) with zero rounding error."""
+    fa = float(a)
+    fb = float(b)
+    lo = float(min_value)
+    hi = float(max_value)
+    tol = float(rel_tol)
+    if not (math.isfinite(fa) and math.isfinite(fb) and math.isfinite(lo) and math.isfinite(hi)):
+        return False
+    if math.isnan(tol) or tol < 0.0:
+        return False
+    if hi <= lo or tol == 0.0:
+        return fa == fb
+    if math.isinf(tol):
+        return True
+    diff_i = abs(_f64_to_exact_2m1074(fa) - _f64_to_exact_2m1074(fb))
+    span_i = _f64_to_exact_2m1074(hi) - _f64_to_exact_2m1074(lo)
+    tol_i = _f64_to_exact_2m1074(tol)
+    return (diff_i << 1074) <= tol_i * span_i
+
+
+def _score_abs_diff_exact_2m1074(a: float, b: float) -> int:
+    """Return exact |a - b| in integer multiples of 2^-1074 without premature clamping."""
+    fa = float(a)
+    fb = float(b)
+    if not (math.isfinite(fa) and math.isfinite(fb)):
+        raise ValueError(f"Score values must be finite, got {a!r} and {b!r}")
+    return abs(_f64_to_exact_2m1074(fa) - _f64_to_exact_2m1074(fb))
+
+
+def _score_mae_from_int_sum(int_sum: int, count: int) -> float:
+    """Convert an accumulated 2^-1074 integer error sum into finite float64 MAE."""
+    if count <= 0 or int_sum <= 0:
+        return 0.0
+    try:
+        val = float(int_sum / (count << 1074))
+    except OverflowError:
+        return sys.float_info.max
+    return val if math.isfinite(val) else sys.float_info.max
+
+
+def _score_rmse_from_int_diffs(int_diffs: Sequence[int]) -> float:
+    """Convert a sequence of exact 2^-1074 integer errors into finite float64 RMSE."""
+    n = len(int_diffs)
+    if n == 0:
+        return 0.0
+    s2 = sum(d * d for d in int_diffs)
+    if s2 <= 0:
+        return 0.0
+    k = ((s2.bit_length() - n.bit_length()) - 150) // 2
+    try:
+        ratio = float(s2 / (n << (2 * k))) if k >= 0 else float((s2 << (-2 * k)) / n)
+        res = math.ldexp(math.sqrt(ratio), k - 1074)
+    except OverflowError:
+        return sys.float_info.max
+    return res if math.isfinite(res) else sys.float_info.max
 
 
 def _score_interval_bounds(
@@ -758,5 +796,8 @@ __all__ = [
     "_score_normalized_margin",
     "_score_within_rel_tolerance",
     "_f64_to_exact_2m1074",
+    "_score_abs_diff_exact_2m1074",
+    "_score_mae_from_int_sum",
+    "_score_rmse_from_int_diffs",
     "_score_interval_bounds",
 ]

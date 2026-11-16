@@ -39,6 +39,7 @@ from system1.core.schema import (
     ScoreField,
     _score_half_span,
     _score_normalized_margin,
+    _score_to_unit_ratio,
     _score_within_rel_tolerance,
 )
 from system1.engine import SystemOneEngine
@@ -293,7 +294,10 @@ class AutoCutoverLifecycle:
         if isinstance(self.primary_field, ScoreField):
             lo = float(self.primary_field.min_value)
             hi = float(self.primary_field.max_value)
-            norm = min(1.0, max(0.0, (float(val) - lo) / max(1e-9, hi - lo)))
+            if hi <= lo:
+                norm = 0.0
+            else:
+                norm = min(1.0, max(0.0, float(_score_to_unit_ratio(float(val), lo, hi))))
             return f"bin_{min(3, int(norm * 4.0))}"
         if isinstance(self.primary_field, BooleanField):
             return "True" if bool(val) else "False"

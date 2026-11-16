@@ -537,18 +537,22 @@ def _compute_hierarchical_logits_np(
     fine_biases: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Compute hierarchical coarse-to-fine logits with float64 softmax scaling and finiteness propagation."""
-    cw_arr = np.asarray(coarse_weights)
-    cb_arr = np.asarray(coarse_biases)
+    cw_arr = _coerce_inference_array_f32_or_f64(coarse_weights, "Hierarchical coarse_weights")
+    cb_arr = _coerce_inference_array_f32_or_f64(coarse_biases, "Hierarchical coarse_biases")
     if cw_arr.ndim != 2 or cw_arr.shape[1] != emb.shape[1] or cb_arr.ndim != 1 or cb_arr.shape != (cw_arr.shape[0],):
         raise ValueError(
             f"Hierarchical coarse shape mismatch: expected (*, {emb.shape[1]}) and (C,), got {cw_arr.shape} and {cb_arr.shape}"
         )
+    if cw_arr.shape[0] < 1:
+        raise ValueError("Hierarchical coarse_weights must have at least 1 cluster row")
     _validate_2d_layout_cloneable(cw_arr, np.dtype(cw_arr.dtype))
     if (fine_weights is None) != (fine_biases is None):
         raise ValueError("Hierarchical fine_weights and fine_biases must both be provided or both be None")
+    fw_arr: Optional[np.ndarray] = None
+    fb_arr: Optional[np.ndarray] = None
     if fine_weights is not None and fine_biases is not None:
-        fw_arr = np.asarray(fine_weights)
-        fb_arr = np.asarray(fine_biases)
+        fw_arr = _coerce_inference_array_f32_or_f64(fine_weights, "Hierarchical fine_weights")
+        fb_arr = _coerce_inference_array_f32_or_f64(fine_biases, "Hierarchical fine_biases")
         if (
             fw_arr.ndim != 2
             or fw_arr.shape != (base_logits.shape[1], emb.shape[1])
@@ -561,7 +565,7 @@ def _compute_hierarchical_logits_np(
         _validate_2d_layout_cloneable(fw_arr, np.dtype(fw_arr.dtype))
     with np.errstate(over="ignore", invalid="ignore"):
         assign = np.asarray(cluster_assignments, dtype=np.int64)
-        coarse_logits = emb @ coarse_weights.T + coarse_biases
+        coarse_logits = emb @ cw_arr.T + cb_arr
         if assign.ndim != 1 or assign.size != base_logits.shape[1] or (
             assign.size > 0 and np.any((assign < 0) | (assign >= coarse_logits.shape[1]))
         ):
@@ -575,8 +579,8 @@ def _compute_hierarchical_logits_np(
         coarse_probs = _stable_softmax(c_scaled, temperature=1.0)
         hier_ok &= np.all(np.isfinite(coarse_probs), axis=1)
         mapped_coarse = np.asarray(coarse_logits, dtype=np.float64)[:, assign]
-        if fine_weights is not None and fine_biases is not None:
-            spec_logits = emb @ fine_weights.T + fine_biases
+        if fw_arr is not None and fb_arr is not None:
+            spec_logits = emb @ fw_arr.T + fb_arr
             hier_ok &= np.all(np.isfinite(spec_logits), axis=1)
             mapped_probs = coarse_probs[:, assign]
             blended64 = (
@@ -591,7 +595,7 @@ def _compute_hierarchical_logits_np(
             )
         has_f64 = any(
             arr is not None and getattr(arr, "dtype", None) == np.float64
-            for arr in (base_logits, coarse_weights, coarse_biases, fine_weights, fine_biases)
+            for arr in (base_logits, cw_arr, cb_arr, fw_arr, fb_arr)
         )
         out_dtype = np.float64 if has_f64 else np.float32
         blended = blended64.astype(out_dtype)
@@ -888,6 +892,47 @@ def _clone_preserving_2d_layout(
 def _owned_readonly_array(arr: Any, dtype: Any = None) -> np.ndarray:
     """Return an owned read-only copy preserving 2D strides, base alignment, and Fortran contiguity."""
     return _clone_preserving_2d_layout(arr, dtype=dtype, writeable=False)
+
+
+def _coerce_inference_array_f32_or_f64(
+    arr: Any,
+    label: str,
+    *,
+    expected_ndim: Optional[int] = None,
+    active_first_only: bool = False,
+) -> np.ndarray:
+    """Validate and coerce an inference array while preserving finite float32/float64 tensors."""
+    arr_in = np.asarray(arr)
+    if (
+        arr_in.dtype == np.bool_
+        or np.issubdtype(arr_in.dtype, np.complexfloating)
+        or arr_in.dtype.kind not in ("i", "u", "f", "O")
+    ):
+        raise ValueError(f"{label} must be a real numeric array")
+    if arr_in.dtype == np.object_ and any(isinstance(v, (bool, np.bool_, complex)) for v in arr_in.flat):
+        raise ValueError(f"{label} must be a real numeric array")
+    if expected_ndim is not None and arr_in.ndim != expected_ndim:
+        raise ValueError(f"{label} must be {expected_ndim}D, got shape {arr_in.shape}")
+    if arr_in.dtype in (np.float32, np.float64):
+        if arr_in.ndim == 2:
+            _validate_2d_layout_cloneable(arr_in, np.dtype(arr_in.dtype))
+        chk_in = arr_in[:1] if (active_first_only and arr_in.size > 0) else arr_in
+        if not bool(np.all(np.isfinite(chk_in))):
+            raise ValueError(f"{label} contains non-finite values")
+        return arr_in
+    f32_dt = np.dtype(np.float32)
+    try:
+        with np.errstate(over="ignore", invalid="ignore"):
+            if arr_in.ndim == 2:
+                out = _owned_readonly_array(arr_in, dtype=f32_dt)
+            else:
+                out = np.asarray(arr_in, dtype=f32_dt)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{label} contains invalid or non-numeric values") from exc
+    chk_out = out[:1] if (active_first_only and out.size > 0) else out
+    if not bool(np.all(np.isfinite(chk_out))):
+        raise ValueError(f"{label} contains non-finite values")
+    return out
 
 
 def _preserve_2d_layout_update(prev: np.ndarray, updated: np.ndarray) -> np.ndarray:
@@ -2299,6 +2344,110 @@ class DecisionFieldHead:
         self._online_shots_are_pseudo = online_shots_are_pseudo
         self._exemplar_projector = DeterministicSemanticProjector(dimension=self.dimension)
 
+    def _snapshot_state(self) -> Dict[str, Any]:
+        """Capture reversible head state for atomic transactional updates."""
+        cov_p = self.covariance_inv
+        cov_b = self.cross_covariance
+        return {
+            "weights": self.weights,
+            "biases": self.biases,
+            "mx_weights": self.mx_weights,
+            "mx_biases": self.mx_biases,
+            "covariance_inv": (
+                cov_p,
+                cov_p.copy() if (cov_p is not None and cov_p.flags.writeable) else None,
+            ),
+            "cross_covariance": (
+                cov_b,
+                cov_b.copy() if (cov_b is not None and cov_b.flags.writeable) else None,
+            ),
+            "regularization": self.regularization,
+            "hierarchical": self.hierarchical,
+            "cluster_assignments": self.cluster_assignments,
+            "coarse_weights": self.coarse_weights,
+            "coarse_biases": self.coarse_biases,
+            "fine_weights": self.fine_weights,
+            "fine_biases": self.fine_biases,
+            "_exemplar_bank": (
+                (self._exemplar_bank[0], list(self._exemplar_bank[1]))
+                if self._exemplar_bank is not None
+                else None
+            ),
+            "_exemplar_mean": self._exemplar_mean,
+            "_exemplar_projector": self._exemplar_projector,
+            "_initial_weights": self._initial_weights,
+            "_exemplar_vectors_raw": self._exemplar_vectors_raw,
+            "_exemplar_vectors_bank_ids": self._exemplar_vectors_bank_ids,
+            "_exemplar_vectors_layout": self._exemplar_vectors_layout,
+            "_online_shots_p": (
+                [list(g) for g in self._online_shots_p]
+                if self._online_shots_p is not None
+                else None
+            ),
+            "_online_shots_c": (
+                [list(g) for g in self._online_shots_c]
+                if self._online_shots_c is not None
+                else None
+            ),
+            "_shots_p_raw": self._shots_p_raw,
+            "_shots_p_row_ids": self._shots_p_row_ids,
+            "_shots_p_layout": self._shots_p_layout,
+            "_shots_c_raw": self._shots_c_raw,
+            "_shots_c_row_ids": self._shots_c_row_ids,
+            "_shots_c_layout": self._shots_c_layout,
+            "_has_online_shots_are_pseudo": "_online_shots_are_pseudo" in self.__dict__,
+            "_online_shots_are_pseudo": self.__dict__.get("_online_shots_are_pseudo", False),
+        }
+
+    def _restore_state(self, snap: Dict[str, Any]) -> None:
+        """Restore head state captured by `_snapshot_state`."""
+        self.weights = snap["weights"]
+        self.biases = snap["biases"]
+        self.mx_weights = snap["mx_weights"]
+        self.mx_biases = snap["mx_biases"]
+        p_orig, p_copy = snap["covariance_inv"]
+        if p_orig is None:
+            self.covariance_inv = None
+        elif p_copy is not None:
+            p_orig[:] = p_copy
+            self.covariance_inv = p_orig
+        else:
+            self.covariance_inv = p_orig
+        b_orig, b_copy = snap["cross_covariance"]
+        if b_orig is None:
+            self.cross_covariance = None
+        elif b_copy is not None:
+            b_orig[:] = b_copy
+            self.cross_covariance = b_orig
+        else:
+            self.cross_covariance = b_orig
+        self.regularization = snap["regularization"]
+        self.hierarchical = snap["hierarchical"]
+        self.cluster_assignments = snap["cluster_assignments"]
+        self.coarse_weights = snap["coarse_weights"]
+        self.coarse_biases = snap["coarse_biases"]
+        self.fine_weights = snap["fine_weights"]
+        self.fine_biases = snap["fine_biases"]
+        self._exemplar_bank = snap["_exemplar_bank"]
+        self._exemplar_mean = snap["_exemplar_mean"]
+        self._exemplar_projector = snap["_exemplar_projector"]
+        self._initial_weights = snap["_initial_weights"]
+        self._exemplar_vectors_raw = snap["_exemplar_vectors_raw"]
+        self._exemplar_vectors_bank_ids = snap["_exemplar_vectors_bank_ids"]
+        self._exemplar_vectors_layout = snap["_exemplar_vectors_layout"]
+        self._online_shots_p = snap["_online_shots_p"]
+        self._online_shots_c = snap["_online_shots_c"]
+        self._shots_p_raw = snap["_shots_p_raw"]
+        self._shots_p_row_ids = snap["_shots_p_row_ids"]
+        self._shots_p_layout = snap["_shots_p_layout"]
+        self._shots_c_raw = snap["_shots_c_raw"]
+        self._shots_c_row_ids = snap["_shots_c_row_ids"]
+        self._shots_c_layout = snap["_shots_c_layout"]
+        if snap["_has_online_shots_are_pseudo"]:
+            self._online_shots_are_pseudo = snap["_online_shots_are_pseudo"]
+        else:
+            self.__dict__.pop("_online_shots_are_pseudo", None)
+
     def _update_exemplar_bank_entry(
         self,
         emb_feat: np.ndarray,
@@ -2320,7 +2469,10 @@ class DecisionFieldHead:
             return
         if (concept_embedding is not None or prompt is not None) and self._exemplar_projector is not None:
             if concept_embedding is not None:
-                c_vec = concept_embedding
+                with np.errstate(over="ignore", invalid="ignore"):
+                    c_vec = np.asarray(concept_embedding, dtype=np.float32).ravel()
+                if len(c_vec) != D or not bool(np.all(np.isfinite(c_vec))):
+                    raise ValueError(f"concept_embedding must be a finite vector of length {D}")
             else:
                 assert prompt is not None
                 c_vec = self._exemplar_projector._project_concept_aware(prompt)
@@ -2597,11 +2749,24 @@ class DecisionFieldHead:
         W_{t+1} = (P_{t+1} B_{t+1})^T
         """
         t0 = time.perf_counter()
+        if isinstance(forgetting_factor, (bool, np.bool_)):
+            raise ValueError(f"Forgetting factor lambda_f must be a real float in (0, 1.0], got {forgetting_factor!r}")
+        if isinstance(reward_scale, (bool, np.bool_)):
+            raise ValueError(f"reward_scale must be a finite real number, got {reward_scale!r}")
         lam_f = float(
             forgetting_factor if forgetting_factor is not None else self.forgetting_factor
         )
         if not math.isfinite(lam_f) or not (0.0 < lam_f <= 1.0):
             raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {lam_f}")
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            lam_f32 = np.float32(lam_f)
+            inv_lam_f32 = np.float32(1.0 / lam_f)
+        if lam_f != 1.0 and (
+            not bool(np.isfinite(inv_lam_f32))
+            or not bool(np.isfinite(lam_f32))
+            or float(lam_f32) <= 0.0
+        ):
+            raise ValueError(f"Forgetting factor lambda_f={lam_f} overflows float32 covariance update")
 
         D = self.dimension
         K = self.weights.shape[0]
@@ -2609,6 +2774,7 @@ class DecisionFieldHead:
         if not math.isfinite(reward_scale_f):
             raise ValueError(f"reward_scale must be finite, got {reward_scale!r}")
 
+        ce_arr: Optional[np.ndarray] = None
         with np.errstate(over="ignore", invalid="ignore"):
             x = np.asarray(x_aug, dtype=np.float32).ravel()
             if len(x) == D:
@@ -2629,7 +2795,14 @@ class DecisionFieldHead:
                 raise ValueError(f"Expected target vector y of length {K}, got {len(y)}")
 
             if concept_embedding is not None:
-                ce_arr = np.asarray(concept_embedding, dtype=np.float32).ravel()
+                ce_raw = np.asarray(concept_embedding)
+                if (
+                    ce_raw.dtype == np.bool_
+                    or np.issubdtype(ce_raw.dtype, np.complexfloating)
+                    or ce_raw.dtype.kind not in ("i", "u", "f", "O")
+                ):
+                    raise ValueError(f"concept_embedding must be a finite real vector of length {D}")
+                ce_arr = np.asarray(ce_raw, dtype=np.float32).ravel()
                 if len(ce_arr) != D or not bool(np.all(np.isfinite(ce_arr))):
                     raise ValueError(f"concept_embedding must be a finite vector of length {D}")
 
@@ -2700,198 +2873,282 @@ class DecisionFieldHead:
                 if not (bool(np.all(np.isfinite(fw_h))) and bool(np.all(np.isfinite(fb_h)))):
                     raise ValueError("Hierarchical fine weights and biases must be finite in online_update")
 
-        if self.covariance_inv is None or self.cross_covariance is None:
-            self.init_covariance(regularization=self.regularization)
+        if not self.hierarchical and isinstance(self.field_def, ChoiceField) and self._exemplar_bank is not None:
+            if not isinstance(self._exemplar_bank, tuple) or len(self._exemplar_bank) != 2:
+                raise ValueError("Invalid _exemplar_bank structure in online_update")
+            w_cons_chk, sub_banks_chk = self._exemplar_bank
+            w_cons_arr = _coerce_inference_array_f32_or_f64(w_cons_chk, "Exemplar bank consensus weights")
+            if w_cons_arr.ndim != 2 or w_cons_arr.shape != (K, D):
+                raise ValueError(f"Exemplar bank consensus weights shape mismatch: got {w_cons_arr.shape}")
+            _validate_2d_layout_cloneable(w_cons_arr, f32_dt)
+            if (
+                isinstance(sub_banks_chk, (str, bytes, bytearray))
+                or not isinstance(sub_banks_chk, Sequence)
+                or len(sub_banks_chk) != K
+            ):
+                raise ValueError("Invalid exemplar sub-banks sequence in online_update")
+            for sb_chk in sub_banks_chk:
+                sb_arr = _coerce_inference_array_f32_or_f64(sb_chk, "Exemplar sub-bank array")
+                if sb_arr.ndim != 2 or sb_arr.shape[1] != D:
+                    raise ValueError(f"Exemplar sub-bank array shape mismatch: got {sb_arr.shape}")
 
-        P = self.covariance_inv
-        B = self.cross_covariance
-        assert P is not None and B is not None
-        if not P.flags.writeable:
-            P = _clone_preserving_2d_layout(P, dtype=P.dtype, writeable=True)
-            self.covariance_inv = P
-        if not B.flags.writeable:
-            B = _clone_preserving_2d_layout(B, dtype=B.dtype, writeable=True)
-            self.cross_covariance = B
+        reg_raw = float(self.regularization)
+        if not math.isfinite(reg_raw):
+            raise ValueError(f"regularization must be finite, got {self.regularization!r}")
 
-        eff_reward_scale = float(min(1.0, max(0.0, reward_scale)))
-        x_step = x
-        y_step = y
-        if not preserve_calibration and isinstance(self.field_def, ChoiceField) and K > 8:
-            pos_max = float(np.max(y))
-            if pos_max > 0.0:
-                neg_balanced = -pos_max / float(max(1, K - 1))
-                y_step = np.where(y > 0.0, y, neg_balanced).astype(np.float32)
-
-        v: Optional[np.ndarray] = None
-        z_curr_dir: Optional[np.ndarray] = None
-        if preserve_calibration and float(np.linalg.norm(x[:D])) > 1e-12:
-            x_step = np.empty(D + 1, dtype=np.float32)
-            x_step[:D] = x[:D]
-            x_step[D] = 0.0
-            v_dir = P @ x_step
-            g = float(x_step @ v_dir)
-            if g > 1e-12:
-                v = v_dir
-                z0 = (self.weights @ x[:D]).astype(np.float64) + self.biases.astype(np.float64)
-                b0 = self.biases.astype(np.float64)
-                z_desired = z0.copy()
-                if isinstance(self.field_def, ChoiceField) and K >= 2:
-                    t_idx = int(np.argmax(y))
-                    for i in range(K):
-                        if i != t_idx and z0[i] > 0.15:
-                            z_desired[i] = 0.05
-                    comp_after = float(max(z_desired[i] for i in range(K) if i != t_idx))
-                    z_desired[t_idx] = max(float(z0[t_idx]), comp_after + 1.45, 1.45)
-                elif isinstance(self.field_def, BooleanField):
-                    sign = 1.0 if float(y[0]) >= 0.0 else -1.0
-                    z_desired[0] = sign * max(abs(float(z0[0])), 1.45)
-                elif isinstance(self.field_def, MultiChoiceField):
-                    for i in range(K):
-                        sign = 1.0 if float(y[i]) >= 0.0 else -1.0
-                        z_desired[i] = sign * max(abs(float(z0[i])), 0.90)
-                elif isinstance(self.field_def, ScoreField):
-                    z_desired[0] = float(y[0])
-                if eff_reward_scale < 1.0:
-                    z_desired = z0 + eff_reward_scale * (z_desired - z0)
-                y_des = z_desired - b0
-                z_curr_dir = z0 - b0
-                y_step = (((lam_f + g) * y_des - lam_f * z_curr_dir) / g).astype(np.float32)
-
-        if v is None:
-            v = P @ x_step
-        denom = float(lam_f + float(x_step @ v))
-        if denom <= 1e-12 or not math.isfinite(denom):
-            # Degenerate input or numerical singularity: preserve internal state
-            return (time.perf_counter() - t0) * 1000.0
-
-        # In-place rank-1 P update using preallocated scratch buffer
-        if self._p_tmp_buf is None or self._p_tmp_buf.shape != P.shape or self._p_tmp_buf.dtype != P.dtype:
-            self._p_tmp_buf = np.empty_like(P)
-        buf = self._p_tmp_buf
-        np.multiply.outer(v, v, out=buf)
-        buf *= np.float32(1.0 / denom)
-        P -= buf
-        if lam_f != 1.0:
-            P *= np.float32(1.0 / lam_f)
-
-        # In-place cross-covariance update: B_{t+1} = lam_f * B_t + x y^T
-        if lam_f != 1.0:
-            B *= np.float32(lam_f)
-        if self._b_tmp_buf is None or self._b_tmp_buf.shape != B.shape or self._b_tmp_buf.dtype != B.dtype:
-            self._b_tmp_buf = np.empty_like(B)
-        np.multiply.outer(x_step, y_step, out=self._b_tmp_buf)
-        B += self._b_tmp_buf
-
-        # Covariance bounding via diagonal view: prevent covariance windup along unexcited directions
-        p_diag = P.diagonal()
-        p_max = float(50.0 / max(1e-4, self.regularization))
-        max_d = float(np.max(p_diag))
-        clamped = False
-        if max_d > p_max and max_d > 0.0:
-            scale = np.float32(p_max / max_d)
-            P *= scale
-            B *= np.float32(1.0 / scale)
-            clamped = True
-
-        # Enforce strict positive-definiteness on diagonal against floating-point drift
-        if float(np.min(p_diag)) < 1e-6:
-            idx = np.arange(P.shape[0])
-            small = p_diag < 1e-6
-            P[idx[small], idx[small]] = np.float32(1e-6)
-            clamped = True
-
-        # Exact O(D*K) Sherman-Morrison weight update when un-clamped
-        if not clamped:
-            if z_curr_dir is not None and x_step[D] == 0.0:
-                z_curr = z_curr_dir.astype(np.float32)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            if self.covariance_inv is None or self.cross_covariance is None:
+                eff_reg = max(1e-4, reg_raw)
+                P_cand = ((1.0 / eff_reg) * np.eye(D + 1, dtype=f32_dt)).astype(f32_dt)
+                w_mat_init = self.weights
+                b_vec_init = np.broadcast_to(self.biases.reshape(-1, 1), (w_mat_init.shape[0], 1))
+                w_aug_init = np.hstack([w_mat_init, b_vec_init])
+                B_cand = (eff_reg * w_aug_init.T).astype(f32_dt)
             else:
-                z_curr = self.weights @ x_step[:D]
-                if x_step[D] != 0.0:
-                    z_curr = z_curr + self.biases * x_step[D]
-            gain = (v * np.float32(1.0 / denom)).astype(np.float32)
-            err = (y_step - z_curr).astype(np.float32)
-            new_W = self.weights + np.multiply.outer(err, gain[:D])
-            if gain[D] != 0.0:
-                b_curr = np.broadcast_to(self.biases.reshape(-1), (K,))
-                new_b = b_curr + err * gain[D]
-            else:
-                new_b = self.biases
-        else:
-            P[:] = np.float32(0.5) * (P + P.T)
-            W_aug = (P @ B).T
-            new_W = W_aug[:, :D].astype(np.float32)
-            new_b = W_aug[:, D].astype(np.float32)
+                eff_reg = reg_raw
+                P_cand = _clone_preserving_2d_layout(self.covariance_inv, dtype=f32_dt, writeable=True)
+                B_cand = _clone_preserving_2d_layout(self.cross_covariance, dtype=f32_dt, writeable=True)
+            if not (bool(np.all(np.isfinite(P_cand))) and bool(np.all(np.isfinite(B_cand)))):
+                raise ValueError("Covariance matrices P/B overflow float32")
 
-        # Update live cold-start exemplar bank if active
-        if not self.hierarchical and isinstance(self.field_def, ChoiceField):
-            if self._exemplar_bank is not None:
-                target_k = int(np.argmax(y))
-                if 0 <= target_k < K and float(y[target_k]) > 0.0:
-                    if K <= 8:
-                        self._update_exemplar_bank_entry(
-                            x[:D],
-                            target_k,
-                            prompt=prompt,
-                            blend_rate=(0.35 if preserve_calibration else 0.28) * eff_reward_scale,
-                            attenuate_competitors=(eff_reward_scale >= 0.5),
-                            concept_embedding=concept_embedding,
+            eff_reward_scale = float(min(1.0, max(0.0, reward_scale_f)))
+            x_step = x
+            y_step = y
+            if not preserve_calibration and isinstance(self.field_def, ChoiceField) and K > 8:
+                pos_max = float(np.max(y))
+                if pos_max > 0.0:
+                    neg_balanced = -pos_max / float(max(1, K - 1))
+                    y_step = np.where(y > 0.0, y, neg_balanced).astype(f32_dt)
+
+            v: Optional[np.ndarray] = None
+            z_curr_dir: Optional[np.ndarray] = None
+            if preserve_calibration and float(np.linalg.norm(x[:D])) > 1e-12:
+                x_step = np.empty(D + 1, dtype=f32_dt)
+                x_step[:D] = x[:D]
+                x_step[D] = 0.0
+                v_dir = P_cand @ x_step
+                g = float(x_step @ v_dir)
+                if g > 1e-12 and math.isfinite(g):
+                    v = v_dir
+                    z0 = (self.weights @ x[:D]).astype(np.float64) + self.biases.astype(np.float64)
+                    b0 = self.biases.astype(np.float64)
+                    z_desired = z0.copy()
+                    if isinstance(self.field_def, ChoiceField) and K >= 2:
+                        t_idx = int(np.argmax(y))
+                        for i in range(K):
+                            if i != t_idx and z0[i] > 0.15:
+                                z_desired[i] = 0.05
+                        comp_after = float(max(z_desired[i] for i in range(K) if i != t_idx))
+                        z_desired[t_idx] = max(float(z0[t_idx]), comp_after + 1.45, 1.45)
+                    elif isinstance(self.field_def, BooleanField):
+                        sign = 1.0 if float(y[0]) >= 0.0 else -1.0
+                        z_desired[0] = sign * max(abs(float(z0[0])), 1.45)
+                    elif isinstance(self.field_def, MultiChoiceField):
+                        for i in range(K):
+                            sign = 1.0 if float(y[i]) >= 0.0 else -1.0
+                            z_desired[i] = sign * max(abs(float(z0[i])), 0.90)
+                    elif isinstance(self.field_def, ScoreField):
+                        z_desired[0] = float(y[0])
+                    if eff_reward_scale < 1.0:
+                        z_desired = z0 + eff_reward_scale * (z_desired - z0)
+                    y_des = z_desired - b0
+                    z_curr_dir = z0 - b0
+                    y_step = (((lam_f + g) * y_des - lam_f * z_curr_dir) / g).astype(f32_dt)
+                    if not bool(np.all(np.isfinite(y_step))):
+                        raise ValueError("online_update target adjustment overflows float32")
+
+            if v is None:
+                v = P_cand @ x_step
+            denom = float(lam_f + float(x_step @ v))
+            if denom <= 1e-12 or not math.isfinite(denom):
+                # Degenerate input or numerical singularity: preserve internal state
+                return (time.perf_counter() - t0) * 1000.0
+            inv_denom_f32 = np.float32(1.0 / denom)
+            if not bool(np.isfinite(inv_denom_f32)):
+                return (time.perf_counter() - t0) * 1000.0
+
+            # Staged rank-1 P update using preallocated scratch buffer
+            if self._p_tmp_buf is None or self._p_tmp_buf.shape != P_cand.shape or self._p_tmp_buf.dtype != P_cand.dtype:
+                self._p_tmp_buf = np.empty_like(P_cand)
+            buf = self._p_tmp_buf
+            np.multiply.outer(v, v, out=buf)
+            buf *= inv_denom_f32
+            P_cand -= buf
+            if lam_f != 1.0:
+                P_cand *= inv_lam_f32
+
+            # Staged cross-covariance update: B_{t+1} = lam_f * B_t + x y^T
+            if lam_f != 1.0:
+                B_cand *= lam_f32
+            if self._b_tmp_buf is None or self._b_tmp_buf.shape != B_cand.shape or self._b_tmp_buf.dtype != B_cand.dtype:
+                self._b_tmp_buf = np.empty_like(B_cand)
+            np.multiply.outer(x_step, y_step, out=self._b_tmp_buf)
+            B_cand += self._b_tmp_buf
+            if not (bool(np.all(np.isfinite(P_cand))) and bool(np.all(np.isfinite(B_cand)))):
+                raise ValueError("Covariance update P/B overflowed float32 in online_update")
+
+            # Covariance bounding via diagonal view: prevent covariance windup along unexcited directions
+            p_diag = P_cand.diagonal()
+            p_max = float(50.0 / max(1e-4, eff_reg))
+            max_d = float(np.max(p_diag))
+            clamped = False
+            if max_d > p_max and max_d > 0.0:
+                scale = np.float32(p_max / max_d)
+                inv_scale = np.float32(1.0 / float(scale)) if float(scale) > 0.0 else np.float32(np.inf)
+                if not (bool(np.isfinite(scale)) and bool(np.isfinite(inv_scale))):
+                    raise ValueError("Covariance rescaling factor overflowed float32 in online_update")
+                P_cand *= scale
+                B_cand *= inv_scale
+                clamped = True
+
+            # Enforce strict positive-definiteness on diagonal against floating-point drift
+            if float(np.min(p_diag)) < 1e-6:
+                idx = np.arange(P_cand.shape[0])
+                small = p_diag < 1e-6
+                P_cand[idx[small], idx[small]] = np.float32(1e-6)
+                clamped = True
+
+            if not (bool(np.all(np.isfinite(P_cand))) and bool(np.all(np.isfinite(B_cand)))):
+                raise ValueError("Covariance matrices P/B overflowed float32 after bounding in online_update")
+
+            # Exact O(D*K) Sherman-Morrison weight update when un-clamped
+            if not clamped:
+                if z_curr_dir is not None and x_step[D] == 0.0:
+                    z_curr = z_curr_dir.astype(f32_dt)
+                else:
+                    z_curr = self.weights @ x_step[:D]
+                    if x_step[D] != 0.0:
+                        z_curr = z_curr + self.biases * x_step[D]
+                gain = (v * inv_denom_f32).astype(f32_dt)
+                err = (y_step - z_curr).astype(f32_dt)
+                new_W = self.weights + np.multiply.outer(err, gain[:D])
+                if gain[D] != 0.0:
+                    b_curr = np.broadcast_to(self.biases.reshape(-1), (K,))
+                    new_b = b_curr + err * gain[D]
+                else:
+                    new_b = self.biases
+            else:
+                P_cand[:] = np.float32(0.5) * (P_cand + P_cand.T)
+                W_aug = (P_cand @ B_cand).T
+                new_W = W_aug[:, :D].astype(f32_dt)
+                new_b = W_aug[:, D].astype(f32_dt)
+
+            new_W_f32 = _preserve_2d_layout_update(self.weights, new_W)
+            new_b_f32 = np.asarray(new_b, dtype=f32_dt)
+            if not (bool(np.all(np.isfinite(new_W_f32))) and bool(np.all(np.isfinite(new_b_f32)))):
+                raise ValueError("Updated head weights/biases overflow float32 in online_update")
+
+            # Stage hierarchical router update before committing any state
+            new_cw_h: Optional[np.ndarray] = None
+            new_fw_h: Optional[np.ndarray] = None
+            if is_hier_update and cw_h is not None and cb_h is not None:
+                target_k_h = int(np.argmax(y))
+                if 0 <= target_k_h < K and float(y[target_k_h]) > 0.0:
+                    target_c = assign_h[target_k_h]
+                    if 0 <= target_c < cw_h.shape[0]:
+                        x_feat = x[:D]
+                        c_logits = cw_h @ x_feat + cb_h
+                        if not bool(np.all(np.isfinite(c_logits))):
+                            raise ValueError("Hierarchical coarse logits overflowed in online_update")
+                        err_c = np.zeros_like(c_logits)
+                        if c_logits[target_c] < 1.2:
+                            err_c[target_c] = 1.2 - c_logits[target_c]
+                        for c_idx in range(len(c_logits)):
+                            if c_idx != target_c and c_logits[c_idx] > 0.1:
+                                err_c[c_idx] = -0.1 - c_logits[c_idx]
+                        step = float(min(0.35, 1.0 / max(1.0, float(x_feat @ x_feat))))
+                        cw_cand = _preserve_2d_layout_update(
+                            cw_h, (cw_h + step * np.outer(err_c, x_feat)).astype(f32_dt)
                         )
-                    elif eff_reward_scale >= 0.5 and isinstance(self.projector, DeterministicSemanticProjector):
-                        if self._online_shots_p is None or getattr(self, "_online_shots_are_pseudo", False):
-                            self._online_shots_p = [[] for _ in range(K)]
-                            self._online_shots_c = [[] for _ in range(K)]
-                            self._online_shots_are_pseudo = False
-                        xp = x[:D].copy()
-                        np_norm = float(np.linalg.norm(xp))
-                        if np_norm > 1e-12:
-                            self._online_shots_p[target_k].append((xp / np_norm).astype(np.float32))
-                            self._shots_p_raw = None
-                            self._shots_p_row_ids = ()
-                        if (concept_embedding is not None or prompt is not None) and self._exemplar_projector is not None:
-                            xc = (
-                                concept_embedding
-                                if concept_embedding is not None
-                                else self._exemplar_projector._project_concept_aware(prompt or "")
+                        if not bool(np.all(np.isfinite(cw_cand))):
+                            raise ValueError("Updated hierarchical coarse_weights overflowed float32")
+                        new_cw_h = cw_cand
+                        if fw_h is not None and fb_h is not None:
+                            f_logits = fw_h @ x_feat + fb_h
+                            if not bool(np.all(np.isfinite(f_logits))):
+                                raise ValueError("Hierarchical fine logits overflowed in online_update")
+                            err_f = np.zeros_like(f_logits)
+                            if f_logits[target_k_h] < 1.5:
+                                err_f[target_k_h] = 1.5 - f_logits[target_k_h]
+                            for k_idx in range(K):
+                                if k_idx != target_k_h and f_logits[k_idx] > 0.1:
+                                    err_f[k_idx] = -0.1 - f_logits[k_idx]
+                            fw_cand = _preserve_2d_layout_update(
+                                fw_h, (fw_h + step * np.outer(err_f, x_feat)).astype(f32_dt)
                             )
-                            nc_norm = float(np.linalg.norm(xc))
-                            if nc_norm > 1e-12:
-                                self._online_shots_c[target_k].append((xc / nc_norm).astype(np.float32))
-                                self._shots_c_raw = None
-                                self._shots_c_row_ids = ()
+                            if not bool(np.all(np.isfinite(fw_cand))):
+                                raise ValueError("Updated hierarchical fine_weights overflowed float32")
+                            new_fw_h = fw_cand
 
-        # Also update coarse cluster router and fine cluster specialist weights if hierarchical routing is active
-        if is_hier_update and cw_h is not None and cb_h is not None:
-            target_k = int(np.argmax(y))
-            if 0 <= target_k < K and float(y[target_k]) > 0.0:
-                target_c = assign_h[target_k]
-                if 0 <= target_c < cw_h.shape[0]:
-                    x_feat = x[:D]
-                    c_logits = cw_h @ x_feat + cb_h
-                    err_c = np.zeros_like(c_logits)
-                    if c_logits[target_c] < 1.2:
-                        err_c[target_c] = 1.2 - c_logits[target_c]
-                    for c_idx in range(len(c_logits)):
-                        if c_idx != target_c and c_logits[c_idx] > 0.1:
-                            err_c[c_idx] = -0.1 - c_logits[c_idx]
-                    step = float(min(0.35, 1.0 / max(1.0, float(x_feat @ x_feat))))
-                    self.coarse_weights = _preserve_2d_layout_update(
-                        cw_h, (cw_h + step * np.outer(err_c, x_feat)).astype(np.float32)
-                    )
-                    if fw_h is not None and fb_h is not None:
-                        f_logits = fw_h @ x_feat + fb_h
-                        err_f = np.zeros_like(f_logits)
-                        if f_logits[target_k] < 1.5:
-                            err_f[target_k] = 1.5 - f_logits[target_k]
-                        for k_idx in range(K):
-                            if k_idx != target_k and f_logits[k_idx] > 0.1:
-                                err_f[k_idx] = -0.1 - f_logits[k_idx]
-                        self.fine_weights = _preserve_2d_layout_update(
-                            fw_h, (fw_h + step * np.outer(err_f, x_feat)).astype(np.float32)
-                        )
+        snap = self._snapshot_state()
+        try:
+            self.regularization = eff_reg
+            if (
+                self.covariance_inv is not None
+                and self.covariance_inv.flags.writeable
+                and self.covariance_inv.dtype == P_cand.dtype
+                and self.covariance_inv.shape == P_cand.shape
+            ):
+                np.copyto(self.covariance_inv, P_cand)
+            else:
+                self.covariance_inv = P_cand
+            if (
+                self.cross_covariance is not None
+                and self.cross_covariance.flags.writeable
+                and self.cross_covariance.dtype == B_cand.dtype
+                and self.cross_covariance.shape == B_cand.shape
+            ):
+                np.copyto(self.cross_covariance, B_cand)
+            else:
+                self.cross_covariance = B_cand
 
-        new_W = _preserve_2d_layout_update(self.weights, new_W)
-        # Atomic commit (preserve _exemplar_bank across online updates)
-        self.set_weights(new_W, new_b, clear_exemplar_bank=False)
+            # Update live cold-start exemplar bank if active
+            if not self.hierarchical and isinstance(self.field_def, ChoiceField):
+                if self._exemplar_bank is not None:
+                    target_k = int(np.argmax(y))
+                    if 0 <= target_k < K and float(y[target_k]) > 0.0:
+                        if K <= 8:
+                            self._update_exemplar_bank_entry(
+                                x[:D],
+                                target_k,
+                                prompt=prompt,
+                                blend_rate=(0.35 if preserve_calibration else 0.28) * eff_reward_scale,
+                                attenuate_competitors=(eff_reward_scale >= 0.5),
+                                concept_embedding=ce_arr,
+                            )
+                        elif eff_reward_scale >= 0.5 and isinstance(self.projector, DeterministicSemanticProjector):
+                            if self._online_shots_p is None or getattr(self, "_online_shots_are_pseudo", False):
+                                self._online_shots_p = [[] for _ in range(K)]
+                                self._online_shots_c = [[] for _ in range(K)]
+                                self._online_shots_are_pseudo = False
+                            xp = x[:D].copy()
+                            np_norm = float(np.linalg.norm(xp))
+                            if np_norm > 1e-12:
+                                self._online_shots_p[target_k].append((xp / np_norm).astype(f32_dt))
+                                self._shots_p_raw = None
+                                self._shots_p_row_ids = ()
+                            if (ce_arr is not None or prompt is not None) and self._exemplar_projector is not None:
+                                xc = (
+                                    ce_arr
+                                    if ce_arr is not None
+                                    else self._exemplar_projector._project_concept_aware(prompt or "")
+                                )
+                                nc_norm = float(np.linalg.norm(xc))
+                                if nc_norm > 1e-12:
+                                    self._online_shots_c[target_k].append((xc / nc_norm).astype(f32_dt))
+                                    self._shots_c_raw = None
+                                    self._shots_c_row_ids = ()
+
+            if new_cw_h is not None:
+                self.coarse_weights = new_cw_h
+            if new_fw_h is not None:
+                self.fine_weights = new_fw_h
+
+            # Atomic commit (preserve _exemplar_bank across online updates)
+            self.set_weights(new_W_f32, new_b_f32, clear_exemplar_bank=False)
+        except BaseException:
+            self._restore_state(snap)
+            raise
         return (time.perf_counter() - t0) * 1000.0
 
     def evaluate_logits(self, logits: np.ndarray) -> RawFieldEvaluation:
@@ -2973,8 +3230,13 @@ class DecisionFieldHead:
         concept_embedding: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Compute raw logits (including two-stage coarse-to-fine routing when active)."""
-        w_cur = np.asarray(self.weights)
-        b_cur = np.asarray(self.biases)
+        is_scalar_head = isinstance(self.field_def, (BooleanField, ScoreField))
+        w_cur = _coerce_inference_array_f32_or_f64(
+            self.weights, "Head weights", active_first_only=is_scalar_head
+        )
+        b_cur = _coerce_inference_array_f32_or_f64(
+            self.biases, "Head biases", active_first_only=is_scalar_head
+        )
         _validate_head_weight_bias_shapes(
             self.field_def,
             w_cur,
@@ -3002,7 +3264,7 @@ class DecisionFieldHead:
             logits = np.array(mx_logits)
         else:
             with np.errstate(over="ignore", invalid="ignore"):
-                logits = emb @ self.weights.T + self.biases
+                logits = emb @ w_cur.T + b_cur
                 if self._exemplar_bank is not None and not self.hierarchical:
                     w_cons, sub_banks = self._exemplar_bank
                     if concept_embedding is not None:
@@ -3344,21 +3606,31 @@ class SystemOneModel:
                 else None
             )
 
-            for f_name, target_val in target_dict.items():
-                if f_name in self.heads:
-                    head = self.heads[f_name]
-                    y_target = head.format_target_vector(target_val)
-                    dt = head.online_update(
-                        x_aug,
-                        y_target,
-                        forgetting_factor=eff_ff,
-                        prompt=prompt_for_head,
-                        preserve_calibration=preserve_calibration,
-                        reward_scale=reward_scale,
-                        concept_embedding=c_emb,
-                    )
-                    update_durations_ms.append(dt)
-                    updated_fields.append(f_name)
+            head_snaps = {
+                f_name: self.heads[f_name]._snapshot_state()
+                for f_name in target_dict
+                if f_name in self.heads and hasattr(self.heads[f_name], "_snapshot_state")
+            }
+            try:
+                for f_name, target_val in target_dict.items():
+                    if f_name in self.heads:
+                        head = self.heads[f_name]
+                        y_target = head.format_target_vector(target_val)
+                        dt = head.online_update(
+                            x_aug,
+                            y_target,
+                            forgetting_factor=eff_ff,
+                            prompt=prompt_for_head,
+                            preserve_calibration=preserve_calibration,
+                            reward_scale=reward_scale,
+                            concept_embedding=c_emb,
+                        )
+                        update_durations_ms.append(dt)
+                        updated_fields.append(f_name)
+            except BaseException:
+                for snap_head_name, snap in head_snaps.items():
+                    self.heads[snap_head_name]._restore_state(snap)
+                raise
 
             rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
             total_ms = (time.perf_counter() - t0) * 1000.0

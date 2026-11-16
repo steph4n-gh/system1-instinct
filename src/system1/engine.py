@@ -59,6 +59,7 @@ from system1.core.model import (
     FastDecisionCallable,
     PackedMultiQuestionKernel,
     _accepts_recency_weighted,
+    _coerce_inference_array_f32_or_f64,
     _compute_engine_inference_signature,
     _compute_hierarchical_logits_np,
     _encode_projector_one,
@@ -76,10 +77,12 @@ from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
 from system1.core.schema import (
     _f64_to_exact_2m1074,
     _score_abs_diff_clamped,
+    _score_abs_diff_exact_2m1074,
     _score_from_unit_prob,
     _score_full_span_clamped,
     _score_half_span,
     _score_interval_bounds,
+    _score_mae_from_int_sum,
     _score_normalized_margin,
     _score_to_unit_ratio,
     _score_within_rel_tolerance,
@@ -1836,8 +1839,7 @@ class SystemOneEngine:
                             covered_i = (lo_v - str_slack) <= float(gt_val) <= (hi_v + str_slack)
                         except (ValueError, IndexError):
                             covered_i = False
-                    abs_err = _score_abs_diff_clamped(float(pred_val), float(gt_val))
-                    f_mae_int_sum += _f64_to_exact_2m1074(abs_err)
+                    f_mae_int_sum += _score_abs_diff_exact_2m1074(float(pred_val), float(gt_val))
                     correct_i = _score_within_rel_tolerance(
                         float(pred_val),
                         float(gt_val),
@@ -1953,7 +1955,7 @@ class SystemOneEngine:
                 abstain_rate=f_abs_rate,
                 unfamiliar_rate=f_unf_rate,
                 abstention_reasons=f_reasons,
-                mae=float(f_mae_int_sum / (n_f << 1074)) if (isinstance(f_def, ScoreField) and n_f > 0) else 0.0,
+                mae=_score_mae_from_int_sum(f_mae_int_sum, n_f) if (isinstance(f_def, ScoreField) and n_f > 0) else 0.0,
             )
 
             total_field_evals += n_f
@@ -3119,38 +3121,66 @@ class SystemOneEngine:
                     else None
                 )
                 heads_dict = getattr(self.model, "_field_heads", getattr(self.model, "heads", {}))
-                for f_name, target_val in target_dict.items():
-                    if f_name in heads_dict:
-                        head = heads_dict[f_name]
-                        if hasattr(head, "format_target_vector") and hasattr(head, "online_update"):
-                            y_target = head.format_target_vector(target_val)
-                            if is_zero_emb:
-                                dt = 0.0
-                                if norm_key is not None and eff_reward_scale >= 0.5:
-                                    if not hasattr(self, "_learned_prompt_overrides"):
-                                        self._learned_prompt_overrides = {}
-                                    if not hasattr(self, "_learned_prompt_override_recency"):
-                                        self._learned_prompt_override_recency = {}
-                                    self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
-                                        self.schema.fields[f_name].validate_value(target_val)
-                                    )
-                                    self._learned_prompt_override_recency[norm_key] = bool(recency_weighted)
-                            else:
-                                try:
-                                    dt = head.online_update(
-                                        x_aug,
-                                        y_target,
-                                        forgetting_factor=eff_forgetting,
-                                        preserve_calibration=preserve_calibration,
-                                        reward_scale=eff_reward_scale,
-                                    )
-                                except TypeError:
+                head_snaps = {
+                    fn: heads_dict[fn]._snapshot_state()
+                    for fn in target_dict
+                    if fn in heads_dict and hasattr(heads_dict[fn], "_snapshot_state")
+                }
+                has_ov = hasattr(self, "_learned_prompt_overrides")
+                ov_snap = (
+                    {k: dict(v) for k, v in self._learned_prompt_overrides.items()}
+                    if has_ov
+                    else None
+                )
+                has_ov_rec = hasattr(self, "_learned_prompt_override_recency")
+                ov_rec_snap = dict(self._learned_prompt_override_recency) if has_ov_rec else None
+                try:
+                    for f_name, target_val in target_dict.items():
+                        if f_name in heads_dict:
+                            head = heads_dict[f_name]
+                            if hasattr(head, "format_target_vector") and hasattr(head, "online_update"):
+                                y_target = head.format_target_vector(target_val)
+                                if is_zero_emb:
+                                    dt = 0.0
+                                    if norm_key is not None and eff_reward_scale >= 0.5:
+                                        if not hasattr(self, "_learned_prompt_overrides"):
+                                            self._learned_prompt_overrides = {}
+                                        if not hasattr(self, "_learned_prompt_override_recency"):
+                                            self._learned_prompt_override_recency = {}
+                                        self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
+                                            self.schema.fields[f_name].validate_value(target_val)
+                                        )
+                                        self._learned_prompt_override_recency[norm_key] = bool(recency_weighted)
+                                else:
                                     try:
-                                        dt = head.online_update(x_aug, y_target, forgetting_factor=eff_forgetting)
+                                        dt = head.online_update(
+                                            x_aug,
+                                            y_target,
+                                            forgetting_factor=eff_forgetting,
+                                            preserve_calibration=preserve_calibration,
+                                            reward_scale=eff_reward_scale,
+                                        )
                                     except TypeError:
-                                        dt = head.online_update(x_aug, y_target)
-                            update_durations_ms.append(dt)
-                            updated_fields.append(f_name)
+                                        try:
+                                            dt = head.online_update(x_aug, y_target, forgetting_factor=eff_forgetting)
+                                        except TypeError:
+                                            dt = head.online_update(x_aug, y_target)
+                                update_durations_ms.append(dt)
+                                updated_fields.append(f_name)
+                except BaseException:
+                    for fn, snap in head_snaps.items():
+                        heads_dict[fn]._restore_state(snap)
+                    if has_ov and ov_snap is not None:
+                        self._learned_prompt_overrides.clear()
+                        self._learned_prompt_overrides.update(ov_snap)
+                    elif hasattr(self, "_learned_prompt_overrides"):
+                        delattr(self, "_learned_prompt_overrides")
+                    if has_ov_rec and ov_rec_snap is not None:
+                        self._learned_prompt_override_recency.clear()
+                        self._learned_prompt_override_recency.update(ov_rec_snap)
+                    elif hasattr(self, "_learned_prompt_override_recency"):
+                        delattr(self, "_learned_prompt_override_recency")
+                    raise
 
                 rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
 
@@ -4170,6 +4200,12 @@ class SystemOneEngine:
                 raw_w_arr = np.asarray(head.weights)
                 raw_b_arr = np.asarray(head.biases)
                 _validate_head_weight_bias_shapes(f_def, raw_w_arr, raw_b_arr, self.dimension, fname)
+                raw_w_arr = _coerce_inference_array_f32_or_f64(
+                    raw_w_arr, f"Field head {fname!r} weights", active_first_only=is_bool
+                )
+                raw_b_arr = _coerce_inference_array_f32_or_f64(
+                    raw_b_arr, f"Field head {fname!r} biases", active_first_only=is_bool
+                )
                 _validate_2d_layout_cloneable(
                     raw_w_arr,
                     np.dtype(raw_w_arr.dtype if raw_w_arr.dtype in (np.float32, np.float64) else np.float32),
@@ -4202,8 +4238,12 @@ class SystemOneEngine:
                         raise ValueError(
                             f"Field head {fname!r} hierarchical weights missing coarse_weights/coarse_biases"
                         )
-                    raw_coarse_w = np.asarray(head.coarse_weights)
-                    raw_coarse_b = np.asarray(head.coarse_biases)
+                    raw_coarse_w = _coerce_inference_array_f32_or_f64(
+                        head.coarse_weights, f"Field head {fname!r} hierarchical coarse weights"
+                    )
+                    raw_coarse_b = _coerce_inference_array_f32_or_f64(
+                        head.coarse_biases, f"Field head {fname!r} hierarchical coarse biases"
+                    )
                     if raw_coarse_b.ndim != 1:
                         raise ValueError(f"Field head {fname!r} coarse_biases must be 1D, got shape {raw_coarse_b.shape}")
                     if not (np.all(np.isfinite(raw_coarse_w)) and np.all(np.isfinite(raw_coarse_b))):
@@ -4222,7 +4262,7 @@ class SystemOneEngine:
                         )
                     ):
                         raise ValueError(f"Field head {fname!r} has invalid hierarchical cluster configuration")
-                    _validate_2d_layout_cloneable(raw_coarse_w, np.dtype(np.float32))
+                    _validate_2d_layout_cloneable(raw_coarse_w, np.dtype(raw_coarse_w.dtype))
                     has_fw = getattr(head, "fine_weights", None) is not None
                     has_fb = getattr(head, "fine_biases", None) is not None
                     if has_fw != has_fb:
@@ -4230,8 +4270,12 @@ class SystemOneEngine:
                             f"Field head {fname!r} fine_weights and fine_biases must both be provided or both be None"
                         )
                     if has_fw and has_fb:
-                        raw_fine_w = np.asarray(head.fine_weights)
-                        raw_fine_b = np.asarray(head.fine_biases)
+                        raw_fine_w = _coerce_inference_array_f32_or_f64(
+                            head.fine_weights, f"Field head {fname!r} hierarchical fine weights"
+                        )
+                        raw_fine_b = _coerce_inference_array_f32_or_f64(
+                            head.fine_biases, f"Field head {fname!r} hierarchical fine biases"
+                        )
                         if raw_fine_b.ndim != 1:
                             raise ValueError(f"Field head {fname!r} fine_biases must be 1D, got shape {raw_fine_b.shape}")
                         if (
@@ -4240,27 +4284,13 @@ class SystemOneEngine:
                             or raw_fine_b.shape != (raw_w_arr.shape[0],)
                         ):
                             raise ValueError(f"Field head {fname!r} hierarchical fine tensor shape mismatch")
-                        _validate_2d_layout_cloneable(raw_fine_w, np.dtype(np.float32))
+                        _validate_2d_layout_cloneable(raw_fine_w, np.dtype(raw_fine_w.dtype))
                         if not (np.all(np.isfinite(raw_fine_w)) and np.all(np.isfinite(raw_fine_b))):
                             raise ValueError(f"Field head {fname!r} contains non-finite hierarchical fine weights")
-                    with np.errstate(over="ignore", invalid="ignore"):
-                        if raw_coarse_w.dtype not in (np.float32, np.float64):
-                            raw_coarse_w = raw_coarse_w.astype(np.float32)
-                        if raw_coarse_b.dtype not in (np.float32, np.float64):
-                            raw_coarse_b = raw_coarse_b.astype(np.float32)
-                        coarse_w = np.asarray(raw_coarse_w, dtype=np.float32)
-                        coarse_b = np.asarray(raw_coarse_b, dtype=np.float32)
-                        if not (bool(np.all(np.isfinite(coarse_w))) and bool(np.all(np.isfinite(coarse_b)))):
-                            raise ValueError(f"Field head {fname!r} hierarchical coarse weights overflow float32")
-                        if raw_fine_w is not None and raw_fine_b is not None:
-                            if raw_fine_w.dtype not in (np.float32, np.float64):
-                                raw_fine_w = raw_fine_w.astype(np.float32)
-                            if raw_fine_b.dtype not in (np.float32, np.float64):
-                                raw_fine_b = raw_fine_b.astype(np.float32)
-                            fine_w = np.asarray(raw_fine_w, dtype=np.float32)
-                            fine_b = np.asarray(raw_fine_b, dtype=np.float32)
-                            if not (bool(np.all(np.isfinite(fine_w))) and bool(np.all(np.isfinite(fine_b)))):
-                                raise ValueError(f"Field head {fname!r} hierarchical fine weights overflow float32")
+                    coarse_w = raw_coarse_w
+                    coarse_b = raw_coarse_b
+                    fine_w = raw_fine_w
+                    fine_b = raw_fine_b
 
                 fam_t = max(
                     float(getattr(head, "familiarity_threshold", 0.0)),

@@ -13981,7 +13981,7 @@ def test_astra_36_round23_regressions() -> None:
     assert cm8_learned.heads["f"].fine_weights.strides == fw_init8.strides
 
 
-def test_astra_37_round24_regressions(tmp_path: Path) -> None:
+def test_astra_37_round24_regressions() -> None:
     """Round-24 regressions R24-1..R24-8 across incomplete hierarchy, v2 class-score budget, subnormal Score math, wide-score MAE/RMSE, online exemplar/shot strides, post-cast exemplar/cov overflow, FastExplainer raw_b length, and atomic online_update validation."""
     import json
     import math
@@ -14179,7 +14179,9 @@ def test_astra_37_round24_regressions(tmp_path: Path) -> None:
         )
         assert lc3._values_match({"f": -s_ulp}, {"f": s_ulp}) is False
         assert lc3._values_match({"f": -s_ulp}, {"f": -s_ulp}) is True
-        sess3 = TeachingSession(tmp_path / "teach_sub", _R24SubnormalScore)
+        sess3 = TeachingSession.__new__(TeachingSession)
+        sess3.schema = _R24SubnormalScore()
+        sess3.field_name = "f"
         out3 = sess3._score_field_outcome(
             "f",
             sess3.schema.fields["f"],
@@ -14205,7 +14207,9 @@ def test_astra_37_round24_regressions(tmp_path: Path) -> None:
             assert rep4.fields["f"].mae == pytest.approx(sys.float_info.max, rel=1e-12)
             assert json.dumps(rep4.to_dict(), allow_nan=False)
 
-        sess4 = TeachingSession(tmp_path / "teach_wide", _R24WideScore)
+        sess4 = TeachingSession.__new__(TeachingSession)
+        sess4.schema = _R24WideScore()
+        sess4.field_name = "f"
         sum4 = sess4._summarize_field_metrics(
             "f",
             sess4.schema.fields["f"],
@@ -14364,3 +14368,358 @@ def test_astra_37_round24_regressions(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         cm8.learn_from_tier2("probe", {"f": "a"})
     assert cm8.model_version == ver_before8
+
+
+
+def test_astra_38_round25_regressions() -> None:
+    """Round-25 regressions R25-1..R25-6 across transactional multi-field learning, staged online_update/concept_embedding, exact subnormal tolerance, unsaturated Score MAE/RMSE, float64 hierarchical parity, and inclusive Score buckets."""
+    import math
+    import sys
+    import warnings
+    import numpy as np
+    import pytest
+
+    from system1 import (
+        ChoiceField,
+        DecisionSchema,
+        GuardShield,
+        ScoreField,
+        SystemOneEngine,
+    )
+    from system1.core.schema import _score_within_rel_tolerance
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.teaching import TeachingSession
+
+    class _R25Pair(DecisionSchema):
+        first = ChoiceField(options=("a", "b"))
+        second = ChoiceField(options=("a", "b"))
+
+    class _R25Choice2(DecisionSchema):
+        f = ChoiceField(options=("safe", "unsafe"))
+
+    def _fresh(schema_cls: Any, dim: int = 16, **kw: Any) -> SystemOneEngine:
+        e = SystemOneEngine(
+            schema_cls,
+            dimension=dim,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=kw.pop("use_cache", False),
+            strict_mode=kw.pop("strict_mode", False),
+            **kw,
+        )
+        for h in e.model.heads.values():
+            h.set_weights(np.zeros_like(h.weights), np.zeros_like(h.biases))
+        return e
+
+    def _in_mem_teach(schema_cls: Any, fname: str = "f") -> TeachingSession:
+        sess = TeachingSession.__new__(TeachingSession)
+        sess.schema = schema_cls()
+        sess.field_name = fname
+        return sess
+
+    # ------------------------------------------------------------------
+    # R25-1: Multi-field learn_from_tier2 / learn rolls back earlier fields,
+    # overrides, init_covariance, and cache cleanly on downstream failure.
+    # ------------------------------------------------------------------
+    emb1 = np.ones(16, dtype="f4")
+    for pres_cal in (False, True):
+        cm1 = _fresh(_R25Pair, 16, use_cache=True).to_compiled_model()
+        cm1.use_cache = True
+        cached1 = cm1.forward_single("p", embedding=emb1).fields["first"].raw_probabilities.copy()
+        w1_0 = cm1.heads["first"].weights.copy()
+        w1_live0 = cm1._field_heads["first"].weights.copy()
+        ver1_0 = cm1.model_version
+        cm1._field_heads["second"].hierarchical = True
+
+        with pytest.raises(ValueError):
+            cm1.learn_from_tier2(
+                "p",
+                {"first": "b", "second": "a"},
+                embedding=emb1,
+                preserve_calibration=pres_cal,
+            )
+        assert cm1.model_version == ver1_0
+        assert np.array_equal(cm1.heads["first"].weights, w1_0)
+        assert np.array_equal(cm1._field_heads["first"].weights, w1_live0)
+        assert cm1._field_heads["first"].covariance_inv is None
+        assert cm1.heads["first"].P is None
+        assert np.array_equal(cm1.forward_single("p", embedding=emb1).fields["first"].raw_probabilities, cached1)
+        assert np.array_equal(cm1._field_heads["first"].forward(emb1).raw_probabilities, cached1)
+
+    cm1_ov = _fresh(_R25Pair, 16, use_cache=True).to_compiled_model()
+    cm1_ov._field_heads["second"].hierarchical = True
+    with pytest.raises(ValueError):
+        cm1_ov.learn_from_tier2(
+            "override probe",
+            {"first": "b", "second": "a"},
+            embedding=np.zeros(16, dtype="f4"),
+            preserve_calibration=True,
+        )
+    assert cm1_ov._learned_prompt_overrides == {}
+    assert cm1_ov._learned_prompt_override_recency == {}
+
+    e1_sys = _fresh(_R25Pair, 16, use_cache=False)
+    w_s1_0 = e1_sys.model.heads["first"].weights.copy()
+    v_s1_0 = e1_sys.model_version
+    e1_sys.model.heads["second"].hierarchical = True
+    with pytest.raises(ValueError):
+        e1_sys.learn("p", {"first": "b", "second": "a"}, embedding=emb1)
+    assert e1_sys.model_version == v_s1_0
+    assert np.array_equal(e1_sys.model.heads["first"].weights, w_s1_0)
+    assert e1_sys.model.heads["first"].covariance_inv is None
+
+    # ------------------------------------------------------------------
+    # R25-2: online_update stages covariance & weights atomically (tiny
+    # forgetting_factor, covariance overflow, and 2D (16, 1) concept_embedding).
+    # ------------------------------------------------------------------
+    h2 = _fresh(_R25Choice2, 16).model.heads["f"]
+    h2.init_covariance()
+    p2_0 = h2.covariance_inv.copy()
+    b2_0 = h2.cross_covariance.copy()
+    w2_0 = h2.weights.copy()
+
+    for w_mode in ("always", "error"):
+        with warnings.catch_warnings(record=True) as caught_2:
+            warnings.simplefilter(w_mode, RuntimeWarning)
+            for bad_ff in (1e-45, 1e-46, True):
+                with pytest.raises(ValueError):
+                    h2.online_update(
+                        np.ones(16, dtype="f4"),
+                        np.array([1.0, 0.0], dtype="f4"),
+                        forgetting_factor=bad_ff,  # type: ignore[arg-type]
+                    )
+                assert np.array_equal(h2.covariance_inv, p2_0)
+                assert np.array_equal(h2.cross_covariance, b2_0)
+                assert np.array_equal(h2.weights, w2_0)
+                assert bool(np.all(np.isfinite(h2.covariance_inv)))
+                assert bool(np.all(np.isfinite(h2.cross_covariance)))
+        if w_mode == "always":
+            assert not any(issubclass(w.category, RuntimeWarning) for w in caught_2)
+
+    h2_none = _fresh(_R25Choice2, 16).model.heads["f"]
+    with pytest.raises(ValueError):
+        h2_none.online_update(
+            np.full(16, 1e18, dtype="f4"),
+            np.array([1e22, 0.0], dtype="f4"),
+        )
+    assert h2_none.covariance_inv is None
+    assert h2_none.cross_covariance is None
+
+    h2_ovf = _fresh(_R25Choice2, 16).model.heads["f"]
+    h2_ovf.init_covariance()
+    p_ovf0 = h2_ovf.covariance_inv.copy()
+    b_ovf0 = h2_ovf.cross_covariance.copy()
+    w_ovf0 = h2_ovf.weights.copy()
+    with pytest.raises(ValueError):
+        h2_ovf.online_update(
+            np.full(16, 1e18, dtype="f4"),
+            np.array([1e22, 0.0], dtype="f4"),
+        )
+    assert np.array_equal(h2_ovf.covariance_inv, p_ovf0)
+    assert np.array_equal(h2_ovf.cross_covariance, b_ovf0)
+    assert np.array_equal(h2_ovf.weights, w_ovf0)
+
+    for k2 in (2, 9):
+        k_schema = DecisionSchema(fields={"f": ChoiceField(options=tuple(str(i) for i in range(k2)))})
+        h2_ex = _fresh(k_schema, 16).model.heads["f"]
+        arrays2: Dict[str, Any] = {
+            "exemplar_centroids": np.zeros((k2, 16), dtype="f4"),
+            "exemplar_vectors": np.zeros((k2, 16), dtype="f4"),
+            "exemplar_mean": np.zeros(16, dtype="f4"),
+        }
+        counts2: Dict[str, List[int]] = {"exemplar_vectors": [1] * k2}
+        if k2 > 8:
+            arrays2["shots_p"] = np.zeros((k2, 16), dtype="f4")
+            arrays2["shots_c"] = np.zeros((k2, 16), dtype="f4")
+            counts2["shots_p"] = [1] * k2
+            counts2["shots_c"] = [1] * k2
+        h2_ex.restore_exemplar_state({"arrays": arrays2, "counts": counts2})
+        h2_ex.init_covariance()
+        targ2 = np.zeros(k2, dtype="f4")
+        targ2[0] = 1.0
+        dt2 = h2_ex.online_update(
+            np.ones(16, dtype="f4"),
+            targ2,
+            concept_embedding=np.ones((16, 1), dtype="f4"),
+        )
+        assert isinstance(dt2, float) and math.isfinite(dt2)
+        if k2 > 8 and h2_ex._online_shots_c is not None:
+            assert h2_ex._online_shots_c[0][-1].shape == (16,)
+        else:
+            h2_ex._update_exemplar_bank_entry(
+                np.ones(16, dtype="f4"),
+                0,
+                concept_embedding=np.ones((16, 1), dtype="f4"),
+            )
+        p_ex_ref = h2_ex.covariance_inv.copy()
+        b_ex_ref = h2_ex.cross_covariance.copy()
+        w_ex_ref = h2_ex.weights.copy()
+        bank_ex_ref = h2_ex._exemplar_bank[0].copy()
+        n_shots_before = len(h2_ex._online_shots_c[0]) if h2_ex._online_shots_c is not None else 0
+
+        for bad_ce in (np.ones((15, 1), dtype="f4"), np.array([float("nan")] * 16, dtype="f4")):
+            with pytest.raises(ValueError):
+                h2_ex.online_update(np.ones(16, dtype="f4"), targ2, concept_embedding=bad_ce)
+            assert np.array_equal(h2_ex.covariance_inv, p_ex_ref)
+            assert np.array_equal(h2_ex.cross_covariance, b_ex_ref)
+            assert np.array_equal(h2_ex.weights, w_ex_ref)
+            assert np.array_equal(h2_ex._exemplar_bank[0], bank_ex_ref)
+            if h2_ex._online_shots_c is not None:
+                assert len(h2_ex._online_shots_c[0]) == n_shots_before
+
+    # ------------------------------------------------------------------
+    # R25-3: Exact subnormal relative tolerance comparison without upward rounding.
+    # ------------------------------------------------------------------
+    u3 = math.ulp(0.0)
+    assert _score_within_rel_tolerance(3 * u3, 2 * u3, 0.0, 6 * u3, 0.1) is False
+    assert _score_within_rel_tolerance(3 * u3, 2 * u3, 0.0, 6 * u3, 0.15) is False
+    assert _score_within_rel_tolerance(3 * u3, 2 * u3, 0.0, 6 * u3, 0.2) is True
+
+    class _R25TinyScore(DecisionSchema):
+        f = ScoreField(min_value=0.0, max_value=6 * u3)
+
+    e3 = _fresh(_R25TinyScore, 16)
+    assert e3.decide("probe", record_receipt=False).values["f"] == 3 * u3
+    assert e3.evaluate([("probe", {"f": 2 * u3})]).fields["f"].accuracy == 0.0
+    lc3 = AutoCutoverLifecycle(_R25TinyScore, CutoverConfig(score_tolerance=0.1))
+    assert lc3._values_match({"f": 3 * u3}, {"f": 2 * u3}) is False
+    sess3 = _in_mem_teach(_R25TinyScore)
+    assert (
+        sess3._score_field_outcome(
+            "f",
+            sess3.schema.fields["f"],
+            e3.decide("probe", record_receipt=False),
+            2 * u3,
+        )["correct"]
+        is False
+    )
+
+    # ------------------------------------------------------------------
+    # R25-4: Unsaturated wide-score MAE & RMSE across mixed residuals.
+    # ------------------------------------------------------------------
+    class _R25WideScore(DecisionSchema):
+        f = ScoreField(min_value=-1e308, max_value=1e308)
+
+    e4 = _fresh(_R25WideScore, 16, strict_mode=True)
+    e4.model.heads["f"].set_weights(np.zeros((1, 16), dtype="f4"), np.array([100.0], dtype="f4"))
+    with warnings.catch_warnings(record=True) as caught_4:
+        warnings.simplefilter("always", RuntimeWarning)
+        rep4_mix = e4.evaluate([("p0", {"f": -1e308}), ("p1", {"f": 1e308})])
+        assert rep4_mix.fields["f"].mae == 1e308
+
+        sess4 = _in_mem_teach(_R25WideScore)
+        sum4_mix = sess4._summarize_field_metrics(
+            "f",
+            sess4.schema.fields["f"],
+            [{"input": "p0", "label": {"f": -1e308}}, {"input": "p1", "label": {"f": 1e308}}],
+            [{"predicted": 1e308, "review": False, "correct": i == 1, "prediction_set": []} for i in range(2)],
+        )
+        assert sum4_mix["mae"] == 1e308
+        assert sum4_mix["rmse"] == pytest.approx(math.sqrt(2.0) * 1e308, rel=1e-12)
+
+        rep4_ovf = e4.evaluate([("p0", {"f": -1e308})])
+        assert rep4_ovf.fields["f"].mae == sys.float_info.max
+        sum4_ovf = sess4._summarize_field_metrics(
+            "f",
+            sess4.schema.fields["f"],
+            [{"input": "p0", "label": {"f": -1e308}}],
+            [{"predicted": 1e308, "review": False, "correct": False, "prediction_set": []}],
+        )
+        assert sum4_ovf["mae"] == sys.float_info.max
+        assert sum4_ovf["rmse"] == sys.float_info.max
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_4)
+
+    # ------------------------------------------------------------------
+    # R25-5: Float64 hierarchical parity across decide, decide_batch, and GuardShield.
+    # ------------------------------------------------------------------
+    def _fresh_hier() -> Tuple[SystemOneEngine, Any]:
+        eh = _fresh(_R25Choice2, 16)
+        hh = eh.model.heads["f"]
+        hh.set_hierarchical_weights(
+            cluster_assignments=(0, 1),
+            coarse_weights=np.zeros((2, 16), dtype="f4"),
+            coarse_biases=np.zeros(2, dtype="f4"),
+            fine_weights=np.zeros((2, 16), dtype="f4"),
+            fine_biases=np.zeros(2, dtype="f4"),
+        )
+        return eh, hh
+
+    w1e40 = np.vstack([np.zeros((1, 16), dtype="f8"), np.full((1, 16), 1e40, dtype="f8")])
+    b1e40 = np.array([0.0, 1e40], dtype="f8")
+    with warnings.catch_warnings(record=True) as caught_5:
+        warnings.simplefilter("always", RuntimeWarning)
+        for attr5, val5, exp_lbl in (
+            ("coarse_biases", b1e40, "unsafe"),
+            ("fine_biases", b1e40, "unsafe"),
+            ("coarse_weights", w1e40, "safe"),
+            ("fine_weights", w1e40, "safe"),
+        ):
+            e5, h5 = _fresh_hier()
+            setattr(h5, attr5, val5)
+            d5 = e5.decide("probe", record_receipt=False)
+            b5 = e5.decide_batch(["probe"], record_receipt=False)[0]
+            g5 = GuardShield(e5, field_name="f", unsafe_label="unsafe").evaluate_single("probe")
+            assert d5.values["f"] == exp_lbl
+            assert b5.values["f"] == exp_lbl
+            assert g5.predicted_label == exp_lbl and g5.is_unsafe is (exp_lbl == "unsafe")
+
+        e5_huge, h5_huge = _fresh_hier()
+        h5_huge.coarse_biases = np.array([0.0, 1e308], dtype="f8")
+        d5_h = e5_huge.decide("probe", record_receipt=False)
+        b5_h = e5_huge.decide_batch(["probe"], record_receipt=False)[0]
+        g5_h = GuardShield(e5_huge, field_name="f", unsafe_label="unsafe").evaluate_single("probe")
+        assert d5_h.is_ambiguous is True and b5_h.is_ambiguous is True
+        assert d5_h.values["f"] == b5_h.values["f"]
+        assert g5_h.is_unsafe is True
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_5)
+
+    for bad_cb in (np.array([0.0, float("nan")], dtype="f8"), np.array([0, 10**50], dtype=object)):
+        e5_bad, h5_bad = _fresh_hier()
+        h5_bad.coarse_biases = bad_cb
+        with pytest.raises(ValueError):
+            e5_bad.decide("probe", record_receipt=False)
+        with pytest.raises(ValueError):
+            e5_bad.decide_batch(["probe"], record_receipt=False)
+        with pytest.raises(ValueError):
+            GuardShield(e5_bad, field_name="f", unsafe_label="unsafe")
+
+    # ------------------------------------------------------------------
+    # R25-6: Teaching diagnostics include max_value endpoint & cutover wide/subnormal key.
+    # ------------------------------------------------------------------
+    for lo6, hi6 in (
+        (1.0, math.nextafter(1.0, math.inf)),
+        (0.0, 6 * u3),
+        (-1e308, sys.float_info.max),
+    ):
+        schema6 = DecisionSchema(fields={"f": ScoreField(min_value=lo6, max_value=hi6)})
+        sess6 = TeachingSession.__new__(TeachingSession)
+        sess6.schema = schema6
+        sess6.field_name = "f"
+        with warnings.catch_warnings(record=True) as caught_6:
+            warnings.simplefilter("always", RuntimeWarning)
+            m6 = sess6._summarize_field_metrics(
+                "f",
+                schema6.fields["f"],
+                [{"input": "p0", "label": {"f": lo6}}, {"input": "p1", "label": {"f": hi6}}],
+                [
+                    {"predicted": lo6, "review": False, "correct": True, "prediction_set": []},
+                    {"predicted": hi6, "review": False, "correct": True, "prediction_set": []},
+                ],
+            )
+            m6_hi = sess6._summarize_field_metrics(
+                "f",
+                schema6.fields["f"],
+                [{"input": "p1", "label": {"f": hi6}}],
+                [{"predicted": hi6, "review": False, "correct": True, "prediction_set": []}],
+            )
+            lc6 = AutoCutoverLifecycle(schema6)
+            assert lc6._primary_label_key({"f": lo6}) == "bin_0"
+            assert lc6._primary_label_key({"f": hi6}) == "bin_3"
+        assert not any(issubclass(w.category, RuntimeWarning) for w in caught_6)
+        assert m6["count"] == 2
+        assert m6["per_class"]["high"]["count"] == 1
+        assert sum(v["count"] for v in m6["per_class"].values()) == 2
+        assert m6_hi["count"] == 1
+        assert m6_hi["per_class"]["high"]["count"] == 1
+        if lo6 != 1.0:
+            assert m6["per_class"]["low"]["count"] == 1
