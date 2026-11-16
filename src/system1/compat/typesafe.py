@@ -45,6 +45,7 @@ from typing import (
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import numpy as np
 
+from system1.cutover import _bind_active_canary_tx
 from system1.engine import DecisionResult, SystemOneEngine
 from system1.ledger import ActionLedger
 from system1.receipt import DecisionWitnessReceipt
@@ -2369,6 +2370,21 @@ class TypeSafeClient:
         self._validation_attempts.pop(evict_key, None)
         self._drift_detectors.pop(evict_key, None)
 
+    def _prune_orphaned_lc_bookkeeping_locked(self) -> None:
+        live_lc_ids = {id(v) for v in self._cutover_lifecycles.values()}
+        if self.auto_cutover_lifecycle is not None and self._injected_lc_digest is not None:
+            live_lc_ids.add(id(self.auto_cutover_lifecycle))
+        inflight_lc_ids = {lc_id for lc_id, cnt in self._lc_inflight_obs.items() if cnt > 0}
+        keep_committed = live_lc_ids | inflight_lc_ids
+        for k_id in [k_id for k_id in self._lc_committed_ops if k_id not in keep_committed]:
+            self._lc_committed_ops.pop(k_id, None)
+        for pend_k, pend_tup in list(self._lc_pending_new_bind.items()):
+            if (
+                self._cutover_lifecycles.get(pend_k) is not pend_tup[0]
+                and id(pend_tup[0]) not in inflight_lc_ids
+            ):
+                self._lc_pending_new_bind.pop(pend_k, None)
+
     def _enforce_unpromoted_cutover_cap_locked(self, *, reserve_for_new: bool = False) -> None:
         limit = max(0, self.max_unpromoted_lifecycles - (1 if reserve_for_new else 0))
         unpromoted = [
@@ -2378,16 +2394,9 @@ class TypeSafeClient:
         ]
         while len(unpromoted) > limit:
             evict_key = unpromoted.pop(0)
-            evict_lc = self._cutover_lifecycles.get(evict_key)
             self._cutover_lifecycles.pop(evict_key, None)
             self._retire_evicted_schema_bookkeeping_locked(evict_key)
-            self._lc_pending_new_bind.pop(evict_key, None)
-            if (
-                evict_lc is not None
-                and evict_lc is not self.auto_cutover_lifecycle
-                and self._lc_inflight_obs.get(id(evict_lc), 0) <= 0
-            ):
-                self._lc_committed_ops.pop(id(evict_lc), None)
+        self._prune_orphaned_lc_bookkeeping_locked()
 
     def _enforce_unpromoted_history_cap_locked(self) -> None:
         seen_unprom: Set[str] = set()
@@ -2617,17 +2626,10 @@ class TypeSafeClient:
                         obs_canary_tx = local_tx
 
                     try:
-                        if getattr(lc, "_supports_canary_tx_arg", False):
-                            lc.observe_teacher(
-                                encoded_state,
-                                teacher_vals,
-                                _canary_tx=(
-                                    obs_canary_tx
-                                    if obs_canary_tx is not None
-                                    else (0, 0, 0, "", None)
-                                ),
-                            )
-                        else:
+                        with _bind_active_canary_tx(
+                            lc,
+                            tx_token=(obs_canary_tx if obs_canary_tx is not None else (0, 0, 0, "", None)),
+                        ):
                             lc.observe_teacher(encoded_state, teacher_vals)
                     except BaseException:
                         with self._engine_lock:
@@ -2663,20 +2665,23 @@ class TypeSafeClient:
                             self._lc_inflight_obs.pop(id(lc), None)
                         else:
                             self._lc_inflight_obs[id(lc)] = rem_in
-                        self._lc_committed_ops[id(lc)] += 1
-                        pend_bind = self._lc_pending_new_bind.get(digest)
-                        if pend_bind is not None and pend_bind[0] is lc:
-                            self._lc_pending_new_bind.pop(digest, None)
+                        if (
+                            self._cutover_lifecycles.get(digest) is lc
+                            or (lc is self.auto_cutover_lifecycle and self._injected_lc_digest == digest)
+                            or rem_in > 0
+                        ):
+                            self._lc_committed_ops[id(lc)] += 1
+                            pend_bind = self._lc_pending_new_bind.get(digest)
+                            if pend_bind is not None and pend_bind[0] is lc:
+                                self._lc_pending_new_bind.pop(digest, None)
                         self._call_count[digest] += 1
                         self._teacher_sample_count[digest] += 1
                         self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
-                        if digest not in self._cutover_lifecycles:
+                        if digest not in self._cutover_lifecycles and not (
+                            lc is self.auto_cutover_lifecycle and self._injected_lc_digest == digest
+                        ):
                             self._retire_evicted_schema_bookkeeping_locked(digest)
-                            if (
-                                lc is not self.auto_cutover_lifecycle
-                                and self._lc_inflight_obs.get(id(lc), 0) <= 0
-                            ):
-                                self._lc_committed_ops.pop(id(lc), None)
+                        self._prune_orphaned_lc_bookkeeping_locked()
                     cloud_resp["auto_cutover_active"] = True
                     cloud_resp["is_cutover"] = self._is_lifecycle_promoted(lc)
                     cloud_resp["cutover_state"] = self._lifecycle_state_str(lc)

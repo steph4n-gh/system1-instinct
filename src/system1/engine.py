@@ -220,6 +220,38 @@ def _iter_structured_ndarray_objects(arr: np.ndarray) -> Any:
                     yield from _iter_structured_ndarray_objects(item)
 
 
+def _clone_void_scalar(src: np.void) -> np.void:
+    buf = np.empty(1, dtype=src.dtype)
+    for fn in src.dtype.names or ():
+        fdt = src.dtype.fields[fn][0]
+        fv = src[fn]
+        if fdt == np.object_:
+            buf[fn][0] = fv
+        elif fdt.names:
+            buf[fn][0] = _clone_void_scalar(fv)
+        else:
+            buf[fn][0] = fv
+    return buf[0]
+
+
+def _void_state_equal(a: np.void, b: np.void) -> bool:
+    if a.dtype != b.dtype:
+        return False
+    for fn in a.dtype.names or ():
+        fdt = a.dtype.fields[fn][0]
+        av = a[fn]
+        bv = b[fn]
+        if fdt == np.object_:
+            if av is not bv:
+                return False
+        elif fdt.names:
+            if not _void_state_equal(av, bv):
+                return False
+        elif not _ndarray_state_equal(np.asarray(av), np.asarray(bv)):
+            return False
+    return True
+
+
 def _snapshot_duck_graph(
     val: Any,
     seen_ids: set[int],
@@ -287,14 +319,10 @@ def _snapshot_duck_graph(
         return val
     if isinstance(val, np.void) and val.dtype.names:
         memo[obj_id] = val
-        cp_void_0d = np.array(val, copy=True)
-        void_fields_snap: List[Tuple[str, Any]] = []
+        snap_void = _clone_void_scalar(val)
         for fname in val.dtype.names:
-            f_val = val[fname]
-            f_snap = f_val.copy() if isinstance(f_val, (np.ndarray, np.void)) else f_val
-            void_fields_snap.append((fname, f_snap))
             _snapshot_duck_graph(
-                f_val,
+                val[fname],
                 seen_ids,
                 state_snaps,
                 dict_snaps,
@@ -304,7 +332,7 @@ def _snapshot_duck_graph(
                 container_snaps,
             )
         if container_snaps is not None:
-            container_snaps.append(("np_void", val, void_fields_snap, bool(val.flags.writeable), cp_void_0d))
+            container_snaps.append(("np_void", val, snap_void, bool(val.flags.writeable)))
         return val
     if isinstance(val, bytearray):
         memo[obj_id] = val
@@ -480,11 +508,11 @@ def _ndarray_state_equal(a: np.ndarray, b: np.ndarray) -> bool:
         return False
     if a.dtype.kind in ("f", "c"):
         return bool(np.array_equal(a, b, equal_nan=True))
+    if a.dtype.names:
+        return all(_ndarray_state_equal(a[fname], b[fname]) for fname in a.dtype.names)
     if a.dtype.hasobject:
         if a.dtype == np.object_:
             return all(x is y for x, y in zip(a.flat, b.flat))
-        if a.dtype.names:
-            return all(_ndarray_state_equal(a[fname], b[fname]) for fname in a.dtype.names)
         if a.dtype.subdtype is not None:
             return all(
                 _ndarray_state_equal(np.asarray(x), np.asarray(y))
@@ -519,15 +547,20 @@ def _restore_duck_containers(container_snaps: Sequence[Tuple[Any, ...]]) -> None
                 except (ValueError, BufferError):
                     pass
         elif kind == "np_void":
-            _, void_obj, fields_snap, orig_w, cp_void_0d = entry
-            if bool(orig_w) or (not _ndarray_state_equal(np.asarray(void_obj), cp_void_0d)):
+            _, void_obj, snap_void, orig_w = entry
+            if not _void_state_equal(void_obj, snap_void):
                 try:
                     if not void_obj.flags.writeable:
                         void_obj.setflags(write=True)
-                    for fname, orig_val in fields_snap:
-                        void_obj[fname] = orig_val
+                    for fname in void_obj.dtype.names or ():
+                        void_obj[fname] = snap_void[fname]
                     if not orig_w and void_obj.flags.writeable:
                         void_obj.setflags(write=False)
+                except (ValueError, BufferError, TypeError):
+                    pass
+            elif not orig_w and void_obj.flags.writeable:
+                try:
+                    void_obj.setflags(write=False)
                 except (ValueError, BufferError, TypeError):
                     pass
             elif not orig_w and void_obj.flags.writeable:
@@ -580,8 +613,18 @@ def _clone_head_attr_value(val: Any) -> Any:
     return copy.deepcopy(val)
 
 
+def _safe_stack_effect(ins: Any, *, default: int = 0) -> int:
+    try:
+        if ins.arg is None:
+            return dis.stack_effect(ins.opcode, jump=False)
+        return dis.stack_effect(ins.opcode, ins.arg, jump=False)
+    except (ValueError, TypeError):
+        return default
+
+
 def _extract_kw_unpack_targets(
     code: types.CodeType,
+    taint_vars: Optional[frozenset[str]] = None,
 ) -> Tuple[set[str], set[Tuple[str, str]], set[str], set[str], set[Tuple[str, str]], set[str]]:
     """Return bytecode callable targets for CALL_FUNCTION_EX (**kwargs) and non-zero-arg CALLs."""
     unpacked_names: set[str] = set()
@@ -592,7 +635,9 @@ def _extract_kw_unpack_targets(
     arg_leaf_attrs: set[str] = set()
 
     stack: List[set[Tuple[str, Any]]] = []
-    locals_env: Dict[str, set[Tuple[str, Any]]] = {}
+    locals_env: Dict[str, set[Tuple[str, Any]]] = {
+        vn: {("kw_taint", True)} for vn in (taint_vars or ())
+    }
 
     def _record(slot: set[Tuple[str, Any]], *, unpacked: bool) -> None:
         names_dst = unpacked_names if unpacked else arg_names
@@ -606,25 +651,39 @@ def _extract_kw_unpack_targets(
             elif kind == "leaf_attr":
                 lattrs_dst.add(val)
 
+    def _load_var_slot(varname: str) -> set[Tuple[str, Any]]:
+        slot = (set(locals_env[varname]) if varname in locals_env else set()) | {("name", varname)}
+        if taint_vars is None or varname in taint_vars:
+            slot.add(("kw_taint", True))
+        return slot
+
     for ins in dis.get_instructions(code):
         op = ins.opname
         arg_int = ins.arg if isinstance(ins.arg, int) else 0
+        if op == "PUSH_NULL":
+            stack.append({("null", None)})
+            continue
         if op == "LOAD_GLOBAL":
             if arg_int & 1:
-                stack.append(set())
+                stack.append({("null", None)})
             stack.append({("name", str(ins.argval))})
             continue
-        if op in ("LOAD_NAME", "LOAD_DEREF", "LOAD_CLOSURE", "LOAD_FAST", "LOAD_FAST_CHECK", "LOAD_FAST_AND_CLEAR"):
-            varname = str(ins.argval)
-            if op.startswith("LOAD_FAST") and varname in locals_env:
-                stack.append(set(locals_env[varname]) | {("name", varname)})
-            else:
-                stack.append({("name", varname)})
+        if op in (
+            "LOAD_NAME",
+            "LOAD_DEREF",
+            "LOAD_CLOSURE",
+            "LOAD_FAST",
+            "LOAD_FAST_BORROW",
+            "LOAD_FAST_CHECK",
+            "LOAD_FAST_AND_CLEAR",
+        ):
+            stack.append(_load_var_slot(str(ins.argval)))
             continue
-        if op == "LOAD_FAST_LOAD_FAST" and isinstance(ins.argval, tuple) and len(ins.argval) == 2:
+        if op in ("LOAD_FAST_LOAD_FAST", "LOAD_FAST_BORROW_LOAD_FAST_BORROW") and (
+            isinstance(ins.argval, tuple) and len(ins.argval) == 2
+        ):
             for vn in ins.argval:
-                s_vn = str(vn)
-                stack.append((set(locals_env[s_vn]) | {("name", s_vn)}) if s_vn in locals_env else {("name", s_vn)})
+                stack.append(_load_var_slot(str(vn)))
             continue
         if op == "LOAD_ATTR":
             base = stack.pop() if stack else set()
@@ -635,19 +694,18 @@ def _extract_kw_unpack_targets(
                     derived.add(("attr", (val, attr_name)))
                 elif kind == "attr":
                     derived.add(("attr", (val[1], attr_name)))
+            if ("kw_taint", True) in base:
+                derived.add(("kw_taint", True))
             if arg_int & 1:
                 stack.append(derived)
-                stack.append(set())
+                stack.append({("null", None)})
             else:
                 stack.append(derived)
             continue
         if op == "LOAD_SUPER_ATTR":
             # Pops self, class, super; pushes method (+ optional self/NULL).
             base = stack[-1] if stack else set()
-            try:
-                eff = dis.stack_effect(ins.opcode, ins.arg, jump=False)
-            except (ValueError, TypeError):
-                eff = -2
+            eff = _safe_stack_effect(ins, default=-2)
             pops = 3
             for _ in range(pops):
                 if stack:
@@ -657,55 +715,137 @@ def _extract_kw_unpack_targets(
             for kind, val in base:
                 if kind == "name":
                     derived_sup.add(("attr", (val, str(ins.argval))))
+            if ("kw_taint", True) in base:
+                derived_sup.add(("kw_taint", True))
             for j in range(max(0, push_cnt)):
-                stack.append(derived_sup if j == 0 else set())
+                stack.append(derived_sup if j == 0 else {("null", None)})
             continue
         if op in ("STORE_FAST", "STORE_NAME", "STORE_DEREF"):
             top = stack.pop() if stack else set()
             locals_env.setdefault(str(ins.argval), set()).update(top)
             continue
+        if op == "STORE_FAST_STORE_FAST" and isinstance(ins.argval, tuple) and len(ins.argval) == 2:
+            t1 = stack.pop() if stack else set()
+            t2 = stack.pop() if stack else set()
+            locals_env.setdefault(str(ins.argval[0]), set()).update(t1)
+            locals_env.setdefault(str(ins.argval[1]), set()).update(t2)
+            continue
+        if op == "STORE_FAST_LOAD_FAST" and isinstance(ins.argval, tuple) and len(ins.argval) == 2:
+            t1 = stack.pop() if stack else set()
+            locals_env.setdefault(str(ins.argval[0]), set()).update(t1)
+            stack.append(_load_var_slot(str(ins.argval[1])))
+            continue
+        if op == "SWAP":
+            if 1 <= arg_int <= len(stack):
+                stack[-1], stack[-arg_int] = stack[-arg_int], stack[-1]
+            continue
         if op == "COPY":
             stack.append(set(stack[-arg_int]) if 1 <= arg_int <= len(stack) else set())
             continue
+        if op == "BUILD_MAP":
+            had_t = False
+            for _ in range(2 * arg_int):
+                s = stack.pop() if stack else set()
+                if ("kw_taint", True) in s:
+                    had_t = True
+            res_map: set[Tuple[str, Any]] = {("lit_map", None)}
+            if had_t:
+                res_map.add(("kw_taint", True))
+            stack.append(res_map)
+            continue
+        if op == "BUILD_CONST_KEY_MAP":
+            had_t = False
+            for _ in range(arg_int + 1):
+                s = stack.pop() if stack else set()
+                if ("kw_taint", True) in s:
+                    had_t = True
+            res_ckm: set[Tuple[str, Any]] = {("lit_map", None)}
+            if had_t:
+                res_ckm.add(("kw_taint", True))
+            stack.append(res_ckm)
+            continue
+        if op in ("DICT_MERGE", "DICT_UPDATE"):
+            src_map = stack.pop() if stack else set()
+            if 1 <= arg_int <= len(stack):
+                dst_map = stack[-arg_int]
+                dst_map.discard(("lit_map", None))
+                dst_map.discard(("null", None))
+                dst_map.add(("kw_unpack", None))
+                if ("kw_taint", True) in src_map:
+                    dst_map.add(("kw_taint", True))
+            continue
+        if op == "UNPACK_SEQUENCE":
+            top = stack.pop() if stack else set()
+            has_t = ("kw_taint", True) in top
+            for _ in range(arg_int):
+                stack.append({("kw_taint", True)} if has_t else set())
+            continue
         if op == "CALL_FUNCTION_EX":
-            try:
-                eff = dis.stack_effect(ins.opcode, ins.arg, jump=False)
-            except (ValueError, TypeError):
-                eff = -2 - (1 if (arg_int & 1) else 0)
+            eff = _safe_stack_effect(
+                ins,
+                default=(-3 if ins.arg is None else (-2 - (1 if (arg_int & 1) else 0))),
+            )
             total_pop = max(0, 1 - eff)
             popped = [stack.pop() if stack else set() for _ in range(total_pop)]
-            has_kw_map = bool(arg_int & 1)
-            for slot in popped[2:]:
-                if has_kw_map:
+            if ins.arg is None or (arg_int & 1):
+                kw_slot = popped[0] if len(popped) >= 1 else set()
+                pos_slot = popped[1] if len(popped) >= 2 else set()
+                callable_slots = popped[2:]
+                has_kw_map = (
+                    bool(kw_slot)
+                    and ("null", None) not in kw_slot
+                    and kw_slot != {("lit_map", None)}
+                )
+            else:
+                kw_slot = set()
+                pos_slot = popped[0] if len(popped) >= 1 else set()
+                callable_slots = popped[1:]
+                has_kw_map = False
+            kw_tainted = (taint_vars is None) or (("kw_taint", True) in kw_slot)
+            any_tainted = (
+                kw_tainted
+                or (("kw_taint", True) in pos_slot)
+                or any(("kw_taint", True) in s for s in callable_slots)
+            )
+            for slot in callable_slots:
+                if has_kw_map and kw_tainted:
                     _record(slot, unpacked=True)
-                _record(slot, unpacked=False)
-            stack.append(set())
+                    _record(slot, unpacked=False)
+                elif any_tainted:
+                    _record(slot, unpacked=False)
+            stack.append({("kw_taint", True)} if any_tainted else set())
             continue
         if op in ("CALL", "CALL_KW"):
-            try:
-                eff = dis.stack_effect(ins.opcode, ins.arg, jump=False)
-            except (ValueError, TypeError):
-                eff = -(arg_int + 1)
+            eff = _safe_stack_effect(ins, default=-(arg_int + 1))
             total_pop = max(0, 1 - eff)
             popped = [stack.pop() if stack else set() for _ in range(total_pop)]
-            has_args = arg_int > 0
-            if has_args:
-                callable_start = arg_int + (1 if op == "CALL_KW" else 0)
-                for slot in popped[callable_start:]:
+            kw_names_cnt = 1 if op == "CALL_KW" else 0
+            arg_slots = popped[kw_names_cnt : kw_names_cnt + arg_int]
+            callable_slots = popped[kw_names_cnt + arg_int :]
+            args_tainted = arg_int > 0 and (
+                (taint_vars is None) or any(("kw_taint", True) in s for s in arg_slots)
+            )
+            any_tainted = args_tainted or any(("kw_taint", True) in s for s in callable_slots)
+            if args_tainted:
+                for slot in callable_slots:
                     _record(slot, unpacked=False)
-            stack.append(set())
+            stack.append({("kw_taint", True)} if any_tainted else set())
             continue
-        try:
-            eff = dis.stack_effect(ins.opcode, ins.arg, jump=False)
-        except (ValueError, TypeError):
-            eff = 0
-        if eff < 0:
-            for _ in range(-eff):
+        eff = _safe_stack_effect(ins, default=0)
+        if op in ("POP_TOP", "STORE_ATTR", "STORE_SUBSCR", "LIST_APPEND", "MAP_ADD", "SET_ADD"):
+            for _ in range(max(0, -eff)):
                 if stack:
                     stack.pop()
+        elif eff < 0:
+            popped_f = [stack.pop() if stack else set() for _ in range(max(1, 1 - eff))]
+            had_t_f = any(("kw_taint", True) in s for s in popped_f)
+            stack.append({("kw_taint", True)} if had_t_f else set())
         elif eff > 0:
             for _ in range(eff):
                 stack.append(set())
+        elif op.startswith(("UNARY_", "GET_", "TO_")) and stack:
+            if ("kw_taint", True) in stack[-1]:
+                stack[-1] = {("kw_taint", True)}
 
     return (
         unpacked_names,
@@ -725,29 +865,30 @@ def _inspect_varkw_wrapper(
     """Return (referenced_candidate_keys, calls_super) for a **kwargs callable."""
     referenced: set[str] = set()
 
-    def _collect_const_strings(val: Any, depth: int = 0) -> None:
+    def _collect_const_strings(val: Any, dst: set[str], depth: int = 0) -> None:
         if isinstance(val, str):
             if val in candidate_keys:
-                referenced.add(val)
+                dst.add(val)
             return
         if depth >= 3:
             return
         if isinstance(val, (tuple, list, set, frozenset)):
             for item in val:
-                _collect_const_strings(item, depth + 1)
+                _collect_const_strings(item, dst, depth + 1)
         elif isinstance(val, Mapping):
             for k_item, v_item in val.items():
-                _collect_const_strings(k_item, depth + 1)
-                _collect_const_strings(v_item, depth + 1)
+                _collect_const_strings(k_item, dst, depth + 1)
+                _collect_const_strings(v_item, dst, depth + 1)
 
-    def _unwrap_callable_and_owner(obj: Any, default_owner: Any) -> Tuple[Optional[Any], Any]:
+    def _unwrap_callable_and_owner(obj: Any, default_owner: Any) -> Tuple[Optional[Any], Any, set[str]]:
         cur = obj
         cur_owner = default_owner
+        partial_kw: set[str] = set()
         while isinstance(cur, functools.partial):
             if cur.keywords:
                 for pk in cur.keywords:
                     if pk in candidate_keys:
-                        referenced.add(pk)
+                        partial_kw.add(pk)
             cur = cur.func
         if isinstance(cur, (staticmethod, classmethod)):
             cur = cur.__func__
@@ -765,7 +906,37 @@ def _inspect_varkw_wrapper(
             if callable(call_attr):
                 cur_owner = cur
                 cur = call_attr
-        return cur, cur_owner
+        return cur, cur_owner, partial_kw
+
+    def _extract_taint_var_names(fn_target: Any, depth: int) -> Optional[frozenset[str]]:
+        code_t = getattr(fn_target, "__code__", None)
+        if not isinstance(code_t, types.CodeType):
+            return None
+        if depth == 0:
+            try:
+                sig_t = inspect.signature(fn_target)
+                vk = frozenset(
+                    p.name for p in sig_t.parameters.values() if p.kind == inspect.Parameter.VAR_KEYWORD
+                )
+                if vk:
+                    return vk
+            except (TypeError, ValueError):
+                pass
+            n_before = (
+                code_t.co_argcount
+                + code_t.co_kwonlyargcount
+                + (1 if (code_t.co_flags & inspect.CO_VARARGS) else 0)
+            )
+            if (code_t.co_flags & inspect.CO_VARKEYWORDS) and n_before < len(code_t.co_varnames):
+                return frozenset((str(code_t.co_varnames[n_before]),))
+            return frozenset()
+        n_params = (
+            code_t.co_argcount
+            + code_t.co_kwonlyargcount
+            + (1 if (code_t.co_flags & inspect.CO_VARARGS) else 0)
+            + (1 if (code_t.co_flags & inspect.CO_VARKEYWORDS) else 0)
+        )
+        return frozenset(str(v) for v in code_t.co_varnames[:n_params])
 
     def _collect_explicit_params(fn_target: Any) -> None:
         try:
@@ -786,31 +957,26 @@ def _inspect_varkw_wrapper(
     max_depth = 6
     max_callables = 64
     queue: deque[Tuple[Any, Any, int]] = deque([(fn_obj, root_owner, 0)])
-    visited_call_keys: set[Tuple[int, int, bool]] = set()
+    visited_call_keys: set[Tuple[int, int]] = set()
     visited_depths: Dict[int, int] = {}
     sig_param_fn_ids: set[int] = set()
-    fwd_kw_fn_ids: set[int] = set()
     code_info_cache: Dict[
-        int,
-        Tuple[set[str], set[str], set[Tuple[str, str]], set[str], set[str], set[Tuple[str, str]], set[str]],
+        Tuple[int, Optional[frozenset[str]]],
+        Tuple[set[str], set[str], set[Tuple[str, str]], set[str], set[str], set[Tuple[str, str]], set[str], set[str]],
     ] = {}
 
-    def _mark_unpacked_edge(cand: Any, sub_owner: Any, *, unpacked: bool, can_fwd_kw: bool) -> None:
+    def _mark_unpacked_edge(cand: Any, sub_owner: Any, *, unpacked: bool) -> None:
         if cand is None or isinstance(cand, type) or not callable(cand):
             return
-        if not unpacked and not can_fwd_kw:
-            return
-        u_cand, _ = _unwrap_callable_and_owner(cand, sub_owner)
+        u_cand, _, partial_kw = _unwrap_callable_and_owner(cand, sub_owner)
         if u_cand is None:
             return
+        referenced.update(partial_kw)
         u_id = id(u_cand)
         if unpacked:
             sig_param_fn_ids.add(u_id)
-            fwd_kw_fn_ids.add(u_id)
             if visited_depths.get(u_id, 0) > 0:
                 _collect_explicit_params(u_cand)
-        elif can_fwd_kw:
-            fwd_kw_fn_ids.add(u_id)
 
     def _enqueue(cand: Any, sub_owner: Any, nxt_depth: int) -> None:
         if cand is None or nxt_depth > max_depth or len(visited_call_keys) >= max_callables:
@@ -832,12 +998,12 @@ def _inspect_varkw_wrapper(
         unpacked_leaf_attrs: Optional[set[str]] = None,
         arg_owner_attrs: Optional[set[Tuple[str, str]]] = None,
         arg_leaf_attrs: Optional[set[str]] = None,
-        parent_can_fwd_kw: bool = False,
         is_root_code: bool = False,
         visited_types: Optional[set[int]] = None,
     ) -> None:
         nonlocal root_calls_super
-        _collect_const_strings(val)
+        if not isinstance(val, (type, types.ModuleType)) and not callable(val):
+            _collect_const_strings(val, referenced)
         if nxt_depth > max_depth or len(visited_call_keys) >= max_callables or val is None:
             return
         if isinstance(val, type):
@@ -853,14 +1019,8 @@ def _inspect_varkw_wrapper(
             al_attrs = arg_leaf_attrs or set()
             # Inspect custom __init__ if defined directly on val.
             raw_init = val.__dict__.get("__init__")
-            if raw_init is not None:
-                if edge_unpacked or edge_can_fwd:
-                    _mark_unpacked_edge(
-                        raw_init,
-                        None,
-                        unpacked=edge_unpacked,
-                        can_fwd_kw=edge_can_fwd,
-                    )
+            if raw_init is not None and (edge_unpacked or edge_can_fwd):
+                _mark_unpacked_edge(raw_init, None, unpacked=edge_unpacked)
                 _enqueue(raw_init, None, nxt_depth)
             for sub_n in local_names:
                 if val in root_mro and sub_n == root_method_name:
@@ -872,12 +1032,9 @@ def _inspect_varkw_wrapper(
                 raw_sub = inspect.getattr_static(val, sub_n, _UNSET_SLOT)
                 if raw_sub is _UNSET_SLOT or isinstance(raw_sub, property):
                     continue
-                is_sub_unp = parent_can_fwd_kw and (
-                    ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
-                )
+                is_sub_unp = ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
                 is_sub_fwd = is_sub_unp or (
-                    parent_can_fwd_kw
-                    and (((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs))
+                    ((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs)
                 )
                 if isinstance(raw_sub, type):
                     _consider_val(
@@ -892,7 +1049,6 @@ def _inspect_varkw_wrapper(
                         unpacked_leaf_attrs=unpacked_leaf_attrs,
                         arg_owner_attrs=arg_owner_attrs,
                         arg_leaf_attrs=arg_leaf_attrs,
-                        parent_can_fwd_kw=parent_can_fwd_kw,
                         is_root_code=is_root_code,
                         visited_types=visited_types,
                     )
@@ -905,14 +1061,25 @@ def _inspect_varkw_wrapper(
                     sub_fn, sub_own = raw_sub, None
                 if not isinstance(sub_fn, type) and callable(sub_fn):
                     if is_sub_unp or is_sub_fwd:
-                        _mark_unpacked_edge(sub_fn, sub_own, unpacked=is_sub_unp, can_fwd_kw=is_sub_fwd)
-                    _enqueue(sub_fn, sub_own, nxt_depth)
+                        _mark_unpacked_edge(sub_fn, sub_own, unpacked=is_sub_unp)
+                        _enqueue(sub_fn, sub_own, nxt_depth)
             return
-        if edge_unpacked or edge_can_fwd:
-            _mark_unpacked_edge(val, sub_owner, unpacked=edge_unpacked, can_fwd_kw=edge_can_fwd)
         if callable(val):
-            _enqueue(val, sub_owner, nxt_depth)
-        elif isinstance(val, types.ModuleType):
+            if edge_unpacked or edge_can_fwd:
+                _mark_unpacked_edge(val, sub_owner, unpacked=edge_unpacked)
+                _enqueue(val, sub_owner, nxt_depth)
+            if isinstance(
+                val,
+                (
+                    types.FunctionType,
+                    types.MethodType,
+                    types.BuiltinFunctionType,
+                    types.BuiltinMethodType,
+                    functools.partial,
+                ),
+            ):
+                return
+        if isinstance(val, types.ModuleType):
             mod_d = val.__dict__
             uo_attrs = unpacked_owner_attrs or set()
             ul_attrs = unpacked_leaf_attrs or set()
@@ -922,12 +1089,9 @@ def _inspect_varkw_wrapper(
                 sub_v = mod_d.get(sub_n)
                 if sub_v is None:
                     continue
-                is_sub_unp = parent_can_fwd_kw and (
-                    ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
-                )
+                is_sub_unp = ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
                 is_sub_fwd = is_sub_unp or (
-                    parent_can_fwd_kw
-                    and (((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs))
+                    ((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs)
                 )
                 if isinstance(sub_v, type):
                     _consider_val(
@@ -942,13 +1106,12 @@ def _inspect_varkw_wrapper(
                         unpacked_leaf_attrs=unpacked_leaf_attrs,
                         arg_owner_attrs=arg_owner_attrs,
                         arg_leaf_attrs=arg_leaf_attrs,
-                        parent_can_fwd_kw=parent_can_fwd_kw,
                         is_root_code=is_root_code,
                     )
                 elif callable(sub_v):
                     if is_sub_unp or is_sub_fwd:
-                        _mark_unpacked_edge(sub_v, None, unpacked=is_sub_unp, can_fwd_kw=is_sub_fwd)
-                    _enqueue(sub_v, None, nxt_depth)
+                        _mark_unpacked_edge(sub_v, None, unpacked=is_sub_unp)
+                        _enqueue(sub_v, None, nxt_depth)
         elif not isinstance(val, (str, bytes, bytearray, int, float, bool, np.ndarray, Mapping, list, tuple, set, frozenset)):
             uo_attrs = unpacked_owner_attrs or set()
             ul_attrs = unpacked_leaf_attrs or set()
@@ -963,12 +1126,9 @@ def _inspect_varkw_wrapper(
                         raw_sub = raw_sub.__get__(val, type(val))
                     except Exception:
                         continue
-                is_sub_unp = parent_can_fwd_kw and (
-                    ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
-                )
+                is_sub_unp = ((via_name, sub_n) in uo_attrs) if via_name else (sub_n in ul_attrs)
                 is_sub_fwd = is_sub_unp or (
-                    parent_can_fwd_kw
-                    and (((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs))
+                    ((via_name, sub_n) in ao_attrs) if via_name else (sub_n in al_attrs)
                 )
                 if isinstance(raw_sub, (staticmethod, classmethod)):
                     raw_sub = raw_sub.__func__
@@ -985,28 +1145,25 @@ def _inspect_varkw_wrapper(
                         unpacked_leaf_attrs=unpacked_leaf_attrs,
                         arg_owner_attrs=arg_owner_attrs,
                         arg_leaf_attrs=arg_leaf_attrs,
-                        parent_can_fwd_kw=parent_can_fwd_kw,
                         is_root_code=is_root_code,
                     )
                 elif callable(raw_sub):
                     if is_sub_unp or is_sub_fwd:
-                        _mark_unpacked_edge(raw_sub, val, unpacked=is_sub_unp, can_fwd_kw=is_sub_fwd)
-                    _enqueue(raw_sub, val, nxt_depth)
+                        _mark_unpacked_edge(raw_sub, val, unpacked=is_sub_unp)
+                        _enqueue(raw_sub, val, nxt_depth)
 
     while queue and len(visited_call_keys) < max_callables:
         cand_fn, cur_owner, depth = queue.popleft()
-        unwrapped, cur_owner = _unwrap_callable_and_owner(cand_fn, cur_owner)
+        unwrapped, cur_owner, partial_kw = _unwrap_callable_and_owner(cand_fn, cur_owner)
         if unwrapped is None:
             continue
         u_id = id(unwrapped)
-        can_fwd_here = (depth == 0) or (u_id in fwd_kw_fn_ids)
-        visit_key = (u_id, id(cur_owner) if cur_owner is not None else 0, can_fwd_here)
+        visit_key = (u_id, id(cur_owner) if cur_owner is not None else 0)
         if visit_key in visited_call_keys:
             continue
         visited_call_keys.add(visit_key)
         visited_depths[u_id] = max(visited_depths.get(u_id, depth), depth)
-        if depth == 0:
-            fwd_kw_fn_ids.add(u_id)
+        referenced.update(partial_kw)
 
         if depth > 0 and u_id in sig_param_fn_ids:
             _collect_explicit_params(unwrapped)
@@ -1015,8 +1172,9 @@ def _inspect_varkw_wrapper(
         if not isinstance(code, types.CodeType):
             continue
 
-        cid = id(code)
-        cached_ci = code_info_cache.get(cid)
+        taint_here = _extract_taint_var_names(unwrapped, depth)
+        cache_key_ci = (id(code), taint_here)
+        cached_ci = code_info_cache.get(cache_key_ci)
         if cached_ci is None:
             c_local_names: set[str] = set()
             c_u_names: set[str] = set()
@@ -1025,17 +1183,18 @@ def _inspect_varkw_wrapper(
             c_a_names: set[str] = set()
             c_a_oattrs: set[Tuple[str, str]] = set()
             c_a_lattrs: set[str] = set()
+            c_consts: set[str] = set()
             seen_sub_codes: set[int] = set()
-            code_stack: List[types.CodeType] = [code]
+            code_stack: List[Tuple[types.CodeType, Optional[frozenset[str]]]] = [(code, taint_here)]
             while code_stack:
-                c = code_stack.pop()
+                c, c_taint = code_stack.pop()
                 sub_cid = id(c)
                 if sub_cid in seen_sub_codes:
                     continue
                 seen_sub_codes.add(sub_cid)
                 c_local_names.update(c.co_names)
                 c_local_names.update(c.co_freevars)
-                un_c, uo_c, ul_c, an_c, ao_c, al_c = _extract_kw_unpack_targets(c)
+                un_c, uo_c, ul_c, an_c, ao_c, al_c = _extract_kw_unpack_targets(c, c_taint)
                 c_u_names.update(un_c)
                 c_u_oattrs.update(uo_c)
                 c_u_lattrs.update(ul_c)
@@ -1044,24 +1203,32 @@ def _inspect_varkw_wrapper(
                 c_a_lattrs.update(al_c)
                 for const in c.co_consts:
                     if isinstance(const, types.CodeType):
-                        code_stack.append(const)
+                        sub_n_p = (
+                            const.co_argcount
+                            + const.co_kwonlyargcount
+                            + (1 if (const.co_flags & inspect.CO_VARARGS) else 0)
+                            + (1 if (const.co_flags & inspect.CO_VARKEYWORDS) else 0)
+                        )
+                        sub_p = frozenset(str(v) for v in const.co_varnames[:sub_n_p])
+                        next_taint = (c_taint | sub_p) if c_taint is not None else sub_p
+                        code_stack.append((const, next_taint))
                     else:
-                        _collect_const_strings(const)
-            cached_ci = (c_local_names, c_u_names, c_u_oattrs, c_u_lattrs, c_a_names, c_a_oattrs, c_a_lattrs)
-            code_info_cache[cid] = cached_ci
-        local_names, u_names, u_oattrs, u_lattrs, a_names, a_oattrs, a_lattrs = cached_ci
+                        _collect_const_strings(const, c_consts)
+            cached_ci = (c_local_names, c_u_names, c_u_oattrs, c_u_lattrs, c_a_names, c_a_oattrs, c_a_lattrs, c_consts)
+            code_info_cache[cache_key_ci] = cached_ci
+        local_names, u_names, u_oattrs, u_lattrs, a_names, a_oattrs, a_lattrs, c_consts = cached_ci
+        referenced.update(c_consts)
 
         if depth == 0 and "super" in local_names:
             root_calls_super = True
 
-        can_fwd_from_here = u_id in fwd_kw_fn_ids
         nxt_depth = depth + 1
         fn_globals = getattr(unwrapped, "__globals__", None)
         if isinstance(fn_globals, Mapping):
             for n in local_names:
                 if n in fn_globals:
-                    is_unp = can_fwd_from_here and (n in u_names)
-                    is_fwd = is_unp or (can_fwd_from_here and (n in a_names))
+                    is_unp = n in u_names
+                    is_fwd = is_unp or (n in a_names)
                     _consider_val(
                         fn_globals[n],
                         None,
@@ -1074,7 +1241,6 @@ def _inspect_varkw_wrapper(
                         unpacked_leaf_attrs=u_lattrs,
                         arg_owner_attrs=a_oattrs,
                         arg_leaf_attrs=a_lattrs,
-                        parent_can_fwd_kw=can_fwd_from_here,
                         is_root_code=(depth == 0),
                     )
 
@@ -1094,8 +1260,8 @@ def _inspect_varkw_wrapper(
                     and isinstance(cur_owner, val_c)
                 ):
                     continue
-                is_unp = can_fwd_from_here and (c_name in u_names if c_name else False)
-                is_fwd = is_unp or (can_fwd_from_here and (c_name in a_names if c_name else bool(a_names)))
+                is_unp = c_name in u_names if c_name else False
+                is_fwd = is_unp or (c_name in a_names if c_name else bool(a_names))
                 _consider_val(
                     val_c,
                     None,
@@ -1108,7 +1274,6 @@ def _inspect_varkw_wrapper(
                     unpacked_leaf_attrs=u_lattrs,
                     arg_owner_attrs=a_oattrs,
                     arg_leaf_attrs=a_lattrs,
-                    parent_can_fwd_kw=can_fwd_from_here,
                     is_root_code=(depth == 0),
                 )
 
@@ -1131,12 +1296,9 @@ def _inspect_varkw_wrapper(
                     attr_owner = cur_owner if owner_is_type else type(cur_owner)
                 else:
                     attr_owner = cur_owner
-                is_unp = can_fwd_from_here and (
-                    ("self", n) in u_oattrs or (None, n) in u_oattrs or n in u_lattrs
-                )
+                is_unp = ("self", n) in u_oattrs or (None, n) in u_oattrs or n in u_lattrs
                 is_fwd = is_unp or (
-                    can_fwd_from_here
-                    and (("self", n) in a_oattrs or (None, n) in a_oattrs or n in a_lattrs)
+                    ("self", n) in a_oattrs or (None, n) in a_oattrs or n in a_lattrs
                 )
                 _consider_val(
                     raw_attr,
@@ -1150,7 +1312,6 @@ def _inspect_varkw_wrapper(
                     unpacked_leaf_attrs=u_lattrs,
                     arg_owner_attrs=a_oattrs,
                     arg_leaf_attrs=a_lattrs,
-                    parent_can_fwd_kw=can_fwd_from_here,
                     is_root_code=(depth == 0),
                 )
 

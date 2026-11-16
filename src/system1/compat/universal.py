@@ -38,7 +38,14 @@ from system1.core.schema import (
     MultiChoiceField,
     ScoreField,
 )
-from system1.cutover import AutoCutoverLifecycle, CutoverConfig, CutoverState, _normalize_cache_key
+from system1.cutover import (
+    _ACTIVE_CANARY_TX_TLS,
+    AutoCutoverLifecycle,
+    CutoverConfig,
+    CutoverState,
+    _bind_active_canary_tx,
+    _normalize_cache_key,
+)
 
 _SAFE_IDENT_RE = re.compile(r"[^A-Za-z0-9_]+")
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -1390,36 +1397,44 @@ class SoftDistillingLifecycle:
         structure_sig: Optional[str] = None,
         _canary_tx: Optional[Any] = None,
     ) -> bool:
+        tls_map = getattr(_ACTIVE_CANARY_TX_TLS, "bindings", None)
+        has_bound = isinstance(tls_map, dict) and id(self) in tls_map
+        eff_canary_tx = tls_map[id(self)] if has_bound else _canary_tx
         with self._lock:
             had_soft = prompt in self._soft_records_by_prompt
             prev_soft = self._soft_records_by_prompt.get(prompt)
-            if soft_targets:
-                self._soft_records_by_prompt[prompt] = soft_targets
             had_sc = False
             prev_sc: Optional[int] = None
             inc_fks: List[Tuple[str, str, str]] = []
-            if structure_sig is not None:
-                had_sc = structure_sig in self._structure_counts
-                prev_sc = self._structure_counts.get(structure_sig)
-                self._structure_counts[structure_sig] = self._structure_counts.get(structure_sig, 0) + 1
-                for fname, f_def in self.lifecycle.schema.fields.items():
-                    if fname in lifecycle_values:
-                        is_disc, canon_v = self._canonical_discrete_field_val(f_def, lifecycle_values[fname])
-                        if is_disc:
-                            fk = (structure_sig, fname, canon_v)
-                            self._structure_field_counts[fk] = self._structure_field_counts.get(fk, 0) + 1
-                            inc_fks.append(fk)
             try:
-                inner_tx = _canary_tx[0] if isinstance(_canary_tx, tuple) and len(_canary_tx) >= 1 else None
-                if getattr(self.lifecycle, "_supports_canary_tx_arg", False) and _canary_tx is not None:
-                    return self.lifecycle.observe_teacher(
-                        prompt,
-                        lifecycle_values,
-                        cache_key=cache_key,
-                        _canary_tx=(
-                            inner_tx if inner_tx is not None else (0, 0, 0, "", None)
-                        ),
+                if soft_targets:
+                    self._soft_records_by_prompt[prompt] = soft_targets
+                if structure_sig is not None:
+                    had_sc = structure_sig in self._structure_counts
+                    prev_sc = self._structure_counts.get(structure_sig)
+                    self._structure_counts[structure_sig] = self._structure_counts.get(structure_sig, 0) + 1
+                    for fname, f_def in self.lifecycle.schema.fields.items():
+                        if fname in lifecycle_values:
+                            is_disc, canon_v = self._canonical_discrete_field_val(f_def, lifecycle_values[fname])
+                            if is_disc:
+                                fk = (structure_sig, fname, canon_v)
+                                self._structure_field_counts[fk] = self._structure_field_counts.get(fk, 0) + 1
+                                inc_fks.append(fk)
+                if has_bound or eff_canary_tx is not None:
+                    inner_tx = (
+                        eff_canary_tx[0]
+                        if isinstance(eff_canary_tx, tuple) and len(eff_canary_tx) >= 1
+                        else None
                     )
+                    with _bind_active_canary_tx(
+                        self.lifecycle,
+                        tx_token=(inner_tx if inner_tx is not None else (0, 0, 0, "", None)),
+                    ):
+                        return self.lifecycle.observe_teacher(
+                            prompt,
+                            lifecycle_values,
+                            cache_key=cache_key,
+                        )
                 return self.lifecycle.observe_teacher(prompt, lifecycle_values, cache_key=cache_key)
             except BaseException:
                 if soft_targets:
@@ -1438,6 +1453,8 @@ class SoftDistillingLifecycle:
                             self._structure_field_counts.pop(fk, None)
                         else:
                             self._structure_field_counts[fk] = cur_c
+                if not has_bound and eff_canary_tx is None and hasattr(self.lifecycle, "_clear_untracked_canary"):
+                    self.lifecycle._clear_untracked_canary(prompt, cache_key=cache_key)
                 raise
 
     def _evaluate_frozen_local_locked(
@@ -1707,6 +1724,7 @@ class SoftDistillingLifecycle:
         freeze: bool = False,
         cache_key: Optional[str] = None,
         structure_sig: Optional[str] = None,
+        _track_tx: bool = True,
     ) -> Tuple[Optional[Dict[str, Any]], Tuple[Optional[Any], int]]:
         """Attempt autonomous local execution and return (answers_or_none, rollback_tx_token)."""
         with self._lock:
@@ -1748,6 +1766,7 @@ class SoftDistillingLifecycle:
                     if structure_sig is not None
                     else None
                 ),
+                _track_tx=_track_tx,
             )
             if local_vals is None:
                 return None, (inner_tx, 0)
@@ -1792,6 +1811,7 @@ class SoftDistillingLifecycle:
             freeze=freeze,
             cache_key=cache_key,
             structure_sig=structure_sig,
+            _track_tx=False,
         )
         return answers
 
@@ -2089,15 +2109,23 @@ class UniversalDecisionService:
             )
         return tok
 
+    def _prune_orphaned_lc_bookkeeping_locked(self) -> None:
+        live_lc_ids = {id(v) for v in self._lifecycles.values()}
+        inflight_lc_ids = {lc_id for lc_id, cnt in self._lc_inflight_obs.items() if cnt > 0}
+        keep_committed = live_lc_ids | inflight_lc_ids
+        for k_id in [k_id for k_id in self._lc_committed_ops if k_id not in keep_committed]:
+            self._lc_committed_ops.pop(k_id, None)
+        for pend_k, pend_lc in list(self._lc_pending_new_bind.items()):
+            if self._lifecycles.get(pend_k) is not pend_lc and id(pend_lc) not in inflight_lc_ids:
+                self._lc_pending_new_bind.pop(pend_k, None)
+
     def _enforce_unpromoted_lifecycle_cap_locked(self, *, reserve_for_new: bool = False) -> None:
         limit = max(0, self.max_unpromoted_lifecycles - (1 if reserve_for_new else 0))
         unpromoted_keys = [k for k, v in self._lifecycles.items() if not v.is_cutover]
         while len(unpromoted_keys) > limit:
             evict_key = unpromoted_keys.pop(0)
-            evict_lc = self._lifecycles.pop(evict_key, None)
-            self._lc_pending_new_bind.pop(evict_key, None)
-            if evict_lc is not None and self._lc_inflight_obs.get(id(evict_lc), 0) <= 0:
-                self._lc_committed_ops.pop(id(evict_lc), None)
+            self._lifecycles.pop(evict_key, None)
+        self._prune_orphaned_lc_bookkeeping_locked()
 
     def _get_or_create_lifecycle(
         self,
@@ -2269,10 +2297,10 @@ class UniversalDecisionService:
                 )
                 strict_json_dumps(body)
                 with self._lock:
-                    if lc_key in self._lifecycles:
+                    if self._lifecycles.get(lc_key) is existing_lc:
                         self._lifecycles.move_to_end(lc_key)
-                    self._lc_committed_ops[id(existing_lc)] += 1
-                    self._lc_pending_new_bind.pop(lc_key, None)
+                        self._lc_committed_ops[id(existing_lc)] += 1
+                        self._lc_pending_new_bind.pop(lc_key, None)
                     self._enforce_unpromoted_lifecycle_cap_locked(reserve_for_new=False)
                     drift_info = self._record_slot_schema_locked(slot_key, contract)
                     self.stats["local_fastpath_requests"] += 1
@@ -2341,20 +2369,10 @@ class UniversalDecisionService:
             elif lc is existing_lc:
                 obs_canary_tx = local_tx_ref[1]
             try:
-                if getattr(lc, "_supports_canary_tx_arg", False):
-                    lc.observe_teacher(
-                        semantic_text,
-                        lifecycle_vals,
-                        soft_targets=soft_targets,
-                        cache_key=req_cache_key,
-                        structure_sig=req_struct_sig,
-                        _canary_tx=(
-                            obs_canary_tx
-                            if obs_canary_tx is not None
-                            else ((0, 0, 0, "", None), 0)
-                        ),
-                    )
-                else:
+                with _bind_active_canary_tx(
+                    lc,
+                    tx_token=(obs_canary_tx if obs_canary_tx is not None else ((0, 0, 0, "", None), 0)),
+                ):
                     lc.observe_teacher(
                         semantic_text,
                         lifecycle_vals,
@@ -2392,9 +2410,11 @@ class UniversalDecisionService:
                     self._lc_inflight_obs.pop(id(lc), None)
                 else:
                     self._lc_inflight_obs[id(lc)] = rem_in
-                self._lc_committed_ops[id(lc)] += 1
-                if self._lc_pending_new_bind.get(lc_key) is lc:
-                    self._lc_pending_new_bind.pop(lc_key, None)
+                if self._lifecycles.get(lc_key) is lc or rem_in > 0:
+                    self._lc_committed_ops[id(lc)] += 1
+                    if self._lc_pending_new_bind.get(lc_key) is lc:
+                        self._lc_pending_new_bind.pop(lc_key, None)
+                self._prune_orphaned_lc_bookkeeping_locked()
         else:
             local_tx_ref[1] = None
 

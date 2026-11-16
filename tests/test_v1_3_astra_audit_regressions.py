@@ -17235,11 +17235,15 @@ def test_astra_43_round30_regressions() -> None:
         assert eng_r1.model_version == 1
         assert eng_r1.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
 
-    # R30-3 negative check: calling zero-arg helper with keyword-only use_cache must NOT forward use_cache to base.
+    def _helper_dict_non_unpack(kw: Dict[str, Any], *, use_cache: bool = True) -> int:
+        return len(kw)
+
+    # R30-3 negative check: calling zero-arg or non-unpacked helper with keyword-only use_cache must NOT forward use_cache to base.
     class _R30AuditOnlyDuck(_R30ModelBase):
         def forward_single(self, *args: Any, **kwargs: Any) -> Any:
             _ = _audit_helper()
             _ = _SharedTransitiveHelper.via_zero()
+            _ = _helper_dict_non_unpack(kwargs)
             return super().forward_single(*args, **kwargs)
 
     eng_r3_ok = SystemOneEngine(
@@ -17913,3 +17917,728 @@ def test_astra_43_round30_regressions() -> None:
         for bad_0d in (np.array(0.0), 0.0):
             with pytest.raises(ValueError):
                 h11.evaluate_logits(bad_0d)  # type: ignore[arg-type]
+
+
+
+def test_astra_44_round31_regressions() -> None:
+    """In-memory Round-31 adversarial regressions for R31-1 through R31-6 and sister paths."""
+    from concurrent.futures import ThreadPoolExecutor
+    import dis
+    import functools
+    from types import SimpleNamespace
+    from typing import Tuple
+    from unittest.mock import patch
+
+    from system1.compat.typesafe import TypeSafeClient, _build_dynamic_schema
+    from system1.compat.universal import (
+        SoftDistillingLifecycle,
+        UniversalDecisionService,
+        _canonical_structured_key,
+        compile_questions_contract,
+    )
+    from system1.core import ChoiceField
+    from system1.core.model import SystemOneModel
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.engine import _extract_kw_unpack_targets
+
+    class _R31CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="First")
+        g = ChoiceField(options=("a", "b"), description="Second")
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return values
+
+    class _R31SimpleSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="Single")
+
+    class _R31BaseModel:
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            self._inner = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            )
+            for h in self._inner.heads.values():
+                h.set_weights(np.zeros((2, dim), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+            self.schema = self._inner.schema
+            self.projector = self._inner.projector
+            self.dimension = self._inner.dimension
+            self.heads = self._inner.heads
+
+        def encode(self, prompt: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
+            return self._inner.encode(prompt, recency_weighted=recency_weighted)
+
+        def forward_single(self, prompt: str, embedding: Any = None) -> Any:
+            return self._inner.forward_single(prompt, embedding=embedding)
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            return self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+
+    # ------------------------------------------------------------------
+    # R31-1: Python 3.12 & Python 3.14 bytecode CALL_FUNCTION_EX (arg=None)
+    # handles Helper.split(**kwargs) without literal strings in source.
+    # ------------------------------------------------------------------
+    class _R31SplitHelper:
+        @staticmethod
+        def split(*, use_cache: bool = True, **rest: Any) -> Tuple[bool, Dict[str, Any]]:
+            return use_cache, rest
+
+    class _R31SplitModel(_R31BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _R31SplitHelper.split(**kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    x_ones = np.ones(16, dtype=np.float32)
+    eng_r1 = SystemOneEngine(
+        _R31CoupledSchema,
+        model=_R31SplitModel(_R31CoupledSchema(), 16),
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    assert eng_r1.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+    with pytest.raises(ValueError, match="Coupled fields disagree"):
+        eng_r1.learn("p", {"f": "b"}, embedding=x_ones)
+    assert eng_r1.model_version == 1
+    assert eng_r1.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+
+    # Simulate Python 3.14 CALL_FUNCTION_EX(arg=None) + PUSH_NULL + LOAD_FAST_BORROW + DICT_MERGE.
+    def _dummy_314_code(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    ins_314_unpacked = [
+        SimpleNamespace(opname="LOAD_GLOBAL", opcode=dis.opmap["LOAD_GLOBAL"], arg=0, argval="_R31SplitHelper"),
+        SimpleNamespace(opname="LOAD_ATTR", opcode=dis.opmap["LOAD_ATTR"], arg=2, argval="split"),
+        SimpleNamespace(opname="PUSH_NULL", opcode=dis.opmap.get("PUSH_NULL", 2), arg=None, argval=None),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=1, argval=()),
+        SimpleNamespace(opname="BUILD_MAP", opcode=dis.opmap["BUILD_MAP"], arg=0, argval=0),
+        SimpleNamespace(opname="LOAD_FAST_BORROW", opcode=dis.opmap["LOAD_FAST"], arg=2, argval="kwargs"),
+        SimpleNamespace(opname="DICT_MERGE", opcode=dis.opmap["DICT_MERGE"], arg=1, argval=1),
+        SimpleNamespace(opname="CALL_FUNCTION_EX", opcode=dis.opmap["CALL_FUNCTION_EX"], arg=None, argval=None),
+    ]
+    with patch.object(dis, "get_instructions", return_value=ins_314_unpacked):
+        un_314, uo_314, ul_314, _, _, _ = _extract_kw_unpack_targets(
+            _dummy_314_code.__code__, frozenset(("kwargs",))
+        )
+    assert ("_R31SplitHelper", "split") in uo_314 and "split" in ul_314
+
+    ins_314_argsonly = [
+        SimpleNamespace(opname="LOAD_GLOBAL", opcode=dis.opmap["LOAD_GLOBAL"], arg=0, argval="_R31SplitHelper"),
+        SimpleNamespace(opname="LOAD_ATTR", opcode=dis.opmap["LOAD_ATTR"], arg=2, argval="split"),
+        SimpleNamespace(opname="PUSH_NULL", opcode=dis.opmap.get("PUSH_NULL", 2), arg=None, argval=None),
+        SimpleNamespace(opname="LOAD_FAST_BORROW", opcode=dis.opmap["LOAD_FAST"], arg=1, argval="args"),
+        SimpleNamespace(opname="PUSH_NULL", opcode=dis.opmap.get("PUSH_NULL", 2), arg=None, argval=None),
+        SimpleNamespace(opname="CALL_FUNCTION_EX", opcode=dis.opmap["CALL_FUNCTION_EX"], arg=None, argval=None),
+    ]
+    with patch.object(dis, "get_instructions", return_value=ins_314_argsonly):
+        _, uo_args, ul_args, _, _, _ = _extract_kw_unpack_targets(
+            _dummy_314_code.__code__, frozenset(("kwargs",))
+        )
+    assert ("_R31SplitHelper", "split") not in uo_args and "split" not in ul_args
+
+    # Test with patched CALL_FUNCTION_EX returning 3.14-style instructions through engine.decide/learn.
+    class _R31Mock314OnlySplitModel(_R31BaseModel):
+        def _unused_placeholder(self) -> None:
+            return None
+
+    m_314_test = _R31SplitModel(_R31CoupledSchema(), 16)
+    orig_get_ins = dis.get_instructions
+
+    def _patched_get_ins(code_obj: Any, *args: Any, **kwargs: Any) -> Any:
+        if code_obj is _R31SplitModel.forward_single.__code__:
+            return [
+                SimpleNamespace(opname="LOAD_GLOBAL", opcode=dis.opmap["LOAD_GLOBAL"], arg=0, argval="_R31SplitHelper"),
+                SimpleNamespace(opname="LOAD_ATTR", opcode=dis.opmap["LOAD_ATTR"], arg=2, argval="split"),
+                SimpleNamespace(opname="PUSH_NULL", opcode=dis.opmap.get("PUSH_NULL", 2), arg=None, argval=None),
+                SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=1, argval=()),
+                SimpleNamespace(opname="BUILD_MAP", opcode=dis.opmap["BUILD_MAP"], arg=0, argval=0),
+                SimpleNamespace(opname="LOAD_FAST_BORROW", opcode=dis.opmap["LOAD_FAST"], arg=2, argval="kwargs"),
+                SimpleNamespace(opname="DICT_MERGE", opcode=dis.opmap["DICT_MERGE"], arg=1, argval=1),
+                SimpleNamespace(opname="CALL_FUNCTION_EX", opcode=dis.opmap["CALL_FUNCTION_EX"], arg=None, argval=None),
+                SimpleNamespace(opname="UNPACK_SEQUENCE", opcode=dis.opmap["UNPACK_SEQUENCE"], arg=2, argval=2),
+                SimpleNamespace(opname="STORE_FAST_STORE_FAST", opcode=dis.opmap["STORE_FAST"], arg=0, argval=("rest", "cached")),
+                SimpleNamespace(opname="LOAD_GLOBAL", opcode=dis.opmap["LOAD_GLOBAL"], arg=0, argval="super"),
+                SimpleNamespace(opname="LOAD_DEREF", opcode=dis.opmap["LOAD_DEREF"], arg=0, argval="__class__"),
+                SimpleNamespace(opname="LOAD_FAST_BORROW", opcode=dis.opmap["LOAD_FAST"], arg=0, argval="self"),
+                SimpleNamespace(opname="LOAD_SUPER_ATTR", opcode=dis.opmap["LOAD_SUPER_ATTR"], arg=4, argval="forward_single"),
+                SimpleNamespace(opname="PUSH_NULL", opcode=dis.opmap.get("PUSH_NULL", 2), arg=None, argval=None),
+                SimpleNamespace(opname="LOAD_FAST_BORROW", opcode=dis.opmap["LOAD_FAST"], arg=1, argval="args"),
+                SimpleNamespace(opname="BUILD_MAP", opcode=dis.opmap["BUILD_MAP"], arg=0, argval=0),
+                SimpleNamespace(opname="LOAD_FAST_BORROW", opcode=dis.opmap["LOAD_FAST"], arg=3, argval="rest"),
+                SimpleNamespace(opname="DICT_MERGE", opcode=dis.opmap["DICT_MERGE"], arg=1, argval=1),
+                SimpleNamespace(opname="CALL_FUNCTION_EX", opcode=dis.opmap["CALL_FUNCTION_EX"], arg=None, argval=None),
+            ]
+        return orig_get_ins(code_obj, *args, **kwargs)
+
+    eng_r1_314 = SystemOneEngine(
+        _R31CoupledSchema,
+        model=m_314_test,
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    with patch.object(dis, "get_instructions", side_effect=_patched_get_ins):
+        assert eng_r1_314.decide("p314", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_r1_314.learn("p314", {"f": "b"}, embedding=x_ones)
+    assert eng_r1_314.model_version == 1
+
+    # ------------------------------------------------------------------
+    # R31-2: Unrelated helpers returning/holding "use_cache" constants
+    # without receiving kwargs do not trigger unexpected kwarg forwarding.
+    # ------------------------------------------------------------------
+    class _R31AuditHelper:
+        @staticmethod
+        def stats() -> Dict[str, bool]:
+            return {"use_cache": False}
+
+        @staticmethod
+        def log(msg: Any) -> Dict[str, bool]:
+            return {"use_cache": False}
+
+        @staticmethod
+        def custom_init_cls_unused() -> None:
+            return None
+
+    _unused_partial_uc = functools.partial(lambda use_cache=False: use_cache, use_cache=False)
+
+    def _audit_non_kw_sig(kw: Dict[str, Any], *, use_cache: bool = True) -> int:
+        return len(kw)
+
+    class _R31AuditConstsDuck(_R31BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _ = _R31AuditHelper.stats()
+            _ = _R31AuditHelper.log(args[0])
+            _ = _unused_partial_uc()
+            _ = _audit_non_kw_sig(kwargs)
+            return super().forward_single(*args, **kwargs)
+
+    class _CallableHelperBox:
+        def __call__(self) -> Dict[str, bool]:
+            return {"use_cache": False}
+
+        def split(self, *, use_cache: bool = True, **rest: Any) -> Tuple[bool, Dict[str, Any]]:
+            return use_cache, rest
+
+    class _R31BoxCallOnlyDuck(_R31BaseModel):
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            super().__init__(schema, dim)
+            self.box = _CallableHelperBox()
+
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _ = self.box()
+            return super().forward_single(*args, **kwargs)
+
+    class _R31BoxSplitDuck(_R31BaseModel):
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            super().__init__(schema, dim)
+            self.box = _CallableHelperBox()
+
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _ = self.box()
+            cached, rest = self.box.split(**kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    eng_r2 = SystemOneEngine(
+        _R31SimpleSchema,
+        model=_R31AuditConstsDuck(_R31SimpleSchema(), 16),
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    assert eng_r2.decide("probe r2", embedding=x_ones, record_receipt=False).values == {"f": "a"}
+    eng_r2.learn("probe r2", {"f": "b"}, embedding=x_ones)
+    assert eng_r2.decide("probe r2", embedding=x_ones, record_receipt=False).values == {"f": "b"}
+
+    eng_box_neg = SystemOneEngine(
+        _R31SimpleSchema,
+        model=_R31BoxCallOnlyDuck(_R31SimpleSchema(), 16),
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    assert eng_box_neg.decide("probe box neg", embedding=x_ones, record_receipt=False).values == {"f": "a"}
+
+    eng_box_pos = SystemOneEngine(
+        _R31CoupledSchema,
+        model=_R31BoxSplitDuck(_R31CoupledSchema(), 16),
+        dimension=16,
+        backend="numpy",
+        contrastive_whitening=False,
+        use_cache=False,
+        strict_mode=False,
+    )
+    assert eng_box_pos.decide("probe box", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+    with pytest.raises(ValueError, match="Coupled fields disagree"):
+        eng_box_pos.learn("probe box", {"f": "b"}, embedding=x_ones)
+    assert eng_box_pos.model_version == 1
+
+    # ------------------------------------------------------------------
+    # R31-3: np.void structured scalar preserves object alias identity
+    # when untouched and restores original aliases when mutated/replaced.
+    # ------------------------------------------------------------------
+    shared_emb = np.array([1.0, 2.0])
+    records_r3 = np.empty(1, dtype=[("embedding", object), ("label", "i4")])
+    records_r3[0] = (shared_emb, 7)
+
+    class _R31VoidAliasUntouchedModel(_R31BaseModel):
+        def __init__(self, schema: DecisionSchema, dim: int = 16, *, mut_mode: str = "none") -> None:
+            super().__init__(schema, dim)
+            r_arr = np.empty(1, dtype=[("embedding", object), ("label", "i4")])
+            r_arr[0] = (shared_emb, 7)
+            self.record = r_arr[0]
+            self._mut_mode = mut_mode
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+            if self._mut_mode == "same_val_copy":
+                self.record["embedding"] = shared_emb.copy()
+            elif self._mut_mode == "mutated":
+                shared_emb[0] = -99.0
+                self.record["embedding"] = np.array([9.0, 9.0])
+                self.record["label"] = 99
+            raise RuntimeError("boom r3")
+
+    for mut_mode in ("none", "same_val_copy", "mutated"):
+        mdl_r3 = _R31VoidAliasUntouchedModel(_R31SimpleSchema(), 16, mut_mode=mut_mode)
+        eng_r3 = SystemOneEngine(
+            _R31SimpleSchema,
+            model=mdl_r3,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        with pytest.raises(RuntimeError, match="boom r3"):
+            eng_r3.learn("p", {"f": "b"}, embedding=x_ones)
+        assert mdl_r3.record["embedding"] is shared_emb
+        assert int(mdl_r3.record["label"]) == 7
+        assert float(shared_emb[0]) == pytest.approx(1.0)
+        shared_emb[0] = 3.0
+        assert float(mdl_r3.record["embedding"][0]) == pytest.approx(3.0)
+        shared_emb[0] = 1.0
+
+    # ------------------------------------------------------------------
+    # R31-4: Public decide_local() + failed observe_teacher() never
+    # retains aborted retries or triggers phantom canary checks.
+    # ------------------------------------------------------------------
+    class _R31CutSchema(DecisionSchema):
+        act = ChoiceField(options=("a", "b"), description="Act")
+
+    lc_r4 = AutoCutoverLifecycle(
+        _R31CutSchema(),
+        config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            canary_rate=1.0,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    lc_r4.clean_cache["probe"] = {"act": "a"}
+    for _ in range(3):
+        assert lc_r4.decide_local("probe") is None
+        with pytest.raises(ValueError):
+            lc_r4.observe_teacher("probe", {"act": "invalid_opt"})
+    assert lc_r4._pending_canaries == {}
+    assert lc_r4._pending_canary_stack == {}
+    assert lc_r4._untracked_canaries == {}
+    # Retrying once with decide_local -> valid observe_teacher runs exactly 1 check, leaving 0 pending.
+    assert lc_r4.decide_local("probe") is None
+    assert lc_r4.observe_teacher("probe", {"act": "a"}) is True
+    assert lc_r4.canary_checks == 1
+    assert lc_r4._pending_canaries == {}
+    # Subsequent teacher-only observation must NOT record a phantom canary check.
+    assert lc_r4.observe_teacher("probe", {"act": "a"}) is True
+    assert lc_r4.canary_checks == 1
+    assert lc_r4._pending_canaries == {}
+
+    # Three consecutive decide_local("probe") calls without observation overwrite (not stack), so retry yields 1 check.
+    for _ in range(3):
+        assert lc_r4.decide_local("probe") is None
+    assert lc_r4.observe_teacher("probe", {"act": "a"}) is True
+    assert lc_r4.observe_teacher("probe", {"act": "a"}) is True
+    assert lc_r4.canary_checks == 2
+    assert lc_r4._pending_canaries == {}
+
+    # Teacher error after aborted decide_local -> invalid observe_teacher -> teacher-only leaves canary_checks unchanged.
+    assert lc_r4.decide_local("probe") is None
+    with pytest.raises(ValueError):
+        lc_r4.observe_teacher("probe", {"act": "invalid_opt"})
+    assert lc_r4.observe_teacher("probe", {"act": "a"}) is True
+    assert lc_r4.canary_checks == 2
+
+    # At canary_rate=0.5 (canary_period=2), aborting on a due canary rolls back
+    # local_accept_eligible so retrying decide_local() re-triggers the due canary.
+    lc_half_r4 = AutoCutoverLifecycle(
+        _R31CutSchema(),
+        config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            canary_rate=0.5,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    lc_half_r4.clean_cache["probe"] = {"act": "a"}
+    assert lc_half_r4.decide_local("probe") == {"act": "a"}
+    assert lc_half_r4.local_accept_eligible == 1
+    assert lc_half_r4.decide_local("probe") is None
+    assert lc_half_r4.local_accept_eligible == 2
+    with pytest.raises(ValueError):
+        lc_half_r4.observe_teacher("probe", {"act": "invalid_opt"})
+    assert lc_half_r4.local_accept_eligible == 1
+    assert lc_half_r4.decide_local("probe") is None
+    assert lc_half_r4.observe_teacher("probe", {"act": "a"}) is True
+    assert lc_half_r4.canary_checks == 1
+    assert lc_half_r4._pending_canaries == {}
+
+    # AutoCutoverLifecycle.step() rolls back local_accept_eligible if teacher raises.
+    lc_step_r4 = AutoCutoverLifecycle(
+        _R31CutSchema(),
+        teacher=lambda p: (_ for _ in ()).throw(RuntimeError("teacher step fail")),
+        config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            canary_rate=1.0,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    lc_step_r4.clean_cache["probe"] = {"act": "a"}
+    with pytest.raises(RuntimeError, match="teacher step fail"):
+        lc_step_r4.step("probe")
+    assert lc_step_r4.local_accept_eligible == 0
+
+    # Sister path: SoftDistillingLifecycle public decide_local / observe_teacher.
+    q_u4 = {"act": {"type": "choice", "options": ["a", "b"], "instructions": "r31-4 soft"}}
+    c_u4 = compile_questions_contract(q_u4)
+    fn_u4 = c_u4.contracts[0].internal_name
+    sdl_r4 = SoftDistillingLifecycle(
+        c_u4,
+        config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            canary_rate=1.0,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    sdl_r4.lifecycle.state = "SELECTIVE_HOT_SWAP"
+    sdl_r4.lifecycle.compiled_active = True
+    sdl_r4.lifecycle.active_tau = 0.0
+    sdl_r4.lifecycle.engine = SystemOneEngine(
+        c_u4.schema, dimension=16, backend="numpy", contrastive_whitening=False, use_cache=False
+    )
+    sdl_r4.lifecycle.clean_cache["probe"] = {fn_u4: "a"}
+    for _ in range(3):
+        assert sdl_r4.decide_local("probe") is None
+        with pytest.raises(ValueError):
+            sdl_r4.observe_teacher("probe", {fn_u4: "bad_choice"})
+    assert sdl_r4.lifecycle._pending_canaries == {}
+    assert sdl_r4.decide_local("probe") is None
+    assert sdl_r4.observe_teacher("probe", {fn_u4: "a"}) is True
+    assert sdl_r4.lifecycle.canary_checks == 1
+    assert sdl_r4.observe_teacher("probe", {fn_u4: "a"}) is True
+    assert sdl_r4.lifecycle.canary_checks == 1
+    assert sdl_r4.lifecycle._pending_canaries == {}
+
+    # ------------------------------------------------------------------
+    # R31-5: Evicted lifecycle _lc_committed_ops bookkeeping is pruned
+    # when overlapping observers complete or raise after eviction.
+    # ------------------------------------------------------------------
+    in_obs_lock = threading.Lock()
+    obs_entered_count = 0
+    all_12_entered = threading.Event()
+    release_all_12 = threading.Event()
+    orig_sdl_obs = SoftDistillingLifecycle.observe_teacher
+
+    def _barrier_12_obs(
+        self_lc: SoftDistillingLifecycle,
+        prompt: str,
+        vals: Dict[str, Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        nonlocal obs_entered_count
+        if prompt.startswith("r31-5-slot-"):
+            with in_obs_lock:
+                obs_entered_count += 1
+                if obs_entered_count == 12:
+                    all_12_entered.set()
+            assert all_12_entered.wait(timeout=5.0)
+            assert release_all_12.wait(timeout=5.0)
+        return orig_sdl_obs(self_lc, prompt, vals, *args, **kwargs)
+
+    svc_r5 = UniversalDecisionService(
+        upstream_handlers={
+            "gemini": lambda t, p, c: {
+                "answers": {"act": {"choice": "a", "probabilities": {"a": 0.9, "b": 0.1}}}
+            }
+        },
+        require_auth=False,
+        max_unpromoted_lifecycles=1,
+    )
+    with patch.object(SoftDistillingLifecycle, "observe_teacher", _barrier_12_obs):
+        with ThreadPoolExecutor(max_workers=12) as pool_12:
+            futs_12 = [
+                pool_12.submit(
+                    svc_r5.process_payload,
+                    path="/v1beta/decisions",
+                    payload={"state": f"r31-5-slot-{i_s}", "slot": f"s-{i_s}", "questions": q_u4},
+                )
+                for i_s in range(12)
+            ]
+            assert all_12_entered.wait(timeout=5.0)
+            release_all_12.set()
+            for f_12 in futs_12:
+                st_12, _ = f_12.result(timeout=5.0)
+                assert st_12 == 200
+
+    assert len(svc_r5._lifecycles) == 1
+    assert svc_r5._lc_inflight_obs == {}
+    assert len(svc_r5._lc_committed_ops) <= 1
+    assert svc_r5._lc_pending_new_bind == {}
+
+    # UniversalDecisionService deferred-eviction-after-commit check: observer 1 commits on u5-a,
+    # observer 2 pauses on u5-a, u5-b evicts u5-a while observer 2 is in-flight, then observer 2 fails ->
+    # _prune_orphaned_lc_bookkeeping_locked must prune evicted u5-a from _lc_committed_ops.
+    u5_a2_entered = threading.Event()
+    u5_a2_release = threading.Event()
+    svc_u5_race = UniversalDecisionService(
+        upstream_handlers={
+            "gemini": lambda t, p, c: {
+                "answers": {"act": {"choice": "a", "probabilities": {"a": 0.9, "b": 0.1}}}
+            }
+        },
+        require_auth=False,
+        max_unpromoted_lifecycles=1,
+    )
+
+    def _u5_evict_race_obs(
+        self_lc: SoftDistillingLifecycle,
+        prompt: str,
+        vals: Dict[str, Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> bool:
+        if prompt == "u5-a2-fail":
+            u5_a2_entered.set()
+            assert u5_a2_release.wait(timeout=5.0)
+            raise RuntimeError("u5 a2 post-evict failure")
+        return orig_sdl_obs(self_lc, prompt, vals, *args, **kwargs)
+
+    with patch.object(SoftDistillingLifecycle, "observe_teacher", _u5_evict_race_obs):
+        st_u5_1, _ = svc_u5_race.process_payload(
+            path="/v1beta/decisions",
+            payload={"state": "u5-a1-ok", "slot": "u5-a", "questions": q_u4},
+        )
+        assert st_u5_1 == 200
+        with ThreadPoolExecutor(max_workers=2) as pool_u5:
+            fut_u5_2 = pool_u5.submit(
+                svc_u5_race.process_payload,
+                path="/v1beta/decisions",
+                payload={"state": "u5-a2-fail", "slot": "u5-a", "questions": q_u4},
+            )
+            assert u5_a2_entered.wait(timeout=5.0)
+            st_u5_b, _ = svc_u5_race.process_payload(
+                path="/v1beta/decisions",
+                payload={"state": "u5-b-evict", "slot": "u5-b", "questions": q_u4},
+            )
+            assert st_u5_b == 200
+            u5_a2_release.set()
+            with pytest.raises(RuntimeError, match="u5 a2 post-evict failure"):
+                fut_u5_2.result(timeout=5.0)
+
+    assert len(svc_u5_race._lifecycles) == 1
+    assert svc_u5_race._lc_inflight_obs == {}
+    assert len(svc_u5_race._lc_committed_ops) <= 1
+    assert svc_u5_race._lc_pending_new_bind == {}
+
+    # TypeSafeClient sister check: observer 1 commits on A, observer 2 pauses on A,
+    # schema B evicts A, then observer 2 fails -> committed_ops must not retain orphaned A.
+    a2_entered = threading.Event()
+    a2_release = threading.Event()
+    q_ts_a = {"act": {"type": "choice", "instructions": "r31-5 schema A", "criteria": ["a", "b"]}}
+    q_ts_b = {"act": {"type": "choice", "instructions": "r31-5 schema B", "criteria": ["a", "b"]}}
+
+    ts_r5 = TypeSafeClient(
+        api_key="tok-r31",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=True,
+        max_unpromoted_lifecycles=1,
+        baseline_handler=lambda s, q: {"answers": {"act": {"type": "choice", "choice": "a", "value": "a"}}},
+    )
+    orig_auto_obs = AutoCutoverLifecycle.observe_teacher
+
+    def _ts_evict_race_obs(self_lc: AutoCutoverLifecycle, prompt: str, vals: Any, *args: Any, **kwargs: Any) -> bool:
+        if prompt == "obs-a2-fail":
+            a2_entered.set()
+            assert a2_release.wait(timeout=5.0)
+            raise RuntimeError("a2 post-evict failure")
+        return orig_auto_obs(self_lc, prompt, vals, *args, **kwargs)
+
+    with patch.object(AutoCutoverLifecycle, "observe_teacher", _ts_evict_race_obs):
+        assert ts_r5.decide("obs-a1-ok", q_ts_a)["answers"]["act"]["value"] == "a"
+        with ThreadPoolExecutor(max_workers=2) as pool_ts5:
+            fut_a2 = pool_ts5.submit(ts_r5.decide, "obs-a2-fail", q_ts_a)
+            assert a2_entered.wait(timeout=5.0)
+            assert ts_r5.decide("obs-b-evict", q_ts_b)["answers"]["act"]["value"] == "a"
+            a2_release.set()
+            with pytest.raises(RuntimeError, match="a2 post-evict failure"):
+                fut_a2.result(timeout=5.0)
+
+    assert len(ts_r5._cutover_lifecycles) == 1
+    assert ts_r5._lc_inflight_obs == {}
+    assert len(ts_r5._lc_committed_ops) <= 1
+    assert ts_r5._lc_pending_new_bind == {}
+
+    # ------------------------------------------------------------------
+    # R31-6: AutoCutoverLifecycle subclasses overriding observe_teacher
+    # without _canary_tx work through TypeSafeClient and SoftDistillingLifecycle.
+    # ------------------------------------------------------------------
+    class _ObservedLifecycleNoCanaryKw(AutoCutoverLifecycle):
+        def observe_teacher(
+            self,
+            prompt: str,
+            teacher_values: Any,
+            *,
+            cache_key: Optional[str] = None,
+        ) -> bool:
+            return super().observe_teacher(prompt, teacher_values, cache_key=cache_key)
+
+    q_r6 = {"act": {"type": "choice", "criteria": ["a", "b"], "instructions": "r31-6 subclass"}}
+    s_r6 = _build_dynamic_schema(q_r6)
+    obs_sub = _ObservedLifecycleNoCanaryKw(
+        s_r6,
+        config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            canary_rate=1.0,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    obs_sub.state = "SELECTIVE_HOT_SWAP"
+    obs_sub.compiled_active = True
+    obs_sub.active_tau = 0.0
+    obs_sub.engine = SystemOneEngine(
+        s_r6, dimension=16, backend="numpy", contrastive_whitening=False, use_cache=False
+    )
+    obs_sub.clean_cache["probe"] = {"act": "a"}
+
+    ts_r6 = TypeSafeClient(
+        api_key="tok-r31",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=obs_sub,
+        baseline_handler=lambda s, q: {"answers": {"act": {"type": "choice", "choice": "a", "value": "a"}}},
+    )
+    res_r6_ts = ts_r6.decide("probe", q_r6)
+    assert res_r6_ts["answers"]["act"]["value"] == "a"
+    assert obs_sub.canary_checks == 1
+    assert obs_sub._pending_canaries == {}
+
+    # Sister path: SoftDistillingLifecycle subclass + _ObservedLifecycleNoCanaryKw through UniversalDecisionService.
+    class _SubSoftDistillingNoCanaryKw(SoftDistillingLifecycle):
+        def observe_teacher(
+            self,
+            prompt: str,
+            lifecycle_values: Dict[str, Any],
+            soft_targets: Optional[Dict[str, Dict[str, Any]]] = None,
+            *,
+            cache_key: Optional[str] = None,
+            structure_sig: Optional[str] = None,
+        ) -> bool:
+            return super().observe_teacher(
+                prompt,
+                lifecycle_values,
+                soft_targets=soft_targets,
+                cache_key=cache_key,
+                structure_sig=structure_sig,
+            )
+
+    obs_inner_u6 = _ObservedLifecycleNoCanaryKw(
+        c_u4.schema,
+        config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            canary_rate=1.0,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    obs_inner_u6.state = "SELECTIVE_HOT_SWAP"
+    obs_inner_u6.compiled_active = True
+    obs_inner_u6.active_tau = 0.0
+    obs_inner_u6.engine = SystemOneEngine(
+        c_u4.schema, dimension=16, backend="numpy", contrastive_whitening=False, use_cache=False
+    )
+    sdl_r6 = _SubSoftDistillingNoCanaryKw(c_u4, config=obs_inner_u6.config)
+    sdl_r6.lifecycle = obs_inner_u6
+
+    req_u6_can = {"state": "probe", "questions": q_u4, "slot": "u6"}
+    req_u6_ft = {"state": "probe", "questions": q_u4, "slot": "u6", "force_teacher": True}
+    can_key_u6 = _canonical_structured_key({"state": "probe"})
+    obs_inner_u6.clean_cache[can_key_u6] = {fn_u4: "a"}
+
+    u6_park = threading.Event()
+    u6_rel = threading.Event()
+
+    def _u6_upstream(t: str, p: Dict[str, Any], c: Any) -> Dict[str, Any]:
+        if not p.get("force_teacher", False):
+            u6_park.set()
+            assert u6_rel.wait(timeout=5.0)
+        return {"answers": {"act": {"choice": "a", "probabilities": {"a": 0.9, "b": 0.1}}}}
+
+    svc_r6 = UniversalDecisionService(
+        upstream_handlers={"gemini": _u6_upstream},
+        require_auth=False,
+    )
+    svc_r6._lifecycles[f"u6:{c_u4.fingerprint}"] = sdl_r6
+    with ThreadPoolExecutor(max_workers=2) as pool_u6:
+        fut_u6 = pool_u6.submit(svc_r6.process_payload, path="/v1beta/decisions", payload=req_u6_can)
+        assert u6_park.wait(timeout=5.0)
+        # Concurrent force_teacher must NOT consume parked canary on _SubSoftDistillingNoCanaryKw/_ObservedLifecycleNoCanaryKw.
+        st_ft_u6, _ = svc_r6.process_payload(path="/v1beta/decisions", payload=req_u6_ft)
+        assert st_ft_u6 == 200
+        assert obs_inner_u6.canary_checks == 0
+        u6_rel.set()
+        st_can_u6, _ = fut_u6.result(timeout=5.0)
+        assert st_can_u6 == 200
+    assert obs_inner_u6.canary_checks == 1
+    assert obs_inner_u6._pending_canaries == {}

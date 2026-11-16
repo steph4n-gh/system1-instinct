@@ -9,6 +9,7 @@ e-process drift recalibration with zero pretrained weights.
 from __future__ import annotations
 
 import collections
+import contextlib
 import dataclasses
 from dataclasses import dataclass
 from enum import Enum
@@ -43,6 +44,38 @@ from system1.core.schema import (
     _score_within_rel_tolerance,
 )
 from system1.engine import SystemOneEngine
+
+
+_ACTIVE_CANARY_TX_TLS = threading.local()
+_UNTRACKED_CANARY_SENTINEL = object()
+_MISSING_CANARY_BINDING = object()
+
+
+@contextlib.contextmanager
+def _bind_active_canary_tx(*targets: Any, tx_token: Any) -> Any:
+    bindings = getattr(_ACTIVE_CANARY_TX_TLS, "bindings", None)
+    if not isinstance(bindings, dict):
+        bindings = {}
+        _ACTIVE_CANARY_TX_TLS.bindings = bindings
+    saved: List[Tuple[int, Any]] = []
+    seen_ids: set[int] = set()
+    for target in targets:
+        if target is None:
+            continue
+        tid = id(target)
+        if tid in seen_ids:
+            continue
+        seen_ids.add(tid)
+        saved.append((tid, bindings.get(tid, _MISSING_CANARY_BINDING)))
+        bindings[tid] = tx_token
+    try:
+        yield
+    finally:
+        for tid, prev_val in saved:
+            if prev_val is _MISSING_CANARY_BINDING:
+                bindings.pop(tid, None)
+            else:
+                bindings[tid] = prev_val
 
 
 def _normalize_cache_key(prompt: str) -> str:
@@ -268,6 +301,8 @@ class AutoCutoverLifecycle:
         self.canary_window: Deque[int] = collections.deque(maxlen=20)
         self._pending_canaries: Dict[str, Tuple[Dict[str, Any], float, bool]] = {}
         self._pending_canary_stack: Dict[str, List[Tuple[object, Tuple[Dict[str, Any], float, bool]]]] = {}
+        self._untracked_canaries: Dict[str, Tuple[Dict[str, Any], float, bool]] = {}
+        self._untracked_canary_de: Dict[str, int] = {}
         self.cutover_events: List[Dict[str, Any]] = []
         self.recalibrate_events: List[Dict[str, Any]] = []
         self.quarantined_total: int = 0
@@ -982,9 +1017,24 @@ class AutoCutoverLifecycle:
         stack = self._pending_canary_stack.get(key)
         if stack:
             self._pending_canaries[key] = stack[-1][1]
+        elif key in self._untracked_canaries:
+            self._pending_canary_stack.pop(key, None)
+            self._pending_canaries[key] = self._untracked_canaries[key]
         else:
             self._pending_canary_stack.pop(key, None)
             self._pending_canaries.pop(key, None)
+
+    def _clear_untracked_canary(self, prompt: str, *, cache_key: Optional[str] = None) -> None:
+        try:
+            key = _resolve_cache_key(prompt, cache_key)
+        except Exception:
+            return
+        with self._lock:
+            self._untracked_canaries.pop(key, None)
+            prev_de = self._untracked_canary_de.pop(key, 0)
+            if prev_de:
+                self.local_accept_eligible = max(0, self.local_accept_eligible - prev_de)
+            self._sync_pending_canary_locked(key)
 
     def _decide_local_with_tx(
         self,
@@ -992,11 +1042,18 @@ class AutoCutoverLifecycle:
         *,
         cache_key: Optional[str] = None,
         accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        _track_tx: bool = True,
     ) -> Tuple[Optional[Dict[str, Any]], Tuple[int, int, int, str, Any]]:
         """Attempt local decision and return (values_or_none, rollback_tx_token)."""
         with self._lock:
             self._maybe_micro_compile_locked()
             key = _resolve_cache_key(prompt, cache_key)
+            if not _track_tx and key in self._untracked_canaries:
+                self._untracked_canaries.pop(key, None)
+                prev_de = self._untracked_canary_de.pop(key, 0)
+                if prev_de:
+                    self.local_accept_eligible = max(0, self.local_accept_eligible - prev_de)
+                self._sync_pending_canary_locked(key)
             e0 = self.local_accept_eligible
             accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(
                 prompt,
@@ -1010,11 +1067,20 @@ class AutoCutoverLifecycle:
                 return vals, (de, 1, 1, key, None)
             canary_tok: Any = None
             if is_canary and vals is not None:
-                if key in self._pending_canaries and key not in self._pending_canary_stack:
-                    self._pending_canary_stack[key] = [(object(), self._pending_canaries[key])]
-                canary_tok = object()
+                if (
+                    key in self._pending_canaries
+                    and key not in self._pending_canary_stack
+                    and key not in self._untracked_canaries
+                ):
+                    self._untracked_canaries[key] = self._pending_canaries[key]
                 added_pend = (vals, margin, from_cache)
-                self._pending_canary_stack.setdefault(key, []).append((canary_tok, added_pend))
+                if _track_tx:
+                    canary_tok = object()
+                    self._pending_canary_stack.setdefault(key, []).append((canary_tok, added_pend))
+                else:
+                    canary_tok = _UNTRACKED_CANARY_SENTINEL
+                    self._untracked_canaries[key] = added_pend
+                    self._untracked_canary_de[key] = de
                 self._sync_pending_canary_locked(key)
             return None, (de, 0, 0, key, canary_tok)
 
@@ -1028,7 +1094,11 @@ class AutoCutoverLifecycle:
                 self.step_count = max(0, self.step_count - ds)
             if dh:
                 self.local_hits = max(0, self.local_hits - dh)
-            if canary_tok is not None:
+            if canary_tok is _UNTRACKED_CANARY_SENTINEL:
+                self._untracked_canaries.pop(key, None)
+                self._untracked_canary_de.pop(key, None)
+                self._sync_pending_canary_locked(key)
+            elif canary_tok is not None:
                 stack = self._pending_canary_stack.get(key)
                 if stack is not None:
                     self._pending_canary_stack[key] = [pair for pair in stack if pair[0] is not canary_tok]
@@ -1046,6 +1116,7 @@ class AutoCutoverLifecycle:
             prompt,
             cache_key=cache_key,
             accept_predicate=accept_predicate,
+            _track_tx=False,
         )
         return vals
 
@@ -1058,13 +1129,29 @@ class AutoCutoverLifecycle:
         _canary_tx: Optional[Any] = None,
     ) -> bool:
         """Ingest a validated teacher answer, update canary drift state, and admit/compile."""
-        validated = self._coerce_teacher_values(teacher_values)
+        tls_map = getattr(_ACTIVE_CANARY_TX_TLS, "bindings", None)
+        has_bound = isinstance(tls_map, dict) and id(self) in tls_map
+        eff_canary_tx = tls_map[id(self)] if has_bound else _canary_tx
+        try:
+            validated = self._coerce_teacher_values(teacher_values)
+        except BaseException:
+            if not has_bound and eff_canary_tx is None:
+                self._clear_untracked_canary(prompt, cache_key=cache_key)
+            raise
         with self._lock:
             key = _resolve_cache_key(prompt, cache_key)
             pending: Optional[Tuple[Dict[str, Any], float, bool]] = None
-            if _canary_tx is not None:
-                tx_tok = _canary_tx[4] if len(_canary_tx) >= 5 else None
-                if tx_tok is not None:
+            if has_bound or eff_canary_tx is not None:
+                tx_tok = (
+                    eff_canary_tx[4]
+                    if (isinstance(eff_canary_tx, tuple) and len(eff_canary_tx) >= 5)
+                    else None
+                )
+                if tx_tok is _UNTRACKED_CANARY_SENTINEL:
+                    pending = self._untracked_canaries.pop(key, None)
+                    self._untracked_canary_de.pop(key, None)
+                    self._sync_pending_canary_locked(key)
+                elif tx_tok is not None:
                     stack = self._pending_canary_stack.get(key)
                     if stack is not None:
                         new_stack: List[Tuple[object, Tuple[Dict[str, Any], float, bool]]] = []
@@ -1076,12 +1163,11 @@ class AutoCutoverLifecycle:
                         self._pending_canary_stack[key] = new_stack
                         self._sync_pending_canary_locked(key)
             else:
-                stack = self._pending_canary_stack.get(key)
-                if stack:
-                    _, pending = stack.pop()
-                    self._sync_pending_canary_locked(key)
-                else:
+                pending = self._untracked_canaries.pop(key, None)
+                self._untracked_canary_de.pop(key, None)
+                if pending is None and key in self._pending_canaries and key not in self._pending_canary_stack:
                     pending = self._pending_canaries.pop(key, None)
+                self._sync_pending_canary_locked(key)
             if pending is not None:
                 pred_vals, margin, from_cache = pending
                 self._record_canary_check_locked(
@@ -1105,22 +1191,27 @@ class AutoCutoverLifecycle:
 
         with self._lock:
             compile_triggered = self._maybe_micro_compile_locked()
-            accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(prompt)
-            if accepted and vals is not None:
-                self.step_count += 1
-                self.local_hits += 1
-                return CutoverStepResult(
-                    values=vals,
-                    used_teacher=False,
-                    state=self.state,
-                    is_canary=False,
-                    quarantined=False,
-                    margin=margin,
-                    compile_triggered=compile_triggered,
-                )
+            e0 = self.local_accept_eligible
+            try:
+                accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(prompt)
+                if accepted and vals is not None:
+                    self.step_count += 1
+                    self.local_hits += 1
+                    return CutoverStepResult(
+                        values=vals,
+                        used_teacher=False,
+                        state=self.state,
+                        is_canary=False,
+                        quarantined=False,
+                        margin=margin,
+                        compile_triggered=compile_triggered,
+                    )
 
-            teacher_raw = self.teacher(prompt)
-            validated = self._coerce_teacher_values(teacher_raw)
+                teacher_raw = self.teacher(prompt)
+                validated = self._coerce_teacher_values(teacher_raw)
+            except BaseException:
+                self.local_accept_eligible = e0
+                raise
             if is_canary and vals is not None:
                 self._record_canary_check_locked(
                     vals,
