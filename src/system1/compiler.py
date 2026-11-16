@@ -66,7 +66,9 @@ from system1.core.schema import (
     DecisionSchema,
     MultiChoiceField,
     ScoreField,
+    _score_abs_diff_clamped,
     _score_from_unit_prob,
+    _score_full_span_clamped,
     _score_half_span,
     _score_to_unit_ratio,
 )
@@ -2216,7 +2218,10 @@ class CompiledSystemOneModel:
                 return _head_tensor_name(_fn, suffix, namespaced=namespaced_tensors)
 
             arrays_to_save[_hk("w")] = _pack_named_array(_hk("w"), ch.weights)
-            arrays_to_save[_hk("b")] = _pack_f32_vec(ch.biases, f"Head {name!r} biases")
+            b_arr = np.asarray(ch.biases)
+            if b_arr.ndim != 1:
+                raise ValueError(f"Head {name!r} biases must be 1D, got shape {b_arr.shape}")
+            arrays_to_save[_hk("b")] = _pack_f32_vec(b_arr, f"Head {name!r} biases")
             state = exemplar_states.get(name)
             if state is not None:
                 for suffix, arr in state["arrays"].items():
@@ -2251,14 +2256,20 @@ class CompiledSystemOneModel:
                 and ch.coarse_weights is not None
                 and ch.coarse_biases is not None
             ):
+                cb_arr = np.asarray(ch.coarse_biases)
+                if cb_arr.ndim != 1:
+                    raise ValueError(f"Head {name!r} coarse_biases must be 1D, got shape {cb_arr.shape}")
                 arrays_to_save[_hk("coarse_w")] = _pack_named_array(_hk("coarse_w"), ch.coarse_weights)
                 arrays_to_save[_hk("coarse_b")] = _pack_f32_vec(
-                    ch.coarse_biases, f"Head {name!r} coarse biases"
+                    cb_arr, f"Head {name!r} coarse biases"
                 )
                 if ch.fine_weights is not None and ch.fine_biases is not None:
+                    fb_arr = np.asarray(ch.fine_biases)
+                    if fb_arr.ndim != 1:
+                        raise ValueError(f"Head {name!r} fine_biases must be 1D, got shape {fb_arr.shape}")
                     arrays_to_save[_hk("fine_w")] = _pack_named_array(_hk("fine_w"), ch.fine_weights)
                     arrays_to_save[_hk("fine_b")] = _pack_f32_vec(
-                        ch.fine_biases, f"Head {name!r} fine biases"
+                        fb_arr, f"Head {name!r} fine biases"
                     )
             if include_covariance:
                 if ch.P is not None:
@@ -6286,14 +6297,14 @@ class SystemOneCompiler:
                 pred_vals = _score_from_unit_prob(probs_calib, f_def.min_value, f_def.max_value)
                 true_calib_floats = raw_floats[num_train:].flatten()
                 residuals = [
-                    float(abs(float(pred_vals[i]) - float(true_calib_floats[i])))
+                    _score_abs_diff_clamped(float(pred_vals[i]), float(true_calib_floats[i]))
                     for i in range(len(pred_vals))
                 ]
                 sorted_residuals = np.sort(np.asarray(residuals, dtype=np.float64))
                 alpha = 0.05
                 n_res = len(sorted_residuals)
                 k = int(math.ceil((n_res + 1) * (1.0 - alpha)))
-                full_range = float(f_def.max_value) - float(f_def.min_value)
+                full_range = _score_full_span_clamped(f_def.min_value, f_def.max_value)
                 conformal_q = (full_range if k > n_res else float(sorted_residuals[k - 1])) if n_res else 0.0
 
                 compiled_heads[field_name] = CompiledHeadWeights(

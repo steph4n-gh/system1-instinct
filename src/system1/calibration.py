@@ -21,7 +21,12 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 
-from system1.core.schema import _score_half_span
+from system1.core.schema import (
+    _score_abs_diff_clamped,
+    _score_full_span_clamped,
+    _score_half_span,
+    _score_interval_bounds,
+)
 
 
 def _normalize_rows_f32_safe(arr: Any) -> Tuple[np.ndarray, np.ndarray]:
@@ -74,8 +79,18 @@ def _normalize_vec_f32_safe(
     return unit, raw_norm, True
 
 
+def _f64_to_exact_2m1074(v: float) -> int:
+    """Convert a finite float64 exactly into an integer multiple of 2^-1074."""
+    if v == 0.0:
+        return 0
+    m, e = math.frexp(v)
+    if e >= -1021:
+        return int(math.ldexp(m, 53)) << (e + 1021)
+    return int(math.ldexp(v, 1074))
+
+
 def _safe_centroid_mean_f64(rows: Any, weights: Optional[Any] = None) -> Optional[np.ndarray]:
-    """Compute overflow-free, order-independent centroid mean via Shewchuk math.fsum."""
+    """Compute overflow-free, permutation-invariant exact centroid mean in 2^-1074 fixed point."""
     r_arr = np.asarray(rows)
     if r_arr.ndim != 2 or r_arr.shape[0] == 0 or r_arr.shape[1] == 0:
         return None
@@ -83,8 +98,8 @@ def _safe_centroid_mean_f64(rows: Any, weights: Optional[Any] = None) -> Optiona
     if not bool(np.any(fin)):
         return None
     sub = np.asarray(r_arr[fin], dtype=np.float64)
-    w_unit: Optional[np.ndarray] = None
-    denom = float(sub.shape[0])
+    w_ints: Optional[List[int]] = None
+    den_int: int
     if weights is not None:
         w_arr = np.asarray(weights, dtype=np.float64).reshape(-1)
         if w_arr.shape[0] != r_arr.shape[0]:
@@ -97,48 +112,25 @@ def _safe_centroid_mean_f64(rows: Any, weights: Optional[Any] = None) -> Optiona
             return None
         sub = sub[w_ok]
         w_pos = w_sub[w_ok]
-        w_max = float(np.max(w_pos))
-        if not math.isfinite(w_max) or w_max <= 0.0:
+        w_ints = [_f64_to_exact_2m1074(float(w)) for w in w_pos]
+        w_sum_int = sum(w_ints)
+        if w_sum_int <= 0:
             return None
-        w_unit = w_pos / w_max
-        denom = math.fsum(w_unit.tolist())
-        if not math.isfinite(denom) or denom <= 0.0:
-            return None
-    n_rows, n_cols = sub.shape
-    shift = max(32, int(math.ceil(math.log2(max(2, n_rows) + 1))) + 4)
+        den_int = w_sum_int << 1074
+    else:
+        den_int = sub.shape[0] << 1074
+    n_cols = sub.shape[1]
     out = np.zeros(n_cols, dtype=np.float64)
     for j in range(n_cols):
         col = sub[:, j]
-        col_max = float(np.max(np.abs(col)))
-        if col_max == 0.0:
+        if not bool(np.any(col)):
             out[j] = 0.0
             continue
-        if w_unit is None:
-            if col_max <= 1e290:
-                out[j] = math.fsum(col.tolist()) / denom
-            else:
-                hi = [math.ldexp(float(v), -shift) for v in col if abs(float(v)) > 1e200]
-                lo = [float(v) for v in col if abs(float(v)) <= 1e200]
-                hi_mean = math.ldexp(math.fsum(hi) / denom, shift) if hi else 0.0
-                lo_mean = (math.fsum(lo) / denom) if lo else 0.0
-                out[j] = hi_mean + lo_mean
+        if w_ints is None:
+            num_int = sum(_f64_to_exact_2m1074(float(v)) for v in col)
         else:
-            if col_max <= 1e290:
-                out[j] = math.fsum((w_unit * col).tolist()) / denom
-            else:
-                hi = [
-                    float(w_unit[i]) * math.ldexp(float(col[i]), -shift)
-                    for i in range(n_rows)
-                    if abs(float(col[i])) > 1e200
-                ]
-                lo = [
-                    float(w_unit[i]) * float(col[i])
-                    for i in range(n_rows)
-                    if abs(float(col[i])) <= 1e200
-                ]
-                hi_mean = math.ldexp(math.fsum(hi) / denom, shift) if hi else 0.0
-                lo_mean = (math.fsum(lo) / denom) if lo else 0.0
-                out[j] = hi_mean + lo_mean
+            num_int = sum(wi * _f64_to_exact_2m1074(float(v)) for wi, v in zip(w_ints, col))
+        out[j] = num_int / den_int
     return out
 
 
@@ -1312,7 +1304,12 @@ class RegressionConformalPredictor:
             raise ValueError("Predictions and targets length mismatch")
         if len(preds) == 0:
             raise ValueError("Cannot calibrate regression conformal predictor with 0 samples")
-        res = np.abs(preds - targets)
+        if not (bool(np.all(np.isfinite(preds))) and bool(np.all(np.isfinite(targets)))):
+            raise ValueError("Predictions and targets must be finite")
+        res = np.array(
+            [_score_abs_diff_clamped(float(p_v), float(t_v)) for p_v, t_v in zip(preds.flat, targets.flat)],
+            dtype=np.float64,
+        )
         self.residuals = np.sort(res)
         self.is_calibrated = True
 
@@ -1326,8 +1323,7 @@ class RegressionConformalPredictor:
         if not (0.0 < alpha < 1.0):
             raise ValueError(f"Significance level alpha must be in (0, 1), got {alpha}")
         y_hat = float(point_prediction)
-        with np.errstate(over="ignore", invalid="ignore"):
-            val_range = float(self.max_value) - float(self.min_value)
+        val_range = _score_full_span_clamped(self.min_value, self.max_value)
         half_span = _score_half_span(self.min_value, self.max_value)
         n = len(self.residuals)
 
@@ -1338,8 +1334,7 @@ class RegressionConformalPredictor:
                 high = self.max_value
             else:
                 margin = (1.0 - alpha) * half_span
-                low = max(self.min_value, y_hat - margin)
-                high = min(self.max_value, y_hat + margin)
+                low, high = _score_interval_bounds(y_hat, margin, self.min_value, self.max_value)
         else:
             k = int(math.ceil((n + 1) * (1.0 - alpha)))
             if k > n:
@@ -1348,8 +1343,7 @@ class RegressionConformalPredictor:
                 high = self.max_value
             else:
                 margin = float(self.residuals[k - 1])
-                low = max(self.min_value, y_hat - margin)
-                high = min(self.max_value, y_hat + margin)
+                low, high = _score_interval_bounds(y_hat, margin, self.min_value, self.max_value)
         return RegressionConformalInterval(
             field_name=self.field_name,
             target_coverage=1.0 - alpha,
@@ -3119,7 +3113,8 @@ class UtilityCalibrator:
         return (not self._is_fitted) or (self.lam_crc < 0.0)
 
     def _fit_temperature(self, probs: np.ndarray, y: np.ndarray) -> float:
-        logits = np.log(np.clip(probs, 1e-12, 1.0))
+        p_norm = self._normalize_prob_rows(probs)
+        logits = np.log(np.clip(p_norm, 1e-12, 1.0))
         n = logits.shape[0]
         rows = np.arange(n)
         y_onehot = np.zeros_like(logits)

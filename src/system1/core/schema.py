@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import re
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Mapping, Optional, Sequence, Tuple, Type, Union, get_type_hints
@@ -636,6 +637,58 @@ def _score_from_unit_prob(prob: Any, min_value: float, max_value: float) -> Any:
     return (1.0 - prob) * lo + prob * hi
 
 
+def _score_full_span_clamped(min_value: float, max_value: float) -> float:
+    """Return finite min(sys.float_info.max, max_value - min_value) without overflow."""
+    lo = float(min_value)
+    hi = float(max_value)
+    if (hi >= 0.0 and lo >= 0.0) or (hi <= 0.0 and lo <= 0.0):
+        return hi - lo
+    hs = 0.5 * hi - 0.5 * lo
+    if hs >= 0.5 * sys.float_info.max:
+        return sys.float_info.max
+    return 2.0 * hs
+
+
+def _score_abs_diff_clamped(a: float, b: float) -> float:
+    """Return finite min(sys.float_info.max, |a - b|) without overflow or subnormal loss."""
+    fa = float(a)
+    fb = float(b)
+    if not (math.isfinite(fa) and math.isfinite(fb)):
+        return math.nan
+    if (fa >= 0.0 and fb >= 0.0) or (fa <= 0.0 and fb <= 0.0):
+        return abs(fa - fb)
+    hd = abs(0.5 * fa - 0.5 * fb)
+    if hd >= 0.5 * sys.float_info.max:
+        return sys.float_info.max
+    return 2.0 * hd
+
+
+def _score_interval_bounds(
+    y_hat: float, margin: float, min_value: float, max_value: float
+) -> Tuple[float, float]:
+    """Return (max(min_value, y_hat - margin), min(max_value, y_hat + margin)) without overflow."""
+    lo = float(min_value)
+    hi = float(max_value)
+    y = float(y_hat)
+    m = float(margin)
+    if not math.isfinite(m) or m >= sys.float_info.max:
+        return lo, hi
+    if not math.isfinite(y):
+        return lo, hi
+    if m <= 0.0:
+        yc = min(hi, max(lo, y))
+        return yc, yc
+    if y <= lo or _score_abs_diff_clamped(y, lo) <= m:
+        low = lo
+    else:
+        low = y - m
+    if y >= hi or _score_abs_diff_clamped(hi, y) <= m:
+        high = hi
+    else:
+        high = y + m
+    return low, high
+
+
 # FieldDefinition alias for canonical DecisionField
 FieldDefinition = DecisionField
 
@@ -652,4 +705,7 @@ __all__ = [
     "_score_half_span",
     "_score_to_unit_ratio",
     "_score_from_unit_prob",
+    "_score_full_span_clamped",
+    "_score_abs_diff_clamped",
+    "_score_interval_bounds",
 ]

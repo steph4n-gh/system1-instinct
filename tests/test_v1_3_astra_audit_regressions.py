@@ -13574,3 +13574,408 @@ def test_astra_35_round22_regressions() -> None:
     ):
         with pytest.raises(ValueError):
             fn9_s()
+
+
+def test_astra_36_round23_regressions() -> None:
+    """Round-23 regressions R23-1..R23-8: hierarchical budget sharing, exemplar bank strides, exact centroids, utility T fit, wide Score residuals/fallbacks, direct FastExplainer & hierarchy bias rank, and existing-compiled hierarchical export."""
+    import itertools
+    import math
+    import sys
+    import warnings
+    import numpy as np
+    import pytest
+
+    import system1.compiler as s1_compiler
+    from system1 import (
+        ChoiceField,
+        DecisionSchema,
+        DeterministicSemanticProjector,
+        FastExplainer,
+        GuardShield,
+        ScoreField,
+        SystemOneEngine,
+    )
+    from system1.calibration import (
+        ConformalPredictor,
+        RegressionConformalPredictor,
+        UtilityCalibrator,
+        _safe_centroid_mean_f64,
+    )
+    from system1.compiler import CompiledHeadWeights, CompiledSystemOneModel, SystemOneCompiler
+
+    class _R23Choice(DecisionSchema):
+        f = ChoiceField(options=("a", "b"))
+
+    def _fresh(schema_cls: Any = _R23Choice, dim: int = 16, **kw: Any) -> SystemOneEngine:
+        return SystemOneEngine(
+            schema_cls,
+            dimension=dim,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=kw.pop("strict_mode", False),
+            **kw,
+        )
+
+    def _root_buf(arr: np.ndarray) -> np.ndarray:
+        while getattr(arr, "base", None) is not None:
+            arr = arr.base
+        return arr
+
+    # ------------------------------------------------------------------
+    # R23-1: Hierarchical strided buffers share single allocation under v2 & v3 budgets.
+    # ------------------------------------------------------------------
+    cw_strided = np.zeros((2, 2048), dtype="f4")[:, :16]
+    fw_strided = np.zeros((2, 2048), dtype="f4")[:, :16]
+    h1 = CompiledHeadWeights(
+        "f",
+        "choice",
+        np.zeros((2, 16), dtype="f4"),
+        np.zeros(2, dtype="f4"),
+        options=("a", "b"),
+        hierarchical=True,
+        cluster_assignments=(0, 1),
+        coarse_weights=cw_strided,
+        coarse_biases=np.zeros(2, dtype="f4"),
+        fine_weights=fw_strided,
+        fine_biases=np.zeros(2, dtype="f4"),
+    )
+    m1 = CompiledSystemOneModel(_R23Choice(), {"f": h1}, dimension=16, backend="numpy", use_cache=False)
+    for fmt_v, allow_cap, reject_cap in ((2, 32_000, 16_000), (3, 20_000, 16_000)):
+        blob1 = m1.to_bytes(format_version=fmt_v, compact=False)
+        cap_attr = "MAX_SKILL_RUNTIME_BYTES_V3" if fmt_v == 3 else "MAX_SKILL_RUNTIME_BYTES"
+        orig_cap = getattr(s1_compiler, cap_attr)
+        try:
+            setattr(s1_compiler, cap_attr, allow_cap)
+            re1 = CompiledSystemOneModel.from_bytes(blob1, backend="numpy")
+            assert _root_buf(re1.heads["f"].coarse_weights) is _root_buf(re1._field_heads["f"].coarse_weights)
+            assert _root_buf(re1.heads["f"].fine_weights) is _root_buf(re1._field_heads["f"].fine_weights)
+            assert _root_buf(re1.heads["f"].coarse_weights).nbytes == 8256 + 128
+            setattr(s1_compiler, cap_attr, reject_cap)
+            with pytest.raises(ValueError, match="memory budget"):
+                CompiledSystemOneModel.from_bytes(blob1, backend="numpy")
+        finally:
+            setattr(s1_compiler, cap_attr, orig_cap)
+
+    # Also reproduce exact Astra coarse-only (16000 / 10000) single-buffer load without doubling.
+    h1_c = CompiledHeadWeights(
+        "f",
+        "choice",
+        np.zeros((2, 16), dtype="f4"),
+        np.zeros(2, dtype="f4"),
+        options=("a", "b"),
+        hierarchical=True,
+        cluster_assignments=(0, 1),
+        coarse_weights=cw_strided,
+        coarse_biases=np.zeros(2, dtype="f4"),
+    )
+    m1_c = CompiledSystemOneModel(_R23Choice(), {"f": h1_c}, dimension=16, backend="numpy", use_cache=False)
+    for fmt_v, cap_exact in ((2, 16_000), (3, 10_000)):
+        blob_c = m1_c.to_bytes(format_version=fmt_v, compact=False)
+        cap_attr = "MAX_SKILL_RUNTIME_BYTES_V3" if fmt_v == 3 else "MAX_SKILL_RUNTIME_BYTES"
+        orig_cap = getattr(s1_compiler, cap_attr)
+        try:
+            setattr(s1_compiler, cap_attr, cap_exact)
+            re_c = CompiledSystemOneModel.from_bytes(blob_c, backend="numpy")
+            assert _root_buf(re_c.heads["f"].coarse_weights) is _root_buf(re_c._field_heads["f"].coarse_weights)
+        finally:
+            setattr(s1_compiler, cap_attr, orig_cap)
+
+    # ------------------------------------------------------------------
+    # R23-2: Exemplar-vector (and shots_p / shots_c) 2D layouts survive export & .s1m v2/v3 reload.
+    # ------------------------------------------------------------------
+    e2 = _fresh(_R23Choice, 32)
+    h2 = e2.model.heads["f"]
+    p2 = "exemplar bank vector layout parity probe"
+    x2 = e2.model.projector._project_concept_aware(p2)
+    V2 = np.random.default_rng(2).normal(size=(2, 64)).astype("f4")[:, ::2]
+    V2 *= np.float32(1e8)
+    C2 = np.array(V2, copy=True)
+    dots2 = np.array([(x2 @ C2[k : k + 1].T)[0] for k in range(2)], dtype="f4")
+    h2.set_weights(np.zeros((2, 32), dtype="f4"), -np.float32(3) * dots2)
+    h2.restore_exemplar_state(
+        {
+            "arrays": {
+                "exemplar_centroids": np.zeros((2, 32), dtype="f4"),
+                "exemplar_vectors": V2,
+                "shots_p": V2,
+                "shots_c": V2,
+            },
+            "counts": {"exemplar_vectors": [1, 1], "shots_p": [1, 1], "shots_c": [1, 1]},
+        }
+    )
+    assert e2.decide(p2, record_receipt=False).values["f"] == "b"
+    cm2 = e2.to_compiled_model()
+    ev_cm2 = cm2.forward_single(p2).fields["f"]
+    assert ev_cm2.selected_value == "b" and float(ev_cm2.logits[1]) > 1.0
+    assert cm2.heads["f"].exemplar_state["arrays"]["exemplar_vectors"].strides == V2.strides
+    assert cm2.heads["f"].exemplar_state["arrays"]["shots_p"].strides == V2.strides
+    assert cm2.heads["f"].exemplar_state["arrays"]["shots_c"].strides == V2.strides
+    assert int(cm2.heads["f"].exemplar_state["arrays"]["exemplar_vectors"].ctypes.data % 64) == int(V2.ctypes.data % 64)
+    for fmt_v in (2, 3):
+        re2 = CompiledSystemOneModel.from_bytes(cm2.to_bytes(format_version=fmt_v, compact=False), backend="numpy")
+        ev_re2 = re2.forward_single(p2).fields["f"]
+        assert ev_re2.selected_value == "b" and np.array_equal(ev_re2.logits, ev_cm2.logits)
+        assert re2.heads["f"].exemplar_state["arrays"]["exemplar_vectors"].strides == V2.strides
+        assert re2.heads["f"].exemplar_state["arrays"]["shots_p"].strides == V2.strides
+        assert int(re2.heads["f"].exemplar_state["arrays"]["exemplar_vectors"].ctypes.data % 64) == int(V2.ctypes.data % 64)
+
+    # Direct sliced bank assignment without prior restore_exemplar_state also preserves 2D strides.
+    h2._exemplar_vectors_raw = None
+    h2._exemplar_vectors_bank_ids = ()
+    h2._exemplar_bank = (np.zeros((2, 32), dtype="f4"), [V2[0:1], V2[1:2]])
+    exp2_direct = h2.export_exemplar_state()
+    assert exp2_direct is not None
+    assert exp2_direct["arrays"]["exemplar_vectors"].strides == V2.strides
+    assert int(exp2_direct["arrays"]["exemplar_vectors"].ctypes.data % 64) == int(V2.ctypes.data % 64)
+
+    # ------------------------------------------------------------------
+    # R23-3: Exact 2^-1074 fixed-point centroid mean defeats split-sum cancellation & preserves scale invariance.
+    # ------------------------------------------------------------------
+    with warnings.catch_warnings(record=True) as caught_p3:
+        warnings.simplefilter("always", RuntimeWarning)
+        A3 = math.ldexp(1.0, 665)
+        X3_base = np.array(
+            [
+                [1e308, 1.0],
+                [-1e308, 1.0],
+                [A3, 1.0],
+                [-A3 / 2.0, 1.0],
+                [-A3 / 2.0, 1.0],
+                [6.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        for scale3 in (1.0, 1e-10, 1e-20, 1e-290):
+            xs3 = X3_base * scale3
+            uw3 = _safe_centroid_mean_f64(xs3)
+            ww3 = _safe_centroid_mean_f64(xs3, np.ones(6))
+            assert uw3 is not None and ww3 is not None
+            assert np.allclose(uw3, [scale3, scale3], rtol=1e-15, atol=0.0)
+            assert np.array_equal(uw3, ww3)
+            cp3 = ConformalPredictor("f", ("a", "b"))
+            cp3.calibrate_prototypes(xs3, ["a"] * 6, alpha=0.5)
+            assert np.allclose(cp3.prototypes[0], [math.sqrt(0.5), math.sqrt(0.5)], atol=1e-6)
+            comp3 = SystemOneCompiler._compute_class_prototypes(xs3, np.tile([1.0, 0.0], (6, 1)))
+            assert np.allclose(comp3[0], [math.sqrt(0.5), math.sqrt(0.5)], atol=1e-6)
+
+        w_ext3 = np.array([1e308, 1e-300], dtype=np.float64)
+        X_wext3 = np.array([[0.0, 0.0], [1e308, 0.0]], dtype=np.float64)
+        mw_ext3 = _safe_centroid_mean_f64(X_wext3, weights=w_ext3)
+        assert mw_ext3 is not None and math.isclose(mw_ext3[0], 1e-300, rel_tol=1e-15)
+
+        sub_min = math.ldexp(1.0, -1074)
+        rows_sub3 = np.array(
+            [[sys.float_info.max, 1.0], [-sys.float_info.max, 1.0], [3.0 * sub_min, 1.0]],
+            dtype=np.float64,
+        )
+        for perm3 in itertools.permutations(range(3)):
+            mp3 = _safe_centroid_mean_f64(rows_sub3[list(perm3)])
+            assert mp3 is not None and mp3[0] == sub_min and mp3[1] == 1.0
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_p3)
+
+    # ------------------------------------------------------------------
+    # R23-4: UtilityCalibrator._fit_temperature normalizes probabilities so fit is scale-invariant.
+    # ------------------------------------------------------------------
+    with warnings.catch_warnings(record=True) as caught_u4:
+        warnings.simplefilter("always", RuntimeWarning)
+        p4 = np.tile([0.9, 0.1], (40, 1))
+        y4 = np.tile([0, 0, 0, 1], 10)
+        temps_cal: List[float] = []
+        temps_split: List[float] = []
+        for sc4 in (1.0, 1e-300, 1e308):
+            cal4 = UtilityCalibrator([[0.0, 4.0], [1.0, 0.0]], safe_action=1, fit_temperature=True).fit(
+                p4 * sc4, y4, cal_probs=p4 * sc4, cal_y=y4
+            )
+            temps_cal.append(cal4.temperature)
+            assert cal4.temperature > 1.5
+            assert cal4.predict([0.9, 0.1], use_crc=False).tolist() == [1]
+
+            cal4_split = UtilityCalibrator([[0.0, 4.0], [1.0, 0.0]], safe_action=1, fit_temperature=True).fit(
+                p4 * sc4, y4
+            )
+            temps_split.append(cal4_split.temperature)
+            assert cal4_split.predict([0.9, 0.1], use_crc=False).tolist() == [1]
+        assert all(math.isclose(t, temps_cal[0], rel_tol=1e-12) for t in temps_cal)
+        assert all(math.isclose(t, temps_split[0], rel_tol=1e-12) for t in temps_split)
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_u4)
+
+    # ------------------------------------------------------------------
+    # R23-5 & R23-6: Wide ScoreField calibration residuals & k > n fallback stay finite & JSON-safe.
+    # ------------------------------------------------------------------
+    class _R23WideScore(DecisionSchema):
+        score = ScoreField(min_value=-1e308, max_value=1e308)
+
+    with warnings.catch_warnings(record=True) as caught_s5:
+        warnings.simplefilter("always", RuntimeWarning)
+        for bias5, targ5, n5, exp_q5 in (
+            (100.0, -1e308, 40, sys.float_info.max),
+            (0.0, 0.0, 4, sys.float_info.max),
+        ):
+            e5 = _fresh(_R23WideScore, 16, strict_mode=True)
+            e5.model.heads["score"].set_weights(np.zeros((1, 16), dtype="f4"), np.array([bias5], dtype="f4"))
+            cal_ds5 = [(f"prompt_{i}", {"score": targ5}) for i in range(n5)]
+            e5.calibrate(cal_ds5)
+            rep5 = e5.recalibrate(cal_ds5, alpha=0.05)
+            assert math.isfinite(rep5.per_field["score"].conformal_quantile)
+            eval5 = e5.evaluate(cal_ds5[:4])
+            assert math.isfinite(eval5.fields["score"].mae)
+
+            d5 = e5.decide("prompt_0", record_receipt=False)
+            b5 = e5.decide_batch(["prompt_0"], record_receipt=False)[0]
+            k5 = e5.compile_packed_kernel()
+            fc5 = e5.compile_callable()
+            d5_fc = fc5("prompt_0")
+            assert math.isfinite(d5.values["score"]) and math.isfinite(b5.values["score"])
+            assert math.isfinite(float(k5.decide_prompt("prompt_0")["s_val"][0, 0]))
+            assert math.isfinite(d5_fc.values["score"])
+
+            cm5 = e5.to_compiled_model()
+            assert math.isfinite(cm5.heads["score"].conformal_quantile)
+            assert cm5.heads["score"].conformal_quantile == pytest.approx(exp_q5, rel=1e-12)
+            assert all(math.isfinite(s) for s in cm5.heads["score"].calibration_scores)
+            e5_comp = SystemOneEngine(_R23WideScore, compiled_model=cm5, use_cache=False, strict_mode=True)
+            cm5_b = e5_comp.to_compiled_model()
+            assert math.isfinite(cm5_b.heads["score"].conformal_quantile)
+
+            for fmt_v in (2, 3):
+                re5 = CompiledSystemOneModel.from_bytes(cm5.to_bytes(format_version=fmt_v, compact=False), backend="numpy")
+                assert math.isfinite(re5.heads["score"].conformal_quantile)
+                assert all(math.isfinite(s) for s in re5.heads["score"].calibration_scores)
+
+        # Compiler direct compile() with +1e308 predictions and -1e308 held-out targets (both k > n_res and k <= n_res).
+        for n_comp in (12, 40):
+            comp_wide = SystemOneCompiler(_R23WideScore, dimension=16).compile(
+                {"score": [(f"wide_tok_{i}", 1e308 if i < (n_comp // 2) else -1e308) for i in range(n_comp)]},
+                calibration_split=0.5,
+                augment=False,
+            )
+            assert math.isfinite(comp_wide.heads["score"].conformal_quantile)
+            assert all(math.isfinite(s) for s in comp_wide.heads["score"].calibration_scores)
+            for fmt_v in (2, 3):
+                re_wide = CompiledSystemOneModel.from_bytes(
+                    comp_wide.to_bytes(format_version=fmt_v, compact=False), backend="numpy"
+                )
+                assert math.isfinite(re_wide.heads["score"].conformal_quantile)
+
+        rcp5 = RegressionConformalPredictor("score", min_value=-1e308, max_value=1e308)
+        rcp5.calibrate([1e308, 1e308], [-1e308, -1e308])
+        assert all(math.isfinite(r) for r in rcp5.residuals)
+        iv5 = rcp5.predict_interval(1e308, alpha=0.5)
+        assert iv5.lower_bound == -1e308 and iv5.upper_bound == 1e308
+        with pytest.raises(ValueError, match="finite"):
+            rcp5.calibrate([float("nan")], [0.0])
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_s5)
+
+    # ------------------------------------------------------------------
+    # R23-7: Direct FastExplainer constructor & hierarchical bias rank enforcement.
+    # ------------------------------------------------------------------
+    from system1.explain import _normalize_head_weights_and_options
+
+    proj16 = DeterministicSemanticProjector(dimension=16)
+    bad_explainer_cases = [
+        (np.zeros((2, 16), dtype="f4"), np.array([[0.0, 2.0]], dtype="f4"), ("a", "b")),
+        (np.zeros((1, 16), dtype="f4"), np.array(2.0, dtype="f4"), None),
+        (np.zeros((1, 16), dtype="f4"), np.array([2.0, 999.0], dtype="f4"), None),
+        (np.zeros((2, 16), dtype="f4"), np.array([0.0, 2.0], dtype="f4"), ("a", "b")),
+    ]
+    for w_ex, b_ex, o_ex in bad_explainer_cases[:3]:
+        with pytest.raises(ValueError):
+            _normalize_head_weights_and_options(w_ex, b_ex, o_ex)
+        with pytest.raises(ValueError):
+            FastExplainer(projector=proj16, weights=w_ex, biases=b_ex, options=o_ex)
+    with pytest.raises(ValueError):
+        FastExplainer(
+            projector=proj16,
+            weights=bad_explainer_cases[3][0],
+            biases=bad_explainer_cases[3][1],
+            options=bad_explainer_cases[3][2],
+            _bool_raw_meta={
+                "raw_w": np.zeros((2, 16), dtype="f4"),
+                "raw_b": np.array([[0.0, 2.0]], dtype="f4"),
+                "base_scale": 4.0,
+                "cal_temp": 1.0,
+            },
+        )
+
+    e7 = _fresh(_R23Choice, 16)
+    h7 = e7.model.heads["f"]
+    h7.set_weights(np.zeros((2, 16), dtype="f4"), np.zeros(2, dtype="f4"))
+    h7.set_hierarchical_weights(
+        cluster_assignments=(0, 1),
+        coarse_weights=np.zeros((2, 16), dtype="f4"),
+        coarse_biases=np.array([0.0, 2.0], dtype="f4"),
+        fine_weights=np.zeros((2, 16), dtype="f4"),
+        fine_biases=np.array([0.0, 2.0], dtype="f4"),
+    )
+    for attr7 in ("coarse_biases", "fine_biases"):
+        orig7 = getattr(h7, attr7)
+        setattr(h7, attr7, orig7.reshape(1, 2))
+        for fn7 in (
+            lambda: e7.decide("p", record_receipt=False),
+            lambda: e7.decide_batch(["p"]),
+            lambda: e7.to_compiled_model(),
+            lambda: GuardShield(e7, field_name="f", unsafe_label="b"),
+            lambda: h7.online_update(np.ones(17, dtype="f4"), np.array([0.0, 1.0], dtype="f4")),
+        ):
+            with pytest.raises(ValueError):
+                fn7()
+        setattr(h7, attr7, orig7)
+
+    # ------------------------------------------------------------------
+    # R23-8: Existing-compiled export synchronizes live hierarchical parameters & strides.
+    # ------------------------------------------------------------------
+    cw_init8 = np.zeros((2, 32), dtype="f4")[:, ::2]
+    fw_init8 = np.zeros((2, 32), dtype="f4")[:, ::2]
+    cw_init8.setflags(write=False)
+    fw_init8.setflags(write=False)
+    h8 = CompiledHeadWeights(
+        "f",
+        "choice",
+        np.zeros((2, 16), dtype="f4"),
+        np.zeros(2, dtype="f4"),
+        options=("a", "b"),
+        hierarchical=True,
+        cluster_assignments=(0, 1),
+        coarse_weights=cw_init8,
+        coarse_biases=np.zeros(2, dtype="f4"),
+        fine_weights=fw_init8,
+        fine_biases=np.zeros(2, dtype="f4"),
+    )
+    m8 = CompiledSystemOneModel(_R23Choice(), {"f": h8}, dimension=16, use_cache=False, backend="numpy")
+    e8 = SystemOneEngine(_R23Choice, model=m8, dimension=16, backend="numpy", use_cache=False, strict_mode=False)
+    x8 = m8.encode("probe")
+    cw_upd8 = np.zeros((2, 32), dtype="f4")[:, ::2]
+    cw_upd8[:] = np.vstack([-x8, x8])
+    m8._field_heads["f"].set_hierarchical_weights(
+        cluster_assignments=(0, 1),
+        coarse_weights=cw_upd8,
+        coarse_biases=np.zeros(2, dtype="f4"),
+        fine_weights=fw_init8,
+        fine_biases=np.zeros(2, dtype="f4"),
+    )
+    assert np.all(m8.heads["f"].coarse_weights == 0.0)
+    assert e8.decide("probe", record_receipt=False).values["f"] == "b"
+    cm8 = e8.to_compiled_model()
+    assert cm8.forward_single("probe").fields["f"].selected_value == "b"
+    assert np.allclose(cm8.heads["f"].coarse_weights, cw_upd8)
+    assert cm8.heads["f"].coarse_weights.strides == cw_init8.strides
+    assert cm8.heads["f"].fine_weights.strides == fw_init8.strides
+    re8_v3: Any = None
+    for fmt_v in (2, 3):
+        re8 = CompiledSystemOneModel.from_bytes(cm8.to_bytes(format_version=fmt_v, compact=False), backend="numpy")
+        assert re8.forward_single("probe").fields["f"].selected_value == "b"
+        assert re8.heads["f"].coarse_weights.strides == cw_init8.strides
+        assert re8.heads["f"].fine_weights.strides == fw_init8.strides
+        assert int(re8.heads["f"].coarse_weights.ctypes.data % 64) == int(cw_init8.ctypes.data % 64)
+        re8_v3 = re8
+
+    # Online learn() on read-only reloaded buffers + existing-compiled to_compiled_model() keeps strided coarse/fine updates.
+    assert re8_v3 is not None
+    cw_before8 = re8_v3.heads["f"].coarse_weights.copy()
+    e8_re = SystemOneEngine(_R23Choice, model=re8_v3, dimension=16, backend="numpy", use_cache=False, strict_mode=False)
+    e8_re.learn("probe", {"f": "a"})
+    cm8_learned = e8_re.to_compiled_model()
+    assert not np.allclose(cm8_learned.heads["f"].coarse_weights, cw_before8)
+    assert cm8_learned.heads["f"].coarse_weights.strides == cw_init8.strides
+    assert cm8_learned.heads["f"].fine_weights.strides == fw_init8.strides

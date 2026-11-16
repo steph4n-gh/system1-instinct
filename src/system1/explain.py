@@ -73,13 +73,18 @@ def _normalize_head_weights_and_options(
 ) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...]]:
     """Normalize ChoiceField or BooleanField (1, D) head into a multi-class matrix pair."""
     w = np.asarray(weights, dtype=np.float64)
-    b = np.asarray(biases, dtype=np.float64).reshape(-1)
+    b_raw = np.asarray(biases)
     if w.ndim != 2:
         raise ValueError(f"Expected 2D weight matrix, got shape {w.shape}")
+    if b_raw.ndim != 1:
+        raise ValueError(f"Expected 1D bias vector, got shape {b_raw.shape}")
+    b = np.asarray(b_raw, dtype=np.float64)
     opts = tuple(str(o) for o in options) if options is not None else ()
 
     if w.shape[0] == 1 and (not opts or len(opts) == 2):
         # Convert scalar BooleanField head w*x + b >= inv_sigmoid(t) into 2-class symmetric logits.
+        if b.shape != (1,):
+            raise ValueError(f"Bias shape {b.shape} does not match scalar Boolean weight rows {w.shape[0]}")
         logit_shift = _boolean_threshold_logit_shift(threshold)
         b_adj = float(b[0]) - (1.0 / float(temperature_scale)) * logit_shift
         w2 = np.vstack([-0.5 * w[0], 0.5 * w[0]])
@@ -439,7 +444,19 @@ class FastExplainer:
             else zero_emb_unit0
         )
         w_in = np.asarray(weights)
-        b_in = np.asarray(biases).reshape(-1)
+        b_in = np.asarray(biases)
+        if w_in.ndim != 2:
+            raise ValueError(f"Expected 2D weight matrix, got shape {w_in.shape}")
+        if (
+            hasattr(projector, "dimension")
+            and type(getattr(projector, "dimension")) is int
+            and w_in.shape[1] != int(projector.dimension)
+        ):
+            raise ValueError(
+                f"Weight width {w_in.shape[1]} does not match projector dimension {int(projector.dimension)}"
+            )
+        if b_in.ndim != 1:
+            raise ValueError(f"Expected 1D bias vector, got shape {b_in.shape}")
         if not (bool(np.all(np.isfinite(w_in))) and bool(np.all(np.isfinite(b_in)))):
             raise ValueError("Head weights and biases must be finite")
         inferred_bool = w_in.ndim == 2 and w_in.shape[0] == 1 and (options is None or len(options) in (0, 2))
@@ -571,7 +588,10 @@ class FastExplainer:
             if _bool_raw_meta is not None and w_f64.shape[0] == 1:
                 self._bool_has_scalar_raw = True
                 rw_src = np.asarray(_bool_raw_meta["raw_w"])
-                rb_src = np.asarray(_bool_raw_meta["raw_b"]).reshape(-1)
+                rb_raw = np.asarray(_bool_raw_meta["raw_b"])
+                if rb_raw.ndim != 1:
+                    raise ValueError(f"Expected 1D raw_b vector, got shape {rb_raw.shape}")
+                rb_src = rb_raw
                 self._bool_raw_w = _owned_readonly_array(
                     rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
                 )
@@ -616,7 +636,10 @@ class FastExplainer:
             if _bool_raw_meta is not None:
                 self._choice_has_raw = True
                 rw_src = np.asarray(_bool_raw_meta["raw_w"])
-                rb_src = np.asarray(_bool_raw_meta["raw_b"]).reshape(-1)
+                rb_raw = np.asarray(_bool_raw_meta["raw_b"])
+                if rb_raw.ndim != 1:
+                    raise ValueError(f"Expected 1D raw_b vector, got shape {rb_raw.shape}")
+                rb_src = rb_raw
                 self._choice_raw_w = _owned_readonly_array(
                     rw_src, dtype=rw_src.dtype if rw_src.dtype in (np.float32, np.float64) else np.float32
                 )

@@ -13,6 +13,7 @@ import json
 import math
 import secrets
 import statistics
+import sys
 import threading
 import time
 from contextlib import nullcontext
@@ -72,7 +73,14 @@ from system1.core.model import (
     _validate_packed_engine_support,
 )
 from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
-from system1.core.schema import _score_from_unit_prob, _score_half_span, _score_to_unit_ratio
+from system1.core.schema import (
+    _score_abs_diff_clamped,
+    _score_from_unit_prob,
+    _score_full_span_clamped,
+    _score_half_span,
+    _score_interval_bounds,
+    _score_to_unit_ratio,
+)
 from system1.core.embeddings import HybridProjector
 from system1.core.telemetry import TelemetryProjector
 from system1.core.text import PragmaticCompositeProjector
@@ -1196,7 +1204,7 @@ class SystemOneEngine:
                             }
                     k = int(math.ceil((len(scores) + 1) * (1.0 - self.default_alpha)))
                     upper = (
-                        float(definition.max_value) - float(definition.min_value)
+                        _score_full_span_clamped(definition.min_value, definition.max_value)
                         if isinstance(definition, ScoreField)
                         else 1.0
                     )
@@ -1317,7 +1325,7 @@ class SystemOneEngine:
                 ):
                     res_prev = self.regression_conformal_predictors[name].residuals
                     k_prev = int(math.ceil((len(res_prev) + 1) * (1.0 - alpha_val)))
-                    upper_p = float(definition.max_value - definition.min_value) if isinstance(definition, ScoreField) else 1.0
+                    upper_p = _score_full_span_clamped(definition.min_value, definition.max_value) if isinstance(definition, ScoreField) else 1.0
                     prev_q = upper_p if k_prev > len(res_prev) else float(res_prev[k_prev - 1])
                 else:
                     prev_q = 0.0
@@ -1507,7 +1515,7 @@ class SystemOneEngine:
                     predictor.calibrate(predictions, conf_labels)
                     scores = predictor.residuals
                     k = int(math.ceil((len(scores) + 1) * (1.0 - alpha_val)))
-                    upper = float(definition.max_value - definition.min_value)
+                    upper = _score_full_span_clamped(definition.min_value, definition.max_value)
                     new_q = upper if k > len(scores) else float(scores[k - 1])
 
                 fam_thresh_val = float(getattr(predictor, "familiarity_threshold", 0.0)) if isinstance(definition, (ChoiceField, BooleanField)) else 0.0
@@ -1824,8 +1832,8 @@ class SystemOneEngine:
                         except (ValueError, IndexError):
                             covered_i = False
                     half_err = abs(0.5 * float(pred_val) - 0.5 * float(gt_val))
-                    abs_err = abs(float(pred_val) - float(gt_val))
-                    f_mae_sum += abs_err
+                    abs_err = _score_abs_diff_clamped(float(pred_val), float(gt_val))
+                    f_mae_sum += abs_err / float(n_f)
                     correct_i = half_err <= 0.10 * half_span if math.isfinite(half_span) and half_span > 0.0 else (float(pred_val) == float(gt_val))
                     set_size_i = float(len(c_set))
                     singleton_i = is_accepted
@@ -1935,7 +1943,7 @@ class SystemOneEngine:
                 abstain_rate=f_abs_rate,
                 unfamiliar_rate=f_unf_rate,
                 abstention_reasons=f_reasons,
-                mae=float(f_mae_sum) / float(n_f) if isinstance(f_def, ScoreField) else 0.0,
+                mae=float(f_mae_sum) if isinstance(f_def, ScoreField) else 0.0,
             )
 
             total_field_evals += n_f
@@ -2602,18 +2610,19 @@ class SystemOneEngine:
                         interval_margin = interval.margin
                     else:
                         if is_strict and not has_learned_override:
-                            interval_margin = float(f_def.max_value) - float(f_def.min_value)
+                            interval_margin = _score_full_span_clamped(f_def.min_value, f_def.max_value)
                             low_b = f_def.min_value
                             high_b = f_def.max_value
                         else:
                             interval_margin = (1.0 - alpha) * half_span if not has_learned_override else 0.0
-                            low_b = max(f_def.min_value, val - interval_margin)
-                            high_b = min(f_def.max_value, val + interval_margin)
+                            low_b, high_b = _score_interval_bounds(val, interval_margin, f_def.min_value, f_def.max_value)
                         conformal_sets[name] = [f"[{low_b:.4f}, {high_b:.4f}]"]
 
                     if has_learned_override or float(interval_margin) == 0.0:
                         normalized_margin = 0.0
-                    elif math.isfinite(float(interval_margin)) and half_span > 0.0:
+                    elif not math.isfinite(float(interval_margin)) or float(interval_margin) >= sys.float_info.max:
+                        normalized_margin = 1.0
+                    elif half_span > 0.0:
                         normalized_margin = min(1.0, (0.5 * float(interval_margin)) / half_span)
                     else:
                         normalized_margin = 1.0
@@ -3502,6 +3511,58 @@ class SystemOneEngine:
             unit_p, _ = _normalize_rows_f32_safe(raw_p)
             return unit_p
 
+        def _extract_validated_hierarchy(
+            h_obj: Any, fname: str, width: int
+        ) -> Tuple[
+            bool,
+            Tuple[int, ...],
+            Optional[np.ndarray],
+            Optional[np.ndarray],
+            Optional[np.ndarray],
+            Optional[np.ndarray],
+        ]:
+            is_h = bool(getattr(h_obj, "hierarchical", False))
+            if not is_h:
+                return False, (), None, None, None, None
+            raw_cw = getattr(h_obj, "coarse_weights", None)
+            raw_cb = getattr(h_obj, "coarse_biases", None)
+            raw_assign = getattr(h_obj, "cluster_assignments", ())
+            if raw_cw is None or raw_cb is None:
+                raise ValueError(
+                    f"Field head {fname!r} hierarchical weights missing coarse_weights/coarse_biases"
+                )
+            cw_arr = _checked_f32_copy(raw_cw, f"Head {fname!r} coarse_weights")
+            cb_arr = _checked_f32_copy(raw_cb, f"Head {fname!r} coarse_biases")
+            if (
+                cw_arr.ndim != 2
+                or cw_arr.shape[1] != self.dimension
+                or cb_arr.ndim != 1
+                or cb_arr.shape != (cw_arr.shape[0],)
+            ):
+                raise ValueError(f"Field head {fname!r} hierarchical coarse shape mismatch")
+            assign_t = tuple(int(c) for c in raw_assign)
+            if len(assign_t) != width or any(c < 0 or c >= cw_arr.shape[0] for c in assign_t):
+                raise ValueError(f"Field head {fname!r} invalid hierarchical cluster_assignments")
+            raw_fw = getattr(h_obj, "fine_weights", None)
+            raw_fb = getattr(h_obj, "fine_biases", None)
+            if (raw_fw is None) != (raw_fb is None):
+                raise ValueError(
+                    f"Field head {fname!r} fine_weights and fine_biases must both be provided or both be None"
+                )
+            fw_arr: Optional[np.ndarray] = None
+            fb_arr: Optional[np.ndarray] = None
+            if raw_fw is not None and raw_fb is not None:
+                fw_arr = _checked_f32_copy(raw_fw, f"Head {fname!r} fine_weights")
+                fb_arr = _checked_f32_copy(raw_fb, f"Head {fname!r} fine_biases")
+                if (
+                    fw_arr.ndim != 2
+                    or fw_arr.shape != (width, self.dimension)
+                    or fb_arr.ndim != 1
+                    or fb_arr.shape != (width,)
+                ):
+                    raise ValueError(f"Field head {fname!r} hierarchical fine shape mismatch")
+            return True, assign_t, cw_arr, cb_arr, fw_arr, fb_arr
+
         with self._lock, getattr(self.model, "_lock", nullcontext()):
             if isinstance(self.model, CompiledSystemOneModel):
                 for name, ch in self.model.heads.items():
@@ -3528,6 +3589,15 @@ class SystemOneEngine:
                             else _checked_f32_copy(live_head.cross_covariance, f"Head {name!r} B")
                         )
                         ch.exemplar_state = live_head.export_exemplar_state()
+                        is_h, assign_t, cw_arr, cb_arr, fw_arr, fb_arr = _extract_validated_hierarchy(
+                            live_head, name, int(ch.weights.shape[0])
+                        )
+                        ch.hierarchical = is_h
+                        ch.cluster_assignments = assign_t
+                        ch.coarse_weights = cw_arr
+                        ch.coarse_biases = cb_arr
+                        ch.fine_weights = fw_arr
+                        ch.fine_biases = fb_arr
                     if name in self.calibrators:
                         ch.temperature = float(self.calibrators[name].temperature)
                         ch.logit_adjustments = _validated_head_logit_adjustments(
@@ -3575,7 +3645,7 @@ class SystemOneEngine:
                             ch.calibration_scores = tuple(float(s) for s in rcp.residuals)
                             n_res = len(rcp.residuals)
                             k_res = int(math.ceil((n_res + 1) * (1.0 - self.default_alpha)))
-                            val_range = float(rcp.max_value - rcp.min_value)
+                            val_range = _score_full_span_clamped(rcp.min_value, rcp.max_value)
                             ch.conformal_quantile = val_range if k_res > n_res else float(rcp.residuals[k_res - 1])
                         elif not rcp.is_calibrated:
                             ch.calibration_scores = ()
@@ -3648,7 +3718,7 @@ class SystemOneEngine:
                         calib_scores = tuple(float(s) for s in rcp.residuals)
                         n_res = len(rcp.residuals)
                         k_res = int(math.ceil((n_res + 1) * (1.0 - self.default_alpha)))
-                        val_range = float(rcp.max_value - rcp.min_value)
+                        val_range = _score_full_span_clamped(rcp.min_value, rcp.max_value)
                         conf_q = val_range if k_res > n_res else float(rcp.residuals[k_res - 1])
 
                 opts: Tuple[str, ...]
@@ -3664,10 +3734,9 @@ class SystemOneEngine:
                 _validate_head_weight_bias_shapes(f_def, w_export, b_export, self.dimension, name)
                 raw_p = getattr(head, "covariance_inv", None)
                 raw_b_cov = getattr(head, "cross_covariance", None)
-                raw_cw = getattr(head, "coarse_weights", None)
-                raw_cb = getattr(head, "coarse_biases", None)
-                raw_fw = getattr(head, "fine_weights", None)
-                raw_fb = getattr(head, "fine_biases", None)
+                is_h, assign_t, cw_arr, cb_arr, fw_arr, fb_arr = _extract_validated_hierarchy(
+                    head, name, int(w_export.shape[0])
+                )
                 compiled_heads[name] = CompiledHeadWeights(
                     field_name=name,
                     field_type=f_def.field_type,
@@ -3692,12 +3761,12 @@ class SystemOneEngine:
                     prototypes=proto_mat,
                     prototype_threshold=proto_thresh,
                     prototype_scores=proto_scores,
-                    hierarchical=bool(getattr(head, "hierarchical", False)),
-                    cluster_assignments=tuple(getattr(head, "cluster_assignments", ())),
-                    coarse_weights=None if raw_cw is None else _checked_f32_copy(raw_cw, f"Head {name!r} coarse_weights"),
-                    coarse_biases=None if raw_cb is None else _checked_f32_copy(raw_cb, f"Head {name!r} coarse_biases"),
-                    fine_weights=None if raw_fw is None else _checked_f32_copy(raw_fw, f"Head {name!r} fine_weights"),
-                    fine_biases=None if raw_fb is None else _checked_f32_copy(raw_fb, f"Head {name!r} fine_biases"),
+                    hierarchical=is_h,
+                    cluster_assignments=assign_t,
+                    coarse_weights=cw_arr,
+                    coarse_biases=cb_arr,
+                    fine_weights=fw_arr,
+                    fine_biases=fb_arr,
                     exemplar_state=head.export_exemplar_state(),
                 )
 

@@ -56,6 +56,7 @@ from system1.core import (
     ScoreField,
 )
 from system1.core.model import FastDecisionCallable
+from system1.core.schema import _score_abs_diff_clamped, _score_half_span
 
 logger = logging.getLogger("system1.compat.typesafe")
 
@@ -417,8 +418,18 @@ def evaluate_promotion_eligibility(
                     and not isinstance(pred_v, bool)
                     and not isinstance(target_v, bool)
                 ):
-                    margin = max(0.5, 0.20 * (getattr(f_def, "max_value", 1.0) - getattr(f_def, "min_value", 0.0))) if f_def else 0.5
-                    if abs(float(pred_v) - float(target_v)) <= margin:
+                    margin = (
+                        max(
+                            0.5,
+                            0.40 * _score_half_span(
+                                float(getattr(f_def, "min_value", 0.0)),
+                                float(getattr(f_def, "max_value", 1.0)),
+                            ),
+                        )
+                        if f_def
+                        else 0.5
+                    )
+                    if _score_abs_diff_clamped(float(pred_v), float(target_v)) <= margin:
                         is_match = True
                 elif isinstance(f_def, MultiChoiceField):
                     s_pred = set(pred_v) if isinstance(pred_v, (list, tuple, set)) else ({pred_v} if pred_v else set())
