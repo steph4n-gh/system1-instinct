@@ -19595,3 +19595,736 @@ def test_astra_46_round33_regressions() -> None:
     assert len(client_r5._cutover_lifecycles) <= 1
 
 
+def test_astra_47_round34_regressions() -> None:
+    """In-memory Round-34 regressions for R34-1 through R34-7 and sister paths."""
+    import dis
+    from types import SimpleNamespace
+    from typing import Tuple
+    from unittest.mock import patch
+
+    from system1.compat.universal import SoftDistillingLifecycle, compile_questions_contract
+    from system1.core.model import SystemOneModel
+    from system1.core.schema import BooleanField, ChoiceField, DecisionSchema
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig, CutoverState
+    from system1.engine import SystemOneEngine, _analyze_code_kw_flow, _inspect_varkw_wrapper
+    from system1.fallback import BoundedReviewFallback
+
+    class _R34CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="First")
+        g = ChoiceField(options=("a", "b"), description="Second")
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return values
+
+    class _R34MixedSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="Primary choice")
+        g = BooleanField(threshold=0.5, description="Approve boolean")
+
+    class _R34SimpleSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="Single choice")
+
+    class _R34BaseModel:
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            self._inner = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            )
+            for h in self._inner.heads.values():
+                h.set_weights(np.zeros((2, dim), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+            self.schema = self._inner.schema
+            self.projector = self._inner.projector
+            self.dimension = self._inner.dimension
+            self.heads = self._inner.heads
+
+        def encode(self, prompt: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
+            return self._inner.encode(prompt, recency_weighted=recency_weighted)
+
+        def forward_single(self, prompt: str, embedding: Any = None) -> Any:
+            return self._inner.forward_single(prompt, embedding=embedding)
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            return self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+
+    class _R34SplitHelper:
+        @staticmethod
+        def split(*, use_cache: bool = True, **rest: Any) -> Tuple[bool, Dict[str, Any]]:
+            return use_cache, rest
+
+    def _assert_cache_wrapper_rejects_invalid_learn(model_cls: Any) -> None:
+        m = model_cls(_R34CoupledSchema(), 16)
+        eng = SystemOneEngine(
+            _R34CoupledSchema(),
+            model=m,
+            use_cache=False,
+            strict_mode=True,
+            min_calibration_lessons=1_000_000,
+        )
+        r0 = eng.decide("p", use_cache=False)
+        assert r0.values == {"f": "a", "g": "a"}
+        v_before = int(eng.model_version)
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng.learn("p", {"f": "b"})
+        assert int(eng.model_version) == v_before
+        if hasattr(m, "last"):
+            del m.last
+        eng.use_cache = True
+        r1 = eng.decide("p", use_cache=False)
+        assert r1.values == {"f": "a", "g": "a"}
+
+    # ------------------------------------------------------------------
+    # R34-1: MAKE_FUNCTION preserves positional default constants even when
+    # a kwonly default shares the same string name as a kwonly parameter.
+    # ------------------------------------------------------------------
+    class _R34PosAndKwSameNameModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def split(opts: Dict[str, Any] = kwargs, key: str = "use_cache", *, use_cache: bool = False) -> Tuple[bool, Dict[str, Any]]:
+                copied = dict(opts)
+                val = bool(copied.pop(key, not use_cache))
+                return val, copied
+
+            cached, rest = split()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    _assert_cache_wrapper_rejects_invalid_learn(_R34PosAndKwSameNameModel)
+    ref_r34_1, _ = _inspect_varkw_wrapper(
+        _R34PosAndKwSameNameModel(_R34CoupledSchema(), 16).forward_single,
+        frozenset({"use_cache"}),
+    )
+    assert "use_cache" in ref_r34_1
+
+    # Negative control for R34-1: kwonly parameter name alone must not leak.
+    class _R34NegKwOnlyParamModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def safe_helper(*, use_cache: bool = False) -> bool:
+                return use_cache
+
+            _ = safe_helper()
+            return super().forward_single(*args, **kwargs)
+
+    ref_neg_r34_1, _ = _inspect_varkw_wrapper(
+        _R34NegKwOnlyParamModel(_R34CoupledSchema(), 16).forward_single,
+        frozenset({"use_cache"}),
+    )
+    assert "use_cache" not in ref_neg_r34_1
+
+    # Cross-runtime synthetic MAKE_FUNCTION(arg=3) instruction sequence check so
+    # both Python 3.12 and Python 3.14 verify R34-1 positional+kwonly overlap.
+    def _dummy_make3_callee(opts: Dict[str, Any] = {}, key: str = "use_cache", *, use_cache: bool = False) -> Any:
+        return opts, key, use_cache
+
+    def _dummy_make3_outer(kwargs: Dict[str, Any]) -> Any:
+        return kwargs
+
+    ins_make3 = [
+        SimpleNamespace(opname="LOAD_FAST", opcode=dis.opmap["LOAD_FAST"], arg=0, argval="kwargs"),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=1, argval="use_cache"),
+        SimpleNamespace(opname="BUILD_TUPLE", opcode=dis.opmap["BUILD_TUPLE"], arg=2, argval=2),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=2, argval=False),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=3, argval=("use_cache",)),
+        SimpleNamespace(opname="BUILD_CONST_KEY_MAP", opcode=dis.opmap.get("BUILD_CONST_KEY_MAP", 156), arg=1, argval=1),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=4, argval=_dummy_make3_callee.__code__),
+        SimpleNamespace(opname="MAKE_FUNCTION", opcode=dis.opmap["MAKE_FUNCTION"], arg=3, argval=3),
+        SimpleNamespace(opname="CALL", opcode=dis.opmap.get("CALL", 171), arg=0, argval=0),
+        SimpleNamespace(opname="RETURN_VALUE", opcode=dis.opmap["RETURN_VALUE"], arg=None, argval=None),
+    ]
+    with patch.object(dis, "get_instructions", return_value=ins_make3):
+        flow_make3 = _analyze_code_kw_flow(
+            _dummy_make3_outer.__code__,
+            frozenset({"kwargs"}),
+            frozenset({"use_cache"}),
+        )
+    assert "use_cache" in flow_make3[6]
+
+    # ------------------------------------------------------------------
+    # R34-2: UNPACK_EX, >16-element tuples, LIST_APPEND/EXTEND starred
+    # sequences, and constant index subscripts preserve container aliases.
+    # ------------------------------------------------------------------
+    class _R34UnpackExPrefixModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            alias, *other = (forwarded, 0)
+            alias.update(kwargs)
+            _ = other
+            cached, rest = _R34SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34UnpackExSuffixModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            *other, alias = (0, 1, forwarded)
+            alias.update(kwargs)
+            _ = other
+            cached, rest = _R34SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34UnpackExStarRestSubscrModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            _, *rest_seq = (0, forwarded)
+            rest_seq[0].update(kwargs)
+            cached, rest = _R34SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34StarredListSuffixModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            extra_items = [1, 2]
+            lst = [0, *extra_items, forwarded]
+            _first, *_mid, alias = lst
+            alias.update(kwargs)
+            cached, rest = _R34SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34Long17TupleModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            t17 = (forwarded, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+            a0, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _ = t17
+            a0.update(kwargs)
+            cached, rest = _R34SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34SubscrAliasModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            t = (0, forwarded)
+            t[-1].update(kwargs)
+            cached, rest = _R34SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34DynamicSubscrAliasModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            idx = int("0")
+            (forwarded, 0)[idx].update(kwargs)
+            cached, rest = _R34SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34NestedCellMutModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+
+            def fill() -> None:
+                forwarded.update(kwargs)
+
+            fill()
+            cached, rest = _R34SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    for mcls_2 in (
+        _R34UnpackExPrefixModel,
+        _R34UnpackExSuffixModel,
+        _R34UnpackExStarRestSubscrModel,
+        _R34StarredListSuffixModel,
+        _R34Long17TupleModel,
+        _R34SubscrAliasModel,
+        _R34DynamicSubscrAliasModel,
+        _R34NestedCellMutModel,
+    ):
+        _assert_cache_wrapper_rejects_invalid_learn(mcls_2)
+
+    # ------------------------------------------------------------------
+    # R34-3: Returned closures retain code/capture metadata across calls.
+    # ------------------------------------------------------------------
+    class _R34ReturnedLambdaDefaultModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def make() -> Any:
+                return lambda opts=kwargs: _R34SplitHelper.split(**opts)
+
+            cached, rest = make()()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34ReturnedClosureCellModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def make() -> Any:
+                return lambda: _R34SplitHelper.split(**kwargs)
+
+            fn = make()
+            cached, rest = fn()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34UntaintedFactoryReturningVarKwModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def make() -> Any:
+                return lambda **opts: _R34SplitHelper.split(**opts)
+
+            cached, rest = make()(**kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34PassthroughFactoryModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def passthrough(fn_arg: Any) -> Any:
+                return fn_arg
+
+            cached, rest = passthrough(lambda opts=kwargs: _R34SplitHelper.split(**opts))()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34ClassFactoryHelper:
+        @staticmethod
+        def make_with(src: Any) -> Any:
+            return lambda opts=src: _R34SplitHelper.split(**opts)
+
+        @staticmethod
+        def make_zero() -> Any:
+            return lambda **opts: _R34SplitHelper.split(**opts)
+
+    class _R34ClassFactoryArgModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _R34ClassFactoryHelper.make_with(kwargs)()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R34ClassFactoryZeroModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _R34ClassFactoryHelper.make_zero()(**kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    for mcls_3 in (
+        _R34ReturnedLambdaDefaultModel,
+        _R34ReturnedClosureCellModel,
+        _R34UntaintedFactoryReturningVarKwModel,
+        _R34PassthroughFactoryModel,
+        _R34ClassFactoryArgModel,
+        _R34ClassFactoryZeroModel,
+    ):
+        _assert_cache_wrapper_rejects_invalid_learn(mcls_3)
+
+    # Negative control for R34-3: untainted factory returning unrelated string
+    # must not leak literal keys inside its body.
+    class _R34NegFactoryNoLeakModel(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def get_mode() -> Any:
+                return lambda: {"use_cache": "fast"}["use_cache"]
+
+            _ = get_mode()()
+            return super().forward_single(*args, **kwargs)
+
+    ref_neg_r34_3, _ = _inspect_varkw_wrapper(
+        _R34NegFactoryNoLeakModel(_R34CoupledSchema(), 16).forward_single,
+        frozenset({"use_cache"}),
+    )
+    assert "use_cache" not in ref_neg_r34_3
+
+    # ------------------------------------------------------------------
+    # R34-4: Fixed-point pass limit scales beyond 64-hop dict chains.
+    # ------------------------------------------------------------------
+    class _R34Chain65Model(_R34BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            d0: Dict[str, Any] = {}
+            d1: Dict[str, Any] = {}
+            d2: Dict[str, Any] = {}
+            d3: Dict[str, Any] = {}
+            d4: Dict[str, Any] = {}
+            d5: Dict[str, Any] = {}
+            d6: Dict[str, Any] = {}
+            d7: Dict[str, Any] = {}
+            d8: Dict[str, Any] = {}
+            d9: Dict[str, Any] = {}
+            d10: Dict[str, Any] = {}
+            d11: Dict[str, Any] = {}
+            d12: Dict[str, Any] = {}
+            d13: Dict[str, Any] = {}
+            d14: Dict[str, Any] = {}
+            d15: Dict[str, Any] = {}
+            d16: Dict[str, Any] = {}
+            d17: Dict[str, Any] = {}
+            d18: Dict[str, Any] = {}
+            d19: Dict[str, Any] = {}
+            d20: Dict[str, Any] = {}
+            d21: Dict[str, Any] = {}
+            d22: Dict[str, Any] = {}
+            d23: Dict[str, Any] = {}
+            d24: Dict[str, Any] = {}
+            d25: Dict[str, Any] = {}
+            d26: Dict[str, Any] = {}
+            d27: Dict[str, Any] = {}
+            d28: Dict[str, Any] = {}
+            d29: Dict[str, Any] = {}
+            d30: Dict[str, Any] = {}
+            d31: Dict[str, Any] = {}
+            d32: Dict[str, Any] = {}
+            d33: Dict[str, Any] = {}
+            d34: Dict[str, Any] = {}
+            d35: Dict[str, Any] = {}
+            d36: Dict[str, Any] = {}
+            d37: Dict[str, Any] = {}
+            d38: Dict[str, Any] = {}
+            d39: Dict[str, Any] = {}
+            d40: Dict[str, Any] = {}
+            d41: Dict[str, Any] = {}
+            d42: Dict[str, Any] = {}
+            d43: Dict[str, Any] = {}
+            d44: Dict[str, Any] = {}
+            d45: Dict[str, Any] = {}
+            d46: Dict[str, Any] = {}
+            d47: Dict[str, Any] = {}
+            d48: Dict[str, Any] = {}
+            d49: Dict[str, Any] = {}
+            d50: Dict[str, Any] = {}
+            d51: Dict[str, Any] = {}
+            d52: Dict[str, Any] = {}
+            d53: Dict[str, Any] = {}
+            d54: Dict[str, Any] = {}
+            d55: Dict[str, Any] = {}
+            d56: Dict[str, Any] = {}
+            d57: Dict[str, Any] = {}
+            d58: Dict[str, Any] = {}
+            d59: Dict[str, Any] = {}
+            d60: Dict[str, Any] = {}
+            d61: Dict[str, Any] = {}
+            d62: Dict[str, Any] = {}
+            d63: Dict[str, Any] = {}
+            d64: Dict[str, Any] = {}
+            for _ in range(65):
+                d0.update(d1); d1.update(d2); d2.update(d3); d3.update(d4); d4.update(d5)
+                d5.update(d6); d6.update(d7); d7.update(d8); d8.update(d9); d9.update(d10)
+                d10.update(d11); d11.update(d12); d12.update(d13); d13.update(d14); d14.update(d15)
+                d15.update(d16); d16.update(d17); d17.update(d18); d18.update(d19); d19.update(d20)
+                d20.update(d21); d21.update(d22); d22.update(d23); d23.update(d24); d24.update(d25)
+                d25.update(d26); d26.update(d27); d27.update(d28); d28.update(d29); d29.update(d30)
+                d30.update(d31); d31.update(d32); d32.update(d33); d33.update(d34); d34.update(d35)
+                d35.update(d36); d36.update(d37); d37.update(d38); d38.update(d39); d39.update(d40)
+                d40.update(d41); d41.update(d42); d42.update(d43); d43.update(d44); d44.update(d45)
+                d45.update(d46); d46.update(d47); d47.update(d48); d48.update(d49); d49.update(d50)
+                d50.update(d51); d51.update(d52); d52.update(d53); d53.update(d54); d54.update(d55)
+                d55.update(d56); d56.update(d57); d57.update(d58); d58.update(d59); d59.update(d60)
+                d60.update(d61); d61.update(d62); d62.update(d63); d63.update(d64); d64.update(kwargs)
+            cached, rest = _R34SplitHelper.split(**d0)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    _assert_cache_wrapper_rejects_invalid_learn(_R34Chain65Model)
+
+    # ------------------------------------------------------------------
+    # R34-5: Failed compile hook mutating staged_engine.schema.fields["g"]
+    # cannot alter old_engine or live lifecycle predictions.
+    # ------------------------------------------------------------------
+    hook_state_r5: Dict[str, Any] = {"fail_on_second": False}
+
+    def _mut_staged_schema_hook(staged_eng: Any, pairs: Any) -> bool:
+        if hook_state_r5["fail_on_second"]:
+            staged_eng.schema.fields["g"].threshold = 1.0
+            raise RuntimeError("staged schema hook failed")
+        return False
+
+    orig_schema_r5 = _R34MixedSchema()
+    lc_r5 = AutoCutoverLifecycle(
+        orig_schema_r5,
+        teacher=lambda p: {"f": "a", "g": True} if "accept" in p else {"f": "b", "g": False},
+        post_compile_hook=_mut_staged_schema_hook,
+        config=CutoverConfig(
+            milestones=(36, 72),
+            k_min=2,
+            canary_rate=0.5,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    for i in range(71):
+        if i % 2 == 0:
+            lc_r5.observe_teacher(f"accept approve pleasant detail number {i}", {"f": "a", "g": True})
+        else:
+            lc_r5.observe_teacher(f"reject deny dangerous detail number {i}", {"f": "b", "g": False})
+    assert len(lc_r5.admitted_vecs) == 71
+    old_eng_r5 = lc_r5.engine
+    assert old_eng_r5 is not None
+    assert old_eng_r5.decide("accept approve pleasant detail number 0", use_cache=False).values["g"] is True
+    assert orig_schema_r5.fields["g"].threshold == 0.5
+    assert lc_r5.schema.fields["g"].threshold == 0.5
+    assert old_eng_r5.schema.fields["g"].threshold == 0.5
+
+    hook_state_r5["fail_on_second"] = True
+    with pytest.raises(RuntimeError, match="staged schema hook failed"):
+        lc_r5.observe_teacher("reject deny dangerous detail number 71", {"f": "b", "g": False})
+    assert len(lc_r5.admitted_vecs) == 71
+    assert lc_r5.engine is old_eng_r5
+    assert lc_r5.schema.fields["g"].threshold == 0.5
+    assert old_eng_r5.schema.fields["g"].threshold == 0.5
+    assert old_eng_r5.decide("accept approve pleasant detail number 0", use_cache=False).values["g"] is True
+
+    # Sister path: SoftDistillingLifecycle does not alias contract.schema into lifecycle.schema,
+    # and passing a DecisionSchema subclass to AutoCutoverLifecycle does not alias _declared_fields.
+    contract_r5 = compile_questions_contract(
+        {
+            "f": {"type": "choice", "options": ["a", "b"], "instructions": "r34 choice"},
+            "g": {"type": "noul", "instructions": "r34 bool"},
+        }
+    )
+    fn_g_r5 = contract_r5.contracts[1].internal_name
+    sdl_r5 = SoftDistillingLifecycle(contract_r5)
+    assert sdl_r5.lifecycle.schema.fields[fn_g_r5] is not contract_r5.schema.fields[fn_g_r5]
+
+    lc_cls_r5 = AutoCutoverLifecycle(
+        _R34MixedSchema,
+        config=CutoverConfig(milestones=(36,), k_min=2, sparse_dim=64, dense_dim=16),
+    )
+    assert lc_cls_r5.schema.fields["g"] is not _R34MixedSchema._declared_fields["g"]
+
+    # ------------------------------------------------------------------
+    # R34-6: Rollback restores existing admitted_labels, admitted_vecs,
+    # admitted_lengths, _vec_buf rows, and schema on both observe_teacher & step.
+    # ------------------------------------------------------------------
+    def _build_35_mixed(hook_fn: Any) -> AutoCutoverLifecycle:
+        lc = AutoCutoverLifecycle(
+            _R34MixedSchema(),
+            teacher=lambda p: {"f": "a", "g": True} if "accept" in p else {"f": "b", "g": False},
+            post_compile_hook=hook_fn,
+            config=CutoverConfig(
+                milestones=(36,),
+                k_min=2,
+                canary_rate=0.5,
+                sparse_dim=64,
+                dense_dim=16,
+                enable_quarantine=False,
+            ),
+        )
+        for i in range(35):
+            if i % 2 == 0:
+                lc.observe_teacher(f"accept approve pleasant detail number {i}", {"f": "a", "g": True})
+            else:
+                lc.observe_teacher(f"reject deny dangerous detail number {i}", {"f": "b", "g": False})
+        return lc
+
+    holder_r6: Dict[str, AutoCutoverLifecycle] = {}
+
+    def _corrupt_existing_and_fail_hook(eng: Any, pairs: Any) -> bool:
+        tgt = holder_r6["lc"]
+        tgt.admitted_labels[0] = "b"
+        tgt.admitted_vecs[0][:] = 0.0
+        tgt.admitted_lengths[0] = 999
+        tgt._vec_buf[0][:] = 0.0
+        tgt.schema.fields["g"].threshold = 1.0
+        raise RuntimeError("corrupt hook failed")
+
+    # (a) observe_teacher rollback
+    lc_obs_r6 = _build_35_mixed(_corrupt_existing_and_fail_hook)
+    holder_r6["lc"] = lc_obs_r6
+    orig_lbl_r6 = lc_obs_r6.admitted_labels[0]
+    orig_vec_r6 = lc_obs_r6.admitted_vecs[0].copy()
+    orig_buf_r6 = lc_obs_r6._vec_buf[0].copy()
+    orig_len_r6 = lc_obs_r6.admitted_lengths[0]
+    with pytest.raises(RuntimeError, match="corrupt hook failed"):
+        lc_obs_r6.observe_teacher("reject deny dangerous detail number 35", {"f": "b", "g": False})
+    assert len(lc_obs_r6.admitted_vecs) == 35
+    assert lc_obs_r6.admitted_labels[0] == orig_lbl_r6
+    assert lc_obs_r6.admitted_values[0] == {"f": "a", "g": True}
+    assert np.array_equal(lc_obs_r6.admitted_vecs[0], orig_vec_r6)
+    assert np.array_equal(lc_obs_r6._vec_buf[0], orig_buf_r6)
+    assert lc_obs_r6.admitted_lengths[0] == orig_len_r6
+    assert lc_obs_r6.schema.fields["g"].threshold == 0.5
+
+    # (b) step() rollback
+    lc_step_r6 = _build_35_mixed(_corrupt_existing_and_fail_hook)
+    holder_r6["lc"] = lc_step_r6
+    orig_lbl_s6 = lc_step_r6.admitted_labels[0]
+    orig_vec_s6 = lc_step_r6.admitted_vecs[0].copy()
+    orig_buf_s6 = lc_step_r6._vec_buf[0].copy()
+    with pytest.raises(RuntimeError, match="corrupt hook failed"):
+        lc_step_r6.step("reject deny dangerous detail number 35")
+    assert len(lc_step_r6.admitted_vecs) == 35
+    assert lc_step_r6.admitted_labels[0] == orig_lbl_s6
+    assert np.array_equal(lc_step_r6.admitted_vecs[0], orig_vec_s6)
+    assert np.array_equal(lc_step_r6._vec_buf[0], orig_buf_s6)
+    assert lc_step_r6.schema.fields["g"].threshold == 0.5
+
+    # ------------------------------------------------------------------
+    # R34-7: Direct lifecycle step()/decide_local() and BoundedReviewFallback
+    # refuse local and cached answers after entering DRIFT_RECALIBRATE.
+    # ------------------------------------------------------------------
+    teacher_calls_r7: List[str] = []
+    drift_flipped = {"on": False}
+
+    def _teacher_r7(prompt: str) -> Dict[str, Any]:
+        teacher_calls_r7.append(prompt)
+        if drift_flipped["on"]:
+            return {"f": "b" if "accept" in prompt else "a"}
+        return {"f": "a" if "accept" in prompt else "b"}
+
+    lc_r7 = AutoCutoverLifecycle(
+        _R34SimpleSchema(),
+        teacher=_teacher_r7,
+        config=CutoverConfig(
+            milestones=(64,),
+            k_min=2,
+            canary_rate=0.5,
+            sparse_dim=128,
+            dense_dim=32,
+            enable_quarantine=False,
+        ),
+    )
+    for i in range(64):
+        if i % 2 == 0:
+            lc_r7.observe_teacher(f"accept approve pleasant detail number {i}", {"f": "a"})
+        else:
+            lc_r7.observe_teacher(f"reject deny dangerous detail number {i}", {"f": "b"})
+    assert lc_r7.state == CutoverState.SELECTIVE_HOT_SWAP.value
+    assert lc_r7.active_tau is not None
+    assert len(lc_r7.clean_cache) > 0
+
+    cache_prompts_r7 = [f"accept approve pleasant detail number {i}" for i in range(0, 64, 2)]
+    heldout_cached_p = cache_prompts_r7[0]
+    lc_r7.clean_cache[heldout_cached_p] = {"f": "a"}
+    probe_prompts_r7 = cache_prompts_r7[1:18]
+
+    contradictions = 0
+    for cp in probe_prompts_r7:
+        lc_r7.clean_cache[cp] = {"f": "a"}
+        if lc_r7.decide_local(cp) is None:
+            lc_r7.observe_teacher(cp, {"f": "b"})
+            contradictions += 1
+        if lc_r7.state == CutoverState.DRIFT_RECALIBRATE.value:
+            break
+    assert contradictions >= 4
+    assert lc_r7.state == CutoverState.DRIFT_RECALIBRATE.value
+    assert lc_r7.pending_recalibrate is True
+    assert len(lc_r7.clean_cache) == 0
+
+    drift_flipped["on"] = True
+    teacher_calls_r7.clear()
+    # (a) decide_local must abstain on both previously cached and uncached prompts.
+    el_before_r7 = lc_r7.local_accept_eligible
+    assert lc_r7.decide_local(heldout_cached_p) is None
+    assert lc_r7.decide_local("accept approve pleasant fresh unseen item") is None
+    assert lc_r7.local_accept_eligible == el_before_r7
+
+    # (b) step() must escalate to teacher on previously cached AND uncached confident prompts.
+    step_cached_r7 = lc_r7.step(heldout_cached_p)
+    assert step_cached_r7.used_teacher is True
+    assert step_cached_r7.values == {"f": "b"}
+    assert len(teacher_calls_r7) == 1
+
+    # Also test two consecutive uncached confident training prompts during
+    # DRIFT_RECALIBRATE (guarantees non-canary hit on canary_rate=0.5 if unguarded; M207 kill).
+    for uncached_p in (
+        "accept approve pleasant detail number 2",
+        "accept approve pleasant detail number 4",
+    ):
+        step_uncached_r7 = lc_r7.step(uncached_p)
+        assert step_uncached_r7.used_teacher is True
+        assert step_uncached_r7.values == {"f": "b"}
+    assert lc_r7.local_accept_eligible == el_before_r7
+    assert len(teacher_calls_r7) == 3
+
+    # Also test SoftDistillingLifecycle.observe_teacher rolls back distillation counters on error.
+    holder_sdl_r6: Dict[str, Any] = {}
+    seen_distilled: Dict[str, Any] = {"cnt": None}
+
+    def _failing_sdl_hook(eng: Any, pairs: Any) -> bool:
+        holder_sdl_r6["orig"](eng, pairs)
+        seen_distilled["cnt"] = sdl_err._distilled_compile_count
+        raise RuntimeError("sdl hook fail")
+
+    sdl_err_contract = compile_questions_contract(
+        {"f": {"type": "choice", "options": ["a", "b"], "instructions": "r34 sdl"}}
+    )
+    fn_sdl = sdl_err_contract.contracts[0].internal_name
+    sdl_err = SoftDistillingLifecycle(
+        sdl_err_contract,
+        config=CutoverConfig(
+            milestones=(36,),
+            k_min=2,
+            canary_rate=0.5,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    holder_sdl_r6["orig"] = sdl_err.lifecycle.post_compile_hook
+    sdl_err.lifecycle.post_compile_hook = _failing_sdl_hook
+    for i in range(35):
+        lbl = "a" if (i % 2 == 0) else "b"
+        pfx = "accept approve pleasant" if lbl == "a" else "reject deny dangerous"
+        sdl_err.observe_teacher(
+            f"{pfx} sdl detail number {i}",
+            {fn_sdl: lbl},
+            soft_targets={fn_sdl: {"probs": {lbl: 0.9, ("b" if lbl == "a" else "a"): 0.1}}},
+        )
+    with pytest.raises(RuntimeError, match="sdl hook fail"):
+        sdl_err.observe_teacher(
+            "reject deny dangerous sdl detail number 35",
+            {fn_sdl: "b"},
+            soft_targets={fn_sdl: {"probs": {"b": 0.9, "a": 0.1}}},
+        )
+    assert seen_distilled["cnt"] == 1
+    assert sdl_err._distilled_compile_count == 0
+    assert sdl_err._soft_distill_applied_count == 0
+    assert len(sdl_err.lifecycle.admitted_vecs) == 35
+
+    # (c) BoundedReviewFallback sister path must not use auto_compile_lifecycle
+    # local/cached answers during DRIFT_RECALIBRATE and must escalate to review_fn.
+    llm_calls_r7: List[str] = []
+    strict_base_eng_r7 = SystemOneEngine(
+        _R34SimpleSchema(),
+        dimension=16,
+        use_cache=False,
+        strict_mode=True,
+        min_calibration_lessons=1_000_000,
+    )
+    fb_r7 = BoundedReviewFallback(
+        strict_base_eng_r7,
+        review_fn=lambda ctx: (llm_calls_r7.append(str(ctx)) or {"f": "b"}),
+        auto_compile_lifecycle=lc_r7,
+        auto_record_lessons=False,
+    )
+    fb_res_r7 = fb_r7.decide(heldout_cached_p)
+    assert fb_res_r7["used_fallback"] is True
+    assert fb_res_r7["values"] == {"f": "b"}
+    assert len(llm_calls_r7) == 1
+    assert lc_r7.local_accept_eligible == el_before_r7
+
+
+

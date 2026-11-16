@@ -214,9 +214,9 @@ class AutoCutoverLifecycle:
         **overrides: Any,
     ) -> None:
         if isinstance(schema, type) and issubclass(schema, DecisionSchema):
-            self.schema: DecisionSchema = schema()
+            self.schema: DecisionSchema = copy.deepcopy(schema())
         elif isinstance(schema, DecisionSchema):
-            self.schema = schema
+            self.schema = copy.deepcopy(schema)
         else:
             raise TypeError(f"Expected DecisionSchema subclass or instance, got {type(schema).__name__}")
 
@@ -254,7 +254,7 @@ class AutoCutoverLifecycle:
 
         self.subword = SubwordSemanticEmbeddings(self.config.dense_dim)
         self.engine = SystemOneEngine(
-            self.schema,
+            copy.deepcopy(self.schema),
             dimension=self.config.dense_dim,
             use_cache=False,
             strict_mode=True,
@@ -328,6 +328,7 @@ class AutoCutoverLifecycle:
             self.state == CutoverState.SELECTIVE_HOT_SWAP.value
             and bool(self.compiled_active)
             and self.engine is not None
+            and not self.pending_recalibrate
         )
 
     def _coerce_teacher_values(self, teacher_output: Any) -> Dict[str, Any]:
@@ -662,12 +663,20 @@ class AutoCutoverLifecycle:
                     self.primary_field_name: ChoiceField(
                         options=list(active_list),
                         descriptions={
-                            o: self.primary_field.descriptions[o]
+                            o: copy.deepcopy(self.primary_field.descriptions[o])
                             for o in active_list
                             if o in getattr(self.primary_field, "descriptions", {})
                         }
                         or None,
-                        description=self.primary_field.description,
+                        default=(
+                            self.primary_field.default
+                            if self.primary_field.default in active_list
+                            else None
+                        ),
+                        description=copy.deepcopy(self.primary_field.description),
+                        required=self.primary_field.required,
+                        escalate_on_ambiguity=self.primary_field.escalate_on_ambiguity,
+                        metadata=copy.deepcopy(self.primary_field.metadata),
                     )
                 },
             )
@@ -677,18 +686,22 @@ class AutoCutoverLifecycle:
                 new_fields[fname] = ChoiceField(
                     options=list(active_list),
                     descriptions={
-                        o: fdef.descriptions[o]
+                        o: copy.deepcopy(fdef.descriptions[o])
                         for o in active_list
                         if o in getattr(fdef, "descriptions", {})
                     }
                     or None,
-                    description=fdef.description,
+                    default=(fdef.default if fdef.default in active_list else None),
+                    description=copy.deepcopy(fdef.description),
+                    required=fdef.required,
+                    escalate_on_ambiguity=fdef.escalate_on_ambiguity,
+                    metadata=copy.deepcopy(fdef.metadata),
                 )
             else:
-                new_fields[fname] = fdef
+                new_fields[fname] = copy.deepcopy(fdef)
         return DecisionSchema(schema_name=self.schema.schema_name, fields=new_fields)
 
-    def _maybe_micro_compile_locked(self) -> bool:
+    def _will_attempt_micro_compile_locked(self) -> bool:
         n_adm = len(self.admitted_vecs)
         hit_milestone = (
             self.next_milestone_idx < len(self.config.milestones)
@@ -698,13 +711,16 @@ class AutoCutoverLifecycle:
         has_new_mature = (
             len(new_mature - self.active_classes) >= 2 and (n_adm - self.last_compile_n >= 24)
         )
+        return bool(
+            hit_milestone
+            or (self.pending_recalibrate and n_adm - self.last_compile_n >= 16)
+            or has_new_mature
+        )
 
-        if (
-            not hit_milestone
-            and not (self.pending_recalibrate and n_adm - self.last_compile_n >= 16)
-            and not has_new_mature
-        ):
+    def _maybe_micro_compile_locked(self) -> bool:
+        if not self._will_attempt_micro_compile_locked():
             return False
+        n_adm = len(self.admitted_vecs)
 
         next_milestone_idx = self.next_milestone_idx
         while (
@@ -974,6 +990,7 @@ class AutoCutoverLifecycle:
         if mon_step.alarm or window_alarm:
             self.pending_recalibrate = True
             self.state = CutoverState.DRIFT_RECALIBRATE.value
+            self.clean_cache.clear()
             self.recalibrate_events.append(
                 {
                     "t": self.step_count,
@@ -995,6 +1012,12 @@ class AutoCutoverLifecycle:
         accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]], float, bool, bool]:
         """Return (accepted_fastpath, candidate_values, margin, is_canary, from_cache)."""
+        if (
+            self.pending_recalibrate
+            or self.state == CutoverState.DRIFT_RECALIBRATE.value
+        ):
+            return False, None, 0.0, False, False
+
         key = _resolve_cache_key(prompt, cache_key)
         canary_period = max(1, int(round(1.0 / self.config.canary_rate)))
 
@@ -1069,43 +1092,57 @@ class AutoCutoverLifecycle:
     ) -> Tuple[Optional[Dict[str, Any]], Tuple[int, int, int, str, Any]]:
         """Attempt local decision and return (values_or_none, rollback_tx_token)."""
         with self._lock:
-            self._maybe_micro_compile_locked()
+            need_snap = accept_predicate is not None or self._will_attempt_micro_compile_locked()
+            tx_snap = self._snapshot_mutation_state_locked() if need_snap else None
+            stack_snap_tx = {k: list(v) for k, v in self._pending_canary_stack.items()} if need_snap else None
+            untr_snap_tx = dict(self._untracked_canaries) if need_snap else None
+            untr_de_snap_tx = dict(self._untracked_canary_de) if need_snap else None
             key = _resolve_cache_key(prompt, cache_key)
-            if not _track_tx and key in self._untracked_canaries:
-                self._untracked_canaries.pop(key, None)
-                prev_de = self._untracked_canary_de.pop(key, 0)
-                if prev_de:
-                    self.local_accept_eligible = max(0, self.local_accept_eligible - prev_de)
-                self._sync_pending_canary_locked(key)
-            e0 = self.local_accept_eligible
-            accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(
-                prompt,
-                cache_key=key,
-                accept_predicate=accept_predicate,
-            )
-            de = self.local_accept_eligible - e0
-            if accepted and vals is not None:
-                self.step_count += 1
-                self.local_hits += 1
-                return vals, (de, 1, 1, key, None)
-            canary_tok: Any = None
-            if is_canary and vals is not None:
-                if (
-                    key in self._pending_canaries
-                    and key not in self._pending_canary_stack
-                    and key not in self._untracked_canaries
-                ):
-                    self._untracked_canaries[key] = self._pending_canaries[key]
-                added_pend = (vals, margin, from_cache)
-                if _track_tx:
-                    canary_tok = object()
-                    self._pending_canary_stack.setdefault(key, []).append((canary_tok, added_pend))
-                else:
-                    canary_tok = _UNTRACKED_CANARY_SENTINEL
-                    self._untracked_canaries[key] = added_pend
-                    self._untracked_canary_de[key] = de
-                self._sync_pending_canary_locked(key)
-            return None, (de, 0, 0, key, canary_tok)
+            try:
+                self._maybe_micro_compile_locked()
+                if not _track_tx and key in self._untracked_canaries:
+                    self._untracked_canaries.pop(key, None)
+                    prev_de = self._untracked_canary_de.pop(key, 0)
+                    if prev_de:
+                        self.local_accept_eligible = max(0, self.local_accept_eligible - prev_de)
+                    self._sync_pending_canary_locked(key)
+                e0 = self.local_accept_eligible
+                accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(
+                    prompt,
+                    cache_key=key,
+                    accept_predicate=accept_predicate,
+                )
+                de = self.local_accept_eligible - e0
+                if accepted and vals is not None:
+                    self.step_count += 1
+                    self.local_hits += 1
+                    return vals, (de, 1, 1, key, None)
+                canary_tok: Any = None
+                if is_canary and vals is not None:
+                    if (
+                        key in self._pending_canaries
+                        and key not in self._pending_canary_stack
+                        and key not in self._untracked_canaries
+                    ):
+                        self._untracked_canaries[key] = self._pending_canaries[key]
+                    added_pend = (vals, margin, from_cache)
+                    if _track_tx:
+                        canary_tok = object()
+                        self._pending_canary_stack.setdefault(key, []).append((canary_tok, added_pend))
+                    else:
+                        canary_tok = _UNTRACKED_CANARY_SENTINEL
+                        self._untracked_canaries[key] = added_pend
+                        self._untracked_canary_de[key] = de
+                    self._sync_pending_canary_locked(key)
+                return None, (de, 0, 0, key, canary_tok)
+            except BaseException:
+                if tx_snap is not None:
+                    self._restore_mutation_state_locked(tx_snap)
+                    self._pending_canary_stack = stack_snap_tx  # type: ignore[assignment]
+                    self._untracked_canaries = untr_snap_tx  # type: ignore[assignment]
+                    self._untracked_canary_de = untr_de_snap_tx  # type: ignore[assignment]
+                    self._sync_pending_canary_locked(key)
+                raise
 
     def _rollback_local_tx(self, tx: Tuple[int, int, int, str, Any]) -> None:
         """Roll back local_accept_eligible, counters, and pending canary state from a failed request."""
@@ -1152,8 +1189,14 @@ class AutoCutoverLifecycle:
             "canary_window": collections.deque(self.canary_window, maxlen=self.canary_window.maxlen),
             "aci": copy.deepcopy(self.aci),
             "drift_monitor": copy.deepcopy(self.drift_monitor),
+            "schema": copy.deepcopy(self.schema),
             "n_adm": len(self.admitted_vecs),
+            "admitted_vecs": [v.copy() for v in self.admitted_vecs],
+            "admitted_labels": list(self.admitted_labels),
             "admitted_values": [_clone_values_dict(v) for v in self.admitted_values],
+            "admitted_lengths": list(self.admitted_lengths),
+            "vec_buf_rows": self._vec_buf[: len(self.admitted_vecs)].copy(),
+            "vec_buf_cap": int(self._vec_buf.shape[0]),
             "admitted_keys": set(self.admitted_keys),
             "ng_df": dict(self.ng_df),
             "class_counts": dict(self.class_counts),
@@ -1175,7 +1218,7 @@ class AutoCutoverLifecycle:
             "compiled_active": self.compiled_active,
             "active_classes": set(self.active_classes),
             "mature_classes": set(self.mature_classes),
-            "selective_cal": self.selective_cal,
+            "selective_cal": copy.deepcopy(self.selective_cal),
             "engine": self.engine,
             "active_tau": self.active_tau,
             "tau_source": self.tau_source,
@@ -1191,6 +1234,19 @@ class AutoCutoverLifecycle:
             },
             "clean_cache": {k: _clone_values_dict(v) for k, v in self.clean_cache.items()},
             "_conflicted_cache_keys": set(self._conflicted_cache_keys),
+            "_pending_canaries": {
+                k: (_clone_values_dict(v[0]), v[1], v[2])
+                for k, v in self._pending_canaries.items()
+            },
+            "_pending_canary_stack": {
+                k: [(tok, (_clone_values_dict(p[0]), p[1], p[2])) for tok, p in stk]
+                for k, stk in self._pending_canary_stack.items()
+            },
+            "_untracked_canaries": {
+                k: (_clone_values_dict(v[0]), v[1], v[2])
+                for k, v in self._untracked_canaries.items()
+            },
+            "_untracked_canary_de": dict(self._untracked_canary_de),
             "recent_unseen_window": collections.deque(
                 self.recent_unseen_window, maxlen=self.recent_unseen_window.maxlen
             ),
@@ -1206,16 +1262,25 @@ class AutoCutoverLifecycle:
         self.canary_checks = snap["canary_checks"]
         self.canary_window = snap["canary_window"]
         self.aci = snap["aci"]
+        self.schema = snap["schema"]
+        self.primary_field = self.schema.fields[self.primary_field_name]
         if getattr(self, "engine", None) is not snap["engine"]:
             self.engine = snap["engine"]
         if self.engine is not None and hasattr(self.engine, "aci_tracker"):
             self.engine.aci_tracker = self.aci
         self.drift_monitor = snap["drift_monitor"]
-        n_adm = snap["n_adm"]
-        del self.admitted_vecs[n_adm:]
-        del self.admitted_labels[n_adm:]
+        self.admitted_vecs[:] = snap["admitted_vecs"]
+        self.admitted_labels[:] = snap["admitted_labels"]
         self.admitted_values[:] = snap["admitted_values"]
-        del self.admitted_lengths[n_adm:]
+        self.admitted_lengths[:] = snap["admitted_lengths"]
+        vec_rows = snap["vec_buf_rows"]
+        orig_cap = int(snap["vec_buf_cap"])
+        if self._vec_buf.shape[0] != orig_cap:
+            self._vec_buf = np.zeros((orig_cap, self.config.dense_dim), dtype=np.float32)
+        if vec_rows.shape[0] > 0:
+            self._vec_buf[: vec_rows.shape[0]] = vec_rows
+        if orig_cap > vec_rows.shape[0]:
+            self._vec_buf[vec_rows.shape[0] :] = 0.0
         self.admitted_keys = snap["admitted_keys"]
         self.ng_df = snap["ng_df"]
         self.class_counts = snap["class_counts"]
@@ -1240,6 +1305,10 @@ class AutoCutoverLifecycle:
         self.teacher_key_labels = snap["teacher_key_labels"]
         self.clean_cache = snap["clean_cache"]
         self._conflicted_cache_keys = snap["_conflicted_cache_keys"]
+        self._pending_canaries = snap["_pending_canaries"]
+        self._pending_canary_stack = snap["_pending_canary_stack"]
+        self._untracked_canaries = snap["_untracked_canaries"]
+        self._untracked_canary_de = snap["_untracked_canary_de"]
         self.recent_unseen_window = snap["recent_unseen_window"]
         self.cutover_events = snap["cutover_events"]
         self.recalibrate_events = snap["recalibrate_events"]

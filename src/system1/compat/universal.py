@@ -12,6 +12,7 @@ Implements a zero-egress-safe, loopback-restricted HTTP and ASGI gateway with:
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import http.server
@@ -1172,7 +1173,7 @@ class SoftDistillingLifecycle:
             enable_quarantine=False,
         )
         self.lifecycle = AutoCutoverLifecycle(
-            contract.schema,
+            copy.deepcopy(contract.schema),
             config=self.config,
             post_compile_hook=self._distill_sub_engine_before_qualification,
         )
@@ -1190,7 +1191,11 @@ class SoftDistillingLifecycle:
 
     @property
     def is_cutover(self) -> bool:
-        return self.lifecycle.state == CutoverState.SELECTIVE_HOT_SWAP and self.lifecycle.engine is not None
+        return (
+            self.lifecycle.state == CutoverState.SELECTIVE_HOT_SWAP
+            and self.lifecycle.engine is not None
+            and not self.lifecycle.pending_recalibrate
+        )
 
     def _distill_sub_engine_before_qualification(
         self,
@@ -1403,12 +1408,14 @@ class SoftDistillingLifecycle:
         with self._lock:
             had_soft = prompt in self._soft_records_by_prompt
             prev_soft = self._soft_records_by_prompt.get(prompt)
+            prev_distilled_cnt = self._distilled_compile_count
+            prev_applied_cnt = self._soft_distill_applied_count
             had_sc = False
             prev_sc: Optional[int] = None
             inc_fks: List[Tuple[str, str, str]] = []
             try:
                 if soft_targets:
-                    self._soft_records_by_prompt[prompt] = soft_targets
+                    self._soft_records_by_prompt[prompt] = copy.deepcopy(soft_targets)
                 if structure_sig is not None:
                     had_sc = structure_sig in self._structure_counts
                     prev_sc = self._structure_counts.get(structure_sig)
@@ -1437,6 +1444,8 @@ class SoftDistillingLifecycle:
                         )
                 return self.lifecycle.observe_teacher(prompt, lifecycle_values, cache_key=cache_key)
             except BaseException:
+                self._distilled_compile_count = prev_distilled_cnt
+                self._soft_distill_applied_count = prev_applied_cnt
                 if soft_targets:
                     if had_soft:
                         self._soft_records_by_prompt[prompt] = prev_soft  # type: ignore[assignment]
@@ -1467,7 +1476,13 @@ class SoftDistillingLifecycle:
         """Read-only fast-path check mirroring AutoCutoverLifecycle without mutating state."""
         lc = self.lifecycle
         engine = lc.engine
-        if not lc.compiled_active or lc.active_tau is None or engine is None:
+        if (
+            not lc.compiled_active
+            or lc.active_tau is None
+            or engine is None
+            or lc.pending_recalibrate
+            or lc.state == CutoverState.DRIFT_RECALIBRATE.value
+        ):
             return None, None, False
         canary_period = max(1, int(round(1.0 / lc.config.canary_rate)))
         key = cache_key if (isinstance(cache_key, str) and cache_key) else _normalize_cache_key(prompt)
