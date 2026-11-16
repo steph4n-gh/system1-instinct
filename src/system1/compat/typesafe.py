@@ -1543,9 +1543,11 @@ class TypeSafeClient:
         self.auto_cutover_lifecycle = auto_cutover_lifecycle
         self._cutover_lifecycles: collections.OrderedDict[str, Any] = collections.OrderedDict()
         self._injected_lc_digest: Optional[str] = None
+        self._injected_lc_bound: bool = False
+        self._injected_lc_evicted: bool = False
         self._lc_inflight_obs: Dict[int, int] = collections.defaultdict(int)
         self._lc_committed_ops: Dict[int, int] = collections.defaultdict(int)
-        self._lc_pending_new_bind: Dict[str, Tuple[Any, bool, Optional[str]]] = {}
+        self._lc_pending_new_bind: Dict[str, Tuple[Any, bool, Optional[str], bool]] = {}
         raw_max_unprom = kwargs.get("max_unpromoted_lifecycles", 256)
         if isinstance(raw_max_unprom, (bool, np.bool_)) or not isinstance(raw_max_unprom, int) or raw_max_unprom < 1:
             raise ValueError(f"max_unpromoted_lifecycles must be a positive int, got {raw_max_unprom!r}")
@@ -2372,7 +2374,11 @@ class TypeSafeClient:
 
     def _prune_orphaned_lc_bookkeeping_locked(self) -> None:
         live_lc_ids = {id(v) for v in self._cutover_lifecycles.values()}
-        if self.auto_cutover_lifecycle is not None and self._injected_lc_digest is not None:
+        if (
+            self.auto_cutover_lifecycle is not None
+            and self._injected_lc_digest is not None
+            and not self._injected_lc_evicted
+        ):
             live_lc_ids.add(id(self.auto_cutover_lifecycle))
         inflight_lc_ids = {lc_id for lc_id, cnt in self._lc_inflight_obs.items() if cnt > 0}
         keep_committed = live_lc_ids | inflight_lc_ids
@@ -2394,6 +2400,9 @@ class TypeSafeClient:
         ]
         while len(unpromoted) > limit:
             evict_key = unpromoted.pop(0)
+            evicted_lc = self._cutover_lifecycles.get(evict_key)
+            if evicted_lc is not None and evicted_lc is self.auto_cutover_lifecycle:
+                self._injected_lc_evicted = True
             self._cutover_lifecycles.pop(evict_key, None)
             self._retire_evicted_schema_bookkeeping_locked(evict_key)
         self._prune_orphaned_lc_bookkeeping_locked()
@@ -2480,6 +2489,7 @@ class TypeSafeClient:
                 with self._engine_lock:
                     existing_lc = self._cutover_lifecycles.get(digest)
                     is_injected_lc = raw_is_injected_lc and self._matches_injected_lifecycle_locked(schema, digest)
+                    inj_evicted = self._injected_lc_evicted
 
                 cand_lc = (
                     existing_lc
@@ -2487,6 +2497,9 @@ class TypeSafeClient:
                     else (self.auto_cutover_lifecycle if is_injected_lc else None)
                 )
                 used_injected_cand = raw_is_injected_lc and cand_lc is self.auto_cutover_lifecycle
+                if used_injected_cand and inj_evicted:
+                    cand_lc = None
+                    used_injected_cand = False
                 local_tx: Optional[Any] = None
                 try:
                     if cand_lc is not None and self._lifecycle_state_str(cand_lc) != CutoverState.DRIFT_RECALIBRATE.value:
@@ -2530,16 +2543,25 @@ class TypeSafeClient:
                                             pend_b = self._lc_pending_new_bind.get(digest)
                                             if pend_b is not None and pend_b[0] is cand_lc:
                                                 self._lc_pending_new_bind.pop(digest, None)
-                                        elif used_injected_cand and cur_reg_lc is None and existing_lc is None:
+                                        elif (
+                                            used_injected_cand
+                                            and cur_reg_lc is None
+                                            and existing_lc is None
+                                            and not self._injected_lc_bound
+                                            and not self._injected_lc_evicted
+                                        ):
                                             self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
                                             self._cutover_lifecycles[digest] = cand_lc
                                             self._cutover_lifecycles.move_to_end(digest)
+                                            self._injected_lc_bound = True
                                             self._lc_committed_ops[id(cand_lc)] += 1
                                             self._lc_pending_new_bind.pop(digest, None)
                                         self._call_count[digest] += 1
                                         self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                                         if digest not in self._cutover_lifecycles and not (
-                                            cand_lc is self.auto_cutover_lifecycle and self._injected_lc_digest == digest
+                                            cand_lc is self.auto_cutover_lifecycle
+                                            and self._injected_lc_digest == digest
+                                            and not self._injected_lc_evicted
                                         ):
                                             self._retire_evicted_schema_bookkeeping_locked(digest)
                                         self._prune_orphaned_lc_bookkeeping_locked()
@@ -2603,15 +2625,21 @@ class TypeSafeClient:
                         lc = self._cutover_lifecycles.get(digest)
                         if lc is None:
                             self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=True)
-                            is_injected_lc = raw_is_injected_lc and self._matches_injected_lifecycle_locked(
-                                schema, digest
+                            is_injected_lc = (
+                                raw_is_injected_lc
+                                and not self._injected_lc_evicted
+                                and self._matches_injected_lifecycle_locked(
+                                    schema, digest
+                                )
                             )
                             bound_inj_digest = False
                             prev_inj_digest: Optional[str] = None
+                            prev_inj_bound = self._injected_lc_bound
                             if is_injected_lc:
                                 lc = self.auto_cutover_lifecycle
                                 prev_inj_digest = self._injected_lc_digest
                                 self._injected_lc_digest = digest
+                                self._injected_lc_bound = True
                                 bound_inj_digest = True
                             else:
                                 lc_cfg = (
@@ -2622,7 +2650,12 @@ class TypeSafeClient:
                                 lc_cfg = lc_cfg if isinstance(lc_cfg, CutoverConfig) else None
                                 lc = AutoCutoverLifecycle(schema, teacher=None, config=lc_cfg)
                             self._cutover_lifecycles[digest] = lc
-                            self._lc_pending_new_bind[digest] = (lc, bound_inj_digest, prev_inj_digest)
+                            self._lc_pending_new_bind[digest] = (
+                                lc,
+                                bound_inj_digest,
+                                prev_inj_digest,
+                                prev_inj_bound,
+                            )
                         else:
                             self._cutover_lifecycles.move_to_end(digest)
                         self._lc_inflight_obs[id(lc)] += 1
@@ -2664,8 +2697,9 @@ class TypeSafeClient:
                                 self._lc_pending_new_bind.pop(digest, None)
                                 if self._cutover_lifecycles.get(digest) is lc:
                                     self._cutover_lifecycles.pop(digest, None)
-                                if pend_bind[1] and self._injected_lc_digest == digest:
+                                if pend_bind[1] and self._injected_lc_digest == digest and not self._injected_lc_evicted:
                                     self._injected_lc_digest = pend_bind[2]
+                                    self._injected_lc_bound = pend_bind[3]
                             self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                         raise
                     local_tx = None
@@ -2677,7 +2711,11 @@ class TypeSafeClient:
                             self._lc_inflight_obs[id(lc)] = rem_in
                         if (
                             self._cutover_lifecycles.get(digest) is lc
-                            or (lc is self.auto_cutover_lifecycle and self._injected_lc_digest == digest)
+                            or (
+                                lc is self.auto_cutover_lifecycle
+                                and self._injected_lc_digest == digest
+                                and not self._injected_lc_evicted
+                            )
                             or rem_in > 0
                         ):
                             self._lc_committed_ops[id(lc)] += 1
@@ -2688,7 +2726,9 @@ class TypeSafeClient:
                         self._teacher_sample_count[digest] += 1
                         self._enforce_unpromoted_cutover_cap_locked(reserve_for_new=False)
                         if digest not in self._cutover_lifecycles and not (
-                            lc is self.auto_cutover_lifecycle and self._injected_lc_digest == digest
+                            lc is self.auto_cutover_lifecycle
+                            and self._injected_lc_digest == digest
+                            and not self._injected_lc_evicted
                         ):
                             self._retire_evicted_schema_bookkeeping_locked(digest)
                         self._prune_orphaned_lc_bookkeeping_locked()

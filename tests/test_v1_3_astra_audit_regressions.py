@@ -17064,6 +17064,7 @@ def test_astra_43_round30_regressions() -> None:
     from concurrent.futures import ThreadPoolExecutor
     from types import SimpleNamespace
     from typing import Tuple
+    from unittest.mock import patch
 
     from system1.compat.typesafe import TypeSafeClient, _build_dynamic_schema
     from system1.compat.universal import (
@@ -17927,6 +17928,7 @@ def test_astra_44_round31_regressions() -> None:
     import functools
     from types import SimpleNamespace
     from typing import Tuple
+    from unittest.mock import patch
     from unittest.mock import patch
 
     from system1.compat.typesafe import TypeSafeClient, _build_dynamic_schema
@@ -19084,4 +19086,512 @@ def test_astra_45_round32_regressions() -> None:
     assert len(client_r4._cutover_lifecycles) <= 1
     assert len(client_r4._lc_committed_ops) <= 1
     assert client_r4._lc_pending_new_bind == {}
+
+
+def test_astra_46_round33_regressions() -> None:
+    """In-memory Round-33 adversarial regressions for R33-1 through R33-5 and sister paths."""
+    import dis
+    import functools
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+    from typing import Tuple
+    from unittest.mock import patch
+
+    from system1.compat.typesafe import TypeSafeClient, _build_dynamic_schema
+    from system1.core.model import SystemOneModel
+    from system1.core.schema import ChoiceField, DecisionSchema
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.engine import SystemOneEngine, _analyze_code_kw_flow, _inspect_varkw_wrapper
+
+    class _R33CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="First")
+        g = ChoiceField(options=("a", "b"), description="Second")
+
+        def validate_decision(self, values: Dict[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return values
+
+    class _R33SimpleSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"), description="Single")
+
+    class _R33BaseModel:
+        def __init__(self, schema: DecisionSchema, dim: int = 16) -> None:
+            self._inner = SystemOneModel(
+                schema, dimension=dim, backend="numpy", contrastive_whitening=False
+            )
+            for h in self._inner.heads.values():
+                h.set_weights(np.zeros((2, dim), dtype="f4"), np.array([2.0, -2.0], dtype="f4"))
+            self.schema = self._inner.schema
+            self.projector = self._inner.projector
+            self.dimension = self._inner.dimension
+            self.heads = self._inner.heads
+
+        def encode(self, prompt: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
+            return self._inner.encode(prompt, recency_weighted=recency_weighted)
+
+        def forward_single(self, prompt: str, embedding: Any = None) -> Any:
+            return self._inner.forward_single(prompt, embedding=embedding)
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            return self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+
+    class _R33SplitHelper:
+        @staticmethod
+        def split(*, use_cache: bool = True, **rest: Any) -> Tuple[bool, Dict[str, Any]]:
+            return use_cache, rest
+
+    # ------------------------------------------------------------------
+    # R33-1: Fixed-point >2-hop dict chains, list extend, comprehensions,
+    # tuple unpack aliases, and aliased |= preserve **kwargs taint.
+    # ------------------------------------------------------------------
+    class _R33ThreeHopChainModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded, middle, tail = {}, {}, {}
+            for _ in range(3):
+                forwarded.update(middle)
+                middle.update(tail)
+                tail.update(kwargs)
+            cached, rest = _R33SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33FourHopTupleAliasModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            a, b, c, d = {}, {}, {}, {}
+            alias = a
+            for _ in range(4):
+                a.update(b)
+                b.update(c)
+                c.update(d)
+                d.update(kwargs)
+            cached, rest = _R33SplitHelper.split(**alias)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33PairsExtendModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            pairs: List[Tuple[str, Any]] = []
+            pairs.extend(kwargs.items())
+            cached, rest = _R33SplitHelper.split(**dict(pairs))
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33ListClassExtendModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            pairs: List[Tuple[str, Any]] = []
+            list.extend(pairs, kwargs.items())
+            cached, rest = _R33SplitHelper.split(**dict(pairs))
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33CompPairsModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            pairs_comp = [(k, v) for k, v in kwargs.items()]
+            pairs_star = [*kwargs.items()]
+            if len(pairs_comp) != len(pairs_star):
+                raise AssertionError("length mismatch")
+            cached, rest = _R33SplitHelper.split(**dict(pairs_comp))
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33StarItemsModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            pairs_star = [*kwargs.items()]
+            cached, rest = _R33SplitHelper.split(**dict(pairs_star))
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33AliasedIorModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            forwarded: Dict[str, Any] = {}
+            alias = forwarded
+            alias |= kwargs
+            cached, rest = _R33SplitHelper.split(**forwarded)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    # ------------------------------------------------------------------
+    # R33-2: Default-argument closure capture, keyword-only defaults,
+    # lambdas, multi-level closures, and functools.partial preserve taint.
+    # ------------------------------------------------------------------
+    class _R33PosDefaultCaptureModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def split(opts: Mapping[str, Any] = kwargs) -> Tuple[bool, Dict[str, Any]]:
+                return _R33SplitHelper.split(**opts)
+
+            cached, rest = split()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33KwDefaultCaptureModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def split(*, opts: Mapping[str, Any] = kwargs) -> Tuple[bool, Dict[str, Any]]:
+                return _R33SplitHelper.split(**opts)
+
+            cached, rest = split()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33LambdaDefaultCaptureModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = (lambda opts=kwargs: _R33SplitHelper.split(**opts))()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33TwoLevelClosureModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def split(opts: Mapping[str, Any] = kwargs) -> Tuple[bool, Dict[str, Any]]:
+                return _R33SplitHelper.split(**opts)
+
+            def runner() -> Tuple[bool, Dict[str, Any]]:
+                return split()
+
+            cached, rest = runner()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R33PartialSplitModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = functools.partial(_R33SplitHelper.split, **kwargs)()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    x_ones = np.ones(16, dtype=np.float32)
+    for mdl_cls in (
+        _R33ThreeHopChainModel,
+        _R33FourHopTupleAliasModel,
+        _R33PairsExtendModel,
+        _R33ListClassExtendModel,
+        _R33CompPairsModel,
+        _R33StarItemsModel,
+        _R33AliasedIorModel,
+        _R33PosDefaultCaptureModel,
+        _R33KwDefaultCaptureModel,
+        _R33LambdaDefaultCaptureModel,
+        _R33TwoLevelClosureModel,
+        _R33PartialSplitModel,
+    ):
+        mdl_c = mdl_cls(_R33CoupledSchema(), 16)
+        eng_c = SystemOneEngine(
+            _R33CoupledSchema,
+            model=mdl_c,
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        assert eng_c.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_c.learn("p", {"f": "b"}, embedding=x_ones)
+        assert eng_c.model_version == 1
+        delattr(mdl_c, "last")
+        assert eng_c.decide("p", embedding=x_ones, record_receipt=False).values == {"f": "a", "g": "a"}
+
+    # ------------------------------------------------------------------
+    # R33-3: Positional mapping to helper with keyword-only default
+    # must not inject unsupported key into Base.forward_single().
+    # ------------------------------------------------------------------
+    class _R33AuditPosKwDefaultModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def audit(options: Any, *, use_cache: bool = False) -> int:
+                return len(options)
+
+            audit(kwargs)
+            return super().forward_single(*args, **kwargs)
+
+    class _R33AuditAnnotatedKwModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def audit(options: Any, *, use_cache: bool = False) -> int:
+                return len(options) + (0 if use_cache else 1)
+
+            audit(kwargs)
+            return super().forward_single(*args, **kwargs)
+
+    class _R33AuditCallKwModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def audit(options: Any, *, use_cache: bool = False) -> int:
+                return len(options)
+
+            audit(kwargs, use_cache=False)
+            return super().forward_single(*args, **kwargs)
+
+    for neg_cls in (_R33AuditPosKwDefaultModel, _R33AuditAnnotatedKwModel, _R33AuditCallKwModel):
+        eng_n = SystemOneEngine(
+            _R33SimpleSchema,
+            model=neg_cls(_R33SimpleSchema(), 16),
+            dimension=16,
+            backend="numpy",
+            contrastive_whitening=False,
+            use_cache=False,
+            strict_mode=False,
+        )
+        assert eng_n.decide("p r33-3", embedding=x_ones, record_receipt=False).values == {"f": "a"}
+        eng_n.learn("p r33-3", {"f": "b"}, embedding=x_ones)
+        assert eng_n.decide("p r33-3", embedding=x_ones, record_receipt=False).values == {"f": "b"}
+
+    def _audit_target_314(options: Any, *, use_cache: bool = False) -> int:
+        return len(options)
+
+    def _dummy_outer_314(*args: Any, **kwargs: Any) -> Any:
+        return len(kwargs)
+
+    ins_314_kwdef = [
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=1, argval="use_cache"),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=2, argval=False),
+        SimpleNamespace(opname="BUILD_MAP", opcode=dis.opmap["BUILD_MAP"], arg=1, argval=1),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=3, argval=_audit_target_314.__code__),
+        SimpleNamespace(opname="MAKE_FUNCTION", opcode=dis.opmap["MAKE_FUNCTION"], arg=None, argval=None),
+        SimpleNamespace(opname="SET_FUNCTION_ATTRIBUTE", opcode=dis.opmap.get("SET_FUNCTION_ATTRIBUTE", 174), arg=2, argval=2),
+        SimpleNamespace(opname="STORE_FAST", opcode=dis.opmap["STORE_FAST"], arg=2, argval="audit"),
+        SimpleNamespace(opname="LOAD_FAST_BORROW", opcode=dis.opmap["LOAD_FAST"], arg=2, argval="audit"),
+        SimpleNamespace(opname="PUSH_NULL", opcode=dis.opmap.get("PUSH_NULL", 2), arg=None, argval=None),
+        SimpleNamespace(opname="LOAD_FAST_BORROW", opcode=dis.opmap["LOAD_FAST"], arg=1, argval="kwargs"),
+        SimpleNamespace(opname="CALL", opcode=dis.opmap.get("CALL", 171), arg=1, argval=1),
+        SimpleNamespace(opname="POP_TOP", opcode=dis.opmap["POP_TOP"], arg=None, argval=None),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=0, argval=None),
+        SimpleNamespace(opname="RETURN_VALUE", opcode=dis.opmap["RETURN_VALUE"], arg=None, argval=None),
+    ]
+    with patch.object(dis, "get_instructions", return_value=ins_314_kwdef):
+        flow_314 = _analyze_code_kw_flow(
+            _dummy_outer_314.__code__,
+            frozenset({"kwargs"}),
+            frozenset({"use_cache"}),
+        )
+    assert flow_314[6] == set()
+    ref_314, _ = _inspect_varkw_wrapper(_R33AuditPosKwDefaultModel(_R33SimpleSchema(), 16).forward_single, frozenset({"use_cache"}))
+    assert "use_cache" not in ref_314
+
+    ins_312_kwdef = [
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=1, argval=False),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=2, argval=("use_cache",)),
+        SimpleNamespace(opname="BUILD_CONST_KEY_MAP", opcode=dis.opmap.get("BUILD_CONST_KEY_MAP", 156), arg=1, argval=1),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=3, argval=_audit_target_314.__code__),
+        SimpleNamespace(opname="MAKE_FUNCTION", opcode=dis.opmap["MAKE_FUNCTION"], arg=2, argval=2),
+        SimpleNamespace(opname="STORE_FAST", opcode=dis.opmap["STORE_FAST"], arg=2, argval="audit"),
+        SimpleNamespace(opname="PUSH_NULL", opcode=dis.opmap.get("PUSH_NULL", 2), arg=None, argval=None),
+        SimpleNamespace(opname="LOAD_FAST", opcode=dis.opmap["LOAD_FAST"], arg=2, argval="audit"),
+        SimpleNamespace(opname="LOAD_FAST", opcode=dis.opmap["LOAD_FAST"], arg=1, argval="kwargs"),
+        SimpleNamespace(opname="CALL", opcode=dis.opmap.get("CALL", 171), arg=1, argval=1),
+        SimpleNamespace(opname="POP_TOP", opcode=dis.opmap["POP_TOP"], arg=None, argval=None),
+        SimpleNamespace(opname="LOAD_CONST", opcode=dis.opmap["LOAD_CONST"], arg=0, argval=None),
+        SimpleNamespace(opname="RETURN_VALUE", opcode=dis.opmap["RETURN_VALUE"], arg=None, argval=None),
+    ]
+    with patch.object(dis, "get_instructions", return_value=ins_312_kwdef):
+        flow_312 = _analyze_code_kw_flow(
+            _dummy_outer_314.__code__,
+            frozenset({"kwargs"}),
+            frozenset({"use_cache"}),
+        )
+    assert flow_312[6] == set()
+
+    # ------------------------------------------------------------------
+    # R33-4: Hook mutating training pairs or live train_by_class dicts
+    # on failed/successful micro-compile never corrupts committed labels.
+    # ------------------------------------------------------------------
+    def _build_r33_35_lifecycle(hook_fn: Any) -> AutoCutoverLifecycle:
+        lc = AutoCutoverLifecycle(
+            _R33SimpleSchema(),
+            teacher=lambda p: {"f": "a" if "accept" in p else "b"},
+            post_compile_hook=hook_fn,
+            config=CutoverConfig(
+                milestones=(36,),
+                k_min=2,
+                canary_rate=0.5,
+                sparse_dim=64,
+                dense_dim=16,
+                enable_quarantine=False,
+            ),
+        )
+        for i in range(35):
+            if i % 2 == 0:
+                lc.observe_teacher(f"accept approve pleasant detail number {i}", {"f": "a"})
+            else:
+                lc.observe_teacher(f"reject deny dangerous detail number {i}", {"f": "b"})
+        assert len(lc.admitted_vecs) == 35
+        return lc
+
+    def _failing_mut_pairs_hook(eng: Any, pairs: Sequence[Tuple[str, Dict[str, Any]]]) -> bool:
+        pairs[0][1]["f"] = "b"
+        raise RuntimeError("hook failed")
+
+    # (a) observe_teacher() rollback with pairs mutation
+    lc_obs_h = _build_r33_35_lifecycle(_failing_mut_pairs_hook)
+    with pytest.raises(RuntimeError, match="hook failed"):
+        lc_obs_h.observe_teacher("reject deny dangerous detail number 35", {"f": "b"})
+    assert len(lc_obs_h.admitted_vecs) == 35
+    assert lc_obs_h.train_by_class["a"][0][1] == {"f": "a"}
+    assert lc_obs_h.admitted_values[0] == {"f": "a"}
+
+    # (b) step() rollback with pairs mutation
+    lc_step_h = _build_r33_35_lifecycle(_failing_mut_pairs_hook)
+    with pytest.raises(RuntimeError, match="hook failed"):
+        lc_step_h.step("reject deny dangerous detail number 35")
+    assert len(lc_step_h.admitted_vecs) == 35
+    assert lc_step_h.train_by_class["a"][0][1] == {"f": "a"}
+    assert lc_step_h.admitted_values[0] == {"f": "a"}
+
+    # (c) Non-raising hook mutating pairs leaves train_by_class intact
+    def _non_raising_mut_pairs_hook(eng: Any, pairs: Sequence[Tuple[str, Dict[str, Any]]]) -> bool:
+        pairs[0][1]["f"] = "b"
+        return False
+
+    lc_ok_h = _build_r33_35_lifecycle(_non_raising_mut_pairs_hook)
+    lc_ok_h.observe_teacher("reject deny dangerous detail number 35", {"f": "b"})
+    assert len(lc_ok_h.admitted_vecs) == 36
+    assert lc_ok_h.train_by_class["a"][0][1] == {"f": "a"}
+    assert lc_ok_h.admitted_values[0] == {"f": "a"}
+
+    # (d) Failing hook mutating live train_by_class dict rolls back cleanly
+    holder_lc: Dict[str, AutoCutoverLifecycle] = {}
+
+    def _failing_direct_mut_hook(eng: Any, pairs: Sequence[Tuple[str, Dict[str, Any]]]) -> bool:
+        holder_lc["lc"].train_by_class["a"][0][1]["f"] = "b"
+        raise RuntimeError("direct mut hook fail")
+
+    lc_dir_h = _build_r33_35_lifecycle(_failing_direct_mut_hook)
+    holder_lc["lc"] = lc_dir_h
+    with pytest.raises(RuntimeError, match="direct mut hook fail"):
+        lc_dir_h.observe_teacher("reject deny dangerous detail number 35", {"f": "b"})
+    assert len(lc_dir_h.admitted_vecs) == 35
+    assert lc_dir_h.train_by_class["a"][0][1] == {"f": "a"}
+
+    # ------------------------------------------------------------------
+    # R33-5: First-bind race on injected unpromoted lifecycle cannot
+    # resurrect the lifecycle after an intervening bind and eviction.
+    # ------------------------------------------------------------------
+    q_r5_a = {"f": {"type": "choice", "instructions": "r33-5 A", "criteria": ["a", "b"]}}
+    q_r5_b = {"f": {"type": "choice", "instructions": "r33-5 B", "criteria": ["a", "b"]}}
+    schema_r5_a = _build_dynamic_schema(q_r5_a)
+    digest_r5_a = schema_r5_a.schema_digest()
+    digest_r5_b = _build_dynamic_schema(q_r5_b).schema_digest()
+
+    prewarmed_lc = AutoCutoverLifecycle(
+        schema_r5_a,
+        teacher=None,
+        config=CutoverConfig(
+            milestones=(36,),
+            k_min=2,
+            canary_rate=0.5,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    for i in range(36):
+        p_t = (
+            f"accept approve pleasant detail number {i}"
+            if (i % 2 == 0)
+            else f"reject deny dangerous detail number {i}"
+        )
+        v_t = {"f": "a" if (i % 2 == 0) else "b"}
+        prewarmed_lc.observe_teacher(p_t, v_t)
+
+    assert len(prewarmed_lc.clean_cache) > 0
+    cached_prompt_r5 = next(
+        p_c
+        for i in range(0, 36, 2)
+        for p_c in (f"accept approve pleasant detail number {i}",)
+        if p_c in prewarmed_lc.clean_cache
+    )
+
+    teacher_calls_r5: List[str] = []
+
+    def _baseline_r5(s: Any, q: Any) -> Dict[str, Any]:
+        teacher_calls_r5.append(str(s))
+        return {
+            "answers": {
+                "f": {
+                    "type": "choice",
+                    "choice": "b" if "reject" in str(s) else "a",
+                    "value": "b" if "reject" in str(s) else "a",
+                }
+            }
+        }
+
+    client_r5 = TypeSafeClient(
+        api_key="tok-r33",
+        mode="auto_cutover",
+        zero_egress=True,
+        auto_cutover_lifecycle=prewarmed_lc,
+        max_unpromoted_lifecycles=1,
+        baseline_handler=_baseline_r5,
+    )
+    assert not client_r5._is_lifecycle_promoted(prewarmed_lc)
+
+    pause_a_entered = threading.Event()
+    pause_a_release = threading.Event()
+    orig_decide_tx_r5 = AutoCutoverLifecycle._decide_local_with_tx
+
+    def _pause_first_bind_hit(self_lc: AutoCutoverLifecycle, prompt: str, *args: Any, **kwargs: Any) -> Any:
+        out = orig_decide_tx_r5(self_lc, prompt, *args, **kwargs)
+        if (
+            self_lc is prewarmed_lc
+            and out[0] is not None
+            and not pause_a_entered.is_set()
+        ):
+            pause_a_entered.set()
+            assert pause_a_release.wait(timeout=5.0)
+        return out
+
+    with ThreadPoolExecutor(max_workers=2) as pool_r5:
+        with patch.object(AutoCutoverLifecycle, "_decide_local_with_tx", _pause_first_bind_hit):
+            fut_a = pool_r5.submit(client_r5.decide, cached_prompt_r5, q_r5_a)
+            assert pause_a_entered.wait(timeout=5.0)
+        # Request B hits canary (2 % 2 == 0), observes teacher, and binds prewarmed_lc.
+        resp_b = client_r5.decide(cached_prompt_r5, q_r5_a)
+        assert not resp_b.get("local_execution", False)
+        assert client_r5._cutover_lifecycles.get(digest_r5_a) is prewarmed_lc
+        # Request C for schema B evicts prewarmed_lc under max_unpromoted_lifecycles=1.
+        resp_c = client_r5.decide("schema B evicts prewarmed", q_r5_b)
+        assert not resp_c.get("local_execution", False)
+        assert digest_r5_a not in client_r5._cutover_lifecycles
+        assert list(client_r5._cutover_lifecycles.keys()) == [digest_r5_b]
+
+        pause_a_release.set()
+        resp_a = fut_a.result(timeout=5.0)
+        assert resp_a["local_execution"] is True
+
+    assert list(client_r5._cutover_lifecycles.keys()) == [digest_r5_b]
+    assert digest_r5_a not in client_r5._cutover_lifecycles
+    # Request D for schema A must neither reuse evicted prewarmed_lc nor rebind it.
+    resp_d = client_r5.decide(cached_prompt_r5, q_r5_a)
+    assert not resp_d.get("local_execution", False)
+    assert len(teacher_calls_r5) == 3
+    assert digest_r5_a in client_r5._cutover_lifecycles
+    assert client_r5._cutover_lifecycles[digest_r5_a] is not prewarmed_lc
+    assert len(client_r5._cutover_lifecycles) <= 1
+
 

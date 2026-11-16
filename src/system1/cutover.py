@@ -89,6 +89,18 @@ def _resolve_cache_key(prompt: str, cache_key: Optional[str] = None) -> str:
     return _normalize_cache_key(prompt)
 
 
+def _clone_values_dict(vals: Mapping[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in vals.items():
+        if isinstance(v, list):
+            out[k] = list(v)
+        elif isinstance(v, (str, int, float, bool)) or v is None:
+            out[k] = v
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
 def _tokenize_words(text: str) -> List[str]:
     return re.findall(r"[a-z0-9]+", text.lower())
 
@@ -449,7 +461,7 @@ class AutoCutoverLifecycle:
         self.admitted_keys.add(key)
         self.admitted_vecs.append(vec)
         self.admitted_labels.append(label_key)
-        self.admitted_values.append(dict(values))
+        self.admitted_values.append(_clone_values_dict(values))
         for g in ngs:
             self.ng_df[g] = self.ng_df.get(g, 0) + 1
         self.admitted_lengths.append(len(words))
@@ -457,9 +469,9 @@ class AutoCutoverLifecycle:
         cnt = self.class_counts.get(label_key, 0)
         self.class_counts[label_key] = cnt + 1
         if cnt < 2 or (cnt % 5 in (0, 2, 4)):
-            self.train_by_class.setdefault(label_key, []).append((prompt, dict(values)))
+            self.train_by_class.setdefault(label_key, []).append((prompt, _clone_values_dict(values)))
         else:
-            self.calib_by_class.setdefault(label_key, []).append((prompt, dict(values)))
+            self.calib_by_class.setdefault(label_key, []).append((prompt, _clone_values_dict(values)))
             self._calib_cache_keys.setdefault(label_key, []).append(key)
 
     def _try_admit_or_quarantine_locked(
@@ -479,7 +491,7 @@ class AutoCutoverLifecycle:
             for lbl_prev, (_, vals_prev) in k_cnts.items()
         )
         prev_cnt, _ = k_cnts.get(label_key, (0, values))
-        k_cnts[label_key] = (prev_cnt + 1, dict(values))
+        k_cnts[label_key] = (prev_cnt + 1, _clone_values_dict(values))
         if has_conflict:
             self._conflicted_cache_keys.add(key)
             self.clean_cache.pop(key, None)
@@ -489,7 +501,7 @@ class AutoCutoverLifecycle:
             and (prev_cnt + 1) >= 2
             and label_key in self.mature_classes
         ):
-            self.clean_cache[key] = dict(values)
+            self.clean_cache[key] = _clone_values_dict(values)
         if key in self.admitted_keys:
             return False
 
@@ -509,7 +521,7 @@ class AutoCutoverLifecycle:
         p90_len = float(np.percentile(self.admitted_lengths, 90))
         if len(words) > max(26, 2.3 * p90_len):
             self.quarantined_total += 1
-            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs, key))
+            self.quarantine.append((prompt, label_key, _clone_values_dict(values), vec, words, ngs, key))
             return True
 
         ng_cov = sum(1 for g in ngs if self.ng_df.get(g, 0) >= 1) / max(1, len(ngs))
@@ -518,7 +530,7 @@ class AutoCutoverLifecycle:
 
         if ng_cov < 0.42 and max_sim < 0.30:
             self.quarantined_total += 1
-            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs, key))
+            self.quarantine.append((prompt, label_key, _clone_values_dict(values), vec, words, ngs, key))
             return True
 
         cls_cnt = self.class_counts.get(label_key, 0)
@@ -535,7 +547,7 @@ class AutoCutoverLifecycle:
                 self._admit_record_locked(prompt, label_key, values, vec, words, ngs, cache_key=key)
                 return False
             self.quarantined_total += 1
-            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs, key))
+            self.quarantine.append((prompt, label_key, _clone_values_dict(values), vec, words, ngs, key))
             return True
 
         if ng_cov >= 0.38 or max_sim >= 0.28:
@@ -555,7 +567,7 @@ class AutoCutoverLifecycle:
                 return False
 
         self.quarantined_total += 1
-        self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs, key))
+        self.quarantine.append((prompt, label_key, _clone_values_dict(values), vec, words, ngs, key))
         return True
 
     def _estimate_noise_rate(
@@ -805,13 +817,14 @@ class AutoCutoverLifecycle:
             aci_tracker=aci_stage,
         )
         sub_eng.default_alpha = self.config.alpha_target
-        if self.post_compile_hook is not None and self.post_compile_hook(sub_eng, tr_pairs):
+        hook_pairs = [(p_t, _clone_values_dict(vals_t)) for p_t, vals_t in tr_pairs]
+        if self.post_compile_hook is not None and self.post_compile_hook(sub_eng, hook_pairs):
             seen_cal: Set[str] = set()
             dedup_cal: List[Tuple[str, Dict[str, Any]]] = []
             for p_c, vals_c in cal_pairs:
                 if p_c not in seen_cal:
                     seen_cal.add(p_c)
-                    dedup_cal.append((p_c, dict(vals_c)))
+                    dedup_cal.append((p_c, _clone_values_dict(vals_c)))
             if dedup_cal:
                 for cal_obj in sub_eng.calibrators.values():
                     if getattr(cal_obj, "logit_adjustments", None) is not None:
@@ -845,7 +858,7 @@ class AutoCutoverLifecycle:
             margins_cal.append(min_margin)
             correct_cal.append(is_ok)
             if d_c.abstention_reason is None and is_ok and min_margin >= 0.85:
-                high_conf_cache.append((k_c, dict(vals_c)))
+                high_conf_cache.append((k_c, _clone_values_dict(vals_c)))
 
         k_act = len(active_list)
         alpha_calib = min(
@@ -911,7 +924,7 @@ class AutoCutoverLifecycle:
 
         for k_c, vals_c in high_conf_cache:
             if k_c not in self.clean_cache and k_c not in self._conflicted_cache_keys:
-                self.clean_cache[k_c] = dict(vals_c)
+                self.clean_cache[k_c] = _clone_values_dict(vals_c)
 
         if tau is not None and len(self.mature_classes) >= 2:
             self.state = CutoverState.SELECTIVE_HOT_SWAP.value
@@ -986,7 +999,7 @@ class AutoCutoverLifecycle:
         canary_period = max(1, int(round(1.0 / self.config.canary_rate)))
 
         if key in self.clean_cache:
-            cached_vals = dict(self.clean_cache[key])
+            cached_vals = _clone_values_dict(self.clean_cache[key])
             self.local_accept_eligible += 1
             is_canary = (self.local_accept_eligible % canary_period) == 0
             return (not is_canary), cached_vals, 1.0, is_canary, True
@@ -1013,11 +1026,11 @@ class AutoCutoverLifecycle:
             if cent is None or float(np.dot(self.subword.encode(prompt), cent)) >= max(
                 self.config.cls_min_abs, floor * 0.90
             ):
-                if accept_predicate is not None and not accept_predicate(vals):
+                if accept_predicate is not None and not accept_predicate(_clone_values_dict(vals)):
                     return False, None, margin, False, False
                 self.local_accept_eligible += 1
                 is_canary = (self.local_accept_eligible % canary_period) == 0
-                return (not is_canary), vals, margin, is_canary, False
+                return (not is_canary), _clone_values_dict(vals), margin, is_canary, False
 
         return False, None, margin, False, False
 
@@ -1140,13 +1153,23 @@ class AutoCutoverLifecycle:
             "aci": copy.deepcopy(self.aci),
             "drift_monitor": copy.deepcopy(self.drift_monitor),
             "n_adm": len(self.admitted_vecs),
+            "admitted_values": [_clone_values_dict(v) for v in self.admitted_values],
             "admitted_keys": set(self.admitted_keys),
             "ng_df": dict(self.ng_df),
             "class_counts": dict(self.class_counts),
-            "train_by_class": {k: list(v) for k, v in self.train_by_class.items()},
-            "calib_by_class": {k: list(v) for k, v in self.calib_by_class.items()},
+            "train_by_class": {
+                k: [(p, _clone_values_dict(vals)) for p, vals in v]
+                for k, v in self.train_by_class.items()
+            },
+            "calib_by_class": {
+                k: [(p, _clone_values_dict(vals)) for p, vals in v]
+                for k, v in self.calib_by_class.items()
+            },
             "_calib_cache_keys": {k: list(v) for k, v in self._calib_cache_keys.items()},
-            "quarantine": list(self.quarantine),
+            "quarantine": [
+                (q[0], q[1], _clone_values_dict(q[2]), q[3].copy(), list(q[4]), set(q[5]), *q[6:])
+                for q in self.quarantine
+            ],
             "quarantined_total": self.quarantined_total,
             "state": self.state,
             "compiled_active": self.compiled_active,
@@ -1160,16 +1183,19 @@ class AutoCutoverLifecycle:
             "last_compile_n": self.last_compile_n,
             "next_milestone_idx": self.next_milestone_idx,
             "pending_recalibrate": self.pending_recalibrate,
-            "class_centroids": dict(self.class_centroids),
+            "class_centroids": {k: v.copy() for k, v in self.class_centroids.items()},
             "class_sim_floors": dict(self.class_sim_floors),
-            "teacher_key_labels": {k: dict(v) for k, v in self.teacher_key_labels.items()},
-            "clean_cache": {k: dict(v) for k, v in self.clean_cache.items()},
+            "teacher_key_labels": {
+                k: {lk: (cnt, _clone_values_dict(lv)) for lk, (cnt, lv) in v.items()}
+                for k, v in self.teacher_key_labels.items()
+            },
+            "clean_cache": {k: _clone_values_dict(v) for k, v in self.clean_cache.items()},
             "_conflicted_cache_keys": set(self._conflicted_cache_keys),
             "recent_unseen_window": collections.deque(
                 self.recent_unseen_window, maxlen=self.recent_unseen_window.maxlen
             ),
-            "cutover_events": list(self.cutover_events),
-            "recalibrate_events": list(self.recalibrate_events),
+            "cutover_events": [dict(ev) for ev in self.cutover_events],
+            "recalibrate_events": [dict(ev) for ev in self.recalibrate_events],
             "compile_time_total_ms": self.compile_time_total_ms,
         }
 
@@ -1188,7 +1214,7 @@ class AutoCutoverLifecycle:
         n_adm = snap["n_adm"]
         del self.admitted_vecs[n_adm:]
         del self.admitted_labels[n_adm:]
-        del self.admitted_values[n_adm:]
+        self.admitted_values[:] = snap["admitted_values"]
         del self.admitted_lengths[n_adm:]
         self.admitted_keys = snap["admitted_keys"]
         self.ng_df = snap["ng_df"]
