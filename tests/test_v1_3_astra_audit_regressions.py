@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import functools
 import io
 import json
 import math
@@ -18778,6 +18779,17 @@ def test_astra_45_round32_regressions() -> None:
             self.last = super().forward_single(*args, **rest)
             return self.last
 
+    class _R32LoopKeySubscrModel(_R32BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            flags: Dict[str, Any] = {}
+            for k_kw in kwargs:
+                flags[k_kw] = False
+            cached, _ = _R32SplitHelper.split(**flags)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, embedding=kwargs.get("embedding"))
+            return self.last
+
     x_ones = np.ones(16, dtype=np.float32)
     for mdl_cls in (
         _R32DictUpdateModel,
@@ -18787,6 +18799,7 @@ def test_astra_45_round32_regressions() -> None:
         _R32LoopSubscrModel,
         _R32DictKwUpdateModel,
         _R32DictClassKwUpdateModel,
+        _R32LoopKeySubscrModel,
     ):
         mdl_r1 = mdl_cls(_R32CoupledSchema(), 16)
         eng_r1 = SystemOneEngine(
@@ -19221,6 +19234,18 @@ def test_astra_46_round33_regressions() -> None:
             self.last = super().forward_single(*args, **rest)
             return self.last
 
+    class _R33SetStarItemsModel(_R33BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            keys_set = {*kwargs}
+            flags: Dict[str, Any] = {}
+            for k_s in keys_set:
+                flags[k_s] = False
+            cached, _ = _R33SplitHelper.split(**flags)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, embedding=kwargs.get("embedding"))
+            return self.last
+
     class _R33AliasedIorModel(_R33BaseModel):
         def forward_single(self, *args: Any, **kwargs: Any) -> Any:
             forwarded: Dict[str, Any] = {}
@@ -19296,6 +19321,7 @@ def test_astra_46_round33_regressions() -> None:
         _R33ListClassExtendModel,
         _R33CompPairsModel,
         _R33StarItemsModel,
+        _R33SetStarItemsModel,
         _R33AliasedIorModel,
         _R33PosDefaultCaptureModel,
         _R33KwDefaultCaptureModel,
@@ -21503,6 +21529,8 @@ def test_astra_50_round37_regressions() -> None:
             acts_bayes = cal_sub.predict(p_sub, use_crc=False)
             assert np.unique(acts_crc).tolist() == [1]
             assert np.unique(acts_bayes).tolist() == [1]
+            epc_sub = cal_sub._expected_policy_costs(p_sub[:1])
+            assert float(epc_sub[0, 0]) > float(epc_sub[0, 1])
             realized = float(np.mean(np.maximum(C_sub[acts_crc, y_sub] - cal_sub.c_esc, 0.0) / (cal_sub.B - cal_sub.c_esc)))
             assert realized == 0.0
 
@@ -21990,6 +22018,1311 @@ def test_astra_50_round37_regressions() -> None:
         auto_compile_lifecycle=soft_lc,
     )
     assert fb_soft_owned._network_owned_by_cutover is True
+
+
+def _r38_ext_consumes_fn(**kw: Any) -> Any:
+    copied = dict(kw)
+    return bool(copied.pop("use_cache", True)), copied
+
+
+def _r38_ext_ignores_fn(**kw: Any) -> Any:
+    return False, dict(kw)
+
+
+def _r38_make_ext_def_helper(cb: Callable[..., Any]) -> Callable[..., Any]:
+    def _helper(kw: Dict[str, Any], fn: Callable[..., Any] = cb) -> Any:
+        return fn(**kw)
+
+    return _helper
+
+
+def _r38_make_ext_kwdef_helper(cb: Callable[..., Any]) -> Callable[..., Any]:
+    def _helper(kw: Dict[str, Any], *, fn: Callable[..., Any] = cb) -> Any:
+        return fn(**kw)
+
+    return _helper
+
+
+def _r38_make_ext_cell_helper(cb: Callable[..., Any]) -> Callable[..., Any]:
+    def _helper(kw: Dict[str, Any]) -> Any:
+        return cb(**kw)
+
+    return _helper
+
+
+def _r38_ext_overridable_helper(fn: Any = None, **kw: Any) -> Any:
+    if fn is not None:
+        return fn(**kw)
+    return False, dict(kw)
+
+
+def _r38_ext_default_live_kw(fn: Any = _r38_ext_consumes_fn, **kw: Any) -> Any:
+    if fn is not None:
+        return fn(**kw)
+    return False, dict(kw)
+
+
+def _r38_ext_dict_copy_consumer(box: Any) -> Any:
+    copied = box.copy()
+    return copied["f"]()
+
+
+def _r38_ext_dict_items_consumer(box: Any) -> Any:
+    out: Any = None
+    for _, fn in box.items():
+        out = fn()
+    return out
+
+
+_r38_ext_def_live_a = _r38_make_ext_def_helper(_r38_ext_consumes_fn)
+_r38_ext_def_dead_z = _r38_make_ext_def_helper(_r38_ext_ignores_fn)
+_r38_ext_def_dead_a = _r38_make_ext_def_helper(_r38_ext_ignores_fn)
+_r38_ext_def_live_z = _r38_make_ext_def_helper(_r38_ext_consumes_fn)
+
+_r38_ext_kwdef_live_a = _r38_make_ext_kwdef_helper(_r38_ext_consumes_fn)
+_r38_ext_kwdef_dead_z = _r38_make_ext_kwdef_helper(_r38_ext_ignores_fn)
+_r38_ext_kwdef_dead_a = _r38_make_ext_kwdef_helper(_r38_ext_ignores_fn)
+_r38_ext_kwdef_live_z = _r38_make_ext_kwdef_helper(_r38_ext_consumes_fn)
+
+_r38_ext_cell_live_a = _r38_make_ext_cell_helper(_r38_ext_consumes_fn)
+_r38_ext_cell_dead_z = _r38_make_ext_cell_helper(_r38_ext_ignores_fn)
+_r38_ext_cell_dead_a = _r38_make_ext_cell_helper(_r38_ext_ignores_fn)
+_r38_ext_cell_live_z = _r38_make_ext_cell_helper(_r38_ext_consumes_fn)
+
+_r38_ext_partial_live_a = functools.partial(_r38_ext_overridable_helper, _r38_ext_consumes_fn)
+_r38_ext_partial_dead_z = functools.partial(_r38_ext_overridable_helper, _r38_ext_ignores_fn)
+_r38_ext_partial_dead_a = functools.partial(_r38_ext_overridable_helper, _r38_ext_ignores_fn)
+_r38_ext_partial_live_z = functools.partial(_r38_ext_overridable_helper, _r38_ext_consumes_fn)
+_r38_ext_partial_kw_live = functools.partial(_r38_ext_default_live_kw)
+_r38_ext_partial_kw_override_pos_safe = functools.partial(_r38_ext_default_live_kw, None)
+_r38_ext_partial_kw_override_kw_safe = functools.partial(_r38_ext_default_live_kw, fn=None)
+_r38_ext_partial_kw_override_dead_fn = functools.partial(_r38_ext_default_live_kw, _r38_ext_ignores_fn)
+
+
+def _r38_explicit_uc_target(*, use_cache: bool = True, **rest: Any) -> Tuple[bool, Dict[str, Any]]:
+    return bool(use_cache), dict(rest)
+
+
+def _r38_explicit_noop_target(**rest: Any) -> Tuple[bool, Dict[str, Any]]:
+    return False, dict(rest)
+
+
+def _r38_make_kw_def_bridge(cb: Any) -> Any:
+    def _bridge(fn: Any = cb, **kw: Any) -> Any:
+        return fn(**kw)
+
+    return _bridge
+
+
+_r38_bridge_a_dead = _r38_make_kw_def_bridge(_r38_explicit_noop_target)
+_r38_bridge_z_live = _r38_make_kw_def_bridge(_r38_explicit_uc_target)
+_r38_bridge_z_dead = _r38_make_kw_def_bridge(_r38_explicit_noop_target)
+_r38_bridge_a_live = _r38_make_kw_def_bridge(_r38_explicit_uc_target)
+
+
+class _R38CacheOuterAZ:
+    class Inner:
+        live = staticmethod(_r38_bridge_z_live)
+
+
+class _R38CacheOuterZA:
+    class Inner:
+        live = staticmethod(_r38_bridge_a_live)
+
+
+def _r38_mid_disp_az(**kw: Any) -> Any:
+    return _R38CacheOuterAZ.Inner.live(**kw)
+
+
+def _r38_mid_disp_za(**kw: Any) -> Any:
+    return _R38CacheOuterZA.Inner.live(**kw)
+
+
+def test_astra_51_round38_regressions() -> None:
+    """Round-38 regressions R38-1..R38-8 across engine flow, negative-zero keys, calibration, and fallback."""
+    import asyncio
+    import copy as _copy_mod
+    import gc
+    import inspect
+    import warnings
+    from concurrent.futures import ThreadPoolExecutor
+    from typing import Mapping
+    import numpy as np
+    import pytest
+    from system1 import UniversalDecisionService, UtilityCalibrator
+    from system1.compat.typesafe import AsyncTypeSafeClient, Choice, TypeSafeClient
+    from system1.compat.universal import _canonical_structured_key, extract_semantic_text
+    from system1.core.model import SystemOneModel
+    from system1.core.schema import ChoiceField, DecisionSchema
+    from system1.cutover import AutoCutoverLifecycle, CutoverConfig
+    from system1.engine import SystemOneEngine, _inspect_varkw_wrapper
+    from system1.fallback import BoundedReviewFallback
+
+    # ------------------------------------------------------------------
+    # R38-1..R38-4 shared coupled schema and base model
+    # ------------------------------------------------------------------
+    class _R38CoupledSchema(DecisionSchema):
+        f = ChoiceField(options=("a", "b"))
+        g = ChoiceField(options=("a", "b"))
+
+        def validate_decision(self, values: Mapping[str, Any]) -> Dict[str, Any]:
+            if values.get("f") != values.get("g"):
+                raise ValueError(f"Coupled fields disagree: {values}")
+            return dict(values)
+
+    class _R38BaseModel:
+        def __init__(self) -> None:
+            self._inner = SystemOneModel(
+                _R38CoupledSchema(),
+                dimension=16,
+                backend="numpy",
+                contrastive_whitening=False,
+            )
+            for hd in self._inner.heads.values():
+                hd.set_weights(np.zeros((2, 16), dtype=np.float32), np.array([2.0, -2.0], dtype=np.float32))
+            for attr_n in ("schema", "projector", "dimension", "heads"):
+                setattr(self, attr_n, getattr(self._inner, attr_n))
+
+        def encode(self, prompt: str, recency_weighted: Optional[bool] = None) -> np.ndarray:
+            return self._inner.encode(prompt, recency_weighted=recency_weighted)
+
+        def forward_single(self, prompt: str, embedding: Optional[np.ndarray] = None) -> Any:
+            return self._inner.forward_single(prompt, embedding=embedding)
+
+        def learn_from_tier2(
+            self,
+            prompt: str,
+            targets: Mapping[str, Any],
+            embedding: Optional[np.ndarray] = None,
+            **kwargs: Any,
+        ) -> Dict[str, Any]:
+            return self._inner.learn_from_tier2(prompt, targets, embedding=embedding, **kwargs)
+
+    # ------------------------------------------------------------------
+    # R38-1: Container parameter copy / splat / dict() / items() / values()
+    # ------------------------------------------------------------------
+    class _R38DictCopyModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                d = box.copy()
+                return d["f"]()
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38CopyCopyModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                d = _copy_mod.copy(box)
+                return d["f"]()
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38DeepCopyModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                d = _copy_mod.deepcopy(box)
+                return d["f"]()
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38DictCtorModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                d = dict(box)
+                return d["f"]()
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38DictStarStarModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                d = dict(**box)
+                return d["f"]()
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38DictMergeModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                d = {**box}
+                return d["f"]()
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38DictItemsModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                out: Any = None
+                for _, fn in box.items():
+                    out = fn()
+                return out
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38DictValuesModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                out: Any = None
+                for fn in box.values():
+                    out = fn()
+                return out
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38ExtDictCopyModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_dict_copy_consumer(
+                {"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)}
+            )
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38ExtDictItemsModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_dict_items_consumer(
+                {"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)}
+            )
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38DictItemsKeyTaintModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            flags: Dict[str, Any] = {}
+            for k_it, _ in kwargs.items():
+                flags[k_it] = False
+            cached, _ = _r38_ext_consumes_fn(**flags)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, embedding=kwargs.get("embedding"))
+            return self.last
+
+    for pos_cls in (
+        _R38DictCopyModel,
+        _R38CopyCopyModel,
+        _R38DeepCopyModel,
+        _R38DictCtorModel,
+        _R38DictStarStarModel,
+        _R38DictMergeModel,
+        _R38DictItemsModel,
+        _R38DictValuesModel,
+        _R38ExtDictCopyModel,
+        _R38ExtDictItemsModel,
+        _R38DictItemsKeyTaintModel,
+    ):
+        m_r1 = pos_cls()
+        assert _inspect_varkw_wrapper(m_r1.forward_single, frozenset({"use_cache"}))[0] == {"use_cache"}
+        eng_r1 = SystemOneEngine(
+            _R38CoupledSchema(),
+            model=m_r1,
+            use_cache=False,
+            strict_mode=True,
+            min_calibration_lessons=1_000_000,
+        )
+        assert eng_r1.decide("p", use_cache=False).values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_r1.learn("p", {"f": "b"})
+        assert eng_r1.model_version == 1
+        assert eng_r1.decide("p", use_cache=False).values == {"f": "a", "g": "a"}
+
+    class _R38NegCopyMaskedKeyModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                d = box.copy()
+                d["f"] = lambda: (False, dict(kwargs))
+                return d["f"]()
+
+            cached, rest = invoke({"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)})
+            return super().forward_single(*args, **rest)
+
+    class _R38NegCopyUnusedKeyModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def invoke(box: Mapping[str, Any]) -> Any:
+                d = box.copy()
+                return d["live"]()
+
+            cached, rest = invoke(
+                {
+                    "live": lambda: (False, dict(kwargs)),
+                    "dead": lambda: (bool(kwargs.pop("use_cache", True)), kwargs),
+                }
+            )
+            return super().forward_single(*args, **rest)
+
+    class _R38ConstKeyItemsNegModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            box = {"other": kwargs.get("other")}
+            flags: Dict[str, Any] = {}
+            for k_it, _ in box.items():
+                flags[k_it] = False
+            _ = _r38_ext_consumes_fn(**flags)
+            return super().forward_single(*args, embedding=kwargs.get("embedding"))
+
+    for neg_r1 in (_R38NegCopyMaskedKeyModel, _R38NegCopyUnusedKeyModel, _R38ConstKeyItemsNegModel):
+        assert _inspect_varkw_wrapper(neg_r1().forward_single, frozenset({"use_cache"}))[0] == set()
+
+    # ------------------------------------------------------------------
+    # R38-2: Factory closure-bound defaults & per-instance isolation
+    # ------------------------------------------------------------------
+    class _R38FactoryPosDefModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pack(cb: Callable[[], Any]) -> Callable[..., Any]:
+                def invoke(fn: Callable[[], Any] = cb) -> Any:
+                    return fn()
+
+                return invoke
+
+            cached, rest = pack(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38FactoryKwDefModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pack(cb: Callable[[], Any]) -> Callable[..., Any]:
+                def invoke(*, fn: Callable[[], Any] = cb) -> Any:
+                    return fn()
+
+                return invoke
+
+            cached, rest = pack(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38FactoryMultiLiveModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pack(cb: Callable[[], Any]) -> Callable[..., Any]:
+                def invoke(fn: Callable[[], Any] = cb) -> Any:
+                    return fn()
+
+                return invoke
+
+            _inv_dead = pack(lambda: (False, dict(kwargs)))
+            inv_live = pack(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))
+            cached, rest = inv_live()
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38MutualRecWrapModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def a(n: int) -> Any:
+                return (bool(kwargs.pop("use_cache", True)), kwargs) if n <= 0 else b(n - 1)
+
+            def b(n: int) -> Any:
+                return c(n)
+
+            def c(n: int) -> Any:
+                return a(n)
+
+            cached, rest = a(2)
+            return super().forward_single(*args, **rest)
+
+    @dataclasses.dataclass
+    class _R38DcBox:
+        x: int = 1
+
+    def _r38_dc_wrap(*args: Any, **kwargs: Any) -> Any:
+        _ = dataclasses.replace(_R38DcBox(), **kwargs)
+        return None
+
+    t0_mr = time.perf_counter()
+    assert _inspect_varkw_wrapper(_R38MutualRecWrapModel().forward_single, frozenset({"use_cache"}))[0] == {"use_cache"}
+    _ = _inspect_varkw_wrapper(_r38_dc_wrap, frozenset({"use_cache"}))
+    assert (time.perf_counter() - t0_mr) < 1.0
+
+    for pos_r2 in (_R38FactoryPosDefModel, _R38FactoryKwDefModel, _R38FactoryMultiLiveModel):
+        m_r2 = pos_r2()
+        assert _inspect_varkw_wrapper(m_r2.forward_single, frozenset({"use_cache"}))[0] == {"use_cache"}
+        eng_r2 = SystemOneEngine(
+            _R38CoupledSchema(),
+            model=m_r2,
+            use_cache=False,
+            strict_mode=True,
+            min_calibration_lessons=1_000_000,
+        )
+        assert eng_r2.decide("p", use_cache=False).values == {"f": "a", "g": "a"}
+        with pytest.raises(ValueError, match="Coupled fields disagree"):
+            eng_r2.learn("p", {"f": "b"})
+        assert eng_r2.model_version == 1
+
+    class _R38FactoryNegDeadInstModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pack(cb: Callable[[], Any]) -> Callable[..., Any]:
+                def invoke(fn: Callable[[], Any] = cb) -> Any:
+                    return fn()
+
+                return invoke
+
+            inv_dead = pack(lambda: (False, dict(kwargs)))
+            _inv_live = pack(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))
+            cached, rest = inv_dead()
+            return super().forward_single(*args, **rest)
+
+    class _R38FactoryNegOverridePosModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pack(cb: Callable[[], Any]) -> Callable[..., Any]:
+                def invoke(fn: Callable[[], Any] = cb) -> Any:
+                    return fn()
+
+                return invoke
+
+            inv_live = pack(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))
+            cached, rest = inv_live(lambda: (False, dict(kwargs)))
+            return super().forward_single(*args, **rest)
+
+    class _R38FactoryNegOverrideKwModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            def pack(cb: Callable[[], Any]) -> Callable[..., Any]:
+                def invoke(*, fn: Callable[[], Any] = cb) -> Any:
+                    return fn()
+
+                return invoke
+
+            inv_live = pack(lambda: (bool(kwargs.pop("use_cache", True)), kwargs))
+            cached, rest = inv_live(fn=lambda: (False, dict(kwargs)))
+            return super().forward_single(*args, **rest)
+
+    for neg_r2 in (
+        _R38FactoryNegDeadInstModel,
+        _R38FactoryNegOverridePosModel,
+        _R38FactoryNegOverrideKwModel,
+    ):
+        assert _inspect_varkw_wrapper(neg_r2().forward_single, frozenset({"use_cache"}))[0] == set()
+
+    # ------------------------------------------------------------------
+    # R38-3: External functions sharing __code__ with differing defaults/
+    # kwdefaults/closure/partial (including alphabetical a/z ordering)
+    # ------------------------------------------------------------------
+    class _R38ExtDefLiveAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_def_live_a(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtDefDeadZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_def_dead_z(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtDefDeadAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_def_dead_a(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtDefLiveZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_def_live_z(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtKwDefLiveAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_kwdef_live_a(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtKwDefDeadZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_kwdef_dead_z(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtKwDefDeadAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_kwdef_dead_a(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtKwDefLiveZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_kwdef_live_z(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtCellLiveAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_cell_live_a(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtCellDeadZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_cell_dead_z(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtCellDeadAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_cell_dead_a(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtCellLiveZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_cell_live_z(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtPartialLiveAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_partial_live_a(**kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtPartialDeadZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_partial_dead_z(**kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtPartialDeadAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_partial_dead_a(**kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtPartialLiveZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_partial_live_z(**kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtPartialKwLiveModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_partial_kw_live(**kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtPartialKwOverridePosSafeModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_partial_kw_override_pos_safe(**kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtPartialKwOverrideKwSafeModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_partial_kw_override_kw_safe(**kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtPartialKwOverrideDeadFnModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_partial_kw_override_dead_fn(**kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtDirectOverrideModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            cached, rest = _r38_ext_default_live_kw(fn=None, **kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtCombinedPosAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _r38_ext_def_dead_z({})
+            cached, rest = _r38_ext_def_live_a(kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38ExtCombinedPosZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _r38_ext_def_dead_a({})
+            cached, rest = _r38_ext_def_live_z(kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38ExtCombinedNegModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _r38_ext_def_live_a({})
+            cached, rest = _r38_ext_def_dead_z(kwargs)
+            return super().forward_single(*args, **rest)
+
+    class _R38ExtCacheKeyAZModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _ = _r38_bridge_a_dead(**kwargs)
+            cached, rest = _r38_mid_disp_az(**kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    class _R38ExtCacheKeyZAModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            _ = _r38_bridge_z_dead(**kwargs)
+            cached, rest = _r38_mid_disp_za(**kwargs)
+            if cached and hasattr(self, "last"):
+                return self.last
+            self.last = super().forward_single(*args, **rest)
+            return self.last
+
+    for ext_live_cls in (
+        _R38ExtDefLiveAModel,
+        _R38ExtDefLiveZModel,
+        _R38ExtKwDefLiveAModel,
+        _R38ExtKwDefLiveZModel,
+        _R38ExtCellLiveAModel,
+        _R38ExtCellLiveZModel,
+        _R38ExtPartialLiveAModel,
+        _R38ExtPartialLiveZModel,
+        _R38ExtPartialKwLiveModel,
+        _R38ExtCombinedPosAModel,
+        _R38ExtCombinedPosZModel,
+        _R38ExtCacheKeyAZModel,
+        _R38ExtCacheKeyZAModel,
+    ):
+        m_r3 = ext_live_cls()
+        assert _inspect_varkw_wrapper(m_r3.forward_single, frozenset({"use_cache"}))[0] == {"use_cache"}
+        if ext_live_cls in (_R38ExtCombinedPosAModel, _R38ExtCombinedPosZModel):
+            eng_r3 = SystemOneEngine(
+                _R38CoupledSchema(),
+                model=m_r3,
+                use_cache=False,
+                strict_mode=True,
+                min_calibration_lessons=1_000_000,
+            )
+            assert eng_r3.decide("p", use_cache=False).values == {"f": "a", "g": "a"}
+            with pytest.raises(ValueError, match="Coupled fields disagree"):
+                eng_r3.learn("p", {"f": "b"})
+            assert eng_r3.model_version == 1
+
+    for ext_dead_cls in (
+        _R38ExtDefDeadZModel,
+        _R38ExtDefDeadAModel,
+        _R38ExtKwDefDeadZModel,
+        _R38ExtKwDefDeadAModel,
+        _R38ExtCellDeadZModel,
+        _R38ExtCellDeadAModel,
+        _R38ExtPartialDeadZModel,
+        _R38ExtPartialDeadAModel,
+        _R38ExtPartialKwOverridePosSafeModel,
+        _R38ExtPartialKwOverrideKwSafeModel,
+        _R38ExtPartialKwOverrideDeadFnModel,
+        _R38ExtDirectOverrideModel,
+        _R38ExtCombinedNegModel,
+    ):
+        assert _inspect_varkw_wrapper(ext_dead_cls().forward_single, frozenset({"use_cache"}))[0] == set()
+
+    # ------------------------------------------------------------------
+    # R38-4: Strong updates vs conditional / loop / try-except weak updates
+    # ------------------------------------------------------------------
+    class _R38StrongDictOverwriteModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            box = {"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)}
+            box["f"] = lambda: (False, dict(kwargs))
+            cached, rest = box["f"]()
+            return super().forward_single(*args, **rest)
+
+    class _R38StrongDictDeleteModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            box = {"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)}
+            del box["f"]
+            cached, rest = box.get("f", lambda: (False, dict(kwargs)))()
+            return super().forward_single(*args, **rest)
+
+    class _R38StrongSeqAssignModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq = [lambda: (bool(kwargs.pop("use_cache", True)), kwargs)]
+            seq[0] = lambda: (False, dict(kwargs))
+            cached, rest = seq[0]()
+            return super().forward_single(*args, **rest)
+
+    class _R38StrongSeqDeleteModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq = [lambda: (bool(kwargs.pop("use_cache", True)), kwargs), lambda: (False, dict(kwargs))]
+            del seq[0]
+            cached, rest = seq[0]()
+            return super().forward_single(*args, **rest)
+
+    class _R38StrongSliceDeleteModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq = [lambda: (bool(kwargs.pop("use_cache", True)), kwargs), lambda: (False, dict(kwargs))]
+            del seq[0:1]
+            cached, rest = seq[0]()
+            return super().forward_single(*args, **rest)
+
+    for strong_cls in (
+        _R38StrongDictOverwriteModel,
+        _R38StrongDictDeleteModel,
+        _R38StrongSeqAssignModel,
+        _R38StrongSeqDeleteModel,
+        _R38StrongSliceDeleteModel,
+    ):
+        m_st = strong_cls()
+        assert _inspect_varkw_wrapper(m_st.forward_single, frozenset({"use_cache"}))[0] == set()
+        eng_st = SystemOneEngine(
+            _R38CoupledSchema(),
+            model=m_st,
+            use_cache=True,
+            strict_mode=True,
+            min_calibration_lessons=1_000_000,
+        )
+        assert eng_st.decide("p").values == {"f": "a", "g": "a"}
+
+    class _R38WeakBranchDictModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            box = {"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)}
+            if args:
+                box["f"] = lambda: (False, dict(kwargs))
+            cached, rest = box["f"]()
+            return super().forward_single(*args, **rest)
+
+    class _R38WeakLoopDictModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            box = {"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)}
+            for _ in args:
+                box["f"] = lambda: (False, dict(kwargs))
+            cached, rest = box["f"]()
+            return super().forward_single(*args, **rest)
+
+    class _R38WeakLoopSeqModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq = [lambda: (bool(kwargs.pop("use_cache", True)), kwargs)]
+            for _ in args:
+                seq[0] = lambda: (False, dict(kwargs))
+            cached, rest = seq[0]()
+            return super().forward_single(*args, **rest)
+
+    class _R38WeakTryDictModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            box = {"f": lambda: (bool(kwargs.pop("use_cache", True)), kwargs)}
+            try:
+                _ = len(args)
+                box["f"] = lambda: (False, dict(kwargs))
+            except Exception:
+                pass
+            cached, rest = box["f"]()
+            return super().forward_single(*args, **rest)
+
+    class _R38WeakTrySeqDelModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            seq = [lambda: (bool(kwargs.pop("use_cache", True)), kwargs), lambda: (False, dict(kwargs))]
+            try:
+                _ = len(args)
+                del seq[0]
+            except Exception:
+                pass
+            cached, rest = seq[0]()
+            return super().forward_single(*args, **rest)
+
+    class _R38WeakUnionPairModel(_R38BaseModel):
+        def forward_single(self, *args: Any, **kwargs: Any) -> Any:
+            if args:
+                pair = (lambda: None, lambda: (bool(kwargs.pop("use_cache", True)), kwargs))
+            else:
+                pair = (lambda: None, lambda: (False, dict(kwargs)))
+            _, fn = pair
+            cached, rest = fn()
+            return super().forward_single(*args, **rest)
+
+    for weak_cls in (
+        _R38WeakBranchDictModel,
+        _R38WeakLoopDictModel,
+        _R38WeakLoopSeqModel,
+        _R38WeakTryDictModel,
+        _R38WeakTrySeqDelModel,
+        _R38WeakUnionPairModel,
+    ):
+        assert _inspect_varkw_wrapper(weak_cls().forward_single, frozenset({"use_cache"}))[0] == {"use_cache"}
+
+    # ------------------------------------------------------------------
+    # R38-5: Signed-zero (-0.0 vs +0.0) distinction across cache & gateway keys
+    # ------------------------------------------------------------------
+    assert _canonical_structured_key(-0.0) != _canonical_structured_key(0.0)
+    assert _canonical_structured_key({"v": -0.0}) != _canonical_structured_key({"v": 0.0})
+    assert _canonical_structured_key([-0.0]) != _canonical_structured_key([0.0])
+    assert extract_semantic_text({"state": {"v": -0.0}})[0] != extract_semantic_text({"state": {"v": 0.0}})[0]
+
+    class _R38NegZeroSchema(DecisionSchema):
+        f = ChoiceField(options=("pos", "neg"))
+
+    def _sign_val(obj: Any) -> str:
+        raw_v = obj["v"] if isinstance(obj, dict) else 0.0
+        return "neg" if math.copysign(1.0, float(raw_v)) < 0.0 else "pos"
+
+    lc_nz = AutoCutoverLifecycle(
+        _R38NegZeroSchema(),
+        config=CutoverConfig(
+            milestones=(64,),
+            k_min=2,
+            canary_rate=1e-9,
+            sparse_dim=128,
+            dense_dim=32,
+            enable_quarantine=False,
+        ),
+    )
+    for i in range(64):
+        lc_nz.observe_teacher(
+            ("positive zero" if i % 2 == 0 else "negative zero") + f" {i}",
+            {"f": "pos" if i % 2 == 0 else "neg"},
+        )
+
+    gw_calls: List[Any] = []
+
+    def _gw_handler(semantic_text: str, raw_payload: Mapping[str, Any], contract: Any) -> Dict[str, Any]:
+        gw_calls.append(raw_payload)
+        state_obj = raw_payload.get("state", {})
+        choice = _sign_val(state_obj)
+        probs = {"pos": 0.99, "neg": 0.01} if choice == "pos" else {"pos": 0.01, "neg": 0.99}
+        return {"answers": {"f": {"choice": choice, "probabilities": probs}}, "usage": {"input_tokens": 4}}
+
+    svc_nz = UniversalDecisionService(
+        upstream_handlers={"jev": _gw_handler},
+        require_auth=False,
+        cutover_config=CutoverConfig(
+            milestones=(50, 100),
+            k_min=2,
+            alpha_target=0.15,
+            canary_rate=1e-9,
+            sparse_dim=64,
+            dense_dim=16,
+            enable_quarantine=False,
+        ),
+    )
+    q_univ = {"f": {"type": "choice", "options": ("pos", "neg")}}
+    for idx_u in range(160):
+        is_pos_u = idx_u % 2 == 0
+        st_u, body_u = svc_nz.process_payload(
+            path="/v1/decisions",
+            payload={
+                "state": {
+                    "v": 0.0 if is_pos_u else -0.0,
+                    "note": ("positive approve " if is_pos_u else "negative reject ") + f"sample {idx_u}",
+                },
+                "questions": q_univ,
+                "slot": "r38_negzero",
+            },
+        )
+        assert st_u == 200
+        assert body_u["answers"]["f"]["choice"] == ("pos" if is_pos_u else "neg")
+
+    nz_lcs = list(svc_nz._lifecycles.values())
+    assert len(nz_lcs) == 1
+    assert str(getattr(nz_lcs[0].lifecycle.state, "value", nz_lcs[0].lifecycle.state)) == "SELECTIVE_HOT_SWAP"
+
+    probe_pos = {"state": {"v": 0.0, "note": "zero probe"}, "questions": q_univ, "slot": "r38_negzero"}
+    probe_neg = {"state": {"v": -0.0, "note": "zero probe"}, "questions": q_univ, "slot": "r38_negzero"}
+    for _ in range(2):
+        st_p, b_p = svc_nz.process_payload(path="/v1/decisions", payload=probe_pos)
+        assert st_p == 200 and b_p["answers"]["f"]["choice"] == "pos"
+    fast_before_nz = int(svc_nz.stats["local_fastpath_requests"])
+    teacher_before_nz = len(gw_calls)
+    st_hit_nz, b_hit_nz = svc_nz.process_payload(path="/v1/decisions", payload=probe_pos)
+    assert st_hit_nz == 200 and b_hit_nz["answers"]["f"]["choice"] == "pos"
+    assert b_hit_nz["local_execution"] is True
+    assert int(svc_nz.stats["local_fastpath_requests"]) >= fast_before_nz + 1
+    assert len(gw_calls) == teacher_before_nz
+
+    st_miss_nz, b_miss_nz = svc_nz.process_payload(path="/v1/decisions", payload=probe_neg)
+    assert st_miss_nz == 200 and b_miss_nz["answers"]["f"]["choice"] == "neg"
+    assert len(gw_calls) == teacher_before_nz + 1
+
+    ts_nz_calls: List[Any] = []
+
+    def _ts_nz_teacher(state_arg: Any, questions_arg: Any) -> Dict[str, Any]:
+        ts_nz_calls.append(state_arg)
+        return {"answers": {"f": {"value": _sign_val(state_arg)}}, "egress_bytes": 0}
+
+    q_nz = {"f": Choice(options=["pos", "neg"])}
+    ts_nz = TypeSafeClient(
+        mode="auto_cutover",
+        auto_cutover_lifecycle=lc_nz,
+        baseline_handler=_ts_nz_teacher,
+    )
+    assert ts_nz.systemone({"v": 0.0}, q_nz)["answers"]["f"]["value"] == "pos"
+    assert ts_nz.systemone({"v": 0.0}, q_nz)["answers"]["f"]["value"] == "pos"
+    ts_pos_calls = len(ts_nz_calls)
+    assert ts_nz.systemone({"v": -0.0}, q_nz)["answers"]["f"]["value"] == "neg"
+    assert len(ts_nz_calls) == ts_pos_calls + 1
+
+    async def _run_async_nz() -> None:
+        ac_nz = AsyncTypeSafeClient(
+            mode="auto_cutover",
+            auto_cutover_lifecycle=lc_nz,
+            baseline_handler=_ts_nz_teacher,
+        )
+        assert (await ac_nz.systemone({"v": 0.0}, q_nz))["answers"]["f"]["value"] == "pos"
+        assert (await ac_nz.systemone({"v": 0.0}, q_nz))["answers"]["f"]["value"] == "pos"
+        ac_pos_calls = len(ts_nz_calls)
+        assert (await ac_nz.systemone({"v": -0.0}, q_nz))["answers"]["f"]["value"] == "neg"
+        assert len(ts_nz_calls) == ac_pos_calls + 1
+        await ac_nz.close()
+
+    asyncio.run(_run_async_nz())
+
+    # ------------------------------------------------------------------
+    # R38-6: UtilityCalibrator subnormal cost scaling & exact tie parity
+    # ------------------------------------------------------------------
+    tiny = float(np.nextafter(0.0, 1.0))
+    cal_tiny = UtilityCalibrator([[tiny, tiny], [0.0, 0.0]], safe_action=1)
+    assert cal_tiny.predict([0.5, 0.5], use_crc=False).tolist() == [1]
+    cal_mixed = UtilityCalibrator([[tiny, tiny], [0.0, 0.0], [1e100, 1e100]], safe_action=1)
+    assert cal_mixed.predict([0.5, 0.5], use_crc=False).tolist() == [1]
+    assert float(cal_tiny._expected_policy_costs(np.array([[0.5, 0.5]], dtype=np.float64))[0, 0]) > 0.0
+    C_pure_grad = np.array(
+        [[2.0 * tiny, 2.0 * tiny, 2.0 * tiny], [0.0, 0.0, 3.0 * tiny], [4.0 * tiny, 4.0 * tiny, 4.0 * tiny]],
+        dtype=np.float64,
+    )
+    cal_pure_grad = UtilityCalibrator(C_pure_grad, safe_action=2)
+    assert int(np.argmin(cal_pure_grad._expected_policy_costs(np.array([[0.25, 0.25, 0.5]], dtype=np.float64))[0])) == 1
+    assert cal_pure_grad.predict([0.25, 0.25, 0.5], use_crc=False).tolist() == [1]
+
+    C_mixed_grad = np.array(
+        [[2.0 * tiny, 2.0 * tiny, 2.0 * tiny], [0.0, 0.0, 3.0 * tiny], [1.0, 1.0, 1.0]],
+        dtype=np.float64,
+    )
+    cal_mixed_grad = UtilityCalibrator(C_mixed_grad, safe_action=2)
+    assert cal_mixed_grad.predict([0.25, 0.25, 0.5], use_crc=False).tolist() == [1]
+
+    C_subnorm = np.array([[1e-310, 1e-310], [2e-310, 2e-310]], dtype=np.float64)
+    p_subnorm = np.tile([0.5, 0.5], (24, 1))
+    y_subnorm = np.array([i % 2 for i in range(24)], dtype=int)
+    with warnings.catch_warnings(record=True) as caught_r38_u:
+        warnings.simplefilter("always", RuntimeWarning)
+        cal_sn = UtilityCalibrator(C_subnorm, safe_action=0, alpha=0.5).fit(p_subnorm, y_subnorm)
+        assert np.all(np.isfinite(cal_sn.L))
+        assert np.allclose(cal_sn.L[0], [0.0, 0.0], atol=1e-12)
+        assert np.allclose(cal_sn.L[1], [1.0, 1.0], atol=1e-12)
+        assert cal_sn.predict([0.5, 0.5], use_crc=False).tolist() == [0]
+
+        C_subnorm_hi_safe = np.array([[2e-310, 2e-310], [1e-310, 1e-310]], dtype=np.float64)
+        cal_sn_hi = UtilityCalibrator(C_subnorm_hi_safe, safe_action=1, alpha=0.5).fit(p_subnorm, y_subnorm)
+        assert np.all(np.isfinite(cal_sn_hi.L))
+        assert np.allclose(cal_sn_hi.L[0], [1.0, 1.0], atol=1e-12)
+        assert np.allclose(cal_sn_hi.L[1], [0.0, 0.0], atol=1e-12)
+        assert cal_sn_hi.predict([0.5, 0.5], use_crc=False).tolist() == [1]
+
+        C_asym_sn = np.array([[4e-310, 0.0], [1e-310, 1e-310]], dtype=np.float64)
+        cal_asym = UtilityCalibrator(C_asym_sn, safe_action=1, alpha=0.5).fit(p_subnorm, y_subnorm)
+        assert cal_asym.predict([0.6, 0.4], use_crc=False).tolist() == [1]
+
+        eps = 2.0 ** -52
+        C_fptie = np.array([[1.0, 1.0 + eps], [1.0, 1.0], [2.0, 2.0]], dtype=np.float64)
+        p_fptie_arr = np.array([[0.75, 0.25]], dtype=np.float64)
+        assert np.all(p_fptie_arr @ C_fptie[:2].T == 1.0)
+        cal_fptie = UtilityCalibrator(
+            C_fptie, safe_action=2, alpha=0.9, fit_temperature=False
+        ).fit(np.tile([0.75, 0.25], (20, 1)), np.zeros(20, dtype=int))
+        assert cal_fptie.predict([0.75, 0.25], use_crc=False).tolist() == [1]
+        assert cal_fptie.predict([0.75, 0.25], use_crc=True).tolist() == [1]
+
+        C_true_tie = np.array([[1e16, 1.0, -1e16], [0.0, 1.0, 0.0]], dtype=np.float64)
+        p_true_tie = np.tile([0.25, 0.5, 0.25], (20, 1))
+        y_true_tie = np.array([i % 3 for i in range(20)], dtype=int)
+        cal_tie = UtilityCalibrator(C_true_tie, safe_action=1, alpha=0.01).fit(p_true_tie, y_true_tie)
+        assert cal_tie.predict([0.25, 0.5, 0.25], use_crc=False).tolist() == [0]
+        assert cal_tie.predict([0.25, 0.5, 0.25], use_crc=True).tolist() == [1]
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_r38_u)
+
+    # ------------------------------------------------------------------
+    # R38-7: BoundedReviewFallback untrusted network cannot spoof cutover
+    # ------------------------------------------------------------------
+    class _R38SpoofingNetwork:
+        def decide(self, prompt: str) -> Dict[str, Any]:
+            return {"values": {"f": "pos"}, "review": False, "auto_compiled": True}
+
+    lc_untrusted = AutoCutoverLifecycle(
+        _R38NegZeroSchema(),
+        config=CutoverConfig(
+            milestones=(64,),
+            k_min=2,
+            canary_rate=1.0,
+            sparse_dim=128,
+            dense_dim=32,
+            enable_quarantine=False,
+        ),
+    )
+    for i in range(64):
+        lc_untrusted.observe_teacher(
+            ("positive zero" if i % 2 == 0 else "negative zero") + f" {i}",
+            {"f": "pos" if i % 2 == 0 else "neg"},
+        )
+    fb_spoof = BoundedReviewFallback(
+        _R38SpoofingNetwork(),
+        review_fn=lambda p: {"f": "neg"},
+        auto_compile_lifecycle=lc_untrusted,
+        auto_record_lessons=False,
+    )
+    assert fb_spoof._network_owned_by_cutover is False
+    for _ in range(5):
+        rs = fb_spoof.decide("positive zero 0")
+        assert rs["recovery_reason"] == "local_accepted"
+        assert rs["used_fallback"] is False
+    assert (
+        lc_untrusted.local_accept_eligible,
+        lc_untrusted.canary_checks,
+        len(lc_untrusted._pending_canaries),
+        sum(map(len, lc_untrusted._pending_canary_stack.values())),
+    ) == (0, 0, 0, 0)
+
+    async def _run_spoof_async() -> None:
+        for _ in range(5):
+            ra = await fb_spoof.decide("positive zero 0")
+            assert ra["recovery_reason"] == "local_accepted"
+            assert ra["used_fallback"] is False
+
+    asyncio.run(_run_spoof_async())
+    assert (
+        lc_untrusted.local_accept_eligible,
+        lc_untrusted.canary_checks,
+        len(lc_untrusted._pending_canaries),
+        sum(map(len, lc_untrusted._pending_canary_stack.values())),
+    ) == (0, 0, 0, 0)
+
+    # Inner fallback adapter forwarding auto_compiled=True cannot orphan outer transactions.
+    class _R38InnerFallbackAdapter:
+        def __init__(self, inner_fb: BoundedReviewFallback) -> None:
+            self._inner_fb = inner_fb
+
+        def decide(self, prompt: str) -> Dict[str, Any]:
+            return dict(self._inner_fb.decide(prompt))
+
+    lc_inner = AutoCutoverLifecycle(
+        _R38NegZeroSchema(),
+        config=CutoverConfig(
+            milestones=(64,),
+            k_min=2,
+            canary_rate=1e-9,
+            sparse_dim=128,
+            dense_dim=32,
+            enable_quarantine=False,
+        ),
+    )
+    for i in range(64):
+        lc_inner.observe_teacher(
+            ("positive zero" if i % 2 == 0 else "negative zero") + f" {i}",
+            {"f": "pos" if i % 2 == 0 else "neg"},
+        )
+    fb_inner = BoundedReviewFallback(
+        lc_inner.engine,
+        review_fn=lambda p: {"f": "neg"},
+        auto_compile_lifecycle=lc_inner,
+        auto_record_lessons=False,
+    )
+    fb_outer = BoundedReviewFallback(
+        _R38InnerFallbackAdapter(fb_inner),
+        review_fn=lambda p: {"f": "neg"},
+        auto_compile_lifecycle=lc_untrusted,
+        auto_record_lessons=False,
+    )
+    for _ in range(10):
+        ro = fb_outer.decide("positive zero 0")
+        assert ro["recovery_reason"] == "local_accepted"
+        assert ro["auto_compiled"] is True
+    assert (
+        lc_untrusted.local_accept_eligible,
+        lc_untrusted.canary_checks,
+        len(lc_untrusted._pending_canaries),
+        sum(map(len, lc_untrusted._pending_canary_stack.values())),
+    ) == (0, 0, 0, 0)
+
+    # Owned cutover engine still records canary checks cleanly.
+    fb_owned = BoundedReviewFallback(
+        lc_untrusted.engine,
+        review_fn=lambda p: {"f": "neg"},
+        auto_compile_lifecycle=lc_untrusted,
+        auto_record_lessons=False,
+    )
+    assert fb_owned._network_owned_by_cutover is True
+    _ = fb_owned.decide("positive zero 0")
+    assert lc_untrusted.local_accept_eligible == 1
+    assert lc_untrusted.canary_checks == 1
+    assert lc_untrusted._pending_canaries == {}
+
+    # ------------------------------------------------------------------
+    # R38-8: BoundedReviewFallback thread-safety under concurrent calls
+    # ------------------------------------------------------------------
+    gate_started = threading.Event()
+    gate_release = threading.Event()
+    sync_calls = 0
+    sync_calls_lock = threading.Lock()
+
+    class _R38SlowLocal:
+        def decide(self, prompt: str) -> Dict[str, Any]:
+            with sync_calls_lock:
+                nonlocal sync_calls
+                sync_calls += 1
+            gate_started.set()
+            gate_release.wait(timeout=2.0)
+            return {"values": {"f": "pos"}, "review": True}
+
+    fb_race = BoundedReviewFallback(
+        _R38SlowLocal(),
+        review_fn=lambda p: {"f": "pos"},
+        auto_record_lessons=False,
+    )
+    results_race: List[Any] = []
+    contender_results: List[Any] = []
+
+    def _first_caller() -> None:
+        results_race.append(fb_race.decide("race 1"))
+
+    def _contender_caller() -> None:
+        assert gate_started.wait(timeout=2.0)
+        contender_results.append(fb_race.decide("race 2"))
+
+    t1 = threading.Thread(target=_first_caller)
+    t2 = threading.Thread(target=_contender_caller)
+    t1.start()
+    t2.start()
+    t2.join(timeout=3.0)
+    gate_release.set()
+    t1.join(timeout=3.0)
+    assert len(results_race) == 1
+    assert results_race[0]["recovery_reason"] in ("stale_context", "validated_expert")
+    assert len(contender_results) == 1
+    assert contender_results[0]["recovery_reason"] == "runner_stopped"
+    assert sync_calls == 1
+    assert fb_race._busy is False
+    assert fb_race.attempts <= 1
+
+    # Trace-synchronized max_reviews=1 contention cannot exceed budget.
+    class _R38ReviewLocal:
+        def decide(self, prompt: str) -> Dict[str, Any]:
+            return {"values": {"f": "pos"}, "review": True}
+
+    trace_expert_calls = 0
+    trace_expert_lock = threading.Lock()
+
+    def _counting_expert(prompt: Any) -> Dict[str, str]:
+        with trace_expert_lock:
+            nonlocal trace_expert_calls
+            trace_expert_calls += 1
+        return {"f": "pos"}
+
+    fb_budget_race = BoundedReviewFallback(
+        _R38ReviewLocal(),
+        review_fn=_counting_expert,
+        max_reviews=1,
+        auto_record_lessons=False,
+    )
+    fb_mod_src = inspect.getsourcelines(BoundedReviewFallback.decide)
+    decide_start_line = fb_mod_src[1]
+    busy_line = next(
+        decide_start_line + idx_s
+        for idx_s, txt_s in enumerate(fb_mod_src[0])
+        if "self._busy = True" in txt_s
+    )
+    attempts_line = next(
+        decide_start_line + idx_s
+        for idx_s, txt_s in enumerate(fb_mod_src[0])
+        if "self.attempts += 1" in txt_s
+    )
+    b_busy = threading.Barrier(2, timeout=0.05)
+    b_attempts = threading.Barrier(2, timeout=0.05)
+
+    def _trace_race(frame: Any, event: str, arg: Any) -> Any:
+        if event == "line" and frame.f_code is BoundedReviewFallback.decide.__code__:
+            if frame.f_lineno == busy_line:
+                try:
+                    b_busy.wait()
+                except threading.BrokenBarrierError:
+                    pass
+            elif frame.f_lineno == attempts_line:
+                try:
+                    b_attempts.wait()
+                except threading.BrokenBarrierError:
+                    pass
+        return _trace_race
+
+    trace_outs: List[Any] = []
+    trace_outs_lock = threading.Lock()
+
+    def _trace_worker(tag: str) -> None:
+        r_tw = fb_budget_race.decide(tag)
+        with trace_outs_lock:
+            trace_outs.append(r_tw)
+
+    threading.settrace(_trace_race)
+    try:
+        wt1 = threading.Thread(target=_trace_worker, args=("one",))
+        wt2 = threading.Thread(target=_trace_worker, args=("two",))
+        wt1.start()
+        wt2.start()
+        wt1.join(timeout=3.0)
+        wt2.join(timeout=3.0)
+    finally:
+        threading.settrace(None)
+
+    assert len(trace_outs) == 2
+    assert trace_expert_calls <= 1
+    assert fb_budget_race.attempts <= 1
+    assert [r["recovery_reason"] for r in trace_outs].count("validated_expert") <= 1
+    assert "runner_stopped" in [r["recovery_reason"] for r in trace_outs]
+    assert fb_budget_race._busy is False
+
+    async def _slow_review_r8(prompt: Any) -> Dict[str, str]:
+        await asyncio.sleep(0.01)
+        return {"f": "pos"}
+
+    class _R38FastSyncLocal:
+        def decide(self, prompt: str) -> Dict[str, Any]:
+            return {"values": {"f": "pos"}, "review": False}
+
+    fb_pool = BoundedReviewFallback(
+        _R38FastSyncLocal(),
+        review_fn=_slow_review_r8,
+        auto_record_lessons=False,
+    )
+
+    def _pool_worker(idx: int) -> str:
+        res_p = fb_pool.decide(f"seq {idx}")
+        return str(res_p["values"]["f"])
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outs = list(pool.map(_pool_worker, range(16)))
+    assert all(v == "pos" for v in outs)
+    assert fb_pool._busy is False
+    assert fb_pool.attempts == 0
+
+    # Lifecycle transitions (unstarted close & halt) remain consistent without RuntimeWarning.
+    with warnings.catch_warnings(record=True) as caught_r38_w:
+        warnings.simplefilter("always", RuntimeWarning)
+
+        async def _verify_r38_async_close() -> None:
+            fb_ac = BoundedReviewFallback(
+                lc_untrusted.engine,
+                review_fn=_slow_review_r8,
+                auto_compile_lifecycle=lc_untrusted,
+                auto_record_lessons=False,
+            )
+            c1 = fb_ac.decide("positive zero 0")
+            c1.close()
+            assert fb_ac._busy is False
+            c2 = fb_ac.decide("positive zero 2")
+            fb_ac.close()
+            r2 = await c2
+            assert r2["recovery_reason"] == "runner_stopped"
+            assert fb_ac._busy is False
+
+        asyncio.run(_verify_r38_async_close())
+        gc.collect()
+    assert not any(issubclass(w.category, RuntimeWarning) for w in caught_r38_w)
+
 
 
 

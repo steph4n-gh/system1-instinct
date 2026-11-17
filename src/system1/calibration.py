@@ -18,6 +18,7 @@ import json
 import math
 from collections import deque
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 
@@ -3037,6 +3038,15 @@ class UtilityCalibrator:
             if c_scale > 0.0
             else np.zeros_like(self.cost_matrix, dtype=np.float64)
         )
+        if 0.0 < c_scale < 1.0:
+            _, exp_c = math.frexp(c_scale)
+            self._upscaled_cost_matrix: Optional[np.ndarray] = np.ldexp(
+                self.cost_matrix,
+                1 - exp_c,
+            )
+        else:
+            self._upscaled_cost_matrix = None
+        self._exact_cost_rows: Optional[List[Tuple[Fraction, ...]]] = None
         self.c_esc = float(np.max(self.cost_matrix[self.safe_action]))
         self.B = float(np.max(self.cost_matrix))
         self._c_esc_scaled: float = float(np.max(self._scaled_cost_matrix[self.safe_action]))
@@ -3216,13 +3226,58 @@ class UtilityCalibrator:
         return costs[0] if single else costs
 
     def _expected_policy_costs(self, p_norm: np.ndarray) -> np.ndarray:
-        """Evaluate expected costs using raw costs when finite, falling back per-row to scaled costs."""
+        """Evaluate expected costs using raw or power-of-two upscaled costs, falling back per-row to scaled costs."""
         with np.errstate(over="ignore", under="ignore", invalid="ignore"):
             costs = p_norm @ self.cost_matrix.T
+            if self._upscaled_cost_matrix is not None:
+                costs = p_norm @ self._upscaled_cost_matrix.T
             bad_rows = ~np.all(np.isfinite(costs), axis=1)
             if bool(np.any(bad_rows)):
                 costs[bad_rows] = p_norm[bad_rows] @ self._scaled_cost_matrix.T
         return costs
+
+    def _select_bayes_actions(self, p_norm: np.ndarray, costs: np.ndarray) -> np.ndarray:
+        """Select Bayes-optimal actions with exact Fraction tie-breaking on floating-point ties."""
+        a_bayes = np.argmin(costs, axis=1).astype(np.int64)
+        if self.n_actions <= 1 or p_norm.shape[0] == 0:
+            return a_bayes
+        row_mins = np.min(costs, axis=1, keepdims=True)
+        subnorm_tol = float(self.n_classes) * float(np.finfo(np.float64).tiny)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            tie_mask = (costs == row_mins) | (np.abs(costs - row_mins) <= subnorm_tol)
+        tie_rows = np.flatnonzero(np.sum(tie_mask, axis=1) > 1)
+        if tie_rows.size == 0:
+            return a_bayes
+        if self._exact_cost_rows is None:
+            self._exact_cost_rows = [
+                tuple(Fraction(float(val)) for val in row)
+                for row in self.cost_matrix
+            ]
+        memo: Dict[Tuple[bytes, Tuple[int, ...]], int] = {}
+        for r_i in tie_rows:
+            cands = np.flatnonzero(tie_mask[r_i])
+            cands_tup = tuple(int(c) for c in cands)
+            if bool(np.all(self.cost_matrix[cands] == self.cost_matrix[cands[0]])):
+                a_bayes[r_i] = cands_tup[0]
+                continue
+            p_bytes = np.ascontiguousarray(p_norm[r_i], dtype=np.float64).tobytes()
+            m_key = (p_bytes, cands_tup)
+            cached = memo.get(m_key)
+            if cached is not None:
+                a_bayes[r_i] = cached
+                continue
+            p_fracs = tuple(Fraction(float(pv)) for pv in p_norm[r_i])
+            best_act = cands_tup[0]
+            best_val: Optional[Fraction] = None
+            for ca in cands_tup:
+                row_fracs = self._exact_cost_rows[ca]
+                tot = sum((p_f * c_f for p_f, c_f in zip(p_fracs, row_fracs) if p_f != 0), Fraction(0))
+                if best_val is None or tot < best_val:
+                    best_val = tot
+                    best_act = ca
+            memo[m_key] = best_act
+            a_bayes[r_i] = best_act
+        return a_bayes
 
     def _apply_policy(self, probs_2d: np.ndarray, lam: float) -> np.ndarray:
         n = probs_2d.shape[0]
@@ -3242,9 +3297,10 @@ class UtilityCalibrator:
         if not bool(np.any(row_fin)):
             return acts
         v_idx = v_idx[row_fin]
+        p_norm = p_norm[row_fin]
         costs_v = costs_v[row_fin]
         eh_v = eh_v[row_fin]
-        a_bayes = np.argmin(costs_v, axis=1).astype(np.int64)
+        a_bayes = self._select_bayes_actions(p_norm, costs_v)
         if self.ladder_mode:
             for pos, orig_i in enumerate(v_idx):
                 ab = int(a_bayes[pos])
@@ -3386,7 +3442,7 @@ class UtilityCalibrator:
                     costs_v = self._expected_policy_costs(p_norm)
                 c_fin = np.all(np.isfinite(costs_v), axis=1)
                 if bool(np.any(c_fin)):
-                    out[v_idx[c_fin]] = np.argmin(costs_v[c_fin], axis=1).astype(np.int64)
+                    out[v_idx[c_fin]] = self._select_bayes_actions(p_norm[c_fin], costs_v[c_fin])
             return out[:1] if single else out
         lam = -1.0 if self.is_vacuous else self.lam_crc
         out = self._apply_policy(p2, lam)

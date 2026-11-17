@@ -410,8 +410,6 @@ def _canonical_structured_key(node: Any, depth: int = 0) -> str:
         fv = float(node)
         if not math.isfinite(fv):
             raise InteropError(f"Non-finite numeric value in input: {node!r}", status_code=400)
-        if fv == 0.0:
-            fv = 0.0
         return f"F{fv.hex()};"
     if isinstance(node, str):
         return f"S{len(node)}:{node};"
@@ -497,8 +495,6 @@ def _canonicalize_for_semantic_json(node: Any, depth: int = 0) -> Tuple[Any, boo
         fv = float(node)
         if not math.isfinite(fv):
             raise InteropError(f"Non-finite numeric value in input: {node!r}", status_code=400)
-        if fv == 0.0:
-            fv = 0.0
         return fv, True
     if isinstance(node, str):
         return node, bool(node.strip())
