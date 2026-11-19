@@ -3046,6 +3046,13 @@ class UtilityCalibrator:
             )
         else:
             self._upscaled_cost_matrix = None
+        eval_cost_mat = (
+            self._upscaled_cost_matrix
+            if self._upscaled_cost_matrix is not None
+            else self.cost_matrix
+        )
+        self._abs_eval_cost_matrix: np.ndarray = np.abs(eval_cost_mat)
+        self._abs_cost_matrix: np.ndarray = np.abs(self.cost_matrix)
         self._exact_cost_rows: Optional[List[Tuple[Fraction, ...]]] = None
         self.c_esc = float(np.max(self.cost_matrix[self.safe_action]))
         self.B = float(np.max(self.cost_matrix))
@@ -3217,8 +3224,34 @@ class UtilityCalibrator:
         valid = self._valid_prob_rows(p2)
         costs = np.full((p2.shape[0], self.n_actions), np.nan, dtype=np.float64)
         if bool(np.any(valid)):
-            with np.errstate(over="ignore", invalid="ignore"):
-                c_ok = self._normalize_prob_rows(p2[valid]) @ self.cost_matrix.T
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                p_ok = self._normalize_prob_rows(p2[valid])
+                c_ok = p_ok @ self.cost_matrix.T
+                cond_ok = p_ok @ self._abs_cost_matrix.T
+            gamma_ec = (float(self.n_classes) + 2.0) * float(np.finfo(np.float64).eps)
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                need_exact = ~np.isfinite(c_ok) | (
+                    (cond_ok > 0.0) & (np.abs(c_ok) <= 1024.0 * gamma_ec * cond_ok)
+                )
+            bad_ec_rows = np.flatnonzero(np.any(need_exact, axis=1))
+            if bad_ec_rows.size > 0:
+                if self._exact_cost_rows is None:
+                    self._exact_cost_rows = [
+                        tuple(Fraction(float(val)) for val in row)
+                        for row in self.cost_matrix
+                    ]
+                for r_i in bad_ec_rows:
+                    p_fracs = tuple(Fraction(float(pv)) for pv in p_ok[r_i])
+                    for a_i in range(self.n_actions):
+                        tot = sum(
+                            (p_f * c_f for p_f, c_f in zip(p_fracs, self._exact_cost_rows[a_i]) if p_f != 0),
+                            Fraction(0),
+                        )
+                        try:
+                            val_f = float(tot)
+                        except OverflowError:
+                            val_f = float("nan")
+                        c_ok[r_i, a_i] = val_f if math.isfinite(val_f) else float("nan")
             c_fin = np.all(np.isfinite(c_ok), axis=1)
             if bool(np.any(c_fin)):
                 v_idx = np.flatnonzero(valid)[c_fin]
@@ -3241,10 +3274,21 @@ class UtilityCalibrator:
         a_bayes = np.argmin(costs, axis=1).astype(np.int64)
         if self.n_actions <= 1 or p_norm.shape[0] == 0:
             return a_bayes
-        row_mins = np.min(costs, axis=1, keepdims=True)
+        row_idx = np.arange(costs.shape[0])
+        row_mins = costs[row_idx, a_bayes][:, None]
+        gamma = (float(self.n_classes) + 2.0) * float(np.finfo(np.float64).eps)
         subnorm_tol = float(self.n_classes) * float(np.finfo(np.float64).tiny)
         with np.errstate(over="ignore", under="ignore", invalid="ignore"):
-            tie_mask = (costs == row_mins) | (np.abs(costs - row_mins) <= subnorm_tol)
+            cond_abs = p_norm @ self._abs_eval_cost_matrix.T
+            err_bound = gamma * cond_abs + subnorm_tol
+            pair_tol = err_bound + err_bound[row_idx, a_bayes][:, None]
+            diff = costs - row_mins
+            tie_mask = (
+                (costs == row_mins)
+                | (~np.isfinite(pair_tol))
+                | (~np.isfinite(diff))
+                | (diff <= pair_tol)
+            )
         tie_rows = np.flatnonzero(np.sum(tie_mask, axis=1) > 1)
         if tie_rows.size == 0:
             return a_bayes
@@ -3426,11 +3470,18 @@ class UtilityCalibrator:
         probs: np.ndarray,
         *,
         use_crc: bool = True,
+        apply_temperature: bool = True,
     ) -> np.ndarray:
         """Select risk-calibrated actions of shape ``(N,)``."""
         p = _coerce_real_numeric_array(probs, name="probs")
         single = p.ndim == 1
-        p2 = self.transform_probs(p.reshape(1, -1) if single else p)
+        p_in = p.reshape(1, -1) if single else p
+        if apply_temperature:
+            p2 = self.transform_probs(p_in)
+        else:
+            if p_in.ndim != 2 or p_in.shape[1] != self.n_classes:
+                raise ValueError(f"Expected {self.n_classes} classes, got shape {p.shape}")
+            p2 = p_in
         if not use_crc:
             n = p2.shape[0]
             out = np.full(n, self.safe_action, dtype=np.int64)

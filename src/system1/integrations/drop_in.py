@@ -773,7 +773,7 @@ class UtilityCascadeRouter:
                 used_crc_fallback = True
             else:
                 action = int(self.utility_calibrator.predict(raw_p[None, :], use_crc=True)[0])
-                bayes_action = int(np.argmin(costs_vec))
+                bayes_action = int(self.utility_calibrator.predict(raw_p[None, :], use_crc=False)[0])
                 used_crc_fallback = action != bayes_action
             is_vacuous = self.utility_calibrator.is_vacuous
         else:
@@ -785,7 +785,7 @@ class UtilityCascadeRouter:
                 costs_vec = nan_costs
                 used_crc_fallback = True
             else:
-                action = int(np.argmin(costs_vec))
+                action = int(self.utility_calibrator.predict(raw_p[None, :], use_crc=False, apply_temperature=False)[0])
                 used_crc_fallback = False
             is_vacuous = True
 

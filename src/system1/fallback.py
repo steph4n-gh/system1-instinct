@@ -57,6 +57,46 @@ def _cutover_owns_network(lc_obj: Any, net: Any) -> bool:
     return False
 
 
+def _cancel_handle_threadsafe(handle: Any) -> None:
+    """Cancel an asyncio Task/Future safely whether invoked inside or outside its owning loop."""
+    if handle is None:
+        return
+    done_fn = getattr(handle, "done", None)
+    if callable(done_fn):
+        try:
+            if done_fn():
+                return
+        except Exception:
+            pass
+    loop_fn = getattr(handle, "get_loop", None)
+    h_loop: Optional[asyncio.AbstractEventLoop] = None
+    if callable(loop_fn):
+        try:
+            cand_loop = loop_fn()
+            if isinstance(cand_loop, asyncio.AbstractEventLoop):
+                h_loop = cand_loop
+        except Exception:
+            h_loop = None
+    if h_loop is None:
+        cancel_fn = getattr(handle, "cancel", None)
+        if callable(cancel_fn):
+            cancel_fn()
+        return
+    if h_loop.is_closed():
+        return
+    try:
+        cur_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+    except RuntimeError:
+        cur_loop = None
+    if cur_loop is h_loop:
+        handle.cancel()
+    else:
+        try:
+            h_loop.call_soon_threadsafe(handle.cancel)
+        except RuntimeError:
+            pass
+
+
 class _TrackedAwaitIterator:
     """Iterator adapter routing awaitable protocol operations through _TrackedDecisionCoroutine."""
 
@@ -108,7 +148,7 @@ class _TrackedDecisionCoroutine(collections.abc.Coroutine):
             if inspect.iscoroutine(self._raw_answer):
                 self._raw_answer.close()
             elif hasattr(self._raw_answer, "cancel") and callable(self._raw_answer.cancel):
-                self._raw_answer.cancel()
+                _cancel_handle_threadsafe(self._raw_answer)
             if self._tx_pair is not None:
                 self._runner._rollback_cutover_tx(self._tx_pair)
             if inspect.iscoroutine(self._coro):
@@ -380,7 +420,7 @@ class BoundedReviewFallback:
             self._halted = True
             pending = self._pending
         if pending is not None:
-            pending.cancel()
+            _cancel_handle_threadsafe(pending)
 
     def _stop(self, decision: Dict[str, Any], reason: str) -> ReviewFallbackDecision:
         self.close()
@@ -869,7 +909,7 @@ class BoundedReviewFallback:
                 if inspect.iscoroutine(awaitable_answer):
                     awaitable_answer.close()
                 elif hasattr(awaitable_answer, "cancel") and callable(awaitable_answer.cancel):
-                    awaitable_answer.cancel()
+                    _cancel_handle_threadsafe(awaitable_answer)
             if tx_pair is not None:
                 self._rollback_cutover_tx(tx_pair)
             with self._state_lock:
