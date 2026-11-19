@@ -80,7 +80,7 @@ class MCPStreamableHTTPConfig:
     upstream_timeout_s: float = 30.0
     shutdown_timeout_s: float = 3.0
     server_name: str = "system1-mcp-guard-http"
-    server_version: str = "1.2.0"
+    server_version: str = "1.3.0"
 
     def __post_init__(self) -> None:
         if int(self.max_body_bytes) <= 0:

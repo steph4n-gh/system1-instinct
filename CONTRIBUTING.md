@@ -36,6 +36,15 @@ establish external-link availability or correctness of prose.
 Run changed executable examples as appropriate. Documentation-only edits do not
 require new classifier evaluations or live API calls.
 
+## Audit scope and exit rule
+
+Review rounds on a release branch follow these rules.
+
+- **In scope.** Untrusted data crossing a boundary (prompts, telemetry, embeddings, `.s1m` and other loaded files, and input to the MCP, HTTP and gRPC servers), ledger and receipt integrity, statistical guarantees the documentation states, and thread safety of the documented public API.
+- **Out of scope.** Behavior of caller-supplied Python code (custom models, callables and schema subclasses) beyond the documented signature contract, because it runs in-process with the caller's privileges. Numerical effects below floating-point rounding error, unless they break a documented guarantee.
+- **Bar for a fix.** A reproducer through the documented public API that yields a wrong decision, a broken documented guarantee, data loss or corruption, a crash or hang, or a crossed security boundary. Anything else is recorded and closed.
+- **Record and exit.** Record each round as one comment on the release pull request that lists every finding with its severity and disposition (fixed, or closed with the reason). A round with no finding above the bar ends the review for that release. Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md), not in a pull request comment.
+
 ## Package checks
 
 ```bash

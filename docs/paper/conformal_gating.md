@@ -1,10 +1,10 @@
 # Mathematical notes: uncertainty, prototype geometry and online correction
 
-**System 1: Instinct 1.2.0 · 13 November 2026 · Implementation notes, not new theorems**
+**System 1: Instinct 1.3.0 · 18 November 2026 · Implementation notes, not new theorems**
 
 This note describes the runtime mathematics in
-**System 1: Instinct 1.2.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)) and the assumptions needed to interpret it,
-including Mondrian class-conditional calibration, dual OOD familiarity and prototype similarity gating, the teaching workflow, and calibration-preserving online RLS updates. The [whitepaper](system1_whitepaper.md) contains the
+**System 1: Instinct 1.3.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)) and the assumptions needed to interpret it,
+including Mondrian class-conditional calibration, dual OOD familiarity and prototype similarity gating, the teaching workflow, and calibration-preserving online RLS updates. Section 7 covers the calibration methods added in 1.3.0. The [whitepaper](system1_whitepaper.md) contains the
 product evaluation; the [architecture reference](../architecture/technical_specification.md)
 maps behavior to code. Earlier claims of guaranteed safe execution, universal
 margin improvement and fixed microsecond update times are withdrawn.
@@ -60,7 +60,7 @@ ordering. Strict inversion includes labels whose score is at most the stored
 quantile; it does not add the next label after crossing that threshold.
 
 New examples-only categorical/Boolean skills use LAC. Legacy and schema-augmented
-skills use APS. Format-v2 artifacts record this choice, while v1 files retain
+skills use APS. Format-v2 and opt-in v3 artifacts record this choice, while v1 files retain
 legacy APS semantics. Both score functions lie in $[0,1]$ for valid normalized
 probabilities; insufficient evidence conservatively includes all labels.
 
@@ -180,9 +180,11 @@ regularizer $R$, the fitted coefficients satisfy
 
 $$\Theta=(Z^TZ+R)^{-1}Z^TY.$$
 
-The implementation computes the inverse with NumPy, retaining it when needed for
-online correction; it has a pseudoinverse/least-squares fallback. It does not ship
-the Cholesky solver described by older drafts. Bias regularization and sample
+The implementation solves these equations with NumPy (`np.linalg.solve`, through
+the equivalent $N\times N$ dual system when there are fewer samples than features)
+and forms the inverse only when it is retained for online correction; it has a
+pseudoinverse/least-squares fallback. Ridge fitting does not use the Cholesky
+solver described by older drafts. Bias regularization and sample
 weights must be included when comparing against a batch formula.
 
 For ideal arithmetic, an invertible matrix $A$ with inverse $P$, and a new feature
@@ -306,3 +308,143 @@ monitors in [calibration.py](../../src/system1/calibration.py):
   across audited error indicators in `"capital_ons"`, `"ons_betting"`,
   `"capital_eb"`, or `"fixed_mixture"` mode, raising an anytime-valid drift
   alarm whenever the e-value reaches $1/\delta$.
+
+## 7. Additions in 1.3.0
+
+The methods below are in [calibration.py](../../src/system1/calibration.py)
+unless stated otherwise. Apart from soft distillation, which is a compiler
+method, they are standalone: `SystemOneEngine.decide` does not call them.
+`UtilityCascadeRouter` combines the cost-aware, ordinal and binary calibrators.
+
+### Online Mondrian threshold tracking
+
+`OnlineMondrianConformal` keeps one LAC threshold per class. Its prediction set is
+$\{k: 1-p_k\le q_k\}$, and `should_accept` requires a singleton. Each class $c$
+stores $u_c\in[0.01,16]$ with $q_c=1-e^{-u_c}$ ($q_c=1$ at the upper bound), a
+working miss level $\alpha_c\in[\alpha_{\min},\alpha_{\max}]$, where
+$\alpha_{\min}=\max(0.015,0.35\alpha)$ and $\alpha_{\max}=\min(0.40,2.5\alpha)$,
+and an error average $\bar e_c$. After observing true class $y$ with score
+$s=1-p_y$ and miss indicator $e=\mathbf 1\{s>q_y\}$ (or a caller-supplied
+indicator), only class $y$ changes:
+
+$$\bar e_y\leftarrow0.85\,\bar e_y+0.15\,e,\qquad
+b=\begin{cases}1.6&\bar e_y>1.6\alpha,\\1&\text{otherwise,}\end{cases}$$
+
+$$\alpha_y\leftarrow\operatorname{clip}\bigl(\alpha_y+\gamma b(\alpha-e),\,
+\alpha_{\min},\alpha_{\max}\bigr),\qquad
+u_y\leftarrow\operatorname{clip}\bigl(u_y+\eta b(e-\alpha_y),\,0.01,16\bigr).$$
+
+After a miss while $b=1.6$, $u_y$ is also raised to at least
+$(1-w)u_y+w\min(-\log(1-s),15.5)$, computed from the value before the step.
+The defaults are $\alpha=0.10$, $\gamma=\max(0.03,0.4\alpha)$, $\eta=0.30$ and
+$w=0.12$.
+
+This tracker has **no finite-sample coverage guarantee**. The step resembles
+adaptive conformal inference ([Gibbs and Candès](https://arxiv.org/abs/2106.00170)),
+whose long-run miss-rate bound assumes a fixed target level and an unclipped
+update. This tracker moves its per-class target, clips and boosts its step, and
+can jump upward, so that bound does not carry over. The repository proves no
+long-run coverage bound for it either, and records no measurement of its
+coverage. A class that is rarely observed is rarely updated.
+
+### Cost-aware decisions with Conformal Risk Control
+
+`UtilityCalibrator` takes a cost matrix $C\in\mathbb R^{A\times K}$ indexed by
+action and true class. The safe action $a_s$ defaults to
+$\arg\min_a\max_kC_{ak}$, the action with the smallest worst-case cost. With
+$c_{\rm esc}=\max_kC_{a_sk}$ and $B=\max_{a,k}C_{ak}$, the default
+`loss_mode="normalized_excess"` scores
+
+$$L_{ak}=\operatorname{clip}\!\left(\frac{C_{ak}-c_{\rm esc}}{B-c_{\rm esc}},0,1\right)
+\quad\text{when }C_{ak}>c_{\rm esc},\qquad L_{ak}=0\text{ otherwise},$$
+
+and `loss_mode="indicator"` uses $L_{ak}=\mathbf 1\{C_{ak}>c_{\rm esc}\}$. The
+safe action therefore has zero loss for every class. For probabilities $p(x)$,
+the Bayes action is $a^*(x)=\arg\min_a\sum_kp_k(x)C_{ak}$. At threshold
+$\lambda$ the policy returns $a^*(x)$ when $\sum_kp_k(x)L_{a^*(x)k}\le\lambda$
+and $a_s$ otherwise. With `ladder_mode=True`, used by `UtilityCascadeRouter`, a
+Bayes action that precedes $a_s$ in action order is replaced by the first action
+from $a^*(x)$ through $a_s$ whose expected loss is at most $\lambda$.
+
+`fit_crc` evaluates the policy on $n$ calibration pairs over a grid $\Lambda$ of
+501 points in $[0,1]$. Let $\ell_i(\lambda)\in[0,1]$ be the realized loss of
+pair $i$ and $\bar\ell_i(\lambda)=\max_{\lambda'\in\Lambda,\lambda'\le\lambda}\ell_i(\lambda')$
+its running maximum, which is nondecreasing in $\lambda$. The calibrator selects
+
+$$\hat\lambda=\max\Bigl\{\lambda\in\Lambda:\frac{\sum_{i=1}^n\bar\ell_i(\lambda)+1}{n+1}\le\alpha\Bigr\}.$$
+
+If no grid point qualifies, or $1/(n+1)>\alpha$, then `lam_crc` is $-1$,
+`is_vacuous` is `True`, and `predict` always returns the safe action. Otherwise,
+if the $n$ calibration pairs and the test pair are exchangeable and the
+probabilities (including any temperature) do not depend on the calibration
+pairs, the Conformal Risk Control argument
+([Angelopoulos et al.](https://arxiv.org/abs/2208.02814)) applied to
+$\bar\ell$ gives
+
+$$\mathbb E\bigl[\ell_{n+1}(\hat\lambda)\bigr]\le\mathbb E\bigl[\bar\ell_{n+1}(\hat\lambda)\bigr]\le\alpha.$$
+
+This bounds the expected normalized cost in excess of the safe action's worst
+case (or, with `"indicator"`, the probability of exceeding it), averaged over
+inputs. It does not bound expected cost itself, the loss conditional on a
+non-safe action being chosen, or the loss for each class. Temperature fitting is
+off by default (`fit_temperature=False`). When it is on, `fit` fits the
+temperature on rows kept apart from the risk-control rows: the training rows
+when separate calibration rows are supplied, or otherwise the first
+$\max(8,\min(\lfloor n/3\rfloor,128))$ rows when $n\ge24$. That split takes rows
+in the given order, so the order must not depend on the data.
+
+### Ordinal heads and intervals
+
+`CumulativeLogitOrdinalHead` fits a proportional-odds model,
+$\Pr(Y\le j\mid x)=\sigma(\theta_j-w^\top x)$ for $j<K-1$, with increasing
+thresholds $\theta_j=\theta_{j-1}+\operatorname{softplus}(\delta_j)+10^{-4}$.
+It minimizes mean negative log-likelihood plus $\tfrac{\lambda}{2}\|w\|^2$
+(default $\lambda=0.01$) with a NumPy L-BFGS routine. `SoftOrdinalHead` fits a
+linear softmax by cross-entropy, with the same penalty on weights only, to soft
+targets $q_{ik}\propto\exp\bigl(-(k-y_i)^2/(2\sigma^2)\bigr)$ (default
+$\sigma=0.5$; $\sigma=0$ gives one-hot targets). Its docstring also names a
+Laplace kernel, but only the Gaussian kernel is implemented.
+`should_use_soft_ordinal(K)` is true for $2\le K\le5$; this is a fixed size rule,
+not a statistical test.
+
+`cqr_ordinal_intervals` takes the lower and upper indices $\ell(x),h(x)$ where
+each probability row's cumulative distribution first reaches $\alpha/2$ and
+$1-\alpha/2$, scores calibration pairs by $s_i=\max(\ell_i-y_i,\,y_i-h_i)$, and
+sets $\hat q$ to the $\lceil(n+1)(1-\alpha)\rceil$-th smallest score. The test
+interval is $[\ell-\hat q,\,h+\hat q]$ intersected with $\{0,\ldots,K-1\}$; when
+$\lceil(n+1)(1-\alpha)\rceil>n$ it is the full range. A label lies in the
+unclipped interval exactly when its score is at most $\hat q$, so the
+split-conformal argument of section 1 gives marginal coverage of at least
+$1-\alpha$ under the same exchangeability and fixed-model assumptions. Clipping
+to the label range removes no possible label. An empty interval, possible when
+$\hat q<0$, is replaced by its midpoint label, which can only add coverage.
+
+`BinaryPlattBetaCalibrator` returns the input probabilities unchanged below
+`min_platt_samples` (default 74) calibration examples, fits two-parameter Platt
+scaling below `min_beta_samples` (default 150), and fits three-parameter beta
+calibration from there on. These thresholds are fixed rules; the calibrator
+makes no coverage statement.
+
+### Soft-distilled heads
+
+`SystemOneCompiler.compile_soft_distilled` (in [compiler.py](../../src/system1/compiler.py))
+fits Choice and Boolean heads to teacher probability rows. It splits the rows
+into two to five stratified folds, chooses the regularization (and, when hard
+labels are supplied, their blend weight) from small grids and fits a temperature
+using out-of-fold predictions, computes LAC calibration
+scores from those same out-of-fold probabilities, and then refits the head on all
+rows. The scores use the supplied hard labels, or the teacher's most probable
+label when none are supplied. The deployed head is not the model that produced
+the scores, and the rows that set the quantile also chose the hyperparameters and
+temperature, so the split-conformal guarantee of section 1 does not apply. No
+coverage guarantee is stated for these heads. Without hard labels, any coverage
+reading is relative to the teacher's top label, not to correct answers.
+
+### Score fields in automatic promotion
+
+Since 1.3, `AutoCutoverLifecycle` accepts a `ScoreField` primary field. A local
+score agrees with the teacher when it lies within `CutoverConfig.score_tolerance`
+(default 0.15) times the field's range. That agreement indicator is what the
+lifecycle's `SelectiveRiskCalibrator` margin gate (section 6) counts as correct,
+so its risk statement is about agreement within the tolerance. The tolerance is a
+policy choice, not a calibrated interval.

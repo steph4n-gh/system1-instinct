@@ -1,10 +1,10 @@
 # System 1: Instinct — teaching bounded decisions for local reuse
 
-**steph4n-gh · System 1: Instinct 1.2.0 · 13 November 2026**
+**steph4n-gh · System 1: Instinct 1.3.0 · 18 November 2026**
 Maintainer-authored technical whitepaper; not a peer-reviewed publication.
 [Source repository](https://github.com/steph4n-gh/system1-instinct)
 
-This document describes **System 1: Instinct 1.2.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
+This document describes **System 1: Instinct 1.3.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Measurements retain
 the original source revisions and evidence linked in each experiment; this
 release includes the 6-category benchmark gauntlet and neural baseline comparisons alongside historical results.
 
@@ -79,13 +79,14 @@ The direct Python engine's legacy default is non-strict; the normal observation
 adapter and saved-model CLI use strict review. Examples-only categorical/Boolean
 skills use LAC scores, while legacy and augmented skills retain APS semantics.
 MultiChoice calibrates complete assignments rather than treating any selected
-list as a categorical singleton. Model corrections invalidate changed heads'
+list as a categorical singleton. By default, model corrections invalidate changed heads'
 calibration; separate recalibration is required before strict acceptance resumes.
 
 Format-v2 `.s1m` artifacts preserve schema, feature configuration, weights,
 temperature and score semantics. Tests check values, probabilities, sets and
 review behavior across saving and loading. The current reader also understands
-legacy v1 artifacts. A smaller skill file does not include the Python runtime or
+legacy v1 artifacts and the opt-in v3 format added in 1.3; v2 remains the default
+for saving. A smaller skill file does not include the Python runtime or
 installed dependencies.
 
 Optional research adapters may supply features from fixed pretrained text
@@ -153,6 +154,37 @@ observable review conditions, without a teacher call or automatic label creation
 These lifecycle changes introduce no new encoder or lesson-selection algorithm,
 do not establish a classification-quality gain, and leave full-scope workload
 requirements unchanged.
+
+### Additions in 1.3.0
+
+Version 1.3.0 extends teaching, execution and inspection. It does not change the
+defaults above and adds no benchmark results. `compile_soft_distilled` fits
+Choice and Boolean heads to teacher probability rows, and
+`SmartsCrossZeroFewRouter` routes from zero or a few examples per class without
+pretrained weights. `compile_callable()` scores every Choice, Boolean and Score
+field in one matrix product and returns values, confidences and a review flag,
+without a receipt. `save(..., format_version=3)` writes an opt-in page-aligned
+format for up to 512 fields that is memory-mapped on load; format v2 remains the
+default. `UniversalDecisionService` accepts Gemini Decision, Laya and Jev
+payloads on a loopback gateway and moves each question schema from its teacher
+to a local skill through `AutoCutoverLifecycle`, which now also accepts a
+`ScoreField`. `explain` reports additive token attributions, exemplars and
+counterfactual edits. `ActiveTeacherSelector` ranks unlabeled examples for
+labeling, an opt-in `GuardShield` normalizes text before the guard classifies
+it, and `MultiTenantSkillFleet` serves many tenants from one shared projector.
+
+The new calibration methods carry different guarantees. `UtilityCalibrator`
+chooses the Bayes expected-cost action and bounds expected normalized excess cost
+with Conformal Risk Control, falling back to a safe action when its calibration
+data cannot certify the bound. `cqr_ordinal_intervals` has split-conformal
+marginal coverage. `OnlineMondrianConformal` tracks per-class thresholds under
+drift and has no finite-sample guarantee, and soft-distilled heads, calibrated on
+out-of-fold scores, carry no stated coverage guarantee. The
+[mathematical note](conformal_gating.md#7-additions-in-130) states the
+assumptions. The engine now chooses a custom model's optional keyword arguments
+from its signature and no longer retries after a `TypeError`; see the
+[architecture reference](../architecture/technical_specification.md#custom-model-keyword-contract)
+and the [changelog](../../CHANGELOG.md).
 
 ## 3. Automatic teacher observation
 
@@ -340,7 +372,8 @@ execution or complete event capture on a compromised host.
 
 Authentication requires an independent key; unsigned diagnostics expose
 only an integrity check. The signed envelope binds the committed ledger ID,
-guards check exact inclusion, and writes reverify the whole chain. Saved-skill
+guards check exact inclusion, and writes recheck the chain, skipping the full
+scan while the ledger is unchanged since its last verified head. Saved-skill
 resource budgets and a closed gRPC schema registry constrain input handling.
 See [deployment boundaries](../deployment.md).
 
@@ -381,5 +414,5 @@ authored checks. The [evidence index](../../benchmarks/quality/README.md) and
 results, reproduction commands and each scope.
 
 Suggested citation: steph4n-gh (2026), *System 1: Instinct — teaching bounded decisions for
-local reuse*, version 1.0.0. Cite the source revision and linked evidence when
+local reuse*, version 1.3.0. Cite the source revision and linked evidence when
 quoting measurements; earlier unsupported benchmark tables have been withdrawn.

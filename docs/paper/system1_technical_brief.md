@@ -1,8 +1,8 @@
 # System 1: Instinct — technical brief
 
-**System 1: Instinct 1.2.0 · 13 November 2026 · Maintainer-authored implementation brief**
+**System 1: Instinct 1.3.0 · 18 November 2026 · Maintainer-authored implementation brief**
 
-This brief describes **System 1: Instinct 1.2.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Each linked experiment
+This brief describes **System 1: Instinct 1.3.0** (see the [6-category benchmark gauntlet report](../../benchmarks/quality/instinct_gauntlet_report.md) and [drop-in & adaptation report](../../benchmarks/quality/drop_in_and_adaptation_report.md)). Each linked experiment
 retains its original source revision and evidence; the benchmark gauntlet adds six
 offline evaluation categories and neural baseline comparisons alongside historical quality results.
 
@@ -75,6 +75,28 @@ Automatic observation is a separate existing path: the teacher keeps answering
 until promotion checks pass. Later local decisions can still request review.
 Neither manual adoption nor automatic promotion grants permission to perform an
 action; the application must honor review and its own execution policy.
+
+## What 1.3.0 adds
+
+Version 1.3.0 adds ways to teach, run and inspect a skill. It reports no new
+benchmark results, and the defaults above are unchanged. A skill can be distilled
+from a teacher's probabilities as well as its labels, and a zero- or few-shot
+router works without pretrained weights. A compiled callable scores every Choice,
+Boolean and Score field in one matrix product and returns no receipt. An opt-in
+`.s1m` v3 format allows up to 512 fields and is memory-mapped on load; v2 remains
+the default. A loopback gateway accepts Gemini Decision, Laya and Jev payloads and
+moves each question schema from its teacher to a local skill. Other additions are
+a cost-aware calibrator gated by Conformal Risk Control, ordinal heads,
+explanations, active example selection, an opt-in guard shield and a multi-tenant
+skill fleet. Input validation is stricter, and the engine now chooses a custom
+model's optional keyword arguments from its signature without retrying after a
+`TypeError`.
+
+The [changelog](../../CHANGELOG.md) lists the changes and the
+[architecture reference](../architecture/technical_specification.md) maps them
+to the source. The [mathematical note](conformal_gating.md#7-additions-in-130)
+states which new calibration methods have a finite-sample guarantee and which do
+not. [Deployment boundaries](../deployment.md) cover the shield and fleet.
 
 ## What the evidence supports
 
