@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 import math
 import secrets
 import statistics
+import sys
 import threading
 import time
+import types
+import weakref
+from collections import OrderedDict, defaultdict, deque
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -38,6 +43,8 @@ from system1.calibration import (
     RecalibrationReport,
     RegressionConformalInterval,
     RegressionConformalPredictor,
+    _normalize_rows_f32_safe,
+    _normalize_vec_f32_safe,
     compute_brier_decomposition,
     compute_ece_and_bins,
     compute_nll,
@@ -52,15 +59,626 @@ from system1.core import (
     ScoreField,
     SystemOneModel,
 )
-from system1.core.model import _stable_sigmoid
+from system1.core.model import (
+    FastDecisionCallable,
+    PackedMultiQuestionKernel,
+    _accepts_recency_weighted,
+    _assert_real_numeric_array_like,
+    _check_nested_real_seq,
+    _clone_preserving_2d_layout,
+    _coerce_inference_array_f32_or_f64,
+    _coerce_real_1d_f32,
+    _compute_engine_inference_signature,
+    _compute_hierarchical_logits_np,
+    _encode_projector_one,
+    _has_custom_validate_decision,
+    _model_zero_unit0,
+    _normalize_raw_projection,
+    _normalize_raw_projection_batch,
+    _resolve_authoritative_head,
+    _stable_sigmoid,
+    _validate_2d_layout_cloneable,
+    _validate_forgetting_factor,
+    _validate_head_weight_bias_shapes,
+    _validate_packed_engine_support,
+    _validate_real_scalar,
+)
 from system1.cache import SemanticSystemOneCache, _validate_cache_inputs
+from system1.core.schema import (
+    _f64_to_exact_2m1074,
+    _format_score_interval,
+    _score_abs_diff_clamped,
+    _score_abs_diff_exact_2m1074,
+    _score_from_unit_prob,
+    _score_full_span_clamped,
+    _score_half_span,
+    _score_interval_bounds,
+    _score_mae_from_int_sum,
+    _score_normalized_margin,
+    _score_to_unit_ratio,
+    _score_within_rel_tolerance,
+)
+from system1.core.embeddings import HybridProjector
 from system1.core.telemetry import TelemetryProjector
+from system1.core.text import PragmaticCompositeProjector
 from system1.ledger import ActionLedger, LedgerWriteError
 from system1.receipt import (
     DecisionWitnessReceipt,
     create_decision_receipt,
     public_key_fingerprint,
 )
+
+
+_UNSET_SLOT = object()
+
+
+def _is_immutable_or_non_state(val: Any) -> bool:
+    if val is None or isinstance(
+        val,
+        (bool, int, float, complex, str, bytes, type, types.ModuleType, DecisionSchema, DecisionField),
+    ):
+        return True
+    if inspect.isroutine(val):
+        return True
+    if hasattr(val, "acquire") and hasattr(val, "release"):
+        return True
+    return False
+
+
+def _collect_instance_slot_names(obj: Any) -> Tuple[str, ...]:
+    names: List[str] = []
+    seen: set[str] = set()
+    for base_cls in type(obj).__mro__:
+        cls_slots = base_cls.__dict__.get("__slots__")
+        if cls_slots is None:
+            continue
+        raw_slots = (cls_slots,) if isinstance(cls_slots, str) else cls_slots
+        cls_prefix = base_cls.__name__.lstrip("_")
+        for s_name in raw_slots:
+            if not isinstance(s_name, str) or s_name in ("__dict__", "__weakref__"):
+                continue
+            attr_name = s_name
+            if attr_name.startswith("__") and not attr_name.endswith("__") and cls_prefix:
+                attr_name = f"_{cls_prefix}{attr_name}"
+            if attr_name not in seen:
+                seen.add(attr_name)
+                names.append(attr_name)
+    return tuple(names)
+
+
+def _snapshot_obj_dict_and_slots(
+    val: Any,
+    obj_id: int,
+    seen_ids: set[int],
+    state_snaps: List[Tuple[Any, Any]],
+    dict_snaps: List[Tuple[Any, Dict[str, Any]]],
+    slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]],
+    memo: Dict[int, Any],
+    skip_ids: Optional[set[int]] = None,
+    container_snaps: Optional[List[Tuple[Any, ...]]] = None,
+) -> bool:
+    inst_dict = getattr(val, "__dict__", None)
+    slot_names = _collect_instance_slot_names(val)
+    if type(inst_dict) is not dict and not slot_names:
+        return False
+    if obj_id not in seen_ids:
+        seen_ids.add(obj_id)
+        if type(inst_dict) is dict:
+            d_snap = {
+                k: _snapshot_duck_graph(
+                    v,
+                    seen_ids,
+                    state_snaps,
+                    dict_snaps,
+                    slot_snaps,
+                    memo,
+                    skip_ids,
+                    container_snaps,
+                )
+                for k, v in inst_dict.items()
+            }
+            dict_snaps.append((val, d_snap))
+        if slot_names:
+            s_snap = [
+                (
+                    s_name,
+                    _snapshot_duck_graph(
+                        getattr(val, s_name, _UNSET_SLOT),
+                        seen_ids,
+                        state_snaps,
+                        dict_snaps,
+                        slot_snaps,
+                        memo,
+                        skip_ids,
+                        container_snaps,
+                    )
+                    if hasattr(val, s_name)
+                    else _UNSET_SLOT,
+                )
+                for s_name in slot_names
+            ]
+            slot_snaps.append((val, s_snap))
+    return True
+
+
+def _iter_structured_ndarray_objects(arr: np.ndarray) -> Any:
+    if not arr.dtype.hasobject:
+        return
+    if arr.dtype == np.object_:
+        yield from arr.flat
+        return
+    if arr.dtype.names:
+        for fname in arr.dtype.names:
+            if arr.dtype.fields[fname][0].hasobject:
+                yield from _iter_structured_ndarray_objects(arr[fname])
+    elif arr.dtype.subdtype is not None:
+        sub_dt, _ = arr.dtype.subdtype
+        if sub_dt.hasobject:
+            for item in arr.flat:
+                if isinstance(item, np.ndarray):
+                    yield from _iter_structured_ndarray_objects(item)
+
+
+def _clone_void_scalar(src: np.void) -> np.void:
+    buf = np.empty(1, dtype=src.dtype)
+    for fn in src.dtype.names or ():
+        fdt = src.dtype.fields[fn][0]
+        fv = src[fn]
+        if fdt == np.object_:
+            buf[fn][0] = fv
+        elif fdt.names:
+            buf[fn][0] = _clone_void_scalar(fv)
+        else:
+            buf[fn][0] = fv
+    return buf[0]
+
+
+def _void_state_equal(a: np.void, b: np.void) -> bool:
+    if a.dtype != b.dtype:
+        return False
+    for fn in a.dtype.names or ():
+        fdt = a.dtype.fields[fn][0]
+        av = a[fn]
+        bv = b[fn]
+        if fdt == np.object_:
+            if av is not bv:
+                return False
+        elif fdt.names:
+            if not _void_state_equal(av, bv):
+                return False
+        elif not _ndarray_state_equal(np.asarray(av), np.asarray(bv)):
+            return False
+    return True
+
+
+def _snapshot_duck_graph(
+    val: Any,
+    seen_ids: set[int],
+    state_snaps: List[Tuple[Any, Any]],
+    dict_snaps: List[Tuple[Any, Dict[str, Any]]],
+    slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]],
+    memo: Dict[int, Any],
+    skip_ids: Optional[set[int]] = None,
+    container_snaps: Optional[List[Tuple[Any, ...]]] = None,
+) -> Any:
+    """Recursively snapshot mutable arrays, containers, nested heads, and duck objects."""
+    if _is_immutable_or_non_state(val):
+        return val
+    obj_id = id(val)
+    if skip_ids is not None and obj_id in skip_ids:
+        return val
+    if obj_id in memo:
+        return memo[obj_id]
+    if isinstance(val, np.ndarray):
+        memo[obj_id] = val
+        try:
+            cp = _clone_preserving_2d_layout(val, writeable=bool(val.flags.writeable))
+        except ValueError:
+            cp = np.array(val, copy=True)
+            if not val.flags.writeable:
+                cp.setflags(write=False)
+        if container_snaps is not None:
+            container_snaps.append(("ndarray", val, cp, bool(val.flags.writeable)))
+        if val.dtype == np.object_:
+            for elem in val.flat:
+                _snapshot_duck_graph(
+                    elem,
+                    seen_ids,
+                    state_snaps,
+                    dict_snaps,
+                    slot_snaps,
+                    memo,
+                    skip_ids,
+                    container_snaps,
+                )
+        elif val.dtype != np.object_ and val.dtype.hasobject:
+            for elem in _iter_structured_ndarray_objects(val):
+                _snapshot_duck_graph(
+                    elem,
+                    seen_ids,
+                    state_snaps,
+                    dict_snaps,
+                    slot_snaps,
+                    memo,
+                    skip_ids,
+                    container_snaps,
+                )
+        if type(val) is not np.ndarray:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
+    if isinstance(val, np.void) and val.dtype.names:
+        memo[obj_id] = val
+        snap_void = _clone_void_scalar(val)
+        for fname in val.dtype.names:
+            _snapshot_duck_graph(
+                val[fname],
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        if container_snaps is not None:
+            container_snaps.append(("np_void", val, snap_void, bool(val.flags.writeable)))
+        return val
+    if isinstance(val, bytearray):
+        memo[obj_id] = val
+        if container_snaps is not None:
+            container_snaps.append(("bytearray", val, bytes(val)))
+        if type(val) is not bytearray:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
+    if isinstance(val, dict):
+        memo[obj_id] = val
+        has_df = isinstance(val, defaultdict)
+        df_snap = (
+            _snapshot_duck_graph(
+                val.default_factory,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+            if (has_df and val.default_factory is not None)
+            else None
+        )
+        items_snap = [
+            (
+                _snapshot_duck_graph(
+                    k, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+                ),
+                _snapshot_duck_graph(
+                    v, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+                ),
+            )
+            for k, v in val.items()
+        ]
+        if container_snaps is not None:
+            container_snaps.append(("dict", val, items_snap, has_df, df_snap))
+        if type(val) is not dict:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
+    if isinstance(val, list):
+        memo[obj_id] = val
+        items_snap = [
+            _snapshot_duck_graph(
+                x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+            )
+            for x in val
+        ]
+        if container_snaps is not None:
+            container_snaps.append(("list", val, items_snap))
+        if type(val) is not list:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
+    if isinstance(val, deque):
+        memo[obj_id] = val
+        items_snap = [
+            _snapshot_duck_graph(
+                x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+            )
+            for x in val
+        ]
+        if container_snaps is not None:
+            container_snaps.append(("deque", val, items_snap))
+        if type(val) is not deque:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
+    if isinstance(val, set):
+        memo[obj_id] = val
+        items_snap = [
+            _snapshot_duck_graph(
+                x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+            )
+            for x in val
+        ]
+        if container_snaps is not None:
+            container_snaps.append(("set", val, items_snap))
+        if type(val) is not set:
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
+    if isinstance(val, (tuple, frozenset)):
+        memo[obj_id] = val
+        for x in val:
+            _snapshot_duck_graph(
+                x, seen_ids, state_snaps, dict_snaps, slot_snaps, memo, skip_ids, container_snaps
+            )
+        if type(val) not in (tuple, frozenset):
+            _snapshot_obj_dict_and_slots(
+                val,
+                obj_id,
+                seen_ids,
+                state_snaps,
+                dict_snaps,
+                slot_snaps,
+                memo,
+                skip_ids,
+                container_snaps,
+            )
+        return val
+    if callable(getattr(val, "_snapshot_state", None)) and callable(getattr(val, "_restore_state", None)):
+        memo[obj_id] = val
+        if obj_id not in seen_ids:
+            seen_ids.add(obj_id)
+            state_snaps.append((val, val._snapshot_state()))
+        return val
+    memo[obj_id] = val
+    _snapshot_obj_dict_and_slots(
+        val,
+        obj_id,
+        seen_ids,
+        state_snaps,
+        dict_snaps,
+        slot_snaps,
+        memo,
+        skip_ids,
+        container_snaps,
+    )
+    return val
+
+
+def _ndarray_state_equal(a: np.ndarray, b: np.ndarray) -> bool:
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    if a.dtype.kind in ("f", "c"):
+        return bool(np.array_equal(a, b, equal_nan=True))
+    if a.dtype.names:
+        return all(_ndarray_state_equal(a[fname], b[fname]) for fname in a.dtype.names)
+    if a.dtype.hasobject:
+        if a.dtype == np.object_:
+            return all(x is y for x, y in zip(a.flat, b.flat))
+        if a.dtype.subdtype is not None:
+            return all(
+                _ndarray_state_equal(np.asarray(x), np.asarray(y))
+                for x, y in zip(a.flat, b.flat)
+            )
+        return False
+    return bool(np.array_equal(a, b))
+
+
+def _restore_duck_containers(container_snaps: Sequence[Tuple[Any, ...]]) -> None:
+    for entry in container_snaps:
+        kind = entry[0]
+        if kind == "ndarray":
+            _, arr, cp, orig_w = entry
+            if arr.dtype != cp.dtype:
+                continue
+            needs_copy = (arr.shape != cp.shape) or bool(orig_w) or (not _ndarray_state_equal(arr, cp))
+            if needs_copy:
+                try:
+                    if not arr.flags.writeable:
+                        arr.setflags(write=True)
+                    if arr.shape != cp.shape:
+                        arr.resize(cp.shape, refcheck=False)
+                    np.copyto(arr, cp)
+                    if not orig_w and arr.flags.writeable:
+                        arr.setflags(write=False)
+                except (ValueError, BufferError):
+                    pass
+            elif not orig_w and arr.flags.writeable:
+                try:
+                    arr.setflags(write=False)
+                except (ValueError, BufferError):
+                    pass
+        elif kind == "np_void":
+            _, void_obj, snap_void, orig_w = entry
+            if not _void_state_equal(void_obj, snap_void):
+                try:
+                    if not void_obj.flags.writeable:
+                        void_obj.setflags(write=True)
+                    for fname in void_obj.dtype.names or ():
+                        void_obj[fname] = snap_void[fname]
+                    if not orig_w and void_obj.flags.writeable:
+                        void_obj.setflags(write=False)
+                except (ValueError, BufferError, TypeError):
+                    pass
+            elif not orig_w and void_obj.flags.writeable:
+                try:
+                    void_obj.setflags(write=False)
+                except (ValueError, BufferError, TypeError):
+                    pass
+            elif not orig_w and void_obj.flags.writeable:
+                try:
+                    void_obj.setflags(write=False)
+                except (ValueError, BufferError, TypeError):
+                    pass
+        elif kind == "bytearray":
+            _, ba, raw_b = entry
+            ba[:] = raw_b
+        elif kind == "dict":
+            _, dct, items_snap, has_df, df_snap = entry
+            dct.clear()
+            dct.update(items_snap)
+            if has_df:
+                dct.default_factory = df_snap
+        elif kind == "list":
+            _, lst, items_snap = entry
+            lst[:] = items_snap
+        elif kind == "deque":
+            _, dq, items_snap = entry
+            dq.clear()
+            dq.extend(items_snap)
+        elif kind == "set":
+            _, st, items_snap = entry
+            st.clear()
+            st.update(items_snap)
+
+
+def _clone_head_attr_value(val: Any) -> Any:
+    """Shallow-copy arrays and standard mutable containers without choking on locks/callables."""
+    if isinstance(val, np.ndarray):
+        try:
+            return _clone_preserving_2d_layout(val, writeable=bool(val.flags.writeable))
+        except ValueError:
+            cp = np.array(val, copy=True)
+            if not val.flags.writeable:
+                cp.setflags(write=False)
+            return cp
+    if isinstance(val, bytearray):
+        return bytearray(val)
+    if isinstance(val, dict):
+        return copy.copy(val)
+    if isinstance(val, list):
+        return list(val)
+    if isinstance(val, deque):
+        return deque(val, maxlen=val.maxlen)
+    if isinstance(val, set):
+        return set(val)
+    return copy.deepcopy(val)
+
+
+_KwFacts = Optional[Tuple[frozenset, bool]]
+# Function attributes that make ``inspect.signature`` look past ``__code__``; functions carrying them are not cached.
+_SIG_OVERRIDE_ATTRS = frozenset({"__signature__", "__wrapped__", "_partialmethod", "__partialmethod__"})
+_SIG_FACTS_CACHE: "weakref.WeakKeyDictionary[types.FunctionType, Dict[bool, Tuple[types.CodeType, _KwFacts]]]" = (
+    weakref.WeakKeyDictionary()
+)
+_SIG_FACTS_LOCK = threading.Lock()
+
+
+def _compute_kw_facts(fn: Any) -> _KwFacts:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None
+    names = frozenset(
+        name
+        for name, p in sig.parameters.items()
+        if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    )
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    return names, has_var_kw
+
+
+def _kw_facts(fn: Any) -> _KwFacts:
+    """Return ``(keyword-capable parameter names, accepts **kwargs)`` for ``fn``, or None without a signature.
+
+    Cached only for plain Python functions and methods bound to them, keyed weakly on the function plus whether
+    it is bound, and validated against the function's current ``__code__`` (which alone determines parameter names
+    and kinds for such functions). Everything else (partials, callable instances, builtins, functions carrying
+    ``__signature__``/``__wrapped__``) is resolved uncached on each call.
+    """
+    bound = isinstance(fn, types.MethodType)
+    func = fn.__func__ if bound else fn
+    if type(func) is not types.FunctionType or not _SIG_OVERRIDE_ATTRS.isdisjoint(func.__dict__):
+        return _compute_kw_facts(fn)
+    code = func.__code__
+    with _SIG_FACTS_LOCK:
+        per_func = _SIG_FACTS_CACHE.get(func)
+        hit = per_func.get(bound) if per_func is not None else None
+    if hit is not None and hit[0] is code:
+        return hit[1]
+    facts = _compute_kw_facts(fn)
+    with _SIG_FACTS_LOCK:
+        _SIG_FACTS_CACHE.setdefault(func, {})[bound] = (code, facts)
+    return facts
+
+
+def _resolve_supported_kwargs(
+    fn: Any,
+    candidate_kwargs: Dict[str, Any],
+) -> Tuple[Dict[str, Any], frozenset[str]]:
+    """Select which optional kwargs to pass to a model callable, from its signature alone.
+
+    - Explicit parameters only: pass exactly the candidates it names; the second value is every
+      keyword-capable parameter name of ``fn``.
+    - Accepts ``**kwargs``: pass every candidate; the second value is ``frozenset(candidate_kwargs)``.
+      What a ``**kwargs`` wrapper does with them is not inspected, so a wrapper that forwards them to a
+      stricter callable gets that callable's ``TypeError``, which propagates to the engine's caller.
+    - Signature unobtainable: ``({}, frozenset())``.
+    """
+    facts = _kw_facts(fn)
+    if facts is None:
+        return {}, frozenset()
+    names, has_var_kw = facts
+    if has_var_kw:
+        return dict(candidate_kwargs), frozenset(candidate_kwargs)
+    return {k: v for k, v in candidate_kwargs.items() if k in names}, names
 
 
 @dataclass(frozen=True)
@@ -331,6 +949,85 @@ def _parse_jsonl_rows(raw_text: str, *, source: str = "input") -> List[Any]:
         except json.JSONDecodeError as ex:
             raise ValueError(f"Invalid JSON in {source} line {line_no}: {ex.msg}") from ex
     return rows
+
+
+def _validated_head_logit_adjustments(
+    raw_adj: Any,
+    definition: Any,
+    field_name: str,
+) -> Optional[np.ndarray]:
+    """Validate optional per-class logit adjustments against field definition."""
+    if raw_adj is None:
+        return None
+    if isinstance(definition, BooleanField):
+        exp_len = 2
+    elif isinstance(definition, ChoiceField):
+        exp_len = len(definition.options)
+    else:
+        raise ValueError(
+            f"Field {field_name!r} of type {type(definition).__name__} does not support logit_adjustments"
+        )
+    if not isinstance(raw_adj, np.ndarray):
+        _check_nested_real_seq(raw_adj, f"logit_adjustments for {field_name!r}")
+    arr = np.asarray(raw_adj)
+    if arr.dtype == np.dtype(np.bool_) or arr.dtype.kind not in ("i", "u", "f"):
+        raise ValueError(f"logit_adjustments for {field_name!r} must have numeric dtype, got {arr.dtype}")
+    if arr.ndim != 1 or arr.shape != (exp_len,):
+        raise ValueError(
+            f"logit_adjustments for {field_name!r} shape {arr.shape} != expected ({exp_len},)"
+        )
+    arr64 = np.asarray(arr, dtype=np.float64)
+    if not bool(np.all(np.isfinite(arr64))):
+        raise ValueError(f"logit_adjustments for {field_name!r} contains non-finite values")
+    return np.array(arr64, dtype=np.float64, copy=True)
+
+
+def _extract_prompt_raw_norm(
+    result_obj: Any,
+    prompt_str: str,
+    proj_obj: Any,
+    *,
+    recency_flag: bool = False,
+) -> Optional[float]:
+    """Retrieve a prompt's pre-normalization norm from an inference result or projector."""
+    rn_attr = getattr(result_obj, "raw_norm", None) if result_obj is not None else None
+    if rn_attr is not None and not isinstance(rn_attr, (bool, np.bool_)):
+        try:
+            return float(rn_attr)
+        except Exception:
+            pass
+    if proj_obj is None:
+        return None
+    raw_norm_fn = getattr(proj_obj, "raw_norm", None)
+    if callable(raw_norm_fn):
+        try:
+            rn_val = (
+                raw_norm_fn(prompt_str, recency_weighted=recency_flag)
+                if _accepts_recency_weighted(raw_norm_fn)
+                else raw_norm_fn(prompt_str)
+            )
+            if rn_val is not None and not isinstance(rn_val, (bool, np.bool_)):
+                return float(rn_val)
+        except Exception:
+            pass
+    pwn_fn = getattr(proj_obj, "project_with_norm", None)
+    if callable(pwn_fn):
+        try:
+            raw_pwn = (
+                pwn_fn(prompt_str, recency_weighted=recency_flag)
+                if _accepts_recency_weighted(pwn_fn)
+                else pwn_fn(prompt_str)
+            )
+            if (
+                isinstance(raw_pwn, tuple)
+                and len(raw_pwn) >= 2
+                and raw_pwn[1] is not None
+                and not isinstance(raw_pwn[1], (bool, np.bool_))
+            ):
+                return float(raw_pwn[1])
+        except Exception:
+            pass
+    return None
 
 
 def _normalize_eval_rows(
@@ -633,7 +1330,7 @@ class SystemOneEngine:
         )
         self.enable_margin_gating = bool(enable_margin_gating)
         self.margin_threshold = margin_threshold
-        self.forgetting_factor = float(forgetting_factor)
+        self.forgetting_factor = _validate_forgetting_factor(forgetting_factor)
         self.relative_odds_ratio = (
             float(relative_odds_ratio) if relative_odds_ratio is not None else None
         )
@@ -664,6 +1361,8 @@ class SystemOneEngine:
         self.model_path: Optional[Path] = Path(model_path).resolve() if model_path is not None else None
         self.auto_reload: bool = bool(auto_reload)
         self._model_stat: Optional[Tuple[int, int, str]] = None
+        self._packed_kernel_cache: Optional[Tuple[Tuple[Any, ...], Any]] = None
+        self._explainer_cache: Dict[str, Tuple[Tuple[Any, ...], Any]] = {}
 
         if model is None and self.model_path is not None and self.model_path.exists():
             from system1.compiler import CompiledSystemOneModel, _read_skill_bytes
@@ -738,6 +1437,9 @@ class SystemOneEngine:
     def _sync_from_model(self, model: Any) -> None:
         self.model = model
         self.model_version = max(getattr(self, "model_version", 1), int(getattr(model, "model_version", 1)))
+        self._packed_kernel_cache = None
+        if hasattr(self, "_explainer_cache"):
+            self._explainer_cache.clear()
         self.dimension = getattr(model, "dimension", self.dimension)
         self.backend = getattr(model, "backend", self.backend)
         self.projector = getattr(model, "projector", self.projector)
@@ -766,6 +1468,11 @@ class SystemOneEngine:
             for name, ch in model.heads.items():
                 if name in self.calibrators:
                     self.calibrators[name].temperature = getattr(ch, "temperature", 1.0)
+                    self.calibrators[name].logit_adjustments = _validated_head_logit_adjustments(
+                        getattr(ch, "logit_adjustments", None),
+                        self.schema.fields[name],
+                        name,
+                    )
                 if name in self.conformal_predictors:
                     self.conformal_predictors[name].score_method = getattr(ch, "score_method", "aps")
                     calib_scores = getattr(ch, "calibration_scores", ())
@@ -925,17 +1632,20 @@ class SystemOneEngine:
         """Encodes prompt into semantic embedding vector."""
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         if hasattr(self.model, "encode"):
-            try:
-                return self.model.encode(prompt, telemetry=telemetry, recency_weighted=use_recency)
-            except TypeError:
-                return self.model.encode(prompt, telemetry=telemetry)
+            encode_fn = self.model.encode
+            enc_kw, _ = _resolve_supported_kwargs(
+                encode_fn,
+                {"telemetry": telemetry, "recency_weighted": use_recency},
+            )
+            return encode_fn(prompt, **enc_kw)
         if self.projector is not None:
-            try:
-                emb = self.projector.project(prompt, recency_weighted=use_recency)
-            except TypeError:
-                emb = self.projector.project(prompt)
-            norm = float(np.linalg.norm(emb))
-            return (emb / norm).astype(np.float32) if norm > 1e-12 else emb
+            return _encode_projector_one(
+                self.projector,
+                prompt,
+                self.dimension,
+                recency_weighted=use_recency,
+                zero_unit0=_model_zero_unit0(self.model, self.projector),
+            )
         v = np.zeros(self.dimension, dtype=np.float32)
         v[0] = 1.0
         return v
@@ -995,7 +1705,7 @@ class SystemOneEngine:
                 elif isinstance(definition, MultiChoiceField):
                     targets = np.asarray([[int(opt in label) for opt in definition.options] for label in labels])
                 else:
-                    midpoint = (definition.min_value + definition.max_value) / 2
+                    midpoint = 0.5 * float(definition.min_value) + 0.5 * float(definition.max_value)
                     targets = np.asarray([int(label >= midpoint) for label in labels])
 
                 temp_logits = logits[:count]
@@ -1019,10 +1729,16 @@ class SystemOneEngine:
                 fam_vals: Optional[List[float]] = None
                 if familiarity_alpha > 0.0 and conf_indices:
                     proj = getattr(self.model, "projector", self.projector)
-                    if proj is not None and hasattr(proj, "raw_norm"):
-                        fam_vals = [float(proj.raw_norm(rows[i][0])) for i in conf_indices]
-                    else:
-                        fam_vals = [float(np.linalg.norm(e)) for e in conf_embeddings]
+                    eff_rec_cal = bool(getattr(self, "recency_weighted", False))
+                    fam_vals = []
+                    for i, emb_c in zip(conf_indices, conf_embeddings):
+                        rn_c = _extract_prompt_raw_norm(
+                            results[i],
+                            rows[i][0],
+                            proj,
+                            recency_flag=eff_rec_cal,
+                        )
+                        fam_vals.append(float(np.linalg.norm(emb_c)) if rn_c is None else rn_c)
                 compiled = getattr(self.model, "heads", {}).get(name)
                 proto_mat = (
                     getattr(compiled, "prototypes", None)
@@ -1055,13 +1771,18 @@ class SystemOneEngine:
                     scores = predictor.calibration_scores
                 else:
                     probs = _stable_sigmoid(conf_logits.reshape(-1) / calibrator.temperature, temperature=1.0)
-                    predictions = definition.min_value + (definition.max_value - definition.min_value) * probs
+                    predictions = _score_from_unit_prob(probs, definition.min_value, definition.max_value)
                     predictor = self.regression_conformal_predictors[name]
                     predictor.calibrate(predictions, conf_labels)
                     scores = predictor.residuals
 
                 if compiled is not None and hasattr(compiled, "calibration_scores"):
                     compiled.temperature = calibrator.temperature
+                    compiled.logit_adjustments = _validated_head_logit_adjustments(
+                        getattr(calibrator, "logit_adjustments", None),
+                        definition,
+                        name,
+                    )
                     compiled.calibration_scores = tuple(float(score) for score in scores)
                     compiled.score_method = getattr(predictor, "score_method", "aps")
                     if isinstance(definition, (ChoiceField, BooleanField)):
@@ -1075,11 +1796,18 @@ class SystemOneEngine:
                                 str(k): tuple(float(v) for v in vals) for k, vals in c_scores.items()
                             }
                     k = int(math.ceil((len(scores) + 1) * (1.0 - self.default_alpha)))
-                    upper = definition.max_value - definition.min_value if isinstance(definition, ScoreField) else 1.0
+                    upper = (
+                        _score_full_span_clamped(definition.min_value, definition.max_value)
+                        if isinstance(definition, ScoreField)
+                        else 1.0
+                    )
                     compiled.conformal_quantile = float(scores[k - 1]) if k <= len(scores) else upper
             self.model_version = max(self.model_version, int(getattr(self.model, "model_version", 1))) + 1
             if hasattr(self.model, "model_version"):
                 self.model.model_version = self.model_version
+            self._packed_kernel_cache = None
+            if hasattr(self, "_explainer_cache"):
+                self._explainer_cache.clear()
             if getattr(self.model, "cache", None) is not None:
                 self.model.cache.clear()
             if self.cache is not None:
@@ -1190,7 +1918,7 @@ class SystemOneEngine:
                 ):
                     res_prev = self.regression_conformal_predictors[name].residuals
                     k_prev = int(math.ceil((len(res_prev) + 1) * (1.0 - alpha_val)))
-                    upper_p = float(definition.max_value - definition.min_value) if isinstance(definition, ScoreField) else 1.0
+                    upper_p = _score_full_span_clamped(definition.min_value, definition.max_value) if isinstance(definition, ScoreField) else 1.0
                     prev_q = upper_p if k_prev > len(res_prev) else float(res_prev[k_prev - 1])
                 else:
                     prev_q = 0.0
@@ -1238,13 +1966,17 @@ class SystemOneEngine:
                 calibrator = DecisionCalibrator(temperature=prev_temp)
                 if isinstance(definition, ScoreField):
                     calibrator.is_binary = False
-                    val_span = max(1e-6, float(definition.max_value - definition.min_value))
                     p_ratio = _stable_sigmoid(logits.flatten() / max(1e-4, prev_temp), temperature=1.0)
-                    y_ratio = np.clip(
-                        (np.asarray(labels, dtype=np.float64) - float(definition.min_value)) / val_span,
-                        0.0,
-                        1.0,
-                    )
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        y_ratio = np.clip(
+                            _score_to_unit_ratio(
+                                np.asarray(labels, dtype=np.float64),
+                                definition.min_value,
+                                definition.max_value,
+                            ),
+                            0.0,
+                            1.0,
+                        )
                     p_clip = np.clip(p_ratio, 1e-12, 1.0 - 1e-12)
                     init_ece = float(np.mean(np.abs(p_ratio - y_ratio))) if len(logits) > 0 else 0.0
                     init_brier = float(np.mean((p_ratio - y_ratio) ** 2)) if len(logits) > 0 else 0.0
@@ -1313,10 +2045,16 @@ class SystemOneEngine:
                 fam_vals: Optional[List[float]] = None
                 if eff_fam_alpha > 0.0 and conf_indices:
                     proj = getattr(self.model, "projector", self.projector)
-                    if proj is not None and hasattr(proj, "raw_norm"):
-                        fam_vals = [float(proj.raw_norm(rows[i][0])) for i in conf_indices]
-                    else:
-                        fam_vals = [float(np.linalg.norm(e)) for e in conf_embeddings]
+                    eff_rec_rcal = bool(getattr(self, "recency_weighted", False))
+                    fam_vals = []
+                    for i, emb_c in zip(conf_indices, conf_embeddings):
+                        rn_c = _extract_prompt_raw_norm(
+                            results[i],
+                            rows[i][0],
+                            proj,
+                            recency_flag=eff_rec_rcal,
+                        )
+                        fam_vals.append(float(np.linalg.norm(emb_c)) if rn_c is None else rn_c)
                 proto_mat = (
                     getattr(compiled, "prototypes", None)
                     if compiled is not None
@@ -1365,12 +2103,12 @@ class SystemOneEngine:
                     predictor.quantile = new_q
                 else:
                     probs = _stable_sigmoid(conf_logits.reshape(-1) / calibrator.temperature, temperature=1.0)
-                    predictions = definition.min_value + (definition.max_value - definition.min_value) * probs
+                    predictions = _score_from_unit_prob(probs, definition.min_value, definition.max_value)
                     predictor = self.regression_conformal_predictors[name]
                     predictor.calibrate(predictions, conf_labels)
                     scores = predictor.residuals
                     k = int(math.ceil((len(scores) + 1) * (1.0 - alpha_val)))
-                    upper = float(definition.max_value - definition.min_value)
+                    upper = _score_full_span_clamped(definition.min_value, definition.max_value)
                     new_q = upper if k > len(scores) else float(scores[k - 1])
 
                 fam_thresh_val = float(getattr(predictor, "familiarity_threshold", 0.0)) if isinstance(definition, (ChoiceField, BooleanField)) else 0.0
@@ -1387,6 +2125,11 @@ class SystemOneEngine:
                 scores_tuple = tuple(float(score) for score in scores)
                 if compiled is not None and hasattr(compiled, "calibration_scores"):
                     compiled.temperature = float(calibrator.temperature)
+                    compiled.logit_adjustments = _validated_head_logit_adjustments(
+                        getattr(calibrator, "logit_adjustments", None),
+                        definition,
+                        name,
+                    )
                     compiled.calibration_scores = scores_tuple
                     compiled.score_method = getattr(predictor, "score_method", "aps")
                     compiled.conformal_quantile = float(new_q)
@@ -1427,6 +2170,9 @@ class SystemOneEngine:
             self.model_version = max(self.model_version, int(getattr(self.model, "model_version", 1))) + 1
             if hasattr(self.model, "model_version"):
                 self.model.model_version = self.model_version
+            self._packed_kernel_cache = None
+            if hasattr(self, "_explainer_cache"):
+                self._explainer_cache.clear()
             if self.cache is not None:
                 self.cache.clear()
             if hasattr(self.model, "cache") and getattr(self.model, "cache", None) is not None:
@@ -1512,6 +2258,9 @@ class SystemOneEngine:
                         )
                 cert = jcal.calibrate(calib_probs, [lbl for _, lbl in calibration_examples])
                 self.joint_calibrator = jcal
+                self._packed_kernel_cache = None
+                if hasattr(self, "_explainer_cache"):
+                    self._explainer_cache.clear()
                 if self.cache is not None:
                     self.cache.clear()
                 if hasattr(self.model, "cache") and getattr(self.model, "cache", None) is not None:
@@ -1601,7 +2350,7 @@ class SystemOneEngine:
             f_covered = 0
             f_set_size_sum = 0.0
             f_singleton = 0
-            f_mae_sum = 0.0
+            f_mae_int_sum = 0
             f_reasons: Dict[str, int] = {}
 
             for row_idx, res, gt_val in f_rows:
@@ -1660,24 +2409,31 @@ class SystemOneEngine:
                     set_size_i = float(len(c_set))
                     singleton_i = is_accepted
                 else:
-                    val_span = max(1e-6, float(f_def.max_value - f_def.min_value))
+                    full_span_s = _score_full_span_clamped(f_def.min_value, f_def.max_value)
+                    cov_slack = min(1e-6, 1e-6 * full_span_s) if full_span_s > 0.0 else 0.0
+                    str_slack = min(1e-4, 1e-4 * full_span_s) if full_span_s > 0.0 else 0.0
                     covered_i = False
                     rcp = self.regression_conformal_predictors.get(fname)
                     if is_unfamiliar or not c_set:
                         covered_i = False
                     elif rcp is not None and rcp.is_calibrated:
                         interval = rcp.predict_interval(float(pred_val), alpha=eff_alpha, strict=eff_strict)
-                        covered_i = (interval.lower_bound - 1e-6) <= float(gt_val) <= (interval.upper_bound + 1e-6)
+                        covered_i = (interval.lower_bound - cov_slack) <= float(gt_val) <= (interval.upper_bound + cov_slack)
                     elif isinstance(c_set[0], str) and c_set[0].startswith("[") and c_set[0].endswith("]"):
                         try:
                             parts = c_set[0][1:-1].split(",")
                             lo_v, hi_v = float(parts[0].strip()), float(parts[1].strip())
-                            covered_i = (lo_v - 1e-4) <= float(gt_val) <= (hi_v + 1e-4)
+                            covered_i = (lo_v - str_slack) <= float(gt_val) <= (hi_v + str_slack)
                         except (ValueError, IndexError):
                             covered_i = False
-                    abs_err = abs(float(pred_val) - float(gt_val))
-                    f_mae_sum += abs_err
-                    correct_i = abs_err <= 0.10 * val_span
+                    f_mae_int_sum += _score_abs_diff_exact_2m1074(float(pred_val), float(gt_val))
+                    correct_i = _score_within_rel_tolerance(
+                        float(pred_val),
+                        float(gt_val),
+                        f_def.min_value,
+                        f_def.max_value,
+                        0.10,
+                    )
                     set_size_i = float(len(c_set))
                     singleton_i = is_accepted
 
@@ -1741,7 +2497,6 @@ class SystemOneEngine:
                 f_brier = float(compute_brier_decomposition(probs_2d, targets_flat, n_bins=n_bins).empirical_brier)
                 f_nll = float(compute_nll(probs_2d, targets_flat))
             else:
-                val_span = max(1e-6, float(f_def.max_value - f_def.min_value))
                 probs_pos = np.clip(
                     np.asarray(
                         [float(res.probabilities.get(fname, {}).get("score_ratio", 0.5)) for _, res, _ in f_rows],
@@ -1752,7 +2507,7 @@ class SystemOneEngine:
                 )
                 y_ratio = np.clip(
                     np.asarray(
-                        [(float(gt_val) - float(f_def.min_value)) / val_span for _, _, gt_val in f_rows],
+                        [float(_score_to_unit_ratio(float(gt_val), f_def.min_value, f_def.max_value)) for _, _, gt_val in f_rows],
                         dtype=np.float64,
                     ),
                     0.0,
@@ -1787,7 +2542,7 @@ class SystemOneEngine:
                 abstain_rate=f_abs_rate,
                 unfamiliar_rate=f_unf_rate,
                 abstention_reasons=f_reasons,
-                mae=float(f_mae_sum) / float(n_f) if isinstance(f_def, ScoreField) else 0.0,
+                mae=_score_mae_from_int_sum(f_mae_int_sum, n_f) if (isinstance(f_def, ScoreField) and n_f > 0) else 0.0,
             )
 
             total_field_evals += n_f
@@ -1932,7 +2687,9 @@ class SystemOneEngine:
             if embedding is not None:
                 if not isinstance(embedding, (np.ndarray, list, tuple)):
                     raise TypeError(f"embedding must be array-like, got {type(embedding).__name__}")
-                arr_emb = np.asarray(embedding, dtype=np.float32).flatten()
+                raw_emb = _assert_real_numeric_array_like(embedding, "embedding")
+                with np.errstate(over="ignore", invalid="ignore"):
+                    arr_emb = np.asarray(raw_emb, dtype=np.float32).flatten()
                 if not np.all(np.isfinite(arr_emb)):
                     raise ValueError("embedding must contain only finite numbers (no NaN or Inf)")
                 if arr_emb.shape[0] != self.dimension:
@@ -1993,25 +2750,26 @@ class SystemOneEngine:
                 if cached is None:
                     if query_emb is None:
                         query_emb = self.encode(prompt, telemetry=telemetry, recency_weighted=recency_weighted)
-                    cached = self.cache.get(
-                        prompt,
-                        embedding=query_emb,
-                        telemetry=telemetry,
-                        schema_digest=self.schema.schema_digest(),
-                        model_version=self.model_version,
-                        policy_scope=eff_scope,
-                        alpha=alpha,
-                        margin_threshold=eff_m_thresh if self.enable_margin_gating else 0.0,
-                        strict=is_strict,
-                        relative_odds_ratio=eff_gamma,
-                        confidence_floor_tau0=eff_tau0,
-                        recency_weighted=recency_weighted,
-                        model_digest=m_dig,
-                        projector_digest=p_dig,
-                        calibration_digest=c_dig,
-                        policy_epoch=self.policy_epoch,
-                        enforce_durability=is_fail_closed,
-                    )
+                    if bool(np.all(np.isfinite(query_emb))):
+                        cached = self.cache.get(
+                            prompt,
+                            embedding=query_emb,
+                            telemetry=telemetry,
+                            schema_digest=self.schema.schema_digest(),
+                            model_version=self.model_version,
+                            policy_scope=eff_scope,
+                            alpha=alpha,
+                            margin_threshold=eff_m_thresh if self.enable_margin_gating else 0.0,
+                            strict=is_strict,
+                            relative_odds_ratio=eff_gamma,
+                            confidence_floor_tau0=eff_tau0,
+                            recency_weighted=recency_weighted,
+                            model_digest=m_dig,
+                            projector_digest=p_dig,
+                            calibration_digest=c_dig,
+                            policy_epoch=self.policy_epoch,
+                            enforce_durability=is_fail_closed,
+                        )
 
                 if cached is not None:
                     entry, sim = cached
@@ -2075,28 +2833,17 @@ class SystemOneEngine:
 
             with self._lock:
                 user_emb = query_emb if embedding is not None else None
-                try:
-                    raw_result = self.model.forward_single(
-                        prompt,
-                        telemetry=telemetry,
-                        embedding=user_emb,
-                        recency_weighted=recency_weighted,
-                        use_cache=False,
-                    )
-                except TypeError:
-                    try:
-                        raw_result = self.model.forward_single(
-                            prompt,
-                            telemetry=telemetry,
-                            embedding=user_emb,
-                            recency_weighted=recency_weighted,
-                        )
-                    except TypeError:
-                        raw_result = self.model.forward_single(
-                            prompt,
-                            telemetry=telemetry,
-                            embedding=user_emb,
-                        )
+                fwd_fn = self.model.forward_single
+                fwd_kw, _ = _resolve_supported_kwargs(
+                    fwd_fn,
+                    {
+                        "telemetry": telemetry,
+                        "embedding": user_emb,
+                        "recency_weighted": recency_weighted,
+                        "use_cache": False,
+                    },
+                )
+                raw_result = fwd_fn(prompt, **fwd_kw)
 
             values: Dict[str, Any] = {}
             confidences: Dict[str, float] = {}
@@ -2114,21 +2861,33 @@ class SystemOneEngine:
 
             from system1.core.text import TfidfProjector
             prompt_raw_norm: Optional[float] = getattr(raw_result, "raw_norm", None)
-            needs_raw_norm = any(
-                float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
-                for cp in self.conformal_predictors.values()
-            ) or any(
-                float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
-                for ch in getattr(self.model, "heads", {}).values()
+            needs_raw_norm = (
+                any(
+                    float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
+                    for cp in self.conformal_predictors.values()
+                )
+                or any(
+                    float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                    for ch in getattr(self.model, "heads", {}).values()
+                )
+                or any(
+                    float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                    for ch in getattr(self.model, "_field_heads", {}).values()
+                )
             )
-            if prompt_raw_norm is None and embedding is None and needs_raw_norm and hasattr(self.projector, "raw_norm"):
-                try:
-                    prompt_raw_norm = float(self.projector.raw_norm(prompt))
-                except Exception:
-                    prompt_raw_norm = None
+            if prompt_raw_norm is None and embedding is None and needs_raw_norm:
+                eff_rec = (
+                    bool(self.recency_weighted)
+                    if recency_weighted is None
+                    else bool(recency_weighted)
+                )
+                prompt_raw_norm = _extract_prompt_raw_norm(
+                    None, prompt, self.projector, recency_flag=eff_rec
+                )
 
+            emb_finite = bool(np.all(np.isfinite(raw_result.embedding)))
             learned_overrides: Dict[str, Any] = {}
-            if embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
+            if emb_finite and embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
                 norm_key = " ".join(prompt.strip().casefold().split())
                 model_ov = getattr(self.model, "_learned_prompt_overrides", {})
                 model_rec = getattr(self.model, "_learned_prompt_override_recency", {})
@@ -2149,12 +2908,19 @@ class SystemOneEngine:
                 calibrator = self.calibrators[name]
                 has_learned_override = name in learned_overrides
                 conformal = self.conformal_predictors.get(name)
+                live_h = (
+                    self.model._field_heads.get(name)
+                    if hasattr(self.model, "_field_heads") and isinstance(self.model._field_heads, Mapping)
+                    else None
+                )
                 head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                 fam_thresh = max(
+                    float(getattr(live_h, "familiarity_threshold", 0.0)) if live_h is not None else 0.0,
                     float(getattr(head_obj, "familiarity_threshold", 0.0)) if head_obj is not None else 0.0,
                     float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0,
                 )
                 proto_thresh = max(
+                    float(getattr(live_h, "prototype_threshold", 0.0)) if live_h is not None else 0.0,
                     float(getattr(head_obj, "prototype_threshold", 0.0)) if head_obj is not None else 0.0,
                     float(getattr(conformal, "prototype_threshold", 0.0)) if conformal is not None else 0.0,
                 )
@@ -2178,13 +2944,30 @@ class SystemOneEngine:
 
                 ood_blocked = False
                 if enforce_calibrated_ood:
-                    if fam_thresh > 0.0 and prompt_raw_norm is not None and prompt_raw_norm < fam_thresh - 1e-12:
+                    if (
+                        fam_thresh > 0.0
+                        and prompt_raw_norm is not None
+                        and (not math.isfinite(prompt_raw_norm) or prompt_raw_norm < fam_thresh - 1e-12)
+                    ):
                         ood_blocked = True
                     if proto_thresh > 0.0 and proto_sim is not None and proto_sim < proto_thresh - 1e-6:
                         ood_blocked = True
 
                 if isinstance(f_def, ChoiceField):
-                    calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
+                    logits_finite = bool(np.all(np.isfinite(raw_eval.logits)))
+                    if not (emb_finite and logits_finite and bool(np.all(np.isfinite(calibrated_p)))):
+                        values[name] = f_def.options[0]
+                        confidences[name] = float("nan")
+                        probabilities[name] = {opt: float("nan") for opt in f_def.options}
+                        conformal_sets[name] = []
+                        abstention_reasons[name] = "non_finite_input"
+                        ambiguous_fields.append(name)
+                        if getattr(f_def, "escalate_on_ambiguity", True):
+                            escalated_fields.append(name)
+                        is_ambiguous = True
+                        continue
                     best_idx = int(np.argmax(calibrated_p))
                     selected_choice = f_def.options[best_idx]
                     conf = float(calibrated_p[best_idx])
@@ -2200,19 +2983,20 @@ class SystemOneEngine:
                         and (is_zero_emb or selected_choice == learned_overrides.get(name))
                     )
                     if conformal is not None and not override_matched:
-                        try:
-                            cset = conformal.predict_set(
-                                calibrated_p,
-                                alpha=alpha,
-                                margin_threshold=eff_m_thresh if (self.enable_margin_gating and not is_strict) else 0.0,
-                                relative_odds_ratio=eff_gamma if not is_strict else None,
-                                confidence_floor_tau0=eff_tau0 if not is_strict else None,
-                                strict=is_strict,
-                                familiarity_score=(None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
-                                prototype_similarity=(None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
-                            )
-                        except TypeError:
-                            cset = conformal.predict_set(calibrated_p, alpha=alpha)
+                        ps_fn = conformal.predict_set
+                        ps_kw, _ = _resolve_supported_kwargs(
+                            ps_fn,
+                            {
+                                "alpha": alpha,
+                                "margin_threshold": eff_m_thresh if (self.enable_margin_gating and not is_strict) else 0.0,
+                                "relative_odds_ratio": eff_gamma if not is_strict else None,
+                                "confidence_floor_tau0": eff_tau0 if not is_strict else None,
+                                "strict": is_strict,
+                                "familiarity_score": (None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
+                                "prototype_similarity": (None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
+                            },
+                        )
+                        cset = ps_fn(calibrated_p, **ps_kw)
                         conformal_sets[name] = list(cset.prediction_set)
                         margins[name] = getattr(cset, "margin", 1.0)
                         margin_thresholds[name] = getattr(cset, "margin_threshold", 0.0)
@@ -2226,10 +3010,16 @@ class SystemOneEngine:
 
                         is_empty_set = getattr(cset, "is_empty", len(cset.prediction_set) == 0)
                         cardinality = len(cset.prediction_set)
+                        pred_excluded = selected_choice not in cset.prediction_set
                         if is_strict:
-                            field_ambiguous = (cardinality != 1) or cset.is_ambiguous or is_empty_set
+                            field_ambiguous = (
+                                (cardinality != 1)
+                                or cset.is_ambiguous
+                                or is_empty_set
+                                or pred_excluded
+                            )
                         else:
-                            field_ambiguous = is_empty_set or cset.is_ambiguous
+                            field_ambiguous = is_empty_set or cset.is_ambiguous or pred_excluded
 
                         if field_ambiguous:
                             ambiguous_fields.append(name)
@@ -2241,7 +3031,20 @@ class SystemOneEngine:
                         margins[name] = 1.0
 
                 elif isinstance(f_def, BooleanField):
-                    calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        calibrated_p = calibrator.calibrate_logits(raw_eval.logits)
+                    logits_finite = bool(np.all(np.isfinite(raw_eval.logits)))
+                    if not (emb_finite and logits_finite and bool(np.all(np.isfinite(calibrated_p)))):
+                        values[name] = False
+                        confidences[name] = float("nan")
+                        probabilities[name] = {"False": float("nan"), "True": float("nan")}
+                        conformal_sets[name] = []
+                        abstention_reasons[name] = "non_finite_input"
+                        ambiguous_fields.append(name)
+                        if getattr(f_def, "escalate_on_ambiguity", True):
+                            escalated_fields.append(name)
+                        is_ambiguous = True
+                        continue
                     prob_true = float(calibrated_p[1])
                     val = bool(prob_true >= f_def.threshold)
                     conf = prob_true if val else (1.0 - prob_true)
@@ -2256,19 +3059,20 @@ class SystemOneEngine:
                         and (is_zero_emb or val == bool(learned_overrides.get(name)))
                     )
                     if conformal is not None and not override_matched:
-                        try:
-                            cset = conformal.predict_set(
-                                calibrated_p,
-                                alpha=alpha,
-                                margin_threshold=eff_m_thresh if (self.enable_margin_gating and not is_strict) else 0.0,
-                                relative_odds_ratio=eff_gamma if not is_strict else None,
-                                confidence_floor_tau0=eff_tau0 if not is_strict else None,
-                                strict=is_strict,
-                                familiarity_score=(None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
-                                prototype_similarity=(None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
-                            )
-                        except TypeError:
-                            cset = conformal.predict_set(calibrated_p, alpha=alpha)
+                        ps_fn = conformal.predict_set
+                        ps_kw, _ = _resolve_supported_kwargs(
+                            ps_fn,
+                            {
+                                "alpha": alpha,
+                                "margin_threshold": eff_m_thresh if (self.enable_margin_gating and not is_strict) else 0.0,
+                                "relative_odds_ratio": eff_gamma if not is_strict else None,
+                                "confidence_floor_tau0": eff_tau0 if not is_strict else None,
+                                "strict": is_strict,
+                                "familiarity_score": (None if (has_learned_override and not enforce_calibrated_ood) else prompt_raw_norm),
+                                "prototype_similarity": (None if (has_learned_override and not enforce_calibrated_ood) else proto_sim),
+                            },
+                        )
+                        cset = ps_fn(calibrated_p, **ps_kw)
                         conformal_sets[name] = list(cset.prediction_set)
                         margins[name] = getattr(cset, "margin", 1.0)
                         margin_thresholds[name] = getattr(cset, "margin_threshold", 0.0)
@@ -2282,10 +3086,16 @@ class SystemOneEngine:
 
                         is_empty_set = getattr(cset, "is_empty", len(cset.prediction_set) == 0)
                         cardinality = len(cset.prediction_set)
+                        pred_excluded = ("True" if val else "False") not in cset.prediction_set
                         if is_strict:
-                            field_ambiguous = (cardinality != 1) or cset.is_ambiguous or is_empty_set
+                            field_ambiguous = (
+                                (cardinality != 1)
+                                or cset.is_ambiguous
+                                or is_empty_set
+                                or pred_excluded
+                            )
                         else:
-                            field_ambiguous = is_empty_set or cset.is_ambiguous
+                            field_ambiguous = is_empty_set or cset.is_ambiguous or pred_excluded
 
                         if field_ambiguous:
                             ambiguous_fields.append(name)
@@ -2298,8 +3108,23 @@ class SystemOneEngine:
 
                 elif isinstance(f_def, MultiChoiceField):
                     calibrated_temp = calibrator.temperature
-                    scaled_logits = raw_eval.logits / max(1e-4, calibrated_temp)
-                    probs = _stable_sigmoid(scaled_logits, temperature=1.0)
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        scaled_logits = raw_eval.logits / max(1e-4, calibrated_temp)
+                        probs = _stable_sigmoid(scaled_logits, temperature=1.0)
+                    logits_finite = bool(np.all(np.isfinite(raw_eval.logits))) and bool(
+                        np.all(np.isfinite(scaled_logits))
+                    )
+                    if not (emb_finite and logits_finite and bool(np.all(np.isfinite(probs)))):
+                        values[name] = ()
+                        confidences[name] = float("nan")
+                        probabilities[name] = {opt: float("nan") for opt in f_def.options}
+                        conformal_sets[name] = []
+                        abstention_reasons[name] = "non_finite_input"
+                        ambiguous_fields.append(name)
+                        if getattr(f_def, "escalate_on_ambiguity", True):
+                            escalated_fields.append(name)
+                        is_ambiguous = True
+                        continue
                     selected = tuple(
                         f_def.options[i] for i, p in enumerate(probs) if p >= f_def.threshold
                     )
@@ -2343,32 +3168,56 @@ class SystemOneEngine:
                 elif isinstance(f_def, ScoreField):
                     calibrator = self.calibrators.get(name)
                     calibrated_temp = calibrator.temperature if calibrator is not None else 1.0
-                    scaled_logit = float(raw_eval.logits[0] / max(1e-4, calibrated_temp))
-                    prob = float(_stable_sigmoid(np.array([scaled_logit]), temperature=1.0)[0])
-                    val = f_def.min_value + (f_def.max_value - f_def.min_value) * prob
-                    conf = float(getattr(raw_eval, "confidence", max(prob, 1.0 - prob)))
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        raw_logit = float(raw_eval.logits[0])
+                        scaled_logit = float(raw_logit / max(1e-4, calibrated_temp))
+                        prob = float(_stable_sigmoid(np.array([scaled_logit]), temperature=1.0)[0])
+                        val = float(_score_from_unit_prob(prob, f_def.min_value, f_def.max_value))
+                        conf = float(getattr(raw_eval, "confidence", max(prob, 1.0 - prob)))
+                    logits_finite = math.isfinite(raw_logit) and math.isfinite(scaled_logit)
+                    if not (emb_finite and logits_finite and math.isfinite(val) and math.isfinite(conf)):
+                        values[name] = (
+                            float(f_def.default)
+                            if getattr(f_def, "default", None) is not None
+                            else float(f_def.min_value)
+                        )
+                        confidences[name] = float("nan")
+                        probabilities[name] = {"score_ratio": float("nan")}
+                        conformal_sets[name] = []
+                        abstention_reasons[name] = "non_finite_input"
+                        ambiguous_fields.append(name)
+                        if getattr(f_def, "escalate_on_ambiguity", True):
+                            escalated_fields.append(name)
+                        is_ambiguous = True
+                        continue
                     values[name] = val
                     confidences[name] = conf
                     probabilities[name] = {"score_ratio": prob}
                     reg_conformal = self.regression_conformal_predictors.get(name)
                     is_uncalibrated = reg_conformal is None or not reg_conformal.is_calibrated
+                    half_span = _score_half_span(f_def.min_value, f_def.max_value)
                     if not is_uncalibrated and not has_learned_override:
                         interval = reg_conformal.predict_interval(val, alpha=alpha, strict=is_strict)
                         conformal_sets[name] = [interval.to_interval_string()]
                         interval_margin = interval.margin
                     else:
                         if is_strict and not has_learned_override:
-                            interval_margin = f_def.max_value - f_def.min_value
+                            interval_margin = _score_full_span_clamped(f_def.min_value, f_def.max_value)
                             low_b = f_def.min_value
                             high_b = f_def.max_value
                         else:
-                            interval_margin = (f_def.max_value - f_def.min_value) * ((1.0 - alpha) / 2.0) if not has_learned_override else 0.0
-                            low_b = max(f_def.min_value, val - interval_margin)
-                            high_b = min(f_def.max_value, val + interval_margin)
-                        conformal_sets[name] = [f"[{low_b:.4f}, {high_b:.4f}]"]
+                            interval_margin = (1.0 - alpha) * half_span if not has_learned_override else 0.0
+                            low_b, high_b = _score_interval_bounds(val, interval_margin, f_def.min_value, f_def.max_value)
+                        conformal_sets[name] = [_format_score_interval(low_b, high_b)]
 
-                    score_range = max(1e-6, f_def.max_value - f_def.min_value)
-                    normalized_margin = interval_margin / score_range
+                    if has_learned_override:
+                        normalized_margin = 0.0
+                    else:
+                        normalized_margin = _score_normalized_margin(
+                            float(interval_margin),
+                            f_def.min_value,
+                            f_def.max_value,
+                        )
                     score_ambiguous = False
                     if is_strict and not has_learned_override:
                         eff_score_thresh = eff_m_thresh if (self.enable_margin_gating and eff_m_thresh is not None) else 0.5
@@ -2399,15 +3248,21 @@ class SystemOneEngine:
                             escalated_fields.append(name)
             if prompt_raw_norm is not None:
                 for name, definition in self.schema.fields.items():
+                    live_h = (
+                        self.model._field_heads.get(name)
+                        if hasattr(self.model, "_field_heads") and isinstance(self.model._field_heads, Mapping)
+                        else None
+                    )
                     head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                     cp_obj = self.conformal_predictors.get(name)
                     fam_t = max(
+                        float(getattr(live_h, "familiarity_threshold", 0.0)) if live_h is not None else 0.0,
                         float(getattr(head_obj, "familiarity_threshold", 0.0)) if head_obj is not None else 0.0,
                         float(getattr(cp_obj, "familiarity_threshold", 0.0)) if cp_obj is not None else 0.0,
                     )
                     if name in learned_overrides and fam_t <= 0.0:
                         continue
-                    if fam_t > 0.0 and prompt_raw_norm < fam_t - 1e-12:
+                    if fam_t > 0.0 and (not math.isfinite(prompt_raw_norm) or prompt_raw_norm < fam_t - 1e-12):
                         familiarity_triggered = True
                         conformal_sets[name] = []
                         abstention_reasons.setdefault(name, "low_feature_familiarity")
@@ -2418,9 +3273,15 @@ class SystemOneEngine:
                             if name not in escalated_fields:
                                 escalated_fields.append(name)
             for name, definition in self.schema.fields.items():
+                live_h = (
+                    self.model._field_heads.get(name)
+                    if hasattr(self.model, "_field_heads") and isinstance(self.model._field_heads, Mapping)
+                    else None
+                )
                 head_obj = self.model.heads.get(name) if hasattr(self.model, "heads") else None
                 cp_obj = self.conformal_predictors.get(name)
                 proto_t = max(
+                    float(getattr(live_h, "prototype_threshold", 0.0)) if live_h is not None else 0.0,
                     float(getattr(head_obj, "prototype_threshold", 0.0)) if head_obj is not None else 0.0,
                     float(getattr(cp_obj, "prototype_threshold", 0.0)) if cp_obj is not None else 0.0,
                 )
@@ -2635,7 +3496,7 @@ class SystemOneEngine:
                 metadata=result_meta,
             )
 
-            if eff_use_cache and not is_ambiguous:
+            if eff_use_cache and not is_ambiguous and emb_finite:
                 self.cache.put(
                     prompt,
                     result,
@@ -2717,12 +3578,15 @@ class SystemOneEngine:
         ``preserve_calibration=True`` is specified.
         """
         with self._lock, getattr(self.model, "_lock", nullcontext()):
+            if not isinstance(prompt, str):
+                raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
             recency_weighted = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
             target = self.schema.validate_lesson(target, allow_unknown=True)
-            eff_forgetting = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
-            if not math.isfinite(eff_forgetting) or not (0.0 < eff_forgetting <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_forgetting}")
-            eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
+            eff_forgetting = _validate_forgetting_factor(
+                forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+            )
+            eff_reward_scale_in = _validate_real_scalar(reward_scale, "reward_scale")
+            eff_reward_scale = float(np.clip(eff_reward_scale_in, 0.0, 1.0))
             t0 = time.perf_counter()
 
             c_emb: Optional[np.ndarray] = None
@@ -2730,7 +3594,7 @@ class SystemOneEngine:
                 embedding is None and isinstance(prompt, str) and bool(prompt.strip())
             )
             if embedding is not None:
-                emb = np.asarray(embedding, dtype=np.float32).flatten()
+                emb = _coerce_real_1d_f32(embedding, "embedding")
             else:
                 from system1.core.model import DeterministicSemanticProjector
 
@@ -2765,268 +3629,385 @@ class SystemOneEngine:
                 raise ValueError("embedding contains NaN or Inf non-finite values")
             x_aug = np.append(emb, 1.0).astype(np.float32)
 
-            if hasattr(self.model, "learn_from_tier2"):
-                model_emb = (
-                    emb
-                    if getattr(self.model, "projector", None) is self.projector
-                    else emb
-                )
-                try:
-                    res_dict = self.model.learn_from_tier2(
-                        prompt,
-                        target,
-                        telemetry=telemetry,
-                        embedding=model_emb,
-                        forgetting_factor=eff_forgetting,
-                        recency_weighted=recency_weighted,
-                        preserve_calibration=preserve_calibration,
-                        reward_scale=eff_reward_scale,
-                        concept_embedding=c_emb,
-                        allow_prompt_for_head=allow_prompt_for_head,
-                    )
-                except TypeError:
-                    try:
-                        res_dict = self.model.learn_from_tier2(
-                            prompt,
-                            target,
-                            telemetry=telemetry,
-                            embedding=None if (embedding is None and getattr(self.model, "projector", None) is self.projector) else emb,
-                            forgetting_factor=eff_forgetting,
-                            recency_weighted=recency_weighted,
-                            preserve_calibration=preserve_calibration,
-                            reward_scale=eff_reward_scale,
+            model = self.model
+            seen_head_ids: set[int] = set()
+            model_state_snaps: List[Tuple[Any, Any]] = []
+            model_dict_snaps: List[Tuple[Any, Dict[str, Any]]] = []
+            model_slot_snaps: List[Tuple[Any, List[Tuple[str, Any]]]] = []
+            model_container_snaps: List[Tuple[Any, ...]] = []
+            snap_memo: Dict[int, Any] = {}
+            skip_snap_ids: set[int] = {id(self), id(model)}
+            if self.projector is not None:
+                skip_snap_ids.add(id(self.projector))
+            m_proj = getattr(model, "projector", None)
+            if m_proj is not None:
+                skip_snap_ids.add(id(m_proj))
+            head_map_snaps: List[Tuple[str, bool, Any, Optional[List[Tuple[Any, Any]]]]] = []
+            for attr_name in ("_field_heads", "heads"):
+                has_attr = hasattr(model, attr_name)
+                h_map = getattr(model, attr_name, None)
+                if has_attr:
+                    map_items = list(h_map.items()) if isinstance(h_map, dict) else None
+                    head_map_snaps.append((attr_name, True, h_map, map_items))
+                else:
+                    head_map_snaps.append((attr_name, False, None, None))
+                if isinstance(h_map, Mapping):
+                    for h_obj in h_map.values():
+                        _snapshot_duck_graph(
+                            h_obj,
+                            seen_head_ids,
+                            model_state_snaps,
+                            model_dict_snaps,
+                            model_slot_snaps,
+                            snap_memo,
+                            skip_snap_ids,
+                            model_container_snaps,
                         )
-                    except TypeError:
-                        try:
-                            res_dict = self.model.learn_from_tier2(
-                                prompt,
-                                target,
-                                telemetry=telemetry,
-                                embedding=model_emb,
-                                forgetting_factor=eff_forgetting,
-                                recency_weighted=recency_weighted,
-                                preserve_calibration=preserve_calibration,
+            skip_model_attrs = frozenset({
+                "schema",
+                "projector",
+                "_lock",
+                "heads",
+                "_field_heads",
+                "model_version",
+                "_learned_prompt_overrides",
+                "_learned_prompt_override_recency",
+                "_online_prototype_bank",
+                "cache",
+            })
+            orig_duck_model_keys: Optional[set[str]] = None
+            duck_model_extra_snap: Optional[Dict[str, Any]] = None
+            if type(getattr(model, "__dict__", None)) is dict:
+                orig_duck_model_keys = set(model.__dict__.keys())
+                duck_model_extra_snap = {
+                    mk: _snapshot_duck_graph(
+                        mv,
+                        seen_head_ids,
+                        model_state_snaps,
+                        model_dict_snaps,
+                        model_slot_snaps,
+                        snap_memo,
+                        skip_snap_ids,
+                        model_container_snaps,
+                    )
+                    for mk, mv in model.__dict__.items()
+                    if mk not in skip_model_attrs
+                }
+            model_own_slots = [
+                s_n for s_n in _collect_instance_slot_names(model) if s_n not in skip_model_attrs
+            ]
+            if model_own_slots:
+                model_slot_snaps.append((
+                    model,
+                    [
+                        (
+                            s_n,
+                            _snapshot_duck_graph(
+                                getattr(model, s_n, _UNSET_SLOT),
+                                seen_head_ids,
+                                model_state_snaps,
+                                model_dict_snaps,
+                                model_slot_snaps,
+                                snap_memo,
+                                skip_snap_ids,
+                                model_container_snaps,
                             )
-                        except TypeError:
-                            try:
-                                res_dict = self.model.learn_from_tier2(
-                                    prompt,
-                                    target,
-                                    telemetry=telemetry,
-                                    embedding=model_emb,
-                                    forgetting_factor=eff_forgetting,
-                                    recency_weighted=recency_weighted,
-                                )
-                            except TypeError:
-                                try:
-                                    res_dict = self.model.learn_from_tier2(
-                                        prompt, target, telemetry=telemetry, embedding=model_emb, forgetting_factor=eff_forgetting
-                                    )
-                                except TypeError:
-                                    res_dict = self.model.learn_from_tier2(
-                                        prompt, target, telemetry=telemetry, embedding=model_emb
-                                    )
-                updated_fields = res_dict.get("updated_fields", [])
-                rank1_ms = res_dict.get("update_latency_ms", 0.0)
-            else:
-                target_dict = dict(target)
+                            if hasattr(model, s_n)
+                            else _UNSET_SLOT,
+                        )
+                        for s_n in model_own_slots
+                    ],
+                ))
 
-                updated_fields = []
-                update_durations_ms: List[float] = []
-                is_zero_emb = not bool(np.any(emb))
-                norm_key = (
-                    " ".join(prompt.strip().casefold().split())
-                    if (embedding is None and is_zero_emb and telemetry is None and isinstance(prompt, str) and prompt.strip())
-                    else None
-                )
-                heads_dict = getattr(self.model, "_field_heads", getattr(self.model, "heads", {}))
-                for f_name, target_val in target_dict.items():
-                    if f_name in heads_dict:
-                        head = heads_dict[f_name]
-                        if hasattr(head, "format_target_vector") and hasattr(head, "online_update"):
-                            y_target = head.format_target_vector(target_val)
-                            if is_zero_emb:
-                                dt = 0.0
-                                if norm_key is not None and eff_reward_scale >= 0.5:
-                                    if not hasattr(self, "_learned_prompt_overrides"):
-                                        self._learned_prompt_overrides = {}
-                                    if not hasattr(self, "_learned_prompt_override_recency"):
-                                        self._learned_prompt_override_recency = {}
-                                    self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
-                                        self.schema.fields[f_name].validate_value(target_val)
-                                    )
-                                    self._learned_prompt_override_recency[norm_key] = bool(recency_weighted)
-                            else:
-                                try:
-                                    dt = head.online_update(
-                                        x_aug,
-                                        y_target,
-                                        forgetting_factor=eff_forgetting,
-                                        preserve_calibration=preserve_calibration,
-                                        reward_scale=eff_reward_scale,
-                                    )
-                                except TypeError:
-                                    try:
-                                        dt = head.online_update(x_aug, y_target, forgetting_factor=eff_forgetting)
-                                    except TypeError:
-                                        dt = head.online_update(x_aug, y_target)
-                            update_durations_ms.append(dt)
-                            updated_fields.append(f_name)
+            has_model_ver = hasattr(model, "model_version")
+            prev_model_ver = getattr(model, "model_version", None)
+            has_m_ov = hasattr(model, "_learned_prompt_overrides")
+            m_ov_snap = (
+                {k: dict(v) for k, v in model._learned_prompt_overrides.items()}
+                if has_m_ov
+                else None
+            )
+            has_m_ov_rec = hasattr(model, "_learned_prompt_override_recency")
+            m_ov_rec_snap = (
+                dict(model._learned_prompt_override_recency)
+                if has_m_ov_rec
+                else None
+            )
+            has_m_proto = hasattr(model, "_online_prototype_bank")
+            m_proto_snap = (
+                {k: [arr.copy() if isinstance(arr, np.ndarray) else _clone_head_attr_value(arr) for arr in v] for k, v in model._online_prototype_bank.items()}
+                if has_m_proto
+                else None
+            )
+            m_cache = getattr(model, "cache", None)
+            m_cache_snap = (
+                m_cache._snapshot_state()
+                if (m_cache is not None and hasattr(m_cache, "_snapshot_state"))
+                else None
+            )
 
-                rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
+            prev_eng_ver = self.model_version
+            has_lesson_cnt = "_online_lesson_count" in self.__dict__
+            prev_lesson_cnt = self.__dict__.get("_online_lesson_count", 0)
+            has_eng_ov = hasattr(self, "_learned_prompt_overrides")
+            eng_ov_snap = (
+                {k: dict(v) for k, v in self._learned_prompt_overrides.items()}
+                if has_eng_ov
+                else None
+            )
+            has_eng_ov_rec = hasattr(self, "_learned_prompt_override_recency")
+            eng_ov_rec_snap = (
+                dict(self._learned_prompt_override_recency)
+                if has_eng_ov_rec
+                else None
+            )
+            has_eng_ov_cnt = hasattr(self, "_override_counts")
+            eng_ov_cnt_snap = (
+                {k: dict(v) for k, v in self._override_counts.items()}
+                if has_eng_ov_cnt
+                else None
+            )
+            cal_snap = {k: copy.deepcopy(v) for k, v in self.calibrators.items()}
+            cp_snap = {k: copy.deepcopy(v) for k, v in self.conformal_predictors.items()}
+            rcp_snap = {k: copy.deepcopy(v) for k, v in self.regression_conformal_predictors.items()}
+            prev_packed_kernel = getattr(self, "_packed_kernel_cache", None)
+            has_exp_cache = hasattr(self, "_explainer_cache")
+            exp_cache_snap = dict(self._explainer_cache) if has_exp_cache else None
+            eng_cache_snap = (
+                self.cache._snapshot_state()
+                if (self.cache is not None and hasattr(self.cache, "_snapshot_state"))
+                else None
+            )
 
-            # Atomic version increment and cache invalidation AFTER weights are updated
-            self.model_version += 1
-            self._online_lesson_count = getattr(self, "_online_lesson_count", 0) + 1
-            if hasattr(self.model, "model_version"):
-                self.model.model_version = self.model_version
-
-            min_cal_lessons = getattr(self, "min_calibration_lessons", 0)
-            min_corrob = max(1, int(getattr(self, "min_override_corroborations", 1)))
-
-            if not preserve_calibration:
-                norm_key_clear = (
-                    " ".join(prompt.strip().casefold().split())
-                    if (embedding is None and bool(np.any(emb)) and telemetry is None and isinstance(prompt, str) and prompt.strip())
-                    else None
-                )
-                for f_name in updated_fields:
-                    if norm_key_clear is not None:
-                        if getattr(self, "_override_counts", None) and norm_key_clear in self._override_counts:
-                            self._override_counts[norm_key_clear].pop(f_name, None)
-                            if not self._override_counts[norm_key_clear]:
-                                self._override_counts.pop(norm_key_clear, None)
-                        if getattr(self, "_learned_prompt_overrides", None) and norm_key_clear in self._learned_prompt_overrides:
-                            self._learned_prompt_overrides[norm_key_clear].pop(f_name, None)
-                            if not self._learned_prompt_overrides[norm_key_clear]:
-                                self._learned_prompt_overrides.pop(norm_key_clear, None)
-                                if hasattr(self, "_learned_prompt_override_recency"):
-                                    self._learned_prompt_override_recency.pop(norm_key_clear, None)
-                    if f_name in self.calibrators:
-                        self.calibrators[f_name] = DecisionCalibrator()
-                    if f_name in self.conformal_predictors:
-                        cp_reset = self.conformal_predictors[f_name]
-                        cp_reset.is_calibrated = False
-                        cp_reset.familiarity_threshold = 0.0
-                        cp_reset.prototype_threshold = 0.0
-                        cp_reset.familiarity_scores = np.array([], dtype=np.float64)
-                        cp_reset.prototype_scores = np.array([], dtype=np.float64)
-                        cp_reset.class_calibration_scores = {}
-                    if f_name in self.regression_conformal_predictors:
-                        self.regression_conformal_predictors[f_name].is_calibrated = False
-            else:
-                target_dict_for_override: Dict[str, Any] = dict(target)
-                norm_key_override = (
-                    " ".join(prompt.strip().casefold().split())
-                    if (embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip())
-                    else None
-                )
-                for f_name in updated_fields:
+            try:
+                if hasattr(self.model, "learn_from_tier2"):
+                    learn_fn = self.model.learn_from_tier2
+                    candidate_learn_kw = {
+                        "telemetry": telemetry,
+                        "embedding": emb,
+                        "forgetting_factor": eff_forgetting,
+                        "recency_weighted": recency_weighted,
+                        "preserve_calibration": preserve_calibration,
+                        "reward_scale": eff_reward_scale,
+                        "concept_embedding": c_emb,
+                        "allow_prompt_for_head": allow_prompt_for_head,
+                    }
+                    learn_kw, explicit_learn_names = _resolve_supported_kwargs(learn_fn, candidate_learn_kw)
                     if (
-                        eff_reward_scale >= 0.5
-                        and norm_key_override is not None
-                        and f_name in target_dict_for_override
-                        and f_name in self.schema.fields
+                        "embedding" in learn_kw
+                        and embedding is None
+                        and getattr(self.model, "projector", None) is self.projector
+                        and "reward_scale" in explicit_learn_names
+                        and "allow_prompt_for_head" not in explicit_learn_names
                     ):
-                        validated_val = self.schema.fields[f_name].validate_value(target_dict_for_override[f_name])
-                        if not hasattr(self, "_override_counts"):
-                            self._override_counts = {}
-                        field_counts = self._override_counts.setdefault(norm_key_override, {})
-                        prev_entry = field_counts.get(f_name)
-                        if prev_entry is not None and prev_entry[0] == validated_val:
-                            corrob_count = prev_entry[1] + 1
-                        else:
-                            corrob_count = 1
-                        field_counts[f_name] = (validated_val, corrob_count)
+                        learn_kw["embedding"] = None
+                    res_dict = learn_fn(prompt, target, **learn_kw)
+                    updated_fields = res_dict.get("updated_fields", [])
+                    rank1_ms = res_dict.get("update_latency_ms", 0.0)
+                else:
+                    target_dict = dict(target)
 
-                        if not hasattr(self, "_learned_prompt_overrides"):
-                            self._learned_prompt_overrides = {}
-                        if not hasattr(self, "_learned_prompt_override_recency"):
-                            self._learned_prompt_override_recency = {}
-                        if corrob_count >= min_corrob:
-                            while len(self._learned_prompt_overrides) >= 4096 and norm_key_override not in self._learned_prompt_overrides:
-                                oldest_k = next(iter(self._learned_prompt_overrides))
-                                del self._learned_prompt_overrides[oldest_k]
-                                self._learned_prompt_override_recency.pop(oldest_k, None)
-                                self._override_counts.pop(oldest_k, None)
-                            self._learned_prompt_overrides.setdefault(norm_key_override, {})[f_name] = validated_val
-                            self._learned_prompt_override_recency[norm_key_override] = bool(recency_weighted)
-                        elif norm_key_override in self._learned_prompt_overrides:
-                            self._learned_prompt_overrides[norm_key_override].pop(f_name, None)
-                            if not self._learned_prompt_overrides[norm_key_override]:
-                                self._learned_prompt_overrides.pop(norm_key_override, None)
-                                self._learned_prompt_override_recency.pop(norm_key_override, None)
-                    ch = getattr(self.model, "heads", {}).get(f_name)
-                    cp = self.conformal_predictors.get(f_name)
-                    if cp is not None:
-                        if ch is not None and hasattr(ch, "calibration_scores"):
-                            cp.score_method = getattr(ch, "score_method", cp.score_method)
-                            protos = getattr(ch, "prototypes", None)
-                            if protos is not None:
-                                cp.prototypes = np.asarray(protos, dtype=np.float32)
-                            cp.prototype_threshold = float(getattr(ch, "prototype_threshold", 0.0))
-                            cp.familiarity_threshold = float(getattr(ch, "familiarity_threshold", 0.0))
-                            cal_scores = getattr(ch, "calibration_scores", ())
-                            if cal_scores:
-                                cp.calibration_scores = np.sort(np.asarray(cal_scores, dtype=np.float64))
+                    updated_fields = []
+                    update_durations_ms: List[float] = []
+                    is_zero_emb = not bool(np.any(emb))
+                    norm_key = (
+                        " ".join(prompt.strip().casefold().split())
+                        if (embedding is None and is_zero_emb and telemetry is None and isinstance(prompt, str) and prompt.strip())
+                        else None
+                    )
+                    heads_dict = getattr(self.model, "_field_heads", getattr(self.model, "heads", {}))
+                    for f_name, target_val in target_dict.items():
+                        if f_name in heads_dict:
+                            head = heads_dict[f_name]
+                            if hasattr(head, "format_target_vector") and hasattr(head, "online_update"):
+                                y_target = head.format_target_vector(target_val)
+                                if is_zero_emb:
+                                    dt = 0.0
+                                    if norm_key is not None and eff_reward_scale >= 0.5:
+                                        if not hasattr(self, "_learned_prompt_overrides"):
+                                            self._learned_prompt_overrides = {}
+                                        if not hasattr(self, "_learned_prompt_override_recency"):
+                                            self._learned_prompt_override_recency = {}
+                                        self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
+                                            self.schema.fields[f_name].validate_value(target_val)
+                                        )
+                                        self._learned_prompt_override_recency[norm_key] = bool(recency_weighted)
+                                else:
+                                    ou_fn = head.online_update
+                                    ou_kw, _ = _resolve_supported_kwargs(
+                                        ou_fn,
+                                        {
+                                            "forgetting_factor": eff_forgetting,
+                                            "preserve_calibration": preserve_calibration,
+                                            "reward_scale": eff_reward_scale,
+                                        },
+                                    )
+                                    dt = ou_fn(x_aug, y_target, **ou_kw)
+                                update_durations_ms.append(dt)
+                                updated_fields.append(f_name)
+
+                    rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
+
+                self.model_version += 1
+                self._online_lesson_count = getattr(self, "_online_lesson_count", 0) + 1
+                if hasattr(self.model, "model_version"):
+                    self.model.model_version = self.model_version
+
+                min_cal_lessons = getattr(self, "min_calibration_lessons", 0)
+                min_corrob = max(1, int(getattr(self, "min_override_corroborations", 1)))
+
+                if not preserve_calibration:
+                    norm_key_clear = (
+                        " ".join(prompt.strip().casefold().split())
+                        if (embedding is None and bool(np.any(emb)) and telemetry is None and isinstance(prompt, str) and prompt.strip())
+                        else None
+                    )
+                    for f_name in updated_fields:
+                        if norm_key_clear is not None:
+                            if getattr(self, "_override_counts", None) and norm_key_clear in self._override_counts:
+                                self._override_counts[norm_key_clear].pop(f_name, None)
+                                if not self._override_counts[norm_key_clear]:
+                                    self._override_counts.pop(norm_key_clear, None)
+                            if getattr(self, "_learned_prompt_overrides", None) and norm_key_clear in self._learned_prompt_overrides:
+                                self._learned_prompt_overrides[norm_key_clear].pop(f_name, None)
+                                if not self._learned_prompt_overrides[norm_key_clear]:
+                                    self._learned_prompt_overrides.pop(norm_key_clear, None)
+                                    if hasattr(self, "_learned_prompt_override_recency"):
+                                        self._learned_prompt_override_recency.pop(norm_key_clear, None)
+                        if f_name in self.calibrators:
+                            self.calibrators[f_name] = DecisionCalibrator()
+                        if (
+                            hasattr(self.model, "heads")
+                            and isinstance(self.model.heads, Mapping)
+                            and f_name in self.model.heads
+                        ):
+                            self.model.heads[f_name].logit_adjustments = None
+                        if f_name in self.conformal_predictors:
+                            cp_reset = self.conformal_predictors[f_name]
+                            cp_reset.is_calibrated = False
+                            cp_reset.familiarity_threshold = 0.0
+                            cp_reset.prototype_threshold = 0.0
+                            cp_reset.familiarity_scores = np.array([], dtype=np.float64)
+                            cp_reset.prototype_scores = np.array([], dtype=np.float64)
+                            cp_reset.class_calibration_scores = {}
+                        if f_name in self.regression_conformal_predictors:
+                            self.regression_conformal_predictors[f_name].is_calibrated = False
+                else:
+                    target_dict_for_override: Dict[str, Any] = dict(target)
+                    norm_key_override = (
+                        " ".join(prompt.strip().casefold().split())
+                        if (embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip())
+                        else None
+                    )
+                    for f_name in updated_fields:
+                        if (
+                            eff_reward_scale >= 0.5
+                            and norm_key_override is not None
+                            and f_name in target_dict_for_override
+                            and f_name in self.schema.fields
+                        ):
+                            validated_val = self.schema.fields[f_name].validate_value(target_dict_for_override[f_name])
+                            if not hasattr(self, "_override_counts"):
+                                self._override_counts = {}
+                            field_counts = self._override_counts.setdefault(norm_key_override, {})
+                            prev_entry = field_counts.get(f_name)
+                            if prev_entry is not None and prev_entry[0] == validated_val:
+                                corrob_count = prev_entry[1] + 1
+                            else:
+                                corrob_count = 1
+                            field_counts[f_name] = (validated_val, corrob_count)
+
+                            if not hasattr(self, "_learned_prompt_overrides"):
+                                self._learned_prompt_overrides = {}
+                            if not hasattr(self, "_learned_prompt_override_recency"):
+                                self._learned_prompt_override_recency = {}
+                            if corrob_count >= min_corrob:
+                                while len(self._learned_prompt_overrides) >= 4096 and norm_key_override not in self._learned_prompt_overrides:
+                                    oldest_k = next(iter(self._learned_prompt_overrides))
+                                    del self._learned_prompt_overrides[oldest_k]
+                                    self._learned_prompt_override_recency.pop(oldest_k, None)
+                                    self._override_counts.pop(oldest_k, None)
+                                self._learned_prompt_overrides.setdefault(norm_key_override, {})[f_name] = validated_val
+                                self._learned_prompt_override_recency[norm_key_override] = bool(recency_weighted)
+                            elif norm_key_override in self._learned_prompt_overrides:
+                                self._learned_prompt_overrides[norm_key_override].pop(f_name, None)
+                                if not self._learned_prompt_overrides[norm_key_override]:
+                                    self._learned_prompt_overrides.pop(norm_key_override, None)
+                                    self._learned_prompt_override_recency.pop(norm_key_override, None)
+                        ch = getattr(self.model, "heads", {}).get(f_name)
+                        cp = self.conformal_predictors.get(f_name)
+                        if cp is not None:
+                            if ch is not None and hasattr(ch, "calibration_scores"):
+                                cp.score_method = getattr(ch, "score_method", cp.score_method)
+                                protos = getattr(ch, "prototypes", None)
+                                if protos is not None:
+                                    cp.prototypes = np.asarray(protos, dtype=np.float32)
+                                cp.prototype_threshold = float(getattr(ch, "prototype_threshold", 0.0))
+                                cp.familiarity_threshold = float(getattr(ch, "familiarity_threshold", 0.0))
+                                cal_scores = getattr(ch, "calibration_scores", ())
+                                if cal_scores:
+                                    cp.calibration_scores = np.sort(np.asarray(cal_scores, dtype=np.float64))
+                                    cp.is_calibrated = True
+                                cls_scores = getattr(ch, "class_calibration_scores", None)
+                                if cls_scores:
+                                    cp.class_calibration_scores = {
+                                        str(k): np.sort(np.asarray(v, dtype=np.float64))
+                                        for k, v in cls_scores.items()
+                                        if len(v) > 0
+                                    }
+                            else:
+                                if getattr(cp, "prototypes", None) is not None and len(emb) == cp.prototypes.shape[1]:
+                                    e_norm = float(np.linalg.norm(emb))
+                                    if e_norm > 1e-12:
+                                        emb_u = emb / e_norm
+                                        sim_after = float(np.max(cp.prototypes @ emb_u))
+                                        if eff_reward_scale >= 0.5 and cp.prototype_threshold > 0.0 and sim_after < cp.prototype_threshold:
+                                            cp.prototype_threshold = max(0.0, sim_after - 1e-4)
+                            if not cp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
+                                k_opts = max(2, len(cp.options))
+                                q_init = float((k_opts - 1.0) / (3.5 + k_opts))
+                                cp.score_method = "lac"
+                                cp.calibration_scores = np.full(20, q_init, dtype=np.float64)
                                 cp.is_calibrated = True
-                            cls_scores = getattr(ch, "class_calibration_scores", None)
-                            if cls_scores:
-                                cp.class_calibration_scores = {
-                                    str(k): np.sort(np.asarray(v, dtype=np.float64))
-                                    for k, v in cls_scores.items()
-                                    if len(v) > 0
-                                }
-                        else:
-                            if getattr(cp, "prototypes", None) is not None and len(emb) == cp.prototypes.shape[1]:
-                                e_norm = float(np.linalg.norm(emb))
-                                if e_norm > 1e-12:
-                                    emb_u = emb / e_norm
-                                    sim_after = float(np.max(cp.prototypes @ emb_u))
-                                    if eff_reward_scale >= 0.5 and cp.prototype_threshold > 0.0 and sim_after < cp.prototype_threshold:
-                                        cp.prototype_threshold = max(0.0, sim_after - 1e-4)
-                        if not cp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
-                            k_opts = max(2, len(cp.options))
-                            q_init = float((k_opts - 1.0) / (3.5 + k_opts))
-                            cp.score_method = "lac"
-                            cp.calibration_scores = np.full(20, q_init, dtype=np.float64)
-                            cp.is_calibrated = True
-                    rcp = self.regression_conformal_predictors.get(f_name)
-                    if rcp is not None and f_name in self.schema.fields:
-                        if ch is not None and getattr(ch, "calibration_scores", ()):
-                            rcp.residuals = np.sort(np.asarray(ch.calibration_scores, dtype=np.float64))
-                            rcp.is_calibrated = True
-                        elif not rcp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
-                            f_def_s = self.schema.fields[f_name]
-                            if isinstance(f_def_s, ScoreField):
-                                span = max(1e-6, float(f_def_s.max_value - f_def_s.min_value))
-                                rcp.residuals = np.full(20, 0.05 * span, dtype=np.float64)
+                        rcp = self.regression_conformal_predictors.get(f_name)
+                        if rcp is not None and f_name in self.schema.fields:
+                            if ch is not None and getattr(ch, "calibration_scores", ()):
+                                rcp.residuals = np.sort(np.asarray(ch.calibration_scores, dtype=np.float64))
                                 rcp.is_calibrated = True
+                            elif not rcp.is_calibrated and self._online_lesson_count >= min_cal_lessons:
+                                f_def_s = self.schema.fields[f_name]
+                                if isinstance(f_def_s, ScoreField):
+                                    half_span_s = _score_half_span(f_def_s.min_value, f_def_s.max_value)
+                                    rcp.residuals = np.full(20, 0.10 * half_span_s, dtype=np.float64)
+                                    rcp.is_calibrated = True
 
-            if self.use_cache and self.cache is not None:
-                if embedding is None:
-                    self.cache.evict_prompt(prompt)
-                self.cache.invalidate_prior_versions(self.model_version)
-
-            if hasattr(self.model, "cache") and self.model.cache is not None:
-                if embedding is None and hasattr(self.model.cache, "evict_prompt"):
-                    self.model.cache.evict_prompt(prompt)
-                if hasattr(self.model.cache, "invalidate_prior_versions"):
-                    self.model.cache.invalidate_prior_versions(self.model_version)
-
-            # Re-evaluate and populate cache only when caching is active
-            if self.use_cache and self.cache is not None:
+                self._packed_kernel_cache = None
                 res = self.decide(
                     prompt,
                     telemetry=telemetry,
-                    embedding=embedding,
+                    embedding=(emb if embedding is not None else None),
                     record_receipt=False,
                     recency_weighted=recency_weighted,
                     strict=self.strict_mode,
                     policy_scope=self.policy_scope,
+                    fail_closed_ledger=False,
+                    use_cache=False,
                 )
 
-                if not res.is_ambiguous or not self.strict_mode:
+                if hasattr(self, "_explainer_cache"):
+                    self._explainer_cache.clear()
+                if self.use_cache and self.cache is not None:
+                    if embedding is None:
+                        self.cache.evict_prompt(prompt)
+                    self.cache.invalidate_prior_versions(self.model_version)
+
+                if hasattr(self.model, "cache") and self.model.cache is not None:
+                    if embedding is None and hasattr(self.model.cache, "evict_prompt"):
+                        self.model.cache.evict_prompt(prompt)
+                    if hasattr(self.model.cache, "invalidate_prior_versions"):
+                        self.model.cache.invalidate_prior_versions(self.model_version)
+
+                if self.use_cache and self.cache is not None and (not res.is_ambiguous or not self.strict_mode):
                     eff_m_thresh = self.margin_threshold
                     m_dig = self._model_digest()
                     p_dig = self._projector_digest()
@@ -3052,6 +4033,104 @@ class SystemOneEngine:
                         policy_epoch=self.policy_epoch,
                         explicit_embedding=(embedding is not None),
                     )
+            except BaseException:
+                for h_obj, snap in model_state_snaps:
+                    h_obj._restore_state(snap)
+                for h_obj, dict_snap in model_dict_snaps:
+                    h_obj.__dict__.clear()
+                    h_obj.__dict__.update(dict_snap)
+                _restore_duck_containers(model_container_snaps)
+                for slot_obj, slot_vals in model_slot_snaps:
+                    for s_name, s_val in slot_vals:
+                        try:
+                            if s_val is _UNSET_SLOT:
+                                if hasattr(slot_obj, s_name):
+                                    delattr(slot_obj, s_name)
+                            else:
+                                setattr(slot_obj, s_name, s_val)
+                        except Exception:
+                            pass
+                for attr_name, existed, orig_map, orig_items in head_map_snaps:
+                    if existed:
+                        if orig_items is not None and isinstance(orig_map, dict):
+                            orig_map.clear()
+                            orig_map.update(orig_items)
+                        try:
+                            setattr(model, attr_name, orig_map)
+                        except Exception:
+                            pass
+                    elif hasattr(model, attr_name):
+                        try:
+                            delattr(model, attr_name)
+                        except Exception:
+                            pass
+                if orig_duck_model_keys is not None and duck_model_extra_snap is not None:
+                    for mk in list(model.__dict__):
+                        if mk not in orig_duck_model_keys:
+                            try:
+                                delattr(model, mk)
+                            except Exception:
+                                pass
+                    for mk, mv in duck_model_extra_snap.items():
+                        try:
+                            setattr(model, mk, mv)
+                        except Exception:
+                            pass
+                if has_model_ver:
+                    model.model_version = prev_model_ver
+                if has_m_ov and m_ov_snap is not None:
+                    model._learned_prompt_overrides.clear()
+                    model._learned_prompt_overrides.update(m_ov_snap)
+                elif hasattr(model, "_learned_prompt_overrides"):
+                    delattr(model, "_learned_prompt_overrides")
+                if has_m_ov_rec and m_ov_rec_snap is not None:
+                    model._learned_prompt_override_recency.clear()
+                    model._learned_prompt_override_recency.update(m_ov_rec_snap)
+                elif hasattr(model, "_learned_prompt_override_recency"):
+                    delattr(model, "_learned_prompt_override_recency")
+                if has_m_proto and m_proto_snap is not None:
+                    model._online_prototype_bank.clear()
+                    model._online_prototype_bank.update(m_proto_snap)
+                elif hasattr(model, "_online_prototype_bank"):
+                    delattr(model, "_online_prototype_bank")
+                if m_cache is not None and m_cache_snap is not None:
+                    m_cache._restore_state(m_cache_snap)
+
+                self.model_version = prev_eng_ver
+                if has_lesson_cnt:
+                    self._online_lesson_count = prev_lesson_cnt
+                else:
+                    self.__dict__.pop("_online_lesson_count", None)
+                if has_eng_ov and eng_ov_snap is not None:
+                    self._learned_prompt_overrides.clear()
+                    self._learned_prompt_overrides.update(eng_ov_snap)
+                elif hasattr(self, "_learned_prompt_overrides"):
+                    delattr(self, "_learned_prompt_overrides")
+                if has_eng_ov_rec and eng_ov_rec_snap is not None:
+                    self._learned_prompt_override_recency.clear()
+                    self._learned_prompt_override_recency.update(eng_ov_rec_snap)
+                elif hasattr(self, "_learned_prompt_override_recency"):
+                    delattr(self, "_learned_prompt_override_recency")
+                if has_eng_ov_cnt and eng_ov_cnt_snap is not None:
+                    self._override_counts.clear()
+                    self._override_counts.update(eng_ov_cnt_snap)
+                elif hasattr(self, "_override_counts"):
+                    delattr(self, "_override_counts")
+                self.calibrators.clear()
+                self.calibrators.update(cal_snap)
+                self.conformal_predictors.clear()
+                self.conformal_predictors.update(cp_snap)
+                self.regression_conformal_predictors.clear()
+                self.regression_conformal_predictors.update(rcp_snap)
+                self._packed_kernel_cache = prev_packed_kernel
+                if has_exp_cache and exp_cache_snap is not None:
+                    self._explainer_cache.clear()
+                    self._explainer_cache.update(exp_cache_snap)
+                elif hasattr(self, "_explainer_cache"):
+                    delattr(self, "_explainer_cache")
+                if self.cache is not None and eng_cache_snap is not None:
+                    self.cache._restore_state(eng_cache_snap)
+                raise
 
             total_ms = (time.perf_counter() - t0) * 1000.0
             return {
@@ -3076,6 +4155,8 @@ class SystemOneEngine:
         unlabeled inputs whose zero-shot probability margin exceeds ``margin_threshold``,
         bridging co-occurring domain vocabulary without requiring teacher calls.
         """
+        margin_threshold = _validate_real_scalar(margin_threshold, "margin_threshold")
+        learning_rate = _validate_real_scalar(learning_rate, "learning_rate")
         with self._lock, getattr(self.model, "_lock", nullcontext()):
             if hasattr(self.model, "adapt_zero_shot"):
                 res_info = self.model.adapt_zero_shot(
@@ -3090,6 +4171,9 @@ class SystemOneEngine:
 
             if int(res_info.get("adapted_samples", 0)) > 0:
                 self.model_version += 1
+                self._packed_kernel_cache = None
+                if hasattr(self, "_explainer_cache"):
+                    self._explainer_cache.clear()
                 if hasattr(self.model, "model_version"):
                     self.model.model_version = self.model_version
                 if self.use_cache and self.cache is not None:
@@ -3120,15 +4204,11 @@ class SystemOneEngine:
         preserve split-conformal coverage; use independent recalibration for it.
         """
         if forgetting_factor is not None:
-            ff_val = float(forgetting_factor)
-            if not math.isfinite(ff_val) or not (0.0 < ff_val <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_val}")
+            _validate_forgetting_factor(forgetting_factor)
         eff_ff = forgetting_factor
         eff_reward_scale = 1.0
         if reward is not None:
-            r_val = float(reward)
-            if not math.isfinite(r_val):
-                raise ValueError("reward must be a finite number")
+            r_val = _validate_real_scalar(reward, "reward")
             if r_val <= 0.0:
                 skipped: Dict[str, Any] = {
                     "status": "skipped_non_positive_reward",
@@ -3142,7 +4222,9 @@ class SystemOneEngine:
                 return skipped
             eff_reward_scale = float(np.clip(r_val, 0.0, 1.0))
             if r_val != 1.0:
-                base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+                base_ff = _validate_forgetting_factor(
+                    forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+                )
                 eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
 
         resolved_target = target
@@ -3203,18 +4285,129 @@ class SystemOneEngine:
         """Exports the active engine state (weights, calibration, prototypes, overrides) as a CompiledSystemOneModel."""
         from system1.compiler import CompiledHeadWeights, CompiledSystemOneModel
 
+        def _checked_f32_copy(arr: Any, label: str) -> np.ndarray:
+            with np.errstate(over="ignore", invalid="ignore"):
+                arr_chk = _assert_real_numeric_array_like(arr, label)
+                arr_in = np.asarray(arr_chk)
+                if (
+                    arr_in.ndim == 2
+                    and arr_in.size > 0
+                    and (
+                        (not arr_in.flags["C_CONTIGUOUS"] and not arr_in.flags["F_CONTIGUOUS"])
+                        or int(arr_in.ctypes.data % 16) != 0
+                    )
+                ):
+                    from system1.core.model import _owned_readonly_array
+
+                    out = _owned_readonly_array(arr_in, dtype=np.float32)
+                else:
+                    out = np.array(arr_in, dtype=np.float32, copy=True, order="K")
+            if not bool(np.all(np.isfinite(out))):
+                raise ValueError(f"{label} must be finite in float32 for compiled export")
+            return out
+
+        def _checked_unit_prototypes(arr: Any, label: str) -> np.ndarray:
+            raw_p_chk = _assert_real_numeric_array_like(arr, label)
+            raw_p = np.asarray(raw_p_chk, dtype=np.float64)
+            if raw_p.ndim != 2 or not bool(np.all(np.isfinite(raw_p))):
+                raise ValueError(f"{label} must be finite 2D array for compiled export")
+            unit_p, _ = _normalize_rows_f32_safe(raw_p)
+            return unit_p
+
+        def _extract_validated_hierarchy(
+            h_obj: Any, fname: str, width: int
+        ) -> Tuple[
+            bool,
+            Tuple[int, ...],
+            Optional[np.ndarray],
+            Optional[np.ndarray],
+            Optional[np.ndarray],
+            Optional[np.ndarray],
+        ]:
+            is_h = bool(getattr(h_obj, "hierarchical", False))
+            if not is_h:
+                return False, (), None, None, None, None
+            raw_cw = getattr(h_obj, "coarse_weights", None)
+            raw_cb = getattr(h_obj, "coarse_biases", None)
+            raw_assign = getattr(h_obj, "cluster_assignments", ())
+            if raw_cw is None or raw_cb is None:
+                raise ValueError(
+                    f"Field head {fname!r} hierarchical weights missing coarse_weights/coarse_biases"
+                )
+            cw_arr = _checked_f32_copy(raw_cw, f"Head {fname!r} coarse_weights")
+            cb_arr = _checked_f32_copy(raw_cb, f"Head {fname!r} coarse_biases")
+            if (
+                cw_arr.ndim != 2
+                or cw_arr.shape[1] != self.dimension
+                or cb_arr.ndim != 1
+                or cb_arr.shape != (cw_arr.shape[0],)
+            ):
+                raise ValueError(f"Field head {fname!r} hierarchical coarse shape mismatch")
+            assign_t = tuple(int(c) for c in raw_assign)
+            if len(assign_t) != width or any(c < 0 or c >= cw_arr.shape[0] for c in assign_t):
+                raise ValueError(f"Field head {fname!r} invalid hierarchical cluster_assignments")
+            raw_fw = getattr(h_obj, "fine_weights", None)
+            raw_fb = getattr(h_obj, "fine_biases", None)
+            if (raw_fw is None) != (raw_fb is None):
+                raise ValueError(
+                    f"Field head {fname!r} fine_weights and fine_biases must both be provided or both be None"
+                )
+            fw_arr: Optional[np.ndarray] = None
+            fb_arr: Optional[np.ndarray] = None
+            if raw_fw is not None and raw_fb is not None:
+                fw_arr = _checked_f32_copy(raw_fw, f"Head {fname!r} fine_weights")
+                fb_arr = _checked_f32_copy(raw_fb, f"Head {fname!r} fine_biases")
+                if (
+                    fw_arr.ndim != 2
+                    or fw_arr.shape != (width, self.dimension)
+                    or fb_arr.ndim != 1
+                    or fb_arr.shape != (width,)
+                ):
+                    raise ValueError(f"Field head {fname!r} hierarchical fine shape mismatch")
+            return True, assign_t, cw_arr, cb_arr, fw_arr, fb_arr
+
         with self._lock, getattr(self.model, "_lock", nullcontext()):
             if isinstance(self.model, CompiledSystemOneModel):
                 for name, ch in self.model.heads.items():
                     if name in self.model._field_heads:
                         live_head = self.model._field_heads[name]
-                        ch.weights = live_head.weights
-                        ch.biases = live_head.biases
-                        ch.P = live_head.covariance_inv
-                        ch.B = live_head.cross_covariance
+                        f_def = self.schema.fields[name]
+                        _validate_head_weight_bias_shapes(
+                            f_def,
+                            np.asarray(live_head.weights),
+                            np.asarray(live_head.biases),
+                            self.dimension,
+                            name,
+                        )
+                        ch.weights = _checked_f32_copy(live_head.weights, f"Head {name!r} weights")
+                        ch.biases = _checked_f32_copy(live_head.biases, f"Head {name!r} biases")
+                        ch.P = (
+                            None
+                            if live_head.covariance_inv is None
+                            else _checked_f32_copy(live_head.covariance_inv, f"Head {name!r} P")
+                        )
+                        ch.B = (
+                            None
+                            if live_head.cross_covariance is None
+                            else _checked_f32_copy(live_head.cross_covariance, f"Head {name!r} B")
+                        )
                         ch.exemplar_state = live_head.export_exemplar_state()
+                        is_h, assign_t, cw_arr, cb_arr, fw_arr, fb_arr = _extract_validated_hierarchy(
+                            live_head, name, int(ch.weights.shape[0])
+                        )
+                        ch.hierarchical = is_h
+                        ch.cluster_assignments = assign_t
+                        ch.coarse_weights = cw_arr
+                        ch.coarse_biases = cb_arr
+                        ch.fine_weights = fw_arr
+                        ch.fine_biases = fb_arr
                     if name in self.calibrators:
                         ch.temperature = float(self.calibrators[name].temperature)
+                        ch.logit_adjustments = _validated_head_logit_adjustments(
+                            getattr(self.calibrators[name], "logit_adjustments", None),
+                            self.schema.fields.get(name),
+                            name,
+                        )
                     if name in self.conformal_predictors:
                         cp = self.conformal_predictors[name]
                         ch.score_method = cp.score_method
@@ -3225,7 +4418,7 @@ class SystemOneEngine:
                         ch.prototypes = (
                             None
                             if getattr(cp, "prototypes", None) is None
-                            else np.asarray(cp.prototypes, dtype=np.float32).copy()
+                            else _checked_unit_prototypes(cp.prototypes, f"Head {name!r} prototypes")
                         )
                         ch.prototype_scores = (
                             tuple(float(s) for s in cp.prototype_scores)
@@ -3255,14 +4448,20 @@ class SystemOneEngine:
                             ch.calibration_scores = tuple(float(s) for s in rcp.residuals)
                             n_res = len(rcp.residuals)
                             k_res = int(math.ceil((n_res + 1) * (1.0 - self.default_alpha)))
-                            val_range = float(rcp.max_value - rcp.min_value)
+                            val_range = _score_full_span_clamped(rcp.min_value, rcp.max_value)
                             ch.conformal_quantile = val_range if k_res > n_res else float(rcp.residuals[k_res - 1])
                         elif not rcp.is_calibrated:
                             ch.calibration_scores = ()
                             ch.conformal_quantile = 0.0
                 if getattr(self, "_learned_prompt_overrides", None):
+                    eng_ov_rec = getattr(self, "_learned_prompt_override_recency", {})
                     for p_k, f_map in self._learned_prompt_overrides.items():
-                        self.model._learned_prompt_overrides.setdefault(p_k, {}).update(f_map)
+                        if isinstance(f_map, Mapping) and f_map:
+                            self.model._learned_prompt_overrides.setdefault(p_k, {}).update(f_map)
+                            if isinstance(eng_ov_rec, Mapping) and p_k in eng_ov_rec:
+                                self.model._learned_prompt_override_recency[p_k] = bool(eng_ov_rec[p_k])
+                            elif p_k not in self.model._learned_prompt_override_recency:
+                                self.model._learned_prompt_override_recency[p_k] = bool(self.recency_weighted)
                 self.model.metadata["strict_mode"] = bool(self.strict_mode)
                 self.model.metadata["default_alpha"] = float(self.default_alpha)
                 return self.model
@@ -3276,6 +4475,15 @@ class SystemOneEngine:
                 rcp = self.regression_conformal_predictors.get(name)
 
                 temp = float(calibrator.temperature) if calibrator is not None else 1.0
+                logit_adj = (
+                    _validated_head_logit_adjustments(
+                        getattr(calibrator, "logit_adjustments", None),
+                        f_def,
+                        name,
+                    )
+                    if calibrator is not None
+                    else None
+                )
                 calib_scores: Tuple[float, ...] = ()
                 conf_q = 0.0
                 score_method = "aps"
@@ -3294,7 +4502,7 @@ class SystemOneEngine:
                     fam_thresh = float(cp.familiarity_threshold)
                     proto_thresh = float(cp.prototype_threshold)
                     if getattr(cp, "prototypes", None) is not None:
-                        proto_mat = np.asarray(cp.prototypes, dtype=np.float32).copy()
+                        proto_mat = _checked_unit_prototypes(cp.prototypes, f"Head {name!r} prototypes")
                     if getattr(cp, "prototype_scores", None) is not None and len(cp.prototype_scores) > 0:
                         proto_scores = tuple(float(s) for s in cp.prototype_scores)
                     if cp.is_calibrated and len(cp.calibration_scores) > 0:
@@ -3313,7 +4521,7 @@ class SystemOneEngine:
                         calib_scores = tuple(float(s) for s in rcp.residuals)
                         n_res = len(rcp.residuals)
                         k_res = int(math.ceil((n_res + 1) * (1.0 - self.default_alpha)))
-                        val_range = float(rcp.max_value - rcp.min_value)
+                        val_range = _score_full_span_clamped(rcp.min_value, rcp.max_value)
                         conf_q = val_range if k_res > n_res else float(rcp.residuals[k_res - 1])
 
                 opts: Tuple[str, ...]
@@ -3324,16 +4532,25 @@ class SystemOneEngine:
                 else:
                     opts = ()
 
+                w_export = _checked_f32_copy(head.weights, f"Head {name!r} weights")
+                b_export = _checked_f32_copy(head.biases, f"Head {name!r} biases")
+                _validate_head_weight_bias_shapes(f_def, w_export, b_export, self.dimension, name)
+                raw_p = getattr(head, "covariance_inv", None)
+                raw_b_cov = getattr(head, "cross_covariance", None)
+                is_h, assign_t, cw_arr, cb_arr, fw_arr, fb_arr = _extract_validated_hierarchy(
+                    head, name, int(w_export.shape[0])
+                )
                 compiled_heads[name] = CompiledHeadWeights(
                     field_name=name,
                     field_type=f_def.field_type,
-                    weights=np.asarray(head.weights, dtype=np.float32).copy(),
-                    biases=np.asarray(head.biases, dtype=np.float32).copy(),
+                    weights=w_export,
+                    biases=b_export,
                     temperature=temp,
+                    logit_adjustments=logit_adj,
                     conformal_quantile=conf_q,
                     options=opts,
-                    P=getattr(head, "covariance_inv", None),
-                    B=getattr(head, "cross_covariance", None),
+                    P=None if raw_p is None else _checked_f32_copy(raw_p, f"Head {name!r} P"),
+                    B=None if raw_b_cov is None else _checked_f32_copy(raw_b_cov, f"Head {name!r} B"),
                     margin_threshold=eff_head_margin,
                     forgetting_factor=float(self.forgetting_factor),
                     relative_odds_ratio=float(self.relative_odds_ratio if self.relative_odds_ratio is not None else 1.5),
@@ -3347,12 +4564,12 @@ class SystemOneEngine:
                     prototypes=proto_mat,
                     prototype_threshold=proto_thresh,
                     prototype_scores=proto_scores,
-                    hierarchical=bool(getattr(head, "hierarchical", False)),
-                    cluster_assignments=tuple(getattr(head, "cluster_assignments", ())),
-                    coarse_weights=getattr(head, "coarse_weights", None),
-                    coarse_biases=getattr(head, "coarse_biases", None),
-                    fine_weights=getattr(head, "fine_weights", None),
-                    fine_biases=getattr(head, "fine_biases", None),
+                    hierarchical=is_h,
+                    cluster_assignments=assign_t,
+                    coarse_weights=cw_arr,
+                    coarse_biases=cb_arr,
+                    fine_weights=fw_arr,
+                    fine_biases=fb_arr,
                     exemplar_state=head.export_exemplar_state(),
                 )
 
@@ -3370,14 +4587,161 @@ class SystemOneEngine:
                 forgetting_factor=self.forgetting_factor,
                 recency_weighted=self.recency_weighted,
             )
-            if getattr(self, "_learned_prompt_overrides", None):
-                for p_k, f_map in self._learned_prompt_overrides.items():
-                    compiled._learned_prompt_overrides[p_k] = dict(f_map)
+            for src_obj in (self.model, self):
+                src_ov = getattr(src_obj, "_learned_prompt_overrides", None)
+                src_rec = getattr(src_obj, "_learned_prompt_override_recency", {})
+                src_def_rec = bool(getattr(src_obj, "recency_weighted", self.recency_weighted))
+                if isinstance(src_ov, Mapping):
+                    for p_k, f_map in src_ov.items():
+                        if isinstance(f_map, Mapping) and f_map:
+                            compiled._learned_prompt_overrides.setdefault(p_k, {}).update(f_map)
+                            if isinstance(src_rec, Mapping) and p_k in src_rec:
+                                compiled._learned_prompt_override_recency[p_k] = bool(src_rec[p_k])
+                            elif p_k not in compiled._learned_prompt_override_recency:
+                                compiled._learned_prompt_override_recency[p_k] = src_def_rec
             return compiled
 
-    def to_bytes(self, include_covariance: bool = False, *, compact: Optional[bool] = None) -> bytes:
+    def _packed_kernel_cache_key(self, storage_mode: str) -> Tuple[Any, ...]:
+        aci_obj = getattr(self, "aci_tracker", None)
+        eff_alpha = float(aci_obj.alpha_t) if aci_obj is not None else float(self.default_alpha)
+        return _compute_engine_inference_signature(self, storage_mode, effective_alpha=eff_alpha)
+
+    def compile_packed_kernel(self, *, storage_mode: str = "float32") -> PackedMultiQuestionKernel:
+        """Compiles and caches a fused multi-question inference kernel for this engine."""
+        model = getattr(self, "model", None)
+        model_lock = getattr(model, "_lock", nullcontext()) if model is not None else nullcontext()
+        with self._lock, model_lock:
+            _validate_packed_engine_support(self)
+            aci_tracker = getattr(self, "aci_tracker", None)
+            raw_alpha = aci_tracker.alpha_t if aci_tracker is not None else self.default_alpha
+            if (
+                isinstance(raw_alpha, bool)
+                or not isinstance(raw_alpha, (int, float))
+                or not math.isfinite(float(raw_alpha))
+                or not (0.0 < float(raw_alpha) < 1.0)
+            ):
+                raise ValueError(f"alpha must be in (0, 1), got {raw_alpha!r}")
+            captured_alpha = float(raw_alpha)
+            cache_key = _compute_engine_inference_signature(
+                self, storage_mode, effective_alpha=captured_alpha
+            )
+            cached = getattr(self, "_packed_kernel_cache", None)
+            if (
+                cached is not None
+                and cached[0] == cache_key
+                and cached[1].alpha == captured_alpha
+            ):
+                return cached[1]
+            kernel = PackedMultiQuestionKernel.from_engine(
+                self,
+                storage_mode=storage_mode,
+                alpha=captured_alpha,
+            )
+            if kernel.alpha != captured_alpha:
+                raise ValueError(
+                    f"PackedMultiQuestionKernel alpha mismatch: expected {captured_alpha}, got {kernel.alpha}"
+                )
+            kernel._inference_sig = cache_key
+            self._packed_kernel_cache = (cache_key, kernel)
+            return kernel
+
+    def compile_callable(self, *, storage_mode: str = "float32") -> FastDecisionCallable:
+        """Returns a zero-overhead decision callable backed by a packed multi-question kernel."""
+        return FastDecisionCallable(self, storage_mode=storage_mode)
+
+    def explain(
+        self,
+        prompt: str,
+        field_name: Optional[str] = None,
+        *,
+        include_counterfactual: bool = True,
+        train_texts: Optional[Sequence[str]] = None,
+        train_labels: Optional[Sequence[Any]] = None,
+    ) -> Any:
+        """Returns additive token attributions, exemplar witnesses, and counterfactual flips."""
+        if not isinstance(prompt, str):
+            raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
+        from system1.explain import FastExplainer, _canonical_explain_field
+
+        resolved_field = _canonical_explain_field(self.schema, field_name)
+        if self.auto_reload and self.model_path is not None:
+            self.reload_if_changed()
+        with self._lock:
+            model = getattr(self, "model", None)
+            if _has_custom_validate_decision(self.schema) or _has_custom_validate_decision(
+                getattr(model, "schema", None)
+            ):
+                raise ValueError(
+                    "FastExplainer does not support custom DecisionSchema.validate_decision"
+                )
+            if getattr(self, "joint_calibrator", None) is not None:
+                raise ValueError(
+                    "FastExplainer does not support engines with active joint_calibrator"
+                )
+            if train_texts is None and train_labels is None:
+                cache_key = self._packed_kernel_cache_key("float32")
+                cached = self._explainer_cache.get(resolved_field)
+                if cached is not None and cached[0] == cache_key:
+                    explainer = cached[1]
+                else:
+                    explainer = FastExplainer.from_engine(self, resolved_field)
+                    self._explainer_cache[resolved_field] = (cache_key, explainer)
+            else:
+                explainer = FastExplainer.from_engine(
+                    self,
+                    resolved_field,
+                    train_texts=train_texts,
+                    train_labels=train_labels,
+                )
+        return explainer.explain(prompt, include_counterfactual=include_counterfactual)
+
+    def explain_all(
+        self,
+        prompt: str,
+        *,
+        include_counterfactual: bool = True,
+    ) -> Dict[str, Any]:
+        """Explains every ChoiceField and BooleanField in the schema for one prompt."""
+        if not isinstance(prompt, str):
+            raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
+        return {
+            name: self.explain(prompt, name, include_counterfactual=include_counterfactual)
+            for name, f_def in self.schema.fields.items()
+            if isinstance(f_def, (ChoiceField, BooleanField))
+        }
+
+    def close(self) -> None:
+        """Releases any memory-mapped resources held by the underlying model."""
+        with self._lock:
+            self._packed_kernel_cache = None
+            if hasattr(self, "_explainer_cache"):
+                self._explainer_cache.clear()
+            model = getattr(self, "model", None)
+            close_fn = getattr(model, "close", None)
+            if callable(close_fn):
+                close_fn()
+
+    def __enter__(self) -> SystemOneEngine:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def to_bytes(
+        self,
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
+    ) -> bytes:
         """Serializes the engine's model and calibration state into compact .s1m binary bytes."""
-        return self.to_compiled_model().to_bytes(include_covariance=include_covariance, compact=compact)
+        return self.to_compiled_model().to_bytes(
+            include_covariance=include_covariance,
+            compact=compact,
+            format_version=format_version,
+            embed_vocab=embed_vocab,
+        )
 
     def save(
         self,
@@ -3385,9 +4749,17 @@ class SystemOneEngine:
         include_covariance: bool = False,
         *,
         compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
     ) -> None:
         """Saves the engine's model, calibration, and online state to a portable .s1m file."""
-        self.to_compiled_model().save(path, include_covariance=include_covariance, compact=compact)
+        self.to_compiled_model().save(
+            path,
+            include_covariance=include_covariance,
+            compact=compact,
+            format_version=format_version,
+            embed_vocab=embed_vocab,
+        )
 
     @classmethod
     def from_bytes(
@@ -3433,6 +4805,7 @@ class SystemOneEngine:
         schema: Optional[Union[DecisionSchema, Type[DecisionSchema]]] = None,
         projector: Optional[Any] = None,
         backend: str = "auto",
+        mmap_mode: bool = True,
         **kwargs: Any,
     ) -> SystemOneEngine:
         """Loads a SystemOneEngine directly from a saved .s1m file."""
@@ -3442,6 +4815,7 @@ class SystemOneEngine:
             path,
             projector=projector,
             backend="numpy" if backend == "auto" else backend,
+            mmap_mode=mmap_mode,
         )
         if "strict_mode" not in kwargs:
             kwargs["strict_mode"] = (
@@ -3550,18 +4924,27 @@ class SystemOneEngine:
 
             proj_obj = getattr(self.model, "projector", self.projector)
             is_tfidf_proj = isinstance(proj_obj, TfidfProjector)
+            zero_unit0 = _model_zero_unit0(self.model, proj_obj)
+            is_hybrid_proj = isinstance(proj_obj, HybridProjector)
             schema_name = self.schema.schema_name
             schema_digest = self.schema.schema_digest()
-            custom_validate = type(self.schema).validate_decision is not DecisionSchema.validate_decision
+            custom_validate = _has_custom_validate_decision(self.schema)
 
             online_bank_map = getattr(self.model, "_online_prototype_bank", {})
             model_field_heads = getattr(self.model, "_field_heads", {})
-            needs_raw_norm = any(
-                float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
-                for cp in self.conformal_predictors.values()
-            ) or any(
-                float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
-                for ch in getattr(self.model, "heads", {}).values()
+            needs_raw_norm = (
+                any(
+                    float(getattr(cp, "familiarity_threshold", 0.0)) > 0.0
+                    for cp in self.conformal_predictors.values()
+                )
+                or any(
+                    float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                    for ch in getattr(self.model, "heads", {}).values()
+                )
+                or any(
+                    float(getattr(ch, "familiarity_threshold", 0.0)) > 0.0
+                    for ch in model_field_heads.values()
+                )
             )
             sel_cals = getattr(self, "selective_calibrators", {}) or {}
             aci = getattr(self, "aci_tracker", None)
@@ -3570,86 +4953,157 @@ class SystemOneEngine:
 
             field_specs: List[Dict[str, Any]] = []
             for fname, f_def in self.schema.fields.items():
-                head = self.model.heads[fname]
+                head, meta_head = _resolve_authoritative_head(self.model, fname)
                 calibrator = self.calibrators[fname]
                 conformal = self.conformal_predictors.get(fname)
                 is_bool = isinstance(f_def, BooleanField)
                 options = ("False", "True") if is_bool else tuple(f_def.options)
                 k_opts = len(options)
 
-                w_mat = np.asarray(head.weights, dtype=np.float32)
-                b_vec = np.asarray(head.biases, dtype=np.float32).reshape(-1)
+                raw_w_arr = np.asarray(head.weights)
+                raw_b_arr = np.asarray(head.biases)
+                _validate_head_weight_bias_shapes(f_def, raw_w_arr, raw_b_arr, self.dimension, fname)
+                raw_w_arr = _coerce_inference_array_f32_or_f64(
+                    raw_w_arr, f"Field head {fname!r} weights", active_first_only=is_bool
+                )
+                raw_b_arr = _coerce_inference_array_f32_or_f64(
+                    raw_b_arr, f"Field head {fname!r} biases", active_first_only=is_bool
+                )
+                _validate_2d_layout_cloneable(
+                    raw_w_arr,
+                    np.dtype(raw_w_arr.dtype if raw_w_arr.dtype in (np.float32, np.float64) else np.float32),
+                )
+                raw_w_val = raw_w_arr[:1] if is_bool else raw_w_arr
+                raw_b_val = raw_b_arr[:1] if is_bool else raw_b_arr
+                if not (np.all(np.isfinite(raw_w_val)) and np.all(np.isfinite(raw_b_val))):
+                    raise ValueError(f"Field head {fname!r} contains non-finite weights or biases")
+                with np.errstate(over="ignore", invalid="ignore"):
+                    if raw_w_arr.dtype not in (np.float32, np.float64):
+                        raw_w_arr = raw_w_arr.astype(np.float32)
+                    if raw_b_arr.dtype not in (np.float32, np.float64):
+                        raw_b_arr = raw_b_arr.astype(np.float32)
+                    w_mat = np.asarray(raw_w_arr[:1] if is_bool else raw_w_arr, dtype=np.float32)
+                    b_vec = np.asarray(raw_b_arr[:1] if is_bool else raw_b_arr, dtype=np.float32)
 
                 cluster_assign_raw = getattr(head, "cluster_assignments", ()) or ()
-                is_hier = bool(
-                    not is_bool
-                    and getattr(head, "hierarchical", False)
-                    and getattr(head, "coarse_weights", None) is not None
-                    and getattr(head, "coarse_biases", None) is not None
-                    and len(cluster_assign_raw) == w_mat.shape[0]
-                )
-                coarse_w = np.asarray(head.coarse_weights, dtype=np.float32) if is_hier else None
-                coarse_b = np.asarray(head.coarse_biases, dtype=np.float32).reshape(-1) if is_hier else None
-                fine_w = (
-                    np.asarray(head.fine_weights, dtype=np.float32)
-                    if is_hier and getattr(head, "fine_weights", None) is not None
-                    else None
-                )
-                fine_b = (
-                    np.asarray(head.fine_biases, dtype=np.float32).reshape(-1)
-                    if is_hier and getattr(head, "fine_biases", None) is not None
-                    else None
-                )
-                cluster_assign = np.asarray(cluster_assign_raw, dtype=np.int64) if is_hier else None
+                is_hier = bool(not is_bool and getattr(head, "hierarchical", False))
+                raw_coarse_w: Optional[np.ndarray] = None
+                raw_coarse_b: Optional[np.ndarray] = None
+                raw_fine_w: Optional[np.ndarray] = None
+                raw_fine_b: Optional[np.ndarray] = None
+                coarse_w: Optional[np.ndarray] = None
+                coarse_b: Optional[np.ndarray] = None
+                fine_w: Optional[np.ndarray] = None
+                fine_b: Optional[np.ndarray] = None
+                cluster_assign: Optional[np.ndarray] = None
+                if is_hier:
+                    if getattr(head, "coarse_weights", None) is None or getattr(head, "coarse_biases", None) is None:
+                        raise ValueError(
+                            f"Field head {fname!r} hierarchical weights missing coarse_weights/coarse_biases"
+                        )
+                    raw_coarse_w = _coerce_inference_array_f32_or_f64(
+                        head.coarse_weights, f"Field head {fname!r} hierarchical coarse weights"
+                    )
+                    raw_coarse_b = _coerce_inference_array_f32_or_f64(
+                        head.coarse_biases, f"Field head {fname!r} hierarchical coarse biases"
+                    )
+                    if raw_coarse_b.ndim != 1:
+                        raise ValueError(f"Field head {fname!r} coarse_biases must be 1D, got shape {raw_coarse_b.shape}")
+                    if not (np.all(np.isfinite(raw_coarse_w)) and np.all(np.isfinite(raw_coarse_b))):
+                        raise ValueError(f"Field head {fname!r} contains non-finite hierarchical coarse weights")
+                    cluster_assign = np.asarray(cluster_assign_raw, dtype=np.int64)
+                    if (
+                        raw_coarse_w.ndim != 2
+                        or raw_coarse_w.shape[0] < 1
+                        or raw_coarse_w.shape[1] != self.dimension
+                        or raw_coarse_b.shape != (raw_coarse_w.shape[0],)
+                        or cluster_assign.ndim != 1
+                        or cluster_assign.size != raw_w_arr.shape[0]
+                        or (
+                            cluster_assign.size > 0
+                            and np.any((cluster_assign < 0) | (cluster_assign >= raw_coarse_w.shape[0]))
+                        )
+                    ):
+                        raise ValueError(f"Field head {fname!r} has invalid hierarchical cluster configuration")
+                    _validate_2d_layout_cloneable(raw_coarse_w, np.dtype(raw_coarse_w.dtype))
+                    has_fw = getattr(head, "fine_weights", None) is not None
+                    has_fb = getattr(head, "fine_biases", None) is not None
+                    if has_fw != has_fb:
+                        raise ValueError(
+                            f"Field head {fname!r} fine_weights and fine_biases must both be provided or both be None"
+                        )
+                    if has_fw and has_fb:
+                        raw_fine_w = _coerce_inference_array_f32_or_f64(
+                            head.fine_weights, f"Field head {fname!r} hierarchical fine weights"
+                        )
+                        raw_fine_b = _coerce_inference_array_f32_or_f64(
+                            head.fine_biases, f"Field head {fname!r} hierarchical fine biases"
+                        )
+                        if raw_fine_b.ndim != 1:
+                            raise ValueError(f"Field head {fname!r} fine_biases must be 1D, got shape {raw_fine_b.shape}")
+                        if (
+                            raw_fine_w.ndim != 2
+                            or raw_fine_w.shape != (raw_w_arr.shape[0], self.dimension)
+                            or raw_fine_b.shape != (raw_w_arr.shape[0],)
+                        ):
+                            raise ValueError(f"Field head {fname!r} hierarchical fine tensor shape mismatch")
+                        _validate_2d_layout_cloneable(raw_fine_w, np.dtype(raw_fine_w.dtype))
+                        if not (np.all(np.isfinite(raw_fine_w)) and np.all(np.isfinite(raw_fine_b))):
+                            raise ValueError(f"Field head {fname!r} contains non-finite hierarchical fine weights")
+                    coarse_w = raw_coarse_w
+                    coarse_b = raw_coarse_b
+                    fine_w = raw_fine_w
+                    fine_b = raw_fine_b
 
                 fam_t = max(
                     float(getattr(head, "familiarity_threshold", 0.0)),
+                    float(getattr(meta_head, "familiarity_threshold", 0.0)) if meta_head is not None else 0.0,
                     float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0,
                 )
                 proto_t = max(
                     float(getattr(head, "prototype_threshold", 0.0)),
+                    float(getattr(meta_head, "prototype_threshold", 0.0)) if meta_head is not None else 0.0,
                     float(getattr(conformal, "prototype_threshold", 0.0)) if conformal is not None else 0.0,
                 )
 
                 proto_chunks: List[np.ndarray] = []
                 head_protos = getattr(head, "prototypes", None)
-                if head_protos is not None and np.ndim(head_protos) == 2 and head_protos.shape[1] == self.dimension:
-                    hp = np.asarray(head_protos, dtype=np.float32)
-                    hnorms = np.linalg.norm(hp, axis=1, keepdims=True)
-                    hvalid = (hnorms[:, 0] > 1e-12) & np.isfinite(hnorms[:, 0])
-                    if np.any(hvalid):
-                        proto_chunks.append((hp[hvalid] / hnorms[hvalid]).astype(np.float32))
-                if not proto_chunks and conformal is not None and getattr(conformal, "prototypes", None) is not None:
-                    cp_p = np.asarray(conformal.prototypes, dtype=np.float32)
-                    if cp_p.ndim == 2 and cp_p.shape[1] == self.dimension:
-                        cnorms = np.linalg.norm(cp_p, axis=1, keepdims=True)
-                        cvalid = (cnorms[:, 0] > 1e-12) & np.isfinite(cnorms[:, 0])
-                        if np.any(cvalid):
-                            proto_chunks.append((cp_p[cvalid] / cnorms[cvalid]).astype(np.float32))
-                if head_protos is not None and online_bank_map:
-                    bank = online_bank_map.get(fname)
-                    if bank:
-                        bank_arr = [
-                            np.asarray(s, dtype=np.float32).flatten()
-                            for s in bank
-                            if np.asarray(s).size == self.dimension
-                        ]
-                        if bank_arr:
-                            proto_chunks.append(np.stack(bank_arr, axis=0))
-                if head_protos is not None and model_field_heads:
-                    mfh = model_field_heads.get(fname)
-                    shots_p = getattr(mfh, "_online_shots_p", None) if mfh is not None else None
-                    if shots_p:
-                        shot_vecs: List[np.ndarray] = []
-                        for grp in shots_p:
-                            for s in grp:
-                                s_arr = np.asarray(s, dtype=np.float32).flatten()
-                                if s_arr.shape[0] == self.dimension:
-                                    sn = float(np.linalg.norm(s_arr))
-                                    if sn > 1e-12:
-                                        shot_vecs.append((s_arr / sn).astype(np.float32))
-                        if shot_vecs:
-                            proto_chunks.append(np.stack(shot_vecs, axis=0))
+                if head_protos is None and meta_head is not None:
+                    head_protos = getattr(meta_head, "prototypes", None)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    if head_protos is not None and np.ndim(head_protos) == 2 and head_protos.shape[1] == self.dimension:
+                        hp_unit, hvalid = _normalize_rows_f32_safe(head_protos)
+                        if np.any(hvalid):
+                            proto_chunks.append(hp_unit[hvalid])
+                    if not proto_chunks and conformal is not None and getattr(conformal, "prototypes", None) is not None:
+                        if np.ndim(conformal.prototypes) == 2 and conformal.prototypes.shape[1] == self.dimension:
+                            cp_unit, cvalid = _normalize_rows_f32_safe(conformal.prototypes)
+                            if np.any(cvalid):
+                                proto_chunks.append(cp_unit[cvalid])
+                    if head_protos is not None and online_bank_map:
+                        bank = online_bank_map.get(fname)
+                        if bank:
+                            bank_arr = [
+                                np.asarray(s, dtype=np.float32).flatten()
+                                for s in bank
+                                if np.asarray(s).size == self.dimension
+                            ]
+                            if bank_arr:
+                                proto_chunks.append(np.stack(bank_arr, axis=0))
+                    if head_protos is not None and model_field_heads:
+                        mfh = model_field_heads.get(fname)
+                        shots_p = getattr(mfh, "_online_shots_p", None) if mfh is not None else None
+                        if shots_p:
+                            shot_vecs: List[np.ndarray] = []
+                            for grp in shots_p:
+                                for s in grp:
+                                    s_raw = np.asarray(s).ravel()
+                                    if s_raw.shape[0] == self.dimension:
+                                        s_unit, _, s_valid = _normalize_vec_f32_safe(s_raw)
+                                        if s_valid:
+                                            shot_vecs.append(s_unit)
+                            if shot_vecs:
+                                proto_chunks.append(np.stack(shot_vecs, axis=0))
                 protos_unit = np.concatenate(proto_chunks, axis=0) if proto_chunks else None
 
                 cp_fam_t = float(getattr(conformal, "familiarity_threshold", 0.0)) if conformal is not None else 0.0
@@ -3705,11 +5159,17 @@ class SystemOneEngine:
                         "escalate": bool(getattr(f_def, "escalate_on_ambiguity", True)),
                         "w": w_mat,
                         "b": b_vec,
+                        "raw_w": raw_w_arr,
+                        "raw_b": raw_b_arr,
                         "is_hier": is_hier,
                         "coarse_w": coarse_w,
                         "coarse_b": coarse_b,
                         "fine_w": fine_w,
                         "fine_b": fine_b,
+                        "raw_coarse_w": raw_coarse_w,
+                        "raw_coarse_b": raw_coarse_b,
+                        "raw_fine_w": raw_fine_w,
+                        "raw_fine_b": raw_fine_b,
                         "cluster_assign": cluster_assign,
                         "calibrator": calibrator,
                         "conformal": conformal,
@@ -3738,40 +5198,42 @@ class SystemOneEngine:
                 t_chunk_start = time.perf_counter()
 
                 raw_norms_arr: Optional[np.ndarray] = None
-                if needs_raw_norm:
-                    try:
-                        proj_ret = proj_obj.project_batch(
-                            chunk_prompts, recency_weighted=recency_flag, return_norms=True
-                        )
-                    except TypeError:
-                        proj_ret = proj_obj.project_batch(chunk_prompts, return_norms=True)
-                    if isinstance(proj_ret, tuple):
-                        X_raw, raw_norms_arr = proj_ret
-                        raw_norms_arr = np.asarray(raw_norms_arr, dtype=np.float64).reshape(-1)
+                enc_rows: List[np.ndarray] = []
+                rn_list: Optional[List[float]] = [] if needs_raw_norm else None
+                has_model_encode_with_norm = hasattr(self.model, "_encode_with_norm")
+                any_rn_observed = False
+                for p in chunk_prompts:
+                    if has_model_encode_with_norm:
+                        emb_p, rn_p = self.model._encode_with_norm(p, recency_weighted=recency_flag)
                     else:
-                        X_raw = proj_ret
-                        if hasattr(proj_obj, "raw_norm"):
-                            raw_norms_arr = np.array(
-                                [float(proj_obj.raw_norm(p)) for p in chunk_prompts], dtype=np.float64
+                        emb_p = self.model.encode(p, recency_weighted=recency_flag)
+                        rn_p = None
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        enc_rows.append(np.asarray(emb_p, dtype=np.float32).ravel())
+                    if rn_list is not None:
+                        if rn_p is None:
+                            rn_p = _extract_prompt_raw_norm(
+                                None, p, proj_obj, recency_flag=recency_flag
                             )
-                else:
-                    try:
-                        X_raw = proj_obj.project_batch(chunk_prompts, recency_weighted=recency_flag)
-                    except TypeError:
-                        X_raw = proj_obj.project_batch(chunk_prompts)
-
-                X_arr = np.asarray(X_raw, dtype=np.float32)
-                norms = np.linalg.norm(X_arr, axis=1, keepdims=True)
-                good = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
-                X = np.zeros((m_docs, self.dimension), dtype=np.float32)
-                if np.any(good):
-                    X[good] = (X_arr[good] / norms[good]).astype(np.float32)
+                        if rn_p is not None:
+                            any_rn_observed = True
+                        rn_list.append(float(rn_p) if rn_p is not None else float("nan"))
+                X = np.stack(enc_rows, axis=0).astype(np.float32, copy=False)
+                if rn_list is not None and (
+                    callable(getattr(proj_obj, "raw_norm", None))
+                    or callable(getattr(proj_obj, "project_with_norm", None))
+                    or any_rn_observed
+                ):
+                    raw_norms_arr = np.asarray(rn_list, dtype=np.float64)
+                nonfin_rows = ~np.all(np.isfinite(X), axis=1)
+                x_inf_chunk = np.max(
+                    np.abs(np.where(np.isfinite(X), X, 0.0)), axis=1
+                ).astype(np.float64)
                 if is_tfidf_proj:
-                    zero_emb_mask = ~good
+                    zero_emb_mask = (~nonfin_rows) & (~np.any(X, axis=1))
                 else:
-                    if np.any(~good):
-                        X[~good, 0] = 1.0
                     zero_emb_mask = np.zeros(m_docs, dtype=bool)
+                row_any_nonfin = nonfin_rows.copy()
 
                 row_values: List[Dict[str, Any]] = [{} for _ in range(m_docs)]
                 row_confs: List[Dict[str, float]] = [{} for _ in range(m_docs)]
@@ -3799,57 +5261,289 @@ class SystemOneEngine:
                     calibrator = spec["calibrator"]
                     conformal = spec["conformal"]
 
-                    logits = X @ spec["w"].T + spec["b"]
-                    if spec["is_hier"]:
-                        coarse_logits = X @ spec["coarse_w"].T + spec["coarse_b"]
-                        c_scaled = coarse_logits.astype(np.float64) / 0.25
-                        c_scaled -= np.max(c_scaled, axis=1, keepdims=True)
-                        c_exp = np.exp(c_scaled)
-                        coarse_probs = c_exp / np.sum(c_exp, axis=1, keepdims=True)
-                        assign = spec["cluster_assign"]
-                        mapped_coarse = coarse_logits[:, assign]
-                        if spec["fine_w"] is not None and spec["fine_b"] is not None:
-                            spec_logits = X @ spec["fine_w"].T + spec["fine_b"]
-                            mapped_probs = coarse_probs[:, assign]
-                            logits = (
-                                0.65 * logits
-                                + (0.20 + 0.30 * mapped_probs) * spec_logits
-                                + 0.20 * mapped_coarse
-                            ).astype(np.float32)
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        if spec["is_hier"]:
+                            has_f64_h = any(
+                                arr is not None and arr.dtype == np.float64
+                                for arr in (
+                                    spec["raw_w"],
+                                    spec["raw_b"],
+                                    spec["raw_coarse_w"],
+                                    spec["raw_coarse_b"],
+                                    spec["raw_fine_w"],
+                                    spec["raw_fine_b"],
+                                )
+                            )
+                            logits = np.full(
+                                (m_docs, k_opts),
+                                np.nan,
+                                dtype=np.float64 if has_f64_h else np.float32,
+                            )
+                            for r_i in range(m_docs):
+                                if nonfin_rows[r_i]:
+                                    continue
+                                x_ex = X[r_i : r_i + 1]
+                                base_ex = x_ex @ spec["raw_w"].T + spec["raw_b"]
+                                hier_ex = _compute_hierarchical_logits_np(
+                                    x_ex,
+                                    base_ex,
+                                    spec["raw_coarse_w"],
+                                    spec["raw_coarse_b"],
+                                    spec["cluster_assign"],
+                                    spec["raw_fine_w"],
+                                    spec["raw_fine_b"],
+                                )
+                                logits[r_i] = hier_ex[0]
                         else:
-                            logits = (0.80 * logits + 0.20 * mapped_coarse).astype(np.float32)
+                            logits = X @ spec["w"].T + spec["b"]
 
-                    if spec["is_bool"]:
-                        z_col = logits[:, 0].astype(np.float64) / 0.25
-                        two_logits = np.column_stack([-z_col / 2.0, z_col / 2.0])
-                        probs = calibrator.calibrate_logits(two_logits)
-                        if probs.ndim == 1:
-                            probs = probs.reshape(1, -1)
-                        p_true = probs[:, 1]
-                        b_vals = p_true >= spec["bool_threshold"]
-                        confs = np.where(b_vals, p_true, 1.0 - p_true)
-                        for i in range(m_docs):
-                            pt = float(p_true[i])
-                            row_values[i][fname] = bool(b_vals[i])
-                            row_confs[i][fname] = float(confs[i])
-                            row_probs[i][fname] = {"False": float(probs[i, 0]), "True": pt}
-                    else:
-                        probs = calibrator.calibrate_logits(logits.astype(np.float64) / 0.25)
-                        if probs.ndim == 1:
-                            probs = probs.reshape(1, -1)
-                        best_idx = np.argmax(probs, axis=1)
-                        confs = probs[np.arange(m_docs), best_idx]
-                        for i in range(m_docs):
-                            bi = int(best_idx[i])
-                            prow = probs[i]
-                            row_values[i][fname] = options[bi]
-                            row_confs[i][fname] = float(confs[i])
-                            row_probs[i][fname] = {opt: float(prow[j]) for j, opt in enumerate(options)}
+                        if not spec["is_hier"]:
+                            raw_w_s = np.asarray(spec["raw_w"], dtype=np.float64)
+                            raw_b_s = np.asarray(spec["raw_b"], dtype=np.float64)
+                            w_l1 = (
+                                float(np.sum(np.abs(raw_w_s[0])))
+                                if spec["is_bool"]
+                                else (float(np.max(np.sum(np.abs(raw_w_s), axis=1))) if raw_w_s.size else 0.0)
+                            )
+                            b_abs = (
+                                abs(float(raw_b_s.ravel()[0]))
+                                if (spec["is_bool"] and raw_b_s.size)
+                                else (float(np.max(np.abs(raw_b_s))) if raw_b_s.size else 0.0)
+                            )
+                            l1_mag = x_inf_chunk * w_l1 + b_abs
+                            pot_ovf_rows = (~np.isfinite(l1_mag)) | (l1_mag >= 1e37)
+                            dz_bound = (
+                                4.0
+                                * (float(self.dimension) + 4.0)
+                                * float(np.finfo(np.float32).eps)
+                                * l1_mag
+                            )
+                            temp_est = max(1e-12, abs(float(getattr(calibrator, "temperature", 1.0))))
+                            dp_bound = np.minimum(1.0, (dz_bound / 0.25) / temp_est + 1e-6)
+                        else:
+                            pot_ovf_rows = np.zeros(m_docs, dtype=bool)
+                            dz_bound = np.empty(0, dtype=np.float64)
+                            dp_bound = np.empty(0, dtype=np.float64)
+
+                        if spec["is_bool"]:
+                            z_col = logits[:, 0].astype(np.float64) / 0.25
+                            raw_logits_nonfin = (~np.isfinite(logits[:, 0])) | (~np.isfinite(z_col))
+                            two_logits = np.column_stack([-z_col / 2.0, z_col / 2.0])
+                            probs = calibrator.calibrate_logits(two_logits)
+                            if probs.ndim == 1:
+                                probs = probs.reshape(1, -1)
+                            if not spec["is_hier"]:
+                                p_nonfin = ~np.all(np.isfinite(probs), axis=1)
+                                cal_adj_b = getattr(calibrator, "logit_adjustments", None)
+                                cal_nonfin = np.zeros(m_docs, dtype=bool)
+                                z_cal_col = z_col
+                                adj_ulp_b = 0.0
+                                with np.errstate(over="ignore", invalid="ignore"):
+                                    if cal_adj_b is not None:
+                                        adj_b_arr = np.asarray(cal_adj_b, dtype=np.float64).reshape(-1)
+                                        if adj_b_arr.size == 2:
+                                            two_cal = two_logits + adj_b_arr.reshape(1, 2)
+                                            z_cal_col = two_cal[:, 1] - two_cal[:, 0]
+                                            cal_nonfin = ~np.all(np.isfinite(two_cal), axis=1)
+                                            if bool(np.all(np.isfinite(adj_b_arr))):
+                                                adj_ulp_b = 8.0 * float(np.finfo(np.float64).eps) * float(np.max(np.abs(adj_b_arr)))
+                                    dp_bound_eff = np.minimum(1.0, dp_bound + adj_ulp_b / temp_est)
+                                    row_finite = (~nonfin_rows) & (~raw_logits_nonfin) & (~p_nonfin) & (~cal_nonfin)
+                                    near_rows = (
+                                        (np.abs(probs[:, 1] - spec["bool_threshold"]) <= dp_bound_eff)
+                                        | (np.abs(probs[:, 1] - 0.5) <= dp_bound_eff)
+                                        | (np.abs(z_cal_col) <= 2.0 * (dz_bound / 0.25) + adj_ulp_b + 1e-9)
+                                        | (~np.isfinite(dp_bound_eff))
+                                        | raw_logits_nonfin
+                                        | p_nonfin
+                                        | cal_nonfin
+                                        | pot_ovf_rows
+                                    )
+                                    if 0.0 < spec["bool_threshold"] < 1.0:
+                                        thr_b = float(spec["bool_threshold"])
+                                        z_thr = temp_est * math.log(thr_b / (1.0 - thr_b))
+                                        near_rows |= np.abs(z_cal_col - z_thr) <= 2.0 * (dz_bound / 0.25) + adj_ulp_b + 1e-9
+                                    if conformal is not None:
+                                        near_rows |= (
+                                            np.any(
+                                                np.abs((1.0 - probs) - spec["q_hat"]) <= dp_bound_eff[:, None] + 1e-6,
+                                                axis=1,
+                                            )
+                                            | (
+                                                np.abs(np.abs(2.0 * probs[:, 1] - 1.0) - spec["eff_m"])
+                                                <= 2.0 * dp_bound_eff + 1e-6
+                                            )
+                                            | (
+                                                np.abs(np.maximum(probs[:, 1], probs[:, 0]) - spec["conf_floor"])
+                                                <= dp_bound_eff + 1e-6
+                                            )
+                                            | (
+                                                np.abs(
+                                                    np.maximum(probs[:, 1], probs[:, 0])
+                                                    - spec["eff_g"] * np.maximum(1e-6, np.minimum(probs[:, 1], probs[:, 0]))
+                                                )
+                                                <= (1.0 + spec["eff_g"]) * dp_bound_eff + 1e-6
+                                            )
+                                        )
+                                        if spec["q_per_cls"] is not None:
+                                            near_rows |= np.any(
+                                                np.abs((1.0 - probs) - spec["q_per_cls"][None, :])
+                                                <= dp_bound_eff[:, None] + 1e-6,
+                                                axis=1,
+                                            )
+                                if spec["sel_cal"] is not None or aci_has_floor:
+                                    near_rows |= row_finite
+                                if spec["raw_w"].dtype == np.float64 or spec["raw_b"].dtype == np.float64:
+                                    near_rows |= ~nonfin_rows
+                                near_rows &= ~nonfin_rows
+                                if np.any(near_rows):
+                                    probs = np.array(probs, dtype=np.float64, copy=True)
+                                    raw_w_b = spec["raw_w"]
+                                    raw_b_b = spec["raw_b"]
+                                    with np.errstate(over="ignore", invalid="ignore"):
+                                        for r_i in np.flatnonzero(near_rows).tolist():
+                                            x_ex = X[r_i : r_i + 1]
+                                            lin_ex = x_ex @ raw_w_b.T
+                                            raw_sum_ex = lin_ex[:, :1] + raw_b_b[:1]
+                                            z_ex = float(raw_sum_ex[0, 0]) / 0.25
+                                            raw_logits_nonfin[r_i] = not (
+                                                math.isfinite(float(lin_ex.ravel()[0]))
+                                                and math.isfinite(float(raw_sum_ex.ravel()[0]))
+                                                and math.isfinite(z_ex)
+                                            )
+                                            if raw_logits_nonfin[r_i]:
+                                                probs[r_i] = np.nan
+                                            else:
+                                                probs[r_i] = calibrator.calibrate_logits(
+                                                    np.array([-0.5 * z_ex, 0.5 * z_ex], dtype=np.float64)
+                                                ).reshape(-1)
+                            p_true = probs[:, 1]
+                            b_vals = p_true >= spec["bool_threshold"]
+                            confs = np.where(b_vals, p_true, 1.0 - p_true)
+                            for i in range(m_docs):
+                                pt = float(p_true[i])
+                                row_values[i][fname] = bool(b_vals[i])
+                                row_confs[i][fname] = float(confs[i])
+                                row_probs[i][fname] = {"False": float(probs[i, 0]), "True": pt}
+                        else:
+                            z_mat = logits.astype(np.float64) / 0.25
+                            raw_logits_nonfin = (~np.all(np.isfinite(logits), axis=1)) | (~np.all(np.isfinite(z_mat), axis=1))
+                            probs = calibrator.calibrate_logits(z_mat)
+                            if probs.ndim == 1:
+                                probs = probs.reshape(1, -1)
+                            if not spec["is_hier"]:
+                                p_nonfin = ~np.all(np.isfinite(probs), axis=1)
+                                cal_adj_c = getattr(calibrator, "logit_adjustments", None)
+                                cal_nonfin = np.zeros(m_docs, dtype=bool)
+                                z_cal_mat = z_mat
+                                adj_ulp_c = 0.0
+                                with np.errstate(over="ignore", invalid="ignore"):
+                                    if cal_adj_c is not None:
+                                        adj_c_arr = np.asarray(cal_adj_c, dtype=np.float64).reshape(-1)
+                                        if adj_c_arr.size == k_opts:
+                                            z_cal_mat = z_mat + adj_c_arr.reshape(1, k_opts)
+                                            cal_nonfin = ~np.all(np.isfinite(z_cal_mat), axis=1)
+                                            if bool(np.all(np.isfinite(adj_c_arr))):
+                                                adj_ulp_c = 8.0 * float(np.finfo(np.float64).eps) * float(np.max(np.abs(adj_c_arr)))
+                                    dp_bound_eff = np.minimum(1.0, dp_bound + adj_ulp_c / temp_est)
+                                    row_finite = (~nonfin_rows) & (~raw_logits_nonfin) & (~p_nonfin) & (~cal_nonfin)
+                                    z_s = -np.sort(-logits.astype(np.float64), axis=1)
+                                    z_cal_s = -np.sort(-z_cal_mat, axis=1)
+                                    p_s = -np.sort(-probs, axis=1)
+                                    near_rows = (
+                                        (
+                                            (
+                                                np.any((z_s[:, :-1] - z_s[:, 1:]) <= 2.0 * dz_bound[:, None] + 1e-9, axis=1)
+                                                | np.any(
+                                                    (z_cal_s[:, :-1] - z_cal_s[:, 1:])
+                                                    <= 2.0 * (dz_bound[:, None] / 0.25) + adj_ulp_c + 1e-9,
+                                                    axis=1,
+                                                )
+                                            )
+                                            if k_opts >= 2
+                                            else np.zeros(m_docs, dtype=bool)
+                                        )
+                                        | (~np.isfinite(dp_bound_eff))
+                                        | raw_logits_nonfin
+                                        | p_nonfin
+                                        | cal_nonfin
+                                        | pot_ovf_rows
+                                    )
+                                    if conformal is not None:
+                                        near_rows |= np.any(
+                                            np.abs((1.0 - probs) - spec["q_hat"]) <= dp_bound_eff[:, None] + 1e-6,
+                                            axis=1,
+                                        )
+                                        near_rows |= np.any(
+                                            np.abs(np.cumsum(np.maximum(p_s, 0.0), axis=1) - spec["q_hat"])
+                                            <= (float(k_opts) + 1.0) * dp_bound_eff[:, None] + 1e-6,
+                                            axis=1,
+                                        )
+                                        if spec["q_per_cls"] is not None:
+                                            near_rows |= np.any(
+                                                np.abs((1.0 - probs) - spec["q_per_cls"][None, :])
+                                                <= dp_bound_eff[:, None] + 1e-6,
+                                                axis=1,
+                                            )
+                                        if k_opts >= 2:
+                                            top_chk = p_s[:, 0]
+                                            run_chk = p_s[:, 1]
+                                            near_rows |= (
+                                                (np.abs((top_chk - run_chk) - spec["eff_m"]) <= 2.0 * dp_bound_eff + 1e-6)
+                                                | (np.abs(top_chk - spec["conf_floor"]) <= dp_bound_eff + 1e-6)
+                                                | (
+                                                    np.abs(top_chk - spec["eff_g"] * np.maximum(1e-6, run_chk))
+                                                    <= (1.0 + spec["eff_g"]) * dp_bound_eff + 1e-6
+                                                )
+                                                | (np.abs(run_chk - 1e-6) <= dp_bound_eff + 1e-6)
+                                            )
+                                        else:
+                                            near_rows |= (
+                                                (np.abs(p_s[:, 0] - spec["conf_floor"]) <= dp_bound_eff + 1e-6)
+                                                | (np.abs(1.0 - spec["eff_m"]) <= 2.0 * dp_bound_eff + 1e-6)
+                                            )
+                                if spec["sel_cal"] is not None or aci_has_floor:
+                                    near_rows |= row_finite
+                                if spec["raw_w"].dtype == np.float64 or spec["raw_b"].dtype == np.float64:
+                                    near_rows |= ~nonfin_rows
+                                near_rows &= ~nonfin_rows
+                                if np.any(near_rows):
+                                    probs = np.array(probs, dtype=np.float64, copy=True)
+                                    raw_w_c = spec["raw_w"]
+                                    raw_b_c = spec["raw_b"]
+                                    for r_i in np.flatnonzero(near_rows).tolist():
+                                        x_ex = X[r_i : r_i + 1]
+                                        lin_ex = x_ex @ raw_w_c.T
+                                        raw_sum_ex = lin_ex + raw_b_c
+                                        z_ex = raw_sum_ex.astype(np.float64).ravel() / 0.25
+                                        raw_logits_nonfin[r_i] = not (
+                                            bool(np.all(np.isfinite(lin_ex)))
+                                            and bool(np.all(np.isfinite(raw_sum_ex)))
+                                            and bool(np.all(np.isfinite(z_ex)))
+                                        )
+                                        if raw_logits_nonfin[r_i]:
+                                            probs[r_i] = np.nan
+                                        else:
+                                            probs[r_i] = calibrator.calibrate_logits(z_ex).reshape(-1)
+                            best_idx = np.argmax(probs, axis=1)
+                            confs = probs[np.arange(m_docs), best_idx]
+                            for i in range(m_docs):
+                                bi = int(best_idx[i])
+                                prow = probs[i]
+                                row_values[i][fname] = options[bi]
+                                row_confs[i][fname] = float(confs[i])
+                                row_probs[i][fname] = {opt: float(prow[j]) for j, opt in enumerate(options)}
+                    field_nonfin = nonfin_rows | raw_logits_nonfin | (~np.all(np.isfinite(probs), axis=1))
+                    if np.any(field_nonfin):
+                        probs = np.array(probs, dtype=np.float64, copy=True)
+                        probs[field_nonfin] = np.nan
                     probs_by_field_arr[fname] = probs
+                    row_any_nonfin |= field_nonfin
 
                     protos_unit = spec["protos_unit"]
                     if protos_unit is not None:
-                        p_sims = np.max(X @ protos_unit.T, axis=1).astype(np.float64)
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            p_sims = np.max(X @ protos_unit.T, axis=1).astype(np.float64)
                         if np.any(zero_emb_mask):
                             p_sims = np.where(zero_emb_mask, 0.0, p_sims)
                         for i in range(m_docs):
@@ -3859,11 +5553,26 @@ class SystemOneEngine:
 
                     if conformal is None:
                         for i in range(m_docs):
-                            if spec["is_bool"]:
-                                row_csets[i][fname] = ["True" if row_values[i][fname] else "False"]
+                            if field_nonfin[i]:
+                                row_values[i][fname] = False if spec["is_bool"] else options[0]
+                                row_confs[i][fname] = float("nan")
+                                row_probs[i][fname] = (
+                                    {"False": float("nan"), "True": float("nan")}
+                                    if spec["is_bool"]
+                                    else {opt: float("nan") for opt in options}
+                                )
+                                row_csets[i][fname] = []
+                                row_reasons[i][fname] = "non_finite_input"
+                                row_amb_fields[i].append(fname)
+                                if spec["escalate"]:
+                                    row_esc_fields[i].append(fname)
+                                row_is_amb[i] = True
                             else:
-                                row_csets[i][fname] = [str(row_values[i][fname])]
-                            row_margins[i][fname] = 1.0
+                                if spec["is_bool"]:
+                                    row_csets[i][fname] = ["True" if row_values[i][fname] else "False"]
+                                else:
+                                    row_csets[i][fname] = [str(row_values[i][fname])]
+                                row_margins[i][fname] = 1.0
                         continue
 
                     cp_fam_t = spec["cp_fam_t"]
@@ -4009,12 +5718,38 @@ class SystemOneEngine:
                         row_ror[i][fname] = eff_g
                         row_cfloor[i][fname] = conf_floor
 
+                        if field_nonfin[i]:
+                            row_values[i][fname] = False if spec["is_bool"] else options[0]
+                            row_confs[i][fname] = float("nan")
+                            row_probs[i][fname] = (
+                                {"False": float("nan"), "True": float("nan")}
+                                if spec["is_bool"]
+                                else {opt: float("nan") for opt in options}
+                            )
+                            row_csets[i][fname] = []
+                            row_reasons[i][fname] = "non_finite_input"
+                            row_amb_fields[i].append(fname)
+                            row_is_amb[i] = True
+                            if spec["escalate"]:
+                                row_esc_fields[i].append(fname)
+                            continue
+
                         if low_fam[i]:
                             row_reasons[i][fname] = "low_feature_familiarity"
                         elif low_proto[i]:
                             row_reasons[i][fname] = "low_semantic_familiarity"
 
-                        field_amb = (card != 1 or cset_amb or is_empty_set) if is_strict else (is_empty_set or cset_amb)
+                        pred_lbl_i = (
+                            ("True" if row_values[i][fname] else "False")
+                            if spec["is_bool"]
+                            else str(row_values[i][fname])
+                        )
+                        pred_excluded_i = pred_lbl_i not in cset_list
+                        field_amb = (
+                            (card != 1 or cset_amb or is_empty_set or pred_excluded_i)
+                            if is_strict
+                            else (is_empty_set or cset_amb or pred_excluded_i)
+                        )
                         if field_amb:
                             row_amb_fields[i].append(fname)
                             if spec["escalate"]:
@@ -4040,7 +5775,9 @@ class SystemOneEngine:
                     fam_t = spec["fam_t"]
                     proto_t = spec["proto_t"]
                     if raw_norms_arr is not None and fam_t > 0.0:
-                        low_f_idxs = np.flatnonzero(raw_norms_arr < (fam_t - 1e-12))
+                        low_f_idxs = np.flatnonzero(
+                            (raw_norms_arr < (fam_t - 1e-12)) | (~np.isfinite(raw_norms_arr))
+                        )
                         for i in low_f_idxs:
                             row_fam_trig[i] = True
                             row_csets[i][fname] = []
@@ -4218,6 +5955,16 @@ class SystemOneEngine:
             and callable(getattr(proj_obj, "project_batch", None))
             and not hasattr(proj_obj, "project_with_norm")
             and all(isinstance(f, (ChoiceField, BooleanField)) for f in self.schema.fields.values())
+            and all(
+                getattr(h, "_exemplar_bank", None) is None
+                and getattr(h, "backend", "numpy") != "mlx"
+                for h in getattr(self.model, "heads", {}).values()
+            )
+            and all(
+                getattr(h, "_exemplar_bank", None) is None
+                and getattr(h, "backend", "numpy") != "mlx"
+                for h in getattr(self.model, "_field_heads", {}).values()
+            )
             and not getattr(self.model, "_learned_prompt_overrides", None)
             and not getattr(self, "_learned_prompt_overrides", None)
         )
@@ -4339,6 +6086,15 @@ class SystemOneEngine:
         )
 
 
+def compile_engine_callable(
+    engine: SystemOneEngine,
+    *,
+    storage_mode: str = "float32",
+) -> FastDecisionCallable:
+    """Compiles a low-overhead fast decision callable for a SystemOneEngine."""
+    return engine.compile_callable(storage_mode=storage_mode)
+
+
 # Compatibility aliases
 ReflexEngine = SystemOneEngine
 System1Engine = SystemOneEngine
@@ -4347,6 +6103,7 @@ __all__ = [
     "SystemOneEngine",
     "System1Engine",
     "ReflexEngine",
+    "compile_engine_callable",
     "DecisionResult",
     "BenchmarkReport",
     "FieldEvaluationMetrics",

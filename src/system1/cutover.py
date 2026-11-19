@@ -9,6 +9,8 @@ e-process drift recalibration with zero pretrained weights.
 from __future__ import annotations
 
 import collections
+import contextlib
+import copy
 import dataclasses
 from dataclasses import dataclass
 from enum import Enum
@@ -16,7 +18,8 @@ import math
 import re
 import threading
 import time
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union
+import weakref
+from typing import Any, Callable, Deque, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Type, Union
 
 import numpy as np
 
@@ -36,12 +39,67 @@ from system1.core.schema import (
     ChoiceField,
     DecisionField,
     DecisionSchema,
+    ScoreField,
+    _score_half_span,
+    _score_normalized_margin,
+    _score_to_unit_ratio,
+    _score_within_rel_tolerance,
 )
 from system1.engine import SystemOneEngine
 
 
+_ACTIVE_CANARY_TX_TLS = threading.local()
+_UNTRACKED_CANARY_SENTINEL = object()
+_MISSING_CANARY_BINDING = object()
+
+
+@contextlib.contextmanager
+def _bind_active_canary_tx(*targets: Any, tx_token: Any) -> Any:
+    bindings = getattr(_ACTIVE_CANARY_TX_TLS, "bindings", None)
+    if not isinstance(bindings, dict):
+        bindings = {}
+        _ACTIVE_CANARY_TX_TLS.bindings = bindings
+    saved: List[Tuple[int, Any]] = []
+    seen_ids: set[int] = set()
+    for target in targets:
+        if target is None:
+            continue
+        tid = id(target)
+        if tid in seen_ids:
+            continue
+        seen_ids.add(tid)
+        saved.append((tid, bindings.get(tid, _MISSING_CANARY_BINDING)))
+        bindings[tid] = tx_token
+    try:
+        yield
+    finally:
+        for tid, prev_val in saved:
+            if prev_val is _MISSING_CANARY_BINDING:
+                bindings.pop(tid, None)
+            else:
+                bindings[tid] = prev_val
+
+
 def _normalize_cache_key(prompt: str) -> str:
     return " ".join(prompt.casefold().split())
+
+
+def _resolve_cache_key(prompt: str, cache_key: Optional[str] = None) -> str:
+    if isinstance(cache_key, str) and cache_key:
+        return cache_key
+    return _normalize_cache_key(prompt)
+
+
+def _clone_values_dict(vals: Mapping[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in vals.items():
+        if isinstance(v, list):
+            out[k] = list(v)
+        elif isinstance(v, (str, int, float, bool)) or v is None:
+            out[k] = v
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
 
 
 def _tokenize_words(text: str) -> List[str]:
@@ -93,6 +151,7 @@ class CutoverConfig:
     enable_quarantine: bool = True
     semantic_mode: str = "default"
     drift_delta: float = 0.05
+    score_tolerance: float = 0.15
 
     def __post_init__(self) -> None:
         if not self.milestones or any(int(m) < 2 for m in self.milestones):
@@ -113,6 +172,8 @@ class CutoverConfig:
             )
         if not (0.0 < float(self.drift_delta) < 1.0):
             raise ValueError(f"drift_delta must be in (0, 1), got {self.drift_delta}")
+        if not (0.0 < float(self.score_tolerance) <= 1.0):
+            raise ValueError(f"score_tolerance must be in (0, 1], got {self.score_tolerance}")
 
 
 @dataclass(frozen=True)
@@ -150,12 +211,13 @@ class AutoCutoverLifecycle:
         teacher: Optional[Callable[[str], Any]] = None,
         *,
         config: Optional[CutoverConfig] = None,
+        post_compile_hook: Optional[Callable[[Any, Sequence[Tuple[str, Dict[str, Any]]]], bool]] = None,
         **overrides: Any,
     ) -> None:
         if isinstance(schema, type) and issubclass(schema, DecisionSchema):
-            self.schema: DecisionSchema = schema()
+            self.schema: DecisionSchema = copy.deepcopy(schema())
         elif isinstance(schema, DecisionSchema):
-            self.schema = schema
+            self.schema = copy.deepcopy(schema)
         else:
             raise TypeError(f"Expected DecisionSchema subclass or instance, got {type(schema).__name__}")
 
@@ -167,6 +229,7 @@ class AutoCutoverLifecycle:
             self.config = config
 
         self.teacher = teacher
+        self.post_compile_hook = post_compile_hook
         self._lock = threading.RLock()
 
         primary_name = ""
@@ -183,6 +246,8 @@ class AutoCutoverLifecycle:
 
         if isinstance(primary_field, ChoiceField):
             self.total_schema_classes = max(2, len(primary_field.options))
+        elif isinstance(primary_field, ScoreField):
+            self.total_schema_classes = 4
         elif isinstance(primary_field, BooleanField):
             self.total_schema_classes = 2
         else:
@@ -190,13 +255,15 @@ class AutoCutoverLifecycle:
 
         self.subword = SubwordSemanticEmbeddings(self.config.dense_dim)
         self.engine = SystemOneEngine(
-            self.schema,
+            copy.deepcopy(self.schema),
             dimension=self.config.dense_dim,
             use_cache=False,
             strict_mode=True,
             min_calibration_lessons=1_000_000,
             min_override_corroborations=2,
         )
+        self._owned_engine_refs: Dict[int, weakref.ref[Any]] = {}
+        self._register_owned_engine(self.engine)
         self.aci = AdaptiveConformalTracker(
             alpha_target=self.config.alpha_target,
             gamma=0.025,
@@ -214,14 +281,15 @@ class AutoCutoverLifecycle:
         self.admitted_vecs: List[np.ndarray] = []
         self.admitted_labels: List[str] = []
         self.admitted_values: List[Dict[str, Any]] = []
-        self._vec_buf = np.zeros((2500, self.config.dense_dim), dtype=np.float32)
+        self._vec_buf = np.empty((0, self.config.dense_dim), dtype=np.float32)
         self.ng_df: Dict[str, int] = {}
         self.admitted_lengths: List[int] = []
 
         self.train_by_class: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
         self.calib_by_class: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+        self._calib_cache_keys: Dict[str, List[str]] = {}
         self.class_counts: Dict[str, int] = {}
-        self.quarantine: List[Tuple[str, str, Dict[str, Any], np.ndarray, List[str], Set[str]]] = []
+        self.quarantine: List[Tuple[str, str, Dict[str, Any], np.ndarray, List[str], Set[str], str]] = []
 
         self.state: str = CutoverState.COLD_START_ABSTAIN.value
         self.compiled_active: bool = False
@@ -239,6 +307,7 @@ class AutoCutoverLifecycle:
         self.class_sim_floors: Dict[str, float] = {}
         self.teacher_key_labels: Dict[str, Dict[str, Tuple[int, Dict[str, Any]]]] = {}
         self.clean_cache: Dict[str, Dict[str, Any]] = {}
+        self._conflicted_cache_keys: Set[str] = set()
         self.recent_unseen_window: Deque[int] = collections.deque(maxlen=40)
 
         self.step_count: int = 0
@@ -247,10 +316,42 @@ class AutoCutoverLifecycle:
         self.canary_checks: int = 0
         self.canary_window: Deque[int] = collections.deque(maxlen=20)
         self._pending_canaries: Dict[str, Tuple[Dict[str, Any], float, bool]] = {}
+        self._pending_canary_stack: Dict[str, List[Tuple[object, Tuple[Dict[str, Any], float, bool]]]] = {}
+        self._untracked_canaries: Dict[str, Tuple[Dict[str, Any], float, bool]] = {}
+        self._untracked_canary_de: Dict[str, int] = {}
         self.cutover_events: List[Dict[str, Any]] = []
         self.recalibrate_events: List[Dict[str, Any]] = []
         self.quarantined_total: int = 0
         self.compile_time_total_ms: float = 0.0
+
+    def _register_owned_engine(self, eng: Any) -> None:
+        if eng is None:
+            return
+        try:
+            self._owned_engine_refs[id(eng)] = weakref.ref(eng)
+        except TypeError:
+            pass
+        dead_keys = [k for k, ref in self._owned_engine_refs.items() if ref() is None]
+        for k in dead_keys:
+            self._owned_engine_refs.pop(k, None)
+
+    def _is_owned_engine(self, obj: Any) -> bool:
+        if obj is None:
+            return False
+        if obj is self.engine:
+            return True
+        ref = self._owned_engine_refs.get(id(obj))
+        return ref is not None and ref() is obj
+
+    @property
+    def is_cutover(self) -> bool:
+        """Whether the lifecycle is actively promoted in SELECTIVE_HOT_SWAP."""
+        return (
+            self.state == CutoverState.SELECTIVE_HOT_SWAP.value
+            and bool(self.compiled_active)
+            and self.engine is not None
+            and not self.pending_recalibrate
+        )
 
     def _coerce_teacher_values(self, teacher_output: Any) -> Dict[str, Any]:
         if hasattr(teacher_output, "values") and isinstance(getattr(teacher_output, "values", None), Mapping):
@@ -271,11 +372,91 @@ class AutoCutoverLifecycle:
 
     def _primary_label_key(self, values: Mapping[str, Any]) -> str:
         val = values[self.primary_field_name]
+        if isinstance(self.primary_field, ScoreField):
+            lo = float(self.primary_field.min_value)
+            hi = float(self.primary_field.max_value)
+            if hi <= lo:
+                norm = 0.0
+            else:
+                norm = min(1.0, max(0.0, float(_score_to_unit_ratio(float(val), lo, hi))))
+            return f"bin_{min(3, int(norm * 4.0))}"
         if isinstance(self.primary_field, BooleanField):
             return "True" if bool(val) else "False"
         if isinstance(val, (tuple, list)):
             return "|".join(str(v) for v in val)
         return str(val)
+
+    def _values_match(
+        self,
+        pred_values: Mapping[str, Any],
+        target_values: Mapping[str, Any],
+        schema: Optional[DecisionSchema] = None,
+    ) -> bool:
+        """Compare predicted and target values across fields using tolerance for ScoreField."""
+        target_schema = schema or self.schema
+        for fname, f_def in target_schema.fields.items():
+            if fname not in pred_values or fname not in target_values:
+                return False
+            p_val = pred_values[fname]
+            t_val = target_values[fname]
+            if isinstance(f_def, ScoreField):
+                try:
+                    p_f = float(p_val)
+                    t_f = float(t_val)
+                except (TypeError, ValueError):
+                    return False
+                if not (math.isfinite(p_f) and math.isfinite(t_f)):
+                    return False
+                if not _score_within_rel_tolerance(
+                    p_f,
+                    t_f,
+                    f_def.min_value,
+                    f_def.max_value,
+                    float(self.config.score_tolerance),
+                ):
+                    return False
+            elif isinstance(f_def, BooleanField):
+                if bool(p_val) != bool(t_val):
+                    return False
+            else:
+                if p_val != t_val:
+                    return False
+        return True
+
+    def _decision_min_margin(
+        self,
+        res: Any,
+        engine: Optional[SystemOneEngine],
+        field_names: Iterable[str],
+    ) -> float:
+        """Return minimum field confidence/margin across fields, supporting ScoreField intervals."""
+        margins: List[float] = []
+        reg_preds = getattr(engine, "regression_conformal_predictors", {}) if engine is not None else {}
+        for fname in field_names:
+            if fname in res.margins:
+                margins.append(float(res.margins[fname]))
+                continue
+            f_def = self.schema.fields.get(fname)
+            if isinstance(f_def, ScoreField):
+                half_span = _score_half_span(f_def.min_value, f_def.max_value)
+                conf = float(res.confidences.get(fname, 0.0))
+                rcp = reg_preds.get(fname)
+                alpha_eff = max(1e-6, float(getattr(res, "alpha", self.config.alpha_target)))
+                if (
+                    half_span > 0.0
+                    and rcp is not None
+                    and getattr(rcp, "is_calibrated", False)
+                    and len(getattr(rcp, "residuals", ())) >= math.ceil(1.0 / alpha_eff) - 1
+                ):
+                    iv = rcp.predict_interval(float(res.values[fname]), alpha=alpha_eff)
+                    ratio = _score_normalized_margin(float(iv.margin), f_def.min_value, f_def.max_value)
+                    half_w_margin = max(0.0, 1.0 - ratio)
+                    margins.append(min(conf, half_w_margin) if ratio < 1.0 else conf)
+                else:
+                    margins.append(conf)
+            else:
+                margins.append(float(res.margins.get(fname, 0.0)))
+        return min(margins) if margins else 0.0
 
     def _admit_record_locked(
         self,
@@ -285,20 +466,25 @@ class AutoCutoverLifecycle:
         vec: np.ndarray,
         words: List[str],
         ngs: Set[str],
+        *,
+        cache_key: Optional[str] = None,
     ) -> None:
-        key = _normalize_cache_key(prompt)
+        key = _resolve_cache_key(prompt, cache_key)
         if key in self.admitted_keys:
             return
         idx = len(self.admitted_vecs)
         if idx >= self._vec_buf.shape[0]:
-            self._vec_buf = np.vstack(
-                [self._vec_buf, np.zeros((1000, self.config.dense_dim), dtype=np.float32)]
-            )
+            cur_cap = self._vec_buf.shape[0]
+            grow = 64 if cur_cap == 0 else max(64, min(1000, cur_cap))
+            new_buf = np.zeros((cur_cap + grow, self.config.dense_dim), dtype=np.float32)
+            if cur_cap > 0:
+                new_buf[:cur_cap] = self._vec_buf
+            self._vec_buf = new_buf
         self._vec_buf[idx] = vec
         self.admitted_keys.add(key)
         self.admitted_vecs.append(vec)
         self.admitted_labels.append(label_key)
-        self.admitted_values.append(dict(values))
+        self.admitted_values.append(_clone_values_dict(values))
         for g in ngs:
             self.ng_df[g] = self.ng_df.get(g, 0) + 1
         self.admitted_lengths.append(len(words))
@@ -306,20 +492,39 @@ class AutoCutoverLifecycle:
         cnt = self.class_counts.get(label_key, 0)
         self.class_counts[label_key] = cnt + 1
         if cnt < 2 or (cnt % 5 in (0, 2, 4)):
-            self.train_by_class.setdefault(label_key, []).append((prompt, dict(values)))
+            self.train_by_class.setdefault(label_key, []).append((prompt, _clone_values_dict(values)))
         else:
-            self.calib_by_class.setdefault(label_key, []).append((prompt, dict(values)))
+            self.calib_by_class.setdefault(label_key, []).append((prompt, _clone_values_dict(values)))
+            self._calib_cache_keys.setdefault(label_key, []).append(key)
 
-    def _try_admit_or_quarantine_locked(self, prompt: str, values: Dict[str, Any]) -> bool:
+    def _try_admit_or_quarantine_locked(
+        self,
+        prompt: str,
+        values: Dict[str, Any],
+        *,
+        cache_key: Optional[str] = None,
+    ) -> bool:
         """Return True if quarantined, False if admitted or already known."""
         label_key = self._primary_label_key(values)
         self.recent_unseen_window.append(0 if label_key in self.active_classes else 1)
-        key = _normalize_cache_key(prompt)
+        key = _resolve_cache_key(prompt, cache_key)
         k_cnts = self.teacher_key_labels.setdefault(key, {})
+        has_conflict = any(
+            lbl_prev != label_key or not self._values_match(vals_prev, values)
+            for lbl_prev, (_, vals_prev) in k_cnts.items()
+        )
         prev_cnt, _ = k_cnts.get(label_key, (0, values))
-        k_cnts[label_key] = (prev_cnt + 1, dict(values))
-        if len(k_cnts) == 1 and (prev_cnt + 1) >= 2 and label_key in self.mature_classes:
-            self.clean_cache[key] = dict(values)
+        k_cnts[label_key] = (prev_cnt + 1, _clone_values_dict(values))
+        if has_conflict:
+            self._conflicted_cache_keys.add(key)
+            self.clean_cache.pop(key, None)
+        elif (
+            key not in self._conflicted_cache_keys
+            and len(k_cnts) == 1
+            and (prev_cnt + 1) >= 2
+            and label_key in self.mature_classes
+        ):
+            self.clean_cache[key] = _clone_values_dict(values)
         if key in self.admitted_keys:
             return False
 
@@ -328,18 +533,18 @@ class AutoCutoverLifecycle:
         vec = self.subword.encode(prompt)
 
         if not self.config.enable_quarantine:
-            self._admit_record_locked(prompt, label_key, values, vec, words, ngs)
+            self._admit_record_locked(prompt, label_key, values, vec, words, ngs, cache_key=key)
             return False
 
         n_adm = len(self.admitted_vecs)
         if n_adm < 20:
-            self._admit_record_locked(prompt, label_key, values, vec, words, ngs)
+            self._admit_record_locked(prompt, label_key, values, vec, words, ngs, cache_key=key)
             return False
 
         p90_len = float(np.percentile(self.admitted_lengths, 90))
         if len(words) > max(26, 2.3 * p90_len):
             self.quarantined_total += 1
-            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs))
+            self.quarantine.append((prompt, label_key, _clone_values_dict(values), vec, words, ngs, key))
             return True
 
         ng_cov = sum(1 for g in ngs if self.ng_df.get(g, 0) >= 1) / max(1, len(ngs))
@@ -348,7 +553,7 @@ class AutoCutoverLifecycle:
 
         if ng_cov < 0.42 and max_sim < 0.30:
             self.quarantined_total += 1
-            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs))
+            self.quarantine.append((prompt, label_key, _clone_values_dict(values), vec, words, ngs, key))
             return True
 
         cls_cnt = self.class_counts.get(label_key, 0)
@@ -362,10 +567,10 @@ class AutoCutoverLifecycle:
             if (max_sim >= 0.28 or ng_cov >= 0.58) and (
                 same_max >= 0.20 or knn_agree >= 1 or ng_cov >= 0.65
             ):
-                self._admit_record_locked(prompt, label_key, values, vec, words, ngs)
+                self._admit_record_locked(prompt, label_key, values, vec, words, ngs, cache_key=key)
                 return False
             self.quarantined_total += 1
-            self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs))
+            self.quarantine.append((prompt, label_key, _clone_values_dict(values), vec, words, ngs, key))
             return True
 
         if ng_cov >= 0.38 or max_sim >= 0.28:
@@ -379,12 +584,13 @@ class AutoCutoverLifecycle:
             if peers:
                 for q in peers:
                     self.quarantine.remove(q)
-                    self._admit_record_locked(q[0], q[1], q[2], q[3], q[4], q[5])
-                self._admit_record_locked(prompt, label_key, values, vec, words, ngs)
+                    q_key = q[6] if len(q) > 6 else None
+                    self._admit_record_locked(q[0], q[1], q[2], q[3], q[4], q[5], cache_key=q_key)
+                self._admit_record_locked(prompt, label_key, values, vec, words, ngs, cache_key=key)
                 return False
 
         self.quarantined_total += 1
-        self.quarantine.append((prompt, label_key, dict(values), vec, words, ngs))
+        self.quarantine.append((prompt, label_key, _clone_values_dict(values), vec, words, ngs, key))
         return True
 
     def _estimate_noise_rate(
@@ -479,12 +685,20 @@ class AutoCutoverLifecycle:
                     self.primary_field_name: ChoiceField(
                         options=list(active_list),
                         descriptions={
-                            o: self.primary_field.descriptions[o]
+                            o: copy.deepcopy(self.primary_field.descriptions[o])
                             for o in active_list
                             if o in getattr(self.primary_field, "descriptions", {})
                         }
                         or None,
-                        description=self.primary_field.description,
+                        default=(
+                            self.primary_field.default
+                            if self.primary_field.default in active_list
+                            else None
+                        ),
+                        description=copy.deepcopy(self.primary_field.description),
+                        required=self.primary_field.required,
+                        escalate_on_ambiguity=self.primary_field.escalate_on_ambiguity,
+                        metadata=copy.deepcopy(self.primary_field.metadata),
                     )
                 },
             )
@@ -494,18 +708,22 @@ class AutoCutoverLifecycle:
                 new_fields[fname] = ChoiceField(
                     options=list(active_list),
                     descriptions={
-                        o: fdef.descriptions[o]
+                        o: copy.deepcopy(fdef.descriptions[o])
                         for o in active_list
                         if o in getattr(fdef, "descriptions", {})
                     }
                     or None,
-                    description=fdef.description,
+                    default=(fdef.default if fdef.default in active_list else None),
+                    description=copy.deepcopy(fdef.description),
+                    required=fdef.required,
+                    escalate_on_ambiguity=fdef.escalate_on_ambiguity,
+                    metadata=copy.deepcopy(fdef.metadata),
                 )
             else:
-                new_fields[fname] = fdef
+                new_fields[fname] = copy.deepcopy(fdef)
         return DecisionSchema(schema_name=self.schema.schema_name, fields=new_fields)
 
-    def _maybe_micro_compile_locked(self) -> bool:
+    def _will_attempt_micro_compile_locked(self) -> bool:
         n_adm = len(self.admitted_vecs)
         hit_milestone = (
             self.next_milestone_idx < len(self.config.milestones)
@@ -515,19 +733,23 @@ class AutoCutoverLifecycle:
         has_new_mature = (
             len(new_mature - self.active_classes) >= 2 and (n_adm - self.last_compile_n >= 24)
         )
+        return bool(
+            hit_milestone
+            or (self.pending_recalibrate and n_adm - self.last_compile_n >= 16)
+            or has_new_mature
+        )
 
-        if (
-            not hit_milestone
-            and not (self.pending_recalibrate and n_adm - self.last_compile_n >= 16)
-            and not has_new_mature
-        ):
+    def _maybe_micro_compile_locked(self) -> bool:
+        if not self._will_attempt_micro_compile_locked():
             return False
+        n_adm = len(self.admitted_vecs)
 
+        next_milestone_idx = self.next_milestone_idx
         while (
-            self.next_milestone_idx < len(self.config.milestones)
-            and n_adm >= self.config.milestones[self.next_milestone_idx]
+            next_milestone_idx < len(self.config.milestones)
+            and n_adm >= self.config.milestones[next_milestone_idx]
         ):
-            self.next_milestone_idx += 1
+            next_milestone_idx += 1
 
         active_list = sorted(
             c
@@ -535,11 +757,21 @@ class AutoCutoverLifecycle:
             if len(tr) >= 2 and len(self.calib_by_class.get(c, ())) >= 1
         )
         if len(active_list) < 2:
+            self.next_milestone_idx = next_milestone_idx
             return False
 
         tr_pairs = [x for c in active_list for x in self.train_by_class[c]]
         cal_pairs = [x for c in active_list for x in self.calib_by_class[c]]
+        cal_keys: List[str] = []
+        for c in active_list:
+            cls_pairs = self.calib_by_class[c]
+            cls_keys = self._calib_cache_keys.get(c, ())
+            if len(cls_keys) == len(cls_pairs):
+                cal_keys.extend(cls_keys)
+            else:
+                cal_keys.extend(_normalize_cache_key(p_c) for p_c, _ in cls_pairs)
         if len(tr_pairs) < 24 or len(cal_pairs) < 12:
+            self.next_milestone_idx = next_milestone_idx
             return False
 
         t0 = time.perf_counter()
@@ -613,15 +845,38 @@ class AutoCutoverLifecycle:
             augment=False,
         )
 
-        self.eta_hat = self._estimate_noise_rate(proj, tr_pairs, active_list)
+        next_eta_hat = self._estimate_noise_rate(proj, tr_pairs, active_list)
+        aci_stage = copy.deepcopy(self.aci)
         sub_eng = SystemOneEngine(
             active_schema,
             model=compiled,
             strict_mode=True,
             use_cache=False,
-            aci_tracker=self.aci,
+            aci_tracker=aci_stage,
         )
         sub_eng.default_alpha = self.config.alpha_target
+        hook_pairs = [(p_t, _clone_values_dict(vals_t)) for p_t, vals_t in tr_pairs]
+        if self.post_compile_hook is not None and self.post_compile_hook(sub_eng, hook_pairs):
+            seen_cal: Set[str] = set()
+            dedup_cal: List[Tuple[str, Dict[str, Any]]] = []
+            for p_c, vals_c in cal_pairs:
+                if p_c not in seen_cal:
+                    seen_cal.add(p_c)
+                    dedup_cal.append((p_c, _clone_values_dict(vals_c)))
+            if dedup_cal:
+                for cal_obj in sub_eng.calibrators.values():
+                    if getattr(cal_obj, "logit_adjustments", None) is not None:
+                        cal_obj.logit_adjustments = None
+                sub_eng.calibrate(
+                    dedup_cal,
+                    familiarity_alpha=self.config.familiarity_alpha,
+                    prototype_alpha=self.config.prototype_alpha,
+                )
+            if hasattr(sub_eng, "_packed_kernel_cache"):
+                sub_eng._packed_kernel_cache = None
+            exp_cache = getattr(sub_eng, "_explainer_cache", None)
+            if exp_cache is not None:
+                exp_cache.clear()
 
         cal_prompts = [p for p, _ in cal_pairs]
         cal_decs = sub_eng.decide_batch(
@@ -633,24 +888,21 @@ class AutoCutoverLifecycle:
         margins_cal: List[float] = []
         correct_cal: List[bool] = []
         high_conf_cache: List[Tuple[str, Dict[str, Any]]] = []
-        for (p_c, vals_c), d_c in zip(cal_pairs, cal_decs):
+        for (p_c, vals_c), k_c, d_c in zip(cal_pairs, cal_keys, cal_decs):
             if d_c.abstention_reason in ("low_feature_familiarity", "low_semantic_familiarity"):
                 continue
-            field_margins = [
-                float(d_c.margins.get(fname, 0.0)) for fname in active_schema.fields
-            ]
-            min_margin = min(field_margins) if field_margins else 0.0
-            is_ok = all(d_c.values.get(fname) == vals_c.get(fname) for fname in active_schema.fields)
+            min_margin = self._decision_min_margin(d_c, sub_eng, active_schema.fields)
+            is_ok = self._values_match(d_c.values, vals_c, schema=active_schema)
             margins_cal.append(min_margin)
             correct_cal.append(is_ok)
             if d_c.abstention_reason is None and is_ok and min_margin >= 0.85:
-                high_conf_cache.append((p_c, dict(vals_c)))
+                high_conf_cache.append((k_c, _clone_values_dict(vals_c)))
 
         k_act = len(active_list)
         alpha_calib = min(
             0.18,
             self.config.alpha_target
-            + self.eta_hat * (1.0 - self.config.alpha_target * k_act / max(1, k_act - 1)),
+            + next_eta_hat * (1.0 - self.config.alpha_target * k_act / max(1, k_act - 1)),
         )
         sel_cal = SelectiveRiskCalibrator(
             score_name="margin",
@@ -667,25 +919,31 @@ class AutoCutoverLifecycle:
             tau = float(sel_cal.threshold)
             tau_src = "ltt_bonferroni"
         else:
-            tau = self._select_shadow_threshold_locked(margins_cal, correct_cal, self.eta_hat, k_act)
+            tau = self._select_shadow_threshold_locked(margins_cal, correct_cal, next_eta_hat, k_act)
             tau_src = "debiased_shadow" if tau is not None else "none"
 
         by_c: Dict[str, List[np.ndarray]] = {}
         for v, lbl in zip(self.admitted_vecs, self.admitted_labels):
             by_c.setdefault(lbl, []).append(v)
-        self.class_centroids = {}
-        self.class_sim_floors = {}
+        new_class_centroids: Dict[str, np.ndarray] = {}
+        new_class_sim_floors: Dict[str, float] = {}
         for c, vs in by_c.items():
             mat = np.stack(vs, axis=0)
             cent = np.mean(mat, axis=0)
             cent = cent / max(1e-8, float(np.linalg.norm(cent)))
-            self.class_centroids[c] = cent
+            new_class_centroids[c] = cent
             sims = mat @ cent
-            self.class_sim_floors[c] = (
+            new_class_sim_floors[c] = (
                 float(np.quantile(sims, self.config.cls_sim_q)) if len(sims) >= 5 else 0.30
             )
 
+        self.class_centroids = new_class_centroids
+        self.class_sim_floors = new_class_sim_floors
+        self.next_milestone_idx = next_milestone_idx
+        self.eta_hat = next_eta_hat
+        sub_eng.aci_tracker = self.aci
         self.engine = sub_eng
+        self._register_owned_engine(sub_eng)
         self.selective_cal = sel_cal
         self.active_tau = tau
         self.tau_source = tau_src
@@ -703,10 +961,9 @@ class AutoCutoverLifecycle:
             mode="capital_ons",
         )
 
-        for p_c, vals_c in high_conf_cache:
-            k = _normalize_cache_key(p_c)
-            if k not in self.clean_cache:
-                self.clean_cache[k] = dict(vals_c)
+        for k_c, vals_c in high_conf_cache:
+            if k_c not in self.clean_cache and k_c not in self._conflicted_cache_keys:
+                self.clean_cache[k_c] = _clone_values_dict(vals_c)
 
         if tau is not None and len(self.mature_classes) >= 2:
             self.state = CutoverState.SELECTIVE_HOT_SWAP.value
@@ -743,7 +1000,7 @@ class AutoCutoverLifecycle:
         from_cache: bool,
     ) -> None:
         self.canary_checks += 1
-        is_err = pred_values != y_teacher_values
+        is_err = not self._values_match(pred_values, y_teacher_values)
         self.canary_window.append(1 if is_err else 0)
         self.aci.update_accepted(is_err, margin=(None if from_cache else margin))
         mon_step = self.drift_monitor.update(is_err, step=self.step_count)
@@ -756,6 +1013,7 @@ class AutoCutoverLifecycle:
         if mon_step.alarm or window_alarm:
             self.pending_recalibrate = True
             self.state = CutoverState.DRIFT_RECALIBRATE.value
+            self.clean_cache.clear()
             self.recalibrate_events.append(
                 {
                     "t": self.step_count,
@@ -770,17 +1028,30 @@ class AutoCutoverLifecycle:
             self.drift_monitor.reset()
 
     def _evaluate_local_candidate_locked(
-        self, prompt: str
+        self,
+        prompt: str,
+        *,
+        cache_key: Optional[str] = None,
+        accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]], float, bool, bool]:
         """Return (accepted_fastpath, candidate_values, margin, is_canary, from_cache)."""
-        key = _normalize_cache_key(prompt)
+        if (
+            self.pending_recalibrate
+            or self.state == CutoverState.DRIFT_RECALIBRATE.value
+        ):
+            return False, None, 0.0, False, False
+
+        key = _resolve_cache_key(prompt, cache_key)
         canary_period = max(1, int(round(1.0 / self.config.canary_rate)))
 
         if key in self.clean_cache:
-            cached_vals = dict(self.clean_cache[key])
+            cached_vals = _clone_values_dict(self.clean_cache[key])
             self.local_accept_eligible += 1
             is_canary = (self.local_accept_eligible % canary_period) == 0
             return (not is_canary), cached_vals, 1.0, is_canary, True
+
+        if key in self._conflicted_cache_keys:
+            return False, None, 0.0, False, False
 
         if not self.compiled_active or self.active_tau is None:
             return False, None, 0.0, False, False
@@ -788,8 +1059,7 @@ class AutoCutoverLifecycle:
         res = self.engine.decide(prompt, strict=False, record_receipt=False, use_cache=False)
         vals = dict(res.values)
         pred_key = self._primary_label_key(vals)
-        field_margins = [float(res.margins.get(fname, 0.0)) for fname in res.values]
-        margin = min(field_margins) if field_margins else 0.0
+        margin = self._decision_min_margin(res, self.engine, res.values)
 
         if (
             res.abstention_reason is None
@@ -802,43 +1072,347 @@ class AutoCutoverLifecycle:
             if cent is None or float(np.dot(self.subword.encode(prompt), cent)) >= max(
                 self.config.cls_min_abs, floor * 0.90
             ):
+                if accept_predicate is not None and not accept_predicate(_clone_values_dict(vals)):
+                    return False, None, margin, False, False
                 self.local_accept_eligible += 1
                 is_canary = (self.local_accept_eligible % canary_period) == 0
-                return (not is_canary), vals, margin, is_canary, False
+                return (not is_canary), _clone_values_dict(vals), margin, is_canary, False
 
         return False, None, margin, False, False
 
-    def decide_local(self, prompt: str) -> Optional[Dict[str, Any]]:
-        """Return validated local decision values when safe, or None to escalate/canary."""
-        with self._lock:
-            self._maybe_micro_compile_locked()
-            accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(prompt)
-            if accepted and vals is not None:
-                self.step_count += 1
-                self.local_hits += 1
-                return vals
-            if is_canary and vals is not None:
-                self._pending_canaries[_normalize_cache_key(prompt)] = (vals, margin, from_cache)
-            return None
+    _supports_canary_tx_arg: bool = True
 
-    def observe_teacher(self, prompt: str, teacher_values: Any) -> bool:
-        """Ingest a validated teacher answer, update canary drift state, and admit/compile."""
-        validated = self._coerce_teacher_values(teacher_values)
+    def _sync_pending_canary_locked(self, key: str) -> None:
+        stack = self._pending_canary_stack.get(key)
+        if stack:
+            self._pending_canaries[key] = stack[-1][1]
+        elif key in self._untracked_canaries:
+            self._pending_canary_stack.pop(key, None)
+            self._pending_canaries[key] = self._untracked_canaries[key]
+        else:
+            self._pending_canary_stack.pop(key, None)
+            self._pending_canaries.pop(key, None)
+
+    def _clear_untracked_canary(self, prompt: str, *, cache_key: Optional[str] = None) -> None:
+        try:
+            key = _resolve_cache_key(prompt, cache_key)
+        except Exception:
+            return
         with self._lock:
-            key = _normalize_cache_key(prompt)
-            pending = self._pending_canaries.pop(key, None)
-            if pending is not None:
-                pred_vals, margin, from_cache = pending
-                self._record_canary_check_locked(
-                    pred_vals,
-                    validated,
-                    margin=margin,
-                    from_cache=from_cache,
+            self._untracked_canaries.pop(key, None)
+            prev_de = self._untracked_canary_de.pop(key, 0)
+            if prev_de:
+                self.local_accept_eligible = max(0, self.local_accept_eligible - prev_de)
+            self._sync_pending_canary_locked(key)
+
+    def _decide_local_with_tx(
+        self,
+        prompt: str,
+        *,
+        cache_key: Optional[str] = None,
+        accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        _track_tx: bool = True,
+    ) -> Tuple[Optional[Dict[str, Any]], Tuple[int, int, int, str, Any]]:
+        """Attempt local decision and return (values_or_none, rollback_tx_token)."""
+        with self._lock:
+            need_snap = accept_predicate is not None or self._will_attempt_micro_compile_locked()
+            tx_snap = self._snapshot_mutation_state_locked() if need_snap else None
+            key = _resolve_cache_key(prompt, cache_key)
+            try:
+                self._maybe_micro_compile_locked()
+                if not _track_tx and key in self._untracked_canaries:
+                    self._untracked_canaries.pop(key, None)
+                    prev_de = self._untracked_canary_de.pop(key, 0)
+                    if prev_de:
+                        self.local_accept_eligible = max(0, self.local_accept_eligible - prev_de)
+                    self._sync_pending_canary_locked(key)
+                e0 = self.local_accept_eligible
+                accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(
+                    prompt,
+                    cache_key=key,
+                    accept_predicate=accept_predicate,
                 )
-            quarantined = self._try_admit_or_quarantine_locked(prompt, validated)
-            self._maybe_micro_compile_locked()
-            self.step_count += 1
-            return not quarantined
+                de = self.local_accept_eligible - e0
+                if accepted and vals is not None:
+                    self.step_count += 1
+                    self.local_hits += 1
+                    return vals, (de, 1, 1, key, None)
+                canary_tok: Any = None
+                if is_canary and vals is not None:
+                    if (
+                        key in self._pending_canaries
+                        and key not in self._pending_canary_stack
+                        and key not in self._untracked_canaries
+                    ):
+                        self._untracked_canaries[key] = self._pending_canaries[key]
+                    added_pend = (vals, margin, from_cache)
+                    if _track_tx:
+                        canary_tok = object()
+                        self._pending_canary_stack.setdefault(key, []).append((canary_tok, added_pend))
+                    else:
+                        canary_tok = _UNTRACKED_CANARY_SENTINEL
+                        self._untracked_canaries[key] = added_pend
+                        self._untracked_canary_de[key] = de
+                    self._sync_pending_canary_locked(key)
+                return None, (de, 0, 0, key, canary_tok)
+            except BaseException:
+                if tx_snap is not None:
+                    self._restore_mutation_state_locked(tx_snap)
+                    self._sync_pending_canary_locked(key)
+                raise
+
+    def _rollback_local_tx(self, tx: Tuple[int, int, int, str, Any]) -> None:
+        """Roll back local_accept_eligible, counters, and pending canary state from a failed request."""
+        de, ds, dh, key, canary_tok = tx
+        with self._lock:
+            if de:
+                self.local_accept_eligible = max(0, self.local_accept_eligible - de)
+            if ds:
+                self.step_count = max(0, self.step_count - ds)
+            if dh:
+                self.local_hits = max(0, self.local_hits - dh)
+            if canary_tok is _UNTRACKED_CANARY_SENTINEL:
+                self._untracked_canaries.pop(key, None)
+                self._untracked_canary_de.pop(key, None)
+                self._sync_pending_canary_locked(key)
+            elif canary_tok is not None:
+                stack = self._pending_canary_stack.get(key)
+                if stack is not None:
+                    self._pending_canary_stack[key] = [pair for pair in stack if pair[0] is not canary_tok]
+                    self._sync_pending_canary_locked(key)
+
+    def decide_local(
+        self,
+        prompt: str,
+        *,
+        cache_key: Optional[str] = None,
+        accept_predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return validated local decision values when safe, or None to escalate/canary."""
+        vals, _ = self._decide_local_with_tx(
+            prompt,
+            cache_key=cache_key,
+            accept_predicate=accept_predicate,
+            _track_tx=False,
+        )
+        return vals
+
+    def _snapshot_mutation_state_locked(self) -> Dict[str, Any]:
+        return {
+            "local_accept_eligible": self.local_accept_eligible,
+            "step_count": self.step_count,
+            "local_hits": self.local_hits,
+            "canary_checks": self.canary_checks,
+            "canary_window": collections.deque(self.canary_window, maxlen=self.canary_window.maxlen),
+            "aci": copy.deepcopy(self.aci),
+            "drift_monitor": copy.deepcopy(self.drift_monitor),
+            "schema": copy.deepcopy(self.schema),
+            "n_adm": len(self.admitted_vecs),
+            "admitted_vecs": [v.copy() for v in self.admitted_vecs],
+            "admitted_labels": list(self.admitted_labels),
+            "admitted_values": [_clone_values_dict(v) for v in self.admitted_values],
+            "admitted_lengths": list(self.admitted_lengths),
+            "vec_buf_rows": self._vec_buf[: len(self.admitted_vecs)].copy(),
+            "vec_buf_cap": int(self._vec_buf.shape[0]),
+            "admitted_keys": set(self.admitted_keys),
+            "ng_df": dict(self.ng_df),
+            "class_counts": dict(self.class_counts),
+            "train_by_class": {
+                k: [(p, _clone_values_dict(vals)) for p, vals in v]
+                for k, v in self.train_by_class.items()
+            },
+            "calib_by_class": {
+                k: [(p, _clone_values_dict(vals)) for p, vals in v]
+                for k, v in self.calib_by_class.items()
+            },
+            "_calib_cache_keys": {k: list(v) for k, v in self._calib_cache_keys.items()},
+            "quarantine": [
+                (q[0], q[1], _clone_values_dict(q[2]), q[3].copy(), list(q[4]), set(q[5]), *q[6:])
+                for q in self.quarantine
+            ],
+            "quarantined_total": self.quarantined_total,
+            "state": self.state,
+            "compiled_active": self.compiled_active,
+            "active_classes": set(self.active_classes),
+            "mature_classes": set(self.mature_classes),
+            "selective_cal": copy.deepcopy(self.selective_cal),
+            "engine": self.engine,
+            "active_tau": self.active_tau,
+            "tau_source": self.tau_source,
+            "eta_hat": self.eta_hat,
+            "last_compile_n": self.last_compile_n,
+            "next_milestone_idx": self.next_milestone_idx,
+            "pending_recalibrate": self.pending_recalibrate,
+            "class_centroids": {k: v.copy() for k, v in self.class_centroids.items()},
+            "class_sim_floors": dict(self.class_sim_floors),
+            "teacher_key_labels": {
+                k: {lk: (cnt, _clone_values_dict(lv)) for lk, (cnt, lv) in v.items()}
+                for k, v in self.teacher_key_labels.items()
+            },
+            "clean_cache": {k: _clone_values_dict(v) for k, v in self.clean_cache.items()},
+            "_conflicted_cache_keys": set(self._conflicted_cache_keys),
+            "_pending_canaries": {
+                k: (_clone_values_dict(v[0]), v[1], v[2])
+                for k, v in self._pending_canaries.items()
+            },
+            "_pending_canary_stack": {
+                k: [(tok, (_clone_values_dict(p[0]), p[1], p[2])) for tok, p in stk]
+                for k, stk in self._pending_canary_stack.items()
+            },
+            "_untracked_canaries": {
+                k: (_clone_values_dict(v[0]), v[1], v[2])
+                for k, v in self._untracked_canaries.items()
+            },
+            "_untracked_canary_de": dict(self._untracked_canary_de),
+            "recent_unseen_window": collections.deque(
+                self.recent_unseen_window, maxlen=self.recent_unseen_window.maxlen
+            ),
+            "cutover_events": [dict(ev) for ev in self.cutover_events],
+            "recalibrate_events": [dict(ev) for ev in self.recalibrate_events],
+            "compile_time_total_ms": self.compile_time_total_ms,
+            "_owned_engine_refs": dict(self._owned_engine_refs),
+        }
+
+    def _restore_mutation_state_locked(self, snap: Dict[str, Any]) -> None:
+        self.local_accept_eligible = snap["local_accept_eligible"]
+        self.step_count = snap["step_count"]
+        self.local_hits = snap["local_hits"]
+        self.canary_checks = snap["canary_checks"]
+        self.canary_window = snap["canary_window"]
+        self.aci = snap["aci"]
+        self.schema = snap["schema"]
+        self.primary_field = self.schema.fields[self.primary_field_name]
+        if getattr(self, "engine", None) is not snap["engine"]:
+            self.engine = snap["engine"]
+        if self.engine is not None and hasattr(self.engine, "aci_tracker"):
+            self.engine.aci_tracker = self.aci
+        self.drift_monitor = snap["drift_monitor"]
+        self.admitted_vecs[:] = snap["admitted_vecs"]
+        self.admitted_labels[:] = snap["admitted_labels"]
+        self.admitted_values[:] = snap["admitted_values"]
+        self.admitted_lengths[:] = snap["admitted_lengths"]
+        vec_rows = snap["vec_buf_rows"]
+        orig_cap = int(snap["vec_buf_cap"])
+        if self._vec_buf.shape[0] != orig_cap:
+            self._vec_buf = np.zeros((orig_cap, self.config.dense_dim), dtype=np.float32)
+        if vec_rows.shape[0] > 0:
+            self._vec_buf[: vec_rows.shape[0]] = vec_rows
+        if orig_cap > vec_rows.shape[0]:
+            self._vec_buf[vec_rows.shape[0] :] = 0.0
+        self.admitted_keys = snap["admitted_keys"]
+        self.ng_df = snap["ng_df"]
+        self.class_counts = snap["class_counts"]
+        self.train_by_class = snap["train_by_class"]
+        self.calib_by_class = snap["calib_by_class"]
+        self._calib_cache_keys = snap["_calib_cache_keys"]
+        self.quarantine = snap["quarantine"]
+        self.quarantined_total = snap["quarantined_total"]
+        self.state = snap["state"]
+        self.compiled_active = snap["compiled_active"]
+        self.active_classes = snap["active_classes"]
+        self.mature_classes = snap["mature_classes"]
+        self.selective_cal = snap["selective_cal"]
+        self.active_tau = snap["active_tau"]
+        self.tau_source = snap["tau_source"]
+        self.eta_hat = snap["eta_hat"]
+        self.last_compile_n = snap["last_compile_n"]
+        self.next_milestone_idx = snap["next_milestone_idx"]
+        self.pending_recalibrate = snap["pending_recalibrate"]
+        self.class_centroids = snap["class_centroids"]
+        self.class_sim_floors = snap["class_sim_floors"]
+        self.teacher_key_labels = snap["teacher_key_labels"]
+        self.clean_cache = snap["clean_cache"]
+        self._conflicted_cache_keys = snap["_conflicted_cache_keys"]
+        self._pending_canaries = snap["_pending_canaries"]
+        self._pending_canary_stack = snap["_pending_canary_stack"]
+        self._untracked_canaries = snap["_untracked_canaries"]
+        self._untracked_canary_de = snap["_untracked_canary_de"]
+        for k_p in (
+            set(self._pending_canaries)
+            | set(self._pending_canary_stack)
+            | set(self._untracked_canaries)
+        ):
+            self._sync_pending_canary_locked(k_p)
+        self.recent_unseen_window = snap["recent_unseen_window"]
+        self.cutover_events = snap["cutover_events"]
+        self.recalibrate_events = snap["recalibrate_events"]
+        self.compile_time_total_ms = snap["compile_time_total_ms"]
+        self._owned_engine_refs = {
+            k: ref for k, ref in snap["_owned_engine_refs"].items() if ref() is not None
+        }
+        self._register_owned_engine(self.engine)
+
+    def observe_teacher(
+        self,
+        prompt: str,
+        teacher_values: Any,
+        *,
+        cache_key: Optional[str] = None,
+        _canary_tx: Optional[Any] = None,
+    ) -> bool:
+        """Ingest a validated teacher answer, update canary drift state, and admit/compile."""
+        tls_map = getattr(_ACTIVE_CANARY_TX_TLS, "bindings", None)
+        has_bound = isinstance(tls_map, dict) and id(self) in tls_map
+        eff_canary_tx = tls_map[id(self)] if has_bound else _canary_tx
+        try:
+            validated = self._coerce_teacher_values(teacher_values)
+        except BaseException:
+            if not has_bound and eff_canary_tx is None:
+                self._clear_untracked_canary(prompt, cache_key=cache_key)
+            raise
+        with self._lock:
+            key = _resolve_cache_key(prompt, cache_key)
+            obs_snap = self._snapshot_mutation_state_locked()
+            try:
+                pending: Optional[Tuple[Dict[str, Any], float, bool]] = None
+                if has_bound or eff_canary_tx is not None:
+                    tx_tok = (
+                        eff_canary_tx[4]
+                        if (isinstance(eff_canary_tx, tuple) and len(eff_canary_tx) >= 5)
+                        else None
+                    )
+                    if tx_tok is _UNTRACKED_CANARY_SENTINEL:
+                        pending = self._untracked_canaries.pop(key, None)
+                        self._untracked_canary_de.pop(key, None)
+                        self._sync_pending_canary_locked(key)
+                    elif tx_tok is not None:
+                        stack = self._pending_canary_stack.get(key)
+                        if stack is not None:
+                            new_stack: List[Tuple[object, Tuple[Dict[str, Any], float, bool]]] = []
+                            for pair in stack:
+                                if pending is None and pair[0] is tx_tok:
+                                    pending = pair[1]
+                                else:
+                                    new_stack.append(pair)
+                            self._pending_canary_stack[key] = new_stack
+                            self._sync_pending_canary_locked(key)
+                else:
+                    pending = self._untracked_canaries.pop(key, None)
+                    self._untracked_canary_de.pop(key, None)
+                    if pending is None and key in self._pending_canaries and key not in self._pending_canary_stack:
+                        pending = self._pending_canaries.pop(key, None)
+                    self._sync_pending_canary_locked(key)
+                if pending is not None:
+                    pred_vals, margin, from_cache = pending
+                    self._record_canary_check_locked(
+                        pred_vals,
+                        validated,
+                        margin=margin,
+                        from_cache=from_cache,
+                    )
+                quarantined = self._try_admit_or_quarantine_locked(prompt, validated, cache_key=key)
+                self._maybe_micro_compile_locked()
+                self.step_count += 1
+                return not quarantined
+            except BaseException:
+                self._restore_mutation_state_locked(obs_snap)
+                if not has_bound and eff_canary_tx is None:
+                    self._untracked_canaries.pop(key, None)
+                    prev_de = self._untracked_canary_de.pop(key, 0)
+                    if prev_de:
+                        self.local_accept_eligible = max(0, self.local_accept_eligible - prev_de)
+                self._sync_pending_canary_locked(key)
+                raise
 
     def step(self, prompt: str) -> CutoverStepResult:
         """Execute one closed-loop step against ``self.teacher``."""
@@ -849,42 +1423,47 @@ class AutoCutoverLifecycle:
             )
 
         with self._lock:
-            compile_triggered = self._maybe_micro_compile_locked()
-            accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(prompt)
-            if accepted and vals is not None:
+            step_snap = self._snapshot_mutation_state_locked()
+            try:
+                compile_triggered = self._maybe_micro_compile_locked()
+                accepted, vals, margin, is_canary, from_cache = self._evaluate_local_candidate_locked(prompt)
+                if accepted and vals is not None:
+                    self.step_count += 1
+                    self.local_hits += 1
+                    return CutoverStepResult(
+                        values=vals,
+                        used_teacher=False,
+                        state=self.state,
+                        is_canary=False,
+                        quarantined=False,
+                        margin=margin,
+                        compile_triggered=compile_triggered,
+                    )
+
+                teacher_raw = self.teacher(prompt)
+                validated = self._coerce_teacher_values(teacher_raw)
+                if is_canary and vals is not None:
+                    self._record_canary_check_locked(
+                        vals,
+                        validated,
+                        margin=margin,
+                        from_cache=from_cache,
+                    )
+                quarantined = self._try_admit_or_quarantine_locked(prompt, validated)
+                compile_triggered = self._maybe_micro_compile_locked() or compile_triggered
                 self.step_count += 1
-                self.local_hits += 1
                 return CutoverStepResult(
-                    values=vals,
-                    used_teacher=False,
+                    values=validated,
+                    used_teacher=True,
                     state=self.state,
-                    is_canary=False,
-                    quarantined=False,
+                    is_canary=is_canary,
+                    quarantined=quarantined,
                     margin=margin,
                     compile_triggered=compile_triggered,
                 )
-
-            teacher_raw = self.teacher(prompt)
-            validated = self._coerce_teacher_values(teacher_raw)
-            if is_canary and vals is not None:
-                self._record_canary_check_locked(
-                    vals,
-                    validated,
-                    margin=margin,
-                    from_cache=from_cache,
-                )
-            quarantined = self._try_admit_or_quarantine_locked(prompt, validated)
-            compile_triggered = self._maybe_micro_compile_locked() or compile_triggered
-            self.step_count += 1
-            return CutoverStepResult(
-                values=validated,
-                used_teacher=True,
-                state=self.state,
-                is_canary=is_canary,
-                quarantined=quarantined,
-                margin=margin,
-                compile_triggered=compile_triggered,
-            )
+            except BaseException:
+                self._restore_mutation_state_locked(step_snap)
+                raise
 
     def summary(self) -> Dict[str, Any]:
         """Return diagnostic snapshot of reservoirs, lifecycle state, and drift events."""

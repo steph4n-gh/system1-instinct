@@ -11,6 +11,11 @@ import json
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
+from system1.compat.universal import (
+    UniversalDecisionASGIApp,
+    UniversalDecisionService,
+    add_universal_decisions_gateway,
+)
 from system1.core import DecisionSchema
 from system1.engine import DecisionResult, SystemOneEngine
 from system1.receipt import DecisionWitnessReceipt, create_decision_receipt
@@ -294,7 +299,30 @@ def add_system1_gateway(
     return SystemOneGatewayMiddleware(app, schema=schema, engine=engine, **kwargs)
 
 
+def create_universal_asgi_app(
+    service: UniversalDecisionService,
+    *,
+    fallback_app: Optional[Any] = None,
+) -> UniversalDecisionASGIApp:
+    """Wrap a UniversalDecisionService in an ASGI 3.0 application."""
+    return UniversalDecisionASGIApp(service, fallback_app=fallback_app)
+
+
+def mount_universal_gateway(
+    app: Any,
+    service: UniversalDecisionService,
+) -> Any:
+    """Mount Gemini Decision 1, Convai Laya, and TypeSafe Jev gateway routes onto an app."""
+    add_universal_decisions_gateway(app, service)
+    return app
+
+
 __all__ = [
     "SystemOneGatewayMiddleware",
+    "UniversalDecisionASGIApp",
+    "UniversalDecisionService",
     "add_system1_gateway",
+    "add_universal_decisions_gateway",
+    "create_universal_asgi_app",
+    "mount_universal_gateway",
 ]

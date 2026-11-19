@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, Mapping, Optional, Sequence, Tuple, Type, Union, get_type_hints
@@ -603,6 +605,215 @@ class DecisionSchema(metaclass=SchemaMeta):
         }
 
 
+def _score_half_span(min_value: float, max_value: float) -> float:
+    """Return 0.5 * (max_value - min_value) preserving subnormals and wide float64 bounds."""
+    lo = float(min_value)
+    hi = float(max_value)
+    span = hi - lo
+    if math.isfinite(span):
+        return 0.5 * span
+    return 0.5 * hi - 0.5 * lo
+
+
+def _score_to_unit_ratio(value: Any, min_value: float, max_value: float) -> Any:
+    """Normalize a scalar or array Score value into [0, 1] without span floor or overflow."""
+    lo = float(min_value)
+    hi = float(max_value)
+    span = hi - lo
+    if math.isfinite(span) and span > 0.0:
+        v = float(value) if isinstance(value, (int, float)) else value
+        return (v - lo) / span
+    hs = 0.5 * hi - 0.5 * lo
+    if isinstance(value, (int, float)):
+        return (0.5 * float(value) - 0.5 * lo) / hs
+    return (0.5 * value - 0.5 * lo) / hs
+
+
+def _score_from_unit_prob(prob: Any, min_value: float, max_value: float) -> Any:
+    """Map a unit probability in [0, 1] back into [min_value, max_value] without overflow or bound overshoot."""
+    lo = float(min_value)
+    hi = float(max_value)
+    span = hi - lo
+    if isinstance(prob, (int, float)) or getattr(prob, "ndim", 0) == 0:
+        p = float(prob)
+        if math.isnan(p):
+            return p
+        if p <= 0.0:
+            return lo
+        if p >= 1.0:
+            return hi
+        val = (lo + span * p) if math.isfinite(span) else ((1.0 - p) * lo + p * hi)
+        if math.isnan(val):
+            return val
+        if val < lo:
+            return lo
+        if val > hi:
+            return hi
+        return val
+    p_arr = prob.astype(float) if hasattr(prob, "astype") else prob
+    out = (lo + span * p_arr) if math.isfinite(span) else ((1.0 - p_arr) * lo + p_arr * hi)
+    if hasattr(out, "__setitem__"):
+        out = out.copy() if hasattr(out, "copy") else out
+        out[p_arr <= 0.0] = lo
+        out[p_arr >= 1.0] = hi
+        out[out < lo] = lo
+        out[out > hi] = hi
+    return out
+
+
+def _format_score_bound(value: float) -> str:
+    """Format a ScoreField interval bound cleanly while preserving exact float64 round-trip precision."""
+    fv = float(value)
+    if fv == 0.0:
+        return "0.0000"
+    if math.isfinite(fv) and abs(fv) < 1e12:
+        s4 = f"{fv:.4f}"
+        if float(s4) == fv:
+            return s4
+    return repr(fv)
+
+
+def _format_score_interval(lower_bound: float, upper_bound: float) -> str:
+    """Format a closed [lower_bound, upper_bound] ScoreField interval without losing bound precision."""
+    return f"[{_format_score_bound(lower_bound)}, {_format_score_bound(upper_bound)}]"
+
+
+def _score_full_span_clamped(min_value: float, max_value: float) -> float:
+    """Return finite min(sys.float_info.max, max_value - min_value) preserving subnormals."""
+    lo = float(min_value)
+    hi = float(max_value)
+    span = hi - lo
+    if math.isfinite(span):
+        return span
+    return sys.float_info.max if hi > lo else -sys.float_info.max
+
+
+def _score_abs_diff_clamped(a: float, b: float) -> float:
+    """Return finite min(sys.float_info.max, |a - b|) preserving subnormals."""
+    fa = float(a)
+    fb = float(b)
+    if not (math.isfinite(fa) and math.isfinite(fb)):
+        return math.nan
+    diff = abs(fa - fb)
+    return diff if math.isfinite(diff) else sys.float_info.max
+
+
+def _score_normalized_margin(margin: float, min_value: float, max_value: float) -> float:
+    """Normalize a nonnegative ScoreField interval margin into [0, 1] without overflow or subnormal loss."""
+    lo = float(min_value)
+    hi = float(max_value)
+    m = float(margin)
+    if m == 0.0:
+        return 0.0
+    if not math.isfinite(m) or m < 0.0:
+        return 1.0 if not math.isfinite(m) else 0.0
+    span = hi - lo
+    if math.isfinite(span):
+        if span <= 0.0:
+            return 1.0
+        return min(1.0, m / span)
+    if m >= sys.float_info.max:
+        return 1.0
+    hs = 0.5 * hi - 0.5 * lo
+    return min(1.0, (0.5 * m) / hs) if hs > 0.0 else 1.0
+
+
+def _f64_to_exact_2m1074(v: float) -> int:
+    """Convert a finite float64 exactly into an integer multiple of 2^-1074."""
+    if v == 0.0:
+        return 0
+    m, e = math.frexp(v)
+    if e >= -1021:
+        return int(math.ldexp(m, 53)) << (e + 1021)
+    return int(math.ldexp(v, 1074))
+
+
+def _score_within_rel_tolerance(
+    a: float, b: float, min_value: float, max_value: float, rel_tol: float
+) -> bool:
+    """Return True when |a - b| <= rel_tol * (max_value - min_value) with zero rounding error."""
+    fa = float(a)
+    fb = float(b)
+    lo = float(min_value)
+    hi = float(max_value)
+    tol = float(rel_tol)
+    if not (math.isfinite(fa) and math.isfinite(fb) and math.isfinite(lo) and math.isfinite(hi)):
+        return False
+    if math.isnan(tol) or tol < 0.0:
+        return False
+    if hi <= lo or tol == 0.0:
+        return fa == fb
+    if math.isinf(tol):
+        return True
+    diff_i = abs(_f64_to_exact_2m1074(fa) - _f64_to_exact_2m1074(fb))
+    span_i = _f64_to_exact_2m1074(hi) - _f64_to_exact_2m1074(lo)
+    tol_i = _f64_to_exact_2m1074(tol)
+    return (diff_i << 1074) <= tol_i * span_i
+
+
+def _score_abs_diff_exact_2m1074(a: float, b: float) -> int:
+    """Return exact |a - b| in integer multiples of 2^-1074 without premature clamping."""
+    fa = float(a)
+    fb = float(b)
+    if not (math.isfinite(fa) and math.isfinite(fb)):
+        raise ValueError(f"Score values must be finite, got {a!r} and {b!r}")
+    return abs(_f64_to_exact_2m1074(fa) - _f64_to_exact_2m1074(fb))
+
+
+def _score_mae_from_int_sum(int_sum: int, count: int) -> float:
+    """Convert an accumulated 2^-1074 integer error sum into finite float64 MAE."""
+    if count <= 0 or int_sum <= 0:
+        return 0.0
+    try:
+        val = float(int_sum / (count << 1074))
+    except OverflowError:
+        return sys.float_info.max
+    return val if math.isfinite(val) else sys.float_info.max
+
+
+def _score_rmse_from_int_diffs(int_diffs: Sequence[int]) -> float:
+    """Convert a sequence of exact 2^-1074 integer errors into finite float64 RMSE."""
+    n = len(int_diffs)
+    if n == 0:
+        return 0.0
+    s2 = sum(d * d for d in int_diffs)
+    if s2 <= 0:
+        return 0.0
+    k = ((s2.bit_length() - n.bit_length()) - 150) // 2
+    try:
+        ratio = float(s2 / (n << (2 * k))) if k >= 0 else float((s2 << (-2 * k)) / n)
+        res = math.ldexp(math.sqrt(ratio), k - 1074)
+    except OverflowError:
+        return sys.float_info.max
+    return res if math.isfinite(res) else sys.float_info.max
+
+
+def _score_interval_bounds(
+    y_hat: float, margin: float, min_value: float, max_value: float
+) -> Tuple[float, float]:
+    """Return (max(min_value, y_hat - margin), min(max_value, y_hat + margin)) without overflow."""
+    lo = float(min_value)
+    hi = float(max_value)
+    y = float(y_hat)
+    m = float(margin)
+    if not math.isfinite(m) or m >= sys.float_info.max:
+        return lo, hi
+    if not math.isfinite(y):
+        return lo, hi
+    if m <= 0.0:
+        yc = min(hi, max(lo, y))
+        return yc, yc
+    if y <= lo or _score_abs_diff_clamped(y, lo) <= m:
+        low = lo
+    else:
+        low = y - m
+    if y >= hi or _score_abs_diff_clamped(hi, y) <= m:
+        high = hi
+    else:
+        high = y + m
+    return low, high
+
+
 # FieldDefinition alias for canonical DecisionField
 FieldDefinition = DecisionField
 
@@ -616,4 +827,18 @@ __all__ = [
     "SchemaMeta",
     "DecisionSchema",
     "_validate_field_name",
+    "_score_half_span",
+    "_score_to_unit_ratio",
+    "_score_from_unit_prob",
+    "_score_full_span_clamped",
+    "_score_abs_diff_clamped",
+    "_score_normalized_margin",
+    "_score_within_rel_tolerance",
+    "_f64_to_exact_2m1074",
+    "_score_abs_diff_exact_2m1074",
+    "_score_mae_from_int_sum",
+    "_score_rmse_from_int_diffs",
+    "_score_interval_bounds",
+    "_format_score_bound",
+    "_format_score_interval",
 ]

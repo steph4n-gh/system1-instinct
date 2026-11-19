@@ -1,6 +1,6 @@
 # System 1: Instinct documentation
 
-Current package version: **1.2.0** (`Development Status :: 5 - Production/Stable`).
+Current package version: **1.3.0** (`Development Status :: 5 - Production/Stable`).
 
 **System 1: Instinct** is a local decision runtime. It is not an LLM, and it ships no pretrained weights by default. Each skill defines a `DecisionSchema` (`ChoiceField`, `BooleanField`, `MultiChoiceField`, and `ScoreField`). A skill runs from option descriptions or fits weights from labeled examples, updates online via `adapt_zero_shot` and `BoundedReviewFallback`, and serializes to a `.s1m` artifact. Latency and file size depend on the host and the vocabulary; see the [README honest limits](../README.md#honest-limits).
 
@@ -47,8 +47,8 @@ The index in [`docs/drop_in/README.md`](drop_in/README.md) covers drop-in integr
 | [Six-category benchmark report](../benchmarks/quality/instinct_gauntlet_report.md) | `BANKING77` (32 and 77 intents), `CLINC150-OOS`, `NotInject`, authored drift probes, four-field extraction, and zero-shot routing |
 | [Drop-in and adaptation curve report](../benchmarks/quality/drop_in_and_adaptation_report.md) | Zero-shot, `adapt_zero_shot`, few-shot, and compiled `.s1m` curves on `BANKING77` and `CLINC150` |
 | [`poke-env` Showdown benchmark report](../benchmarks/quality/poke_env_showdown_report.md) | Live `gen9randombattle` Showdown results against `RandomPlayer`, `MaxBasePowerPlayer`, and `SimpleHeuristicsPlayer` |
-| [Architecture reference](architecture/technical_specification.md) | Runtime components, `.s1m` v2 binary format, and module map |
-| [Technical brief](paper/system1_technical_brief.md) | Summary of the runtime and empirical results |
-| [Whitepaper](paper/system1_whitepaper.md) | Full design, mathematical formulation, and workload evaluations |
-| [Mathematical notes](paper/conformal_gating.md) | Split-conformal prediction, Mondrian calibration, dual OOD gating, and rank-1 RLS updates |
+| [Architecture reference](architecture/technical_specification.md) | Runtime components and module map, `.s1m` v2 and opt-in v3 formats, and the custom-model keyword contract |
+| [Technical brief](paper/system1_technical_brief.md) | Summary of the runtime, empirical results, and 1.3 additions |
+| [Whitepaper](paper/system1_whitepaper.md) | Full design, mathematical formulation, workload evaluations, and 1.3 additions |
+| [Mathematical notes](paper/conformal_gating.md) | Split-conformal prediction, Mondrian calibration, dual OOD gating, rank-1 RLS updates, and the 1.3 online tracker, Conformal Risk Control, and ordinal intervals |
 | [Benchmark suite index](../benchmarks/quality/README.md) | Reproducible benchmark runners and datasets |

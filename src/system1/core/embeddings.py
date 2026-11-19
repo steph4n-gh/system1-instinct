@@ -7,11 +7,13 @@ no workload-independent latency bound is asserted."""
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
 import json
 import math
 import re
+import time
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
 
@@ -86,8 +88,10 @@ _ANCHOR_STOPWORDS: frozenset[str] = frozenset({
 })
 
 
-@lru_cache(maxsize=65536)
-def _stem_word(word: str) -> str:
+_EMBEDDING_CACHE_MAXSIZE = 16384
+
+
+def _stem_word_impl(word: str) -> str:
     """Deterministic Porter-style English morphological stemmer for cold-start alignment."""
     w = word.lower().strip()
     if len(w) <= 3 or not w.isalpha():
@@ -136,6 +140,18 @@ def _stem_word(word: str) -> str:
     if len(w) >= 4 and w.endswith("ll"):
         w = w[:-1]
     return w
+
+
+_stem_word_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_stem_word_impl)
+
+
+def _stem_word(word: str) -> str:
+    """Deterministic Porter-style English morphological stemmer with bounded configurable cache."""
+    return _stem_word_cached(word)
+
+
+_stem_word.cache_clear = lambda: _stem_word_cached.cache_clear()  # type: ignore[attr-defined]
+_stem_word.cache_info = lambda: _stem_word_cached.cache_info()  # type: ignore[attr-defined]
 
 
 _CLAUSE_SPLIT_RE = re.compile(r"[.!?;,]+")
@@ -841,10 +857,65 @@ def match_semantic_concepts(text: str) -> Dict[str, float]:
     return dict(scores)
 
 
-@lru_cache(maxsize=65536)
-def _cached_token_hash(token_norm: str, vocab_size: int) -> int:
+def _cached_token_hash_impl(token_norm: str, vocab_size: int) -> int:
     h = hashlib.sha256(token_norm.encode("utf-8")).digest()
     return int.from_bytes(h[:4], "big") % vocab_size
+
+
+_cached_token_hash_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_cached_token_hash_impl)
+
+
+def _cached_token_hash(token_norm: str, vocab_size: int) -> int:
+    return _cached_token_hash_cached(token_norm, vocab_size)
+
+
+_cached_token_hash.cache_clear = lambda: _cached_token_hash_cached.cache_clear()  # type: ignore[attr-defined]
+_cached_token_hash.cache_info = lambda: _cached_token_hash_cached.cache_info()  # type: ignore[attr-defined]
+
+
+def _sparse_word_hashes_impl(token: str, sparse_dim: int, count: int = 4) -> Tuple[Tuple[int, float], ...]:
+    h = hashlib.sha256(f"word:{token}".encode("utf-8")).digest()
+    res: List[Tuple[int, float]] = []
+    for i in range(count):
+        chunk = h[i * 4 : (i + 1) * 4]
+        val = int.from_bytes(chunk, byteorder="big", signed=False)
+        idx = val % sparse_dim
+        sign = 1.0 if ((val >> 16) & 1) == 0 else -1.0
+        res.append((idx, sign))
+    return tuple(res)
+
+
+def _sparse_single_hash_impl(prefix_token: str, sparse_dim: int) -> Tuple[int, float]:
+    h = hashlib.sha256(prefix_token.encode("utf-8")).digest()
+    idx = int.from_bytes(h[:4], "big") % sparse_dim
+    sign = 1.0 if (h[4] & 1) == 0 else -1.0
+    return idx, sign
+
+
+_sparse_word_hashes_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_sparse_word_hashes_impl)
+_sparse_single_hash_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_sparse_single_hash_impl)
+
+
+def set_embedding_cache_maxsize(maxsize: int) -> None:
+    """Update maxsize for module-level token/stem/subword LRU caches and flush old entries."""
+    global _EMBEDDING_CACHE_MAXSIZE
+    global _stem_word_cached, _cached_token_hash_cached
+    global _sparse_word_hashes_cached, _sparse_single_hash_cached
+    if type(maxsize) is not int or maxsize < 0:
+        raise ValueError(f"maxsize must be a non-negative integer, got {maxsize}")
+    _EMBEDDING_CACHE_MAXSIZE = int(maxsize)
+    _stem_word_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_stem_word_impl)
+    _cached_token_hash_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_cached_token_hash_impl)
+    _sparse_word_hashes_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_sparse_word_hashes_impl)
+    _sparse_single_hash_cached = lru_cache(maxsize=_EMBEDDING_CACHE_MAXSIZE)(_sparse_single_hash_impl)
+
+
+def clear_embedding_caches() -> None:
+    """Clear all module-level token/stem/subword LRU caches."""
+    _stem_word_cached.cache_clear()
+    _cached_token_hash_cached.cache_clear()
+    _sparse_word_hashes_cached.cache_clear()
+    _sparse_single_hash_cached.cache_clear()
 
 
 class SubwordSemanticEmbeddings:
@@ -1350,6 +1421,30 @@ class HybridProjector:
 
     extract_schema_anchor_texts = staticmethod(extract_schema_anchor_texts)
 
+    @staticmethod
+    def _require_finite_scalar(val: Any, name: str) -> float:
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"HybridProjector {name} must be a finite number, got {val!r}")
+        fval = float(val)
+        if not math.isfinite(fval):
+            raise ValueError(f"HybridProjector {name} must be finite, got {val!r}")
+        return fval
+
+    @staticmethod
+    def _require_strict_int(val: Any, name: str) -> int:
+        if type(val) is not int:
+            raise ValueError(f"HybridProjector {name} must be an integer, got {val!r}")
+        return val
+
+    @staticmethod
+    def _require_strict_bool(mapping: Mapping[str, Any], key: str, default: bool = False) -> bool:
+        if key not in mapping:
+            return default
+        val = mapping[key]
+        if type(val) is not bool:
+            raise ValueError(f"Saved hybrid projector {key} must be a boolean")
+        return val
+
     def __init__(
         self,
         dimension: Optional[int] = None,
@@ -1363,11 +1458,12 @@ class HybridProjector:
         spectral_blend: float = 0.35,
     ) -> None:
         self._explicit_alpha = alpha is not None
-        eff_alpha = 0.5 if alpha is None else float(alpha)
+        eff_alpha = 0.5 if alpha is None else self._require_finite_scalar(alpha, "alpha")
         if not (0.0 < eff_alpha < 1.0):
             raise ValueError(f"alpha must be in (0.0, 1.0), got {eff_alpha}")
 
         if dimension is not None:
+            dimension = self._require_strict_int(dimension, "dimension")
             if dimension <= 0:
                 raise ValueError(f"dimension must be positive, got {dimension}")
             # Divide dimension between sparse and dense
@@ -1375,18 +1471,28 @@ class HybridProjector:
             dense_dim = max(1, dimension - sparse_dim)
             self.dimension = sparse_dim + dense_dim
         else:
+            sparse_dim = self._require_strict_int(sparse_dim, "sparse_dim")
+            dense_dim = self._require_strict_int(dense_dim, "dense_dim")
             if sparse_dim <= 0:
                 raise ValueError(f"sparse_dim must be positive, got {sparse_dim}")
             if dense_dim <= 0:
                 raise ValueError(f"dense_dim must be positive, got {dense_dim}")
             self.dimension = sparse_dim + dense_dim
 
+        seed = self._require_strict_int(seed, "seed")
+        eff_svd_power = self._require_finite_scalar(svd_power, "svd_power")
+        if eff_svd_power < 0.0:
+            raise ValueError(f"svd_power must be nonnegative, got {eff_svd_power}")
+        eff_spectral_blend = self._require_finite_scalar(spectral_blend, "spectral_blend")
+        if not (0.0 <= eff_spectral_blend <= 1.0):
+            raise ValueError(f"spectral_blend must be in [0.0, 1.0], got {eff_spectral_blend}")
+
         self.sparse_dim = sparse_dim
         self.dense_dim = dense_dim
         self.alpha = eff_alpha
         self.seed = seed
-        self.svd_power = float(svd_power)
-        self.spectral_blend = float(spectral_blend)
+        self.svd_power = eff_svd_power
+        self.spectral_blend = eff_spectral_blend
         self.backend = self._resolve_backend(backend)
 
         # Dense subword semantic engine
@@ -1947,25 +2053,12 @@ class HybridProjector:
     fit = _HybridFitDescriptor()
 
     @staticmethod
-    @lru_cache(maxsize=65536)
     def _sparse_word_hashes(token: str, sparse_dim: int, count: int = 4) -> Tuple[Tuple[int, float], ...]:
-        h = hashlib.sha256(f"word:{token}".encode("utf-8")).digest()
-        res: List[Tuple[int, float]] = []
-        for i in range(count):
-            chunk = h[i * 4 : (i + 1) * 4]
-            val = int.from_bytes(chunk, byteorder="big", signed=False)
-            idx = val % sparse_dim
-            sign = 1.0 if ((val >> 16) & 1) == 0 else -1.0
-            res.append((idx, sign))
-        return tuple(res)
+        return _sparse_word_hashes_cached(token, sparse_dim, count)
 
     @staticmethod
-    @lru_cache(maxsize=65536)
     def _sparse_single_hash(prefix_token: str, sparse_dim: int) -> Tuple[int, float]:
-        h = hashlib.sha256(prefix_token.encode("utf-8")).digest()
-        idx = int.from_bytes(h[:4], "big") % sparse_dim
-        sign = 1.0 if (h[4] & 1) == 0 else -1.0
-        return idx, sign
+        return _sparse_single_hash_cached(prefix_token, sparse_dim)
 
     def _hash_to_sparse_vec(
         self,
@@ -2065,15 +2158,23 @@ class HybridProjector:
         if not counts:
             return None, False
         r_spec = self._spectral_vectors.shape[1]
-        spec_accum = np.zeros(r_spec, dtype=np.float32)
-        for tm, cnt in counts.items():
-            idx = self._spectral_vocab[tm]
-            w = (1.0 + math.log(cnt)) * self._spectral_weights[idx]
-            spec_accum += w * self._spectral_vectors[idx]
-        s_norm = float(np.linalg.norm(spec_accum))
-        if s_norm < 1e-12:
-            return None, False
-        return (spec_accum / s_norm).astype(np.float32), True
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            spec_accum = np.zeros(r_spec, dtype=np.float32)
+            for tm, cnt in counts.items():
+                idx = self._spectral_vocab[tm]
+                w = (1.0 + math.log(cnt)) * self._spectral_weights[idx]
+                spec_accum += w * self._spectral_vectors[idx]
+            if not bool(np.all(np.isfinite(spec_accum))):
+                return np.full(r_spec, np.nan, dtype=np.float32), True
+            s_norm = float(np.linalg.norm(spec_accum))
+            if not math.isfinite(s_norm):
+                return np.full(r_spec, np.nan, dtype=np.float32), True
+            if s_norm < 1e-12:
+                return None, False
+            out = (spec_accum / s_norm).astype(np.float32)
+            if not bool(np.all(np.isfinite(out))):
+                return np.full(r_spec, np.nan, dtype=np.float32), True
+            return out, True
 
     def _extract_spectral_unit_batch(self, texts: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
         """Batched unit-normalized raw spectral vectors and validity mask via chunked SGEMM."""
@@ -2096,37 +2197,46 @@ class HybridProjector:
         out = np.zeros((n_docs, r_spec), dtype=np.float32)
         has_spec = np.zeros(n_docs, dtype=bool)
         chunk_size = 256
-        for start in range(0, n_docs, chunk_size):
-            end = min(start + chunk_size, n_docs)
-            c_len = end - start
-            counts_mat = np.zeros((c_len, v_size), dtype=np.float32)
-            non_empty_rows: List[int] = []
-            for local_i, t in enumerate(texts[start:end]):
-                terms = _extract_corpus_terms(t)
-                if not terms:
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            for start in range(0, n_docs, chunk_size):
+                end = min(start + chunk_size, n_docs)
+                c_len = end - start
+                counts_mat = np.zeros((c_len, v_size), dtype=np.float32)
+                non_empty_rows: List[int] = []
+                for local_i, t in enumerate(texts[start:end]):
+                    terms = _extract_corpus_terms(t)
+                    if not terms:
+                        continue
+                    cnts: Dict[int, int] = {}
+                    for tm in terms:
+                        idx = sv.get(tm)
+                        if idx is not None:
+                            cnts[idx] = cnts.get(idx, 0) + 1
+                    if cnts:
+                        cols = list(cnts.keys())
+                        vals = [
+                            float(sw_arr[idx]) if c == 1 else (1.0 + math.log(c)) * float(sw_arr[idx])
+                            for idx, c in cnts.items()
+                        ]
+                        counts_mat[local_i, cols] = np.asarray(vals, dtype=np.float32)
+                        non_empty_rows.append(local_i)
+                if not non_empty_rows:
                     continue
-                cnts: Dict[int, int] = {}
-                for tm in terms:
-                    idx = sv.get(tm)
-                    if idx is not None:
-                        cnts[idx] = cnts.get(idx, 0) + 1
-                if cnts:
-                    cols = list(cnts.keys())
-                    vals = [
-                        float(sw_arr[idx]) if c == 1 else (1.0 + math.log(c)) * float(sw_arr[idx])
-                        for idx, c in cnts.items()
-                    ]
-                    counts_mat[local_i, cols] = np.asarray(vals, dtype=np.float32)
-                    non_empty_rows.append(local_i)
-            if not non_empty_rows:
-                continue
-            accums = counts_mat @ self._spectral_vectors
-            norms = np.linalg.norm(accums, axis=1, keepdims=True)
-            valid = (norms[:, 0] >= 1e-12) & np.isfinite(norms[:, 0])
-            if np.any(valid):
-                accums[valid] /= norms[valid]
-                out[start:end][valid] = accums[valid].astype(np.float32)
-                has_spec[start:end] = valid
+                accums = counts_mat @ self._spectral_vectors
+                norms = np.linalg.norm(accums, axis=1, keepdims=True)
+                row_fin = np.all(np.isfinite(accums), axis=1) & np.isfinite(norms[:, 0])
+                valid = row_fin & (norms[:, 0] >= 1e-12)
+                bad = ~row_fin
+                if np.any(valid):
+                    normed = (accums[valid] / norms[valid]).astype(np.float32)
+                    norm_bad = ~np.all(np.isfinite(normed), axis=1)
+                    if np.any(norm_bad):
+                        normed[norm_bad] = np.nan
+                    out[start:end][valid] = normed
+                    has_spec[start:end] = has_spec[start:end] | valid
+                if np.any(bad):
+                    out[start:end][bad] = np.nan
+                    has_spec[start:end] = has_spec[start:end] | bad
         return out, has_spec
 
     def _encode_spectral_dense(self, text: str, base_dense: np.ndarray) -> np.ndarray:
@@ -2136,14 +2246,28 @@ class HybridProjector:
         spec_unit, ok = self._extract_spectral_unit(text)
         if not ok or spec_unit is None:
             return base_dense
-        spec_dense = spec_unit @ self._spectral_basis
-        sd_norm = float(np.linalg.norm(spec_dense))
-        if sd_norm > 1e-12:
-            spec_dense = spec_dense / sd_norm
-        blend = min(1.0, max(0.0, float(self.spectral_blend)))
-        blended = (1.0 - blend) * base_dense + blend * spec_dense
-        b_norm = float(np.linalg.norm(blended))
-        return (blended / b_norm).astype(np.float32) if b_norm > 1e-12 else base_dense
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if not bool(np.all(np.isfinite(spec_unit))) or not bool(np.all(np.isfinite(base_dense))):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            spec_dense = spec_unit @ self._spectral_basis
+            if not bool(np.all(np.isfinite(spec_dense))):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            sd_norm = float(np.linalg.norm(spec_dense))
+            if not math.isfinite(sd_norm):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            if sd_norm > 1e-12:
+                spec_dense = spec_dense / sd_norm
+            blend = min(1.0, max(0.0, float(self.spectral_blend)))
+            blended = (1.0 - blend) * base_dense + blend * spec_dense
+            if not bool(np.all(np.isfinite(blended))):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            b_norm = float(np.linalg.norm(blended))
+            if not math.isfinite(b_norm):
+                return np.full(base_dense.shape, np.nan, dtype=np.float32)
+            if b_norm > 1e-12:
+                out = (blended / b_norm).astype(np.float32)
+                return out if bool(np.all(np.isfinite(out))) else np.full(base_dense.shape, np.nan, dtype=np.float32)
+            return base_dense
 
     def _project_base(self, text: str) -> np.ndarray:
         fit_cache = getattr(self, "_fit_base_cache", None)
@@ -2169,47 +2293,56 @@ class HybridProjector:
             v_sparse = self._hash_to_sparse_vec(text, _pretokenized=pretok)
         v_dense = self._dense_engine.encode(text, _pretokenized=pretok)
 
-        if self._direct_spectral:
-            sd = self.sparse_dim
-            dd = self.dense_dim
-            spd = self._direct_spectral_dim
-            base_dim = sd + dd + spd
-            w_sparse = math.sqrt(self.alpha)
-            if spd > 0:
-                w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
-                w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
-            else:
-                w_dense = math.sqrt(1.0 - self.alpha)
-                w_spec = 0.0
-            v_out = np.empty(base_dim, dtype=np.float32)
-            np.multiply(v_sparse, w_sparse, out=v_out[:sd])
-            np.multiply(v_dense, w_dense, out=v_out[sd : sd + dd])
-            if spd > 0:
-                spec_unit, ok = self._extract_spectral_unit(text)
-                if ok and spec_unit is not None and spec_unit.shape[0] == spd:
-                    np.multiply(spec_unit, w_spec, out=v_out[sd + dd :])
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if self._direct_spectral:
+                sd = self.sparse_dim
+                dd = self.dense_dim
+                spd = self._direct_spectral_dim
+                base_dim = sd + dd + spd
+                w_sparse = math.sqrt(self.alpha)
+                if spd > 0:
+                    w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
+                    w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
                 else:
-                    v_out[sd + dd :] = 0.0
-            norm = float(np.linalg.norm(v_out))
-            if norm > 1e-12 and np.isfinite(norm):
-                return (v_out / norm).astype(np.float32)
-            v_fallback = np.zeros(base_dim, dtype=np.float32)
-            v_fallback[0] = 1.0
-            return v_fallback
+                    w_dense = math.sqrt(1.0 - self.alpha)
+                    w_spec = 0.0
+                v_out = np.empty(base_dim, dtype=np.float32)
+                np.multiply(v_sparse, w_sparse, out=v_out[:sd])
+                np.multiply(v_dense, w_dense, out=v_out[sd : sd + dd])
+                if spd > 0:
+                    spec_unit, ok = self._extract_spectral_unit(text)
+                    if ok and spec_unit is not None and spec_unit.shape[0] == spd:
+                        np.multiply(spec_unit, w_spec, out=v_out[sd + dd :])
+                    else:
+                        v_out[sd + dd :] = 0.0
+                all_fin = bool(np.all(np.isfinite(v_out)))
+                norm = float(np.linalg.norm(v_out)) if all_fin else float("nan")
+                if all_fin and math.isfinite(norm) and norm > 1e-12:
+                    normed = (v_out / norm).astype(np.float32)
+                    return normed if bool(np.all(np.isfinite(normed))) else np.full(base_dim, np.nan, dtype=np.float32)
+                if all_fin and math.isfinite(norm):
+                    v_fallback = np.zeros(base_dim, dtype=np.float32)
+                    v_fallback[0] = 1.0
+                    return v_fallback
+                return np.full(base_dim, np.nan, dtype=np.float32)
 
-        if self._fitted:
-            v_dense = self._encode_spectral_dense(text, v_dense)
+            if self._fitted:
+                v_dense = self._encode_spectral_dense(text, v_dense)
 
-        w_sparse = math.sqrt(self.alpha)
-        w_dense = math.sqrt(1.0 - self.alpha)
+            w_sparse = math.sqrt(self.alpha)
+            w_dense = math.sqrt(1.0 - self.alpha)
 
-        v_hybrid = np.concatenate([w_sparse * v_sparse, w_dense * v_dense]).astype(np.float32)
-        norm = float(np.linalg.norm(v_hybrid))
-        if norm > 1e-12:
-            return (v_hybrid / norm).astype(np.float32)
-        v_fallback = np.zeros(self._base_dimension, dtype=np.float32)
-        v_fallback[0] = 1.0
-        return v_fallback
+            v_hybrid = np.concatenate([w_sparse * v_sparse, w_dense * v_dense]).astype(np.float32)
+            all_fin = bool(np.all(np.isfinite(v_hybrid)))
+            norm = float(np.linalg.norm(v_hybrid)) if all_fin else float("nan")
+            if all_fin and math.isfinite(norm) and norm > 1e-12:
+                normed = (v_hybrid / norm).astype(np.float32)
+                return normed if bool(np.all(np.isfinite(normed))) else np.full(self._base_dimension, np.nan, dtype=np.float32)
+            if all_fin and math.isfinite(norm):
+                v_fallback = np.zeros(self._base_dimension, dtype=np.float32)
+                v_fallback[0] = 1.0
+                return v_fallback
+            return np.full(self._base_dimension, np.nan, dtype=np.float32)
 
     def _project_base_batch(
         self,
@@ -2260,65 +2393,91 @@ class HybridProjector:
             ] if pretok_list is not None else None,
         )
 
-        if self._direct_spectral:
-            sd = self.sparse_dim
-            dd = self.dense_dim
-            spd = self._direct_spectral_dim
-            w_sparse = math.sqrt(self.alpha)
-            if spd > 0:
-                w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
-                w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
-            else:
-                w_dense = math.sqrt(1.0 - self.alpha)
-                w_spec = 0.0
-
-            base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
-            np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, :sd])
-            np.multiply(v_dense_mat, w_dense, out=base_mat[:, sd : sd + dd])
-            if spd > 0:
-                spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
-                if spec_mat.shape[1] == spd:
-                    np.multiply(spec_mat, w_spec, out=base_mat[:, sd + dd :])
-                    if np.any(~has_spec):
-                        base_mat[~has_spec, sd + dd :] = 0.0
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if self._direct_spectral:
+                sd = self.sparse_dim
+                dd = self.dense_dim
+                spd = self._direct_spectral_dim
+                w_sparse = math.sqrt(self.alpha)
+                if spd > 0:
+                    w_dense = math.sqrt((1.0 - self.alpha) * max(0.0, 1.0 - self.spectral_blend))
+                    w_spec = math.sqrt((1.0 - self.alpha) * max(0.0, self.spectral_blend))
                 else:
-                    base_mat[:, sd + dd :] = 0.0
-        else:
-            if (
-                self._fitted
-                and self._spectral_vectors is not None
-                and self._spectral_basis is not None
-                and self._spectral_vocab
-                and self.spectral_blend > 0.0
-            ):
-                spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
-                if np.any(has_spec):
-                    spec_dense = spec_mat[has_spec] @ self._spectral_basis
-                    sd_norms = np.linalg.norm(spec_dense, axis=1, keepdims=True)
-                    good_sd = sd_norms[:, 0] > 1e-12
-                    if np.any(good_sd):
-                        spec_dense[good_sd] = spec_dense[good_sd] / sd_norms[good_sd]
-                    blend = min(1.0, max(0.0, float(self.spectral_blend)))
-                    blended = (1.0 - blend) * v_dense_mat[has_spec] + blend * spec_dense
-                    b_norms = np.linalg.norm(blended, axis=1, keepdims=True)
-                    good_b = b_norms[:, 0] > 1e-12
-                    has_idx = np.flatnonzero(has_spec)
-                    if np.any(good_b):
-                        v_dense_mat[has_idx[good_b]] = (blended[good_b] / b_norms[good_b]).astype(np.float32)
+                    w_dense = math.sqrt(1.0 - self.alpha)
+                    w_spec = 0.0
 
-            w_sparse = math.sqrt(self.alpha)
-            w_dense = math.sqrt(1.0 - self.alpha)
-            base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
-            np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, : self.sparse_dim])
-            np.multiply(v_dense_mat, w_dense, out=base_mat[:, self.sparse_dim :])
+                base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
+                np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, :sd])
+                np.multiply(v_dense_mat, w_dense, out=base_mat[:, sd : sd + dd])
+                if spd > 0:
+                    spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
+                    if spec_mat.shape[1] == spd:
+                        np.multiply(spec_mat, w_spec, out=base_mat[:, sd + dd :])
+                        if np.any(~has_spec):
+                            base_mat[~has_spec, sd + dd :] = 0.0
+                    else:
+                        base_mat[:, sd + dd :] = 0.0
+            else:
+                if (
+                    self._fitted
+                    and self._spectral_vectors is not None
+                    and self._spectral_basis is not None
+                    and self._spectral_vocab
+                    and self.spectral_blend > 0.0
+                ):
+                    spec_mat, has_spec = self._extract_spectral_unit_batch(texts)
+                    if np.any(has_spec):
+                        spec_dense = spec_mat[has_spec] @ self._spectral_basis
+                        sd_fin = np.all(np.isfinite(spec_mat[has_spec]), axis=1) & np.all(
+                            np.isfinite(spec_dense), axis=1
+                        )
+                        sd_norms = np.linalg.norm(spec_dense, axis=1, keepdims=True)
+                        sd_fin &= np.isfinite(sd_norms[:, 0])
+                        good_sd = sd_fin & (sd_norms[:, 0] > 1e-12)
+                        if np.any(good_sd):
+                            spec_dense[good_sd] = spec_dense[good_sd] / sd_norms[good_sd]
+                        blend = min(1.0, max(0.0, float(self.spectral_blend)))
+                        blended = (1.0 - blend) * v_dense_mat[has_spec] + blend * spec_dense
+                        b_norms = np.linalg.norm(blended, axis=1, keepdims=True)
+                        b_fin = (
+                            sd_fin
+                            & np.all(np.isfinite(v_dense_mat[has_spec]), axis=1)
+                            & np.all(np.isfinite(blended), axis=1)
+                            & np.isfinite(b_norms[:, 0])
+                        )
+                        good_b = b_fin & (b_norms[:, 0] > 1e-12)
+                        has_idx = np.flatnonzero(has_spec)
+                        if np.any(good_b):
+                            v_dense_mat[has_idx[good_b]] = (blended[good_b] / b_norms[good_b]).astype(
+                                np.float32
+                            )
+                        bad_b = ~b_fin
+                        if np.any(bad_b):
+                            v_dense_mat[has_idx[bad_b]] = np.nan
 
-        norms = np.linalg.norm(base_mat, axis=1, keepdims=True)
-        valid = (norms[:, 0] > 1e-12) & np.isfinite(norms[:, 0])
-        if np.any(valid):
-            base_mat[valid] = (base_mat[valid] / norms[valid]).astype(np.float32)
-        if np.any(~valid):
-            base_mat[~valid] = 0.0
-            base_mat[~valid, 0] = 1.0
+                w_sparse = math.sqrt(self.alpha)
+                w_dense = math.sqrt(1.0 - self.alpha)
+                base_mat = np.empty((n_docs, base_dim), dtype=np.float32)
+                np.multiply(v_sparse_mat, w_sparse, out=base_mat[:, : self.sparse_dim])
+                np.multiply(v_dense_mat, w_dense, out=base_mat[:, self.sparse_dim :])
+
+            row_fin = np.all(np.isfinite(base_mat), axis=1)
+            norms = np.linalg.norm(base_mat, axis=1, keepdims=True)
+            fin_norm = row_fin & np.isfinite(norms[:, 0])
+            unit_mask = fin_norm & (norms[:, 0] > 1e-12)
+            zero_mask = fin_norm & (norms[:, 0] <= 1e-12)
+            bad_mask = ~fin_norm
+            if np.any(unit_mask):
+                normed = (base_mat[unit_mask] / norms[unit_mask]).astype(np.float32)
+                bad_after = ~np.all(np.isfinite(normed), axis=1)
+                if np.any(bad_after):
+                    normed[bad_after] = np.nan
+                base_mat[unit_mask] = normed
+            if np.any(zero_mask):
+                base_mat[zero_mask] = 0.0
+                base_mat[zero_mask, 0] = 1.0
+            if np.any(bad_mask):
+                base_mat[bad_mask] = np.nan
 
         if return_norms:
             assert raw_norms is not None
@@ -2339,38 +2498,60 @@ class HybridProjector:
             raise TypeError(f"Expected text to be a string, got {type(text).__name__}")
 
         v_base = self._project_base(text)
-        if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
-            coords = self._subspace_components @ v_base
-            v_sub = self._subspace_components.T @ coords
-            v_base = v_base + float(self._subspace_weight) * v_sub
-            norm = float(np.linalg.norm(v_base))
-            if norm > 1e-12 and np.isfinite(norm):
-                v_base = (v_base / norm).astype(np.float32)
-            else:
-                v_base = np.zeros(self._base_dimension, dtype=np.float32)
-                v_base[0] = 1.0
+        if not bool(np.all(np.isfinite(v_base))):
+            return np.full(self.dimension, np.nan, dtype=np.float32)
 
-        if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
-            sims = self._rbf_landmarks @ v_base
-            phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
-            pnorm = float(np.linalg.norm(phi))
-            wb = math.sqrt(1.0 - self._rbf_weight)
-            wr = math.sqrt(self._rbf_weight)
-            d_b = len(v_base)
-            v_out = np.empty(self.dimension, dtype=np.float32)
-            np.multiply(v_base, wb, out=v_out[:d_b])
-            if pnorm > 1e-12:
-                np.multiply(phi, wr / pnorm, out=v_out[d_b:])
-                if not np.any(v_base):
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
+                coords = self._subspace_components @ v_base
+                v_sub = self._subspace_components.T @ coords
+                v_base = (v_base + float(self._subspace_weight) * v_sub).astype(np.float32)
+                sub_fin = (
+                    bool(np.all(np.isfinite(coords)))
+                    and bool(np.all(np.isfinite(v_sub)))
+                    and bool(np.all(np.isfinite(v_base)))
+                )
+                norm = float(np.linalg.norm(v_base)) if sub_fin else float("nan")
+                if sub_fin and math.isfinite(norm) and norm > 1e-12:
+                    v_base = (v_base / norm).astype(np.float32)
+                    if not bool(np.all(np.isfinite(v_base))):
+                        return np.full(self.dimension, np.nan, dtype=np.float32)
+                elif sub_fin and math.isfinite(norm):
+                    v_base = np.zeros(self._base_dimension, dtype=np.float32)
+                    v_base[0] = 1.0
+                else:
+                    return np.full(self.dimension, np.nan, dtype=np.float32)
+
+            if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
+                sims = self._rbf_landmarks @ v_base
+                phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
+                rbf_fin = bool(np.all(np.isfinite(sims))) and bool(np.all(np.isfinite(phi)))
+                pnorm = float(np.linalg.norm(phi)) if rbf_fin else float("nan")
+                if not rbf_fin or not math.isfinite(pnorm):
+                    return np.full(self.dimension, np.nan, dtype=np.float32)
+                wb = math.sqrt(1.0 - self._rbf_weight)
+                wr = math.sqrt(self._rbf_weight)
+                d_b = len(v_base)
+                v_out = np.empty(self.dimension, dtype=np.float32)
+                np.multiply(v_base, wb, out=v_out[:d_b])
+                if pnorm > 1e-12:
+                    np.multiply(phi, wr / pnorm, out=v_out[d_b:])
+                    if not np.any(v_base):
+                        on = float(np.linalg.norm(v_out))
+                        if math.isfinite(on) and on > 1e-12:
+                            v_out /= on
+                        elif not math.isfinite(on):
+                            return np.full(self.dimension, np.nan, dtype=np.float32)
+                else:
+                    v_out[d_b:] = 0.0
                     on = float(np.linalg.norm(v_out))
-                    if on > 1e-12:
+                    if math.isfinite(on) and on > 1e-12:
                         v_out /= on
-            else:
-                v_out[d_b:] = 0.0
-                on = float(np.linalg.norm(v_out))
-                if on > 1e-12:
-                    v_out /= on
-            return v_out
+                    elif not math.isfinite(on):
+                        return np.full(self.dimension, np.nan, dtype=np.float32)
+                if not bool(np.all(np.isfinite(v_out))):
+                    return np.full(self.dimension, np.nan, dtype=np.float32)
+                return v_out
 
         return v_base
 
@@ -2408,39 +2589,79 @@ class HybridProjector:
             v_base_mat = self._project_base_batch(text_list, return_norms=False)
             raw_norms = None
 
-        if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
-            coords = v_base_mat @ self._subspace_components.T
-            v_sub = coords @ self._subspace_components
-            v_base_mat = (v_base_mat + float(self._subspace_weight) * v_sub).astype(np.float32)
-            s_norms = np.linalg.norm(v_base_mat, axis=1, keepdims=True)
-            valid = (s_norms[:, 0] > 1e-12) & np.isfinite(s_norms[:, 0])
-            if np.any(valid):
-                v_base_mat[valid] = (v_base_mat[valid] / s_norms[valid]).astype(np.float32)
-            if np.any(~valid):
-                v_base_mat[~valid] = 0.0
-                v_base_mat[~valid, 0] = 1.0
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            if self._fitted and self._subspace_components is not None and self._subspace_weight > 0.0:
+                in_fin = np.all(np.isfinite(v_base_mat), axis=1)
+                coords = v_base_mat @ self._subspace_components.T
+                v_sub = coords @ self._subspace_components
+                v_base_mat = (v_base_mat + float(self._subspace_weight) * v_sub).astype(np.float32)
+                s_norms = np.linalg.norm(v_base_mat, axis=1, keepdims=True)
+                row_fin = (
+                    in_fin
+                    & np.all(np.isfinite(coords), axis=1)
+                    & np.all(np.isfinite(v_sub), axis=1)
+                    & np.all(np.isfinite(v_base_mat), axis=1)
+                    & np.isfinite(s_norms[:, 0])
+                )
+                unit_sub = row_fin & (s_norms[:, 0] > 1e-12)
+                zero_sub = row_fin & (s_norms[:, 0] <= 1e-12)
+                bad_sub = ~row_fin
+                if np.any(unit_sub):
+                    normed_sub = (v_base_mat[unit_sub] / s_norms[unit_sub]).astype(np.float32)
+                    bad_after = ~np.all(np.isfinite(normed_sub), axis=1)
+                    if np.any(bad_after):
+                        normed_sub[bad_after] = np.nan
+                    v_base_mat[unit_sub] = normed_sub
+                if np.any(zero_sub):
+                    v_base_mat[zero_sub] = 0.0
+                    v_base_mat[zero_sub, 0] = 1.0
+                if np.any(bad_sub):
+                    v_base_mat[bad_sub] = np.nan
 
-        if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
-            sims = v_base_mat @ self._rbf_landmarks.T
-            phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
-            p_norms = np.linalg.norm(phi, axis=1, keepdims=True)
-            phi_unit = np.where(p_norms > 1e-12, phi / np.maximum(p_norms, 1e-12), 0.0).astype(np.float32)
-            wb = math.sqrt(1.0 - self._rbf_weight)
-            wr = math.sqrt(self._rbf_weight)
-            d_b = v_base_mat.shape[1]
-            v_out = np.empty((len(text_list), self.dimension), dtype=np.float32)
-            np.multiply(v_base_mat, wb, out=v_out[:, :d_b])
-            np.multiply(phi_unit, wr, out=v_out[:, d_b:])
-            row_norms = np.linalg.norm(v_out, axis=1, keepdims=True)
-            valid_out = (row_norms[:, 0] > 1e-12) & np.isfinite(row_norms[:, 0])
-            if np.any(valid_out):
-                v_out[valid_out] = (v_out[valid_out] / row_norms[valid_out]).astype(np.float32)
-            if np.any(~valid_out):
-                v_out[~valid_out] = 0.0
-                v_out[~valid_out, 0] = 1.0
-            res = v_out
-        else:
-            res = v_base_mat
+            if self._rbf_landmarks is not None and self._rbf_weight > 0.0:
+                base_fin = np.all(np.isfinite(v_base_mat), axis=1)
+                sims = v_base_mat @ self._rbf_landmarks.T
+                phi = np.exp(self._rbf_gamma * (sims - 1.0)).astype(np.float32)
+                p_norms = np.linalg.norm(phi, axis=1, keepdims=True)
+                rbf_fin = (
+                    base_fin
+                    & np.all(np.isfinite(sims), axis=1)
+                    & np.all(np.isfinite(phi), axis=1)
+                    & np.isfinite(p_norms[:, 0])
+                )
+                phi_unit = np.full(phi.shape, np.nan, dtype=np.float32)
+                nz_phi = rbf_fin & (p_norms[:, 0] > 1e-12)
+                zero_phi = rbf_fin & (p_norms[:, 0] <= 1e-12)
+                if np.any(nz_phi):
+                    phi_unit[nz_phi] = (phi[nz_phi] / p_norms[nz_phi]).astype(np.float32)
+                if np.any(zero_phi):
+                    phi_unit[zero_phi] = 0.0
+
+                wb = math.sqrt(1.0 - self._rbf_weight)
+                wr = math.sqrt(self._rbf_weight)
+                d_b = v_base_mat.shape[1]
+                v_out = np.empty((len(text_list), self.dimension), dtype=np.float32)
+                np.multiply(v_base_mat, wb, out=v_out[:, :d_b])
+                np.multiply(phi_unit, wr, out=v_out[:, d_b:])
+                row_norms = np.linalg.norm(v_out, axis=1, keepdims=True)
+                fin_out = rbf_fin & np.all(np.isfinite(v_out), axis=1) & np.isfinite(row_norms[:, 0])
+                unit_out = fin_out & (row_norms[:, 0] > 1e-12)
+                zero_out = fin_out & (row_norms[:, 0] <= 1e-12)
+                bad_out = ~fin_out
+                if np.any(unit_out):
+                    normed_out = (v_out[unit_out] / row_norms[unit_out]).astype(np.float32)
+                    bad_after_o = ~np.all(np.isfinite(normed_out), axis=1)
+                    if np.any(bad_after_o):
+                        normed_out[bad_after_o] = np.nan
+                    v_out[unit_out] = normed_out
+                if np.any(zero_out):
+                    v_out[zero_out] = 0.0
+                    v_out[zero_out, 0] = 1.0
+                if np.any(bad_out):
+                    v_out[bad_out] = np.nan
+                res = v_out
+            else:
+                res = v_base_mat
 
         if return_norms:
             assert raw_norms is not None
@@ -2465,15 +2686,15 @@ class HybridProjector:
         }
         if self._fitted:
             cfg["fitted"] = True
-            cfg["svd_power"] = round(float(self.svd_power), 6)
-            cfg["spectral_blend"] = round(float(self.spectral_blend), 6)
+            cfg["svd_power"] = float(self.svd_power)
+            cfg["spectral_blend"] = float(self.spectral_blend)
             cfg["spectral_terms"] = list(self._spectral_terms)
-            cfg["spectral_weights"] = [round(float(w), 6) for w in self._spectral_weights]
+            cfg["spectral_weights"] = [float(w) for w in self._spectral_weights]
             if self._direct_spectral:
                 cfg["direct_spectral"] = True
                 cfg["direct_spectral_dim"] = int(self._direct_spectral_dim)
-            if abs(self._context_smooth - 1.0) > 1e-9:
-                cfg["context_smooth"] = round(float(self._context_smooth), 6)
+            if self._context_smooth != 1.0:
+                cfg["context_smooth"] = float(self._context_smooth)
             if self._tfidf_projector is not None:
                 tp_cfg = self._tfidf_projector.to_config(include_arrays=include_arrays)
                 cfg["tfidf_terms"] = tp_cfg["terms"]
@@ -2494,22 +2715,22 @@ class HybridProjector:
             if self._use_subspace:
                 cfg["use_subspace"] = True
             if self._rbf_landmarks is not None:
-                cfg["rbf_gamma"] = round(float(self._rbf_gamma), 6)
-                cfg["rbf_weight"] = round(float(self._rbf_weight), 6)
+                cfg["rbf_gamma"] = float(self._rbf_gamma)
+                cfg["rbf_weight"] = float(self._rbf_weight)
                 if include_arrays:
                     cfg["rbf_landmarks"] = [
-                        [round(float(x), 6) for x in row] for row in self._rbf_landmarks
+                        [float(x) for x in row] for row in self._rbf_landmarks
                     ]
             if include_arrays:
                 if self._spectral_vectors is not None:
                     cfg["spectral_vectors"] = [
-                        [round(float(x), 6) for x in row] for row in self._spectral_vectors
+                        [float(x) for x in row] for row in self._spectral_vectors
                     ]
                 if self._subspace_components is not None:
                     cfg["subspace_components"] = [
-                        [round(float(x), 6) for x in row] for row in self._subspace_components
+                        [float(x) for x in row] for row in self._subspace_components
                     ]
-            cfg["subspace_weight"] = round(float(self._subspace_weight), 6)
+            cfg["subspace_weight"] = float(self._subspace_weight)
         return cfg
 
     @classmethod
@@ -2531,13 +2752,100 @@ class HybridProjector:
         dense = config.get("dense_dim")
         if type(sparse) is not int or type(dense) is not int or sparse <= 0 or dense <= 0:
             raise ValueError("Saved hybrid projector dimensions do not match the skill")
-        alpha = float(config.get("alpha", 0.5))
-        seed = int(config.get("seed", 42))
-        svd_power = float(config.get("svd_power", 0.5))
-        spectral_blend = float(config.get("spectral_blend", 0.35))
-        terms = tuple(config.get("spectral_terms", ()))
-        if any(not isinstance(term, str) or not term.strip() for term in terms) or len(set(terms)) != len(terms):
+        fitted_flag = cls._require_strict_bool(config, "fitted", False)
+        use_subspace_flag = cls._require_strict_bool(config, "use_subspace", False)
+        direct_spectral_flag = cls._require_strict_bool(config, "direct_spectral", False)
+        raw_ds_dim = cls._require_strict_int(config.get("direct_spectral_dim", 0), "direct_spectral_dim")
+        if not (0 <= raw_ds_dim <= 1024):
+            raise ValueError("Saved hybrid projector direct_spectral_dim is invalid")
+        alpha = cls._require_finite_scalar(config.get("alpha", 0.5), "alpha")
+        seed = cls._require_strict_int(config.get("seed", 42), "seed")
+        svd_power = cls._require_finite_scalar(config.get("svd_power", 0.5), "svd_power")
+        spectral_blend = cls._require_finite_scalar(config.get("spectral_blend", 0.35), "spectral_blend")
+        subspace_weight = cls._require_finite_scalar(
+            config.get("subspace_weight", 0.20 if fitted_flag else 0.0),
+            "subspace_weight",
+        )
+        if not (0.0 <= subspace_weight <= 1.0):
+            raise ValueError("Saved hybrid projector subspace_weight must be in [0, 1]")
+        context_smooth = cls._require_finite_scalar(config.get("context_smooth", 1.0), "context_smooth")
+        if context_smooth < 0.0:
+            raise ValueError("Saved hybrid projector context_smooth must be nonnegative")
+        rbf_gamma = cls._require_finite_scalar(config.get("rbf_gamma", 3.0), "rbf_gamma")
+        if rbf_gamma <= 0.0:
+            raise ValueError("Saved hybrid projector rbf_gamma must be positive")
+        rbf_weight = cls._require_finite_scalar(config.get("rbf_weight", 0.0), "rbf_weight")
+        if not (0.0 <= rbf_weight < 1.0):
+            raise ValueError("Saved hybrid projector rbf_weight must be in [0, 1)")
+        raw_terms = config.get("spectral_terms", ())
+        if not isinstance(raw_terms, (list, tuple)):
+            raise ValueError("Saved hybrid spectral terms must be a sequence")
+        terms = tuple(raw_terms)
+        if (
+            len(terms) > 2048
+            or any(not isinstance(term, str) or not term.strip() for term in terms)
+            or len(set(terms)) != len(terms)
+        ):
             raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
+        has_spectral_weights_key = "spectral_weights" in config and config["spectral_weights"] is not None
+        raw_weights = config.get("spectral_weights") if has_spectral_weights_key else ()
+        if not isinstance(raw_weights, (list, tuple)):
+            raise ValueError("Saved hybrid projector spectral weights must be a sequence")
+        weights = tuple(cls._require_finite_scalar(w, "spectral_weights") for w in raw_weights)
+        if len(terms) != len(weights):
+            raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
+        with np.errstate(over="ignore", invalid="ignore"):
+            weights_arr = (
+                np.asarray(weights, dtype=np.float32)
+                if weights
+                else np.empty(0, dtype=np.float32)
+            )
+        if not bool(np.all(np.isfinite(weights_arr))):
+            raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
+
+        def _resolve_hybrid_matrix(
+            cfg_key: str,
+            arg_arr: Optional[np.ndarray],
+        ) -> Optional[np.ndarray]:
+            raw_cfg = config.get(cfg_key)
+            cfg_arr: Optional[np.ndarray] = None
+            if cfg_key in config and raw_cfg is not None:
+                if not isinstance(raw_cfg, (list, tuple)) or len(raw_cfg) == 0:
+                    raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                row_len: Optional[int] = None
+                for row in raw_cfg:
+                    if not isinstance(row, (list, tuple)) or len(row) == 0:
+                        raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                    if row_len is None:
+                        row_len = len(row)
+                    elif len(row) != row_len:
+                        raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                    for elem in row:
+                        if isinstance(elem, bool) or not isinstance(elem, (int, float)):
+                            raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                with np.errstate(over="ignore", invalid="ignore"):
+                    cfg_arr = np.asarray(raw_cfg, dtype=np.float32)
+                if cfg_arr.ndim != 2 or not bool(np.all(np.isfinite(cfg_arr))):
+                    raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
+            if arg_arr is not None:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    out_arr = np.asarray(arg_arr, dtype=np.float32)
+                if not bool(np.all(np.isfinite(out_arr))):
+                    raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
+                if cfg_arr is not None and (
+                    cfg_arr.shape != out_arr.shape
+                    or not np.allclose(cfg_arr, out_arr, rtol=0.0, atol=1e-4)
+                ):
+                    raise ValueError(
+                        f"Saved hybrid projector inline {cfg_key} mismatches binary tensor"
+                    )
+                return out_arr
+            return cfg_arr
+
+        spec_arr = _resolve_hybrid_matrix("spectral_vectors", spectral_vectors)
+        sub_arr = _resolve_hybrid_matrix("subspace_components", subspace_components)
+        rbf_arr = _resolve_hybrid_matrix("rbf_landmarks", rbf_landmarks)
+
         proj = cls(
             sparse_dim=sparse,
             dense_dim=dense,
@@ -2547,50 +2855,77 @@ class HybridProjector:
             svd_power=svd_power,
             spectral_blend=spectral_blend,
         )
-        proj._use_subspace = bool(config.get("use_subspace", False))
-        proj._direct_spectral = bool(config.get("direct_spectral", False))
-        proj._direct_spectral_dim = int(config.get("direct_spectral_dim", 0)) if proj._direct_spectral else 0
-        proj._context_smooth = float(config.get("context_smooth", 1.0))
+        proj._use_subspace = use_subspace_flag
+        proj._direct_spectral = direct_spectral_flag
+        proj._direct_spectral_dim = raw_ds_dim if proj._direct_spectral else 0
+        proj._context_smooth = context_smooth
 
-        if config.get("fitted"):
-            if "tfidf_terms" in config:
+        _hybrid_tfidf_key_map = (
+            ("tfidf_use_stems", "use_stems"),
+            ("tfidf_stem_weight", "stem_weight"),
+            ("tfidf_use_skip_bigrams", "use_skip_bigrams"),
+            ("tfidf_skip_weight", "skip_weight"),
+            ("tfidf_word_quota_frac", "word_quota_frac"),
+            ("tfidf_char_weight", "char_weight"),
+        )
+        _hybrid_all_tfidf_keys = {
+            "tfidf_terms",
+            "tfidf_idf",
+            "tfidf_char_ngrams",
+            *(src_k for src_k, _ in _hybrid_tfidf_key_map),
+        }
+        has_any_tfidf_cfg = bool(set(config.keys()) & _hybrid_all_tfidf_keys)
+
+        if fitted_flag:
+            if "tfidf_terms" not in config:
+                if has_any_tfidf_cfg or tfidf_idf_array is not None:
+                    raise ValueError("Saved hybrid projector has incomplete TF-IDF configuration")
+            else:
                 from system1.core.text import DEFAULT_MAX_FEATURES, TfidfProjector
 
                 tf_terms = config["tfidf_terms"]
                 if not isinstance(tf_terms, (list, tuple)) or not 0 < len(tf_terms) <= sparse:
                     raise ValueError("Saved hybrid TF-IDF vocabulary exceeds sparse_dim")
                 tf_cfg: Dict[str, Any] = {"type": "tfidf", "terms": list(tf_terms)}
-                if "tfidf_char_ngrams" in config and config["tfidf_char_ngrams"] is not None:
+                if "tfidf_char_ngrams" in config:
                     tf_cfg["char_ngrams"] = config["tfidf_char_ngrams"]
-                for src_k, dst_k in (
-                    ("tfidf_use_stems", "use_stems"),
-                    ("tfidf_stem_weight", "stem_weight"),
-                    ("tfidf_use_skip_bigrams", "use_skip_bigrams"),
-                    ("tfidf_skip_weight", "skip_weight"),
-                    ("tfidf_word_quota_frac", "word_quota_frac"),
-                    ("tfidf_char_weight", "char_weight"),
-                ):
+                for src_k, dst_k in _hybrid_tfidf_key_map:
                     if src_k in config:
                         tf_cfg[dst_k] = config[src_k]
                 if len(tf_terms) > DEFAULT_MAX_FEATURES:
                     tf_cfg["max_features"] = len(tf_terms)
-                if tfidf_idf_array is None and "tfidf_idf" in config:
+                if "tfidf_idf" in config:
                     tf_cfg["idf"] = config["tfidf_idf"]
-                proj._tfidf_projector = TfidfProjector.from_config(tf_cfg, idf_array=tfidf_idf_array)
-            raw_weights = config.get("spectral_weights", ())
-            if not isinstance(raw_weights, (list, tuple)):
-                raise ValueError("Saved hybrid projector spectral weights must be a sequence")
-            weights = tuple(float(w) for w in raw_weights)
-            if len(terms) != len(weights) or any(not math.isfinite(w) for w in weights):
-                raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
+                    tf_proj = TfidfProjector.from_config(tf_cfg)
+                    if tfidf_idf_array is not None:
+                        bin_idf = np.asarray(tfidf_idf_array, dtype=np.float64)
+                        if (
+                            bin_idf.ndim != 1
+                            or len(bin_idf) != len(tf_terms)
+                            or not np.all(np.isfinite(bin_idf))
+                            or not np.allclose(
+                                np.asarray(tf_proj._idf, dtype=np.float64),
+                                bin_idf,
+                                rtol=0.0,
+                                atol=1e-5,
+                            )
+                        ):
+                            raise ValueError(
+                                "Saved hybrid projector inline tfidf_idf mismatches binary IDF tensor"
+                            )
+                    proj._tfidf_projector = tf_proj
+                else:
+                    if tfidf_idf_array is None:
+                        raise ValueError("Saved hybrid projector missing TF-IDF idf weights")
+                    proj._tfidf_projector = TfidfProjector.from_config(
+                        tf_cfg, idf_array=tfidf_idf_array
+                    )
             proj._spectral_terms = terms
             proj._spectral_vocab = {tm: i for i, tm in enumerate(terms)}
             proj._spectral_weights = weights
-            proj._spectral_weights_arr = np.asarray(weights, dtype=np.float32)
+            proj._spectral_weights_arr = weights_arr
 
-            raw_spec = spectral_vectors if spectral_vectors is not None else config.get("spectral_vectors")
-            if raw_spec is not None and len(raw_spec) > 0:
-                spec_arr = np.asarray(raw_spec, dtype=np.float32)
+            if spec_arr is not None and len(spec_arr) > 0:
                 if proj._direct_spectral:
                     max_r = proj._direct_spectral_dim if proj._direct_spectral_dim > 0 else spec_arr.shape[1]
                     if (
@@ -2620,11 +2955,11 @@ class HybridProjector:
                         proj._spectral_basis = (aligned_basis / b_norms).astype(np.float32)
                     else:
                         proj._spectral_basis = proj._build_spectral_basis(spec_arr.shape[1])
+            elif terms or (proj._direct_spectral and proj._direct_spectral_dim != 0):
+                raise ValueError("Saved hybrid projector missing spectral_vectors")
 
             proj._update_dimension()
-            raw_sub = subspace_components if subspace_components is not None else config.get("subspace_components")
-            if raw_sub is not None and len(raw_sub) > 0:
-                sub_arr = np.asarray(raw_sub, dtype=np.float32)
+            if sub_arr is not None and len(sub_arr) > 0:
                 base_dim = proj._base_dimension
                 if (
                     sub_arr.ndim != 2
@@ -2634,23 +2969,41 @@ class HybridProjector:
                 ):
                     raise ValueError("Saved hybrid projector subspace_components have invalid shape")
                 proj._subspace_components = sub_arr
-            sub_w = float(config.get("subspace_weight", 0.20))
-            if not math.isfinite(sub_w):
-                raise ValueError("Saved hybrid projector subspace_weight must be finite")
-            proj._subspace_weight = sub_w
+            proj._subspace_weight = subspace_weight
 
-            raw_rbf = rbf_landmarks if rbf_landmarks is not None else config.get("rbf_landmarks")
-            if raw_rbf is not None and len(raw_rbf) > 0:
-                rbf_arr = np.asarray(raw_rbf, dtype=np.float32)
+            if rbf_arr is not None and len(rbf_arr) > 0:
                 base_dim = proj._base_dimension
                 if rbf_arr.ndim != 2 or rbf_arr.shape[0] < 1 or rbf_arr.shape[1] != base_dim or not np.all(np.isfinite(rbf_arr)):
                     raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
+                eff_rw = cls._require_finite_scalar(config.get("rbf_weight", 0.14), "rbf_weight")
+                if not (0.0 < eff_rw < 1.0):
+                    raise ValueError(
+                        "Saved hybrid projector rbf_weight must be in (0, 1) when rbf_landmarks are present"
+                    )
                 proj._rbf_landmarks = rbf_arr
-                proj._rbf_gamma = float(config.get("rbf_gamma", 3.0))
-                proj._rbf_weight = float(config.get("rbf_weight", 0.14))
+                proj._rbf_gamma = rbf_gamma
+                proj._rbf_weight = eff_rw
 
             proj._update_dimension()
             proj._fitted = True
+        elif (
+            has_any_tfidf_cfg
+            or tfidf_idf_array is not None
+            or terms
+            or weights
+            or (has_spectral_weights_key and len(raw_weights) > 0)
+            or spec_arr is not None
+            or sub_arr is not None
+            or rbf_arr is not None
+            or config.get("spectral_vectors") is not None
+            or config.get("subspace_components") is not None
+            or config.get("rbf_landmarks") is not None
+            or spectral_vectors is not None
+            or subspace_components is not None
+            or rbf_landmarks is not None
+            or (proj._direct_spectral and proj._direct_spectral_dim != 0)
+        ):
+            raise ValueError("Unfitted saved hybrid projector cannot carry TF-IDF state or fitted tensors")
         proj._digest = None
         return proj
 
@@ -2667,12 +3020,719 @@ HybridSemanticProjector = HybridProjector
 UnifiedHybridProjector = HybridProjector
 
 
+_BM25_WORD_SPLIT_RE = re.compile(r"[a-z0-9]+")
+_BM25_CRIT_SPLIT_RE = re.compile(r"[;.]+")
+_BM25_ITEM_SPLIT_RE = re.compile(r"[;]+")
+_BM25_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "to", "of", "in", "on", "at", "for", "with", "by", "from", "as", "into",
+    "or", "and", "that", "this", "these", "those", "it", "its", "my", "your",
+    "our", "their", "we", "you", "i", "me", "us", "they", "them", "do", "does",
+    "did", "can", "could", "will", "would", "should", "may", "might", "please",
+    "how", "what", "when", "where", "why", "which", "who", "whom", "about",
+    "any", "all", "if", "so", "than", "then", "also", "just", "only", "already",
+    "needs", "need", "related", "issues", "problems", "requests", "questions",
+    "handling", "select", "classify", "appropriate", "category", "option",
+})
+
+
+def _extract_bm25_feats(
+    text: str,
+    *,
+    include_char: bool = True,
+    include_prag: bool = True,
+) -> Dict[str, float]:
+    from system1.core.text import _stem_word as _text_stem_word, extract_pragmatic_features
+
+    feats: Dict[str, float] = {}
+    words = [w for w in _BM25_WORD_SPLIT_RE.findall(text.lower()) if len(w) >= 2]
+    prev_st: Optional[str] = None
+    for w in words:
+        if w in _BM25_STOPWORDS:
+            prev_st = None
+            continue
+        wk = f"w_{w}"
+        feats[wk] = feats.get(wk, 0.0) + 1.0
+        st = _text_stem_word(w)
+        if len(st) >= 3 and st not in _BM25_STOPWORDS:
+            sk = f"s_{st}"
+            feats[sk] = feats.get(sk, 0.0) + 0.90
+            if prev_st is not None:
+                bk = f"bg_{prev_st}_{st}"
+                feats[bk] = feats.get(bk, 0.0) + 1.15
+            prev_st = st
+        else:
+            prev_st = None
+        if include_char and len(w) >= 4:
+            padded = f"<{w}>"
+            for i in range(len(padded) - 3):
+                ck = f"c4_{padded[i : i + 4]}"
+                feats[ck] = feats.get(ck, 0.0) + 0.16
+
+    if include_prag and ("{" in text or "=" in text or any(c.isdigit() for c in text)):
+        raw_prag = extract_pragmatic_features(
+            text,
+            enable_negation=False,
+            enable_num_http=True,
+            enable_json_kv=True,
+        )
+        for term, val in raw_prag.items():
+            if term.startswith(("HTTP_", "KV_")):
+                feats[term] = feats.get(term, 0.0) + float(val)
+    return feats
+
+
+def _split_criterion_units(opt: str, desc_val: Any) -> List[str]:
+    units: List[str] = []
+    clean_opt = opt.replace("_", " ").replace("-", " ")
+    if isinstance(desc_val, (list, tuple)):
+        for item in desc_val:
+            for sub in _BM25_ITEM_SPLIT_RE.split(str(item)):
+                if sub.strip():
+                    units.append(sub.strip())
+    elif isinstance(desc_val, str) and desc_val.strip():
+        for sub in _BM25_CRIT_SPLIT_RE.split(desc_val):
+            if sub.strip():
+                units.append(sub.strip())
+    return units or [clean_opt]
+
+
+def _solve_dual_or_primal_ridge_np(
+    X: np.ndarray,
+    Y: np.ndarray,
+    reg: float,
+    sample_weights: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Closed-form weighted multi-output ridge regression in pure NumPy."""
+    n, d = X.shape
+    if sample_weights is None:
+        w = np.full(n, 1.0 / max(1, n), dtype=np.float64)
+    else:
+        w_raw = np.maximum(1e-6, np.asarray(sample_weights, dtype=np.float64))
+        w = w_raw / np.sum(w_raw)
+    mu_x = (w[:, None] * X).sum(axis=0)
+    mu_y = (w[:, None] * Y).sum(axis=0)
+    Xc = X - mu_x
+    Yc = Y - mu_y
+    sw = np.sqrt(w * float(n))
+    Xw = Xc * sw[:, None]
+    Yw = Yc * sw[:, None]
+    if n < d:
+        kmat = Xw @ Xw.T
+        kmat[np.diag_indices(n)] += float(reg)
+        dual = np.linalg.solve(kmat, Yw)
+        U = (Xw.T @ dual).T
+    else:
+        xtx = Xw.T @ Xw
+        xtx[np.diag_indices(d)] += float(reg)
+        U = np.linalg.solve(xtx, Xw.T @ Yw).T
+    c = mu_y - U @ mu_x
+    return U, c
+
+
+@dataclass(frozen=True)
+class RouterDecisionResult:
+    """Lightweight isolated zero/few-shot decision output matching DecisionResult attributes."""
+
+    schema_name: str
+    schema_digest: str
+    prompt: str
+    values: Dict[str, Any]
+    confidences: Dict[str, float]
+    probabilities: Dict[str, Dict[str, float]]
+    conformal_sets: Dict[str, Tuple[Any, ...]]
+    is_ambiguous: bool
+    latency_ms: float
+    alpha: float = 0.05
+    receipt: Optional[Any] = None
+
+
+class SmartsCrossZeroFewRouter:
+    """Zero-pretrained-weight 0/few-shot router combining BM25F, MaxSim criteria, concept interaction, and ridge."""
+
+    def __init__(
+        self,
+        schema_cls: Any,
+        field_name: Optional[str] = None,
+        options: Optional[Sequence[str]] = None,
+        descriptions: Optional[Mapping[str, Any]] = None,
+        instruction: str = "",
+        *,
+        disable_concept_gate: bool = False,
+        dimension: int = 384,
+    ) -> None:
+        from system1.core.model import SystemOneModel
+        from system1.core.schema import BooleanField, DecisionSchema
+
+        if isinstance(schema_cls, DecisionSchema):
+            s_inst = schema_cls
+            self.schema_name = s_inst.schema_name
+        elif isinstance(schema_cls, type) and issubclass(schema_cls, DecisionSchema):
+            s_inst = schema_cls()
+            self.schema_name = schema_cls.__name__
+        else:
+            raise TypeError(f"Expected DecisionSchema subclass or instance, got {type(schema_cls).__name__}")
+
+        if field_name is None:
+            field_name = next(iter(s_inst.fields))
+        if field_name not in s_inst.fields:
+            raise KeyError(f"Field {field_name!r} not found in schema")
+
+        f_def = s_inst.fields[field_name]
+        self.is_boolean = isinstance(f_def, BooleanField)
+        self.bool_threshold: Optional[float] = float(f_def.threshold) if self.is_boolean else None
+        if options is None:
+            if self.is_boolean:
+                options = ("False", "True")
+            elif hasattr(f_def, "options"):
+                options = list(f_def.options)
+            else:
+                raise ValueError(f"Field {field_name!r} does not define discrete options")
+        if descriptions is None:
+            if self.is_boolean:
+                descriptions = {
+                    "False": f_def.false_description,
+                    "True": f_def.true_description,
+                }
+            else:
+                descriptions = dict(getattr(f_def, "descriptions", {}) or {})
+        if not instruction:
+            instruction = str(getattr(f_def, "description", "") or "")
+
+        self.options: List[str] = [str(o) for o in options]
+        if not self.options:
+            raise ValueError("options must not be empty")
+        self.K = len(self.options)
+        self.opt_to_idx: Dict[str, int] = {o: i for i, o in enumerate(self.options)}
+        self.descriptions = dict(descriptions)
+        self.instruction = instruction
+        self.field_name = field_name
+        self.disable_concept_gate = bool(disable_concept_gate)
+        self.schema_digest = s_inst.schema_digest()
+        self.rich_descriptions = (
+            float(np.mean([len(str(self.descriptions.get(o, "")).split()) for o in self.options])) >= 4.0
+        )
+        self.s1_model = SystemOneModel(s_inst, dimension=dimension, backend="numpy")
+        self._compile_bm25f_and_concepts()
+        self.fewshot_active = False
+        self.k_per_class = 0
+        self.few_proj: Optional[Any] = None
+        self.few_vocab: Dict[str, int] = {}
+        self.few_W: Optional[np.ndarray] = None
+        self.few_b: Optional[np.ndarray] = None
+        self.few_protos: Optional[np.ndarray] = None
+        self.few_X: Optional[np.ndarray] = None
+        self.few_y: Optional[np.ndarray] = None
+        self.few_idf: Optional[np.ndarray] = None
+        self._few_examples: List[Tuple[str, str]] = []
+        self._calibrated = False
+        self._conformal_q = 1.0
+        self._cal_alpha = 0.10
+        self._cal_scores: Optional[np.ndarray] = None
+
+    def _normalize_label_str(self, label: Any) -> str:
+        if self.is_boolean and isinstance(label, bool):
+            key = "True" if label else "False"
+        else:
+            key = str(label)
+        if key not in self.opt_to_idx:
+            raise ValueError(f"Unknown label {label!r}; expected one of {self.options}")
+        return key
+
+    def _public_value(self, label_str: str) -> Any:
+        if self.is_boolean:
+            if label_str == "True":
+                return True
+            if label_str == "False":
+                return False
+        return label_str
+
+    def _select_predicted_label(self, scores: np.ndarray, probs: np.ndarray) -> Any:
+        if (
+            self.is_boolean
+            and self.bool_threshold is not None
+            and "True" in self.opt_to_idx
+            and "False" in self.opt_to_idx
+        ):
+            return bool(float(probs[self.opt_to_idx["True"]]) >= self.bool_threshold)
+        return self._public_value(self.options[int(np.argmax(scores))])
+
+    def _compile_bm25f_and_concepts(self) -> None:
+        K = self.K
+        name_feats: List[Dict[str, float]] = []
+        pool_feats: List[Dict[str, float]] = []
+        crit_units: List[Tuple[int, Dict[str, float], Dict[str, float]]] = []
+        opt_concept_pool: List[Counter[str]] = [Counter() for _ in range(K)]
+
+        for c_idx, opt in enumerate(self.options):
+            clean_opt = opt.replace("_", " ").replace("-", " ")
+            nf = _extract_bm25_feats(clean_opt, include_char=True)
+            name_feats.append(nf)
+            units = _split_criterion_units(opt, self.descriptions.get(opt, ""))
+            pf: Counter[str] = Counter()
+            for k, v in nf.items():
+                pf[k] += v * 1.5
+            for ck, cv in match_semantic_concepts(clean_opt).items():
+                opt_concept_pool[c_idx][ck] += float(cv) * 1.2
+            if len(units) == 1:
+                uf = _extract_bm25_feats(f"{clean_opt} {units[0]}", include_char=True)
+                uc = dict(match_semantic_concepts(f"{clean_opt}: {units[0]}"))
+                crit_units.append((c_idx, uf, uc))
+                for k, v in uf.items():
+                    pf[k] += v
+                for ck, cv in uc.items():
+                    opt_concept_pool[c_idx][ck] += float(cv)
+            else:
+                for u in units:
+                    uf = _extract_bm25_feats(u, include_char=True)
+                    uc = dict(match_semantic_concepts(f"{clean_opt}: {u}"))
+                    crit_units.append((c_idx, uf, uc))
+                    for k, v in uf.items():
+                        pf[k] += v
+                    for ck, cv in uc.items():
+                        opt_concept_pool[c_idx][ck] += float(cv)
+            pool_feats.append(dict(pf))
+
+        self.M = len(crit_units)
+        self.crit_opt_idx = np.array([c for c, _, _ in crit_units], dtype=np.int32)
+        self.opt_to_crit_idxs = [np.where(self.crit_opt_idx == c)[0] for c in range(K)]
+
+        all_ck = sorted({ck for cp in opt_concept_pool for ck in cp})
+        if self.disable_concept_gate:
+            self.concept_gate = 1.0
+        elif all_ck:
+            c_mat = np.zeros((K, len(all_ck)), dtype=np.float64)
+            ck_to_i = {ck: i for i, ck in enumerate(all_ck)}
+            for c_idx, cp in enumerate(opt_concept_pool):
+                for ck, cv in cp.items():
+                    c_mat[c_idx, ck_to_i[ck]] = cv
+            max_strength = float(np.mean(np.max(c_mat, axis=1)))
+            norms = np.linalg.norm(c_mat, axis=1, keepdims=True)
+            c_unit = c_mat / np.maximum(1e-8, norms)
+            sim_mat = c_unit @ c_unit.T
+            off_diag = (float(np.sum(sim_mat)) - float(np.trace(sim_mat))) / max(1, K * (K - 1))
+            ortho = max(0.0, 1.0 - off_diag)
+            self.concept_gate = ortho * min(1.0, max(0.0, (max_strength - 2.5) / 8.0))
+        else:
+            self.concept_gate = 0.0
+
+        df_opt: Counter[str] = Counter()
+        for pf in pool_feats:
+            for t in pf:
+                df_opt[t] += 1
+        df_crit: Counter[str] = Counter()
+        for _, uf, _ in crit_units:
+            for t in uf:
+                df_crit[t] += 1
+
+        def _idf(df: int, n_docs: int) -> float:
+            return math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+
+        avg_name = max(1.0, float(np.mean([sum(f.values()) for f in name_feats])))
+        avg_pool = max(1.0, float(np.mean([sum(f.values()) for f in pool_feats])))
+        avg_crit = max(1.0, float(np.mean([sum(f.values()) for _, f, _ in crit_units])))
+        k1, b_field = 1.2, 0.45
+
+        self.opt_lex_tbl: Dict[str, np.ndarray] = {}
+        self.crit_lex_tbl: Dict[str, np.ndarray] = {}
+        for t in set(df_opt.keys()) | set(df_crit.keys()):
+            idf = 0.65 * _idf(df_opt.get(t, 0), K) + 0.35 * _idf(df_crit.get(t, 0), max(1, self.M))
+            v_opt = np.zeros(K, dtype=np.float64)
+            for c_idx in range(K):
+                tf_n = name_feats[c_idx].get(t, 0.0)
+                if tf_n > 0.0:
+                    norm_n = (1.0 - b_field) + b_field * (sum(name_feats[c_idx].values()) / avg_name)
+                    v_opt[c_idx] += 2.3 * (tf_n * (k1 + 1.0)) / (tf_n + k1 * norm_n)
+                tf_p = pool_feats[c_idx].get(t, 0.0)
+                if tf_p > 0.0:
+                    norm_p = (1.0 - b_field) + b_field * (sum(pool_feats[c_idx].values()) / avg_pool)
+                    v_opt[c_idx] += 1.2 * (tf_p * (k1 + 1.0)) / (tf_p + k1 * norm_p)
+            if np.any(v_opt > 0.0):
+                self.opt_lex_tbl[t] = idf * v_opt
+
+            v_crit = np.zeros(self.M, dtype=np.float64)
+            any_c = False
+            for m_idx, (_, uf, _) in enumerate(crit_units):
+                tf_u = uf.get(t, 0.0)
+                if tf_u > 0.0:
+                    any_c = True
+                    norm_u = (1.0 - 0.50) + 0.50 * (sum(uf.values()) / avg_crit)
+                    v_crit[m_idx] = idf * (tf_u * (k1 + 1.0)) / (tf_u + k1 * norm_u)
+            if any_c:
+                self.crit_lex_tbl[t] = v_crit
+
+        opt_sq = np.zeros(K, dtype=np.float64)
+        for v in self.opt_lex_tbl.values():
+            opt_sq += v * v
+        opt_inv = 1.0 / np.maximum(1e-6, np.sqrt(opt_sq))
+        for t in self.opt_lex_tbl:
+            self.opt_lex_tbl[t] *= opt_inv
+
+        crit_sq = np.zeros(self.M, dtype=np.float64)
+        for v in self.crit_lex_tbl.values():
+            crit_sq += v * v
+        crit_inv = 1.0 / np.maximum(1e-6, np.sqrt(crit_sq))
+        for t in self.crit_lex_tbl:
+            self.crit_lex_tbl[t] *= crit_inv
+
+        df_co: Counter[str] = Counter()
+        for cp in opt_concept_pool:
+            for ck in cp:
+                df_co[ck] += 1
+        df_cc: Counter[str] = Counter()
+        for _, _, uc in crit_units:
+            for ck in uc:
+                df_cc[ck] += 1
+
+        self.opt_concept_tbl: Dict[str, np.ndarray] = {}
+        self.crit_concept_tbl: Dict[str, np.ndarray] = {}
+        for ck in set(df_co.keys()) | set(df_cc.keys()):
+            idf_ck = 0.65 * _idf(df_co.get(ck, 0), K) + 0.35 * _idf(df_cc.get(ck, 0), max(1, self.M))
+            vo = np.array(
+                [
+                    idf_ck * math.log1p(opt_concept_pool[c].get(ck, 0.0))
+                    if opt_concept_pool[c].get(ck, 0.0) > 0
+                    else 0.0
+                    for c in range(K)
+                ],
+                dtype=np.float64,
+            )
+            if np.any(vo > 0.0):
+                self.opt_concept_tbl[ck] = vo
+            vc = np.zeros(self.M, dtype=np.float64)
+            any_cc = False
+            for m_idx, (_, _, uc) in enumerate(crit_units):
+                val = uc.get(ck, 0.0)
+                if val > 0.0:
+                    any_cc = True
+                    vc[m_idx] = idf_ck * math.log1p(val)
+            if any_cc:
+                self.crit_concept_tbl[ck] = vc
+
+        oc_sq = np.zeros(K, dtype=np.float64)
+        for v in self.opt_concept_tbl.values():
+            oc_sq += v * v
+        oc_inv = 1.0 / np.maximum(1e-6, np.sqrt(oc_sq))
+        for ck in self.opt_concept_tbl:
+            self.opt_concept_tbl[ck] *= oc_inv
+
+        cc_sq = np.zeros(self.M, dtype=np.float64)
+        for v in self.crit_concept_tbl.values():
+            cc_sq += v * v
+        cc_inv = 1.0 / np.maximum(1e-6, np.sqrt(cc_sq))
+        for ck in self.crit_concept_tbl:
+            self.crit_concept_tbl[ck] *= cc_inv
+
+    def _featurize_with_concepts(self, lex_feats: Mapping[str, float], q_concepts: Mapping[str, float]) -> Dict[str, float]:
+        feats = dict(lex_feats)
+        if self.concept_gate > 0.15:
+            for ck, cv in q_concepts.items():
+                feats[f"CNC_{ck}"] = float(cv) * 1.4
+        return feats
+
+    def _vectorize_few(self, feats: Mapping[str, float]) -> np.ndarray:
+        vec = np.zeros(len(self.few_vocab), dtype=np.float64)
+        vocab = self.few_vocab
+        idf = self.few_idf
+        for t, w in feats.items():
+            idx = vocab.get(t)
+            if idx is not None and idf is not None:
+                vec[idx] = math.log1p(w) * idf[idx]
+        nrm = float(np.linalg.norm(vec))
+        if nrm > 1e-12:
+            vec /= nrm
+        return vec
+
+    def fit_few_shot(
+        self,
+        examples_or_prompts: Union[Sequence[Tuple[str, Any]], Sequence[str]],
+        labels: Optional[Sequence[Any]] = None,
+    ) -> "SmartsCrossZeroFewRouter":
+        from system1.core.text import TfidfProjector
+
+        if labels is not None:
+            if len(examples_or_prompts) != len(labels):
+                raise ValueError("prompts and labels must have equal length")
+            pairs = [(str(p), self._normalize_label_str(lbl)) for p, lbl in zip(examples_or_prompts, labels)]
+        else:
+            pairs = [(str(item[0]), self._normalize_label_str(item[1])) for item in examples_or_prompts]  # type: ignore[index]
+
+        self._few_examples = list(pairs)
+        self._calibrated = False
+        self._cal_scores = None
+        if not pairs:
+            self.fewshot_active = False
+            self.few_proj = None
+            self.k_per_class = 0
+            return self
+
+        all_texts = [txt for txt, _ in pairs]
+        all_labels_str = [lbl for _, lbl in pairs]
+        all_labels = [self.opt_to_idx[lbl] for lbl in all_labels_str]
+        counts = np.bincount(all_labels, minlength=self.K)
+        self.k_per_class = max(1, int(np.min(counts[counts > 0]))) if np.any(counts > 0) else 0
+        schema_texts = [
+            f"{opt.replace('_', ' ')}: {' '.join(_split_criterion_units(opt, self.descriptions.get(opt, '')))}"
+            for opt in self.options
+        ]
+
+        if self.rich_descriptions:
+            self.few_proj = None
+            shot_fmaps = [
+                self._featurize_with_concepts(_extract_bm25_feats(t, include_char=True), match_semantic_concepts(t))
+                for t in all_texts
+            ]
+            schema_fmaps = [
+                self._featurize_with_concepts(_extract_bm25_feats(s, include_char=True), match_semantic_concepts(s))
+                for s in schema_texts
+            ]
+            df: Counter[str] = Counter()
+            for fm in shot_fmaps + schema_fmaps:
+                for t in fm:
+                    df[t] += 1
+            n_docs = len(shot_fmaps) + len(schema_fmaps)
+            terms_sorted = sorted(df.keys(), key=lambda t: (-df[t], t))[:1536]
+            self.few_vocab = {t: i for i, t in enumerate(terms_sorted)}
+            self.few_idf = np.array([math.log((n_docs + 1.0) / (df[t] + 1.0)) + 1.0 for t in terms_sorted], dtype=np.float64)
+            X_shots = np.vstack([self._vectorize_few(fm) for fm in shot_fmaps])
+            X_schema = np.vstack([self._vectorize_few(fm) for fm in schema_fmaps])
+            reg = 0.85 if self.k_per_class <= 1 else (0.30 if self.k_per_class <= 3 else 0.16)
+        else:
+            self.few_vocab = {}
+            self.few_idf = None
+            self.few_proj = TfidfProjector.fit(
+                all_texts + schema_texts,
+                max_features=2048,
+                labels=all_labels_str + list(self.options),
+                selection="chi2",
+                char_ngrams=(3, 5),
+            )
+            X_shots = np.asarray(self.few_proj.project_batch(all_texts), dtype=np.float64)
+            X_schema = np.asarray(self.few_proj.project_batch(schema_texts), dtype=np.float64)
+            reg = 0.45 if self.k_per_class <= 1 else (0.20 if self.k_per_class <= 3 else 0.10)
+
+        w_prior = math.sqrt(max(0.25, 1.5 / (1.0 + 0.4 * float(self.k_per_class))))
+        X_aug = np.vstack([X_shots, w_prior * X_schema])
+        Y_shots = np.zeros((len(all_labels), self.K), dtype=np.float64)
+        for i, c in enumerate(all_labels):
+            Y_shots[i, c] = 1.0
+        Y_aug = np.vstack([Y_shots, w_prior * np.eye(self.K, dtype=np.float64)])
+
+        self.few_W, self.few_b = _solve_dual_or_primal_ridge_np(X_aug, Y_aug, reg=reg)
+        self.few_X = X_shots
+        self.few_y = np.array(all_labels, dtype=np.int32)
+        self.few_protos = np.zeros((self.K, X_shots.shape[1]), dtype=np.float64)
+        for c in range(self.K):
+            mask = self.few_y == c
+            p = np.mean(X_shots[mask], axis=0) if np.any(mask) else X_schema[c]
+            nrm = float(np.linalg.norm(p))
+            if nrm > 1e-12:
+                self.few_protos[c] = p / nrm
+        self.fewshot_active = True
+        return self
+
+    def learn(self, prompt: str, label: Any) -> "SmartsCrossZeroFewRouter":
+        """Incrementally add one labeled example and refresh few-shot weights."""
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt must be a non-empty string")
+        norm_lbl = self._normalize_label_str(label)
+        self._few_examples.append((prompt, norm_lbl))
+        return self.fit_few_shot(self._few_examples)
+
+    def calibrate(
+        self,
+        prompts: Sequence[str],
+        labels: Sequence[Any],
+        *,
+        alpha: float = 0.10,
+    ) -> float:
+        """Fit split-conformal LAC quantile over held-out calibration examples."""
+        if len(prompts) != len(labels):
+            raise ValueError("prompts and labels must have equal length")
+        if not (0.0 < float(alpha) < 1.0):
+            raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+        n = len(prompts)
+        if n == 0:
+            self._calibrated = False
+            self._conformal_q = 1.0
+            self._cal_alpha = float(alpha)
+            self._cal_scores = None
+            return self._conformal_q
+        scores = np.empty(n, dtype=np.float64)
+        for i, (prompt, raw_lbl) in enumerate(zip(prompts, labels)):
+            _, probs = self.score_and_predict(str(prompt))
+            lbl_idx = self.opt_to_idx[self._normalize_label_str(raw_lbl)]
+            scores[i] = 1.0 - float(probs[lbl_idx])
+        sorted_scores = np.sort(scores)
+        rank = int(math.ceil((n + 1) * (1.0 - float(alpha))))
+        self._conformal_q = 1.0 if rank > n else float(sorted_scores[max(0, rank - 1)])
+        self._cal_alpha = float(alpha)
+        self._cal_scores = sorted_scores
+        self._calibrated = True
+        return self._conformal_q
+
+    def score_and_predict(self, text: str) -> Tuple[Any, np.ndarray]:
+        if not isinstance(text, str):
+            raise TypeError(f"Prompt must be a string, got {type(text).__name__}")
+        lf = _extract_bm25_feats(text, include_char=True)
+        opt_l = np.zeros(self.K, dtype=np.float64)
+        crit_l = np.zeros(self.M, dtype=np.float64)
+        ql_sq = 0.0
+        opt_tbl, crit_tbl = self.opt_lex_tbl, self.crit_lex_tbl
+        for t, tf in lf.items():
+            qw = math.log1p(tf)
+            vo = opt_tbl.get(t)
+            if vo is not None:
+                opt_l += qw * vo
+            vc = crit_tbl.get(t)
+            if vc is not None:
+                crit_l += qw * vc
+                ql_sq += qw * qw
+        if ql_sq > 1e-12:
+            inv_q = 1.0 / math.sqrt(ql_sq)
+            opt_l *= inv_q
+            crit_l *= inv_q
+        crit_l_max = np.array(
+            [float(np.max(crit_l[idxs])) if len(idxs) else 0.0 for idxs in self.opt_to_crit_idxs],
+            dtype=np.float64,
+        )
+        s_lex_c = 0.60 * opt_l + 0.40 * crit_l_max
+        s_lex_c -= float(np.mean(s_lex_c))
+
+        qc: Dict[str, float] = {}
+        if self.concept_gate > 0.05:
+            qc = match_semantic_concepts(text)
+            opt_c = np.zeros(self.K, dtype=np.float64)
+            crit_c = np.zeros(self.M, dtype=np.float64)
+            qc_sq = 0.0
+            for ck, cv in qc.items():
+                qw = math.log1p(cv)
+                vo = self.opt_concept_tbl.get(ck)
+                if vo is not None:
+                    opt_c += qw * vo
+                vc = self.crit_concept_tbl.get(ck)
+                if vc is not None:
+                    crit_c += qw * vc
+                    qc_sq += qw * qw
+            if qc_sq > 1e-12:
+                inv_c = 1.0 / math.sqrt(qc_sq)
+                opt_c *= inv_c
+                crit_c *= inv_c
+            crit_c_max = np.array(
+                [float(np.max(crit_c[idxs])) if len(idxs) else 0.0 for idxs in self.opt_to_crit_idxs],
+                dtype=np.float64,
+            )
+            s_cnc_c = 0.40 * opt_c + 0.60 * crit_c_max
+            s_cnc_c -= float(np.mean(s_cnc_c))
+        else:
+            s_cnc_c = np.zeros(self.K, dtype=np.float64)
+
+        s1_raw = np.asarray(self.s1_model.forward_single(text).fields[self.field_name].logits, dtype=np.float64).ravel()
+        s1_c = s1_raw - float(np.mean(s1_raw))
+        s1_w = 0.42 if self.concept_gate > 0.90 else 0.28
+        zs = 1.50 * s_lex_c + (1.10 * self.concept_gate) * s_cnc_c + s1_w * s1_c
+
+        if not self.fewshot_active or self.few_W is None or self.few_b is None:
+            probs = np.exp((zs - np.max(zs)) * 4.0)
+            probs /= probs.sum()
+            return self._select_predicted_label(zs, probs), probs
+
+        assert self.few_protos is not None and self.few_X is not None and self.few_y is not None
+        if self.few_proj is not None:
+            v = np.asarray(self.few_proj.project(text), dtype=np.float64)
+            rc = v @ self.few_W.T + self.few_b
+            rc -= float(np.mean(rc))
+            pc = self.few_protos @ v
+            pc -= float(np.mean(pc))
+            shot_cos = self.few_X @ v
+            ec = np.array(
+                [float(np.max(shot_cos[self.few_y == c])) if np.any(self.few_y == c) else 0.0 for c in range(self.K)],
+                dtype=np.float64,
+            )
+            ec -= float(np.mean(ec))
+            fs_comb = 0.72 * rc + 0.18 * pc + 0.10 * ec
+            w_zs = 1.2 / (1.2 + float(self.k_per_class))
+        else:
+            v = self._vectorize_few(self._featurize_with_concepts(lf, qc))
+            r_c = v @ self.few_W.T + self.few_b
+            r_c -= float(np.mean(r_c))
+            p_c = self.few_protos @ v
+            p_c -= float(np.mean(p_c))
+            shot_cos = self.few_X @ v
+            e_c = np.array(
+                [float(np.max(shot_cos[self.few_y == c])) if np.any(self.few_y == c) else 0.0 for c in range(self.K)],
+                dtype=np.float64,
+            )
+            e_c -= float(np.mean(e_c))
+            fs_comb = 0.70 * r_c + 0.20 * p_c + 0.10 * e_c
+            w_zs = 2.4 / (2.4 + float(self.k_per_class))
+        zs_std = float(np.std(zs))
+        fs_std = float(np.std(fs_comb))
+        zs_scaled = zs * (fs_std / zs_std) if (zs_std > 1e-6 and fs_std > 1e-6) else zs
+        comb = w_zs * zs_scaled + (1.0 - w_zs) * fs_comb
+        probs = np.exp((comb - np.max(comb)) * 4.0)
+        probs /= probs.sum()
+        return self._select_predicted_label(comb, probs), probs
+
+    def predict(self, prompt: str) -> Any:
+        pred, _ = self.score_and_predict(prompt)
+        return pred
+
+    def predict_proba(self, prompt: str) -> Dict[str, float]:
+        _, probs = self.score_and_predict(prompt)
+        return {self.options[j]: float(probs[j]) for j in range(self.K)}
+
+    def predict_batch(self, prompts: Sequence[str]) -> List[Any]:
+        return [self.predict(p) for p in prompts]
+
+    def decide(self, prompt: str, alpha: Optional[float] = None) -> RouterDecisionResult:
+        eff_alpha = self._cal_alpha if alpha is None else float(alpha)
+        if not (0.0 < eff_alpha < 1.0):
+            raise ValueError(f"alpha must be in (0, 1), got {eff_alpha}")
+        t0 = time.perf_counter()
+        pred, probs = self.score_and_predict(prompt)
+        bi = self.opt_to_idx[self._normalize_label_str(pred)]
+        if self._calibrated:
+            if self._cal_scores is not None and len(self._cal_scores) > 0:
+                n_cal = len(self._cal_scores)
+                rank = int(math.ceil((n_cal + 1) * (1.0 - eff_alpha)))
+                q_eff = 1.0 if rank > n_cal else float(self._cal_scores[max(0, rank - 1)])
+            else:
+                q_eff = self._conformal_q
+            cset_indices = [
+                j for j in range(self.K) if (1.0 - float(probs[j])) <= q_eff + 1e-12
+            ]
+            cset = tuple(self._public_value(self.options[j]) for j in cset_indices)
+            is_ambig = cset_indices != [bi]
+        else:
+            cset = (pred,)
+            is_ambig = False
+        lat_ms = (time.perf_counter() - t0) * 1000.0
+        return RouterDecisionResult(
+            schema_name=self.schema_name,
+            schema_digest=self.schema_digest,
+            prompt=prompt,
+            values={self.field_name: pred},
+            confidences={self.field_name: float(probs[bi])},
+            probabilities={self.field_name: {self.options[j]: float(probs[j]) for j in range(self.K)}},
+            conformal_sets={self.field_name: cset},
+            is_ambiguous=is_ambig,
+            latency_ms=lat_ms,
+            alpha=eff_alpha,
+            receipt=None,
+        )
+
+
 __all__ = [
     "SubwordSemanticEmbeddings",
     "StaticEmbeddingTable",
     "HybridProjector",
     "HybridSemanticProjector",
     "UnifiedHybridProjector",
+    "SmartsCrossZeroFewRouter",
+    "RouterDecisionResult",
+    "set_embedding_cache_maxsize",
+    "clear_embedding_caches",
     "_build_default_table",
     "_stem_word",
     "_ANCHOR_STOPWORDS",

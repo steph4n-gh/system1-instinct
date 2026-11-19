@@ -28,7 +28,17 @@ from system1.core.schema import (
     DecisionSchema,
     MultiChoiceField,
     ScoreField,
+    _f64_to_exact_2m1074,
+    _score_abs_diff_clamped,
+    _score_abs_diff_exact_2m1074,
+    _score_from_unit_prob,
+    _score_full_span_clamped,
+    _score_half_span,
+    _score_mae_from_int_sum,
+    _score_rmse_from_int_diffs,
+    _score_within_rel_tolerance,
 )
+from system1.core.model import _accepts_recency_weighted
 from system1.core.text import MAX_FEATURES, MAX_TEXT_LENGTH, TfidfProjector
 from system1.engine import SystemOneEngine
 from system1.compat.typesafe import _binomial_lower_bound
@@ -505,15 +515,27 @@ class TeachingSession:
         reasons = []
         engine = self.engine
         proj = engine.model.projector
+        eff_rec = bool(getattr(engine, "recency_weighted", getattr(engine.model, "recency_weighted", False)))
         norm_key = " ".join(text.strip().casefold().split()) if isinstance(text, str) else ""
         has_override = (
             norm_key in getattr(engine.model, "_learned_prompt_overrides", {})
             or norm_key in getattr(engine, "_learned_prompt_overrides", {})
         )
-        if not has_override and not proj.project(text).any():
+        proj_fn = getattr(proj, "project", None)
+        proj_vec = (
+            proj_fn(text, recency_weighted=eff_rec)
+            if callable(proj_fn) and _accepts_recency_weighted(proj_fn)
+            else proj.project(text)
+        )
+        if not has_override and not proj_vec.any():
             reasons.append("unknown_vocabulary")
         if not has_override and hasattr(proj, "raw_norm"):
-            raw_n = float(proj.raw_norm(text))
+            rn_fn = getattr(proj, "raw_norm")
+            raw_n = float(
+                rn_fn(text, recency_weighted=eff_rec)
+                if _accepts_recency_weighted(rn_fn)
+                else rn_fn(text)
+            )
             for h in getattr(engine.model, "heads", {}).values():
                 fam_t = float(getattr(h, "familiarity_threshold", 0.0))
                 if fam_t > 0.0 and raw_n < fam_t - 1e-12:
@@ -737,8 +759,15 @@ class TeachingSession:
         elif isinstance(f_def, MultiChoiceField):
             correct = bool(set(pred) == set(target))
         elif isinstance(f_def, ScoreField):
-            val_range = max(1e-6, f_def.max_value - f_def.min_value)
-            tol_ok = bool(abs(float(pred) - float(target)) <= 0.15 * val_range)
+            tol_ok = _score_within_rel_tolerance(
+                float(pred),
+                float(target),
+                f_def.min_value,
+                f_def.max_value,
+                0.15,
+            )
+            full_span_t = _score_full_span_clamped(f_def.min_value, f_def.max_value)
+            slack_t = min(1e-4, 1e-4 * full_span_t) if full_span_t > 0.0 else 0.0
             interval_ok = True
             if (
                 not f_review
@@ -750,7 +779,7 @@ class TeachingSession:
                 try:
                     lb_s, ub_s = cset[0][1:-1].split(",", 1)
                     lb, ub = float(lb_s.strip()), float(ub_s.strip())
-                    interval_ok = (lb - 1e-4) <= float(target) <= (ub + 1e-4)
+                    interval_ok = (lb - slack_t) <= float(target) <= (ub + slack_t)
                 except (ValueError, TypeError):
                     pass
             correct = bool(tol_ok and interval_ok)
@@ -815,13 +844,22 @@ class TeachingSession:
                     "review": len(selected) - len(local),
                 }
         elif isinstance(f_def, ScoreField):
-            val_range = max(1e-6, f_def.max_value - f_def.min_value)
-            for bucket_name, lo_f, hi_f in (("low", 0.0, 1.0 / 3.0), ("medium", 1.0 / 3.0, 2.0 / 3.0), ("high", 2.0 / 3.0, 1.01)):
-                lo_v = f_def.min_value + lo_f * val_range
-                hi_v = f_def.min_value + hi_f * val_range
+            b0 = float(f_def.min_value)
+            b3 = float(f_def.max_value)
+            b1 = min(b3, max(b0, float(_score_from_unit_prob(1.0 / 3.0, b0, b3))))
+            b2 = min(b3, max(b1, float(_score_from_unit_prob(2.0 / 3.0, b0, b3))))
+            for bucket_name, lo_v, hi_v, inclusive_hi in (
+                ("low", b0, b1, False),
+                ("medium", b1, b2, False),
+                ("high", b2, b3, True),
+            ):
                 selected = [
                     outcome for row, outcome in zip(checks, field_outcomes)
-                    if lo_v <= float(self._field_label(row["label"], fname)) < hi_v
+                    if (
+                        lo_v <= float(self._field_label(row["label"], fname)) <= hi_v
+                        if inclusive_hi
+                        else lo_v <= float(self._field_label(row["label"], fname)) < hi_v
+                    )
                 ]
                 local = [outcome for outcome in selected if not outcome["review"]]
                 per_class[bucket_name] = {
@@ -849,12 +887,12 @@ class TeachingSession:
             "per_class": per_class,
         }
         if isinstance(f_def, ScoreField):
-            errs = [
-                abs(float(o["predicted"]) - float(self._field_label(r["label"], fname)))
+            err_ints = [
+                _score_abs_diff_exact_2m1074(float(o["predicted"]), float(self._field_label(r["label"], fname)))
                 for r, o in zip(checks, field_outcomes)
             ]
-            summary["mae"] = float(sum(errs) / len(errs)) if errs else 0.0
-            summary["rmse"] = float(math.sqrt(sum(e * e for e in errs) / len(errs))) if errs else 0.0
+            summary["mae"] = _score_mae_from_int_sum(sum(err_ints), len(err_ints))
+            summary["rmse"] = _score_rmse_from_int_diffs(err_ints)
         return summary
 
     def _measure(self, engine, checks):
@@ -1265,4 +1303,332 @@ class TeachingSession:
             return report
 
 
-__all__ = ["TeachingSession"]
+import numpy as np
+from typing import List, Optional, Sequence, Tuple
+
+
+def _softmax_rows(logits: np.ndarray, temp: float = 0.25) -> np.ndarray:
+    scaled = logits / float(temp)
+    scaled = scaled - np.max(scaled, axis=1, keepdims=True)
+    e = np.exp(np.clip(scaled, -50.0, 50.0))
+    return e / np.sum(e, axis=1, keepdims=True)
+
+
+def _solve_ridge_dual(
+    X_sub: np.ndarray,
+    Y_sub: np.ndarray,
+    reg: float = 0.1,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Solve primal/dual ridge regression matching SystemOneCompiler regularize_bias=True."""
+    n, d = X_sub.shape
+    X_aug = np.column_stack([X_sub.astype(np.float64), np.ones((n, 1), dtype=np.float64)])
+    Y64 = Y_sub.astype(np.float64)
+    d_inv = np.full(d + 1, 1.0 / float(reg), dtype=np.float64)
+    d_inv[d] = 1.0 / max(1.0, float(reg))
+    XD = X_aug * d_inv
+    gram = np.eye(n, dtype=np.float64) + XD @ X_aug.T
+    alpha = np.linalg.solve(gram, Y64)
+    sol = XD.T @ alpha
+    return sol[:d, :].T, sol[d, :]
+
+
+def _norm_01(vals: np.ndarray) -> np.ndarray:
+    if vals.size == 0:
+        return vals
+    lo = float(np.min(vals))
+    hi = float(np.max(vals))
+    span = hi - lo
+    if span <= 1e-12:
+        return np.zeros_like(vals)
+    return (vals - lo) / span
+
+
+def _as_target_matrix(targets: Any, num_classes: int) -> np.ndarray:
+    arr = np.asarray(targets)
+    if arr.ndim == 1:
+        y_int = arr.astype(np.int64)
+        if np.any((y_int < 0) | (y_int >= num_classes)):
+            raise ValueError(f"Class indices must lie in [0, {num_classes})")
+        out = np.zeros((len(y_int), num_classes), dtype=np.float64)
+        out[np.arange(len(y_int)), y_int] = 1.0
+        return out
+    if arr.ndim == 2:
+        if arr.shape[1] != num_classes:
+            raise ValueError(f"Target matrix has {arr.shape[1]} columns, expected {num_classes}")
+        return arr.astype(np.float64)
+    raise ValueError(f"Expected 1D labels or 2D target matrix, got shape {arr.shape}")
+
+
+class ActiveTeacherSelector:
+    """Selects informative unlabeled examples using RLS variance, margin entropy, and k-center."""
+
+    def __init__(
+        self,
+        X_pool: np.ndarray,
+        *,
+        num_classes: int,
+        reg: float = 0.25,
+        batch_size: int = 4,
+        w_rls: float = 0.35,
+        w_entropy: float = 0.45,
+        w_kcenter: float = 0.20,
+    ) -> None:
+        self.X_pool = np.asarray(X_pool, dtype=np.float64)
+        if self.X_pool.ndim != 2 or self.X_pool.shape[0] == 0:
+            raise ValueError("X_pool must be a non-empty 2D array")
+        self.n_pool, self.dim = self.X_pool.shape
+        self.num_classes = int(num_classes)
+        if self.num_classes < 2:
+            raise ValueError(f"num_classes must be >= 2, got {self.num_classes}")
+        self.reg = float(reg)
+        if self.reg <= 0.0:
+            raise ValueError(f"reg must be positive, got {self.reg}")
+        self.batch_size = max(1, int(batch_size))
+        self.w_rls = float(w_rls)
+        self.w_entropy = float(w_entropy)
+        self.w_kcenter = float(w_kcenter)
+
+        bias_scale = math.sqrt(self.reg / max(1.0, self.reg))
+        X_tilde = np.column_stack([self.X_pool, np.full((self.n_pool, 1), bias_scale, dtype=np.float64)])
+        self.G = X_tilde @ X_tilde.T
+        self.X_sq = np.sum(self.X_pool * self.X_pool, axis=1)
+
+    @classmethod
+    def from_texts(
+        cls,
+        texts: Sequence[str],
+        *,
+        num_classes: int,
+        projector: Optional[Any] = None,
+        **kwargs: Any,
+    ) -> ActiveTeacherSelector:
+        """Project raw pool texts with a fitted or default HybridProjector."""
+        text_list = list(texts)
+        if not text_list:
+            raise ValueError("texts must be non-empty")
+        if projector is None:
+            from system1.core.embeddings import HybridProjector
+
+            projector = HybridProjector.fit(text_list)
+        X_pool = projector.project_batch(text_list)
+        if isinstance(X_pool, tuple):
+            X_pool = X_pool[0]
+        return cls(np.asarray(X_pool, dtype=np.float64), num_classes=num_classes, **kwargs)
+
+    def _euclidean_dists_to(self, idx: int) -> np.ndarray:
+        dots = self.X_pool @ self.X_pool[idx]
+        d2 = np.maximum(0.0, self.X_sq + self.X_sq[idx] - 2.0 * dots)
+        return np.sqrt(d2)
+
+    def _sherman_morrison_state(self, initial_indices: Sequence[int]) -> Tuple[np.ndarray, np.ndarray]:
+        S = (self.G / self.reg).copy()
+        min_dists = np.full(self.n_pool, np.inf, dtype=np.float64)
+        for idx in initial_indices:
+            ii = int(idx)
+            denom = 1.0 + float(S[ii, ii])
+            if denom > 1e-12:
+                sq = S[:, ii].copy()
+                S -= np.outer(sq, sq) / denom
+            min_dists = np.minimum(min_dists, self._euclidean_dists_to(ii))
+        return S, min_dists
+
+    def _fit_model_if_ready(
+        self,
+        labeled_indices: Sequence[int],
+        Y_labeled: np.ndarray,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        warm_min = max(8, self.num_classes * 2)
+        if len(labeled_indices) < warm_min:
+            return None
+        seen_classes = int(len(set(np.argmax(Y_labeled, axis=1).tolist())))
+        if seen_classes < 2:
+            return None
+        return _solve_ridge_dual(self.X_pool[list(labeled_indices)], Y_labeled, reg=self.reg)
+
+    def _entropy_margin_uncertainty(
+        self, rem_idx: np.ndarray, W: np.ndarray, b: np.ndarray
+    ) -> np.ndarray:
+        logits = self.X_pool[rem_idx] @ W.T + b
+        probs = _softmax_rows(logits)
+        p_clip = np.clip(probs, 1e-12, 1.0)
+        ent = -np.sum(p_clip * np.log(p_clip), axis=1) / max(1e-12, math.log(self.num_classes))
+        p_sorted = np.sort(probs, axis=1)
+        margin_unc = 1.0 - (p_sorted[:, -1] - p_sorted[:, -2])
+        return _norm_01(0.5 * ent + 0.5 * margin_unc)
+
+    def _pick_next_rls(
+        self,
+        S: np.ndarray,
+        min_dists: np.ndarray,
+        remaining: np.ndarray,
+        model_wb: Optional[Tuple[np.ndarray, np.ndarray]],
+    ) -> int:
+        rem_idx = np.flatnonzero(remaining)
+        S_cols = S[np.ix_(rem_idx, rem_idx)]
+        diag_u = np.maximum(0.0, np.diag(S_cols))
+        v_pool_red = np.sum(S_cols * S_cols, axis=0) / (1.0 + diag_u)
+        v_norm = _norm_01(v_pool_red)
+        d_norm = _norm_01(min_dists[rem_idx])
+        if model_wb is not None:
+            u_norm = self._entropy_margin_uncertainty(rem_idx, model_wb[0], model_wb[1])
+            scores = self.w_rls * v_norm + self.w_entropy * u_norm + self.w_kcenter * d_norm
+        else:
+            scores = 0.70 * v_norm + 0.30 * d_norm
+        chosen = int(rem_idx[int(np.argmax(scores))])
+        remaining[chosen] = False
+        denom = 1.0 + float(S[chosen, chosen])
+        if denom > 1e-12:
+            sq = S[:, chosen].copy()
+            S -= np.outer(sq, sq) / denom
+        np.minimum(min_dists, self._euclidean_dists_to(chosen), out=min_dists)
+        return chosen
+
+    def partition_calibration_and_active(
+        self,
+        calibration_size: int,
+        *,
+        seed: int = 42,
+    ) -> Tuple[List[int], List[int]]:
+        """Reserve an exchangeable random calibration slice disjoint from active acquisition."""
+        n_cal = int(calibration_size)
+        if not 0 <= n_cal <= self.n_pool:
+            raise ValueError(f"calibration_size must be in [0, {self.n_pool}], got {n_cal}")
+        perm = np.random.default_rng(seed).permutation(self.n_pool).tolist()
+        return [int(i) for i in perm[:n_cal]], [int(i) for i in perm[n_cal:]]
+
+    def select_order(
+        self,
+        pool_teacher_targets: Any,
+        max_budget: int,
+        *,
+        strategy: str = "active_rls",
+        seed: int = 42,
+        reserve_calibration: int = 0,
+    ) -> List[int]:
+        """Return ordered list of `max_budget` pool indices queried under `strategy`."""
+        targets_2d = _as_target_matrix(pool_teacher_targets, self.num_classes)
+        if targets_2d.shape[0] != self.n_pool:
+            raise ValueError(f"pool_teacher_targets rows {targets_2d.shape[0]} != pool size {self.n_pool}")
+        budget = min(max(0, int(max_budget)), self.n_pool)
+        if budget == 0:
+            return []
+
+        rng = np.random.default_rng(seed)
+        target_labels = np.argmax(targets_2d, axis=1)
+        all_perm = [int(i) for i in rng.permutation(self.n_pool).tolist()]
+
+        if strategy == "uniform_random":
+            return all_perm[:budget]
+
+        if strategy not in ("confidence_only", "active_rls"):
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+        n_cal = int(reserve_calibration)
+        if n_cal < 0:
+            raise ValueError(f"reserve_calibration must be non-negative, got {n_cal}")
+        cal_selected: List[int] = []
+        train_selected: List[int] = []
+        remaining = np.ones(self.n_pool, dtype=bool)
+        cal_count = min(n_cal, budget)
+        for idx in all_perm[:cal_count]:
+            cal_selected.append(idx)
+            remaining[idx] = False
+
+        if len(cal_selected) >= budget:
+            return cal_selected[:budget]
+
+        train_budget = budget - len(cal_selected)
+        seed_idx = all_perm[cal_count]
+        train_selected.append(seed_idx)
+        remaining[seed_idx] = False
+
+        if strategy == "confidence_only":
+            warm = min(max(8, self.num_classes * 2), train_budget)
+            for idx in all_perm[cal_count + 1:]:
+                if len(train_selected) >= warm and len(set(target_labels[train_selected].tolist())) >= 2:
+                    break
+                train_selected.append(idx)
+                remaining[idx] = False
+                if len(train_selected) >= train_budget:
+                    return (cal_selected + train_selected)[:budget]
+
+            while len(train_selected) < train_budget:
+                W, b = _solve_ridge_dual(self.X_pool[train_selected], targets_2d[train_selected], reg=self.reg)
+                rem_idx = np.flatnonzero(remaining)
+                if rem_idx.size == 0:
+                    break
+                probs = _softmax_rows(self.X_pool[rem_idx] @ W.T + b)
+                uncertainty = 1.0 - np.max(probs, axis=1)
+                step_k = min(self.batch_size, train_budget - len(train_selected))
+                order = np.argsort(-uncertainty, kind="mergesort")[:step_k]
+                for pos in order:
+                    chosen = int(rem_idx[int(pos)])
+                    train_selected.append(chosen)
+                    remaining[chosen] = False
+            return (cal_selected + train_selected)[:budget]
+
+        S, min_dists = self._sherman_morrison_state(train_selected)
+        while len(train_selected) < train_budget:
+            rem_idx = np.flatnonzero(remaining)
+            if rem_idx.size == 0:
+                break
+            model_wb = self._fit_model_if_ready(train_selected, targets_2d[train_selected])
+            step_k = min(self.batch_size, train_budget - len(train_selected), int(rem_idx.size))
+            for _ in range(step_k):
+                if not np.any(remaining):
+                    break
+                train_selected.append(self._pick_next_rls(S, min_dists, remaining, model_wb))
+        return (cal_selected + train_selected)[:budget]
+
+    def select_next_batch(
+        self,
+        labeled_indices: Sequence[int] = (),
+        y_labeled: Optional[Any] = None,
+        *,
+        k: Optional[int] = None,
+        excluded_indices: Sequence[int] = (),
+        seed: int = 42,
+    ) -> List[int]:
+        """Select the next unlabeled pool batch without access to held-out teacher labels."""
+        remaining = np.ones(self.n_pool, dtype=bool)
+        labeled_list = [int(i) for i in labeled_indices]
+        for idx in labeled_list:
+            if not 0 <= idx < self.n_pool:
+                raise ValueError(f"Labeled index {idx} out of range [0, {self.n_pool})")
+            remaining[idx] = False
+        for idx in excluded_indices:
+            ii = int(idx)
+            if not 0 <= ii < self.n_pool:
+                raise ValueError(f"Excluded index {ii} out of range [0, {self.n_pool})")
+            remaining[ii] = False
+
+        rem_count = int(np.sum(remaining))
+        step_k = min(self.batch_size if k is None else max(0, int(k)), rem_count)
+        if step_k == 0:
+            return []
+
+        picked: List[int] = []
+        if not labeled_list:
+            rng = np.random.default_rng(seed)
+            first_idx = int(next(i for i in rng.permutation(self.n_pool).tolist() if remaining[i]))
+            remaining[first_idx] = False
+            picked.append(first_idx)
+            S, min_dists = self._sherman_morrison_state([first_idx])
+            model_wb = None
+        else:
+            S, min_dists = self._sherman_morrison_state(labeled_list)
+            model_wb = None
+            if y_labeled is not None:
+                Y_lab = _as_target_matrix(y_labeled, self.num_classes)
+                if Y_lab.shape[0] != len(labeled_list):
+                    raise ValueError(
+                        f"y_labeled rows {Y_lab.shape[0]} != labeled_indices length {len(labeled_list)}"
+                    )
+                model_wb = self._fit_model_if_ready(labeled_list, Y_lab)
+
+        while len(picked) < step_k and np.any(remaining):
+            picked.append(self._pick_next_rls(S, min_dists, remaining, model_wb))
+        return picked
+
+
+__all__ = ["TeachingSession", "ActiveTeacherSelector"]

@@ -135,9 +135,13 @@ def _validate_cache_inputs(
             raise ValueError("telemetry array contains NaN or infinite values")
 
     if embedding is not None:
-        if not isinstance(embedding, (np.ndarray, Sequence)):
+        if not isinstance(embedding, (np.ndarray, Sequence)) or isinstance(embedding, (str, bytes, bytearray)):
             raise TypeError(f"embedding must be a sequence or ndarray, got {type(embedding).__name__}")
-        emb_arr = np.asarray(embedding, dtype=np.float32)
+        from system1.core.model import _assert_real_numeric_array_like
+
+        raw_emb = _assert_real_numeric_array_like(embedding, "embedding")
+        with np.errstate(over="ignore", invalid="ignore"):
+            emb_arr = np.asarray(raw_emb, dtype=np.float32)
         if emb_arr.ndim > 2 or (emb_arr.ndim == 2 and emb_arr.shape[0] != 1 and emb_arr.shape[1] != 1):
             raise ValueError(f"embedding must be a 1D vector, got shape {emb_arr.shape}")
         if not np.all(np.isfinite(emb_arr)):
@@ -678,6 +682,44 @@ class SemanticSystemOneCache:
     def _evict_one(self) -> None:
         """Evicts the least recently used entry from exact and vector indices."""
         self._remove_key(next(iter(self._exact_index)))
+
+    def _snapshot_state(self) -> Dict[str, Any]:
+        """Capture reversible cache index and stats state for transactional rollback."""
+        with self._lock:
+            entry_clones: Dict[str, CacheEntry] = {}
+            idx_copy: OrderedDict[str, CacheEntry] = OrderedDict()
+            for k, entry in self._exact_index.items():
+                cl = copy.copy(entry)
+                entry_clones[k] = cl
+                idx_copy[k] = cl
+            emb_entries_copy = [entry_clones.get(e.key, copy.copy(e)) for e in self._embedding_entries]
+            return {
+                "exact_index": idx_copy,
+                "base_to_key": dict(self._base_to_key),
+                "embeddings": self._embeddings.copy() if self._embeddings is not None else None,
+                "embedding_entries": emb_entries_copy,
+                "key_to_emb_idx": dict(self._key_to_emb_idx),
+                "total_queries": self._total_queries,
+                "exact_hits": self._exact_hits,
+                "semantic_hits": self._semantic_hits,
+                "misses": self._misses,
+                "evictions": self._evictions,
+            }
+
+    def _restore_state(self, snap: Dict[str, Any]) -> None:
+        """Restore cache index and stats state captured by `_snapshot_state`."""
+        with self._lock:
+            self._exact_index = OrderedDict(snap["exact_index"])
+            self._base_to_key = dict(snap["base_to_key"])
+            emb = snap["embeddings"]
+            self._embeddings = emb.copy() if emb is not None else None
+            self._embedding_entries = list(snap["embedding_entries"])
+            self._key_to_emb_idx = dict(snap["key_to_emb_idx"])
+            self._total_queries = int(snap["total_queries"])
+            self._exact_hits = int(snap["exact_hits"])
+            self._semantic_hits = int(snap["semantic_hits"])
+            self._misses = int(snap["misses"])
+            self._evictions = int(snap["evictions"])
 
     def clear(self) -> None:
         """Clears all entries and resets statistics."""

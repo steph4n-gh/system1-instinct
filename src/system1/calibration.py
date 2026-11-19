@@ -11,13 +11,124 @@ Implements:
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import itertools
 import json
 import math
+from collections import deque
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import numpy as np
+
+from system1.core.model import (
+    _assert_real_numeric_array_like,
+    _validate_real_scalar,
+)
+from system1.core.schema import (
+    _f64_to_exact_2m1074,
+    _format_score_interval,
+    _score_abs_diff_clamped,
+    _score_full_span_clamped,
+    _score_half_span,
+    _score_interval_bounds,
+)
+
+
+def _normalize_rows_f32_safe(arr: Any) -> Tuple[np.ndarray, np.ndarray]:
+    """L2-normalize 2D rows in scaled float64 without overflow, returning (unit_f32, valid_mask)."""
+    a64 = np.asarray(arr, dtype=np.float64)
+    if a64.ndim != 2 or a64.shape[0] == 0 or a64.shape[1] == 0:
+        cols = a64.shape[1] if a64.ndim == 2 else 0
+        return np.zeros((0, cols), dtype=np.float32), np.zeros((0,), dtype=bool)
+    row_finite = np.all(np.isfinite(a64), axis=1)
+    safe_a = np.where(row_finite[:, None], a64, 0.0)
+    scales = np.max(np.abs(safe_a), axis=1, keepdims=True)
+    pos_scale = (scales[:, 0] > 0.0) & row_finite
+    denom_scale = np.where(pos_scale[:, None], scales, 1.0)
+    scaled = safe_a / denom_scale
+    scaled_norms = np.linalg.norm(scaled, axis=1, keepdims=True)
+    with np.errstate(over="ignore", invalid="ignore"):
+        raw_norms = np.where(scales >= 1.0, np.inf, scales * scaled_norms)
+    valid = (
+        pos_scale
+        & np.isfinite(scaled_norms[:, 0])
+        & (scaled_norms[:, 0] > 0.0)
+        & ((scales[:, 0] >= 1.0) | (raw_norms[:, 0] > 1e-12))
+    )
+    denom_norm = np.where(valid[:, None], scaled_norms, 1.0)
+    unit_64 = np.where(valid[:, None], scaled / denom_norm, 0.0)
+    return unit_64.astype(np.float32), valid
+
+
+def _normalize_vec_f32_safe(
+    vec: Any,
+    *,
+    min_norm: float = 1e-12,
+) -> Tuple[np.ndarray, float, bool]:
+    """L2-normalize a 1D vector in scaled float64, returning (unit_f32, norm_f64, is_valid)."""
+    v64 = np.asarray(vec, dtype=np.float64).ravel()
+    if v64.size == 0 or not np.all(np.isfinite(v64)):
+        return np.zeros((v64.size,), dtype=np.float32), float("nan") if v64.size else 0.0, False
+    scale = float(np.max(np.abs(v64)))
+    if scale == 0.0:
+        return np.zeros_like(v64, dtype=np.float32), 0.0, False
+    scaled = v64 / scale
+    scaled_norm = float(np.linalg.norm(scaled))
+    if not math.isfinite(scaled_norm) or scaled_norm <= 0.0:
+        return np.zeros_like(v64, dtype=np.float32), float("nan"), False
+    with np.errstate(over="ignore"):
+        raw_norm = scale * scaled_norm
+    if min_norm > 0.0 and scale < 1.0 and raw_norm <= min_norm:
+        return np.zeros_like(v64, dtype=np.float32), raw_norm, False
+    unit = (scaled / scaled_norm).astype(np.float32)
+    return unit, raw_norm, True
+
+
+def _safe_centroid_mean_f64(rows: Any, weights: Optional[Any] = None) -> Optional[np.ndarray]:
+    """Compute overflow-free, permutation-invariant exact centroid mean in 2^-1074 fixed point."""
+    r_arr = np.asarray(rows)
+    if r_arr.ndim != 2 or r_arr.shape[0] == 0 or r_arr.shape[1] == 0:
+        return None
+    fin = np.all(np.isfinite(r_arr), axis=1)
+    if not bool(np.any(fin)):
+        return None
+    sub = np.asarray(r_arr[fin], dtype=np.float64)
+    w_ints: Optional[List[int]] = None
+    den_int: int
+    if weights is not None:
+        w_arr = np.asarray(weights, dtype=np.float64).reshape(-1)
+        if w_arr.shape[0] != r_arr.shape[0]:
+            raise ValueError(
+                f"Sample weights length {w_arr.shape[0]} != rows count {r_arr.shape[0]}"
+            )
+        w_sub = w_arr[fin]
+        w_ok = np.isfinite(w_sub) & (w_sub > 0.0)
+        if not bool(np.any(w_ok)):
+            return None
+        sub = sub[w_ok]
+        w_pos = w_sub[w_ok]
+        w_ints = [_f64_to_exact_2m1074(float(w)) for w in w_pos]
+        w_sum_int = sum(w_ints)
+        if w_sum_int <= 0:
+            return None
+        den_int = w_sum_int << 1074
+    else:
+        den_int = sub.shape[0] << 1074
+    n_cols = sub.shape[1]
+    out = np.zeros(n_cols, dtype=np.float64)
+    for j in range(n_cols):
+        col = sub[:, j]
+        if not bool(np.any(col)):
+            out[j] = 0.0
+            continue
+        if w_ints is None:
+            num_int = sum(_f64_to_exact_2m1074(float(v)) for v in col)
+        else:
+            num_int = sum(wi * _f64_to_exact_2m1074(float(v)) for wi, v in zip(w_ints, col))
+        out[j] = num_int / den_int
+    return out
 
 
 def _binom_cdf(k: int, n: int, p: float) -> float:
@@ -165,10 +276,17 @@ class ConformalPredictionSet:
 def _stable_softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     """Numerically stable softmax with temperature."""
     temp = max(1e-4, float(temperature))
-    scaled = np.asarray(logits, dtype=np.float64) / temp
-    max_val = np.max(scaled, axis=-1, keepdims=True)
-    exp = np.exp(scaled - max_val)
-    return exp / np.sum(exp, axis=-1, keepdims=True)
+    with np.errstate(over="ignore", invalid="ignore"):
+        arr = np.asarray(logits, dtype=np.float64)
+        scaled = arr / temp
+        row_finite = np.all(np.isfinite(arr), axis=-1) & np.all(np.isfinite(scaled), axis=-1)
+        safe_scaled = np.where(row_finite[..., None], scaled, 0.0)
+        max_val = np.max(safe_scaled, axis=-1, keepdims=True)
+        exp = np.exp(safe_scaled - max_val)
+        out = exp / np.sum(exp, axis=-1, keepdims=True)
+        if not bool(np.all(row_finite)):
+            out = np.where(row_finite[..., None], out, np.nan)
+        return out
 
 
 def compute_nll(probs: np.ndarray, labels: np.ndarray) -> float:
@@ -385,50 +503,76 @@ class DecisionCalibrator:
 
     def calibrate_logits(self, logits: np.ndarray) -> np.ndarray:
         """Applies learned logit adjustment and temperature scaling to raw logits."""
-        arr = np.asarray(logits, dtype=np.float64)
-        temp = self.temperature
-        adj = self.logit_adjustments
-        if self.is_binary:
-            if arr.ndim == 0:
-                z = float(arr)
-                if adj is not None and adj.shape == (2,):
-                    z += float(adj[1] - adj[0])
-                half_z = z / (2.0 * temp)
-                s_max = half_z if half_z >= -half_z else -half_z
-                e0 = math.exp(-half_z - s_max)
-                e1 = math.exp(half_z - s_max)
-                inv = 1.0 / (e0 + e1)
-                return np.array([e0 * inv, e1 * inv], dtype=np.float64)
-            if arr.ndim == 1:
-                arr = np.column_stack([-arr / 2.0, arr / 2.0])
-                if adj is not None and adj.shape == (2,):
-                    arr = arr + adj
-                return _stable_softmax(arr / temp)
+        logits_chk = _assert_real_numeric_array_like(logits, "logits")
+        arr = np.asarray(logits_chk, dtype=np.float64)
+        temp = _validate_real_scalar(self.temperature, "DecisionCalibrator temperature")
+        if not math.isfinite(temp) or temp <= 0.0:
+            raise ValueError(f"DecisionCalibrator temperature must be positive and finite, got {temp!r}")
+        raw_adj = self.logit_adjustments
+        if raw_adj is None:
+            adj = None
+        else:
+            adj_chk = _assert_real_numeric_array_like(raw_adj, "DecisionCalibrator logit_adjustments")
+            adj = np.asarray(adj_chk, dtype=np.float64)
+            exp_adj_len = 2 if (arr.ndim == 0 or self.is_binary or (arr.ndim == 1 and len(arr) == 1)) else arr.shape[-1]
+            if adj.ndim != 1 or adj.shape != (exp_adj_len,) or not bool(np.all(np.isfinite(adj))):
+                raise ValueError(
+                    f"DecisionCalibrator logit_adjustments must be finite with shape ({exp_adj_len},), got {adj.shape}"
+                )
 
-        if arr.ndim == 1:
-            if len(arr) == 1:
-                z = float(arr[0])
-                if adj is not None and adj.shape == (2,):
-                    z += float(adj[1] - adj[0])
-                half_z = z / (2.0 * temp)
-                s_max = half_z if half_z >= -half_z else -half_z
-                e0 = math.exp(-half_z - s_max)
-                e1 = math.exp(half_z - s_max)
-                inv = 1.0 / (e0 + e1)
-                return np.array([e0 * inv, e1 * inv], dtype=np.float64)
-            if adj is not None and adj.shape == (len(arr),):
+        def _single_binary_logit(z: float) -> np.ndarray:
+            if not math.isfinite(z):
+                return np.array([np.nan, np.nan], dtype=np.float64)
+            two = np.array([-0.5 * z, 0.5 * z], dtype=np.float64)
+            if adj is not None and adj.shape == (2,):
+                two = two + adj
+            scaled_two = two / temp
+            if not bool(np.all(np.isfinite(scaled_two))):
+                return np.array([np.nan, np.nan], dtype=np.float64)
+            return _stable_softmax(scaled_two, temperature=1.0)
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            if arr.ndim == 0:
+                return _single_binary_logit(float(arr))
+            if self.is_binary:
+                if arr.ndim == 1:
+                    finite_1d = np.isfinite(arr)
+                    two = np.column_stack([-arr / 2.0, arr / 2.0])
+                    if adj is not None and adj.shape == (2,):
+                        two = two + adj
+                    scaled_two = two / temp
+                    out = _stable_softmax(scaled_two, temperature=1.0)
+                    row_ok = finite_1d & np.all(np.isfinite(scaled_two), axis=-1)
+                    if not bool(np.all(row_ok)):
+                        out = np.where(row_ok[:, None], out, np.nan)
+                    return out
+
+            if arr.ndim == 1:
+                if len(arr) == 1:
+                    return _single_binary_logit(float(arr[0]))
+                if not bool(np.all(np.isfinite(arr))):
+                    return np.full(arr.shape, np.nan, dtype=np.float64)
+                if adj is not None and adj.shape == (len(arr),):
+                    arr = arr + adj
+                scaled = arr / temp
+                if not bool(np.all(np.isfinite(scaled))):
+                    return np.full(arr.shape, np.nan, dtype=np.float64)
+                s = scaled - float(np.max(scaled))
+                exp = np.exp(s)
+                return exp / float(np.sum(exp))
+
+            row_finite = np.all(np.isfinite(arr), axis=-1)
+            if adj is not None and adj.shape == (arr.shape[-1],):
                 arr = arr + adj
             scaled = arr / temp
-            s = scaled - float(np.max(scaled))
-            exp = np.exp(s)
-            return exp / float(np.sum(exp))
-
-        if adj is not None and adj.shape == (arr.shape[-1],):
-            arr = arr + adj
-        scaled = arr / temp
-        max_val = np.max(scaled, axis=-1, keepdims=True)
-        exp = np.exp(scaled - max_val)
-        return exp / np.sum(exp, axis=-1, keepdims=True)
+            row_finite = row_finite & np.all(np.isfinite(scaled), axis=-1)
+            safe_scaled = np.where(row_finite[..., None], scaled, 0.0)
+            max_val = np.max(safe_scaled, axis=-1, keepdims=True)
+            exp = np.exp(safe_scaled - max_val)
+            out = exp / np.sum(exp, axis=-1, keepdims=True)
+            if not bool(np.all(row_finite)):
+                out = np.where(row_finite[..., None], out, np.nan)
+            return out
 
     def fit_imbalance_aware(
         self,
@@ -621,9 +765,15 @@ class ConformalPredictor:
         self.familiarity_scores: np.ndarray = np.array([], dtype=np.float64)
         self.prototype_threshold: float = float(prototype_threshold)
         self.prototype_scores: np.ndarray = np.array([], dtype=np.float64)
-        self.prototypes: Optional[np.ndarray] = (
-            np.asarray(prototypes, dtype=np.float32) if prototypes is not None else None
-        )
+        if prototypes is not None:
+            p_raw = np.asarray(prototypes)
+            if p_raw.ndim == 2 and np.all(np.isfinite(np.asarray(p_raw, dtype=np.float64))):
+                self.prototypes = _normalize_rows_f32_safe(p_raw)[0]
+            else:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    self.prototypes = np.asarray(p_raw, dtype=np.float32)
+        else:
+            self.prototypes = None
         self.is_calibrated: bool = False
         self.quantile: Optional[float] = None
         self.margin_threshold: Optional[float] = (
@@ -641,18 +791,16 @@ class ConformalPredictor:
         """Compute maximum cosine similarity between an input embedding and class prototypes."""
         if self.prototypes is None or self.prototypes.size == 0:
             return None
-        emb = np.asarray(embedding, dtype=np.float32).flatten()
-        if emb.ndim != 1 or self.prototypes.ndim != 2 or self.prototypes.shape[1] != emb.shape[0]:
+        emb_flat = np.asarray(embedding).ravel()
+        if emb_flat.ndim != 1 or self.prototypes.ndim != 2 or self.prototypes.shape[1] != emb_flat.shape[0]:
             return None
-        e_norm = float(np.linalg.norm(emb))
-        if e_norm < 1e-12 or not math.isfinite(e_norm):
+        emb_unit, _, emb_valid = _normalize_vec_f32_safe(emb_flat)
+        if not emb_valid:
             return 0.0
-        emb_unit = emb / e_norm
-        p_norms = np.linalg.norm(self.prototypes, axis=1, keepdims=True)
-        valid_rows = (p_norms.flatten() > 1e-12)
+        proto_all, valid_rows = _normalize_rows_f32_safe(self.prototypes)
         if not np.any(valid_rows):
             return None
-        proto_unit = self.prototypes[valid_rows] / np.where(p_norms[valid_rows] < 1e-12, 1.0, p_norms[valid_rows])
+        proto_unit = proto_all[valid_rows]
         sims = proto_unit @ emb_unit
         return float(np.max(sims))
 
@@ -691,7 +839,12 @@ class ConformalPredictor:
         if not (0.0 <= eff_alpha < 1.0) or not math.isfinite(eff_alpha):
             raise ValueError(f"alpha_prototype must be in [0, 1), got {eff_alpha}")
         if prototypes is not None:
-            self.prototypes = np.asarray(prototypes, dtype=np.float32)
+            p_raw = np.asarray(prototypes)
+            if p_raw.ndim == 2 and np.all(np.isfinite(np.asarray(p_raw, dtype=np.float64))):
+                self.prototypes = _normalize_rows_f32_safe(p_raw)[0]
+            else:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    self.prototypes = np.asarray(p_raw, dtype=np.float32)
         arr = np.asarray(prototype_values, dtype=np.float64)
         if arr.ndim == 2:
             if self.prototypes is None and labels is not None and len(labels) == arr.shape[0] and len(self.options) > 0:
@@ -699,10 +852,11 @@ class ConformalPredictor:
                 for c_idx, opt in enumerate(self.options):
                     mask = [i for i, lbl in enumerate(labels) if str(lbl) == str(opt)]
                     if mask:
-                        c_mean = np.mean(arr[mask], axis=0)
-                        c_norm = float(np.linalg.norm(c_mean))
-                        if c_norm > 1e-12:
-                            protos[c_idx] = (c_mean / c_norm).astype(np.float32)
+                        c_mean = _safe_centroid_mean_f64(arr[mask])
+                        if c_mean is not None:
+                            u_vec, _, ok = _normalize_vec_f32_safe(c_mean, min_norm=0.0)
+                            if ok:
+                                protos[c_idx] = u_vec
                 self.prototypes = protos
             if self.prototypes is not None and self.prototypes.size > 0 and len(arr) > 0:
                 sims = [self.compute_prototype_similarity(row) for row in arr]
@@ -720,7 +874,7 @@ class ConformalPredictor:
         m = len(self.prototype_scores)
         rank = int(math.floor((m + 1) * eff_alpha))
         if rank >= 1:
-            self.prototype_threshold = float(self.prototype_scores[rank - 1])
+            self.prototype_threshold = float(max(0.0, float(self.prototype_scores[rank - 1])))
         else:
             # For small calibration cohorts where (m + 1) * alpha < 1, use a conservative
             # margin below the minimum observed in-distribution prototype similarity.
@@ -804,7 +958,7 @@ class ConformalPredictor:
             true_idx = self.option_to_idx[label]
             row = probs[i]
 
-            sorted_indices = np.argsort(-row)
+            sorted_indices = np.argsort(-row, kind="mergesort")
             top_idx = int(sorted_indices[0])
             runner_up_idx = int(sorted_indices[1]) if len(sorted_indices) > 1 else top_idx
             margin_i = float(row[top_idx] - row[runner_up_idx])
@@ -897,7 +1051,7 @@ class ConformalPredictor:
             prototype_similarity = self.compute_prototype_similarity(embedding)
 
         n = len(self.calibration_scores)
-        sorted_indices = np.argsort(-probs)
+        sorted_indices = np.argsort(-probs, kind="mergesort")
         top_prob = float(probs[sorted_indices[0]]) if len(sorted_indices) > 0 else 0.0
         runner_up_prob = float(probs[sorted_indices[1]]) if len(sorted_indices) > 1 else 0.0
         margin = float(top_prob - runner_up_prob) if len(sorted_indices) > 1 else 1.0
@@ -1137,7 +1291,7 @@ class RegressionConformalInterval:
     is_calibrated: bool
 
     def to_interval_string(self) -> str:
-        return f"[{self.lower_bound:.4f}, {self.upper_bound:.4f}]"
+        return _format_score_interval(self.lower_bound, self.upper_bound)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1160,7 +1314,12 @@ class RegressionConformalPredictor:
             raise ValueError("Predictions and targets length mismatch")
         if len(preds) == 0:
             raise ValueError("Cannot calibrate regression conformal predictor with 0 samples")
-        res = np.abs(preds - targets)
+        if not (bool(np.all(np.isfinite(preds))) and bool(np.all(np.isfinite(targets)))):
+            raise ValueError("Predictions and targets must be finite")
+        res = np.array(
+            [_score_abs_diff_clamped(float(p_v), float(t_v)) for p_v, t_v in zip(preds.flat, targets.flat)],
+            dtype=np.float64,
+        )
         self.residuals = np.sort(res)
         self.is_calibrated = True
 
@@ -1174,7 +1333,8 @@ class RegressionConformalPredictor:
         if not (0.0 < alpha < 1.0):
             raise ValueError(f"Significance level alpha must be in (0, 1), got {alpha}")
         y_hat = float(point_prediction)
-        val_range = self.max_value - self.min_value
+        val_range = _score_full_span_clamped(self.min_value, self.max_value)
+        half_span = _score_half_span(self.min_value, self.max_value)
         n = len(self.residuals)
 
         if not self.is_calibrated or n == 0:
@@ -1183,9 +1343,8 @@ class RegressionConformalPredictor:
                 low = self.min_value
                 high = self.max_value
             else:
-                margin = val_range * ((1.0 - alpha) / 2.0)
-                low = max(self.min_value, y_hat - margin)
-                high = min(self.max_value, y_hat + margin)
+                margin = (1.0 - alpha) * half_span
+                low, high = _score_interval_bounds(y_hat, margin, self.min_value, self.max_value)
         else:
             k = int(math.ceil((n + 1) * (1.0 - alpha)))
             if k > n:
@@ -1194,8 +1353,7 @@ class RegressionConformalPredictor:
                 high = self.max_value
             else:
                 margin = float(self.residuals[k - 1])
-                low = max(self.min_value, y_hat - margin)
-                high = min(self.max_value, y_hat + margin)
+                low, high = _score_interval_bounds(y_hat, margin, self.min_value, self.max_value)
         return RegressionConformalInterval(
             field_name=self.field_name,
             target_coverage=1.0 - alpha,
@@ -1724,7 +1882,8 @@ class AdaptiveConformalTracker:
         self.accepted_steps = 0
         self.accepted_errors = 0
         self.escalation_steps = 0
-        self._scores: List[float] = []
+        self._scores: deque[float] = deque(maxlen=max(1, self.max_window))
+        self._sorted_scores: List[float] = []
 
     def should_accept_margin(self, margin: float) -> bool:
         if self.margin_floor is None:
@@ -1765,10 +1924,20 @@ class AdaptiveConformalTracker:
 
     def push_calibration_score(self, score: float) -> np.ndarray:
         """Append a nonconformity score into the bounded sliding window and return sorted scores."""
-        self._scores.append(float(score))
-        if len(self._scores) > self.max_window:
-            self._scores = self._scores[-self.max_window :]
-        return np.sort(np.asarray(self._scores, dtype=np.float64))
+        val = float(score)
+        if self.max_window <= 0:
+            return np.array([], dtype=np.float64)
+        if len(self._scores) >= self.max_window:
+            oldest = self._scores[0]
+            rm_idx = bisect.bisect_left(self._sorted_scores, oldest)
+            if rm_idx < len(self._sorted_scores) and self._sorted_scores[rm_idx] == oldest:
+                self._sorted_scores.pop(rm_idx)
+            else:
+                self._scores.popleft()
+                self._sorted_scores = sorted(self._scores)
+        self._scores.append(val)
+        bisect.insort(self._sorted_scores, val)
+        return np.asarray(self._sorted_scores, dtype=np.float64)
 
     def rescore_calibration_window(
         self,
@@ -1778,7 +1947,7 @@ class AdaptiveConformalTracker:
         default_floor: float = 0.30,
     ) -> Tuple[np.ndarray, float]:
         """Re-score a bounded calibration window after online weight updates and ratchet margin_floor."""
-        window = list(pairs)[-self.max_window :]
+        window = list(pairs)[-self.max_window :] if self.max_window > 0 else []
         scores: List[float] = []
         err_margins: List[float] = []
         for prompt_c, label_c in window:
@@ -1786,13 +1955,14 @@ class AdaptiveConformalTracker:
             scores.append(float(nc_score))
             if not is_correct and math.isfinite(float(margin_c)):
                 err_margins.append(float(margin_c))
-        self._scores = list(scores)
+        self._scores = deque(scores, maxlen=max(1, self.max_window))
+        self._sorted_scores = sorted(self._scores)
         new_floor = (max(err_margins) + 1e-4) if err_margins else float(default_floor)
         if self.margin_floor is not None:
             self.margin_floor = max(self.margin_floor, new_floor)
         else:
             self.margin_floor = new_floor
-        return np.sort(np.asarray(self._scores, dtype=np.float64)), float(self.margin_floor)
+        return np.asarray(self._sorted_scores, dtype=np.float64), float(self.margin_floor)
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -1809,6 +1979,281 @@ class AdaptiveConformalTracker:
             "accepted_errors": self.accepted_errors,
             "escalation_steps": self.escalation_steps,
         }
+
+
+def _is_bool_scalar(val: Any) -> bool:
+    return isinstance(val, (bool, np.bool_)) or getattr(getattr(val, "dtype", None), "kind", None) == "b"
+
+
+def _validate_real_1d_vec(vec: Any, expected_len: int, label: str) -> np.ndarray:
+    if isinstance(vec, (str, bytes, bytearray, Mapping)):
+        raise ValueError(f"{label} must be a 1D numeric sequence, not {type(vec).__name__}")
+    if isinstance(vec, np.ndarray):
+        if vec.dtype == np.bool_ or vec.dtype.kind not in ("i", "u", "f"):
+            raise ValueError(f"{label} must have real numeric dtype, got {vec.dtype}")
+        if vec.ndim != 1 or vec.shape[0] != expected_len:
+            raise ValueError(f"{label} must have shape ({expected_len},), got {vec.shape}")
+        arr = np.asarray(vec, dtype=np.float64)
+    else:
+        try:
+            items = list(vec)
+        except TypeError as exc:
+            raise ValueError(f"{label} must be a 1D numeric sequence, got {type(vec).__name__}") from exc
+        if len(items) != expected_len:
+            raise ValueError(f"{label} must have length {expected_len}, got {len(items)}")
+        for v in items:
+            if _is_bool_scalar(v) or not isinstance(v, (int, float, np.integer, np.floating)):
+                raise ValueError(f"{label} entries must be real numbers, got {v!r}")
+        arr = np.asarray(items, dtype=np.float64)
+    if not bool(np.all(np.isfinite(arr))):
+        raise ValueError(f"{label} must contain only finite values")
+    return arr
+
+
+class OnlineMondrianConformal:
+    """Strictly O(1) per-class online adaptive quantile tracker in log-nonconformity space.
+
+    Uses ACI-style adaptive tracking toward long-run target coverage under
+    distribution shift rather than a static distribution-free finite-sample guarantee.
+    """
+
+    def __init__(
+        self,
+        num_classes: int,
+        alpha: float = 0.10,
+        q_init: Optional[Sequence[float]] = None,
+        gamma_aci: Optional[float] = None,
+        eta_u: float = 0.30,
+        jump_w: float = 0.12,
+    ) -> None:
+        if _is_bool_scalar(num_classes) or not isinstance(num_classes, (int, np.integer)):
+            raise ValueError(f"num_classes must be an integer >= 1, got {num_classes!r}")
+        nc = int(num_classes)
+        if nc < 1:
+            raise ValueError("num_classes must be >= 1")
+        if _is_bool_scalar(alpha) or not isinstance(alpha, (int, float, np.integer, np.floating)):
+            raise ValueError("alpha must be finite and in (0, 1)")
+        a = float(alpha)
+        if not math.isfinite(a) or not (0.0 < a < 1.0):
+            raise ValueError("alpha must be finite and in (0, 1)")
+        if gamma_aci is not None:
+            if _is_bool_scalar(gamma_aci) or not isinstance(gamma_aci, (int, float, np.integer, np.floating)):
+                raise ValueError(f"gamma_aci must be finite and positive, got {gamma_aci!r}")
+            g_aci = float(gamma_aci)
+            if not math.isfinite(g_aci) or g_aci <= 0.0:
+                raise ValueError(f"gamma_aci must be finite and positive, got {gamma_aci!r}")
+        else:
+            g_aci = max(0.03, 0.4 * a)
+        if _is_bool_scalar(eta_u) or not isinstance(eta_u, (int, float, np.integer, np.floating)):
+            raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
+        eta_val = float(eta_u)
+        if not math.isfinite(eta_val) or eta_val <= 0.0:
+            raise ValueError(f"eta_u must be finite and positive, got {eta_u!r}")
+        if _is_bool_scalar(jump_w) or not isinstance(jump_w, (int, float, np.integer, np.floating)):
+            raise ValueError(f"jump_w must be finite and in [0, 1], got {jump_w!r}")
+        jump_val = float(jump_w)
+        if not math.isfinite(jump_val) or not (0.0 <= jump_val <= 1.0):
+            raise ValueError(f"jump_w must be finite and in [0, 1], got {jump_w!r}")
+        self.num_classes = nc
+        self.alpha_target = a
+        self.gamma_aci = g_aci
+        self.eta_u = eta_val
+        self.jump_w = jump_val
+        if q_init is not None:
+            q0 = _validate_real_1d_vec(q_init, self.num_classes, "q_init")
+        else:
+            q0 = np.full(self.num_classes, 0.5, dtype=np.float64)
+        self.u_max = 16.0
+        self.q_c = np.clip(q0.copy(), 0.0, 1.0)
+        self.u_c = np.where(
+            self.q_c >= 1.0 - math.exp(-(self.u_max - 1e-6)),
+            self.u_max,
+            np.maximum(0.0, -np.log(np.clip(1.0 - self.q_c, 1e-12, 1.0))),
+        )
+        self.alpha_c = np.full(self.num_classes, a, dtype=np.float64)
+        self.err_ewma = np.full(self.num_classes, a, dtype=np.float64)
+        self.alpha_min = max(0.015, 0.35 * a)
+        self.alpha_max = min(0.40, 2.5 * a)
+        self.steps = 0
+
+    def thresholds(self) -> np.ndarray:
+        """Return per-class nonconformity score thresholds in [0, 1]."""
+        return self.q_c
+
+    def update(
+        self,
+        y: int,
+        score_y: Optional[float] = None,
+        err_y: Optional[int] = None,
+        *,
+        probs: Optional[Sequence[float]] = None,
+    ) -> None:
+        """O(1) update after observing true class y and either (score_y, err_y) or probs."""
+        if _is_bool_scalar(y) or not isinstance(y, (int, np.integer)):
+            raise ValueError(f"Class index y must be an integer, got {y!r}")
+        cls_idx = int(y)
+        if cls_idx < 0 or cls_idx >= self.num_classes:
+            raise IndexError(f"Class index {cls_idx} out of range [0, {self.num_classes})")
+        err_int: Optional[int] = None
+        if err_y is not None:
+            if _is_bool_scalar(err_y) or not isinstance(err_y, (int, np.integer)):
+                raise ValueError(f"err_y must be 0 or 1 (non-boolean integer), got {err_y!r}")
+            err_int = int(err_y)
+            if err_int not in (0, 1):
+                raise ValueError(f"err_y must be 0 or 1, got {err_y!r}")
+        if probs is not None:
+            p_arr = self._validate_probs(probs)
+            if score_y is None:
+                s_val = 1.0 - float(p_arr[cls_idx])
+            else:
+                if _is_bool_scalar(score_y) or not isinstance(score_y, (int, float, np.integer, np.floating)):
+                    raise ValueError(f"score_y must be finite in [0, 1], got {score_y!r}")
+                s_val = float(score_y)
+        else:
+            if score_y is None:
+                raise ValueError("Either score_y or probs must be provided to update()")
+            if _is_bool_scalar(score_y) or not isinstance(score_y, (int, float, np.integer, np.floating)):
+                raise ValueError(f"score_y must be finite in [0, 1], got {score_y!r}")
+            s_val = float(score_y)
+        if not math.isfinite(s_val) or s_val < -1e-9 or s_val > 1.0 + 1e-9:
+            raise ValueError(f"Nonconformity score {s_val!r} must be finite in [0, 1]")
+        s_val = min(1.0, max(0.0, s_val))
+        e_flag = (1 if s_val > float(self.q_c[cls_idx]) else 0) if err_int is None else err_int
+
+        s_clip = s_val if s_val < 1.0 - 1e-7 else (1.0 - 1e-7)
+        u_obs = -math.log(max(1.0 - s_clip, 1e-7))
+        if u_obs > self.u_max:
+            u_obs = self.u_max
+        fe = 1.0 if e_flag else 0.0
+        self.err_ewma[cls_idx] = 0.85 * self.err_ewma[cls_idx] + 0.15 * fe
+        shift = self.err_ewma[cls_idx] > 1.6 * self.alpha_target
+        boost = 1.6 if shift else 1.0
+        a_next = self.alpha_c[cls_idx] + self.gamma_aci * boost * (self.alpha_target - fe)
+        if a_next < self.alpha_min:
+            a_next = self.alpha_min
+        elif a_next > self.alpha_max:
+            a_next = self.alpha_max
+        self.alpha_c[cls_idx] = a_next
+        u_next = self.u_c[cls_idx] + self.eta_u * boost * (fe - a_next)
+        if e_flag and shift:
+            jump_cap = max(0.01, self.u_max - 0.5)
+            u_jump = (1.0 - self.jump_w) * self.u_c[cls_idx] + self.jump_w * min(u_obs, jump_cap)
+            if u_jump > u_next:
+                u_next = u_jump
+        if u_next < 0.01:
+            u_next = 0.01
+        elif u_next > self.u_max:
+            u_next = self.u_max
+        self.u_c[cls_idx] = u_next
+        self.q_c[cls_idx] = 1.0 if u_next >= self.u_max - 1e-6 else (1.0 - math.exp(-u_next))
+        self.steps += 1
+
+    def _validate_probs(self, probs: Sequence[float]) -> np.ndarray:
+        """Validate 1D finite probability vector in [0.0, 1.0] (rejecting bool/str/object)."""
+        p_arr = _validate_real_1d_vec(probs, self.num_classes, "probs")
+        if not bool(np.all((p_arr >= 0.0) & (p_arr <= 1.0))):
+            raise ValueError("probs entries must lie in [0.0, 1.0]")
+        return p_arr
+
+    def predict_set(self, probs: Sequence[float]) -> List[int]:
+        """Return class indices whose nonconformity score (1 - p_k) <= q_c[k]."""
+        p_arr = self._validate_probs(probs)
+        scores = 1.0 - p_arr
+        return [k for k in range(self.num_classes) if float(scores[k]) <= float(self.q_c[k]) + 1e-12]
+
+    def should_accept(self, probs: Sequence[float]) -> bool:
+        """Accept locally when the Mondrian prediction set is a singleton."""
+        return len(self.predict_set(probs)) == 1
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "num_classes": self.num_classes,
+            "alpha_target": self.alpha_target,
+            "gamma_aci": self.gamma_aci,
+            "eta_u": self.eta_u,
+            "jump_w": self.jump_w,
+            "q_c": [float(v) for v in self.q_c],
+            "u_c": [float(v) for v in self.u_c],
+            "alpha_c": [float(v) for v in self.alpha_c],
+            "err_ewma": [float(v) for v in self.err_ewma],
+            "steps": self.steps,
+        }
+
+    @classmethod
+    def from_state_dict(cls, data: Mapping[str, Any]) -> "OnlineMondrianConformal":
+        if not isinstance(data, Mapping):
+            raise ValueError("OnlineMondrianConformal state must be a mapping")
+        if "num_classes" not in data or "alpha_target" not in data:
+            raise ValueError("OnlineMondrianConformal state requires 'num_classes' and 'alpha_target'")
+        if "gamma_aci" in data:
+            gamma_val = data["gamma_aci"]
+            if gamma_val is None:
+                raise ValueError("gamma_aci cannot be None when explicitly present in state_dict")
+        else:
+            gamma_val = None
+        if "eta_u" in data:
+            eta_val = data["eta_u"]
+            if eta_val is None:
+                raise ValueError("eta_u cannot be None when explicitly present in state_dict")
+        else:
+            eta_val = 0.30
+        if "jump_w" in data:
+            jump_val = data["jump_w"]
+            if jump_val is None:
+                raise ValueError("jump_w cannot be None when explicitly present in state_dict")
+        else:
+            jump_val = 0.12
+        obj = cls(
+            num_classes=data["num_classes"],
+            alpha=data["alpha_target"],
+            q_init=None,
+            gamma_aci=gamma_val,
+            eta_u=eta_val,
+            jump_w=jump_val,
+        )
+        if "q_c" in data and data["q_c"] is not None:
+            q_arr = _validate_real_1d_vec(data["q_c"], obj.num_classes, "q_c").copy()
+            if float(np.min(q_arr)) < 0.0 or float(np.max(q_arr)) > 1.0:
+                raise ValueError("q_c values must lie in [0.0, 1.0]")
+            obj.q_c = q_arr
+        if "u_c" in data and data["u_c"] is not None:
+            u_arr = _validate_real_1d_vec(data["u_c"], obj.num_classes, "u_c").copy()
+            if float(np.min(u_arr)) < 0.0 or float(np.max(u_arr)) > obj.u_max:
+                raise ValueError(f"u_c values must lie in [0.0, {obj.u_max}]")
+            obj.u_c = u_arr
+        else:
+            obj.u_c = np.where(
+                obj.q_c >= 1.0 - math.exp(-(obj.u_max - 1e-6)),
+                obj.u_max,
+                -np.log(np.clip(1.0 - obj.q_c, 1e-12, 1.0)),
+            )
+        if "alpha_c" in data and data["alpha_c"] is not None:
+            a_arr = _validate_real_1d_vec(data["alpha_c"], obj.num_classes, "alpha_c").copy()
+            if float(np.min(a_arr)) <= 0.0 or float(np.max(a_arr)) >= 1.0:
+                raise ValueError("alpha_c values must lie in (0.0, 1.0)")
+            obj.alpha_c = a_arr
+        if "err_ewma" in data and data["err_ewma"] is not None:
+            e_arr = _validate_real_1d_vec(data["err_ewma"], obj.num_classes, "err_ewma").copy()
+            if float(np.min(e_arr)) < 0.0 or float(np.max(e_arr)) > 1.0:
+                raise ValueError("err_ewma values must lie in [0.0, 1.0]")
+            obj.err_ewma = e_arr
+        raw_steps = data.get("steps", 0)
+        if _is_bool_scalar(raw_steps):
+            raise ValueError(f"steps must be a nonnegative integer, got {raw_steps!r}")
+        if isinstance(raw_steps, (int, np.integer)):
+            steps = int(raw_steps)
+        elif (
+            isinstance(raw_steps, (float, np.floating))
+            and math.isfinite(float(raw_steps))
+            and float(raw_steps).is_integer()
+        ):
+            steps = int(raw_steps)
+        else:
+            raise ValueError(f"steps must be a nonnegative integer, got {raw_steps!r}")
+        if steps < 0:
+            raise ValueError(f"steps must be nonnegative, got {steps}")
+        obj.steps = steps
+        return obj
 
 
 VALID_MONITOR_MODES = (
@@ -2330,15 +2775,1445 @@ class SequentialRiskMonitor:
         return out
 
 
+# ---------------------------------------------------------------------------
+# Wave 3: Pure-NumPy Decision Utility, Ordinal Calibration & Platt/Beta Head
+# ---------------------------------------------------------------------------
+
+
+def _expit_np(x: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
+    """Numerically bounded pure-NumPy logistic sigmoid."""
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        arr = np.asarray(x, dtype=np.float64)
+        nan_mask = np.isnan(arr)
+        arr_safe = np.where(nan_mask, 0.0, arr)
+        clipped = np.clip(arr_safe, -60.0, 60.0)
+        out = np.where(nan_mask, np.nan, 1.0 / (1.0 + np.exp(-clipped)))
+    if np.ndim(x) == 0:
+        return float(out)
+    return out
+
+
+def _softmax_np(logits: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically stable pure-NumPy softmax failing closed with NaN on non-finite slices."""
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        arr = np.asarray(logits, dtype=np.float64)
+        if arr.size == 0:
+            return arr.copy()
+        slice_ok = np.all(np.isfinite(arr), axis=axis, keepdims=True)
+        arr_safe = np.where(slice_ok, arr, 0.0)
+        shifted = arr_safe - np.max(arr_safe, axis=axis, keepdims=True)
+        exps = np.exp(np.clip(shifted, -60.0, 60.0))
+        denom = np.maximum(np.sum(exps, axis=axis, keepdims=True), 1e-12)
+        out = exps / denom
+        return np.where(slice_ok, out, np.nan)
+
+
+def _safe_l2_norm(v: np.ndarray) -> float:
+    """Compute overflow-safe Euclidean norm of a finite 1D vector via max-abs scaling."""
+    v64 = np.asarray(v, dtype=np.float64).ravel()
+    if v64.size == 0:
+        return 0.0
+    if not bool(np.all(np.isfinite(v64))):
+        return float("nan")
+    scale = float(np.max(np.abs(v64)))
+    if scale == 0.0:
+        return 0.0
+    with np.errstate(over="ignore", under="ignore"):
+        return float(scale * np.linalg.norm(v64 / scale))
+
+
+def _minimize_lbfgs_np(
+    fun: Callable[[np.ndarray], Tuple[float, np.ndarray]],
+    x0: np.ndarray,
+    *,
+    bounds: Optional[Sequence[Tuple[Optional[float], Optional[float]]]] = None,
+    maxiter: int = 250,
+    gtol: float = 1e-6,
+    ftol: float = 1e-12,
+    m: int = 10,
+) -> Tuple[np.ndarray, float, int]:
+    """Pure-NumPy box-projected L-BFGS optimizer with Armijo backtracking line search."""
+    x = np.asarray(x0, dtype=np.float64).copy().ravel()
+    n = x.size
+    if bounds is not None:
+        if len(bounds) != n:
+            raise ValueError(f"Expected {n} bounds entries, got {len(bounds)}")
+        lb = np.array([-np.inf if lo is None else float(lo) for lo, _ in bounds], dtype=np.float64)
+        ub = np.array([np.inf if hi is None else float(hi) for _, hi in bounds], dtype=np.float64)
+    else:
+        lb = np.full(n, -np.inf, dtype=np.float64)
+        ub = np.full(n, np.inf, dtype=np.float64)
+
+    x = np.clip(x, lb, ub)
+    f_raw, g_raw = fun(x)
+    f = float(f_raw)
+    g = np.asarray(g_raw, dtype=np.float64).ravel()
+    if not math.isfinite(f) or not bool(np.all(np.isfinite(g))):
+        raise ValueError("Initial optimization objective or gradient is non-finite")
+
+    def _project_grad(xv: np.ndarray, gv: np.ndarray) -> np.ndarray:
+        pg = gv.copy()
+        pg[(xv <= lb + 1e-12) & (gv > 0.0)] = 0.0
+        pg[(xv >= ub - 1e-12) & (gv < 0.0)] = 0.0
+        return pg
+
+    history: List[Tuple[np.ndarray, np.ndarray, float]] = []
+    iters = 0
+    for iters in range(1, max(1, int(maxiter)) + 1):
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            pg = _project_grad(x, g)
+            if pg.size == 0 or float(np.max(np.abs(pg))) <= gtol:
+                break
+
+            # Two-loop L-BFGS search direction on projected gradient.
+            q = pg.copy()
+            alphas = [0.0] * len(history)
+            for idx in range(len(history) - 1, -1, -1):
+                s_i, y_i, rho_i = history[idx]
+                alpha_i = rho_i * float(np.dot(s_i, q))
+                alphas[idx] = alpha_i
+                q = q - alpha_i * y_i
+
+            if history:
+                s_last, y_last, _ = history[-1]
+                yy = float(np.dot(y_last, y_last))
+                sy_last = float(np.dot(s_last, y_last))
+                if math.isfinite(yy) and math.isfinite(sy_last) and sy_last > 0.0:
+                    gamma = max(min(sy_last / max(yy, 1e-12), 1e6), 1e-6)
+                else:
+                    gamma = 1.0
+            else:
+                gamma = 1.0
+
+            r = gamma * q
+            for idx, (s_i, y_i, rho_i) in enumerate(history):
+                beta_i = rho_i * float(np.dot(y_i, r))
+                r = r + s_i * (alphas[idx] - beta_i)
+
+            d = -r
+            d[(x <= lb + 1e-12) & (d < 0.0)] = 0.0
+            d[(x >= ub - 1e-12) & (d > 0.0)] = 0.0
+            g_norm = _safe_l2_norm(g)
+            gd = float(np.dot(g, d))
+            if (
+                not bool(np.all(np.isfinite(d)))
+                or math.isnan(gd)
+                or (
+                    math.isfinite(gd)
+                    and (not math.isfinite(g_norm) or gd >= -1e-14 * max(1.0, g_norm))
+                )
+            ):
+                d = -pg
+                history.clear()
+
+            step = 1.0
+            accepted = False
+            x_next = x
+            f_next = f
+            g_next = g
+            for _ in range(36):
+                cand = np.clip(x + step * d, lb, ub)
+                if not bool(np.all(np.isfinite(cand))):
+                    step *= 0.5
+                    continue
+                delta_x = cand - x
+                slope = float(np.dot(g, delta_x))
+                if math.isnan(slope) or slope >= 0.0:
+                    step *= 0.5
+                    continue
+                cand_f, cand_g = fun(cand)
+                cand_f_f = float(cand_f)
+                cand_g_arr = np.asarray(cand_g, dtype=np.float64).ravel()
+                armijo_ok = (
+                    cand_f_f < f
+                    if slope == -math.inf
+                    else cand_f_f <= f + 1e-4 * slope
+                )
+                if (
+                    math.isfinite(cand_f_f)
+                    and bool(np.all(np.isfinite(cand_g_arr)))
+                    and armijo_ok
+                ):
+                    x_next = cand
+                    f_next = cand_f_f
+                    g_next = cand_g_arr
+                    accepted = True
+                    break
+                step *= 0.5
+
+            if not accepted:
+                if history:
+                    history.clear()
+                    continue
+                break
+
+            s_vec = x_next - x
+            y_vec = g_next - g
+            rel_f = abs(f - f_next) / max(1.0, abs(f))
+            x, f, g = x_next, f_next, g_next
+            if rel_f <= ftol and float(np.max(np.abs(s_vec))) <= 1e-11:
+                break
+
+            if bool(np.all(np.isfinite(s_vec))) and bool(np.all(np.isfinite(y_vec))):
+                sy = float(np.dot(s_vec, y_vec))
+                ss = float(np.dot(s_vec, s_vec))
+                if math.isfinite(sy) and math.isfinite(ss) and sy > 1e-10 * max(ss, 1e-12):
+                    inv_sy = 1.0 / sy
+                    if math.isfinite(inv_sy):
+                        history.append((s_vec, y_vec, inv_sy))
+                        if len(history) > m:
+                            history.pop(0)
+
+    return x, f, iters
+
+
+def should_use_soft_ordinal(n_classes: int) -> bool:
+    """Return True when soft ordinal heads apply (small ordinal schemas 2 <= K <= 5)."""
+    return 2 <= int(n_classes) <= 5
+
+
+class UtilityCalibrator:
+    """Bayes expected-cost decision rule + Conformal Risk Control (CRC) gating.
+
+    Uses pure-NumPy temperature scaling and finite-sample CRC calibration over an
+    ``(A, K)`` cost matrix ``C[action, true_class]``. When finite-sample data
+    cannot certify non-vacuous excess-risk control, ``lam_crc`` is set to
+    ``-1.0``, ``is_vacuous`` is True, and ``predict`` falls back to ``safe_action``.
+    """
+
+    def __init__(
+        self,
+        cost_matrix: Any,
+        *,
+        safe_action: Optional[int] = None,
+        alpha: float = 0.05,
+        loss_mode: str = "normalized_excess",
+        fit_temperature: bool = False,
+        temperature: float = 1.0,
+        ladder_mode: bool = False,
+    ) -> None:
+        matrix = _coerce_real_numeric_array(cost_matrix, name="cost_matrix")
+        if matrix.ndim != 2 or matrix.shape[0] < 1 or matrix.shape[1] < 2:
+            raise ValueError(
+                f"cost_matrix must be 2D (n_actions >= 1, n_classes >= 2), got shape {matrix.shape}"
+            )
+        if not bool(np.all(np.isfinite(matrix))):
+            raise ValueError("cost_matrix must contain only finite values")
+        if _is_bool_scalar(alpha) or not isinstance(alpha, (int, float, np.integer, np.floating)):
+            raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+        alpha_f = float(alpha)
+        if not math.isfinite(alpha_f) or not (0.0 < alpha_f < 1.0):
+            raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+        if loss_mode not in {"normalized_excess", "indicator"}:
+            raise ValueError(f"Unsupported loss_mode {loss_mode!r}")
+        if _is_bool_scalar(temperature) or not isinstance(
+            temperature, (int, float, np.integer, np.floating)
+        ):
+            raise ValueError(f"temperature must be finite and positive, got {temperature!r}")
+        temp_f = float(temperature)
+        if not math.isfinite(temp_f) or temp_f <= 0.0:
+            raise ValueError(f"temperature must be finite and positive, got {temperature!r}")
+
+        self.cost_matrix = matrix
+        self.n_actions, self.n_classes = matrix.shape
+        if safe_action is None:
+            self.safe_action = int(np.argmin(np.max(matrix, axis=1)))
+        else:
+            if _is_bool_scalar(safe_action) or not isinstance(safe_action, (int, np.integer)):
+                raise ValueError(f"safe_action must be an integer, got {safe_action!r}")
+            sa_i = int(safe_action)
+            if not (0 <= sa_i < self.n_actions):
+                raise ValueError(f"safe_action {safe_action} out of range [0, {self.n_actions})")
+            self.safe_action = sa_i
+        self.alpha = alpha_f
+        self.loss_mode = loss_mode
+        self.fit_temperature = bool(fit_temperature)
+        self.temperature = max(1e-3, temp_f)
+        self.ladder_mode = bool(ladder_mode)
+
+        c_scale = float(np.max(np.abs(self.cost_matrix)))
+        self._cost_scale: float = c_scale
+        self._scaled_cost_matrix: np.ndarray = (
+            (self.cost_matrix / c_scale)
+            if c_scale > 0.0
+            else np.zeros_like(self.cost_matrix, dtype=np.float64)
+        )
+        if 0.0 < c_scale < 1.0:
+            _, exp_c = math.frexp(c_scale)
+            self._upscaled_cost_matrix: Optional[np.ndarray] = np.ldexp(
+                self.cost_matrix,
+                1 - exp_c,
+            )
+        else:
+            self._upscaled_cost_matrix = None
+        eval_cost_mat = (
+            self._upscaled_cost_matrix
+            if self._upscaled_cost_matrix is not None
+            else self.cost_matrix
+        )
+        self._abs_eval_cost_matrix: np.ndarray = np.abs(eval_cost_mat)
+        self._abs_cost_matrix: np.ndarray = np.abs(self.cost_matrix)
+        self._exact_cost_rows: Optional[List[Tuple[Fraction, ...]]] = None
+        self.c_esc = float(np.max(self.cost_matrix[self.safe_action]))
+        self.B = float(np.max(self.cost_matrix))
+        self._c_esc_scaled: float = float(np.max(self._scaled_cost_matrix[self.safe_action]))
+        with np.errstate(over="ignore", invalid="ignore"):
+            raw_span = self.B - self.c_esc
+        self.denom = (
+            float(raw_span)
+            if (math.isfinite(raw_span) and raw_span > 1e-9)
+            else (float("inf") if not math.isfinite(raw_span) else max(1e-9, float(raw_span)))
+        )
+        self.L = np.zeros_like(self.cost_matrix, dtype=np.float64)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            pos_mask = self.cost_matrix > self.c_esc
+            if math.isfinite(raw_span):
+                if raw_span > 0.0 and bool(np.any(pos_mask)):
+                    self.L[pos_mask] = np.clip(
+                        (self.cost_matrix[pos_mask] - self.c_esc) / raw_span,
+                        0.0,
+                        1.0,
+                    )
+            else:
+                span_scale = max(abs(self.B), abs(self.c_esc))
+                if span_scale > 0.0 and bool(np.any(pos_mask)):
+                    c_sp = self.cost_matrix / span_scale
+                    esc_sp = self.c_esc / span_scale
+                    denom_sp = (self.B / span_scale) - esc_sp
+                    if math.isfinite(denom_sp) and denom_sp > 0.0:
+                        self.L[pos_mask] = np.clip(
+                            (c_sp[pos_mask] - esc_sp) / denom_sp,
+                            0.0,
+                            1.0,
+                        )
+        self._indicator_loss_matrix: np.ndarray = (self.cost_matrix > self.c_esc).astype(np.float64)
+
+        self.lam_crc: float = -1.0
+        self._is_fitted: bool = False
+
+    @staticmethod
+    def _valid_prob_rows(p2: np.ndarray) -> np.ndarray:
+        if p2.size == 0:
+            return np.zeros(p2.shape[0], dtype=bool)
+        with np.errstate(over="ignore", invalid="ignore"):
+            fin = np.all(np.isfinite(p2), axis=1)
+            nonneg = np.all(p2 >= -1e-9, axis=1)
+            safe_p = np.where(fin[:, None], p2, 0.0)
+            rmax = np.max(np.abs(safe_p), axis=1, keepdims=True)
+            safe_m = np.where(rmax > 0.0, rmax, 1.0)
+            pos_sum = (rmax[:, 0] > 0.0) & (np.sum(safe_p / safe_m, axis=1) > 0.0)
+        return fin & nonneg & pos_sum
+
+    @staticmethod
+    def _normalize_prob_rows(p_rows: np.ndarray) -> np.ndarray:
+        if p_rows.size == 0:
+            return p_rows
+        with np.errstate(over="ignore", invalid="ignore"):
+            raw_sums = np.sum(p_rows, axis=1, keepdims=True)
+            already_unit = np.isfinite(raw_sums) & (np.abs(raw_sums - 1.0) <= 1e-9)
+            rmax = np.max(np.abs(p_rows), axis=1, keepdims=True)
+            safe_m = np.where(rmax > 0.0, rmax, 1.0)
+            scaled = p_rows / safe_m
+            scaled_sums = np.sum(scaled, axis=1, keepdims=True)
+            normed = scaled / np.where(scaled_sums > 0.0, scaled_sums, 1.0)
+            return np.where(already_unit, p_rows, normed)
+
+    def _validate_cal_labels(self, y_raw: Any, n_rows: int) -> np.ndarray:
+        if isinstance(y_raw, (str, bytes, bytearray, memoryview, Mapping, set, frozenset)):
+            raise ValueError("Labels must be a 1D array of integer class indices")
+        if not isinstance(y_raw, np.ndarray) and _contains_bool_element(y_raw):
+            raise ValueError("Labels must have integer dtype, not boolean")
+        y_np = np.asarray(y_raw)
+        if y_np.ndim != 1:
+            raise ValueError(f"Labels must be a 1D array of integer class indices, got shape {y_np.shape}")
+        if y_np.dtype == np.dtype(np.object_):
+            out_vals: List[int] = []
+            for v in y_np.flat:
+                if isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, np.integer)):
+                    raise ValueError(f"Labels must have integer dtype, got element {type(v).__name__}")
+                iv = int(v)
+                if iv < -9223372036854775808 or iv > 9223372036854775807:
+                    raise ValueError(f"Label integer index out of int64 bounds: {iv}")
+                out_vals.append(iv)
+            y_arr = np.asarray(out_vals, dtype=np.int64).ravel()
+        else:
+            if y_np.dtype == np.dtype(np.bool_) or y_np.dtype.kind not in ("i", "u"):
+                raise ValueError(f"Labels must have integer dtype, got {y_np.dtype}")
+            if (
+                y_np.dtype == np.dtype(np.uint64)
+                and y_np.size > 0
+                and bool(np.any(y_np > np.uint64(np.iinfo(np.int64).max)))
+            ):
+                raise ValueError("Label integer indices exceed int64 bounds")
+            y_arr = y_np.astype(np.int64, copy=False).ravel()
+        if y_arr.size > 0 and (int(np.min(y_arr)) < 0 or int(np.max(y_arr)) >= self.n_classes):
+            raise ValueError(f"Labels must lie in [0, {self.n_classes}), got [{int(np.min(y_arr))}, {int(np.max(y_arr))}]")
+        return y_arr
+
+    @property
+    def is_vacuous(self) -> bool:
+        """True when CRC has no certified non-safe threshold (lam_crc < 0)."""
+        return (not self._is_fitted) or (self.lam_crc < 0.0)
+
+    def _fit_temperature(self, probs: np.ndarray, y: np.ndarray) -> float:
+        p_norm = self._normalize_prob_rows(probs)
+        logits = np.log(np.clip(p_norm, 1e-12, 1.0))
+        n = logits.shape[0]
+        rows = np.arange(n)
+        y_onehot = np.zeros_like(logits)
+        y_onehot[rows, y] = 1.0
+
+        def _obj(params: np.ndarray) -> Tuple[float, np.ndarray]:
+            beta = float(params[0])
+            inv_t = math.exp(beta)
+            scaled = inv_t * logits
+            shifted = scaled - np.max(scaled, axis=1, keepdims=True)
+            exps = np.exp(np.clip(shifted, -60.0, 60.0))
+            denom = np.sum(exps, axis=1, keepdims=True)
+            log_p = shifted - np.log(np.maximum(denom, 1e-12))
+            p = exps / np.maximum(denom, 1e-12)
+            nll = -float(np.mean(log_p[rows, y])) + 0.5 * 1e-4 * (beta ** 2)
+            d_inv_t = float(np.mean(np.sum((p - y_onehot) * logits, axis=1)))
+            grad_beta = inv_t * d_inv_t + 1e-4 * beta
+            return nll, np.array([grad_beta], dtype=np.float64)
+
+        opt, _, _ = _minimize_lbfgs_np(
+            _obj,
+            np.array([0.0], dtype=np.float64),
+            bounds=[(math.log(0.1), math.log(10.0))],
+            maxiter=80,
+        )
+        return float(1.0 / math.exp(float(opt[0])))
+
+    def transform_probs(self, probs: np.ndarray) -> np.ndarray:
+        """Apply learned temperature scaling when ``temperature != 1.0``."""
+        p = _coerce_real_numeric_array(probs, name="probs")
+        single = p.ndim == 1
+        p2 = p.reshape(1, -1) if single else p
+        if p2.ndim != 2 or p2.shape[1] != self.n_classes:
+            raise ValueError(f"Expected {self.n_classes} classes, got shape {p.shape}")
+        valid = self._valid_prob_rows(p2)
+        scaled = np.full(p2.shape, np.nan, dtype=np.float64)
+        if bool(np.any(valid)):
+            p_ok = self._normalize_prob_rows(p2[valid])
+            if not math.isfinite(self.temperature) or self.temperature <= 0.0:
+                return scaled[0] if single else scaled
+            if abs(self.temperature - 1.0) <= 1e-12:
+                scaled[valid] = p_ok
+            else:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    logits = np.log(np.clip(p_ok, 1e-12, 1.0))
+                    s_ok = _softmax_np(logits / max(self.temperature, 1e-3), axis=1)
+                s_fin = np.all(np.isfinite(s_ok), axis=1)
+                if bool(np.any(s_fin)):
+                    v_idx = np.flatnonzero(valid)[s_fin]
+                    scaled[v_idx] = s_ok[s_fin]
+        return scaled[0] if single else scaled
+
+    def expected_costs(self, probs: np.ndarray, *, apply_temperature: bool = True) -> np.ndarray:
+        """Return expected cost matrix product ``probs @ C.T`` of shape ``(..., A)``."""
+        p = (
+            self.transform_probs(probs)
+            if apply_temperature
+            else _coerce_real_numeric_array(probs, name="probs")
+        )
+        single = p.ndim == 1
+        p2 = p.reshape(1, -1) if single else p
+        if p2.ndim != 2 or p2.shape[1] != self.n_classes:
+            raise ValueError(f"Expected {self.n_classes} classes, got shape {p.shape}")
+        valid = self._valid_prob_rows(p2)
+        costs = np.full((p2.shape[0], self.n_actions), np.nan, dtype=np.float64)
+        if bool(np.any(valid)):
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                p_ok = self._normalize_prob_rows(p2[valid])
+                c_ok = p_ok @ self.cost_matrix.T
+                cond_ok = p_ok @ self._abs_cost_matrix.T
+            gamma_ec = (float(self.n_classes) + 2.0) * float(np.finfo(np.float64).eps)
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                need_exact = ~np.isfinite(c_ok) | (
+                    (cond_ok > 0.0) & (np.abs(c_ok) <= 1024.0 * gamma_ec * cond_ok)
+                )
+            bad_ec_rows = np.flatnonzero(np.any(need_exact, axis=1))
+            if bad_ec_rows.size > 0:
+                if self._exact_cost_rows is None:
+                    self._exact_cost_rows = [
+                        tuple(Fraction(float(val)) for val in row)
+                        for row in self.cost_matrix
+                    ]
+                for r_i in bad_ec_rows:
+                    p_fracs = tuple(Fraction(float(pv)) for pv in p_ok[r_i])
+                    for a_i in range(self.n_actions):
+                        tot = sum(
+                            (p_f * c_f for p_f, c_f in zip(p_fracs, self._exact_cost_rows[a_i]) if p_f != 0),
+                            Fraction(0),
+                        )
+                        try:
+                            val_f = float(tot)
+                        except OverflowError:
+                            val_f = float("nan")
+                        c_ok[r_i, a_i] = val_f if math.isfinite(val_f) else float("nan")
+            c_fin = np.all(np.isfinite(c_ok), axis=1)
+            if bool(np.any(c_fin)):
+                v_idx = np.flatnonzero(valid)[c_fin]
+                costs[v_idx] = c_ok[c_fin]
+        return costs[0] if single else costs
+
+    def _expected_policy_costs(self, p_norm: np.ndarray) -> np.ndarray:
+        """Evaluate expected costs using raw or power-of-two upscaled costs, falling back per-row to scaled costs."""
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            costs = p_norm @ self.cost_matrix.T
+            if self._upscaled_cost_matrix is not None:
+                costs = p_norm @ self._upscaled_cost_matrix.T
+            bad_rows = ~np.all(np.isfinite(costs), axis=1)
+            if bool(np.any(bad_rows)):
+                costs[bad_rows] = p_norm[bad_rows] @ self._scaled_cost_matrix.T
+        return costs
+
+    def _select_bayes_actions(self, p_norm: np.ndarray, costs: np.ndarray) -> np.ndarray:
+        """Select Bayes-optimal actions with exact Fraction tie-breaking on floating-point ties."""
+        a_bayes = np.argmin(costs, axis=1).astype(np.int64)
+        if self.n_actions <= 1 or p_norm.shape[0] == 0:
+            return a_bayes
+        row_idx = np.arange(costs.shape[0])
+        row_mins = costs[row_idx, a_bayes][:, None]
+        gamma = (float(self.n_classes) + 2.0) * float(np.finfo(np.float64).eps)
+        subnorm_tol = float(self.n_classes) * float(np.finfo(np.float64).tiny)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            cond_abs = p_norm @ self._abs_eval_cost_matrix.T
+            err_bound = gamma * cond_abs + subnorm_tol
+            pair_tol = err_bound + err_bound[row_idx, a_bayes][:, None]
+            diff = costs - row_mins
+            tie_mask = (
+                (costs == row_mins)
+                | (~np.isfinite(pair_tol))
+                | (~np.isfinite(diff))
+                | (diff <= pair_tol)
+            )
+        tie_rows = np.flatnonzero(np.sum(tie_mask, axis=1) > 1)
+        if tie_rows.size == 0:
+            return a_bayes
+        if self._exact_cost_rows is None:
+            self._exact_cost_rows = [
+                tuple(Fraction(float(val)) for val in row)
+                for row in self.cost_matrix
+            ]
+        memo: Dict[Tuple[bytes, Tuple[int, ...]], int] = {}
+        for r_i in tie_rows:
+            cands = np.flatnonzero(tie_mask[r_i])
+            cands_tup = tuple(int(c) for c in cands)
+            if bool(np.all(self.cost_matrix[cands] == self.cost_matrix[cands[0]])):
+                a_bayes[r_i] = cands_tup[0]
+                continue
+            p_bytes = np.ascontiguousarray(p_norm[r_i], dtype=np.float64).tobytes()
+            m_key = (p_bytes, cands_tup)
+            cached = memo.get(m_key)
+            if cached is not None:
+                a_bayes[r_i] = cached
+                continue
+            p_fracs = tuple(Fraction(float(pv)) for pv in p_norm[r_i])
+            best_act = cands_tup[0]
+            best_val: Optional[Fraction] = None
+            for ca in cands_tup:
+                row_fracs = self._exact_cost_rows[ca]
+                tot = sum((p_f * c_f for p_f, c_f in zip(p_fracs, row_fracs) if p_f != 0), Fraction(0))
+                if best_val is None or tot < best_val:
+                    best_val = tot
+                    best_act = ca
+            memo[m_key] = best_act
+            a_bayes[r_i] = best_act
+        return a_bayes
+
+    def _apply_policy(self, probs_2d: np.ndarray, lam: float) -> np.ndarray:
+        n = probs_2d.shape[0]
+        acts = np.full(n, self.safe_action, dtype=np.int64)
+        if not math.isfinite(float(lam)) or lam < 0.0 or n == 0:
+            return acts
+        valid = self._valid_prob_rows(probs_2d)
+        if not bool(np.any(valid)):
+            return acts
+        v_idx = np.flatnonzero(valid)
+        policy_loss = self._indicator_loss_matrix if self.loss_mode == "indicator" else self.L
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            p_norm = self._normalize_prob_rows(probs_2d[v_idx])
+            costs_v = self._expected_policy_costs(p_norm)
+            eh_v = p_norm @ policy_loss.T
+        row_fin = np.all(np.isfinite(costs_v), axis=1) & np.all(np.isfinite(eh_v), axis=1)
+        if not bool(np.any(row_fin)):
+            return acts
+        v_idx = v_idx[row_fin]
+        p_norm = p_norm[row_fin]
+        costs_v = costs_v[row_fin]
+        eh_v = eh_v[row_fin]
+        a_bayes = self._select_bayes_actions(p_norm, costs_v)
+        if self.ladder_mode:
+            for pos, orig_i in enumerate(v_idx):
+                ab = int(a_bayes[pos])
+                if ab <= self.safe_action:
+                    chosen = self.safe_action
+                    for cand in range(ab, self.safe_action + 1):
+                        if cand == self.safe_action or float(eh_v[pos, cand]) <= lam + 1e-12:
+                            chosen = cand
+                            break
+                    acts[orig_i] = chosen
+                else:
+                    acts[orig_i] = ab if float(eh_v[pos, ab]) <= lam + 1e-12 else self.safe_action
+            return acts
+        eh_best = eh_v[np.arange(len(v_idx)), a_bayes]
+        acts[v_idx] = np.where(eh_best <= lam + 1e-12, a_bayes, self.safe_action).astype(np.int64)
+        return acts
+
+    def fit_crc(
+        self,
+        probs_cal: np.ndarray,
+        y_cal: np.ndarray,
+        alpha: Optional[float] = None,
+    ) -> float:
+        """Select largest threshold ``lam`` in ``[0, 1]`` satisfying CRC bound ``<= alpha``."""
+        if alpha is None:
+            eff_alpha = self.alpha
+        elif _is_bool_scalar(alpha) or not isinstance(alpha, (int, float, np.integer, np.floating)):
+            raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+        else:
+            eff_alpha = float(alpha)
+        if not math.isfinite(eff_alpha) or not (0.0 < eff_alpha < 1.0):
+            raise ValueError(f"alpha must lie in (0, 1), got {eff_alpha!r}")
+        p_in = _coerce_real_numeric_array(probs_cal, name="probs_cal")
+        if p_in.ndim != 2 or p_in.shape[1] != self.n_classes:
+            raise ValueError(f"probs_cal must have shape (N, {self.n_classes}), got {p_in.shape}")
+        if p_in.shape[0] > 0 and not bool(np.all(self._valid_prob_rows(p_in))):
+            raise ValueError("probs_cal contains non-finite or invalid probability rows")
+        y_arr = self._validate_cal_labels(y_cal, p_in.shape[0])
+        p_cal = self.transform_probs(p_in)
+        if p_cal.shape[0] > 0 and not bool(np.all(np.isfinite(p_cal))):
+            raise ValueError("probs_cal produced non-finite values after temperature scaling")
+        n = y_arr.shape[0]
+        if p_cal.shape[0] != n or n == 0 or (1.0 / float(n + 1) > eff_alpha + 1e-12):
+            self.lam_crc = -1.0
+            self._is_fitted = True
+            return -1.0
+
+        lam_best = -1.0
+        # Pointwise non-decreasing upper envelope preserves finite-sample CRC validity across ladder switches.
+        env_losses = np.zeros(n, dtype=np.float64)
+        for lam in np.linspace(0.0, 1.0, 501):
+            lam_f = float(lam)
+            acts = self._apply_policy(p_cal, lam_f)
+            if self.loss_mode == "indicator":
+                losses = (self.cost_matrix[acts, y_arr] > self.c_esc).astype(np.float64)
+            else:
+                losses = self.L[acts, y_arr]
+            env_losses = np.maximum(env_losses, losses)
+            crc_ub = (float(np.sum(env_losses)) + 1.0) / float(n + 1)
+            if crc_ub <= eff_alpha + 1e-12:
+                lam_best = lam_f
+
+        self.lam_crc = lam_best
+        self._is_fitted = True
+        return lam_best
+
+    def fit(
+        self,
+        probs: np.ndarray,
+        y_true: np.ndarray,
+        *,
+        cal_probs: Optional[np.ndarray] = None,
+        cal_y: Optional[np.ndarray] = None,
+    ) -> "UtilityCalibrator":
+        """Fit optional temperature scaling and finite-sample CRC risk threshold."""
+        if (cal_probs is None) != (cal_y is None):
+            raise ValueError("cal_probs and cal_y must both be provided or both be None")
+        p_train = _coerce_real_numeric_array(probs, name="probs")
+        if p_train.ndim != 2 or p_train.shape[1] != self.n_classes:
+            raise ValueError(f"probs must have shape (N, {self.n_classes}), got {p_train.shape}")
+        y_train = self._validate_cal_labels(y_true, p_train.shape[0])
+        if p_train.shape[0] != y_train.shape[0] or y_train.size == 0:
+            raise ValueError("probs and y_true must be non-empty and match in length")
+        if not bool(np.all(self._valid_prob_rows(p_train))):
+            raise ValueError("probs contains non-finite or invalid probability rows")
+
+        if cal_probs is not None and cal_y is not None:
+            p_crc = _coerce_real_numeric_array(cal_probs, name="cal_probs")
+            if p_crc.ndim != 2 or p_crc.shape[1] != self.n_classes:
+                raise ValueError(f"cal_probs must have shape (N, {self.n_classes}), got {p_crc.shape}")
+            y_crc = self._validate_cal_labels(cal_y, p_crc.shape[0])
+            if p_crc.shape[0] > 0 and not bool(np.all(self._valid_prob_rows(p_crc))):
+                raise ValueError("cal_probs contains non-finite or invalid probability rows")
+            if self.fit_temperature and y_train.size >= 8:
+                self.temperature = self._fit_temperature(p_train, y_train)
+        elif self.fit_temperature and y_train.size >= 24:
+            # Keep temperature scaling and CRC holdout samples strictly disjoint.
+            n_temp = max(8, min(y_train.size // 3, 128))
+            self.temperature = self._fit_temperature(p_train[:n_temp], y_train[:n_temp])
+            p_crc = p_train[n_temp:]
+            y_crc = y_train[n_temp:]
+        else:
+            p_crc = p_train
+            y_crc = y_train
+
+        if p_crc.shape[0] != y_crc.shape[0] or y_crc.size == 0:
+            self.lam_crc = -1.0
+            self._is_fitted = True
+            return self
+        self.fit_crc(p_crc, y_crc, alpha=self.alpha)
+        return self
+
+    def calibrate(
+        self,
+        probs: np.ndarray,
+        y_true: np.ndarray,
+    ) -> "UtilityCalibrator":
+        """Alias for ``fit`` matching calibrator conventions."""
+        return self.fit(probs, y_true)
+
+    def predict(
+        self,
+        probs: np.ndarray,
+        *,
+        use_crc: bool = True,
+        apply_temperature: bool = True,
+    ) -> np.ndarray:
+        """Select risk-calibrated actions of shape ``(N,)``."""
+        p = _coerce_real_numeric_array(probs, name="probs")
+        single = p.ndim == 1
+        p_in = p.reshape(1, -1) if single else p
+        if apply_temperature:
+            p2 = self.transform_probs(p_in)
+        else:
+            if p_in.ndim != 2 or p_in.shape[1] != self.n_classes:
+                raise ValueError(f"Expected {self.n_classes} classes, got shape {p.shape}")
+            p2 = p_in
+        if not use_crc:
+            n = p2.shape[0]
+            out = np.full(n, self.safe_action, dtype=np.int64)
+            valid = self._valid_prob_rows(p2)
+            if bool(np.any(valid)):
+                v_idx = np.flatnonzero(valid)
+                with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                    p_norm = self._normalize_prob_rows(p2[v_idx])
+                    costs_v = self._expected_policy_costs(p_norm)
+                c_fin = np.all(np.isfinite(costs_v), axis=1)
+                if bool(np.any(c_fin)):
+                    out[v_idx[c_fin]] = self._select_bayes_actions(p_norm[c_fin], costs_v[c_fin])
+            return out[:1] if single else out
+        lam = -1.0 if self.is_vacuous else self.lam_crc
+        out = self._apply_policy(p2, lam)
+        return out[:1] if single else out
+
+
+def _contains_bool_element(obj: Any) -> bool:
+    if isinstance(obj, (bool, np.bool_)):
+        return True
+    if isinstance(obj, np.ndarray):
+        if obj.dtype == np.dtype(np.bool_):
+            return True
+        if obj.dtype == np.object_:
+            return any(_contains_bool_element(v) for v in obj.flat)
+        return False
+    if isinstance(obj, Sequence) and not isinstance(obj, (str, bytes, bytearray, memoryview)):
+        return any(_contains_bool_element(v) for v in obj)
+    return False
+
+
+def _coerce_real_numeric_array(arr: Any, *, name: str) -> np.ndarray:
+    """Convert numeric array-like to float64, rejecting booleans and non-real dtypes."""
+    if isinstance(arr, (str, bytes, bytearray, memoryview, Mapping, set, frozenset)):
+        raise ValueError(f"{name} must have real numeric dtype, got {type(arr).__name__}")
+    if _contains_bool_element(arr):
+        raise ValueError(f"{name} must have real numeric dtype, not boolean")
+    raw = np.asarray(arr)
+    if raw.dtype == np.dtype(np.bool_):
+        raise ValueError(f"{name} must have real numeric dtype, got {raw.dtype}")
+    if raw.dtype == np.dtype(np.object_):
+        vals: List[float] = []
+        for v in raw.flat:
+            if isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, float, np.integer, np.floating)):
+                raise ValueError(
+                    f"{name} must have real numeric dtype, got element of type {type(v).__name__}"
+                )
+            try:
+                vals.append(float(v))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"{name} contains non-convertible numeric value {v!r}") from exc
+        return np.asarray(vals, dtype=np.float64).reshape(raw.shape)
+    if raw.dtype.kind not in ("i", "u", "f"):
+        raise ValueError(f"{name} must have real numeric dtype, got {raw.dtype}")
+    return np.asarray(raw, dtype=np.float64)
+
+
+def _validate_ordinal_class_indices(y: Any, *, name: str) -> np.ndarray:
+    """Validate 1D ordinal class labels strictly without lossy float/object truncation."""
+    if isinstance(y, (str, bytes, bytearray, Mapping, set, frozenset)):
+        raise ValueError(f"{name} must be a 1D array of integer class indices")
+    if not isinstance(y, np.ndarray) and _contains_bool_element(y):
+        raise ValueError(f"{name} must contain integer class indices, not booleans")
+    raw = np.asarray(y)
+    if raw.ndim != 1:
+        raise ValueError(f"{name} must be a 1D array of integer class indices")
+    if raw.dtype == np.dtype(np.object_):
+        out_vals: List[int] = []
+        for v in raw.flat:
+            if isinstance(v, (bool, np.bool_)):
+                raise ValueError(f"{name} must contain integer class indices, not booleans")
+            if isinstance(v, (int, np.integer)):
+                iv = int(v)
+                if iv < -9223372036854775808 or iv > 9223372036854775807:
+                    raise ValueError(f"{name} integer index out of int64 bounds: {iv}")
+                out_vals.append(iv)
+            elif isinstance(v, (float, np.floating)):
+                fv = float(v)
+                if (
+                    not math.isfinite(fv)
+                    or fv != math.floor(fv)
+                    or fv < -9223372036854775808.0
+                    or fv >= 9223372036854775808.0
+                ):
+                    raise ValueError(f"{name} must contain exact integer class indices, got {v!r}")
+                out_vals.append(int(fv))
+            else:
+                raise ValueError(
+                    f"{name} must contain integer class indices, got {type(v).__name__}"
+                )
+        return np.asarray(out_vals, dtype=np.int64).ravel()
+    if np.issubdtype(raw.dtype, np.floating):
+        if raw.size > 0 and (
+            not bool(np.all(np.isfinite(raw)))
+            or not bool(np.all(raw == np.floor(raw)))
+            or not bool(
+                np.all((raw >= -9223372036854775808.0) & (raw < 9223372036854775808.0))
+            )
+        ):
+            raise ValueError(f"{name} must contain exact integer class indices within int64 bounds")
+        return np.asarray(raw, dtype=np.int64).ravel()
+    if raw.dtype.kind in ("i", "u"):
+        if (
+            raw.dtype == np.dtype(np.uint64)
+            and raw.size > 0
+            and bool(np.any(raw > np.uint64(np.iinfo(np.int64).max)))
+        ):
+            raise ValueError(f"{name} integer indices exceed int64 bounds")
+        return np.asarray(raw, dtype=np.int64).ravel()
+    raise ValueError(f"{name} must have integer or exact-integral dtype, got {raw.dtype}")
+
+
+def _validate_nonneg_finite_scalar(value: Any, *, name: str) -> float:
+    """Validate a finite non-negative real scalar parameter (rejecting booleans)."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be a finite non-negative number, got bool")
+    if not isinstance(value, (int, float, np.integer, np.floating)):
+        raise ValueError(f"{name} must be a finite non-negative number, got {type(value).__name__}")
+    val = float(value)
+    if not math.isfinite(val) or val < 0.0:
+        raise ValueError(f"{name} must be finite and >= 0, got {value!r}")
+    return val
+
+
+def _validate_int_scalar(value: Any, *, name: str, min_val: int) -> int:
+    """Validate a finite integer scalar parameter (rejecting booleans and non-integral floats)."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be an integer, got bool")
+    if isinstance(value, (int, np.integer)):
+        ival = int(value)
+    elif isinstance(value, (float, np.floating)):
+        fv = float(value)
+        if not math.isfinite(fv) or fv != math.floor(fv):
+            raise ValueError(f"{name} must be a finite integer, got {value!r}")
+        ival = int(fv)
+    else:
+        raise ValueError(f"{name} must be an integer, got {type(value).__name__}")
+    if ival < min_val:
+        raise ValueError(f"{name} must be >= {min_val}, got {ival}")
+    return ival
+
+
+class CumulativeLogitOrdinalHead:
+    """Proportional-odds cumulative logit model trained with pure-NumPy L-BFGS."""
+
+    def __init__(
+        self,
+        n_classes: Optional[int] = None,
+        *,
+        l2: float = 1e-2,
+        max_iter: int = 300,
+    ) -> None:
+        self.n_classes = _validate_int_scalar(n_classes, name="n_classes", min_val=2) if n_classes is not None else None
+        self.l2 = _validate_nonneg_finite_scalar(l2, name="l2")
+        self.max_iter = max(10, _validate_int_scalar(max_iter, name="max_iter", min_val=1))
+        self.weights_: Optional[np.ndarray] = None
+        self.thresholds_: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _unpack_thresholds(delta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        k_minus_1 = delta.size
+        thetas = np.empty(k_minus_1, dtype=np.float64)
+        slopes = np.ones(k_minus_1, dtype=np.float64)
+        thetas[0] = delta[0]
+        for j in range(1, k_minus_1):
+            g = float(np.clip(delta[j], -30.0, 30.0))
+            step = math.log1p(math.exp(g)) if g < 20.0 else g
+            thetas[j] = thetas[j - 1] + step + 1e-4
+            slopes[j] = float(_expit_np(g))
+        return thetas, slopes
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "CumulativeLogitOrdinalHead":
+        X_arr = _coerce_real_numeric_array(X, name="X")
+        y_arr = _validate_ordinal_class_indices(y, name="y")
+        if (
+            X_arr.ndim != 2
+            or X_arr.shape[0] != y_arr.shape[0]
+            or y_arr.size == 0
+            or not bool(np.all(np.isfinite(X_arr)))
+        ):
+            raise ValueError("X must be finite 2D and match non-empty 1D y")
+        n, d = X_arr.shape
+        k = int(self.n_classes) if self.n_classes is not None else int(np.max(y_arr)) + 1
+        if k < 2:
+            raise ValueError(f"Ordinal head requires at least 2 classes, got {k}")
+        if int(np.min(y_arr)) < 0 or int(np.max(y_arr)) >= k:
+            raise ValueError(f"Labels must lie in [0, {k - 1}]")
+        self.n_classes = k
+
+        y_le_idx = y_arr.copy()
+        delta0 = np.zeros(k - 1, dtype=np.float64)
+        delta0[0] = -0.5 * float(k - 2) if k > 2 else 0.0
+        for j in range(1, k - 1):
+            delta0[j] = 0.0
+        x0 = np.concatenate([np.zeros(d, dtype=np.float64), delta0])
+
+        def _obj(params: np.ndarray) -> Tuple[float, np.ndarray]:
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                if not bool(np.all(np.isfinite(params))):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                w = params[:d]
+                delta = params[d:]
+                thetas, slopes = self._unpack_thresholds(delta)
+                if not bool(np.all(np.isfinite(thetas))) or not bool(np.all(np.isfinite(slopes))):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                eta = X_arr @ w
+                if not bool(np.all(np.isfinite(eta))):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+
+                f_hi = np.ones(n, dtype=np.float64)
+                mask_hi = y_le_idx < (k - 1)
+                if np.any(mask_hi):
+                    diff_hi = thetas[y_le_idx[mask_hi]] - eta[mask_hi]
+                    if not bool(np.all(np.isfinite(diff_hi))):
+                        return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                    f_hi[mask_hi] = _expit_np(diff_hi)
+
+                f_lo = np.zeros(n, dtype=np.float64)
+                mask_lo = y_le_idx > 0
+                if np.any(mask_lo):
+                    diff_lo = thetas[y_le_idx[mask_lo] - 1] - eta[mask_lo]
+                    if not bool(np.all(np.isfinite(diff_lo))):
+                        return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                    f_lo[mask_lo] = _expit_np(diff_lo)
+
+                probs = np.maximum(f_hi - f_lo, 1e-12)
+                reg_term = 0.5 * self.l2 * float(np.sum(w * w))
+                loss = -float(np.mean(np.log(probs))) + reg_term
+                if not math.isfinite(loss):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+
+                s_hi = np.where(mask_hi, f_hi * (1.0 - f_hi), 0.0)
+                s_lo = np.where(mask_lo, f_lo * (1.0 - f_lo), 0.0)
+                inv_pn = 1.0 / (probs * float(n))
+
+                d_eta = (s_hi - s_lo) * inv_pn
+                grad_w = X_arr.T @ d_eta + self.l2 * w
+
+                grad_theta = np.zeros(k - 1, dtype=np.float64)
+                if np.any(mask_hi):
+                    np.add.at(grad_theta, y_le_idx[mask_hi], -s_hi[mask_hi] * inv_pn[mask_hi])
+                if np.any(mask_lo):
+                    np.add.at(grad_theta, y_le_idx[mask_lo] - 1, s_lo[mask_lo] * inv_pn[mask_lo])
+
+                suffix_sum = np.cumsum(grad_theta[::-1])[::-1]
+                grad_delta = suffix_sum.copy()
+                grad_delta[1:] = suffix_sum[1:] * slopes[1:]
+                grad = np.concatenate([grad_w, grad_delta])
+                if not bool(np.all(np.isfinite(grad))):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                return loss, grad
+
+        f0, g0 = _obj(x0)
+        if not math.isfinite(f0) or not bool(np.all(np.isfinite(g0))):
+            raise ValueError("Ordinal optimization failed due to non-finite initial objective or gradient")
+        opt, _, _ = _minimize_lbfgs_np(_obj, x0, maxiter=self.max_iter)
+        f_fin, g_fin = _obj(opt)
+        g0_inf = float(np.max(np.abs(g0))) if g0.size > 0 else 0.0
+        thetas_fin, _ = self._unpack_thresholds(opt[d:]) if bool(np.all(np.isfinite(opt))) else (np.array([np.nan]), np.array([]))
+        if (
+            not bool(np.all(np.isfinite(opt)))
+            or not math.isfinite(f_fin)
+            or not bool(np.all(np.isfinite(g_fin)))
+            or not bool(np.all(np.isfinite(thetas_fin)))
+        ):
+            raise ValueError("Ordinal optimization failed to produce finite parameters")
+        if g0_inf > 1e-6 and (np.array_equal(opt, x0) or not (f_fin < f0)):
+            raise ValueError("Ordinal optimization failed to converge due to numerical overflow")
+        self.weights_ = opt[:d].copy()
+        self.thresholds_ = thetas_fin
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.weights_ is None or self.thresholds_ is None or self.n_classes is None:
+            raise RuntimeError("CumulativeLogitOrdinalHead must be fit before calling predict_proba")
+        X_arr = _coerce_real_numeric_array(X, name="X")
+        single = X_arr.ndim == 1
+        X2 = X_arr.reshape(1, -1) if single else X_arr
+        w = np.asarray(self.weights_, dtype=np.float64)
+        thetas = np.asarray(self.thresholds_, dtype=np.float64).reshape(-1)
+        k = int(self.n_classes)
+        if X2.ndim != 2 or w.ndim != 1 or X2.shape[1] != w.shape[0] or thetas.shape != (k - 1,):
+            raise ValueError(
+                f"Input/model shape mismatch in CumulativeLogitOrdinalHead: X={X2.shape}, w={w.shape}, thresholds={thetas.shape}"
+            )
+        n = X2.shape[0]
+        probs = np.full((n, k), np.nan, dtype=np.float64)
+        params_ok = (
+            bool(np.all(np.isfinite(w)))
+            and bool(np.all(np.isfinite(thetas)))
+            and (thetas.size <= 1 or bool(np.all(thetas[1:] >= (thetas[:-1] - 1e-12))))
+        )
+        if params_ok and n > 0:
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                eta = X2 @ w
+                diff = thetas[None, :] - eta[:, None]
+                row_ok = (
+                    np.all(np.isfinite(X2), axis=1)
+                    & np.isfinite(eta)
+                    & np.all(np.isfinite(diff), axis=1)
+                )
+                if bool(np.any(row_ok)):
+                    cum = np.ones((int(np.sum(row_ok)), k), dtype=np.float64)
+                    cum[:, : k - 1] = _expit_np(diff[row_ok])
+                    p_ok = np.empty((cum.shape[0], k), dtype=np.float64)
+                    p_ok[:, 0] = cum[:, 0]
+                    if k > 1:
+                        p_ok[:, 1:] = cum[:, 1:] - cum[:, :-1]
+                    p_ok = np.clip(p_ok, 1e-12, 1.0)
+                    p_ok /= np.sum(p_ok, axis=1, keepdims=True)
+                    p_fin = np.all(np.isfinite(p_ok), axis=1)
+                    good_idx = np.flatnonzero(row_ok)[p_fin]
+                    if good_idx.size > 0:
+                        probs[good_idx] = p_ok[p_fin]
+        return probs[0] if single else probs
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return _predict_ordinal_class(self.predict_proba(X))
+
+    def expected_value(self, X: np.ndarray) -> np.ndarray:
+        return _ordinal_expected_value(self.predict_proba(X), self.n_classes)
+
+
+class SoftOrdinalHead:
+    """Gaussian/Laplace soft-target linear softmax ordinal head in pure NumPy."""
+
+    def __init__(
+        self,
+        n_classes: Optional[int] = None,
+        *,
+        sigma: float = 0.5,
+        l2: float = 1e-2,
+        max_iter: int = 300,
+    ) -> None:
+        self.n_classes = _validate_int_scalar(n_classes, name="n_classes", min_val=2) if n_classes is not None else None
+        self.sigma = _validate_nonneg_finite_scalar(sigma, name="sigma")
+        self.l2 = _validate_nonneg_finite_scalar(l2, name="l2")
+        self.max_iter = max(10, _validate_int_scalar(max_iter, name="max_iter", min_val=1))
+        self.weights_: Optional[np.ndarray] = None
+        self.bias_: Optional[np.ndarray] = None
+
+    @staticmethod
+    def build_soft_targets(y: np.ndarray, n_classes: int, sigma: float) -> np.ndarray:
+        k = _validate_int_scalar(n_classes, name="n_classes", min_val=2)
+        sig_f = _validate_nonneg_finite_scalar(sigma, name="sigma")
+        y_idx = _validate_ordinal_class_indices(y, name="y")
+        n = y_idx.shape[0]
+        if n == 0:
+            raise ValueError("y must be non-empty")
+        if int(np.min(y_idx)) < 0 or int(np.max(y_idx)) >= k:
+            raise ValueError(f"Labels must lie in [0, {k - 1}]")
+        if sig_f <= 0.0:
+            q = np.zeros((n, k), dtype=np.float64)
+            q[np.arange(n), y_idx] = 1.0
+            return q
+        ks = np.arange(k, dtype=np.float64)[None, :]
+        diff = ks - y_idx[:, None].astype(np.float64)
+        with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
+            scaled = diff / sig_f
+            logits = -0.5 * (scaled * scaled)
+            logits[np.arange(n), y_idx] = 0.0
+            exps = np.exp(logits)
+            denom = np.sum(exps, axis=1, keepdims=True)
+            out = exps / denom
+        if not bool(np.all(np.isfinite(out))):
+            q = np.zeros((n, k), dtype=np.float64)
+            q[np.arange(n), y_idx] = 1.0
+            return q
+        return out
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "SoftOrdinalHead":
+        X_arr = _coerce_real_numeric_array(X, name="X")
+        y_arr = _validate_ordinal_class_indices(y, name="y")
+        if (
+            X_arr.ndim != 2
+            or X_arr.shape[0] != y_arr.shape[0]
+            or y_arr.size == 0
+            or not bool(np.all(np.isfinite(X_arr)))
+        ):
+            raise ValueError("X must be finite 2D and match non-empty 1D y")
+        n, d = X_arr.shape
+        k = int(self.n_classes) if self.n_classes is not None else int(np.max(y_arr)) + 1
+        if k < 2:
+            raise ValueError(f"SoftOrdinalHead requires at least 2 classes, got {k}")
+        if int(np.min(y_arr)) < 0 or int(np.max(y_arr)) >= k:
+            raise ValueError(f"Labels must lie in [0, {k - 1}]")
+        self.n_classes = k
+
+        q = self.build_soft_targets(y_arr, k, self.sigma)
+        w_len = d * k
+        x0 = np.zeros(w_len + k, dtype=np.float64)
+
+        def _obj(params: np.ndarray) -> Tuple[float, np.ndarray]:
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                if not bool(np.all(np.isfinite(params))):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                w = params[:w_len].reshape(d, k)
+                b = params[w_len:]
+                logits = X_arr @ w + b
+                if not bool(np.all(np.isfinite(logits))):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                shifted = logits - np.max(logits, axis=1, keepdims=True)
+                if not bool(np.all(np.isfinite(shifted))):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                exps = np.exp(np.clip(shifted, -60.0, 60.0))
+                denom = np.maximum(np.sum(exps, axis=1, keepdims=True), 1e-12)
+                log_p = shifted - np.log(denom)
+                p = exps / denom
+                reg_term = 0.5 * self.l2 * float(np.sum(w * w))
+                loss = -float(np.mean(np.sum(q * log_p, axis=1))) + reg_term
+                if not math.isfinite(loss):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                dz = (p - q) / float(n)
+                gw = (X_arr.T @ dz) + self.l2 * w
+                gb = np.sum(dz, axis=0)
+                grad = np.concatenate([gw.ravel(), gb])
+                if not bool(np.all(np.isfinite(grad))):
+                    return float("inf"), np.full(params.shape, np.nan, dtype=np.float64)
+                return loss, grad
+
+        f0, g0 = _obj(x0)
+        if not math.isfinite(f0) or not bool(np.all(np.isfinite(g0))):
+            raise ValueError("Ordinal optimization failed due to non-finite initial objective or gradient")
+        opt, _, _ = _minimize_lbfgs_np(_obj, x0, maxiter=self.max_iter)
+        f_fin, g_fin = _obj(opt)
+        g0_inf = float(np.max(np.abs(g0))) if g0.size > 0 else 0.0
+        if (
+            not bool(np.all(np.isfinite(opt)))
+            or not math.isfinite(f_fin)
+            or not bool(np.all(np.isfinite(g_fin)))
+        ):
+            raise ValueError("Ordinal optimization failed to produce finite parameters")
+        if g0_inf > 1e-6 and (np.array_equal(opt, x0) or not (f_fin < f0)):
+            raise ValueError("Ordinal optimization failed to converge due to numerical overflow")
+        self.weights_ = opt[:w_len].reshape(d, k).copy()
+        self.bias_ = opt[w_len:].copy()
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.weights_ is None or self.bias_ is None:
+            raise RuntimeError("SoftOrdinalHead must be fit before calling predict_proba")
+        X_arr = _coerce_real_numeric_array(X, name="X")
+        single = X_arr.ndim == 1
+        X2 = X_arr.reshape(1, -1) if single else X_arr
+        w = np.asarray(self.weights_, dtype=np.float64)
+        b = np.asarray(self.bias_, dtype=np.float64).reshape(-1)
+        if X2.ndim != 2 or w.ndim != 2 or X2.shape[1] != w.shape[0] or b.shape != (w.shape[1],):
+            raise ValueError(
+                f"Input/model shape mismatch in SoftOrdinalHead: X={X2.shape}, w={w.shape}, b={b.shape}"
+            )
+        k = w.shape[1]
+        probs = np.full((X2.shape[0], k), np.nan, dtype=np.float64)
+        if bool(np.all(np.isfinite(w))) and bool(np.all(np.isfinite(b))) and X2.shape[0] > 0:
+            with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+                lin = X2 @ w
+                logits = lin + b
+                row_ok = (
+                    np.all(np.isfinite(X2), axis=1)
+                    & np.all(np.isfinite(lin), axis=1)
+                    & np.all(np.isfinite(logits), axis=1)
+                )
+                if bool(np.any(row_ok)):
+                    p_ok = _softmax_np(logits[row_ok], axis=1)
+                    p_fin = np.all(np.isfinite(p_ok), axis=1)
+                    good_idx = np.flatnonzero(row_ok)[p_fin]
+                    if good_idx.size > 0:
+                        probs[good_idx] = p_ok[p_fin]
+        return probs[0] if single else probs
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return _predict_ordinal_class(self.predict_proba(X))
+
+    def expected_value(self, X: np.ndarray) -> np.ndarray:
+        return _ordinal_expected_value(self.predict_proba(X), self.n_classes)
+
+
+def _validate_ordinal_prob_matrix(
+    probs: np.ndarray, *, name: str = "probs", allow_1d: bool = False
+) -> np.ndarray:
+    arr = _coerce_real_numeric_array(probs, name=name).copy()
+    was_1d = bool(allow_1d and arr.ndim == 1)
+    if was_1d:
+        check = arr.reshape(1, -1)
+    elif arr.ndim == 2:
+        check = arr
+    else:
+        shape_desc = "1D or 2D" if allow_1d else "2D"
+        raise ValueError(f"{name} must be a {shape_desc} array, got shape {arr.shape}")
+    if check.shape[1] < 1:
+        raise ValueError(f"{name} must have at least 1 class column, got shape {arr.shape}")
+    if check.shape[0] > 0:
+        if not bool(np.all(np.isfinite(check))):
+            raise ValueError(f"{name} contains non-finite values")
+        if bool(np.any((check < -1e-12) | (check > 1.0 + 1e-12))):
+            raise ValueError(f"{name} entries must lie in [0.0, 1.0]")
+        row_sums = np.sum(check, axis=1)
+        if not bool(np.all(np.isfinite(row_sums))) or bool(np.any(np.abs(row_sums - 1.0) > 1e-4)):
+            raise ValueError(f"{name} rows must sum to 1.0")
+        check = np.clip(check, 0.0, 1.0)
+        norm_sums = np.sum(check, axis=1, keepdims=True)
+        if bool(np.any(norm_sums <= 0.0)):
+            raise ValueError(f"{name} rows must have positive sum")
+        check = check / norm_sums
+    return check[0] if was_1d else check
+
+
+def _predict_ordinal_class(proba: np.ndarray) -> np.ndarray:
+    p = _validate_ordinal_prob_matrix(proba, name="ordinal probabilities", allow_1d=True)
+    if p.ndim == 1:
+        return np.array([int(np.argmax(p))], dtype=np.int64)
+    return np.argmax(p, axis=1).astype(np.int64)
+
+
+def _ordinal_expected_value(proba: np.ndarray, n_classes: Optional[int]) -> np.ndarray:
+    p = _validate_ordinal_prob_matrix(proba, name="ordinal probabilities", allow_1d=True)
+    classes = np.arange(n_classes or p.shape[-1], dtype=np.float64)
+    return p @ classes
+
+
+def _cdf_quantiles_from_validated(p: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    if isinstance(alpha, (bool, np.bool_)) or not (0.0 < float(alpha) < 1.0):
+        raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+    cdf = np.cumsum(p, axis=1)
+    mask_lo = cdf >= (0.5 * float(alpha)) - 1e-12
+    mask_hi = cdf >= (1.0 - 0.5 * float(alpha)) - 1e-12
+    has_lo = np.any(mask_lo, axis=1)
+    has_hi = np.any(mask_hi, axis=1)
+    lo = np.where(has_lo, np.argmax(mask_lo, axis=1), 0).astype(np.int64)
+    hi = np.where(has_hi, np.argmax(mask_hi, axis=1), p.shape[1] - 1).astype(np.int64)
+    hi = np.maximum(hi, lo)
+    return lo, hi
+
+
+def _cdf_ordinal_quantiles(probs: np.ndarray, alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    if isinstance(alpha, (bool, np.bool_)) or not (0.0 < float(alpha) < 1.0):
+        raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+    p = _validate_ordinal_prob_matrix(probs, name="probs", allow_1d=False)
+    return _cdf_quantiles_from_validated(p, float(alpha))
+
+
+def cqr_ordinal_intervals(
+    cal_probs: np.ndarray,
+    cal_y: np.ndarray,
+    test_probs: np.ndarray,
+    *,
+    alpha: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Finite-sample Conformalized Quantile Regression intervals for ordinal labels.
+
+    Returns integer arrays ``(lower, upper)`` with guaranteed finite-sample marginal
+    coverage ``>= 1 - alpha`` under exchangeability.
+    """
+    p_cal = _validate_ordinal_prob_matrix(cal_probs, name="cal_probs", allow_1d=False)
+    y_cal = _validate_ordinal_class_indices(cal_y, name="cal_y")
+    p_test = _validate_ordinal_prob_matrix(test_probs, name="test_probs", allow_1d=False)
+    if p_cal.shape[1] != p_test.shape[1]:
+        raise ValueError("cal_probs and test_probs must be 2D arrays with matching n_classes")
+    if p_cal.shape[0] != y_cal.shape[0] or y_cal.size == 0:
+        raise ValueError("cal_probs and cal_y must be non-empty and match in length")
+    if bool(np.any((y_cal < 0) | (y_cal >= p_cal.shape[1]))):
+        raise ValueError(f"cal_y indices must lie in [0, {p_cal.shape[1] - 1}]")
+    if isinstance(alpha, (bool, np.bool_)) or not (0.0 < float(alpha) < 1.0):
+        raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+
+    k = p_cal.shape[1]
+    n = y_cal.shape[0]
+    cal_lo, cal_hi = _cdf_quantiles_from_validated(p_cal, float(alpha))
+    scores = np.maximum(cal_lo - y_cal, y_cal - cal_hi).astype(np.float64)
+
+    level = math.ceil((n + 1) * (1.0 - float(alpha))) / float(n)
+    if level > 1.0:
+        lo_out = np.zeros(p_test.shape[0], dtype=np.int64)
+        hi_out = np.full(p_test.shape[0], k - 1, dtype=np.int64)
+        return lo_out, hi_out
+
+    q_idx = min(n, max(1, int(math.ceil((n + 1) * (1.0 - float(alpha)))))) - 1
+    q_hat = int(round(float(np.sort(scores)[q_idx])))
+
+    test_lo, test_hi = _cdf_quantiles_from_validated(p_test, float(alpha))
+    lo_out = np.clip(test_lo - q_hat, 0, k - 1).astype(np.int64)
+    hi_out = np.clip(test_hi + q_hat, 0, k - 1).astype(np.int64)
+    mid = np.clip(np.round(0.5 * (test_lo + test_hi)).astype(np.int64), 0, k - 1)
+    empty = lo_out > hi_out
+    if np.any(empty):
+        lo_out = np.where(empty, mid, lo_out)
+        hi_out = np.where(empty, mid, hi_out)
+    return lo_out, hi_out
+
+
+class BinaryPlattBetaCalibrator:
+    """Adaptive Platt / Beta binary probability calibrator in pure NumPy.
+
+    Returns identity calibration when ``n_cal < min_platt_samples`` (default 74),
+    fits 2-parameter Platt scaling for ``min_platt_samples <= n_cal < min_beta_samples``,
+    and fits 3-parameter Beta calibration when ``n_cal >= min_beta_samples``.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_platt_samples: int = 74,
+        min_beta_samples: int = 150,
+        reg: float = 1e-3,
+        max_iter: int = 200,
+    ) -> None:
+        self.min_platt_samples = max(1, int(min_platt_samples))
+        self.min_beta_samples = max(1, int(min_beta_samples))
+        self.reg = max(0.0, float(reg))
+        self.max_iter = max(10, int(max_iter))
+        self.mode: str = "unfitted"
+        self.n_cal: int = 0
+        self.params_: Optional[np.ndarray] = None
+
+    @staticmethod
+    def _extract_positive_probs(probs: np.ndarray) -> np.ndarray:
+        arr = _coerce_real_numeric_array(probs, name="probs")
+        if arr.ndim == 2:
+            if arr.shape[1] != 2:
+                raise ValueError(f"Expected binary (N, 2) probabilities, got {arr.shape}")
+            p1 = arr[:, 1]
+        elif arr.ndim == 1:
+            p1 = arr
+        else:
+            raise ValueError(f"Expected 1D or 2D probabilities, got ndim={arr.ndim}")
+        if not bool(np.all(np.isfinite(arr))):
+            raise ValueError("BinaryPlattBetaCalibrator received non-finite probabilities")
+        if arr.size > 0 and (float(np.min(arr)) < -1e-9 or float(np.max(arr)) > 1.0 + 1e-9):
+            raise ValueError("BinaryPlattBetaCalibrator probabilities must lie in [0, 1]")
+        return np.where(p1 == 0.0, 0.0, np.clip(p1, 0.0, 1.0))
+
+    def fit(self, probs: np.ndarray, y_true: np.ndarray) -> "BinaryPlattBetaCalibrator":
+        p1 = self._extract_positive_probs(probs)
+        y_raw = _coerce_real_numeric_array(y_true, name="y_true")
+        if y_raw.ndim != 1:
+            raise ValueError(f"y_true must be 1D, got shape {y_raw.shape}")
+        y = y_raw.ravel()
+        if p1.shape[0] != y.shape[0] or y.size == 0:
+            raise ValueError("probs and y_true must be non-empty and match in length")
+        if np.any((y != 0.0) & (y != 1.0)):
+            raise ValueError("BinaryPlattBetaCalibrator requires binary {0, 1} labels")
+
+        n = y.shape[0]
+        self.n_cal = int(n)
+        if n < self.min_platt_samples:
+            self.mode = "identity"
+            self.params_ = np.array([1.0, 0.0], dtype=np.float64)
+            return self
+        p1_eps = np.clip(p1, 1e-6, 1.0 - 1e-6)
+        if n < self.min_beta_samples:
+            self.mode = "platt"
+            z = np.log(p1_eps / (1.0 - p1_eps))
+
+            def _obj_platt(params: np.ndarray) -> Tuple[float, np.ndarray]:
+                w, c = float(params[0]), float(params[1])
+                eta = np.clip(w * z + c, -60.0, 60.0)
+                q = _expit_np(eta)
+                bce = float(np.mean(np.logaddexp(0.0, eta) - y * eta))
+                loss = bce + 0.5 * self.reg * ((w - 1.0) ** 2 + c ** 2)
+                diff = (q - y) / float(n)
+                dw = float(np.dot(diff, z)) + self.reg * (w - 1.0)
+                dc = float(np.sum(diff)) + self.reg * c
+                return loss, np.array([dw, dc], dtype=np.float64)
+
+            opt, _, _ = _minimize_lbfgs_np(
+                _obj_platt,
+                np.array([1.0, 0.0], dtype=np.float64),
+                bounds=[(0.0, 20.0), (-20.0, 20.0)],
+                maxiter=self.max_iter,
+            )
+            self.params_ = opt.copy()
+        else:
+            self.mode = "beta"
+            x_pos = np.log(p1_eps)
+            x_neg = -np.log(1.0 - p1_eps)
+
+            def _obj_beta(params: np.ndarray) -> Tuple[float, np.ndarray]:
+                a, b, c = float(params[0]), float(params[1]), float(params[2])
+                eta = np.clip(a * x_pos + b * x_neg + c, -60.0, 60.0)
+                q = _expit_np(eta)
+                bce = float(np.mean(np.logaddexp(0.0, eta) - y * eta))
+                loss = bce + 0.5 * self.reg * ((a - 1.0) ** 2 + (b - 1.0) ** 2 + c ** 2)
+                diff = (q - y) / float(n)
+                da = float(np.dot(diff, x_pos)) + self.reg * (a - 1.0)
+                db = float(np.dot(diff, x_neg)) + self.reg * (b - 1.0)
+                dc = float(np.sum(diff)) + self.reg * c
+                return loss, np.array([da, db, dc], dtype=np.float64)
+
+            opt, _, _ = _minimize_lbfgs_np(
+                _obj_beta,
+                np.array([1.0, 1.0, 0.0], dtype=np.float64),
+                bounds=[(0.0, 20.0), (0.0, 20.0), (-20.0, 20.0)],
+                maxiter=self.max_iter,
+            )
+            self.params_ = opt.copy()
+        return self
+
+    def transform(self, probs: np.ndarray) -> np.ndarray:
+        """Return calibrated positive-class probability vector of shape ``(N,)``."""
+        if self.params_ is None or self.mode == "unfitted":
+            raise RuntimeError("BinaryPlattBetaCalibrator must be fit before transforming")
+        p1 = self._extract_positive_probs(probs)
+        if self.mode == "identity":
+            return p1
+        p1_eps = np.clip(p1, 1e-6, 1.0 - 1e-6)
+        if self.mode == "platt":
+            w, c = float(self.params_[0]), float(self.params_[1])
+            z = np.log(p1_eps / (1.0 - p1_eps))
+            out = _expit_np(w * z + c)
+        else:
+            a, b, c = float(self.params_[0]), float(self.params_[1]), float(self.params_[2])
+            out = _expit_np(a * np.log(p1_eps) - b * np.log(1.0 - p1_eps) + c)
+        return np.clip(np.asarray(out, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+
+    def predict_proba(self, probs: np.ndarray) -> np.ndarray:
+        """Return calibrated two-column probability matrix ``[1 - p, p]``."""
+        p_cal = self.transform(probs)
+        return np.stack([1.0 - p_cal, p_cal], axis=1)
+
+
 __all__ = [
     "AdaptiveConformalTracker",
+    "BinaryPlattBetaCalibrator",
     "BrierDecomposition",
     "CalibrationMetrics",
     "ConformalPredictionSet",
     "ConformalPredictor",
+    "CumulativeLogitOrdinalHead",
     "DecisionCalibrator",
     "JointSchemaCalibrator",
     "JointSelectiveCertificate",
+    "OnlineMondrianConformal",
     "RecalibrationMetrics",
     "RecalibrationReport",
     "RegressionConformalInterval",
@@ -2347,9 +4222,13 @@ __all__ = [
     "SelectiveRiskCertificate",
     "SequentialMonitorStep",
     "SequentialRiskMonitor",
+    "SoftOrdinalHead",
+    "UtilityCalibrator",
     "VALID_MONITOR_MODES",
     "clopper_pearson_upper",
     "compute_brier_decomposition",
     "compute_ece_and_bins",
     "compute_nll",
+    "cqr_ordinal_intervals",
+    "should_use_soft_ordinal",
 ]

@@ -6,9 +6,12 @@ Schema-derived synthetic examples remain available for bootstrapping demos.
 
 from __future__ import annotations
 
+import gc
+import inspect
 import io
 import json
 import math
+import mmap
 import os
 import struct
 import threading
@@ -16,7 +19,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
+from typing import AbstractSet, Any, Dict, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
 
@@ -26,9 +29,41 @@ from system1.core.model import (
     ModelInferenceResult,
     RawFieldEvaluation,
     SystemOneModel,
+    _MAX_STRIDED_CLONE_SPAN_BYTES,
+    _accepts_recency_weighted,
+    _assert_real_numeric_array_like,
+    _check_nested_real_seq,
+    _coerce_real_1d_f32,
+    _is_active_zero_head,
+    _is_native_scalar_projector,
+    _needs_2d_layout_preservation,
+    _normalize_raw_projection,
+    _normalize_raw_projection_batch,
+    _reconstruct_2d_layout_array,
     _stable_sigmoid,
     _stable_softmax,
+    _validate_2d_layout_cloneable,
+    _validate_forgetting_factor,
+    _validate_real_scalar,
 )
+
+
+def _accepts_return_norms(fn: Any) -> bool:
+    """Return True when a projector batch callable accepts a `return_norms` keyword argument."""
+    if not callable(fn):
+        return False
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if "return_norms" in params:
+        p = params["return_norms"]
+        return p.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 from system1.core.schema import (
     BooleanField,
     ChoiceField,
@@ -36,14 +71,173 @@ from system1.core.schema import (
     DecisionSchema,
     MultiChoiceField,
     ScoreField,
+    _score_abs_diff_clamped,
+    _score_from_unit_prob,
+    _score_full_span_clamped,
+    _score_half_span,
+    _score_to_unit_ratio,
 )
-from system1.calibration import ConformalPredictor, DecisionCalibrator
+from system1.calibration import (
+    ConformalPredictor,
+    DecisionCalibrator,
+    _normalize_rows_f32_safe,
+    _normalize_vec_f32_safe,
+    _safe_centroid_mean_f64,
+)
 from system1.core.embeddings import compute_strict_loo_weights
 from system1.core.telemetry import TelemetryProjector
-from system1.core.text import TfidfProjector
+from system1.core.text import (
+    DEFAULT_MAX_FEATURES,
+    MAX_PRAG_FEATURES,
+    PragmaticCompositeProjector,
+    TfidfProjector,
+)
 from system1.cache import SemanticSystemOneCache
 
 MAGIC_HEADER = b"S1M\x02"
+MAGIC_HEADER_V3 = b"S1M\x03\x00\x00\x00\x00"
+_V3_HDR_STRUCT = struct.Struct("<8sQ")
+S1M_V3_PAGE_SIZE = 16384
+MAX_SKILL_FIELDS_V3 = 512
+MAX_SKILL_BYTES_V3 = 256 * 1024 * 1024
+MAX_SKILL_HEADER_BYTES_V3 = 16 * 1024 * 1024
+MAX_SKILL_ARRAY_BYTES_V3 = 256 * 1024 * 1024
+MAX_SKILL_RUNTIME_BYTES_V3 = 512 * 1024 * 1024
+_ALLOWED_V3_DTYPES = frozenset(("float16", "float32", "float64"))
+
+
+def _strict_json_parse_float(num_str: str) -> float:
+    """Reject JSON float tokens that overflow IEEE-754 float64 to +/-inf."""
+    val = float(num_str)
+    if not math.isfinite(val):
+        raise ValueError(f"Saved skill header contains overflowing float token: {num_str!r}")
+    return val
+
+
+def _strict_header_bool(
+    mapping: Mapping[str, Any],
+    key: str,
+    default: bool,
+    context: str,
+) -> bool:
+    """Validate an optional boolean header field without coercing non-bool types."""
+    if key not in mapping:
+        return default
+    raw = mapping[key]
+    if type(raw) is not bool:
+        raise ValueError(f"{context} field {key!r} must be a boolean, got {raw!r}")
+    return raw
+
+
+def _call_raw_norm_if_callable(
+    projector: Any,
+    prompt: str,
+    *,
+    recency_weighted: bool = False,
+) -> Optional[float]:
+    """Call `projector.raw_norm` when callable, returning None on missing or invalid values."""
+    rn_fn = getattr(projector, "raw_norm", None) if projector is not None else None
+    if not callable(rn_fn):
+        return None
+    try:
+        rn_val = (
+            rn_fn(prompt, recency_weighted=recency_weighted)
+            if _accepts_recency_weighted(rn_fn)
+            else rn_fn(prompt)
+        )
+        if rn_val is not None and not isinstance(rn_val, (bool, np.bool_)):
+            return float(rn_val)
+    except Exception:
+        pass
+    return None
+
+
+def _extract_projector_raw_norm(
+    projector: Any,
+    prompt: str,
+    *,
+    recency_weighted: bool = False,
+) -> Optional[float]:
+    """Retrieve a prompt's raw norm from `raw_norm` or `project_with_norm`."""
+    rn_val = _call_raw_norm_if_callable(projector, prompt, recency_weighted=recency_weighted)
+    if rn_val is not None:
+        return rn_val
+    pwn_fn = getattr(projector, "project_with_norm", None) if projector is not None else None
+    if callable(pwn_fn):
+        try:
+            raw_pwn = (
+                pwn_fn(prompt, recency_weighted=recency_weighted)
+                if _accepts_recency_weighted(pwn_fn)
+                else pwn_fn(prompt)
+            )
+            if (
+                isinstance(raw_pwn, tuple)
+                and len(raw_pwn) >= 2
+                and raw_pwn[1] is not None
+                and not isinstance(raw_pwn[1], (bool, np.bool_))
+            ):
+                return float(raw_pwn[1])
+        except Exception:
+            pass
+    return None
+
+
+def _validate_compiled_logit_adj(raw_adj: Any, definition: Any, name: str) -> Optional[np.ndarray]:
+    """Validate and freeze optional per-class logit_adjustments for a compiled head."""
+    if raw_adj is None:
+        return None
+    if isinstance(definition, BooleanField):
+        exp_len = 2
+    elif isinstance(definition, ChoiceField):
+        exp_len = len(definition.options)
+    else:
+        raise ValueError(
+            f"Saved head {name!r} of type {type(definition).__name__} does not support logit_adj"
+        )
+    if not isinstance(raw_adj, np.ndarray):
+        _check_nested_real_seq(raw_adj, f"Saved head {name!r} logit_adj")
+    arr = np.asarray(raw_adj)
+    if arr.dtype == np.dtype(np.bool_) or arr.dtype.kind not in ("i", "u", "f"):
+        raise ValueError(f"Saved head {name!r} logit_adj must have numeric dtype, got {arr.dtype}")
+    if arr.ndim != 1 or arr.shape != (exp_len,):
+        raise ValueError(
+            f"Saved head {name!r} has incompatible logit_adj dimensions {arr.shape} != ({exp_len},)"
+        )
+    out = np.ascontiguousarray(arr, dtype=np.float64).copy()
+    if not bool(np.all(np.isfinite(out))):
+        raise ValueError(f"Saved head {name!r} logit_adj contains non-finite values")
+    out.setflags(write=False)
+    return out
+
+
+def _strict_header_float(
+    mapping: Mapping[str, Any],
+    key: str,
+    default: float,
+    context: str,
+    *,
+    min_val: Optional[float] = None,
+    min_inclusive: bool = True,
+    max_val: Optional[float] = None,
+    max_inclusive: bool = True,
+) -> float:
+    """Validate an optional finite numeric header field within inclusive/exclusive bounds."""
+    if key not in mapping:
+        return default
+    raw = mapping[key]
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"{context} field {key!r} must be a finite number, got {raw!r}")
+    try:
+        val = float(raw)
+    except OverflowError as exc:
+        raise ValueError(f"{context} field {key!r} overflows float64: {raw!r}") from exc
+    if not math.isfinite(val):
+        raise ValueError(f"{context} field {key!r} must be finite, got {raw!r}")
+    if min_val is not None and (val < min_val if min_inclusive else val <= min_val):
+        raise ValueError(f"{context} field {key!r} out of range: {val!r}")
+    if max_val is not None and (val > max_val if max_inclusive else val >= max_val):
+        raise ValueError(f"{context} field {key!r} out of range: {val!r}")
+    return val
 
 # Fixed budgets for portable, bounded skills. Check before decoding/allocating.
 MAX_SKILL_BYTES = 64 * 1024 * 1024
@@ -57,6 +251,63 @@ MAX_SKILL_CALIBRATION_SCORES = 1_000_000
 MAX_SKILL_COMPRESSION_RATIO = 1024
 EXEMPLAR_ARRAYS = ("exemplar_centroids", "exemplar_vectors", "exemplar_mean", "initial_w", "shots_p", "shots_c")
 VALID_SEMANTIC_MODES = ("default", "v1_1", "v1_2_fisher", "v1_2_rbf")
+HEAD_TENSOR_SUFFIXES = (
+    "w",
+    "b",
+    "P",
+    "B",
+    "calib_scores",
+    "logit_adj",
+    "prototypes",
+    "proto_scores",
+    "coarse_w",
+    "coarse_b",
+    "fine_w",
+    "fine_b",
+    *EXEMPLAR_ARRAYS,
+)
+PROJECTOR_TENSOR_NAMES = frozenset((
+    "_projector_tfidf_idf",
+    "_projector_prag_base_idf",
+    "_projector_prag_idf",
+    "_projector_spectral_vectors",
+    "_projector_spectral_basis",
+    "_projector_subspace_components",
+    "_projector_rbf_landmarks",
+    "_projector_hybrid_tfidf_idf",
+    "_projector_dense_table",
+))
+
+
+def _head_tensor_name(field_name: str, suffix: str, *, namespaced: bool = False) -> str:
+    """Return canonical serialized tensor key for (field_name, suffix)."""
+    if namespaced:
+        return f"0h{len(field_name)}_{field_name}_{suffix}"
+    return f"{field_name}_{suffix}"
+
+
+def _schema_needs_namespaced_head_tensors(schema: DecisionSchema) -> bool:
+    """Return True if un-namespaced head tensor keys could collide."""
+    seen: set[str] = set(PROJECTOR_TENSOR_NAMES)
+    for fname in schema.fields:
+        if fname.startswith("0h"):
+            return True
+        for suffix in HEAD_TENSOR_SUFFIXES:
+            legacy_key = f"{fname}_{suffix}"
+            if legacy_key in seen:
+                return True
+            seen.add(legacy_key)
+    return False
+
+
+def _resolve_tensor_namespaced_flag(schema: DecisionSchema, meta: Mapping[str, Any]) -> bool:
+    """Validate and resolve the serialized head tensor namespace mode from header metadata."""
+    ns_val = meta.get("tensor_namespace")
+    if ns_val is None:
+        return False
+    if type(ns_val) is str and ns_val == "len_v1":
+        return True
+    raise ValueError(f"Saved skill uses unsupported tensor_namespace: {ns_val!r}")
 
 
 def _snap_f16(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -68,6 +319,186 @@ def _snap_f16(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
         return a32
     a16 = a32.astype(np.float16)
     return a16.astype(np.float32) if np.all(np.isfinite(a16)) else a32
+
+
+def _centered_log_odds(probs: np.ndarray, eps: float = 5e-3) -> np.ndarray:
+    """Map probability simplex rows into zero-sum centered log-odds."""
+    p = np.clip(np.asarray(probs, dtype=np.float64), float(eps), 1.0)
+    p = p / np.maximum(1e-12, p.sum(axis=1, keepdims=True))
+    lp = np.log(p)
+    return lp - lp.mean(axis=1, keepdims=True)
+
+
+def _soft_fit_temperature_np(logits: np.ndarray, P_T: np.ndarray) -> float:
+    """Pure-NumPy grid + golden-section temperature search minimizing KL(P_T || softmax(logits / T))."""
+    logits64 = np.asarray(logits, dtype=np.float64)
+    P64 = np.clip(np.asarray(P_T, dtype=np.float64), 0.0, 1.0)
+    P64 = P64 / np.maximum(1e-12, P64.sum(axis=1, keepdims=True))
+    if logits64.shape[0] == 0:
+        return 1.0
+
+    def _obj(log_t: float) -> float:
+        lt = max(-2.5, min(2.5, float(log_t)))
+        T = math.exp(lt)
+        s = logits64 / T
+        s = s - np.max(s, axis=1, keepdims=True)
+        lse = np.log(np.maximum(1e-12, np.sum(np.exp(s), axis=1, keepdims=True)))
+        nll = -float(np.mean(np.sum(P64 * (s - lse), axis=1)))
+        return nll + 0.01 * (lt * lt)
+
+    grid = np.linspace(-2.5, 2.5, 41)
+    vals = [_obj(float(g)) for g in grid]
+    best_i = int(np.argmin(vals))
+    lo = float(grid[max(0, best_i - 1)])
+    hi = float(grid[min(len(grid) - 1, best_i + 1)])
+    phi = (math.sqrt(5.0) - 1.0) / 2.0
+    c = hi - phi * (hi - lo)
+    d = lo + phi * (hi - lo)
+    fc, fd = _obj(c), _obj(d)
+    for _ in range(40):
+        if fc < fd:
+            hi = d
+            d, fd = c, fc
+            c = hi - phi * (hi - lo)
+            fc = _obj(c)
+        else:
+            lo = c
+            c, fc = d, fd
+            d = lo + phi * (hi - lo)
+            fd = _obj(d)
+    best_log_t = 0.5 * (lo + hi)
+    return float(math.exp(max(-2.5, min(2.5, best_log_t))))
+
+
+def _soft_student_sample_weights(
+    P_clean: np.ndarray,
+    y_lbl_idx: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Compute entropy-weighted + bounded class-balanced sample weights."""
+    N, K = P_clean.shape
+    entropy = -np.sum(P_clean * np.log(np.clip(P_clean, 1e-12, 1.0)), axis=1) / math.log(max(2, K))
+    sw = 0.45 + 0.55 * (1.0 - np.clip(entropy, 0.0, 1.0))
+    idx = np.asarray(y_lbl_idx, dtype=np.int64) if y_lbl_idx is not None else np.argmax(P_clean, axis=1)
+    counts = np.bincount(idx, minlength=K).astype(np.float64)
+    present = counts > 0
+    k_eff = max(1, int(np.sum(present)))
+    cls_w = np.ones(K, dtype=np.float64)
+    cls_w[present] = np.clip(float(N) / (float(k_eff) * counts[present]), 0.35, 3.0)
+    sw = sw * cls_w[idx]
+    mean_sw = float(np.mean(sw))
+    if mean_sw > 1e-12:
+        sw = sw / mean_sw
+    return sw
+
+
+def _solve_soft_ridge_student_raw(
+    X: np.ndarray,
+    P_T: np.ndarray,
+    Y_hard_oh: Optional[np.ndarray] = None,
+    *,
+    beta: float = 0.25,
+    reg: float = 0.5,
+    eps_smooth: float = 5e-3,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Closed-form dual/primal weighted ridge over centered soft log-odds mixed with optional hard targets."""
+    X64 = np.asarray(X, dtype=np.float64)
+    N, D = X64.shape
+    P_raw = np.clip(np.asarray(P_T, dtype=np.float64), 0.0, 1.0)
+    K = P_raw.shape[1]
+    row_s = P_raw.sum(axis=1, keepdims=True)
+    P_norm = np.where(row_s > 1e-12, P_raw / np.maximum(1e-12, row_s), 1.0 / max(1, K))
+    P_clean = (1.0 - eps_smooth) * P_norm + eps_smooth / K
+    P_clean = P_clean / np.maximum(1e-12, P_clean.sum(axis=1, keepdims=True))
+
+    y_idx = np.argmax(Y_hard_oh, axis=1) if Y_hard_oh is not None else np.argmax(P_clean, axis=1)
+    sw = _soft_student_sample_weights(P_clean, y_idx)
+
+    Z_soft = _centered_log_odds(P_clean, eps=eps_smooth)
+    if Y_hard_oh is not None and beta > 0.0:
+        P_hard = (1.0 - eps_smooth) * np.asarray(Y_hard_oh, dtype=np.float64) + eps_smooth / K
+        Y_centered = _centered_log_odds(P_hard, eps=eps_smooth)
+        Z = (1.0 - float(beta)) * Z_soft + float(beta) * Y_centered
+    else:
+        Z = Z_soft
+
+    w_sum = max(1e-12, float(np.sum(sw)))
+    mu_X = (sw @ X64) / w_sum
+    mu_Z = (sw @ Z) / w_sum
+    sw_sqrt = np.sqrt(np.maximum(1e-8, sw))[:, None]
+    Xc = (X64 - mu_X) * sw_sqrt
+    Zc = (Z - mu_Z) * sw_sqrt
+
+    reg_val = max(1e-4, float(reg))
+    if 0 < N < D:
+        gram = np.eye(N, dtype=np.float64) + (1.0 / reg_val) * (Xc @ Xc.T)
+        try:
+            alpha_dual = np.linalg.solve(gram, Zc)
+            U = ((1.0 / reg_val) * (Xc.T @ alpha_dual)).T
+        except np.linalg.LinAlgError:
+            A = Xc.T @ Xc + reg_val * np.eye(D, dtype=np.float64)
+            U = np.linalg.lstsq(A, Xc.T @ Zc, rcond=None)[0].T
+    else:
+        A = Xc.T @ Xc + reg_val * np.eye(D, dtype=np.float64)
+        try:
+            U = np.linalg.solve(A, Xc.T @ Zc).T
+        except np.linalg.LinAlgError:
+            U = np.linalg.lstsq(A, Xc.T @ Zc, rcond=None)[0].T
+    c = mu_Z - U @ mu_X
+    return U, c, Z, sw
+
+
+def _oof_conservative_soft_conformal(
+    p_oof: np.ndarray,
+    P_T: np.ndarray,
+    *,
+    y_true_idx: Optional[np.ndarray] = None,
+    alpha: float = 0.05,
+) -> Tuple[float, float]:
+    """Finite-sample weighted conformal LAC quantile + Laplace OOF confidence floor."""
+    N, K = p_oof.shape
+    if N == 0:
+        return 1.0, 0.0
+    y_target = (
+        np.asarray(y_true_idx, dtype=np.int64)
+        if y_true_idx is not None
+        else np.argmax(P_T, axis=1)
+    )
+    scores_arg = 1.0 - p_oof[np.arange(N), y_target]
+    w_arg = np.ones(N, dtype=np.float64) if y_true_idx is not None else np.maximum(1e-6, np.max(P_T, axis=1))
+    order = np.argsort(scores_arg, kind="mergesort")
+    v_s = scores_arg[order]
+    w_s = w_arg[order]
+    w_sum = float(np.sum(w_s))
+    n_eff = (w_sum * w_sum) / max(1e-12, float(np.sum(w_s * w_s)))
+    target = (1.0 - float(alpha)) * (n_eff + 1.0) / n_eff
+    if target >= 1.0:
+        q_lac = float(np.max(v_s)) if N >= 20 else 1.0
+    else:
+        cdf = np.cumsum(w_s) / w_sum
+        idx = int(np.searchsorted(cdf, target, side="left"))
+        q_lac = float(v_s[min(idx, len(v_s) - 1)])
+
+    top_pred = np.argmax(p_oof, axis=1)
+    top_prob = np.max(p_oof, axis=1)
+    is_err = (top_pred != y_target).astype(np.float64)
+    singletons = np.sum((1.0 - p_oof) <= q_lac + 1e-12, axis=1) == 1
+    cands = sorted(set([0.0] + [float(x) for x in np.round(top_prob, 4)]))
+    chosen_floor = 0.0
+    found = False
+    for fl in cands:
+        mask = singletons & (top_prob >= fl)
+        n_m = int(np.sum(mask))
+        if n_m == 0:
+            continue
+        if (float(np.sum(is_err[mask])) + 0.5) / (n_m + 1.0) <= float(alpha) + 1e-9:
+            chosen_floor = fl
+            found = True
+            break
+    if not found:
+        chosen_floor = float(np.max(top_prob)) + 1e-3
+    elif N <= 80 and np.any(singletons):
+        chosen_floor = max(chosen_floor, float(np.quantile(top_prob[singletons], 0.35)))
+    return float(q_lac), float(chosen_floor)
 
 
 def _roundtrip_unit_f16(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -102,32 +533,278 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
     _, disk, directory_disk, disk_count, count, directory_size, directory_offset, comment_size = struct.unpack(
         "<4s4H2LH", data[end:end + 22]
     )
-    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (11 + len(EXEMPLAR_ARRAYS)) + 5
+def _validate_skill_shapes_and_runtime_delta(
+    schema: DecisionSchema,
+    dimension: int,
+    shapes: Mapping[str, Tuple[int, ...]],
+    *,
+    heads_meta: Optional[Mapping[str, Any]] = None,
+    namespaced: bool = False,
+) -> int:
+    """Validate saved projector and head array shapes and return extra Python/covariance runtime bytes."""
+    runtime_delta = 0
+
+    tfidf_idf_shape = shapes.get("_projector_tfidf_idf")
+    if tfidf_idf_shape is not None and tfidf_idf_shape != (dimension,):
+        raise ValueError("Saved TF-IDF idf array has invalid shape")
+    hyb_idf_shape = shapes.get("_projector_hybrid_tfidf_idf")
+    if hyb_idf_shape is not None and (
+        len(hyb_idf_shape) != 1 or not (1 <= hyb_idf_shape[0] <= dimension)
+    ):
+        raise ValueError("Saved hybrid TF-IDF idf array has invalid shape")
+    prag_base_idf_shape = shapes.get("_projector_prag_base_idf")
+    if prag_base_idf_shape is not None and (
+        len(prag_base_idf_shape) != 1 or not (1 <= prag_base_idf_shape[0] <= dimension)
+    ):
+        raise ValueError("Saved pragmatic base TF-IDF idf array has invalid shape")
+    prag_idf_shape = shapes.get("_projector_prag_idf")
+    if prag_idf_shape is not None and (
+        len(prag_idf_shape) != 1 or not (0 <= prag_idf_shape[0] <= min(dimension, MAX_PRAG_FEATURES))
+    ):
+        raise ValueError("Saved pragmatic TF-IDF idf array has invalid shape")
+    spec_vec_shape = shapes.get("_projector_spectral_vectors")
+    if spec_vec_shape is not None and (
+        len(spec_vec_shape) != 2
+        or not (1 <= spec_vec_shape[0] <= 2048)
+        or not (1 <= spec_vec_shape[1] <= dimension)
+    ):
+        raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
+    spec_basis_shape = shapes.get("_projector_spectral_basis")
+    if spec_basis_shape is not None and (
+        len(spec_basis_shape) != 2
+        or not (1 <= spec_basis_shape[0] <= dimension)
+        or not (1 <= spec_basis_shape[1] <= dimension)
+    ):
+        raise ValueError("Saved hybrid projector spectral_basis has invalid shape")
+    sub_comp_shape = shapes.get("_projector_subspace_components")
+    if sub_comp_shape is not None and (
+        len(sub_comp_shape) != 2
+        or not (1 <= sub_comp_shape[0] <= dimension)
+        or not (1 <= sub_comp_shape[1] <= dimension)
+    ):
+        raise ValueError("Saved hybrid projector subspace_components have invalid shape")
+    rbf_shape = shapes.get("_projector_rbf_landmarks")
+    if rbf_shape is not None and (
+        len(rbf_shape) != 2
+        or not (1 <= rbf_shape[0] <= MAX_SKILL_OPTIONS)
+        or not (1 <= rbf_shape[1] <= dimension)
+        or rbf_shape[0] + rbf_shape[1] != dimension
+    ):
+        raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
+    dense_tbl_shape = shapes.get("_projector_dense_table")
+    if dense_tbl_shape is not None and (
+        len(dense_tbl_shape) != 2
+        or not (1 <= dense_tbl_shape[0] <= 250_000)
+        or not (1 <= dense_tbl_shape[1] <= dimension)
+    ):
+        raise ValueError("Saved hybrid projector dense_table has invalid shape")
+
+    for name, definition in schema.fields.items():
+        def _k(suffix: str, _fn: str = name) -> str:
+            return _head_tensor_name(_fn, suffix, namespaced=namespaced)
+
+        widths = (
+            (1, 2)
+            if isinstance(definition, (BooleanField, ScoreField))
+            else (len(definition.options),)
+            if hasattr(definition, "options")
+            else (1,)
+        )
+        weight_shape = shapes.get(_k("w"), ())
+        if weight_shape not in tuple((width, dimension) for width in widths):
+            raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
+        width = weight_shape[0]
+        valid_b_shapes = (
+            ((1,), (width,))
+            if isinstance(definition, (BooleanField, ScoreField))
+            else ((width,),)
+        )
+        b_shape = shapes.get(_k("b"))
+        if b_shape not in valid_b_shapes:
+            raise ValueError(f"Saved head {name!r} has incompatible b dimensions")
+        required_shapes = {
+            "P": (dimension + 1, dimension + 1),
+            "B": (dimension + 1, width),
+        }
+        for suffix, shape in required_shapes.items():
+            actual = shapes.get(_k(suffix))
+            if actual is not None and actual != shape:
+                raise ValueError(f"Saved head {name!r} has incompatible {suffix} dimensions")
+        logit_adj_shape = shapes.get(_k("logit_adj"))
+        if logit_adj_shape is not None:
+            if isinstance(definition, BooleanField):
+                exp_adj_len = 2
+            elif isinstance(definition, ChoiceField):
+                exp_adj_len = len(definition.options)
+            else:
+                raise ValueError(
+                    f"Saved head {name!r} of type {type(definition).__name__} does not support logit_adj"
+                )
+            if logit_adj_shape != (exp_adj_len,):
+                raise ValueError(f"Saved head {name!r} has incompatible logit_adj dimensions")
+            runtime_delta += 8 * exp_adj_len
+        calibration = shapes.get(_k("calib_scores"))
+        if calibration is not None and (len(calibration) != 1 or calibration[0] > MAX_SKILL_CALIBRATION_SCORES):
+            raise ValueError("Saved skill calibration exceeds limits")
+        proto_shape = shapes.get(_k("prototypes"))
+        if proto_shape is not None:
+            valid_proto_rows = (1, 2) if isinstance(definition, BooleanField) else (width,)
+            if len(proto_shape) != 2 or proto_shape[0] not in valid_proto_rows or proto_shape[1] != dimension:
+                raise ValueError(f"Saved head {name!r} has incompatible prototypes dimensions")
+        proto_scores_shape = shapes.get(_k("proto_scores"))
+        if proto_scores_shape is not None and (
+            len(proto_scores_shape) != 1 or proto_scores_shape[0] > MAX_SKILL_CALIBRATION_SCORES
+        ):
+            raise ValueError("Saved skill prototype calibration exceeds limits")
+        coarse_w_shape = shapes.get(_k("coarse_w"))
+        coarse_b_shape = shapes.get(_k("coarse_b"))
+        if (coarse_w_shape is None) != (coarse_b_shape is None):
+            raise ValueError(f"Saved head {name!r} has incomplete coarse hierarchical arrays")
+        if coarse_w_shape is not None:
+            if (
+                len(coarse_w_shape) != 2
+                or not (1 <= coarse_w_shape[0] <= width)
+                or coarse_w_shape[1] != dimension
+                or coarse_b_shape != (coarse_w_shape[0],)
+            ):
+                raise ValueError(f"Saved head {name!r} has incompatible coarse hierarchical dimensions")
+        fine_w_shape = shapes.get(_k("fine_w"))
+        fine_b_shape = shapes.get(_k("fine_b"))
+        if (fine_w_shape is None) != (fine_b_shape is None):
+            raise ValueError(f"Saved head {name!r} has incomplete fine hierarchical arrays")
+        if fine_w_shape is not None:
+            if fine_w_shape != (width, dimension) or fine_b_shape != (width,):
+                raise ValueError(f"Saved head {name!r} has incompatible fine hierarchical dimensions")
+        if _k("B") in shapes and _k("P") not in shapes:
+            runtime_delta += 8 * (dimension + 1) ** 2
+        for suffix in ("calib_scores", "proto_scores"):
+            runtime_delta += 32 * shapes.get(_k(suffix), (0,))[0]
+        if isinstance(heads_meta, Mapping):
+            h_info = heads_meta.get(name)
+            if isinstance(h_info, Mapping):
+                raw_cls_scores = h_info.get("class_calibration_scores")
+                if raw_cls_scores is not None:
+                    if not isinstance(raw_cls_scores, Mapping):
+                        raise ValueError(f"Saved head {name!r} class_calibration_scores must be a mapping")
+                    total_cls_scores = 0
+                    for c_vals in raw_cls_scores.values():
+                        if not isinstance(c_vals, (list, tuple)):
+                            raise ValueError(f"Saved head {name!r} class_calibration_scores entry must be a list")
+                        total_cls_scores += len(c_vals)
+                        if total_cls_scores > MAX_SKILL_CALIBRATION_SCORES:
+                            raise ValueError(f"Saved head {name!r} class_calibration_scores exceeds limit")
+                    runtime_delta += 56 * len(raw_cls_scores) + 32 * total_cls_scores
+        for suffix in EXEMPLAR_ARRAYS:
+            shape = shapes.get(_k(suffix))
+            if shape is None:
+                continue
+            valid = (shape == (dimension,)) if suffix == "exemplar_mean" else (
+                len(shape) == 2 and shape[1] == dimension
+                and (suffix not in ("exemplar_centroids", "initial_w") or shape[0] == width)
+            )
+            if not isinstance(definition, ChoiceField) or not valid:
+                raise ValueError(f"Saved head {name!r} has incompatible exemplar dimensions")
+            if suffix in ("shots_p", "shots_c"):
+                runtime_delta += 160 * shape[0]
+    return runtime_delta
+
+
+def _validate_tensor_layouts_header(
+    meta: Mapping[str, Any],
+    shapes: Mapping[str, Tuple[int, ...]],
+    *,
+    non_f32_2d_names: AbstractSet[str] = frozenset(),
+    full_allocation: bool = False,
+) -> Tuple[Dict[str, Tuple[int, int, int]], int]:
+    """Validate optional serialized 2D stride/alignment metadata and return extra runtime bytes."""
+    if "tensor_layouts" not in meta:
+        return {}, 0
+    raw_layouts = meta["tensor_layouts"]
+    if not isinstance(raw_layouts, dict):
+        raise ValueError("Saved skill tensor_layouts header must be a mapping")
+    validated: Dict[str, Tuple[int, int, int]] = {}
+    extra_bytes = 0
+    for tname, lspec in raw_layouts.items():
+        if not isinstance(tname, str) or tname not in shapes or tname in non_f32_2d_names:
+            raise ValueError(f"Saved skill tensor_layouts references unexpected tensor {tname!r}")
+        sh = shapes[tname]
+        if len(sh) != 2 or sh[0] <= 0 or sh[1] <= 0:
+            raise ValueError(f"Saved skill tensor_layouts entry {tname!r} requires non-empty 2D tensor")
+        if not isinstance(lspec, list) or len(lspec) != 3 or any(type(v) is not int for v in lspec):
+            raise ValueError(f"Saved skill tensor_layouts entry {tname!r} must be [mod64, s0, s1]")
+        mod64, s0, s1 = int(lspec[0]), int(lspec[1]), int(lspec[2])
+        K, D = int(sh[0]), int(sh[1])
+        itemsize = 4
+        nbytes_f32 = itemsize * K * D
+        if not (0 <= mod64 < 64):
+            raise ValueError(f"Saved skill tensor_layouts mod64 {mod64} out of range for {tname!r}")
+        if (s0 % itemsize) != 0 or (s1 % itemsize) != 0:
+            raise ValueError(f"Saved skill tensor_layouts strides ({s0}, {s1}) incompatible with float32 for {tname!r}")
+        if (K == 1 and s0 != 0) or (D == 1 and s1 != 0):
+            raise ValueError(f"Saved skill tensor_layouts singleton stride invalid for {tname!r}")
+        min_off = min(0, (K - 1) * s0) + min(0, (D - 1) * s1)
+        max_off = max(0, (K - 1) * s0) + max(0, (D - 1) * s1)
+        span_bytes = (max_off - min_off) + itemsize
+        max_allowed_span = min(_MAX_STRIDED_CLONE_SPAN_BYTES, max(1 << 20, 64 * nbytes_f32))
+        if span_bytes <= 0 or span_bytes < nbytes_f32 or span_bytes > max_allowed_span:
+            raise ValueError(
+                f"Saved skill tensor_layouts span {span_bytes} exceeds limit {max_allowed_span} for {tname!r}"
+            )
+        a0, a1 = abs(s0), abs(s1)
+        aliased = (K > 1 and a0 == 0) or (D > 1 and a1 == 0)
+        if not aliased and K > 1 and D > 1:
+            g = math.gcd(a0, a1)
+            aliased = (a1 // g) < K and (a0 // g) < D
+        if aliased:
+            raise ValueError(f"Saved skill tensor_layouts aliases elements for {tname!r}")
+        extra_bytes += (span_bytes + 128) if full_allocation else ((span_bytes - nbytes_f32) + 128)
+        validated[tname] = (mod64, s0, s1)
+    return validated, extra_bytes
+
+
+def _read_skill_arrays(
+    data: bytes,
+    schema: DecisionSchema,
+    dimension: int,
+    runtime_bytes: int,
+    *,
+    namespaced: bool = False,
+    meta: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, np.ndarray]:
+    """Validate and deserialize `.s1m` v1/v2 NPZ arrays within strict bounds."""
+    if not data.startswith(b"PK\x03\x04"):
+        raise ValueError("Saved skill does not contain a valid NPZ array archive")
+    eocd = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
+    if eocd < 0 or eocd + 22 > len(data):
+        raise ValueError("Saved skill NPZ archive is missing or malformed")
+    disk, directory_disk, entries, disk_count, directory_size, directory_offset, comment_size = struct.unpack_from(
+        "<HHHHIIH", data, eocd + 4
+    )
+    end, count = directory_offset + directory_size, entries
+    if (
+        directory_offset > eocd
+        or entries != disk_count
+        or directory_size == 0
+        or end != eocd
+        or data[directory_offset : directory_offset + 4] != b"PK\x01\x02"
+    ):
+        raise ValueError("Saved skill NPZ directory is malformed")
+    if (disk or directory_disk or disk_count != count or count > MAX_SKILL_FIELDS * (12 + len(EXEMPLAR_ARRAYS)) + 7
             or directory_size > MAX_SKILL_HEADER_BYTES or directory_offset + directory_size != end
             or end + 22 + comment_size != len(data)):
         raise ValueError("Saved skill NPZ directory exceeds limits or is malformed")
     expected = {
-        f"{name}_{suffix}.npy"
+        f"{_head_tensor_name(name, suffix, namespaced=namespaced)}.npy"
         for name in schema.fields
-        for suffix in (
-            "w",
-            "b",
-            "P",
-            "B",
-            "calib_scores",
-            "prototypes",
-            "proto_scores",
-            "coarse_w",
-            "coarse_b",
-            "fine_w",
-            "fine_b",
-        ) + EXEMPLAR_ARRAYS
+        for suffix in HEAD_TENSOR_SUFFIXES
     } | {
         "_projector_spectral_vectors.npy",
         "_projector_subspace_components.npy",
         "_projector_rbf_landmarks.npy",
         "_projector_tfidf_idf.npy",
         "_projector_hybrid_tfidf_idf.npy",
+        "_projector_prag_base_idf.npy",
+        "_projector_prag_idf.npy",
     }
     shapes: Dict[str, Tuple[int, ...]] = {}
     effective_array_bytes = 0
@@ -160,95 +837,15 @@ def _read_skill_arrays(data: bytes, schema: DecisionSchema, dimension: int, runt
                 shapes[info.filename[:-4]] = shape
         if effective_array_bytes > MAX_SKILL_ARRAY_BYTES:
             raise ValueError("Saved skill arrays exceed upcast array budget")
-        tfidf_idf_shape = shapes.get("_projector_tfidf_idf")
-        if tfidf_idf_shape is not None and tfidf_idf_shape != (dimension,):
-            raise ValueError("Saved TF-IDF idf array has invalid shape")
-        hyb_idf_shape = shapes.get("_projector_hybrid_tfidf_idf")
-        if hyb_idf_shape is not None and (
-            len(hyb_idf_shape) != 1 or not (1 <= hyb_idf_shape[0] <= dimension)
-        ):
-            raise ValueError("Saved hybrid TF-IDF idf array has invalid shape")
-        spec_vec_shape = shapes.get("_projector_spectral_vectors")
-        if spec_vec_shape is not None and (
-            len(spec_vec_shape) != 2
-            or not (1 <= spec_vec_shape[0] <= 2048)
-            or not (1 <= spec_vec_shape[1] <= dimension)
-        ):
-            raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
-        sub_comp_shape = shapes.get("_projector_subspace_components")
-        if sub_comp_shape is not None and (
-            len(sub_comp_shape) != 2
-            or not (1 <= sub_comp_shape[0] <= dimension)
-            or not (1 <= sub_comp_shape[1] <= dimension)
-        ):
-            raise ValueError("Saved hybrid projector subspace_components have invalid shape")
-        rbf_shape = shapes.get("_projector_rbf_landmarks")
-        if rbf_shape is not None and (
-            len(rbf_shape) != 2
-            or not (1 <= rbf_shape[0] <= MAX_SKILL_OPTIONS)
-            or not (1 <= rbf_shape[1] <= dimension)
-            or rbf_shape[0] + rbf_shape[1] != dimension
-        ):
-            raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
-        for name, definition in schema.fields.items():
-            widths = (1, 2) if isinstance(definition, BooleanField) else (len(definition.options),) if hasattr(definition, "options") else (1,)
-            weight_shape = shapes.get(f"{name}_w", ())
-            if weight_shape not in tuple((width, dimension) for width in widths):
-                raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
-            width = weight_shape[0]
-            required_shapes = {"b": (width,), "P": (dimension + 1, dimension + 1), "B": (dimension + 1, width)}
-            for suffix, shape in required_shapes.items():
-                actual = shapes.get(f"{name}_{suffix}")
-                if (suffix == "b" or actual is not None) and actual != shape:
-                    raise ValueError(f"Saved head {name!r} has incompatible {suffix} dimensions")
-            calibration = shapes.get(f"{name}_calib_scores")
-            if calibration is not None and (len(calibration) != 1 or calibration[0] > MAX_SKILL_CALIBRATION_SCORES):
-                raise ValueError("Saved skill calibration exceeds limits")
-            proto_shape = shapes.get(f"{name}_prototypes")
-            if proto_shape is not None:
-                valid_proto_rows = (1, 2) if isinstance(definition, BooleanField) else (width,)
-                if len(proto_shape) != 2 or proto_shape[0] not in valid_proto_rows or proto_shape[1] != dimension:
-                    raise ValueError(f"Saved head {name!r} has incompatible prototypes dimensions")
-            proto_scores_shape = shapes.get(f"{name}_proto_scores")
-            if proto_scores_shape is not None and (
-                len(proto_scores_shape) != 1 or proto_scores_shape[0] > MAX_SKILL_CALIBRATION_SCORES
-            ):
-                raise ValueError("Saved skill prototype calibration exceeds limits")
-            coarse_w_shape = shapes.get(f"{name}_coarse_w")
-            coarse_b_shape = shapes.get(f"{name}_coarse_b")
-            if (coarse_w_shape is None) != (coarse_b_shape is None):
-                raise ValueError(f"Saved head {name!r} has incomplete coarse hierarchical arrays")
-            if coarse_w_shape is not None:
-                if (
-                    len(coarse_w_shape) != 2
-                    or not (1 <= coarse_w_shape[0] <= width)
-                    or coarse_w_shape[1] != dimension
-                    or coarse_b_shape != (coarse_w_shape[0],)
-                ):
-                    raise ValueError(f"Saved head {name!r} has incompatible coarse hierarchical dimensions")
-            fine_w_shape = shapes.get(f"{name}_fine_w")
-            fine_b_shape = shapes.get(f"{name}_fine_b")
-            if (fine_w_shape is None) != (fine_b_shape is None):
-                raise ValueError(f"Saved head {name!r} has incomplete fine hierarchical arrays")
-            if fine_w_shape is not None:
-                if fine_w_shape != (width, dimension) or fine_b_shape != (width,):
-                    raise ValueError(f"Saved head {name!r} has incompatible fine hierarchical dimensions")
-            if f"{name}_B" in shapes and f"{name}_P" not in shapes:
-                runtime_bytes += 8 * (dimension + 1) ** 2
-            for suffix in ("calib_scores", "proto_scores"):
-                runtime_bytes += 32 * shapes.get(f"{name}_{suffix}", (0,))[0]
-            for suffix in EXEMPLAR_ARRAYS:
-                shape = shapes.get(f"{name}_{suffix}")
-                if shape is None:
-                    continue
-                valid = (shape == (dimension,)) if suffix == "exemplar_mean" else (
-                    len(shape) == 2 and shape[1] == dimension
-                    and (suffix not in ("exemplar_centroids", "initial_w") or shape[0] == width)
-                )
-                if not isinstance(definition, ChoiceField) or not valid:
-                    raise ValueError(f"Saved head {name!r} has incompatible exemplar dimensions")
-                if suffix in ("shots_p", "shots_c"):
-                    runtime_bytes += 160 * shape[0]  # Retained per-row ndarray views and list slots.
+        runtime_bytes += _validate_skill_shapes_and_runtime_delta(
+            schema,
+            dimension,
+            shapes,
+            heads_meta=meta.get("heads") if isinstance(meta, Mapping) else None,
+            namespaced=namespaced,
+        )
+        _, layout_extra_bytes = _validate_tensor_layouts_header(meta or {}, shapes)
+        runtime_bytes += layout_extra_bytes
         runtime_bytes += 2 * effective_array_bytes
         if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
             raise ValueError("Saved skill runtime allocation exceeds memory budget")
@@ -266,6 +863,8 @@ def _projector_config(projector: Any, *, include_arrays: bool = True) -> Dict[st
                 "recency_weighted": projector.recency_weighted}
     if type(projector) is TfidfProjector:
         return projector.to_config(include_arrays=include_arrays)
+    if isinstance(projector, PragmaticCompositeProjector):
+        return projector.to_config(include_arrays=include_arrays)
     if isinstance(projector, HybridProjector):
         return projector.to_config(include_arrays=include_arrays)
     config = {"type": "external", "class": f"{type(projector).__module__}.{type(projector).__qualname__}",
@@ -273,6 +872,38 @@ def _projector_config(projector: Any, *, include_arrays: bool = True) -> Dict[st
     if callable(getattr(projector, "projector_digest", None)):
         config["digest"] = projector.projector_digest()
     return config
+
+
+def _validate_projector_header_strict(projector_config: Any, dimension: int) -> None:
+    if not isinstance(projector_config, Mapping) or not isinstance(projector_config.get("type"), str):
+        raise ValueError("Saved projector config must be a mapping with a string type")
+    kind = projector_config["type"]
+    if kind == "deterministic":
+        unexpected = set(projector_config.keys()) - {"type", "dimension", "recency_weighted"}
+        if unexpected:
+            raise ValueError(f"Saved deterministic projector config contains unexpected keys: {sorted(unexpected)}")
+        dim_cfg = projector_config.get("dimension")
+        if type(dim_cfg) is not int or dim_cfg != dimension:
+            raise ValueError("Saved projector dimension does not match the skill")
+        _strict_header_bool(
+            projector_config, "recency_weighted", False, "Saved deterministic projector"
+        )
+    elif kind == "external":
+        unexpected = set(projector_config.keys()) - {"type", "class", "dimension", "digest"}
+        if unexpected:
+            raise ValueError(f"Saved external projector config contains unexpected keys: {sorted(unexpected)}")
+        cls_name = projector_config.get("class")
+        if not isinstance(cls_name, str) or not cls_name.strip():
+            raise ValueError("Saved external projector config must define a non-empty class string")
+        if "dimension" not in projector_config:
+            raise ValueError("Saved external projector config must define dimension")
+        ext_dim = projector_config.get("dimension")
+        if ext_dim is not None and (type(ext_dim) is not int or ext_dim != dimension):
+            raise ValueError("Saved external projector dimension does not match the skill")
+        if "digest" in projector_config:
+            dig = projector_config["digest"]
+            if not isinstance(dig, str) or not dig.strip():
+                raise ValueError("Saved external projector digest must be a non-empty string")
 
 
 @dataclass
@@ -284,6 +915,7 @@ class CompiledHeadWeights:
     weights: np.ndarray  # shape: (K, D) or (1, D)
     biases: np.ndarray   # shape: (K,) or (1,)
     temperature: float = 1.0
+    logit_adjustments: Optional[np.ndarray] = None
     conformal_quantile: float = 0.0
     options: Tuple[str, ...] = ()
     P: Optional[np.ndarray] = None  # Inverted regularized covariance matrix (D+1, D+1)
@@ -338,10 +970,12 @@ class CompiledSystemOneModel:
         self.backend = backend
         self.metadata = metadata or {}
         self.created_at = float(self.metadata.get("created_at", 0.0))
-        self.forgetting_factor = float(forgetting_factor)
+        self.forgetting_factor = _validate_forgetting_factor(forgetting_factor)
         self.recency_weighted = bool(recency_weighted)
         if type(projector) is TfidfProjector and self.recency_weighted:
             raise ValueError("TF-IDF does not support recency weighting")
+        if isinstance(projector, PragmaticCompositeProjector) and self.recency_weighted:
+            raise ValueError("PragmaticCompositeProjector does not support recency weighting")
         self.projector = (
             projector
             if projector is not None
@@ -358,6 +992,8 @@ class CompiledSystemOneModel:
         self.model_version: int = 1
         self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
         self._lock = threading.RLock()
+        self._mmap_obj: Optional[mmap.mmap] = None
+        self._mmap_fh: Optional[Any] = None
         self._learned_prompt_overrides: Dict[str, Dict[str, Any]] = {}
         self._learned_prompt_override_recency: Dict[str, bool] = {}
         raw_overrides = self.metadata.get("learned_prompt_overrides")
@@ -392,15 +1028,21 @@ class CompiledSystemOneModel:
             )
             if name in self.heads:
                 ch = self.heads[name]
+                ch.logit_adjustments = _validate_compiled_logit_adj(
+                    getattr(ch, "logit_adjustments", None),
+                    f_def,
+                    name,
+                )
                 head.set_weights(ch.weights, ch.biases)
                 if ch.exemplar_state is not None:
                     head.restore_exemplar_state(ch.exemplar_state)
-                if (
-                    getattr(ch, "hierarchical", False)
-                    and ch.coarse_weights is not None
-                    and ch.coarse_biases is not None
-                    and len(ch.cluster_assignments) == ch.weights.shape[0]
-                ):
+                if not isinstance(f_def, BooleanField) and getattr(ch, "hierarchical", False):
+                    if (
+                        ch.coarse_weights is None
+                        or ch.coarse_biases is None
+                        or len(ch.cluster_assignments) != ch.weights.shape[0]
+                    ):
+                        raise ValueError(f"Compiled head {name!r} has incomplete hierarchical parameters")
                     head.set_hierarchical_weights(
                         cluster_assignments=ch.cluster_assignments,
                         coarse_weights=ch.coarse_weights,
@@ -411,6 +1053,61 @@ class CompiledSystemOneModel:
                 if ch.P is not None or ch.B is not None:
                     head.init_covariance(P=ch.P, B=ch.B)
             self._field_heads[name] = head
+
+    @staticmethod
+    def _close_mmap_handle(mm: Optional[mmap.mmap], fh: Optional[Any]) -> None:
+        """Closes file handle immediately and unmaps mmap when no NumPy views remain."""
+        try:
+            if mm is not None:
+                try:
+                    mm.close()
+                except BufferError:
+                    gc.collect()
+                    try:
+                        mm.close()
+                    except BufferError:
+                        # External read-only NumPy views still reference mm; GC will unmap it safely.
+                        pass
+        finally:
+            if fh is not None:
+                fh.close()
+
+    def close(self) -> None:
+        """Releases any memory-mapped buffers held by this compiled model."""
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            mm = getattr(self, "_mmap_obj", None)
+            fh = getattr(self, "_mmap_fh", None)
+            if mm is None and fh is None:
+                return
+            self._mmap_obj = None
+            self._mmap_fh = None
+            if hasattr(self, "_field_heads") and self._field_heads:
+                self._field_heads.clear()
+            if hasattr(self, "heads") and self.heads:
+                self.heads.clear()
+            if hasattr(self, "_online_prototype_bank"):
+                self._online_prototype_bank.clear()
+            self.projector = None
+            cache = getattr(self, "cache", None)
+            if cache is not None and hasattr(cache, "clear"):
+                cache.clear()
+            gc.collect()
+            self._close_mmap_handle(mm, fh)
+
+    def __enter__(self) -> CompiledSystemOneModel:
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _build_override_eval(head: DecisionFieldHead, override_val: Any) -> RawFieldEvaluation:
@@ -427,7 +1124,7 @@ class CompiledSystemOneModel:
             logits = (
                 np.array([z], dtype=np.float32)
                 if head.weights.shape[0] == 1
-                else np.array([-z, z], dtype=np.float32)
+                else np.array([z, -z], dtype=np.float32)
             )
             return head.evaluate_logits(logits)
         if isinstance(f_def, MultiChoiceField):
@@ -458,27 +1155,25 @@ class CompiledSystemOneModel:
         ch = self.heads.get(field_name)
         if ch is None or ch.prototypes is None or ch.prototypes.size == 0:
             return None
-        emb = np.asarray(embedding, dtype=np.float32).flatten()
-        if emb.ndim != 1 or ch.prototypes.ndim != 2 or ch.prototypes.shape[1] != emb.shape[0]:
+        emb_raw = np.asarray(embedding)
+        emb_flat = emb_raw.ravel()
+        if emb_flat.ndim != 1 or ch.prototypes.ndim != 2 or ch.prototypes.shape[1] != emb_flat.shape[0]:
             return None
-        e_norm = float(np.linalg.norm(emb))
-        if e_norm < 1e-12 or not math.isfinite(e_norm):
+        emb_unit, _, emb_valid = _normalize_vec_f32_safe(emb_flat)
+        if not emb_valid:
             return 0.0
-        emb_unit = emb / e_norm
-        p_norms = np.linalg.norm(ch.prototypes, axis=1, keepdims=True)
-        valid_rows = p_norms.flatten() > 1e-12
+        proto_all, valid_rows = _normalize_rows_f32_safe(ch.prototypes)
         if not np.any(valid_rows):
             return None
-        proto_unit = ch.prototypes[valid_rows] / np.where(
-            p_norms[valid_rows] < 1e-12, 1.0, p_norms[valid_rows]
-        )
+        proto_unit = proto_all[valid_rows]
         best_sim = float(np.max(proto_unit @ emb_unit))
         online_bank = getattr(self, "_online_prototype_bank", {}).get(field_name)
         if online_bank:
             for shot in online_bank:
-                s_arr = np.asarray(shot, dtype=np.float32).flatten()
-                if s_arr.shape[0] == emb_unit.shape[0]:
-                    sim_s = float(np.dot(s_arr, emb_unit))
+                s_raw = np.asarray(shot).ravel()
+                if s_raw.shape[0] == emb_unit.shape[0]:
+                    with np.errstate(over="ignore", invalid="ignore"):
+                        sim_s = float(np.dot(s_raw.astype(np.float32), emb_unit))
                     if sim_s > best_sim:
                         best_sim = sim_s
         head = self._field_heads.get(field_name)
@@ -486,11 +1181,11 @@ class CompiledSystemOneModel:
         if online_shots:
             for group in online_shots:
                 for shot in group:
-                    s_arr = np.asarray(shot, dtype=np.float32).flatten()
-                    if s_arr.shape[0] == emb_unit.shape[0]:
-                        s_norm = float(np.linalg.norm(s_arr))
-                        if s_norm > 1e-12:
-                            sim_s = float(np.dot(s_arr / s_norm, emb_unit))
+                    s_raw = np.asarray(shot).ravel()
+                    if s_raw.shape[0] == emb_unit.shape[0]:
+                        s_unit, _, s_valid = _normalize_vec_f32_safe(s_raw)
+                        if s_valid:
+                            sim_s = float(np.dot(s_unit, emb_unit))
                             if sim_s > best_sim:
                                 best_sim = sim_s
         return best_sim
@@ -505,25 +1200,25 @@ class CompiledSystemOneModel:
             raise TypeError(f"Prompt must be a string, got {type(prompt).__name__}")
         use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
         raw_norm: Optional[float] = None
-        if hasattr(self.projector, "project_with_norm") and telemetry is None:
-            try:
-                emb, raw_norm = self.projector.project_with_norm(prompt, recency_weighted=use_recency)
-            except TypeError:
-                emb, raw_norm = self.projector.project_with_norm(prompt)
-        elif hasattr(self.projector, "project"):
-            try:
-                emb = self.projector.project(prompt, recency_weighted=use_recency)
-            except TypeError:
-                emb = self.projector.project(prompt)
+        pwn_fn = getattr(self.projector, "project_with_norm", None)
+        proj_fn = getattr(self.projector, "project", None)
+        pwn_rw = _accepts_recency_weighted(pwn_fn)
+        proj_rw = _accepts_recency_weighted(proj_fn)
+        if callable(pwn_fn) and telemetry is None and (pwn_rw or not proj_rw):
+            emb, raw_norm = (
+                pwn_fn(prompt, recency_weighted=use_recency) if pwn_rw else pwn_fn(prompt)
+            )
+        elif callable(proj_fn):
+            emb = proj_fn(prompt, recency_weighted=use_recency) if proj_rw else proj_fn(prompt)
+            if callable(pwn_fn) and telemetry is None:
+                _, raw_norm = pwn_fn(prompt)
         else:
             emb = self.projector(prompt)
-        norm = float(np.linalg.norm(emb))
-        if norm > 1e-12:
-            emb = emb / norm
-        else:
-            emb = np.zeros(self.dimension, dtype=np.float32)
-            if not isinstance(self.projector, TfidfProjector):
-                emb[0] = 1.0
+        emb = _normalize_raw_projection(
+            emb,
+            self.dimension,
+            zero_unit0=not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector)),
+        )
         if telemetry is not None:
             emb = self.telemetry_projector.fuse(emb, telemetry)
         return emb, raw_norm
@@ -574,14 +1269,21 @@ class CompiledSystemOneModel:
         eff_use_cache = self.use_cache if use_cache is None else bool(use_cache)
         raw_norm: Optional[float] = None
         if embedding is not None:
-            emb = np.asarray(embedding, dtype=np.float32).flatten()
+            raw_emb = _assert_real_numeric_array_like(embedding, "embedding")
+            with np.errstate(over="ignore", invalid="ignore"):
+                emb = np.asarray(raw_emb, dtype=np.float32).flatten()
+            if emb.shape[0] != self.dimension:
+                raise ValueError(
+                    f"embedding dimension mismatch: expected {self.dimension}, got {emb.shape[0]}"
+                )
         else:
             emb, raw_norm = self._encode_with_norm(prompt, telemetry=telemetry, recency_weighted=use_recency)
 
         # Check Tier 0 Semantic System 1 Cache
+        emb_finite = bool(np.all(np.isfinite(emb)))
         cur_version = getattr(self, "model_version", 1)
-        if eff_use_cache:
-            schema_dig = self.schema.schema_digest()
+        schema_dig = self.schema.schema_digest()
+        if eff_use_cache and emb_finite:
             hit = self.cache.get(
                 prompt,
                 embedding=emb,
@@ -603,7 +1305,14 @@ class CompiledSystemOneModel:
                     )
 
         override_map: Optional[Dict[str, Any]] = None
-        if self._learned_prompt_overrides and embedding is None and telemetry is None and isinstance(prompt, str) and prompt.strip():
+        if (
+            emb_finite
+            and self._learned_prompt_overrides
+            and embedding is None
+            and telemetry is None
+            and isinstance(prompt, str)
+            and prompt.strip()
+        ):
             norm_key = " ".join(prompt.strip().casefold().split())
             if self._learned_prompt_override_recency.get(norm_key, bool(self.recency_weighted)) == bool(use_recency):
                 override_map = self._learned_prompt_overrides.get(norm_key)
@@ -614,7 +1323,7 @@ class CompiledSystemOneModel:
             if (
                 override_map is not None
                 and name in override_map
-                and (is_zero_emb_eval or (not np.any(head.weights) and not np.any(head.biases)))
+                and (is_zero_emb_eval or _is_active_zero_head(head.field_def, head.weights, head.biases))
             ):
                 evals[name] = self._build_override_eval(head, override_map[name])
             else:
@@ -628,7 +1337,7 @@ class CompiledSystemOneModel:
             raw_norm=raw_norm,
         )
 
-        if eff_use_cache:
+        if eff_use_cache and emb_finite:
             self.cache.put(
                 prompt,
                 result,
@@ -661,6 +1370,8 @@ class CompiledSystemOneModel:
         telemetry: Optional[Any] = None,
         embedding: Optional[np.ndarray] = None,
         recency_weighted: Optional[bool] = None,
+        *,
+        use_cache: Optional[bool] = None,
     ) -> ModelInferenceResult:
         """Alias for forward_single with optional continuous telemetry vector and precomputed embedding."""
         return self.forward_single(
@@ -668,6 +1379,7 @@ class CompiledSystemOneModel:
             telemetry=telemetry,
             embedding=embedding,
             recency_weighted=recency_weighted,
+            use_cache=use_cache,
         )
 
     def learn_from_tier2(
@@ -688,15 +1400,16 @@ class CompiledSystemOneModel:
         examples and recompiling is the simplest reproducible update workflow."""
         with self._lock:
             target_dict = self.schema.validate_lesson(target, allow_unknown=True)
-            eff_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
-            if not math.isfinite(eff_ff) or not (0.0 < eff_ff <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {eff_ff}")
-            eff_reward_scale = float(np.clip(reward_scale, 0.0, 1.0))
+            eff_ff = _validate_forgetting_factor(
+                forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+            )
+            eff_reward_scale_in = _validate_real_scalar(reward_scale, "reward_scale")
+            eff_reward_scale = float(np.clip(eff_reward_scale_in, 0.0, 1.0))
             t0 = time.perf_counter()
             use_recency = self.recency_weighted if recency_weighted is None else bool(recency_weighted)
 
             if embedding is not None:
-                emb = np.asarray(embedding, dtype=np.float32).flatten()
+                emb = _coerce_real_1d_f32(embedding, "embedding")
             else:
                 emb = self.encode(prompt, telemetry=telemetry, recency_weighted=use_recency)
             if len(emb) != self.dimension:
@@ -704,14 +1417,6 @@ class CompiledSystemOneModel:
             if not np.all(np.isfinite(emb)):
                 raise ValueError("embedding contains NaN or Inf non-finite values")
             x_aug = np.append(emb, 1.0).astype(np.float32)
-
-            # Bump model_version and evict prompt only after all inputs are validated
-            self.model_version = getattr(self, "model_version", 1) + 1
-            if self.use_cache and self.cache is not None:
-                if embedding is None and hasattr(self.cache, "evict_prompt"):
-                    self.cache.evict_prompt(prompt)
-                if hasattr(self.cache, "invalidate_prior_versions"):
-                    self.cache.invalidate_prior_versions(self.model_version)
 
             updated_fields: List[str] = []
             update_durations_ms: List[float] = []
@@ -727,203 +1432,34 @@ class CompiledSystemOneModel:
                 else None
             )
 
-            for f_name, target_val in target_dict.items():
-                if f_name in self._field_heads:
-                    head = self._field_heads[f_name]
-                    y_target = head.format_target_vector(target_val)
-                    is_cold_head = head._exemplar_bank is not None or is_cold_skill
-                    skip_field = False
-                    if is_zero_emb:
-                        dt = 0.0
-                        if norm_key is not None and eff_reward_scale >= 0.5:
-                            if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
-                                oldest_key = next(iter(self._learned_prompt_overrides))
-                                self._learned_prompt_overrides.pop(oldest_key, None)
-                                self._learned_prompt_override_recency.pop(oldest_key, None)
-                            self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
-                                self.schema.fields[f_name].validate_value(target_val)
-                            )
-                            self._learned_prompt_override_recency[norm_key] = bool(use_recency)
-                    elif is_cold_head:
-                        if preserve_calibration and eff_reward_scale >= 0.5:
-                            if norm_key is not None:
-                                if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
-                                    oldest_key = next(iter(self._learned_prompt_overrides))
-                                    self._learned_prompt_overrides.pop(oldest_key, None)
-                                    self._learned_prompt_override_recency.pop(oldest_key, None)
-                                self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
-                                    self.schema.fields[f_name].validate_value(target_val)
-                                )
-                                self._learned_prompt_override_recency[norm_key] = bool(use_recency)
-                        elif not preserve_calibration:
-                            if norm_key is not None and norm_key in self._learned_prompt_overrides:
-                                self._learned_prompt_overrides[norm_key].pop(f_name, None)
-                                if not self._learned_prompt_overrides[norm_key]:
-                                    self._learned_prompt_overrides.pop(norm_key, None)
-                                    self._learned_prompt_override_recency.pop(norm_key, None)
-                        dt = head.online_update(
-                            x_aug,
-                            y_target,
-                            forgetting_factor=eff_ff,
-                            prompt=prompt_for_head,
-                            preserve_calibration=preserve_calibration,
-                            reward_scale=eff_reward_scale,
-                        )
-                    else:
-                        if preserve_calibration:
-                            if head.covariance_inv is None or head.cross_covariance is None:
-                                head.init_covariance(regularization=max(4.0, float(getattr(head, "regularization", 1.0))))
-                            x_step = np.append(emb, 0.0).astype(np.float32)
-                            step_ff = 1.0 if eff_ff >= 0.95 else eff_ff
-                            ch_ref = self.heads.get(f_name)
-                            f_type = getattr(ch_ref, "field_type", None) or getattr(getattr(head, "definition", None), "field_type", "choice")
-                            ch_temp = max(0.05, float(getattr(ch_ref, "temperature", 1.0))) if ch_ref is not None else 1.0
-                            score_method = getattr(ch_ref, "score_method", "lac") if ch_ref is not None else "lac"
-                            raw_cal_scores = getattr(ch_ref, "calibration_scores", ()) if ch_ref is not None else ()
-                            ch_q = float(getattr(ch_ref, "conformal_quantile", 0.05)) if ch_ref is not None else 0.05
-                            if score_method == "lac":
-                                pos_scores = [float(s) for s in raw_cal_scores if 1e-6 < float(s) < 0.99]
-                                eff_lac_q = max(ch_q if ch_q < 0.99 else 0.01, min(pos_scores) if pos_scores else 0.01)
-                                q_goal = max(1e-4, min(0.035, eff_lac_q * 0.65))
-                            else:
-                                q_goal = 0.02
-                            target_top_p = min(0.999, max(0.95, 1.0 - q_goal))
-                            hier_scale = 1.45 if getattr(head, "hierarchical", False) else 1.0
-                            wx0 = (head.weights @ emb).astype(np.float32)
-                            b0 = np.asarray(head.biases, dtype=np.float32).flatten()
-                            if f_type == "choice":
-                                target_idx = int(np.argmax(y_target))
-                                z0 = wx0 + b0
-                                z_desired = z0.copy()
-                                for k_idx in range(len(z_desired)):
-                                    if k_idx != target_idx and z_desired[k_idx] > 0.10:
-                                        z_desired[k_idx] = -0.15
-                                other_scaled = np.array(
-                                    [z_desired[k_idx] / (0.25 * ch_temp) for k_idx in range(len(z_desired)) if k_idx != target_idx],
-                                    dtype=np.float64,
-                                )
-                                if len(other_scaled) > 0:
-                                    m_other = float(np.max(other_scaled))
-                                    log_sum_other = m_other + math.log(float(np.sum(np.exp(other_scaled - m_other))))
-                                else:
-                                    log_sum_other = 0.0
-                                req_target_scaled = log_sum_other + math.log(max(2.0, (1.0 - q_goal) / max(1e-6, q_goal)))
-                                req_target_raw = float(np.clip(0.25 * ch_temp * req_target_scaled * hier_scale + 0.15, 1.8, 7.5))
-                                z_desired[target_idx] = max(float(z0[target_idx]), req_target_raw)
-                                y_desired = (z_desired - b0).astype(np.float32)
-                            elif f_type == "boolean":
-                                req_scaled_mag = math.log((1.0 - q_goal) / max(1e-6, q_goal))
-                                req_raw_mag = float(np.clip(0.25 * req_scaled_mag * hier_scale, 2.0, 6.0))
-                                want_true = float(y_target[0]) > 0.0
-                                b_val = float(b0[0]) if len(b0) > 0 else 0.0
-                                y_desired = np.array([(req_raw_mag if want_true else -req_raw_mag) - b_val], dtype=np.float32)
-                            elif f_type in ("multi_choice", "multichoice"):
-                                ev_mc0 = head.forward(emb, prompt=prompt_for_eval)
-                                probs_mc0 = np.asarray(ev_mc0.raw_probabilities, dtype=np.float64)
-                                y_desired = wx0.copy()
-                                z_mag = float(np.clip(0.25 * math.log((1.0 - q_goal) / max(1e-6, q_goal)), 1.8, 5.5))
-                                for k_idx in range(len(y_target)):
-                                    want_pos = float(y_target[k_idx]) > 0.0
-                                    p_k = float(probs_mc0[k_idx]) if k_idx < len(probs_mc0) else 0.5
-                                    err_k = (1.0 - p_k) if want_pos else p_k
-                                    if err_k > q_goal:
-                                        desired_logit = (z_mag if want_pos else -z_mag) - float(b0[k_idx])
-                                        y_desired[k_idx] = np.float32(np.clip(desired_logit, -5.5, 5.5))
-                            elif f_type == "score":
-                                b_val = float(b0[0]) if len(b0) > 0 else 0.0
-                                y_desired = np.array([float(y_target[0]) - b_val], dtype=np.float32)
-                            else:
-                                y_desired = y_target
+            head_snaps = {
+                fn: self._field_heads[fn]._snapshot_state()
+                for fn in target_dict
+                if fn in self._field_heads and hasattr(self._field_heads[fn], "_snapshot_state")
+            }
+            ch_snaps = {
+                fn: dict(self.heads[fn].__dict__)
+                for fn in target_dict
+                if fn in self.heads
+            }
+            ov_snap = {k: dict(v) for k, v in self._learned_prompt_overrides.items()}
+            ov_rec_snap = dict(self._learned_prompt_override_recency)
+            has_proto_bank = hasattr(self, "_online_prototype_bank")
+            proto_bank_snap = (
+                {k: list(v) for k, v in self._online_prototype_bank.items()}
+                if has_proto_bank
+                else None
+            )
 
-                            if eff_reward_scale < 1.0:
-                                y_desired = (wx0 + eff_reward_scale * (y_desired - wx0)).astype(np.float32)
-
+            try:
+                for f_name, target_val in target_dict.items():
+                    if f_name in self._field_heads:
+                        head = self._field_heads[f_name]
+                        y_target = head.format_target_vector(target_val)
+                        is_cold_head = head._exemplar_bank is not None or is_cold_skill
+                        skip_field = False
+                        if is_zero_emb:
                             dt = 0.0
-                            if len(self._field_heads) > 1:
-                                ev_pre = head.forward(emb, prompt=prompt_for_eval)
-                                logits_pre = np.asarray(ev_pre.logits, dtype=np.float64) / ch_temp
-                                eff_q_skip = ch_q if 0.0 < ch_q < 0.90 else 0.04
-                                if f_type == "choice" and len(logits_pre) >= 2:
-                                    shifted_pre = logits_pre - np.max(logits_pre)
-                                    exp_pre = np.exp(shifted_pre)
-                                    probs_c_pre = exp_pre / np.sum(exp_pre)
-                                    pred_idx_pre = int(np.argmax(probs_c_pre))
-                                    p_top_pre = float(probs_c_pre[pred_idx_pre])
-                                    if pred_idx_pre == target_idx and (1.0 - p_top_pre) <= max(1e-3, eff_q_skip) and p_top_pre >= 0.95:
-                                        skip_field = True
-                                elif f_type in ("multi_choice", "multichoice"):
-                                    probs_pre = np.asarray(ev_pre.raw_probabilities, dtype=np.float64)
-                                    s_pre = float(np.max(np.minimum(probs_pre, 1.0 - probs_pre))) if len(probs_pre) > 0 else 0.0
-                                    if set(ev_pre.selected_value) == set(target_val) and s_pre <= max(0.04, eff_q_skip):
-                                        skip_field = True
-                                elif f_type == "boolean":
-                                    p_sel_pre = float(ev_pre.confidence)
-                                    if bool(ev_pre.selected_value) == bool(target_val) and (1.0 - p_sel_pre) <= max(0.04, eff_q_skip) and p_sel_pre >= 0.95:
-                                        skip_field = True
-                                elif f_type == "score":
-                                    if abs(float(ev_pre.selected_value) - float(target_val)) <= min(0.04, max(0.01, eff_q_skip * 0.8)):
-                                        skip_field = True
-                            if not skip_field:
-                                # Exact Sherman-Morrison directional gain scaling so W_next @ emb == y_desired in 1 step
-                                p_mat = head.covariance_inv
-                                g_val = float(x_step @ (p_mat @ x_step)) if p_mat is not None else 0.0
-                                if g_val > 1e-6:
-                                    y_step = ((step_ff + g_val) * y_desired - step_ff * wx0) / g_val
-                                    y_step = np.clip(y_step, -40.0, 40.0).astype(np.float32)
-                                else:
-                                    y_step = y_desired
-                                dt = head.online_update(
-                                    x_step,
-                                    y_step,
-                                    forgetting_factor=step_ff,
-                                    prompt=prompt_for_head,
-                                )
-                                if eff_reward_scale >= 0.5:
-                                    for step_i in range(4):
-                                        ev = head.forward(emb, prompt=prompt_for_eval)
-                                        logits_ev = np.asarray(ev.logits, dtype=np.float64) / ch_temp
-                                        if f_type == "choice" and len(logits_ev) >= 2:
-                                            shifted_ev = logits_ev - np.max(logits_ev)
-                                            exp_ev = np.exp(shifted_ev)
-                                            probs_cal = exp_ev / np.sum(exp_ev)
-                                            s_p = np.sort(probs_cal)
-                                            if (
-                                                ev.selected_value == target_val
-                                                and float(s_p[-1]) >= target_top_p
-                                                and float(s_p[-1] - s_p[-2]) >= 0.55
-                                            ):
-                                                break
-                                        elif f_type in ("multi_choice", "multichoice"):
-                                            probs_mc = np.asarray(ev.raw_probabilities, dtype=np.float64)
-                                            max_err_mc = float(np.max(np.minimum(probs_mc, 1.0 - probs_mc))) if len(probs_mc) > 0 else 0.0
-                                            if (
-                                                set(ev.selected_value) == set(target_val)
-                                                and max_err_mc <= max(0.03, ch_q * 0.9)
-                                            ):
-                                                break
-                                        elif f_type == "score":
-                                            if abs(float(ev.selected_value) - float(target_val)) <= 0.02:
-                                                break
-                                        elif f_type == "boolean":
-                                            p_sel = float(ev.confidence)
-                                            if bool(ev.selected_value) == bool(target_val) and p_sel >= target_top_p:
-                                                break
-                                        elif bool(ev.selected_value) == bool(target_val) and ev.confidence >= 0.90:
-                                            break
-                                        wx_curr = (head.weights @ emb).astype(np.float32)
-                                        p_curr = head.covariance_inv
-                                        g_curr = float(x_step @ (p_curr @ x_step)) if p_curr is not None else 0.0
-                                        if g_curr > 1e-6:
-                                            y_refine = ((step_ff + g_curr) * y_desired - step_ff * wx_curr) / g_curr
-                                            y_refine = np.clip(y_refine, -40.0, 40.0).astype(np.float32)
-                                        else:
-                                            y_refine = y_desired
-                                        dt += head.online_update(
-                                            x_step,
-                                            y_refine,
-                                            forgetting_factor=step_ff,
-                                            prompt=prompt_for_head,
-                                        )
                             if norm_key is not None and eff_reward_scale >= 0.5:
                                 if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
                                     oldest_key = next(iter(self._learned_prompt_overrides))
@@ -933,122 +1469,337 @@ class CompiledSystemOneModel:
                                     self.schema.fields[f_name].validate_value(target_val)
                                 )
                                 self._learned_prompt_override_recency[norm_key] = bool(use_recency)
-                        else:
-                            if norm_key is not None and norm_key in self._learned_prompt_overrides:
-                                self._learned_prompt_overrides[norm_key].pop(f_name, None)
-                                if not self._learned_prompt_overrides[norm_key]:
-                                    self._learned_prompt_overrides.pop(norm_key, None)
-                                    self._learned_prompt_override_recency.pop(norm_key, None)
+                        elif is_cold_head:
+                            if preserve_calibration and eff_reward_scale >= 0.5:
+                                if norm_key is not None:
+                                    if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
+                                        oldest_key = next(iter(self._learned_prompt_overrides))
+                                        self._learned_prompt_overrides.pop(oldest_key, None)
+                                        self._learned_prompt_override_recency.pop(oldest_key, None)
+                                    self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
+                                        self.schema.fields[f_name].validate_value(target_val)
+                                    )
+                                    self._learned_prompt_override_recency[norm_key] = bool(use_recency)
+                            elif not preserve_calibration:
+                                if norm_key is not None and norm_key in self._learned_prompt_overrides:
+                                    self._learned_prompt_overrides[norm_key].pop(f_name, None)
+                                    if not self._learned_prompt_overrides[norm_key]:
+                                        self._learned_prompt_overrides.pop(norm_key, None)
+                                        self._learned_prompt_override_recency.pop(norm_key, None)
                             dt = head.online_update(
                                 x_aug,
                                 y_target,
                                 forgetting_factor=eff_ff,
                                 prompt=prompt_for_head,
+                                preserve_calibration=preserve_calibration,
+                                reward_scale=eff_reward_scale,
                             )
-                    update_durations_ms.append(dt)
+                        else:
+                            if preserve_calibration:
+                                if head.covariance_inv is None or head.cross_covariance is None:
+                                    head.init_covariance(regularization=max(4.0, float(getattr(head, "regularization", 1.0))))
+                                x_step = np.append(emb, 0.0).astype(np.float32)
+                                step_ff = 1.0 if eff_ff >= 0.95 else eff_ff
+                                ch_ref = self.heads.get(f_name)
+                                f_type = getattr(ch_ref, "field_type", None) or getattr(getattr(head, "definition", None), "field_type", "choice")
+                                ch_temp = max(0.05, float(getattr(ch_ref, "temperature", 1.0))) if ch_ref is not None else 1.0
+                                score_method = getattr(ch_ref, "score_method", "lac") if ch_ref is not None else "lac"
+                                raw_cal_scores = getattr(ch_ref, "calibration_scores", ()) if ch_ref is not None else ()
+                                ch_q = float(getattr(ch_ref, "conformal_quantile", 0.05)) if ch_ref is not None else 0.05
+                                if score_method == "lac":
+                                    pos_scores = [float(s) for s in raw_cal_scores if 1e-6 < float(s) < 0.99]
+                                    eff_lac_q = max(ch_q if ch_q < 0.99 else 0.01, min(pos_scores) if pos_scores else 0.01)
+                                    q_goal = max(1e-4, min(0.035, eff_lac_q * 0.65))
+                                else:
+                                    q_goal = 0.02
+                                target_top_p = min(0.999, max(0.95, 1.0 - q_goal))
+                                hier_scale = 1.45 if getattr(head, "hierarchical", False) else 1.0
+                                wx0 = (head.weights @ emb).astype(np.float32)
+                                b0 = np.asarray(head.biases, dtype=np.float32).flatten()
+                                if f_type == "choice":
+                                    target_idx = int(np.argmax(y_target))
+                                    z0 = wx0 + b0
+                                    z_desired = z0.copy()
+                                    for k_idx in range(len(z_desired)):
+                                        if k_idx != target_idx and z_desired[k_idx] > 0.10:
+                                            z_desired[k_idx] = -0.15
+                                    other_scaled = np.array(
+                                        [z_desired[k_idx] / (0.25 * ch_temp) for k_idx in range(len(z_desired)) if k_idx != target_idx],
+                                        dtype=np.float64,
+                                    )
+                                    if len(other_scaled) > 0:
+                                        m_other = float(np.max(other_scaled))
+                                        log_sum_other = m_other + math.log(float(np.sum(np.exp(other_scaled - m_other))))
+                                    else:
+                                        log_sum_other = 0.0
+                                    req_target_scaled = log_sum_other + math.log(max(2.0, (1.0 - q_goal) / max(1e-6, q_goal)))
+                                    req_target_raw = float(np.clip(0.25 * ch_temp * req_target_scaled * hier_scale + 0.15, 1.8, 7.5))
+                                    z_desired[target_idx] = max(float(z0[target_idx]), req_target_raw)
+                                    y_desired = (z_desired - b0).astype(np.float32)
+                                elif f_type == "boolean":
+                                    req_scaled_mag = math.log((1.0 - q_goal) / max(1e-6, q_goal))
+                                    req_raw_mag = float(np.clip(0.25 * req_scaled_mag * hier_scale, 2.0, 6.0))
+                                    want_true = float(y_target[0]) > 0.0
+                                    b_val = float(b0[0]) if len(b0) > 0 else 0.0
+                                    y_desired = np.array([(req_raw_mag if want_true else -req_raw_mag) - b_val], dtype=np.float32)
+                                elif f_type in ("multi_choice", "multichoice"):
+                                    ev_mc0 = head.forward(emb, prompt=prompt_for_eval)
+                                    probs_mc0 = np.asarray(ev_mc0.raw_probabilities, dtype=np.float64)
+                                    y_desired = wx0.copy()
+                                    z_mag = float(np.clip(0.25 * math.log((1.0 - q_goal) / max(1e-6, q_goal)), 1.8, 5.5))
+                                    for k_idx in range(len(y_target)):
+                                        want_pos = float(y_target[k_idx]) > 0.0
+                                        p_k = float(probs_mc0[k_idx]) if k_idx < len(probs_mc0) else 0.5
+                                        err_k = (1.0 - p_k) if want_pos else p_k
+                                        if err_k > q_goal:
+                                            desired_logit = (z_mag if want_pos else -z_mag) - float(b0[k_idx])
+                                            y_desired[k_idx] = np.float32(np.clip(desired_logit, -5.5, 5.5))
+                                elif f_type == "score":
+                                    b_val = float(b0[0]) if len(b0) > 0 else 0.0
+                                    y_desired = np.array([float(y_target[0]) - b_val], dtype=np.float32)
+                                else:
+                                    y_desired = y_target
 
-                    # Sync back to compiled head weights
-                    if f_name in self.heads:
-                        ch = self.heads[f_name]
-                        ch.weights = head.weights
-                        ch.biases = head.biases
-                        ch.P = head.covariance_inv
-                        ch.B = head.cross_covariance
-                        ch.exemplar_state = head.export_exemplar_state()
-                        if head.hierarchical:
-                            ch.coarse_weights = head.coarse_weights
-                            ch.coarse_biases = head.coarse_biases
-                            ch.fine_weights = head.fine_weights
-                            ch.fine_biases = head.fine_biases
-                        if not is_zero_emb and ch.prototypes is not None and ch.prototypes.shape[1] == len(emb):
-                            e_norm = float(np.linalg.norm(emb))
-                            if e_norm > 1e-12:
-                                emb_u = emb / e_norm
-                                proto_idx: Optional[int] = None
-                                if ch.field_type == "choice" and len(y_target) == ch.prototypes.shape[0]:
-                                    proto_idx = int(np.argmax(y_target))
-                                elif ch.field_type == "boolean" and ch.prototypes.shape[0] == 2:
-                                    proto_idx = 1 if float(y_target[0]) > 0.0 else 0
-                                if not skip_field and proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
-                                    cur_p = ch.prototypes[proto_idx]
-                                    sim_before = float(np.max(ch.prototypes @ emb_u)) if np.any(cur_p) else 0.0
-                                    if not preserve_calibration or ch.prototype_threshold <= 0.0 or not np.any(cur_p):
-                                        blend = (0.25 if preserve_calibration else 0.15) * eff_reward_scale
-                                        updated_p = emb_u if not np.any(cur_p) else ((1.0 - blend) * cur_p + blend * emb_u)
-                                        up_norm = float(np.linalg.norm(updated_p))
-                                        if up_norm > 1e-12:
-                                            ch.prototypes = ch.prototypes.copy()
-                                            ch.prototypes[proto_idx] = (updated_p / up_norm).astype(np.float32)
-                                    elif eff_reward_scale >= 0.5 and sim_before < ch.prototype_threshold:
-                                        if not hasattr(self, "_online_prototype_bank"):
-                                            self._online_prototype_bank = {}
-                                        bank = self._online_prototype_bank.setdefault(f_name, [])
-                                        if len(bank) >= 256:
-                                            bank.pop(0)
-                                        bank.append(emb_u.astype(np.float32))
-                                if preserve_calibration and eff_reward_scale >= 0.5 and ch.prototype_threshold > 0.0:
-                                    sim_after = self.compute_prototype_similarity(f_name, emb_u)
-                                    if sim_after is not None and sim_after < ch.prototype_threshold:
-                                        ch.prototype_threshold = max(0.0, sim_after - 1e-4)
-                        if (
-                            preserve_calibration
-                            and eff_reward_scale >= 0.5
-                            and ch.familiarity_threshold > 0.0
-                            and hasattr(self.projector, "raw_norm")
-                            and isinstance(prompt, str)
-                            and prompt.strip()
-                        ):
-                            try:
-                                p_raw_norm = float(self.projector.raw_norm(prompt))
-                                if p_raw_norm > 0.0 and p_raw_norm < ch.familiarity_threshold:
-                                    ch.familiarity_threshold = max(0.0, p_raw_norm - 1e-4)
-                            except Exception:
-                                pass
-                        if preserve_calibration and not ch.calibration_scores:
-                            if ch.field_type in ("choice", "boolean", "multi_choice", "multichoice"):
-                                k_opts = max(2, len(ch.options))
-                                q_init = float((k_opts - 1.0) / (3.5 + k_opts))
-                                ch.score_method = "lac"
-                                ch.calibration_scores = tuple(q_init for _ in range(20))
-                                ch.conformal_quantile = q_init
-                            elif ch.field_type == "score":
-                                f_def_sc = self.schema.fields.get(f_name)
-                                span = (
-                                    max(1e-6, float(f_def_sc.max_value - f_def_sc.min_value))
-                                    if isinstance(f_def_sc, ScoreField)
-                                    else 1.0
+                                if eff_reward_scale < 1.0:
+                                    y_desired = (wx0 + eff_reward_scale * (y_desired - wx0)).astype(np.float32)
+
+                                dt = 0.0
+                                if len(self._field_heads) > 1:
+                                    ev_pre = head.forward(emb, prompt=prompt_for_eval)
+                                    logits_pre = np.asarray(ev_pre.logits, dtype=np.float64) / ch_temp
+                                    eff_q_skip = ch_q if 0.0 < ch_q < 0.90 else 0.04
+                                    if f_type == "choice" and len(logits_pre) >= 2:
+                                        shifted_pre = logits_pre - np.max(logits_pre)
+                                        exp_pre = np.exp(shifted_pre)
+                                        probs_c_pre = exp_pre / np.sum(exp_pre)
+                                        pred_idx_pre = int(np.argmax(probs_c_pre))
+                                        p_top_pre = float(probs_c_pre[pred_idx_pre])
+                                        if pred_idx_pre == target_idx and (1.0 - p_top_pre) <= max(1e-3, eff_q_skip) and p_top_pre >= 0.95:
+                                            skip_field = True
+                                    elif f_type in ("multi_choice", "multichoice"):
+                                        probs_pre = np.asarray(ev_pre.raw_probabilities, dtype=np.float64)
+                                        s_pre = float(np.max(np.minimum(probs_pre, 1.0 - probs_pre))) if len(probs_pre) > 0 else 0.0
+                                        if set(ev_pre.selected_value) == set(target_val) and s_pre <= max(0.04, eff_q_skip):
+                                            skip_field = True
+                                    elif f_type == "boolean":
+                                        p_sel_pre = float(ev_pre.confidence)
+                                        if bool(ev_pre.selected_value) == bool(target_val) and (1.0 - p_sel_pre) <= max(0.04, eff_q_skip) and p_sel_pre >= 0.95:
+                                            skip_field = True
+                                    elif f_type == "score":
+                                        if abs(float(ev_pre.selected_value) - float(target_val)) <= min(0.04, max(0.01, eff_q_skip * 0.8)):
+                                            skip_field = True
+                                if not skip_field:
+                                    # Exact Sherman-Morrison directional gain scaling so W_next @ emb == y_desired in 1 step
+                                    p_mat = head.covariance_inv
+                                    g_val = float(x_step @ (p_mat @ x_step)) if p_mat is not None else 0.0
+                                    if g_val > 1e-6:
+                                        y_step = ((step_ff + g_val) * y_desired - step_ff * wx0) / g_val
+                                        y_step = np.clip(y_step, -40.0, 40.0).astype(np.float32)
+                                    else:
+                                        y_step = y_desired
+                                    dt = head.online_update(
+                                        x_step,
+                                        y_step,
+                                        forgetting_factor=step_ff,
+                                        prompt=prompt_for_head,
+                                    )
+                                    if eff_reward_scale >= 0.5:
+                                        for step_i in range(4):
+                                            ev = head.forward(emb, prompt=prompt_for_eval)
+                                            logits_ev = np.asarray(ev.logits, dtype=np.float64) / ch_temp
+                                            if f_type == "choice" and len(logits_ev) >= 2:
+                                                shifted_ev = logits_ev - np.max(logits_ev)
+                                                exp_ev = np.exp(shifted_ev)
+                                                probs_cal = exp_ev / np.sum(exp_ev)
+                                                s_p = np.sort(probs_cal)
+                                                if (
+                                                    ev.selected_value == target_val
+                                                    and float(s_p[-1]) >= target_top_p
+                                                    and float(s_p[-1] - s_p[-2]) >= 0.55
+                                                ):
+                                                    break
+                                            elif f_type in ("multi_choice", "multichoice"):
+                                                probs_mc = np.asarray(ev.raw_probabilities, dtype=np.float64)
+                                                max_err_mc = float(np.max(np.minimum(probs_mc, 1.0 - probs_mc))) if len(probs_mc) > 0 else 0.0
+                                                if (
+                                                    set(ev.selected_value) == set(target_val)
+                                                    and max_err_mc <= max(0.03, ch_q * 0.9)
+                                                ):
+                                                    break
+                                            elif f_type == "score":
+                                                if abs(float(ev.selected_value) - float(target_val)) <= 0.02:
+                                                    break
+                                            elif f_type == "boolean":
+                                                p_sel = float(ev.confidence)
+                                                if bool(ev.selected_value) == bool(target_val) and p_sel >= target_top_p:
+                                                    break
+                                            elif bool(ev.selected_value) == bool(target_val) and ev.confidence >= 0.90:
+                                                break
+                                            wx_curr = (head.weights @ emb).astype(np.float32)
+                                            p_curr = head.covariance_inv
+                                            g_curr = float(x_step @ (p_curr @ x_step)) if p_curr is not None else 0.0
+                                            if g_curr > 1e-6:
+                                                y_refine = ((step_ff + g_curr) * y_desired - step_ff * wx_curr) / g_curr
+                                                y_refine = np.clip(y_refine, -40.0, 40.0).astype(np.float32)
+                                            else:
+                                                y_refine = y_desired
+                                            dt += head.online_update(
+                                                x_step,
+                                                y_refine,
+                                                forgetting_factor=step_ff,
+                                                prompt=prompt_for_head,
+                                            )
+                                if norm_key is not None and eff_reward_scale >= 0.5:
+                                    if len(self._learned_prompt_overrides) >= 4096 and norm_key not in self._learned_prompt_overrides:
+                                        oldest_key = next(iter(self._learned_prompt_overrides))
+                                        self._learned_prompt_overrides.pop(oldest_key, None)
+                                        self._learned_prompt_override_recency.pop(oldest_key, None)
+                                    self._learned_prompt_overrides.setdefault(norm_key, {})[f_name] = (
+                                        self.schema.fields[f_name].validate_value(target_val)
+                                    )
+                                    self._learned_prompt_override_recency[norm_key] = bool(use_recency)
+                            else:
+                                if norm_key is not None and norm_key in self._learned_prompt_overrides:
+                                    self._learned_prompt_overrides[norm_key].pop(f_name, None)
+                                    if not self._learned_prompt_overrides[norm_key]:
+                                        self._learned_prompt_overrides.pop(norm_key, None)
+                                        self._learned_prompt_override_recency.pop(norm_key, None)
+                                dt = head.online_update(
+                                    x_aug,
+                                    y_target,
+                                    forgetting_factor=eff_ff,
+                                    prompt=prompt_for_head,
                                 )
-                                q_init_sc = 0.05 * span
-                                ch.calibration_scores = tuple(q_init_sc for _ in range(20))
-                                ch.conformal_quantile = q_init_sc
-                        elif not preserve_calibration:
-                            # Old evidence describes the previous weights, including on disk.
-                            ch.calibration_scores = ()
-                            ch.class_calibration_scores = {}
-                            ch.familiarity_threshold = 0.0
-                            ch.prototype_threshold = 0.0
-                            ch.prototype_scores = ()
-                            ch.conformal_quantile = 0.0
-                            ch.temperature = 1.0
-                    updated_fields.append(f_name)
+                        update_durations_ms.append(dt)
 
-            rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
-            total_ms = (time.perf_counter() - t0) * 1000.0
+                        # Sync back to compiled head weights
+                        if f_name in self.heads:
+                            ch = self.heads[f_name]
+                            ch.weights = head.weights
+                            ch.biases = head.biases
+                            ch.P = head.covariance_inv
+                            ch.B = head.cross_covariance
+                            ch.exemplar_state = head.export_exemplar_state()
+                            if head.hierarchical:
+                                ch.coarse_weights = head.coarse_weights
+                                ch.coarse_biases = head.coarse_biases
+                                ch.fine_weights = head.fine_weights
+                                ch.fine_biases = head.fine_biases
+                            if not is_zero_emb and ch.prototypes is not None and ch.prototypes.shape[1] == len(emb):
+                                e_norm = float(np.linalg.norm(emb))
+                                if e_norm > 1e-12:
+                                    emb_u = emb / e_norm
+                                    proto_idx: Optional[int] = None
+                                    if ch.field_type == "choice" and len(y_target) == ch.prototypes.shape[0]:
+                                        proto_idx = int(np.argmax(y_target))
+                                    elif ch.field_type == "boolean" and ch.prototypes.shape[0] == 2:
+                                        proto_idx = 1 if float(y_target[0]) > 0.0 else 0
+                                    if not skip_field and proto_idx is not None and 0 <= proto_idx < ch.prototypes.shape[0]:
+                                        cur_p = ch.prototypes[proto_idx]
+                                        sim_before = float(np.max(ch.prototypes @ emb_u)) if np.any(cur_p) else 0.0
+                                        if not preserve_calibration or ch.prototype_threshold <= 0.0 or not np.any(cur_p):
+                                            blend = (0.25 if preserve_calibration else 0.15) * eff_reward_scale
+                                            updated_p = emb_u if not np.any(cur_p) else ((1.0 - blend) * cur_p + blend * emb_u)
+                                            up_norm = float(np.linalg.norm(updated_p))
+                                            if up_norm > 1e-12:
+                                                ch.prototypes = ch.prototypes.copy()
+                                                ch.prototypes[proto_idx] = (updated_p / up_norm).astype(np.float32)
+                                        elif eff_reward_scale >= 0.5 and sim_before < ch.prototype_threshold:
+                                            if not hasattr(self, "_online_prototype_bank"):
+                                                self._online_prototype_bank = {}
+                                            bank = self._online_prototype_bank.setdefault(f_name, [])
+                                            if len(bank) >= 256:
+                                                bank.pop(0)
+                                            bank.append(emb_u.astype(np.float32))
+                                    if preserve_calibration and eff_reward_scale >= 0.5 and ch.prototype_threshold > 0.0:
+                                        sim_after = self.compute_prototype_similarity(f_name, emb_u)
+                                        if sim_after is not None and sim_after < ch.prototype_threshold:
+                                            ch.prototype_threshold = max(0.0, sim_after - 1e-4)
+                            if (
+                                preserve_calibration
+                                and eff_reward_scale >= 0.5
+                                and ch.familiarity_threshold > 0.0
+                                and isinstance(prompt, str)
+                                and prompt.strip()
+                            ):
+                                p_raw_norm = _extract_projector_raw_norm(
+                                    self.projector, prompt, recency_weighted=use_recency
+                                )
+                                if (
+                                    p_raw_norm is not None
+                                    and math.isfinite(p_raw_norm)
+                                    and 0.0 < p_raw_norm < ch.familiarity_threshold
+                                ):
+                                    ch.familiarity_threshold = max(0.0, p_raw_norm - 1e-4)
+                            if preserve_calibration and not ch.calibration_scores:
+                                if ch.field_type in ("choice", "boolean", "multi_choice", "multichoice"):
+                                    k_opts = max(2, len(ch.options))
+                                    q_init = float((k_opts - 1.0) / (3.5 + k_opts))
+                                    ch.score_method = "lac"
+                                    ch.calibration_scores = tuple(q_init for _ in range(20))
+                                    ch.conformal_quantile = q_init
+                                elif ch.field_type == "score":
+                                    f_def_sc = self.schema.fields.get(f_name)
+                                    q_init_sc = (
+                                        0.10 * _score_half_span(f_def_sc.min_value, f_def_sc.max_value)
+                                        if isinstance(f_def_sc, ScoreField)
+                                        else 0.05
+                                    )
+                                    ch.calibration_scores = tuple(q_init_sc for _ in range(20))
+                                    ch.conformal_quantile = q_init_sc
+                            elif not preserve_calibration:
+                                # Old evidence describes the previous weights, including on disk.
+                                ch.calibration_scores = ()
+                                ch.class_calibration_scores = {}
+                                ch.familiarity_threshold = 0.0
+                                ch.prototype_threshold = 0.0
+                                ch.prototype_scores = ()
+                                ch.conformal_quantile = 0.0
+                                ch.temperature = 1.0
+                                ch.logit_adjustments = None
+                        updated_fields.append(f_name)
 
-            # Evaluate model to get fresh result and store in Tier 0 cache
-            override_map = None
-            if norm_key is not None and self._learned_prompt_override_recency.get(norm_key, bool(self.recency_weighted)) == bool(use_recency):
-                override_map = self._learned_prompt_overrides.get(norm_key)
-            evals: Dict[str, RawFieldEvaluation] = {}
-            for name, head in self._field_heads.items():
-                if (
-                    override_map is not None
-                    and name in override_map
-                    and (is_zero_emb or (not np.any(head.weights) and not np.any(head.biases)))
-                ):
-                    evals[name] = self._build_override_eval(head, override_map[name])
-                else:
-                    evals[name] = head.forward(emb, prompt=prompt_for_eval)
+                rank1_ms = float(sum(update_durations_ms)) if update_durations_ms else 0.0
+                total_ms = (time.perf_counter() - t0) * 1000.0
+
+                # Evaluate model to get fresh result before committing version and cache updates
+                override_map = None
+                if norm_key is not None and self._learned_prompt_override_recency.get(norm_key, bool(self.recency_weighted)) == bool(use_recency):
+                    override_map = self._learned_prompt_overrides.get(norm_key)
+                evals: Dict[str, RawFieldEvaluation] = {}
+                for name, head in self._field_heads.items():
+                    if (
+                        override_map is not None
+                        and name in override_map
+                        and (is_zero_emb or _is_active_zero_head(head.field_def, head.weights, head.biases))
+                    ):
+                        evals[name] = self._build_override_eval(head, override_map[name])
+                    else:
+                        evals[name] = head.forward(emb, prompt=prompt_for_eval)
+            except BaseException:
+                for fn, h_snap in head_snaps.items():
+                    self._field_heads[fn]._restore_state(h_snap)
+                for fn, ch_snap in ch_snaps.items():
+                    self.heads[fn].__dict__.clear()
+                    self.heads[fn].__dict__.update(ch_snap)
+                self._learned_prompt_overrides.clear()
+                self._learned_prompt_overrides.update(ov_snap)
+                self._learned_prompt_override_recency.clear()
+                self._learned_prompt_override_recency.update(ov_rec_snap)
+                if has_proto_bank and proto_bank_snap is not None:
+                    self._online_prototype_bank.clear()
+                    self._online_prototype_bank.update(proto_bank_snap)
+                elif hasattr(self, "_online_prototype_bank"):
+                    delattr(self, "_online_prototype_bank")
+                raise
+
+            self.model_version = getattr(self, "model_version", 1) + 1
+            if self.use_cache and self.cache is not None:
+                if embedding is None and hasattr(self.cache, "evict_prompt"):
+                    self.cache.evict_prompt(prompt)
+                if hasattr(self.cache, "invalidate_prior_versions"):
+                    self.cache.invalidate_prior_versions(self.model_version)
+
             inference_res = ModelInferenceResult(
                 prompt=prompt,
                 embedding=emb,
@@ -1085,6 +1836,8 @@ class CompiledSystemOneModel:
         recency_weighted: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Unsupervised test-time zero-shot prototype and exemplar adaptation across schema heads."""
+        margin_threshold = _validate_real_scalar(margin_threshold, "margin_threshold")
+        learning_rate = _validate_real_scalar(learning_rate, "learning_rate")
         with self._lock:
             t0 = time.perf_counter()
             if isinstance(prompts, str):
@@ -1148,15 +1901,11 @@ class CompiledSystemOneModel:
     ) -> Dict[str, Any]:
         """Online teaching with retained heuristic gates, not preserved coverage."""
         if forgetting_factor is not None:
-            ff_val = float(forgetting_factor)
-            if not math.isfinite(ff_val) or not (0.0 < ff_val <= 1.0):
-                raise ValueError(f"Forgetting factor lambda_f must be in (0, 1.0], got {ff_val}")
+            _validate_forgetting_factor(forgetting_factor)
         eff_ff = forgetting_factor
         eff_reward_scale = 1.0
         if reward is not None:
-            r_val = float(reward)
-            if not math.isfinite(r_val):
-                raise ValueError("reward must be a finite number")
+            r_val = _validate_real_scalar(reward, "reward")
             if r_val <= 0.0:
                 skipped: Dict[str, Any] = {
                     "status": "skipped_non_positive_reward",
@@ -1170,7 +1919,9 @@ class CompiledSystemOneModel:
                 return skipped
             eff_reward_scale = float(np.clip(r_val, 0.0, 1.0))
             if r_val != 1.0:
-                base_ff = float(forgetting_factor if forgetting_factor is not None else self.forgetting_factor)
+                base_ff = _validate_forgetting_factor(
+                    forgetting_factor if forgetting_factor is not None else self.forgetting_factor
+                )
                 eff_ff = float(np.clip(1.0 - (1.0 - base_ff) * min(r_val, 2.0), 0.5, 1.0))
 
         resolved_target = target
@@ -1291,174 +2042,454 @@ class CompiledSystemOneModel:
             use_cache=use_cache,
         )
 
-    def to_bytes(self, include_covariance: bool = False, *, compact: Optional[bool] = None) -> bytes:
-        """Serializes the compiled model into compact .s1m binary bytes.
+    def _build_export_header_and_arrays(
+        self,
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
+    ) -> Tuple[Dict[str, Any], Dict[str, np.ndarray]]:
+        """Builds metadata dictionary and contiguous array payload for .s1m serialization."""
+        if format_version not in (2, 3):
+            raise ValueError(f"Unsupported .s1m format_version {format_version!r}; expected 2 or 3")
+        if format_version == 3 and not 0 < len(self.schema.fields) <= MAX_SKILL_FIELDS_V3:
+            raise ValueError(
+                f"Skill field count {len(self.schema.fields)} exceeds v3 limit {MAX_SKILL_FIELDS_V3}"
+            )
 
-        By default, excludes covariance matrices to keep the binary ultra-compact (<20 KB).
-        Covariance is automatically initialized on-demand if online learning is invoked.
+        heads_meta: Dict[str, Any] = {}
+        exemplar_states = {name: head.export_exemplar_state() for name, head in self._field_heads.items()}
+        for name, ch in sorted(self.heads.items()):
+            h_entry: Dict[str, Any] = {
+                "field_type": ch.field_type,
+                "temperature": float(ch.temperature),
+                "conformal_quantile": float(ch.conformal_quantile),
+                "score_method": ch.score_method,
+                "margin_threshold": float(getattr(ch, "margin_threshold", 0.20)),
+                "forgetting_factor": float(getattr(ch, "forgetting_factor", 0.995)),
+                "relative_odds_ratio": float(getattr(ch, "relative_odds_ratio", 1.5)),
+                "confidence_floor_tau0": float(getattr(ch, "confidence_floor_tau0", 0.15)),
+                "escalate_on_ambiguity": bool(getattr(ch, "escalate_on_ambiguity", True)),
+                "options": list(ch.options),
+                "weights_shape": list(ch.weights.shape),
+                "biases_shape": list(ch.biases.shape),
+            }
+            if getattr(ch, "mondrian", False):
+                h_entry["mondrian"] = True
+            class_scores = getattr(ch, "class_calibration_scores", None)
+            if class_scores and (
+                getattr(ch, "mondrian", False)
+                or sum(len(v) for v in class_scores.values()) <= 2048
+            ):
+                h_entry["class_calibration_scores"] = {
+                    str(k): [float(v) for v in vals] for k, vals in sorted(class_scores.items())
+                }
+            fam_thresh = float(getattr(ch, "familiarity_threshold", 0.0))
+            if fam_thresh > 0.0:
+                h_entry["familiarity_threshold"] = fam_thresh
+            proto_thresh = float(getattr(ch, "prototype_threshold", 0.0))
+            if proto_thresh > 0.0:
+                h_entry["prototype_threshold"] = proto_thresh
+            f_def_h = self.schema.fields.get(name)
+            if not isinstance(f_def_h, BooleanField) and getattr(ch, "hierarchical", False):
+                if (
+                    ch.coarse_weights is None
+                    or ch.coarse_biases is None
+                    or len(getattr(ch, "cluster_assignments", ()) or ()) != ch.weights.shape[0]
+                    or (ch.fine_weights is None) != (ch.fine_biases is None)
+                ):
+                    raise ValueError(f"Head {name!r} has incomplete hierarchical parameters")
+                h_entry["hierarchical"] = True
+                h_entry["cluster_assignments"] = [int(c) for c in ch.cluster_assignments]
+            state = exemplar_states.get(name)
+            if state is not None:
+                h_entry["exemplar_state"] = {key: value for key, value in state.items() if key != "arrays"}
+            heads_meta[name] = h_entry
+
+        serialized_meta: Dict[str, Any] = {
+            **self.metadata,
+            "forgetting_factor": self.forgetting_factor,
+            "recency_weighted": self.recency_weighted,
+        }
+        # Loaded metadata may describe lessons that have since been cleared.
+        serialized_meta.pop("learned_prompt_overrides", None)
+        serialized_meta.pop("learned_prompt_override_recency", None)
+        if self._learned_prompt_overrides:
+            serialized_meta["learned_prompt_overrides"] = {
+                p_k: {
+                    f_k: (list(f_v) if isinstance(f_v, tuple) else f_v)
+                    for f_k, f_v in f_map.items()
+                }
+                for p_k, f_map in self._learned_prompt_overrides.items()
+            }
+            serialized_meta["learned_prompt_override_recency"] = {
+                p_k: bool(self._learned_prompt_override_recency.get(p_k, self.recency_weighted))
+                for p_k in self._learned_prompt_overrides
+            }
+
+        use_binary_tfidf_idf = (
+            type(self.projector) is TfidfProjector
+            and (compact is True or len(self.projector._terms) > 128)
+        )
+        use_binary_prag_tfidf = (
+            isinstance(self.projector, PragmaticCompositeProjector)
+            and (
+                compact is True
+                or (len(self.projector.base_tfidf._terms) + len(self.projector._prag_terms)) > 128
+            )
+        )
+        header_meta: Dict[str, Any] = {
+            "version": int(format_version),
+            "projector": _projector_config(
+                self.projector,
+                include_arrays=(
+                    not use_binary_tfidf_idf
+                    if type(self.projector) is TfidfProjector
+                    else (
+                        not use_binary_prag_tfidf
+                        if isinstance(self.projector, PragmaticCompositeProjector)
+                        else False
+                    )
+                ),
+            ),
+            "schema_name": self.schema.schema_name,
+            "schema_dict": self.schema.to_dict(),
+            "schema_digest": self.schema.schema_digest(),
+            "dimension": self.dimension,
+            "created_at": getattr(self, "created_at", 0.0),
+            "metadata": serialized_meta,
+            "heads": heads_meta,
+        }
+        if format_version == 3:
+            header_meta["embed_vocab"] = bool(embed_vocab)
+        namespaced_tensors = _schema_needs_namespaced_head_tensors(self.schema)
+        if namespaced_tensors:
+            header_meta["tensor_namespace"] = "len_v1"
+
+        def _is_f_2d_tensor(arr: np.ndarray) -> bool:
+            return bool(
+                isinstance(arr, np.ndarray)
+                and arr.ndim == 2
+                and arr.size > 0
+                and arr.flags["F_CONTIGUOUS"]
+                and not arr.flags["C_CONTIGUOUS"]
+            )
+
+        def _pack_array(arr: np.ndarray) -> np.ndarray:
+            is_f_2d = _is_f_2d_tensor(arr)
+            with np.errstate(over="ignore", invalid="ignore"):
+                a32 = np.asarray(arr).astype(np.float32, order="K", copy=False)
+            if not bool(np.all(np.isfinite(a32))):
+                raise ValueError("Compiled model array must be finite in float32")
+            if a32.ndim == 2 and a32.size > 0:
+                if format_version == 3:
+                    if compact is True:
+                        with np.errstate(over="ignore", invalid="ignore"):
+                            a16 = a32.astype(np.float16, order="K")
+                        if np.all(np.isfinite(a16)):
+                            return np.asfortranarray(a16) if is_f_2d else np.ascontiguousarray(a16)
+                    return np.asfortranarray(a32) if is_f_2d else np.ascontiguousarray(a32)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    a16 = a32.astype(np.float16, order="K")
+                if np.all(np.isfinite(a16)) and (
+                    compact is True
+                    or (compact is None and np.array_equal(a32, a16.astype(np.float32)))
+                ):
+                    return np.asfortranarray(a16) if is_f_2d else a16
+            if format_version == 3:
+                return np.asfortranarray(a32) if is_f_2d else np.ascontiguousarray(a32)
+            return np.asfortranarray(a32) if is_f_2d else a32
+
+        tensor_layouts: Dict[str, List[int]] = {}
+
+        def _pack_named_array(tname: str, arr: np.ndarray) -> np.ndarray:
+            arr_np = np.asarray(arr)
+            if _needs_2d_layout_preservation(arr_np):
+                clone_spec = _validate_2d_layout_cloneable(arr_np, np.dtype(np.float32))
+                if clone_spec is not None:
+                    mod64, s0_f32, s1_f32, _, _ = clone_spec
+                    tensor_layouts[tname] = [int(mod64), int(s0_f32), int(s1_f32)]
+                return _pack_array(np.array(arr_np, order="C", copy=True))
+            return _pack_array(arr_np)
+
+        def _pack_f32_vec(arr: np.ndarray, label: str) -> np.ndarray:
+            with np.errstate(over="ignore", invalid="ignore"):
+                out = np.asarray(arr, dtype=np.float32)
+            if not bool(np.all(np.isfinite(out))):
+                raise ValueError(f"{label} must be finite in float32")
+            return out
+
+        arrays_to_save: Dict[str, np.ndarray] = {}
+        from system1.core.embeddings import HybridProjector
+
+        if use_binary_tfidf_idf:
+            arrays_to_save["_projector_tfidf_idf"] = np.asarray(self.projector._idf, dtype=np.float64)
+        if use_binary_prag_tfidf:
+            arrays_to_save["_projector_prag_base_idf"] = np.asarray(
+                self.projector.base_tfidf._idf, dtype=np.float64
+            )
+            if self.projector.prag_dim > 0:
+                arrays_to_save["_projector_prag_idf"] = np.asarray(
+                    self.projector.prag_idf, dtype=np.float64
+                )
+        if isinstance(self.projector, HybridProjector) and getattr(self.projector, "_fitted", False):
+            if getattr(self.projector, "_spectral_vectors", None) is not None:
+                arrays_to_save["_projector_spectral_vectors"] = _pack_named_array(
+                    "_projector_spectral_vectors", self.projector._spectral_vectors
+                )
+            if getattr(self.projector, "_subspace_components", None) is not None:
+                arrays_to_save["_projector_subspace_components"] = _pack_named_array(
+                    "_projector_subspace_components", self.projector._subspace_components
+                )
+            if getattr(self.projector, "_rbf_landmarks", None) is not None:
+                arrays_to_save["_projector_rbf_landmarks"] = _pack_named_array(
+                    "_projector_rbf_landmarks", self.projector._rbf_landmarks
+                )
+            hybrid_tfidf = getattr(self.projector, "_tfidf_projector", None)
+            if hybrid_tfidf is not None and getattr(hybrid_tfidf, "_idf", None) is not None:
+                arrays_to_save["_projector_hybrid_tfidf_idf"] = np.asarray(
+                    hybrid_tfidf._idf, dtype=np.float64
+                )
+
+        if format_version == 3 and embed_vocab and isinstance(self.projector, HybridProjector):
+            dense_eng = self.projector._dense_engine
+            arrays_to_save["_projector_dense_table"] = np.ascontiguousarray(
+                dense_eng._table, dtype=np.float32
+            )
+            if getattr(self.projector, "_spectral_basis", None) is not None:
+                arrays_to_save["_projector_spectral_basis"] = _pack_named_array(
+                    "_projector_spectral_basis", self.projector._spectral_basis
+                )
+            header_meta["dense_embed_vocab"] = {
+                "vocab_size": int(dense_eng.vocab_size),
+                "seed": int(dense_eng.seed),
+                "explicit_alpha": bool(getattr(self.projector, "_explicit_alpha", True)),
+                "multiword_by_space3": {
+                    str(k): [[str(e[0]), bool(e[1]), int(e[2])] for e in entries]
+                    for k, entries in dense_eng._multiword_by_space3.items()
+                },
+                "sparse": (
+                    self.projector._tfidf_projector.to_config(include_arrays=False)
+                    if self.projector._tfidf_projector is not None
+                    else None
+                ),
+            }
+
+        for name, ch in sorted(self.heads.items()):
+            def _hk(suffix: str, _fn: str = name) -> str:
+                return _head_tensor_name(_fn, suffix, namespaced=namespaced_tensors)
+
+            arrays_to_save[_hk("w")] = _pack_named_array(_hk("w"), ch.weights)
+            b_arr = np.asarray(ch.biases)
+            if b_arr.ndim != 1:
+                raise ValueError(f"Head {name!r} biases must be 1D, got shape {b_arr.shape}")
+            arrays_to_save[_hk("b")] = _pack_f32_vec(b_arr, f"Head {name!r} biases")
+            state = exemplar_states.get(name)
+            if state is not None:
+                for suffix, arr in state["arrays"].items():
+                    arr_np = np.asarray(arr)
+                    arrays_to_save[_hk(suffix)] = (
+                        _pack_named_array(_hk(suffix), arr_np) if arr_np.ndim == 2 else arr_np
+                    )
+            if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
+                arrays_to_save[_hk("calib_scores")] = np.asarray(ch.calibration_scores, dtype=np.float64)
+            if getattr(ch, "logit_adjustments", None) is not None:
+                adj_valid = _validate_compiled_logit_adj(
+                    ch.logit_adjustments, self.schema.fields[name], name
+                )
+                if adj_valid is not None:
+                    arrays_to_save[_hk("logit_adj")] = np.ascontiguousarray(adj_valid, dtype=np.float64)
+            if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
+                proto_32 = _pack_f32_vec(ch.prototypes, f"Head {name!r} prototypes")
+                with np.errstate(over="ignore", invalid="ignore"):
+                    proto_16 = proto_32.astype(np.float16)
+                if (
+                    compact is not False
+                    and (format_version == 2 or compact is True)
+                    and np.all(np.isfinite(proto_16))
+                ):
+                    arrays_to_save[_hk("prototypes")] = proto_16
+                else:
+                    arrays_to_save[_hk("prototypes")] = _pack_array(proto_32)
+            if getattr(ch, "prototype_scores", ()) and len(ch.prototype_scores) > 0:
+                arrays_to_save[_hk("proto_scores")] = np.asarray(ch.prototype_scores, dtype=np.float64)
+            if (
+                getattr(ch, "hierarchical", False)
+                and ch.coarse_weights is not None
+                and ch.coarse_biases is not None
+            ):
+                cb_arr = np.asarray(ch.coarse_biases)
+                if cb_arr.ndim != 1:
+                    raise ValueError(f"Head {name!r} coarse_biases must be 1D, got shape {cb_arr.shape}")
+                arrays_to_save[_hk("coarse_w")] = _pack_named_array(_hk("coarse_w"), ch.coarse_weights)
+                arrays_to_save[_hk("coarse_b")] = _pack_f32_vec(
+                    cb_arr, f"Head {name!r} coarse biases"
+                )
+                if ch.fine_weights is not None and ch.fine_biases is not None:
+                    fb_arr = np.asarray(ch.fine_biases)
+                    if fb_arr.ndim != 1:
+                        raise ValueError(f"Head {name!r} fine_biases must be 1D, got shape {fb_arr.shape}")
+                    arrays_to_save[_hk("fine_w")] = _pack_named_array(_hk("fine_w"), ch.fine_weights)
+                    arrays_to_save[_hk("fine_b")] = _pack_f32_vec(
+                        fb_arr, f"Head {name!r} fine biases"
+                    )
+            if include_covariance:
+                if ch.P is not None:
+                    arrays_to_save[_hk("P")] = _pack_named_array(_hk("P"), ch.P)
+                if ch.B is not None:
+                    arrays_to_save[_hk("B")] = _pack_named_array(_hk("B"), ch.B)
+
+        if tensor_layouts:
+            header_meta["tensor_layouts"] = tensor_layouts
+
+        if format_version == 3:
+            for tname, arr in list(arrays_to_save.items()):
+                is_f_2d = _is_f_2d_tensor(arr)
+                if arr.dtype.name not in _ALLOWED_V3_DTYPES:
+                    arr_norm = (
+                        np.asfortranarray(arr, dtype=np.float32)
+                        if is_f_2d
+                        else np.ascontiguousarray(arr, dtype=np.float32)
+                    )
+                else:
+                    arr_norm = np.asfortranarray(arr) if is_f_2d else np.ascontiguousarray(arr)
+                arrays_to_save[tname] = arr_norm
+
+        return header_meta, arrays_to_save
+
+    def _to_bytes_v3(
+        self,
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+        embed_vocab: bool = False,
+    ) -> bytes:
+        header_meta, arrays_to_save = self._build_export_header_and_arrays(
+            include_covariance=include_covariance,
+            compact=compact,
+            format_version=3,
+            embed_vocab=embed_vocab,
+        )
+        arrays_ordered = sorted(arrays_to_save.items(), key=lambda kv: kv[0])
+
+        def _v3_manifest_entry(arr: np.ndarray, offset: int) -> Dict[str, Any]:
+            entry: Dict[str, Any] = {
+                "dtype": arr.dtype.name,
+                "shape": [int(d) for d in arr.shape],
+                "offset": int(offset),
+                "nbytes": int(arr.nbytes),
+            }
+            if (
+                arr.ndim == 2
+                and arr.size > 0
+                and arr.flags["F_CONTIGUOUS"]
+                and not arr.flags["C_CONTIGUOUS"]
+            ):
+                entry["order"] = "F"
+            return entry
+
+        manifest: Dict[str, Dict[str, Any]] = {
+            tname: _v3_manifest_entry(arr, 0) for tname, arr in arrays_ordered
+        }
+        header_meta["tensors"] = manifest
+        header_bytes = json.dumps(header_meta, sort_keys=True, allow_nan=False).encode("utf-8")
+        if len(header_bytes) > MAX_SKILL_HEADER_BYTES_V3:
+            raise ValueError("Saved v3 skill header exceeds size limit")
+
+        cursor = 0
+        for _ in range(8):
+            cursor = (
+                (16 + len(header_bytes) + S1M_V3_PAGE_SIZE - 1) // S1M_V3_PAGE_SIZE
+            ) * S1M_V3_PAGE_SIZE
+            next_manifest: Dict[str, Dict[str, Any]] = {}
+            for idx, (tname, arr) in enumerate(arrays_ordered):
+                align = (
+                    S1M_V3_PAGE_SIZE
+                    if (idx == 0 or arr.nbytes >= 65536 or tname == "_projector_dense_table")
+                    else 64
+                )
+                cursor = ((cursor + align - 1) // align) * align
+                next_manifest[tname] = _v3_manifest_entry(arr, cursor)
+                cursor += int(arr.nbytes)
+            header_meta["tensors"] = next_manifest
+            next_header_bytes = json.dumps(header_meta, sort_keys=True, allow_nan=False).encode("utf-8")
+            if len(next_header_bytes) > MAX_SKILL_HEADER_BYTES_V3:
+                raise ValueError("Saved v3 skill header exceeds size limit")
+            if next_manifest == manifest and next_header_bytes == header_bytes:
+                header_bytes = next_header_bytes
+                manifest = next_manifest
+                break
+            header_bytes = next_header_bytes
+            manifest = next_manifest
+        else:
+            # Final pass to guarantee offsets remain consistent with settled header_len.
+            cursor = (
+                (16 + len(header_bytes) + S1M_V3_PAGE_SIZE - 1) // S1M_V3_PAGE_SIZE
+            ) * S1M_V3_PAGE_SIZE
+            for idx, (tname, arr) in enumerate(arrays_ordered):
+                align = (
+                    S1M_V3_PAGE_SIZE
+                    if (idx == 0 or arr.nbytes >= 65536 or tname == "_projector_dense_table")
+                    else 64
+                )
+                cursor = ((cursor + align - 1) // align) * align
+                manifest[tname]["offset"] = int(cursor)
+                cursor += int(arr.nbytes)
+            header_meta["tensors"] = manifest
+            header_bytes = json.dumps(header_meta, sort_keys=True, allow_nan=False).encode("utf-8")
+
+        total_len = ((cursor + S1M_V3_PAGE_SIZE - 1) // S1M_V3_PAGE_SIZE) * S1M_V3_PAGE_SIZE
+        if total_len > MAX_SKILL_BYTES_V3:
+            raise ValueError("Saved v3 skill file exceeds size limit")
+
+        out = bytearray(total_len)
+        _V3_HDR_STRUCT.pack_into(out, 0, MAGIC_HEADER_V3, len(header_bytes))
+        out[16 : 16 + len(header_bytes)] = header_bytes
+        for tname, arr in arrays_ordered:
+            spec = manifest[tname]
+            nbytes = int(spec["nbytes"])
+            if nbytes > 0:
+                offset = int(spec["offset"])
+                if spec.get("order") == "F":
+                    out[offset : offset + nbytes] = arr.tobytes(order="F")
+                else:
+                    out[offset : offset + nbytes] = np.ascontiguousarray(arr).tobytes()
+        return bytes(out)
+
+    def to_bytes(
+        self,
+        include_covariance: bool = False,
+        *,
+        compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
+    ) -> bytes:
+        """Serializes the compiled model into .s1m binary bytes (v2 compact zip or v3 page-aligned mmap).
+
+        By default (format_version=2), excludes covariance matrices and emits S1M\\x02
+        bytes (<20 KB for typical skills). Set format_version=3 for S1M\\x03 page-aligned
+        zero-copy mmap storage supporting up to 512 fields and optional embed_vocab.
         """
         with self._lock:
-            heads_meta: Dict[str, Any] = {}
-            exemplar_states = {name: head.export_exemplar_state() for name, head in self._field_heads.items()}
-            for name, ch in sorted(self.heads.items()):
-                h_entry: Dict[str, Any] = {
-                    "field_type": ch.field_type,
-                    "temperature": float(ch.temperature),
-                    "conformal_quantile": float(ch.conformal_quantile),
-                    "score_method": ch.score_method,
-                    "margin_threshold": float(getattr(ch, "margin_threshold", 0.20)),
-                    "forgetting_factor": float(getattr(ch, "forgetting_factor", 0.995)),
-                    "relative_odds_ratio": float(getattr(ch, "relative_odds_ratio", 1.5)),
-                    "confidence_floor_tau0": float(getattr(ch, "confidence_floor_tau0", 0.15)),
-                    "escalate_on_ambiguity": bool(getattr(ch, "escalate_on_ambiguity", True)),
-                    "options": list(ch.options),
-                    "weights_shape": list(ch.weights.shape),
-                    "biases_shape": list(ch.biases.shape),
-                }
-                if getattr(ch, "mondrian", False):
-                    h_entry["mondrian"] = True
-                class_scores = getattr(ch, "class_calibration_scores", None)
-                if class_scores and (
-                    getattr(ch, "mondrian", False)
-                    or sum(len(v) for v in class_scores.values()) <= 2048
-                ):
-                    h_entry["class_calibration_scores"] = {
-                        str(k): [float(v) for v in vals] for k, vals in sorted(class_scores.items())
-                    }
-                fam_thresh = float(getattr(ch, "familiarity_threshold", 0.0))
-                if fam_thresh > 0.0:
-                    h_entry["familiarity_threshold"] = fam_thresh
-                proto_thresh = float(getattr(ch, "prototype_threshold", 0.0))
-                if proto_thresh > 0.0:
-                    h_entry["prototype_threshold"] = proto_thresh
-                if getattr(ch, "hierarchical", False) and getattr(ch, "cluster_assignments", ()):
-                    h_entry["hierarchical"] = True
-                    h_entry["cluster_assignments"] = [int(c) for c in ch.cluster_assignments]
-                state = exemplar_states.get(name)
-                if state is not None:
-                    h_entry["exemplar_state"] = {key: value for key, value in state.items() if key != "arrays"}
-                heads_meta[name] = h_entry
-
-            serialized_meta: Dict[str, Any] = {
-                **self.metadata,
-                "forgetting_factor": self.forgetting_factor,
-                "recency_weighted": self.recency_weighted,
-            }
-            # Loaded metadata may describe lessons that have since been cleared.
-            serialized_meta.pop("learned_prompt_overrides", None)
-            serialized_meta.pop("learned_prompt_override_recency", None)
-            if self._learned_prompt_overrides:
-                serialized_meta["learned_prompt_overrides"] = {
-                    p_k: {
-                        f_k: (list(f_v) if isinstance(f_v, tuple) else f_v)
-                        for f_k, f_v in f_map.items()
-                    }
-                    for p_k, f_map in self._learned_prompt_overrides.items()
-                }
-                serialized_meta["learned_prompt_override_recency"] = {
-                    p_k: bool(self._learned_prompt_override_recency.get(p_k, self.recency_weighted))
-                    for p_k in self._learned_prompt_overrides
-                }
-
-            use_binary_tfidf_idf = (
-                type(self.projector) is TfidfProjector
-                and (compact is True or len(self.projector._terms) > 128)
+            if format_version == 3:
+                return self._to_bytes_v3(
+                    include_covariance=include_covariance,
+                    compact=compact,
+                    embed_vocab=embed_vocab,
+                )
+            header_meta, arrays_to_save = self._build_export_header_and_arrays(
+                include_covariance=include_covariance,
+                compact=compact,
+                format_version=format_version,
+                embed_vocab=False,
             )
-            header_meta = {
-                "version": 2,
-                "projector": _projector_config(
-                    self.projector,
-                    include_arrays=(
-                        not use_binary_tfidf_idf
-                        if type(self.projector) is TfidfProjector
-                        else False
-                    ),
-                ),
-                "schema_name": self.schema.schema_name,
-                "schema_dict": self.schema.to_dict(),
-                "schema_digest": self.schema.schema_digest(),
-                "dimension": self.dimension,
-                "created_at": getattr(self, "created_at", 0.0),
-                "metadata": serialized_meta,
-                "heads": heads_meta,
-            }
             header_bytes = json.dumps(header_meta, sort_keys=True).encode("utf-8")
             header_len = len(header_bytes)
             if header_len > MAX_SKILL_HEADER_BYTES:
                 raise ValueError("Saved skill header exceeds size limit")
 
-            def _pack_array(arr: np.ndarray) -> np.ndarray:
-                a32 = np.asarray(arr, dtype=np.float32)
-                if a32.ndim == 2 and a32.size > 0:
-                    a16 = a32.astype(np.float16)
-                    if np.all(np.isfinite(a16)) and (
-                        compact is True
-                        or (compact is None and np.array_equal(a32, a16.astype(np.float32)))
-                    ):
-                        return a16
-                return a32
-
-            # Pack numpy weights into compressed zip buffer
             npz_buf = io.BytesIO()
-            arrays_to_save: Dict[str, np.ndarray] = {}
-            from system1.core.embeddings import HybridProjector
-
-            if use_binary_tfidf_idf:
-                arrays_to_save["_projector_tfidf_idf"] = np.asarray(self.projector._idf, dtype=np.float64)
-            if isinstance(self.projector, HybridProjector) and getattr(self.projector, "_fitted", False):
-                if getattr(self.projector, "_spectral_vectors", None) is not None:
-                    arrays_to_save["_projector_spectral_vectors"] = _pack_array(
-                        self.projector._spectral_vectors
-                    )
-                if getattr(self.projector, "_subspace_components", None) is not None:
-                    arrays_to_save["_projector_subspace_components"] = _pack_array(
-                        self.projector._subspace_components
-                    )
-                if getattr(self.projector, "_rbf_landmarks", None) is not None:
-                    arrays_to_save["_projector_rbf_landmarks"] = _pack_array(
-                        self.projector._rbf_landmarks
-                    )
-                hybrid_tfidf = getattr(self.projector, "_tfidf_projector", None)
-                if hybrid_tfidf is not None and getattr(hybrid_tfidf, "_idf", None) is not None:
-                    arrays_to_save["_projector_hybrid_tfidf_idf"] = np.asarray(
-                        hybrid_tfidf._idf, dtype=np.float64
-                    )
-            for name, ch in sorted(self.heads.items()):
-                arrays_to_save[f"{name}_w"] = _pack_array(ch.weights)
-                arrays_to_save[f"{name}_b"] = ch.biases.astype(np.float32)
-                state = exemplar_states.get(name)
-                if state is not None:
-                    for suffix, arr in state["arrays"].items():
-                        arr_np = np.asarray(arr)
-                        arrays_to_save[f"{name}_{suffix}"] = (
-                            _pack_array(arr_np) if arr_np.ndim == 2 else arr_np
-                        )
-                if hasattr(ch, "calibration_scores") and len(ch.calibration_scores) > 0:
-                    arrays_to_save[f"{name}_calib_scores"] = np.asarray(ch.calibration_scores, dtype=np.float64)
-                if getattr(ch, "prototypes", None) is not None and np.any(ch.prototypes):
-                    proto_32 = np.asarray(ch.prototypes, dtype=np.float32)
-                    proto_16 = proto_32.astype(np.float16)
-                    if compact is not False and np.all(np.isfinite(proto_16)):
-                        arrays_to_save[f"{name}_prototypes"] = proto_16
-                    else:
-                        arrays_to_save[f"{name}_prototypes"] = _pack_array(proto_32)
-                if getattr(ch, "prototype_scores", ()) and len(ch.prototype_scores) > 0:
-                    arrays_to_save[f"{name}_proto_scores"] = np.asarray(ch.prototype_scores, dtype=np.float64)
-                if (
-                    getattr(ch, "hierarchical", False)
-                    and ch.coarse_weights is not None
-                    and ch.coarse_biases is not None
-                ):
-                    arrays_to_save[f"{name}_coarse_w"] = _pack_array(ch.coarse_weights)
-                    arrays_to_save[f"{name}_coarse_b"] = np.asarray(ch.coarse_biases, dtype=np.float32)
-                    if ch.fine_weights is not None and ch.fine_biases is not None:
-                        arrays_to_save[f"{name}_fine_w"] = _pack_array(ch.fine_weights)
-                        arrays_to_save[f"{name}_fine_b"] = np.asarray(ch.fine_biases, dtype=np.float32)
-                if include_covariance:
-                    if ch.P is not None:
-                        arrays_to_save[f"{name}_P"] = _pack_array(ch.P)
-                    if ch.B is not None:
-                        arrays_to_save[f"{name}_B"] = _pack_array(ch.B)
             np.savez_compressed(npz_buf, **arrays_to_save)
             npz_bytes = npz_buf.getvalue()
 
@@ -1476,164 +2507,586 @@ class CompiledSystemOneModel:
         include_covariance: bool = False,
         *,
         compact: Optional[bool] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
     ) -> None:
         """Saves compiled model to a .s1m binary file on disk."""
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(self.to_bytes(include_covariance=include_covariance, compact=compact))
+        target.write_bytes(
+            self.to_bytes(
+                include_covariance=include_covariance,
+                compact=compact,
+                format_version=format_version,
+                embed_vocab=embed_vocab,
+            )
+        )
+
+    @staticmethod
+    def _coerce_readonly_float_array(arr: Optional[np.ndarray], dtype: Any) -> Optional[np.ndarray]:
+        """Convert array to target runtime float dtype without overflow warnings and mark read-only."""
+        if arr is None:
+            return None
+        target = np.dtype(dtype)
+        if arr.dtype == target:
+            return arr
+        with np.errstate(over="ignore", invalid="ignore"):
+            out = np.asarray(arr).astype(target, order="K", copy=False)
+        out.setflags(write=False)
+        return out
+
+    @staticmethod
+    def _validate_hybrid_projector_config_and_tensors(
+        projector_config: Mapping[str, Any],
+        array_map: Mapping[str, np.ndarray],
+        dimension: int,
+    ) -> Tuple[
+        int,
+        Optional[TfidfProjector],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+        Optional[np.ndarray],
+    ]:
+        """Validate HybridProjector config scalars, TF-IDF header, and tensor shapes before reconstruction."""
+        from system1.core.embeddings import HybridProjector
+
+        if not isinstance(projector_config, Mapping):
+            raise ValueError("Saved hybrid projector config must be a mapping")
+        if set(projector_config) - HybridProjector.CONFIG_KEYS:
+            raise ValueError("Saved hybrid projector contains unsupported settings")
+
+        sparse = projector_config.get("sparse_dim")
+        dense = projector_config.get("dense_dim")
+        if type(sparse) is not int or type(dense) is not int or sparse <= 0 or dense <= 0:
+            raise ValueError("Saved hybrid projector dimensions are invalid")
+
+        def _req_num(val: Any, name: str) -> float:
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise ValueError(f"Saved hybrid projector {name} must be finite")
+            fval = float(val)
+            if not math.isfinite(fval):
+                raise ValueError(f"Saved hybrid projector {name} must be finite")
+            return fval
+
+        def _req_bool(key: str, default: bool = False) -> bool:
+            if key not in projector_config:
+                return default
+            val = projector_config[key]
+            if type(val) is not bool:
+                raise ValueError(f"Saved hybrid projector {key} must be a boolean")
+            return val
+
+        alpha = _req_num(projector_config.get("alpha", 0.5), "alpha")
+        if not (0.0 < alpha < 1.0):
+            raise ValueError("Saved hybrid projector alpha must be in (0, 1)")
+        seed = projector_config.get("seed", 42)
+        if type(seed) is not int:
+            raise ValueError("Saved hybrid projector seed must be an integer")
+        if _req_num(projector_config.get("svd_power", 0.5), "svd_power") < 0.0:
+            raise ValueError("Saved hybrid projector svd_power must be nonnegative")
+        spectral_blend = _req_num(projector_config.get("spectral_blend", 0.35), "spectral_blend")
+        if not (0.0 <= spectral_blend <= 1.0):
+            raise ValueError("Saved hybrid projector spectral_blend must be in [0, 1]")
+        subspace_weight = _req_num(projector_config.get("subspace_weight", 0.0), "subspace_weight")
+        if not (0.0 <= subspace_weight <= 1.0):
+            raise ValueError("Saved hybrid projector subspace_weight must be in [0, 1]")
+        if _req_num(projector_config.get("context_smooth", 1.0), "context_smooth") < 0.0:
+            raise ValueError("Saved hybrid projector context_smooth must be nonnegative")
+        if _req_num(projector_config.get("rbf_gamma", 3.0), "rbf_gamma") <= 0.0:
+            raise ValueError("Saved hybrid projector rbf_gamma must be positive")
+        rbf_weight = _req_num(projector_config.get("rbf_weight", 0.0), "rbf_weight")
+        if not (0.0 <= rbf_weight < 1.0):
+            raise ValueError("Saved hybrid projector rbf_weight must be in [0, 1)")
+
+        fitted = _req_bool("fitted", False)
+        _req_bool("use_subspace", False)
+        direct_spectral = _req_bool("direct_spectral", False)
+        raw_ds_dim = projector_config.get("direct_spectral_dim", 0)
+        if type(raw_ds_dim) is not int or not (0 <= raw_ds_dim <= 1024):
+            raise ValueError("Saved hybrid projector direct_spectral_dim is invalid")
+
+        _HYBRID_TFIDF_KEY_MAP = (
+            ("tfidf_use_stems", "use_stems"),
+            ("tfidf_stem_weight", "stem_weight"),
+            ("tfidf_use_skip_bigrams", "use_skip_bigrams"),
+            ("tfidf_skip_weight", "skip_weight"),
+            ("tfidf_word_quota_frac", "word_quota_frac"),
+            ("tfidf_char_weight", "char_weight"),
+        )
+        _HYBRID_ALL_TFIDF_KEYS = {
+            "tfidf_terms",
+            "tfidf_idf",
+            "tfidf_char_ngrams",
+            *(src_k for src_k, _ in _HYBRID_TFIDF_KEY_MAP),
+        }
+        has_any_tfidf_cfg = bool(set(projector_config.keys()) & _HYBRID_ALL_TFIDF_KEYS)
+        has_hybrid_idf_arr = "_projector_hybrid_tfidf_idf" in array_map
+        top_tfidf: Optional[TfidfProjector] = None
+        if not fitted:
+            if has_any_tfidf_cfg or has_hybrid_idf_arr:
+                raise ValueError("Unfitted saved hybrid projector cannot carry TF-IDF state")
+        elif "tfidf_terms" not in projector_config:
+            if has_any_tfidf_cfg or has_hybrid_idf_arr:
+                raise ValueError("Saved hybrid projector has incomplete TF-IDF configuration")
+        else:
+            tf_terms = projector_config["tfidf_terms"]
+            if not isinstance(tf_terms, (list, tuple)) or not 0 < len(tf_terms) <= sparse:
+                raise ValueError("Saved hybrid TF-IDF vocabulary exceeds sparse_dim")
+            top_tf_cfg: Dict[str, Any] = {"type": "tfidf", "terms": list(tf_terms)}
+            if "tfidf_char_ngrams" in projector_config:
+                top_tf_cfg["char_ngrams"] = projector_config["tfidf_char_ngrams"]
+            for src_k, dst_k in _HYBRID_TFIDF_KEY_MAP:
+                if src_k in projector_config:
+                    top_tf_cfg[dst_k] = projector_config[src_k]
+            if len(tf_terms) > DEFAULT_MAX_FEATURES:
+                top_tf_cfg["max_features"] = len(tf_terms)
+            bin_idf = array_map.get("_projector_hybrid_tfidf_idf")
+            if "tfidf_idf" in projector_config:
+                top_tf_cfg["idf"] = projector_config["tfidf_idf"]
+                TfidfProjector.validate_header_config(top_tf_cfg, allow_missing_idf=False)
+                top_tfidf = TfidfProjector.from_config(top_tf_cfg)
+                if bin_idf is not None:
+                    if (
+                        bin_idf.ndim != 1
+                        or len(bin_idf) != len(tf_terms)
+                        or not np.all(np.isfinite(bin_idf))
+                        or not np.allclose(
+                            np.asarray(top_tfidf._idf, dtype=np.float64),
+                            bin_idf,
+                            rtol=0.0,
+                            atol=1e-5,
+                        )
+                    ):
+                        raise ValueError(
+                            "Saved hybrid projector inline tfidf_idf mismatches binary IDF tensor"
+                        )
+            else:
+                if bin_idf is None:
+                    raise ValueError("Saved hybrid projector missing TF-IDF idf weights")
+                TfidfProjector.validate_header_config(top_tf_cfg, allow_missing_idf=True)
+                top_tfidf = TfidfProjector.from_config(top_tf_cfg, idf_array=bin_idf)
+
+        raw_terms = projector_config.get("spectral_terms", ())
+        raw_weights = projector_config.get("spectral_weights", ())
+        if not isinstance(raw_terms, (list, tuple)) or not isinstance(raw_weights, (list, tuple)):
+            raise ValueError("Saved hybrid projector spectral terms and weights must be sequences")
+        terms: List[str] = []
+        for tm in raw_terms:
+            if not isinstance(tm, str) or not tm.strip():
+                raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
+            terms.append(tm)
+        if len(set(terms)) != len(terms):
+            raise ValueError("Saved hybrid spectral terms must be unique nonempty strings")
+        if len(terms) > 2048:
+            raise ValueError("Saved hybrid spectral terms exceed maximum allowed size")
+        for w_val in raw_weights:
+            _req_num(w_val, "spectral_weights")
+        if len(terms) != len(raw_weights):
+            raise ValueError("Saved hybrid projector spectral terms and weights length mismatch")
+        try:
+            with np.errstate(over="ignore", invalid="ignore"):
+                spec_w_f32 = np.asarray([float(w_val) for w_val in raw_weights], dtype=np.float32)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Saved hybrid projector spectral weights are invalid") from exc
+        if not bool(np.all(np.isfinite(spec_w_f32))):
+            raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
+
+        if len(terms) > 2048:
+            raise ValueError("Saved hybrid projector spectral_terms exceeds limit")
+
+        def _parse_inline_matrix_f32(raw_val: Any, cfg_key: str) -> np.ndarray:
+            if not isinstance(raw_val, (list, tuple)) or len(raw_val) == 0:
+                raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+            if len(raw_val) > 2048:
+                raise ValueError(f"Saved hybrid projector {cfg_key} exceeds row limit")
+            row_len: Optional[int] = None
+            for row in raw_val:
+                if not isinstance(row, (list, tuple)) or len(row) == 0:
+                    raise ValueError(f"Saved hybrid projector {cfg_key} is invalid")
+                if row_len is None:
+                    row_len = len(row)
+                    if row_len > MAX_SKILL_DIMENSION:
+                        raise ValueError(f"Saved hybrid projector {cfg_key} exceeds dimension limit")
+                elif len(row) != row_len:
+                    raise ValueError(f"Saved hybrid projector {cfg_key} is ragged")
+                for elem in row:
+                    if isinstance(elem, bool) or not isinstance(elem, (int, float)):
+                        raise ValueError(f"Saved hybrid projector {cfg_key} contains invalid element")
+            try:
+                with np.errstate(over="ignore", invalid="ignore"):
+                    arr = np.asarray(raw_val, dtype=np.float32)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"Saved hybrid projector {cfg_key} is invalid") from exc
+            if arr.ndim != 2 or not bool(np.all(np.isfinite(arr))):
+                raise ValueError(f"Saved hybrid projector {cfg_key} contains non-finite values")
+            arr.setflags(write=False)
+            return arr
+
+        def _inline_or_map_f32(map_key: str, cfg_key: str) -> Optional[np.ndarray]:
+            bin_raw = array_map.get(map_key)
+            bin_arr = (
+                CompiledSystemOneModel._coerce_readonly_float_array(bin_raw, np.float32)
+                if bin_raw is not None
+                else None
+            )
+            inline_arr: Optional[np.ndarray] = None
+            if cfg_key in projector_config and projector_config[cfg_key] is not None:
+                inline_arr = _parse_inline_matrix_f32(projector_config[cfg_key], cfg_key)
+            if bin_arr is not None:
+                if inline_arr is not None and (
+                    inline_arr.shape != bin_arr.shape
+                    or not np.allclose(inline_arr, bin_arr, rtol=0.0, atol=1e-4)
+                ):
+                    raise ValueError(
+                        f"Saved hybrid projector inline {cfg_key} mismatches binary tensor"
+                    )
+                return bin_arr
+            return inline_arr
+
+        spec_arr = _inline_or_map_f32("_projector_spectral_vectors", "spectral_vectors")
+        basis_arr = CompiledSystemOneModel._coerce_readonly_float_array(
+            array_map.get("_projector_spectral_basis"), np.float32
+        )
+        sub_arr = _inline_or_map_f32("_projector_subspace_components", "subspace_components")
+        rbf_arr = _inline_or_map_f32("_projector_rbf_landmarks", "rbf_landmarks")
+
+        if not fitted:
+            if (
+                terms
+                or len(raw_weights) > 0
+                or (spec_arr is not None and len(spec_arr) > 0)
+                or basis_arr is not None
+                or (sub_arr is not None and len(sub_arr) > 0)
+                or (rbf_arr is not None and len(rbf_arr) > 0)
+                or (direct_spectral and raw_ds_dim != 0)
+            ):
+                raise ValueError("Unfitted saved hybrid projector cannot carry fitted tensors")
+
+        if spec_arr is not None and len(spec_arr) > 0:
+            if spec_arr.ndim != 2 or spec_arr.shape[0] != len(terms) or len(terms) == 0:
+                raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
+            if direct_spectral:
+                if (
+                    not (1 <= spec_arr.shape[1] <= 1024)
+                    or (raw_ds_dim != 0 and spec_arr.shape[1] != raw_ds_dim)
+                    or basis_arr is not None
+                ):
+                    raise ValueError("Saved hybrid projector direct spectral_vectors have invalid shape")
+                eff_spec_dim = int(spec_arr.shape[1])
+            else:
+                if not (1 <= spec_arr.shape[1] <= dense):
+                    raise ValueError("Saved hybrid projector spectral_vectors have invalid shape")
+                if basis_arr is not None and (
+                    basis_arr.ndim != 2 or basis_arr.shape != (spec_arr.shape[1], dense)
+                ):
+                    raise ValueError("Saved hybrid projector _projector_spectral_basis shape mismatch")
+                eff_spec_dim = 0
+        else:
+            if terms or basis_arr is not None or (direct_spectral and raw_ds_dim != 0):
+                raise ValueError("Saved hybrid projector missing spectral_vectors")
+            eff_spec_dim = 0
+
+        base_dim = sparse + dense + eff_spec_dim
+        if sub_arr is not None and len(sub_arr) > 0:
+            if sub_arr.ndim != 2 or not (1 <= sub_arr.shape[0] <= base_dim) or sub_arr.shape[1] != base_dim:
+                raise ValueError("Saved hybrid projector subspace_components have invalid shape")
+        rbf_rows = 0
+        if rbf_arr is not None and len(rbf_arr) > 0:
+            if (
+                rbf_arr.ndim != 2
+                or not (1 <= rbf_arr.shape[0] <= MAX_SKILL_OPTIONS)
+                or rbf_arr.shape[1] != base_dim
+            ):
+                raise ValueError("Saved hybrid projector rbf_landmarks have invalid shape")
+            eff_rbf_weight = _req_num(projector_config.get("rbf_weight", 0.14), "rbf_weight")
+            if not (0.0 < eff_rbf_weight < 1.0):
+                raise ValueError(
+                    "Saved hybrid projector rbf_weight must be in (0, 1) when rbf_landmarks are present"
+                )
+            rbf_rows = int(rbf_arr.shape[0])
+
+        if base_dim + rbf_rows != dimension:
+            raise ValueError("Saved hybrid projector dimensions do not match the skill")
+        return eff_spec_dim, top_tfidf, spec_arr, sub_arr, rbf_arr
 
     @classmethod
-    def from_bytes(
+    def _reconstruct_model_from_parts(
         cls,
-        data: bytes,
-        projector: Optional[Any] = None,
-        backend: str = "numpy",
+        meta: Mapping[str, Any],
+        array_map: Mapping[str, np.ndarray],
+        *,
+        projector: Optional[Any],
+        backend: str,
+        schema: DecisionSchema,
+        dimension: int,
+        projector_config: Optional[Mapping[str, Any]],
+        saved_tfidf: Optional[Any],
+        saved_prag: Optional[Any],
+        format_version: int,
     ) -> CompiledSystemOneModel:
-        """Deserializes a CompiledSystemOneModel from binary bytes."""
-        if len(data) > MAX_SKILL_BYTES:
-            raise ValueError("Saved skill file exceeds size limit")
-        if len(data) < 8 or data[:4] not in (b"S1M\x01", MAGIC_HEADER):
-            raise ValueError("Invalid System 1 Model binary: missing or invalid magic header")
-
-        header_len = struct.unpack(">I", data[4:8])[0]
-        if header_len > MAX_SKILL_HEADER_BYTES:
-            raise ValueError("Saved skill header exceeds size limit")
-        header_end = 8 + header_len
-        if len(data) < header_end:
-            raise ValueError("Corrupted System 1 Model binary: truncated header")
-
-        header_json = data[8:header_end].decode("utf-8")
-        meta = json.loads(header_json)
-        if meta.get("version") not in (1, 2) or meta["version"] != data[3]:
-            raise ValueError("Unsupported or inconsistent saved skill format version")
-
-        # Reconstruct schema
-        fields_data = meta["schema_dict"]["fields"]
-        if not isinstance(fields_data, dict) or not 0 < len(fields_data) <= MAX_SKILL_FIELDS:
-            raise ValueError("Saved skill field count exceeds limits")
-        for definition in fields_data.values():
-            if len(definition.get("options", ())) > MAX_SKILL_OPTIONS:
-                raise ValueError("Saved skill option count exceeds limits")
-        schema = DecisionSchema.from_dict(meta["schema_dict"])
-        if meta.get("schema_digest") != schema.schema_digest():
-            raise ValueError("Saved skill schema digest does not match its definition")
-        dimension = meta["dimension"]
-        if type(dimension) is not int or not 0 < dimension <= MAX_SKILL_DIMENSION:
-            raise ValueError("Saved skill dimension must be a positive integer within limits")
-        if set(meta["heads"]) != set(schema.fields):
-            raise ValueError("Saved skill heads must exactly match its schema")
-        # Includes constructor/NumPy temporaries and covariance defaults when applicable.
-        widths = sum(max(2, len(getattr(f, "options", ()))) for f in schema.fields.values())
-        projector_config = meta.get("projector")
-        cov_fields = (
-            len(schema.fields)
-            if (projector_config is None or projector_config.get("type") == "deterministic")
-            else 0
-        )
-        runtime_bytes = 16 * cov_fields * (dimension + 1) ** 2 + 16 * widths * (dimension + 1)
-        saved_tfidf = None
-        saved_hybrid = None
-        if projector_config is not None:
-            kind = projector_config["type"]
-            if kind == "tfidf":
-                tfidf_terms, _ = TfidfProjector.validate_header_config(
-                    projector_config, allow_missing_idf=True
-                )
-                if len(tfidf_terms) != dimension:
-                    raise ValueError("Saved TF-IDF dimension does not match the skill")
-                if "idf" in projector_config:
-                    saved_tfidf = TfidfProjector.from_config(projector_config)
-            if kind == "deterministic" and projector_config.get("dimension") != dimension:
-                raise ValueError("Saved projector dimension does not match the skill")
-            if kind == "hybrid":
-                from system1.core.embeddings import HybridProjector
-                if set(projector_config) - HybridProjector.CONFIG_KEYS:
-                    raise ValueError("Saved hybrid projector contains unsupported settings")
-                sparse, dense = projector_config.get("sparse_dim"), projector_config.get("dense_dim")
-                direct_spec = (
-                    projector_config.get("direct_spectral_dim", 0)
-                    if projector_config.get("direct_spectral")
-                    else 0
-                )
-                inline_rbf_rows = len(projector_config.get("rbf_landmarks") or ())
-                if (
-                    type(sparse) is not int
-                    or type(dense) is not int
-                    or sparse <= 0
-                    or dense <= 0
-                    or type(direct_spec) is not int
-                    or direct_spec < 0
-                    or sparse + dense + direct_spec + inline_rbf_rows > dimension
-                ):
-                    raise ValueError("Saved hybrid projector dimensions do not match the skill")
-                runtime_bytes += 16 * 25000 * dense
-                runtime_bytes += 64 * len(projector_config.get("tfidf_terms", ()))
-                runtime_bytes += 16 * len(projector_config.get("spectral_terms", ())) * dense
-                runtime_bytes += 8 * sum(
-                    len(row)
-                    for key in ("spectral_vectors", "subspace_components", "rbf_landmarks")
-                    for row in (projector_config.get(key) or ())
-                )
-                if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
-                    raise ValueError("Saved skill runtime allocation exceeds memory budget")
-        if runtime_bytes > MAX_SKILL_RUNTIME_BYTES:
-            raise ValueError("Saved skill runtime allocation exceeds memory budget")
-        npz_file = _read_skill_arrays(data[header_end:], schema, dimension, runtime_bytes)
-        if (projector_config is None or projector_config.get("type") != "tfidf") and (
-            "_projector_tfidf_idf" in npz_file
-        ):
-            raise ValueError("Saved skill contains unexpected TF-IDF idf array")
-        if (projector_config is None or projector_config.get("type") != "hybrid") and (
-            "_projector_spectral_vectors" in npz_file
-            or "_projector_subspace_components" in npz_file
-            or "_projector_rbf_landmarks" in npz_file
-            or "_projector_hybrid_tfidf_idf" in npz_file
-        ):
-            raise ValueError("Saved skill contains unexpected hybrid projector arrays")
+        from system1.core.embeddings import HybridProjector, SubwordSemanticEmbeddings
 
         def _as_f32(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
-            if arr is None:
-                return None
-            return np.asarray(arr, dtype=np.float32) if arr.dtype == np.float16 else arr
+            return cls._coerce_readonly_float_array(arr, np.float32)
+
+        def _as_f64(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            return cls._coerce_readonly_float_array(arr, np.float64)
+
+        array_map = dict(array_map)
+        validated_layouts, _ = _validate_tensor_layouts_header(
+            meta,
+            {k: tuple(np.asarray(v).shape) for k, v in array_map.items()},
+        )
+
+        def _restore_f32_layout(tname: str, arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            out_arr = _as_f32(arr)
+            if out_arr is not None and tname in validated_layouts:
+                if not bool(np.all(np.isfinite(out_arr))):
+                    raise ValueError(f"Saved tensor {tname!r} contains non-finite values")
+                mod64, s0, s1 = validated_layouts[tname]
+                out_arr = _reconstruct_2d_layout_array(
+                    out_arr, np.array([mod64, s0, s1], dtype=np.int64)
+                )
+            return out_arr
+
+        is_v3 = format_version == 3
+        embed_vocab_flag = bool(meta.get("embed_vocab", False)) if is_v3 else False
+
+        if (projector_config is None or projector_config.get("type") != "tfidf") and (
+            "_projector_tfidf_idf" in array_map
+        ):
+            raise ValueError("Saved skill contains unexpected TF-IDF idf array")
+        if (projector_config is None or projector_config.get("type") != "pragmatic_tfidf") and (
+            "_projector_prag_base_idf" in array_map or "_projector_prag_idf" in array_map
+        ):
+            raise ValueError("Saved skill contains unexpected pragmatic TF-IDF idf array")
+        if (projector_config is None or projector_config.get("type") != "hybrid") and (
+            "_projector_spectral_vectors" in array_map
+            or "_projector_spectral_basis" in array_map
+            or "_projector_subspace_components" in array_map
+            or "_projector_rbf_landmarks" in array_map
+            or "_projector_hybrid_tfidf_idf" in array_map
+            or "_projector_dense_table" in array_map
+        ):
+            raise ValueError("Saved skill contains unexpected hybrid projector arrays")
+        if (not is_v3 or not embed_vocab_flag) and (
+            "_projector_dense_table" in array_map or "_projector_spectral_basis" in array_map
+        ):
+            raise ValueError("Saved skill contains unexpected dense vocab projector arrays")
+        if (
+            not is_v3
+            or not embed_vocab_flag
+            or projector_config is None
+            or projector_config.get("type") != "hybrid"
+        ) and "dense_embed_vocab" in meta:
+            raise ValueError("Saved skill contains unexpected dense_embed_vocab metadata")
+
+        for proj_arr_key in (
+            "_projector_tfidf_idf",
+            "_projector_prag_base_idf",
+            "_projector_prag_idf",
+            "_projector_hybrid_tfidf_idf",
+        ):
+            if proj_arr_key in array_map:
+                conv_f64 = _as_f64(array_map[proj_arr_key])
+                assert conv_f64 is not None
+                if not np.all(np.isfinite(conv_f64)):
+                    raise ValueError(f"Saved projector array {proj_arr_key!r} contains non-finite values")
+                array_map[proj_arr_key] = conv_f64
+
+        for proj_arr_key in (
+            "_projector_spectral_vectors",
+            "_projector_spectral_basis",
+            "_projector_subspace_components",
+            "_projector_rbf_landmarks",
+            "_projector_dense_table",
+        ):
+            if proj_arr_key in array_map:
+                conv_f32 = _restore_f32_layout(proj_arr_key, array_map[proj_arr_key])
+                assert conv_f32 is not None
+                if not np.all(np.isfinite(conv_f32)):
+                    raise ValueError(f"Saved projector array {proj_arr_key!r} contains non-finite values")
+                array_map[proj_arr_key] = conv_f32
 
         if projector_config is not None and projector_config["type"] == "tfidf" and saved_tfidf is None:
             saved_tfidf = TfidfProjector.from_config(
                 projector_config,
-                idf_array=npz_file.get("_projector_tfidf_idf"),
+                idf_array=array_map.get("_projector_tfidf_idf"),
             )
+        if projector_config is not None and projector_config["type"] == "pragmatic_tfidf" and saved_prag is None:
+            saved_prag = PragmaticCompositeProjector.from_config(
+                projector_config,
+                tfidf_idf_array=array_map.get("_projector_prag_base_idf"),
+                prag_idf_array=array_map.get("_projector_prag_idf"),
+            )
+
+        saved_hybrid = None
         if projector_config is not None and projector_config["type"] == "hybrid":
-            rbf_arr = npz_file.get("_projector_rbf_landmarks")
-            rbf_rows = (
-                int(rbf_arr.shape[0])
-                if rbf_arr is not None
-                else len(projector_config.get("rbf_landmarks") or ())
+            eff_spec_dim, top_tfidf, spec_arr, sub_arr, rbf_arr = (
+                cls._validate_hybrid_projector_config_and_tensors(
+                    projector_config,
+                    array_map,
+                    dimension,
+                )
             )
-            direct_spec = (
-                projector_config.get("direct_spectral_dim", 0)
-                if projector_config.get("direct_spectral")
-                else 0
-            )
-            if (
-                projector_config["sparse_dim"] + projector_config["dense_dim"] + direct_spec + rbf_rows
-                != dimension
-            ):
-                raise ValueError("Saved hybrid projector dimensions do not match the skill")
-            hyb_kwargs: Dict[str, Any] = {
-                "backend": backend,
-                "spectral_vectors": _as_f32(npz_file.get("_projector_spectral_vectors")),
-                "subspace_components": _as_f32(npz_file.get("_projector_subspace_components")),
-            }
-            if "_projector_hybrid_tfidf_idf" in npz_file:
-                hyb_kwargs["tfidf_idf_array"] = npz_file["_projector_hybrid_tfidf_idf"]
-            if "_projector_rbf_landmarks" in npz_file:
-                hyb_kwargs["rbf_landmarks"] = _as_f32(npz_file["_projector_rbf_landmarks"])
-            try:
-                saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
-            except TypeError:
-                hyb_kwargs.pop("tfidf_idf_array", None)
-                hyb_kwargs.pop("rbf_landmarks", None)
-                saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
+
+            if is_v3 and embed_vocab_flag:
+                if "_projector_dense_table" not in array_map:
+                    raise ValueError(
+                        "Saved v3 skill with embed_vocab=True missing _projector_dense_table"
+                    )
+                vocab_meta = meta.get("dense_embed_vocab")
+                if not isinstance(vocab_meta, Mapping):
+                    raise ValueError("Saved v3 skill missing dense_embed_vocab metadata")
+                if set(vocab_meta) - {"vocab_size", "seed", "explicit_alpha", "multiword_by_space3", "sparse"}:
+                    raise ValueError("Saved v3 skill dense_embed_vocab contains unsupported settings")
+                vocab_size = vocab_meta.get("vocab_size")
+                if type(vocab_size) is not int or not 1 <= vocab_size <= 250_000:
+                    raise ValueError("Saved v3 skill dense_embed_vocab vocab_size is invalid")
+                dense_dim = int(projector_config["dense_dim"])
+                dense_table = array_map["_projector_dense_table"]
+                if dense_table.ndim != 2 or dense_table.shape != (vocab_size, dense_dim):
+                    raise ValueError("Saved v3 skill _projector_dense_table shape mismatch")
+
+                raw_mw = vocab_meta.get("multiword_by_space3", {})
+                if not isinstance(raw_mw, Mapping):
+                    raise ValueError("Saved v3 skill multiword_by_space3 must be a mapping")
+                mw_map: Dict[str, Tuple[Tuple[str, bool, int], ...]] = {}
+                for k_str, entries in raw_mw.items():
+                    if not isinstance(k_str, str) or not isinstance(entries, (list, tuple)):
+                        raise ValueError("Saved v3 skill multiword_by_space3 entry is invalid")
+                    parsed_entries: List[Tuple[str, bool, int]] = []
+                    for entry in entries:
+                        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+                            raise ValueError("Saved v3 skill multiword_by_space3 tuple is invalid")
+                        term_s, neg_f, tok_idx = entry
+                        if (
+                            not isinstance(term_s, str)
+                            or type(neg_f) is not bool
+                            or type(tok_idx) is not int
+                            or not 0 <= tok_idx < vocab_size
+                        ):
+                            raise ValueError("Saved v3 skill multiword_by_space3 item out of bounds")
+                        parsed_entries.append((term_s, neg_f, tok_idx))
+                    mw_map[k_str] = tuple(parsed_entries)
+
+                sparse_cfg = vocab_meta.get("sparse")
+                tfidf_proj: Optional[Any] = None
+                if top_tfidf is None and sparse_cfg is not None:
+                    raise ValueError(
+                        "Saved v3 skill sparse projector config mismatches top-level hybrid header"
+                    )
+                if top_tfidf is not None and sparse_cfg is None:
+                    raise ValueError(
+                        "Saved v3 skill missing sparse projector config for fitted hybrid TF-IDF"
+                    )
+                if sparse_cfg is not None:
+                    if not isinstance(sparse_cfg, Mapping):
+                        raise ValueError("Saved v3 skill sparse projector config is invalid")
+                    TfidfProjector.validate_header_config(sparse_cfg, allow_missing_idf=True)
+                    tfidf_proj = TfidfProjector.from_config(
+                        sparse_cfg,
+                        idf_array=array_map.get("_projector_hybrid_tfidf_idf"),
+                    )
+                    if tfidf_proj.dimension > int(projector_config["sparse_dim"]):
+                        raise ValueError("Saved hybrid TF-IDF vocabulary exceeds sparse_dim")
+                    if top_tfidf is not None and (
+                        tfidf_proj.to_config(include_arrays=True)
+                        != top_tfidf.to_config(include_arrays=True)
+                    ):
+                        raise ValueError(
+                            "Saved v3 skill sparse projector config mismatches top-level hybrid header"
+                        )
+
+                dense_engine = object.__new__(SubwordSemanticEmbeddings)
+                dense_engine.dimension = dense_dim
+                dense_engine.vocab_size = vocab_size
+                vm_seed = vocab_meta.get("seed", projector_config.get("seed", 42))
+                if type(vm_seed) is not int or vm_seed != int(projector_config.get("seed", 42)):
+                    raise ValueError("Saved v3 skill dense_embed_vocab seed mismatches hybrid projector seed")
+                dense_engine.seed = vm_seed
+                dense_engine._table = dense_table
+                dense_engine._multiword_by_space3 = mw_map
+
+                hp = object.__new__(HybridProjector)
+                hp.sparse_dim = int(projector_config["sparse_dim"])
+                hp.dense_dim = dense_dim
+                hp.dimension = int(dimension)
+                hp.alpha = float(projector_config.get("alpha", 0.5))
+                hp._explicit_alpha = _strict_header_bool(
+                    vocab_meta, "explicit_alpha", True, "Saved v3 skill dense_embed_vocab"
+                )
+                hp.seed = int(projector_config.get("seed", 42))
+                hp.svd_power = float(projector_config.get("svd_power", 0.5))
+                hp.spectral_blend = float(projector_config.get("spectral_blend", 0.35))
+                hp.backend = "numpy"
+                hp._dense_engine = dense_engine
+                hp._fitted = bool(projector_config.get("fitted", False))
+                hp._tfidf_projector = tfidf_proj
+                spec_terms = tuple(str(t) for t in projector_config.get("spectral_terms", ()))
+                spec_weights = tuple(float(w) for w in projector_config.get("spectral_weights", ()))
+                hp._spectral_terms = spec_terms
+                hp._spectral_vocab = {t: idx for idx, t in enumerate(spec_terms)}
+                hp._spectral_weights = spec_weights
+                with np.errstate(over="ignore", invalid="ignore"):
+                    spec_w_arr = (
+                        np.asarray(spec_weights, dtype=np.float32)
+                        if spec_weights
+                        else np.empty(0, dtype=np.float32)
+                    )
+                if not bool(np.all(np.isfinite(spec_w_arr))):
+                    raise ValueError("Saved hybrid projector spectral weights contain non-finite values")
+                hp._spectral_weights_arr = spec_w_arr
+                hp._spectral_vectors = _as_f32(spec_arr)
+                hp._spectral_basis = _as_f32(array_map.get("_projector_spectral_basis"))
+                hp._subspace_components = _as_f32(sub_arr)
+                hp._subspace_weight = float(
+                    projector_config.get("subspace_weight", 0.20 if sub_arr is not None else 0.0)
+                )
+                hp._use_subspace = bool(
+                    projector_config.get("use_subspace", hp._subspace_components is not None)
+                )
+                hp._direct_spectral = bool(projector_config.get("direct_spectral", False))
+                hp._direct_spectral_dim = eff_spec_dim
+                if (
+                    hp._spectral_vectors is not None
+                    and hp._spectral_vectors.size > 0
+                    and not hp._direct_spectral
+                    and hp._spectral_basis is None
+                ):
+                    vocab_dense = dense_engine.encode_batch(list(spec_terms)).astype(np.float32)
+                    aligned_basis = (hp._spectral_vectors.T @ vocab_dense).astype(np.float32)
+                    b_norms = np.linalg.norm(aligned_basis, axis=1, keepdims=True)
+                    if np.all(b_norms.flatten() > 1e-6):
+                        hp._spectral_basis = (aligned_basis / b_norms).astype(np.float32)
+                    else:
+                        hp._spectral_basis = hp._build_spectral_basis(hp._spectral_vectors.shape[1])
+                hp._context_smooth = float(projector_config.get("context_smooth", 1.0))
+                hp._rbf_landmarks = _as_f32(rbf_arr)
+                hp._rbf_gamma = float(projector_config.get("rbf_gamma", 3.0))
+                hp._rbf_weight = float(projector_config.get("rbf_weight", 0.14)) if rbf_arr is not None else 0.0
+                hp._digest = None
+                hp._fit_base_cache = {}
+                saved_hybrid = hp
+            else:
+                hyb_kwargs: Dict[str, Any] = {
+                    "backend": backend,
+                    "spectral_vectors": _as_f32(spec_arr),
+                    "subspace_components": _as_f32(sub_arr),
+                }
+                if "_projector_hybrid_tfidf_idf" in array_map:
+                    hyb_kwargs["tfidf_idf_array"] = array_map["_projector_hybrid_tfidf_idf"]
+                if rbf_arr is not None:
+                    hyb_kwargs["rbf_landmarks"] = _as_f32(rbf_arr)
+                try:
+                    saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
+                except TypeError:
+                    hyb_kwargs.pop("tfidf_idf_array", None)
+                    hyb_kwargs.pop("rbf_landmarks", None)
+                    saved_hybrid = HybridProjector.from_config(projector_config, **hyb_kwargs)
+
         if projector_config is not None:
+            _validate_projector_header_strict(projector_config, dimension)
             if projector is not None:
                 if projector_config["type"] == "hybrid" and saved_hybrid is not None:
                     if (
@@ -1648,54 +3101,127 @@ class CompiledSystemOneModel:
                         != _projector_config(saved_tfidf, include_arrays=True)
                     ):
                         raise ValueError("Supplied projector does not match the saved skill's feature space")
+                elif projector_config["type"] == "pragmatic_tfidf" and saved_prag is not None:
+                    if (
+                        not isinstance(projector, PragmaticCompositeProjector)
+                        or projector.projector_digest() != saved_prag.projector_digest()
+                    ):
+                        raise ValueError("Supplied projector does not match the saved skill's feature space")
                 elif _projector_config(projector) != projector_config:
                     raise ValueError("Supplied projector does not match the saved skill's feature space")
             elif projector_config["type"] == "deterministic":
+                det_rw = _strict_header_bool(
+                    projector_config, "recency_weighted", False, "Saved deterministic projector"
+                )
+                if type(projector_config.get("dimension")) is not int or projector_config["dimension"] != dimension:
+                    raise ValueError("Saved projector dimension does not match the skill")
                 projector = DeterministicSemanticProjector(
-                    dimension=projector_config["dimension"],
-                    recency_weighted=projector_config["recency_weighted"],
+                    dimension=dimension,
+                    recency_weighted=det_rw,
                 )
             elif saved_hybrid is not None:
                 projector = saved_hybrid
             elif saved_tfidf is not None:
                 projector = saved_tfidf
+            elif saved_prag is not None:
+                projector = saved_prag
             else:
                 raise ValueError("This skill requires its original external projector; pass projector= when loading")
 
+        top_created_at = _strict_header_float(
+            meta, "created_at", 0.0, "Saved skill header", min_val=0.0, min_inclusive=True
+        )
         saved_meta = meta.get("metadata", {})
         if not isinstance(saved_meta, dict):
             raise ValueError("Saved skill metadata must be a mapping")
-        is_cold_skill = bool(saved_meta.get("cold_start", False))
+        is_cold_skill = _strict_header_bool(saved_meta, "cold_start", False, "Saved skill metadata")
+        meta_ff = _validate_forgetting_factor(
+            _strict_header_float(
+                saved_meta,
+                "forgetting_factor",
+                0.995,
+                "Saved skill metadata",
+                min_val=0.0,
+                min_inclusive=False,
+                max_val=1.0,
+                max_inclusive=True,
+            )
+        )
+        meta_rw = _strict_header_bool(saved_meta, "recency_weighted", False, "Saved skill metadata")
+        meta_created_at = _strict_header_float(
+            saved_meta, "created_at", top_created_at, "Saved skill metadata", min_val=0.0, min_inclusive=True
+        )
+        _strict_header_bool(saved_meta, "strict_mode", True, "Saved skill metadata")
+        _strict_header_float(
+            saved_meta,
+            "default_alpha",
+            0.05,
+            "Saved skill metadata",
+            min_val=0.0,
+            min_inclusive=False,
+            max_val=1.0,
+            max_inclusive=False,
+        )
 
-        # Reconstruct head weights
         heads: Dict[str, CompiledHeadWeights] = {}
+        namespaced_tensors = _resolve_tensor_namespaced_flag(schema, meta)
         for name, h_info in meta["heads"].items():
-            if name not in schema.fields or h_info["field_type"] != schema.fields[name].field_type:
+            def _hk(suffix: str, _fn: str = name) -> str:
+                return _head_tensor_name(_fn, suffix, namespaced=namespaced_tensors)
+
+            if not isinstance(h_info, Mapping):
+                raise ValueError(f"Saved head {name!r} metadata must be a mapping")
+            ctx = f"Saved head {name!r}"
+            if name not in schema.fields or h_info.get("field_type") != schema.fields[name].field_type:
                 raise ValueError(f"Saved head {name!r} does not match the schema")
             definition = schema.fields[name]
-            w = _as_f32(npz_file[f"{name}_w"])
+            if _hk("w") not in array_map or _hk("b") not in array_map:
+                raise ValueError(f"Saved head {name!r} is missing required weights")
+            w = _restore_f32_layout(_hk("w"), array_map[_hk("w")])
             assert w is not None
-            b = npz_file[f"{name}_b"]
-            widths = (1, 2) if isinstance(definition, BooleanField) else (len(definition.options),) if hasattr(definition, "options") else (1,)
-            if w.ndim != 2 or w.shape[0] not in widths or w.shape[1] != dimension or b.shape != (w.shape[0],):
+            b = _as_f32(array_map[_hk("b")])
+            assert b is not None
+            widths = (
+                (1, 2)
+                if isinstance(definition, (BooleanField, ScoreField))
+                else (len(definition.options),)
+                if hasattr(definition, "options")
+                else (1,)
+            )
+            valid_b_shapes = (
+                ((1,), (w.shape[0],))
+                if isinstance(definition, (BooleanField, ScoreField))
+                else ((w.shape[0],),)
+            )
+            if (
+                w.ndim != 2
+                or w.shape[0] not in widths
+                or w.shape[1] != dimension
+                or b.shape not in valid_b_shapes
+            ):
                 raise ValueError(f"Saved head {name!r} has incompatible weight dimensions")
             if not np.all(np.isfinite(w)) or not np.all(np.isfinite(b)):
                 raise ValueError(f"Saved head {name!r} contains non-finite weights")
-            temperature = float(h_info.get("temperature", 1.0))
-            if not math.isfinite(temperature) or temperature <= 0:
-                raise ValueError(f"Saved head {name!r} has an invalid temperature")
+            temperature = _strict_header_float(
+                h_info, "temperature", 1.0, ctx, min_val=0.0, min_inclusive=False
+            )
             if h_info.get("score_method", "aps") not in ("aps", "lac"):
                 raise ValueError(f"Saved head {name!r} uses an unsupported conformal score")
             if isinstance(definition, (ChoiceField, MultiChoiceField)) and tuple(h_info.get("options", ())) != definition.options:
                 raise ValueError(f"Saved head {name!r} options do not match the schema")
-            p_mat = _as_f32(npz_file[f"{name}_P"]) if f"{name}_P" in npz_file else None
-            b_mat = _as_f32(npz_file[f"{name}_B"]) if f"{name}_B" in npz_file else None
+            p_mat = _restore_f32_layout(_hk("P"), array_map[_hk("P")]) if _hk("P") in array_map else None
+            b_mat = _restore_f32_layout(_hk("B"), array_map[_hk("B")]) if _hk("B") in array_map else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (p_mat, b_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite covariance")
-            calib_scores_arr = npz_file[f"{name}_calib_scores"] if f"{name}_calib_scores" in npz_file else None
+            calib_scores_arr = array_map[_hk("calib_scores")] if _hk("calib_scores") in array_map else None
             calib_scores = tuple(float(s) for s in calib_scores_arr) if calib_scores_arr is not None else ()
             if any(not math.isfinite(score) or score < 0 for score in calib_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid calibration scores")
+            logit_adj_arr = _validate_compiled_logit_adj(
+                array_map.get(_hk("logit_adj")),
+                definition,
+                name,
+            )
             raw_class_scores = h_info.get("class_calibration_scores", {})
             parsed_class_scores: Dict[str, Tuple[float, ...]] = {}
             if raw_class_scores is not None:
@@ -1722,19 +3248,18 @@ class CompiledSystemOneModel:
                             raise ValueError(f"Saved head {name!r} contains invalid class calibration score")
                         parsed_vals.append(fv)
                     parsed_class_scores[str(c_key)] = tuple(parsed_vals)
-            fam_thresh = float(h_info.get("familiarity_threshold", 0.0))
-            if not math.isfinite(fam_thresh) or fam_thresh < 0:
-                raise ValueError(f"Saved head {name!r} has an invalid familiarity_threshold")
-            proto_thresh = float(h_info.get("prototype_threshold", 0.0))
-            if not math.isfinite(proto_thresh) or proto_thresh < 0:
-                raise ValueError(f"Saved head {name!r} has an invalid prototype_threshold")
-            raw_proto_arr = npz_file[f"{name}_prototypes"] if f"{name}_prototypes" in npz_file else None
+            fam_thresh = _strict_header_float(
+                h_info, "familiarity_threshold", 0.0, ctx, min_val=0.0, min_inclusive=True
+            )
+            proto_thresh = _strict_header_float(
+                h_info, "prototype_threshold", 0.0, ctx, min_val=0.0, min_inclusive=True
+            )
+            raw_proto_arr = array_map[_hk("prototypes")] if _hk("prototypes") in array_map else None
             proto_mat = _as_f32(raw_proto_arr)
             if proto_mat is not None and not np.all(np.isfinite(proto_mat)):
                 raise ValueError(f"Saved head {name!r} contains non-finite prototypes")
-            if raw_proto_arr is not None and raw_proto_arr.dtype == np.float16 and proto_mat is not None and proto_mat.ndim == 2:
-                proto_norms = np.linalg.norm(proto_mat, axis=1, keepdims=True)
-                proto_mat = (proto_mat / np.where(proto_norms < 1e-12, 1.0, proto_norms)).astype(np.float32)
+            if proto_mat is not None and proto_mat.ndim == 2:
+                proto_mat, _ = _normalize_rows_f32_safe(proto_mat)
             if (
                 proto_mat is None
                 and not is_cold_skill
@@ -1743,18 +3268,19 @@ class CompiledSystemOneModel:
                 and np.any(w)
             ):
                 if w.shape[0] >= 2:
-                    w_norms = np.linalg.norm(w, axis=1, keepdims=True)
-                    w_norms = np.where(w_norms < 1e-12, 1.0, w_norms)
-                    proto_mat = (w / w_norms).astype(np.float32)
+                    proto_mat, _ = _normalize_rows_f32_safe(w)
                 elif isinstance(definition, BooleanField) and w.shape[0] == 1:
-                    w_norm = max(1e-12, float(np.linalg.norm(w[0])))
-                    w_u = (w[0] / w_norm).astype(np.float32)
+                    w_u, _, w_ok = _normalize_vec_f32_safe(w[0])
+                    if not w_ok and np.any(w[0]):
+                        w64 = np.asarray(w[0], dtype=np.float64)
+                        w_norm = max(1e-12, float(np.linalg.norm(w64)))
+                        w_u = (w64 / w_norm).astype(np.float32)
                     proto_mat = np.vstack([-w_u, w_u]).astype(np.float32)
-            proto_scores_arr = npz_file[f"{name}_proto_scores"] if f"{name}_proto_scores" in npz_file else None
+            proto_scores_arr = array_map[_hk("proto_scores")] if _hk("proto_scores") in array_map else None
             proto_scores = tuple(float(s) for s in proto_scores_arr) if proto_scores_arr is not None else ()
-            if any(not math.isfinite(score) or score < 0 for score in proto_scores):
+            if any(not math.isfinite(score) or score < -1.0 - 1e-4 or score > 1.0 + 1e-4 for score in proto_scores):
                 raise ValueError(f"Saved head {name!r} contains invalid prototype calibration scores")
-            is_hier = bool(h_info.get("hierarchical", False))
+            is_hier = _strict_header_bool(h_info, "hierarchical", False, ctx)
             raw_assign = h_info.get("cluster_assignments", ())
             if is_hier and (
                 not isinstance(raw_assign, (list, tuple))
@@ -1762,10 +3288,10 @@ class CompiledSystemOneModel:
             ):
                 raise ValueError(f"Saved head {name!r} has invalid cluster_assignments")
             cluster_assign = tuple(int(c) for c in raw_assign) if isinstance(raw_assign, (list, tuple)) else ()
-            coarse_w = _as_f32(npz_file[f"{name}_coarse_w"]) if f"{name}_coarse_w" in npz_file else None
-            coarse_b = npz_file[f"{name}_coarse_b"] if f"{name}_coarse_b" in npz_file else None
-            fine_w = _as_f32(npz_file[f"{name}_fine_w"]) if f"{name}_fine_w" in npz_file else None
-            fine_b = npz_file[f"{name}_fine_b"] if f"{name}_fine_b" in npz_file else None
+            coarse_w = _restore_f32_layout(_hk("coarse_w"), array_map[_hk("coarse_w")]) if _hk("coarse_w") in array_map else None
+            coarse_b = _as_f32(array_map[_hk("coarse_b")]) if _hk("coarse_b") in array_map else None
+            fine_w = _restore_f32_layout(_hk("fine_w"), array_map[_hk("fine_w")]) if _hk("fine_w") in array_map else None
+            fine_b = _as_f32(array_map[_hk("fine_b")]) if _hk("fine_b") in array_map else None
             if any(a is not None and not np.all(np.isfinite(a)) for a in (coarse_w, coarse_b, fine_w, fine_b)):
                 raise ValueError(f"Saved head {name!r} contains non-finite hierarchical weights")
             if is_hier:
@@ -1775,10 +3301,13 @@ class CompiledSystemOneModel:
                     raise ValueError(f"Saved head {name!r} has out-of-range cluster_assignments")
 
             exemplar_arrays = {
-                suffix: (_as_f32(npz_file[f"{name}_{suffix}"]) if npz_file[f"{name}_{suffix}"].dtype == np.float16 else npz_file[f"{name}_{suffix}"])
+                suffix: _restore_f32_layout(_hk(suffix), array_map[_hk(suffix)])
                 for suffix in EXEMPLAR_ARRAYS
-                if f"{name}_{suffix}" in npz_file
+                if _hk(suffix) in array_map
             }
+            for ex_arr in exemplar_arrays.values():
+                if ex_arr is None or not np.all(np.isfinite(ex_arr)):
+                    raise ValueError(f"Saved head {name!r} contains non-finite exemplar arrays")
             if "exemplar_state" in h_info:
                 exemplar_meta = h_info["exemplar_state"]
                 if not isinstance(exemplar_meta, Mapping) or (
@@ -1794,24 +3323,60 @@ class CompiledSystemOneModel:
                     raise ValueError(f"Saved head {name!r} has unexpected exemplar arrays without exemplar_state")
                 exemplar_state = None
 
+            cq_max = None if isinstance(definition, ScoreField) else (1.0 + 1e-6)
+            conformal_q = _strict_header_float(
+                h_info,
+                "conformal_quantile",
+                0.0,
+                ctx,
+                min_val=0.0,
+                min_inclusive=True,
+                max_val=cq_max,
+                max_inclusive=True,
+            )
+            margin_t = _strict_header_float(
+                h_info, "margin_threshold", 0.20, ctx, min_val=0.0, min_inclusive=True
+            )
+            head_ff = _validate_forgetting_factor(
+                _strict_header_float(
+                    h_info,
+                    "forgetting_factor",
+                    0.995,
+                    ctx,
+                    min_val=0.0,
+                    min_inclusive=False,
+                    max_val=1.0,
+                    max_inclusive=True,
+                )
+            )
+            rel_odds = _strict_header_float(
+                h_info, "relative_odds_ratio", 1.5, ctx, min_val=0.0, min_inclusive=False
+            )
+            conf_tau0 = _strict_header_float(
+                h_info, "confidence_floor_tau0", 0.15, ctx, min_val=0.0, min_inclusive=True
+            )
+            esc_ambig = _strict_header_bool(h_info, "escalate_on_ambiguity", True, ctx)
+            is_mondrian = _strict_header_bool(h_info, "mondrian", False, ctx)
+
             heads[name] = CompiledHeadWeights(
                 field_name=name,
                 field_type=h_info["field_type"],
                 weights=w,
                 biases=b,
-                temperature=float(h_info.get("temperature", 1.0)),
-                conformal_quantile=float(h_info.get("conformal_quantile", 0.0)),
+                temperature=temperature,
+                logit_adjustments=logit_adj_arr,
+                conformal_quantile=conformal_q,
                 score_method=h_info.get("score_method", "aps"),
                 options=tuple(h_info.get("options", [])),
                 P=p_mat,
                 B=b_mat,
-                margin_threshold=float(h_info.get("margin_threshold", 0.20)),
-                forgetting_factor=float(h_info.get("forgetting_factor", 0.995)),
-                relative_odds_ratio=float(h_info.get("relative_odds_ratio", 1.5)),
-                confidence_floor_tau0=float(h_info.get("confidence_floor_tau0", 0.15)),
-                escalate_on_ambiguity=bool(h_info.get("escalate_on_ambiguity", True)),
+                margin_threshold=margin_t,
+                forgetting_factor=head_ff,
+                relative_odds_ratio=rel_odds,
+                confidence_floor_tau0=conf_tau0,
+                escalate_on_ambiguity=esc_ambig,
                 calibration_scores=calib_scores,
-                mondrian=bool(h_info.get("mondrian", False)),
+                mondrian=is_mondrian,
                 class_calibration_scores=parsed_class_scores,
                 familiarity_threshold=fam_thresh,
                 prototypes=proto_mat,
@@ -1826,15 +3391,464 @@ class CompiledSystemOneModel:
                 exemplar_state=exemplar_state,
             )
 
-        return cls(
+        inst = cls(
             schema=schema,
             heads=heads,
             dimension=dimension,
             projector=projector,
             backend=backend,
-            metadata=saved_meta,
-            forgetting_factor=float(saved_meta.get("forgetting_factor", 0.995)),
-            recency_weighted=bool(saved_meta.get("recency_weighted", False)),
+            metadata=dict(saved_meta),
+            forgetting_factor=meta_ff,
+            recency_weighted=meta_rw,
+        )
+        inst.created_at = meta_created_at
+        return inst
+
+    @staticmethod
+    def _validate_projector_and_budget(
+        schema: DecisionSchema,
+        dimension: int,
+        projector_config: Optional[Mapping[str, Any]],
+        *,
+        cov_fields: int,
+        max_runtime_bytes: int,
+        extra_runtime_bytes: int = 0,
+    ) -> Tuple[Optional[Any], Optional[Any], int]:
+        """Validates projector configuration and estimates bounded runtime memory allocation."""
+        widths = sum(max(2, len(getattr(f, "options", ()))) for f in schema.fields.values())
+        runtime_bytes = (
+            16 * cov_fields * (dimension + 1) ** 2
+            + 16 * widths * (dimension + 1)
+            + int(extra_runtime_bytes)
+        )
+        saved_tfidf = None
+        saved_prag = None
+        if projector_config is not None:
+            _validate_projector_header_strict(projector_config, dimension)
+            kind = projector_config["type"]
+            if kind == "tfidf":
+                tfidf_terms, _ = TfidfProjector.validate_header_config(
+                    projector_config, allow_missing_idf=True
+                )
+                if len(tfidf_terms) != dimension:
+                    raise ValueError("Saved TF-IDF dimension does not match the skill")
+                if "idf" in projector_config:
+                    saved_tfidf = TfidfProjector.from_config(projector_config)
+            if kind == "pragmatic_tfidf":
+                _, _, prag_total_dim = PragmaticCompositeProjector.validate_header_config(
+                    projector_config, allow_missing_idf=True
+                )
+                if prag_total_dim != dimension:
+                    raise ValueError("Saved pragmatic TF-IDF dimension does not match the skill")
+                runtime_bytes += 64 * prag_total_dim
+                base_cfg = projector_config.get("base_tfidf", {})
+                if "prag_idf" in projector_config and isinstance(base_cfg, dict) and "idf" in base_cfg:
+                    saved_prag = PragmaticCompositeProjector.from_config(projector_config)
+            if kind == "deterministic" and (
+                type(projector_config.get("dimension")) is not int
+                or projector_config.get("dimension") != dimension
+            ):
+                raise ValueError("Saved projector dimension does not match the skill")
+            if kind == "hybrid":
+                from system1.core.embeddings import HybridProjector
+
+                if set(projector_config) - HybridProjector.CONFIG_KEYS:
+                    raise ValueError("Saved hybrid projector contains unsupported settings")
+                sparse, dense = projector_config.get("sparse_dim"), projector_config.get("dense_dim")
+                ds_flag = projector_config.get("direct_spectral", False)
+                if "direct_spectral" in projector_config and type(ds_flag) is not bool:
+                    raise ValueError("Saved hybrid projector direct_spectral must be a boolean")
+                direct_spec = projector_config.get("direct_spectral_dim", 0) if ds_flag else 0
+                raw_rbf = projector_config.get("rbf_landmarks")
+                if raw_rbf is not None and not isinstance(raw_rbf, (list, tuple)):
+                    raise ValueError("Saved hybrid projector rbf_landmarks must be a sequence")
+                inline_rbf_rows = len(raw_rbf) if raw_rbf is not None else 0
+                if (
+                    type(sparse) is not int
+                    or type(dense) is not int
+                    or sparse <= 0
+                    or dense <= 0
+                    or type(direct_spec) is not int
+                    or direct_spec < 0
+                    or sparse + dense + direct_spec + inline_rbf_rows > dimension
+                ):
+                    raise ValueError("Saved hybrid projector dimensions do not match the skill")
+                tf_terms_raw = projector_config.get("tfidf_terms", ())
+                spec_terms_raw = projector_config.get("spectral_terms", ())
+                if not isinstance(tf_terms_raw, (list, tuple)):
+                    raise ValueError("Saved hybrid projector tfidf_terms must be a sequence")
+                if not isinstance(spec_terms_raw, (list, tuple)):
+                    raise ValueError("Saved hybrid projector spectral_terms must be a sequence")
+                runtime_bytes += 16 * 25000 * dense
+                runtime_bytes += 64 * len(tf_terms_raw)
+                runtime_bytes += 16 * len(spec_terms_raw) * dense
+                for mat_key in ("spectral_vectors", "subspace_components", "rbf_landmarks"):
+                    mat_val = projector_config.get(mat_key)
+                    if mat_val is None:
+                        continue
+                    if not isinstance(mat_val, (list, tuple)) or any(
+                        not isinstance(row, (list, tuple)) for row in mat_val
+                    ):
+                        raise ValueError(f"Saved hybrid projector {mat_key} must be a 2D sequence")
+                    runtime_bytes += 8 * sum(len(row) for row in mat_val)
+        if runtime_bytes > max_runtime_bytes:
+            raise ValueError("Saved skill runtime allocation exceeds memory budget")
+        return saved_tfidf, saved_prag, runtime_bytes
+
+    @staticmethod
+    def _is_readonly_mmap(mm: mmap.mmap) -> bool:
+        with memoryview(mm) as mv:
+            return bool(mv.readonly)
+
+    @classmethod
+    def _from_v3_buffer(
+        cls,
+        buf: Union[bytes, bytearray, memoryview, mmap.mmap],
+        buf_len: int,
+        projector: Optional[Any] = None,
+        backend: str = "numpy",
+    ) -> CompiledSystemOneModel:
+        """Preflight-validates and constructs a zero-copy CompiledSystemOneModel over a v3 buffer."""
+        if not isinstance(buf, (bytes, bytearray, memoryview, mmap.mmap)):
+            raise ValueError("Invalid System 1 v3 Model binary: unsupported buffer type")
+        actual_len = buf.nbytes if isinstance(buf, memoryview) else len(buf)
+        if (
+            type(buf_len) is not int
+            or buf_len != actual_len
+            or buf_len < 16
+            or buf_len > MAX_SKILL_BYTES_V3
+        ):
+            raise ValueError("Saved v3 skill file size is out of bounds")
+        if isinstance(buf, bytearray):
+            buf = memoryview(bytes(buf))
+        elif isinstance(buf, mmap.mmap):
+            if not cls._is_readonly_mmap(buf):
+                buf = memoryview(bytes(buf))
+        elif isinstance(buf, memoryview):
+            if not buf.c_contiguous:
+                buf = memoryview(buf.tobytes())
+            else:
+                if buf.ndim != 1 or buf.format != "B":
+                    buf = buf.cast("B")
+                buf_obj = getattr(buf, "obj", None)
+                is_ro_backing = type(buf_obj) is bytes or (
+                    isinstance(buf_obj, mmap.mmap) and cls._is_readonly_mmap(buf_obj)
+                )
+                if not buf.readonly or not is_ro_backing:
+                    buf = memoryview(buf.tobytes())
+        elif type(buf) is not bytes:
+            buf = memoryview(bytes(buf))
+
+        magic, hdr_len = _V3_HDR_STRUCT.unpack_from(buf, 0)
+        if magic != MAGIC_HEADER_V3:
+            raise ValueError("Invalid System 1 v3 Model binary: missing or invalid magic header")
+        if hdr_len == 0 or hdr_len > MAX_SKILL_HEADER_BYTES_V3:
+            raise ValueError("Saved v3 skill header exceeds size limit")
+        header_end = 16 + hdr_len
+        if buf_len < header_end:
+            raise ValueError("Corrupted System 1 v3 Model binary: truncated header")
+
+        try:
+            header_json = bytes(buf[16:header_end]).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Corrupted System 1 v3 header encoding: {exc}") from exc
+
+        def _reject_nonfinite(tok: str) -> Any:
+            raise ValueError(f"Saved v3 skill header contains non-finite constant: {tok!r}")
+
+        meta = json.loads(header_json, parse_constant=_reject_nonfinite, parse_float=_strict_json_parse_float)
+        if not isinstance(meta, dict) or meta.get("version") != 3:
+            raise ValueError("Unsupported or inconsistent saved v3 skill format version")
+        if "embed_vocab" in meta and type(meta["embed_vocab"]) is not bool:
+            raise ValueError("Saved v3 skill embed_vocab flag must be a boolean")
+
+        fields_data = meta["schema_dict"]["fields"]
+        if not isinstance(fields_data, dict) or not 0 < len(fields_data) <= MAX_SKILL_FIELDS_V3:
+            raise ValueError("Saved v3 skill field count exceeds limits")
+        for definition in fields_data.values():
+            if len(definition.get("options", ())) > MAX_SKILL_OPTIONS:
+                raise ValueError("Saved v3 skill option count exceeds limits")
+        schema = DecisionSchema.from_dict(meta["schema_dict"])
+        if meta.get("schema_digest") != schema.schema_digest():
+            raise ValueError("Saved skill schema digest does not match its definition")
+        dimension = meta.get("dimension")
+        if type(dimension) is not int or not 0 < dimension <= MAX_SKILL_DIMENSION:
+            raise ValueError("Saved skill dimension must be a positive integer within limits")
+        if set(meta.get("heads", ())) != set(schema.fields):
+            raise ValueError("Saved skill heads must exactly match its schema")
+
+        raw_tensors = meta.get("tensors")
+        if not isinstance(raw_tensors, dict) or len(raw_tensors) > 17 * MAX_SKILL_FIELDS_V3 + 32:
+            raise ValueError("Saved v3 skill tensor manifest is invalid or exceeds limit")
+
+        namespaced = _resolve_tensor_namespaced_flag(schema, meta)
+        allowed_names = set(PROJECTOR_TENSOR_NAMES)
+        for fname in schema.fields:
+            for suf in HEAD_TENSOR_SUFFIXES:
+                allowed_names.add(_head_tensor_name(fname, suf, namespaced=namespaced))
+
+        max_dim_bound = max(MAX_SKILL_CALIBRATION_SCORES, 250_000)
+        total_array_bytes = 0
+        intervals: List[Tuple[int, int, str]] = []
+        for tname, spec in raw_tensors.items():
+            if not isinstance(tname, str) or tname not in allowed_names:
+                raise ValueError(f"Saved v3 skill contains unexpected tensor: {tname!r}")
+            if not isinstance(spec, Mapping):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} spec must be a mapping")
+            dt_name = spec.get("dtype")
+            if not isinstance(dt_name, str) or dt_name not in _ALLOWED_V3_DTYPES:
+                raise ValueError(f"Saved v3 skill tensor {tname!r} has unsupported dtype {dt_name!r}")
+            dt = np.dtype(dt_name)
+            shape = spec.get("shape")
+            if (
+                not isinstance(shape, list)
+                or len(shape) > 3
+                or any(type(d) is not int or d < 0 or d > max_dim_bound for d in shape)
+            ):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} has invalid shape {shape!r}")
+            raw_order = spec.get("order", "C")
+            if type(raw_order) is not str or raw_order not in ("C", "F"):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} has unsupported order {raw_order!r}")
+            if raw_order == "F" and len(shape) != 2:
+                raise ValueError(f"Saved v3 skill tensor {tname!r} order 'F' requires a 2D shape, got {shape!r}")
+            count = 1
+            for d in shape:
+                count *= d
+            expected_nbytes = count * dt.itemsize
+            nbytes = spec.get("nbytes")
+            if (
+                type(nbytes) is not int
+                or nbytes != expected_nbytes
+                or nbytes < 0
+                or nbytes > MAX_SKILL_ARRAY_BYTES_V3
+            ):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} nbytes mismatch")
+            offset = spec.get("offset")
+            if (
+                type(offset) is not int
+                or offset < header_end
+                or (offset % 64) != 0
+                or offset + nbytes > buf_len
+            ):
+                raise ValueError(f"Saved v3 skill tensor {tname!r} offset is misaligned or out of bounds")
+            if (nbytes >= 65536 or tname == "_projector_dense_table") and (offset % S1M_V3_PAGE_SIZE) != 0:
+                raise ValueError(f"Saved v3 skill tensor {tname!r} is not {S1M_V3_PAGE_SIZE}-byte page aligned")
+            total_array_bytes += nbytes
+            if total_array_bytes > MAX_SKILL_ARRAY_BYTES_V3:
+                raise ValueError("Saved v3 skill array payload exceeds memory budget")
+            if nbytes > 0:
+                intervals.append((offset, offset + nbytes, tname))
+
+        intervals.sort()
+        prev_end = header_end
+        for start, end, tname in intervals:
+            if start < prev_end:
+                raise ValueError(f"Saved v3 skill tensor {tname!r} overlaps another tensor region")
+            prev_end = end
+
+        shapes_v3: Dict[str, Tuple[int, ...]] = {
+            tname: tuple(spec["shape"]) for tname, spec in raw_tensors.items()
+        }
+        idf_tensor_names = frozenset((
+            "_projector_tfidf_idf",
+            "_projector_prag_base_idf",
+            "_projector_prag_idf",
+            "_projector_hybrid_tfidf_idf",
+        ))
+        logit_adj_names = frozenset(
+            _head_tensor_name(fname, "logit_adj", namespaced=namespaced)
+            for fname in schema.fields
+        )
+        score_f64_names = frozenset(
+            _head_tensor_name(fname, sfx, namespaced=namespaced)
+            for fname in schema.fields
+            for sfx in ("calib_scores", "proto_scores")
+        )
+        upcast_bytes_v3 = 0
+        for tname, spec in raw_tensors.items():
+            dt_bytes = np.dtype(spec["dtype"]).itemsize
+            cnt = int(math.prod(shapes_v3[tname]))
+            if tname in idf_tensor_names or tname in logit_adj_names:
+                if dt_bytes != 8:
+                    upcast_bytes_v3 += 8 * cnt
+            elif tname not in score_f64_names and dt_bytes != 4:
+                upcast_bytes_v3 += 4 * cnt
+        extra_runtime_bytes = _validate_skill_shapes_and_runtime_delta(
+            schema,
+            dimension,
+            shapes_v3,
+            heads_meta=meta.get("heads"),
+            namespaced=namespaced,
+        )
+        _, layout_extra_bytes_v3 = _validate_tensor_layouts_header(
+            meta,
+            shapes_v3,
+            non_f32_2d_names=idf_tensor_names | logit_adj_names | score_f64_names,
+            full_allocation=True,
+        )
+        extra_runtime_bytes += upcast_bytes_v3 + layout_extra_bytes_v3
+
+        cov_fields = sum(
+            1
+            for fname in schema.fields
+            if (
+                _head_tensor_name(fname, "P", namespaced=namespaced) in raw_tensors
+                or _head_tensor_name(fname, "B", namespaced=namespaced) in raw_tensors
+            )
+        )
+        projector_config = meta.get("projector")
+        saved_tfidf, saved_prag, _ = cls._validate_projector_and_budget(
+            schema,
+            dimension,
+            projector_config,
+            cov_fields=cov_fields,
+            max_runtime_bytes=MAX_SKILL_RUNTIME_BYTES_V3,
+            extra_runtime_bytes=extra_runtime_bytes,
+        )
+
+        views: Dict[str, np.ndarray] = {}
+        try:
+            for tname, spec in raw_tensors.items():
+                shape = tuple(spec["shape"])
+                dt = np.dtype(spec["dtype"])
+                order_flag = spec.get("order", "C")
+                count = int(math.prod(shape)) if shape else 1
+                if count == 0:
+                    arr = np.empty(shape, dtype=dt, order=order_flag)
+                elif order_flag == "F":
+                    arr = np.ndarray(shape, dtype=dt, buffer=buf, offset=spec["offset"], order="F")
+                else:
+                    arr = np.frombuffer(buf, dtype=dt, count=count, offset=spec["offset"]).reshape(shape)
+                arr.setflags(write=False)
+                views[tname] = arr
+
+            return cls._reconstruct_model_from_parts(
+                meta,
+                views,
+                projector=projector,
+                backend=backend,
+                schema=schema,
+                dimension=dimension,
+                projector_config=projector_config,
+                saved_tfidf=saved_tfidf,
+                saved_prag=saved_prag,
+                format_version=3,
+            )
+        except Exception:
+            views.clear()
+            raise
+
+    @classmethod
+    def from_bytes(
+        cls,
+        data: Union[bytes, bytearray, memoryview],
+        projector: Optional[Any] = None,
+        backend: str = "numpy",
+    ) -> CompiledSystemOneModel:
+        """Deserializes a CompiledSystemOneModel from .s1m binary bytes (v1, v2, or v3)."""
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            raise ValueError("Invalid System 1 Model binary: unsupported buffer type")
+        mv = memoryview(data)
+        total_bytes = mv.nbytes
+        if total_bytes > max(MAX_SKILL_BYTES, MAX_SKILL_BYTES_V3):
+            raise ValueError("Saved skill file exceeds size limit")
+        if total_bytes < 8:
+            raise ValueError("Invalid System 1 Model binary: missing or invalid magic header")
+
+        if not mv.c_contiguous:
+            frozen: Optional[bytes] = mv.tobytes()
+            mv_b = memoryview(frozen)
+        else:
+            mv_b = mv if (mv.ndim == 1 and mv.format == "B") else mv.cast("B")
+            frozen = None
+
+        magic8 = bytes(mv_b[:8])
+        if magic8 == MAGIC_HEADER_V3:
+            if total_bytes > MAX_SKILL_BYTES_V3:
+                raise ValueError("Saved v3 skill file size is out of bounds")
+            if frozen is None and not (
+                type(data) is bytes
+                or (
+                    isinstance(data, memoryview)
+                    and data.readonly
+                    and type(getattr(data, "obj", None)) is bytes
+                )
+            ):
+                mv_b = memoryview(mv_b.tobytes())
+            return cls._from_v3_buffer(mv_b, total_bytes, projector=projector, backend=backend)
+
+        if total_bytes > MAX_SKILL_BYTES:
+            raise ValueError("Saved skill file exceeds size limit")
+        if magic8[:4] not in (b"S1M\x01", MAGIC_HEADER):
+            raise ValueError("Invalid System 1 Model binary: missing or invalid magic header")
+
+        raw_bytes = frozen if frozen is not None else (data if type(data) is bytes else mv_b.tobytes())
+        header_len = struct.unpack(">I", raw_bytes[4:8])[0]
+        if header_len > MAX_SKILL_HEADER_BYTES:
+            raise ValueError("Saved skill header exceeds size limit")
+        header_end = 8 + header_len
+        if len(raw_bytes) < header_end:
+            raise ValueError("Corrupted System 1 Model binary: truncated header")
+
+        try:
+            header_json = raw_bytes[8:header_end].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"Corrupted System 1 header encoding: {exc}") from exc
+
+        def _reject_nonfinite(tok: str) -> Any:
+            raise ValueError(f"Saved skill header contains non-finite constant: {tok!r}")
+
+        meta = json.loads(header_json, parse_constant=_reject_nonfinite, parse_float=_strict_json_parse_float)
+        if meta.get("version") not in (1, 2) or meta["version"] != raw_bytes[3]:
+            raise ValueError("Unsupported or inconsistent saved skill format version")
+
+        fields_data = meta["schema_dict"]["fields"]
+        if not isinstance(fields_data, dict) or not 0 < len(fields_data) <= MAX_SKILL_FIELDS:
+            raise ValueError("Saved skill field count exceeds limits")
+        for definition in fields_data.values():
+            if len(definition.get("options", ())) > MAX_SKILL_OPTIONS:
+                raise ValueError("Saved skill option count exceeds limits")
+        schema = DecisionSchema.from_dict(meta["schema_dict"])
+        if meta.get("schema_digest") != schema.schema_digest():
+            raise ValueError("Saved skill schema digest does not match its definition")
+        dimension = meta["dimension"]
+        if type(dimension) is not int or not 0 < dimension <= MAX_SKILL_DIMENSION:
+            raise ValueError("Saved skill dimension must be a positive integer within limits")
+        if set(meta["heads"]) != set(schema.fields):
+            raise ValueError("Saved skill heads must exactly match its schema")
+        projector_config = meta.get("projector")
+        cov_fields = (
+            len(schema.fields)
+            if (projector_config is None or projector_config.get("type") == "deterministic")
+            else 0
+        )
+        saved_tfidf, saved_prag, runtime_bytes = cls._validate_projector_and_budget(
+            schema,
+            dimension,
+            projector_config,
+            cov_fields=cov_fields,
+            max_runtime_bytes=MAX_SKILL_RUNTIME_BYTES,
+        )
+        namespaced = _resolve_tensor_namespaced_flag(schema, meta)
+        npz_file = _read_skill_arrays(
+            raw_bytes[header_end:],
+            schema,
+            dimension,
+            runtime_bytes,
+            namespaced=namespaced,
+            meta=meta,
+        )
+        return cls._reconstruct_model_from_parts(
+            meta,
+            npz_file,
+            projector=projector,
+            backend=backend,
+            schema=schema,
+            dimension=dimension,
+            projector_config=projector_config,
+            saved_tfidf=saved_tfidf,
+            saved_prag=saved_prag,
+            format_version=int(meta["version"]),
         )
 
     @classmethod
@@ -1843,11 +3857,32 @@ class CompiledSystemOneModel:
         path: Union[str, Path],
         projector: Optional[Any] = None,
         backend: str = "numpy",
+        *,
+        mmap_mode: bool = True,
     ) -> CompiledSystemOneModel:
-        """Loads a CompiledSystemOneModel from a .s1m file."""
+        """Loads a CompiledSystemOneModel from a .s1m file (using zero-copy mmap for S1M\\x03)."""
         target = Path(path)
         if not target.is_file():
             raise FileNotFoundError(f"Model file not found: {target}")
+        file_size = target.stat().st_size
+        with open(target, "rb") as _hdr_fh:
+            magic8 = _hdr_fh.read(8)
+        if magic8 == MAGIC_HEADER_V3:
+            if file_size > MAX_SKILL_BYTES_V3:
+                raise ValueError("Saved v3 skill file exceeds size limit")
+            if mmap_mode:
+                fh = open(target, "rb")
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                try:
+                    model = cls._from_v3_buffer(mm, len(mm), projector=projector, backend=backend)
+                except Exception:
+                    cls._close_mmap_handle(mm, fh)
+                    raise
+                model._mmap_obj = mm
+                model._mmap_fh = fh
+                return model
+            return cls.from_bytes(target.read_bytes(), projector=projector, backend=backend)
+
         data = _read_skill_bytes(target)
         return cls.from_bytes(data, projector=projector, backend=backend)
 
@@ -1924,7 +3959,7 @@ class SystemOneCompiler:
             raise ValueError("noise_robust must be a boolean")
         self.noise_robust = resolved_noise_robust
         self.backend = backend
-        self.forgetting_factor = float(forgetting_factor)
+        self.forgetting_factor = _validate_forgetting_factor(forgetting_factor)
         self.relative_odds_ratio = float(relative_odds_ratio)
         self.confidence_floor_tau0 = float(confidence_floor_tau0)
         self.recency_weighted = bool(recency_weighted)
@@ -2207,7 +4242,6 @@ class SystemOneCompiler:
                     field_samples.append((neg_text, ()))
 
             elif isinstance(f_def, ScoreField):
-                val_range = max(1e-6, f_def.max_value - f_def.min_value)
                 low_d = f_def.low_description
                 high_d = f_def.high_description
                 desc_mid = f_def.description or "Intermediate balanced condition"
@@ -2232,8 +4266,8 @@ class SystemOneCompiler:
                     (1.0, f"Maximum critical rating: {high_d}"),
                 ]
                 for fraction, prompt in score_levels:
-                    target_val = f_def.min_value + fraction * val_range
-                    field_samples.append((prompt, float(target_val)))
+                    target_val = float(_score_from_unit_prob(fraction, f_def.min_value, f_def.max_value))
+                    field_samples.append((prompt, target_val))
 
             exemplars[field_name] = field_samples
 
@@ -2434,26 +4468,27 @@ class SystemOneCompiler:
         sample_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Compute unit-normalized class feature centroids (shape (K, D))."""
-        X_mat = np.asarray(X_train, dtype=np.float32)
+        X_mat = np.asarray(X_train, dtype=np.float64)
         N, D = X_mat.shape
         sw = (
             np.maximum(1e-6, np.asarray(sample_weights, dtype=np.float64).flatten())
             if sample_weights is not None
             else None
         )
+
+        def _safe_weighted_mean(rows: np.ndarray, weights: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            return _safe_centroid_mean_f64(rows, weights)
+
         if is_boolean:
             y_flat = np.asarray(Y_train, dtype=np.float32).flatten()
             protos = np.zeros((2, D), dtype=np.float32)
             for idx, mask in enumerate((y_flat < 0.0, y_flat > 0.0)):
                 if np.any(mask):
-                    vec = (
-                        np.average(X_mat[mask], axis=0, weights=sw[mask])
-                        if sw is not None
-                        else np.mean(X_mat[mask], axis=0)
-                    )
-                    norm = float(np.linalg.norm(vec))
-                    if norm > 1e-12:
-                        protos[idx] = (vec / norm).astype(np.float32)
+                    vec = _safe_weighted_mean(X_mat[mask], sw[mask] if sw is not None else None)
+                    if vec is not None:
+                        unit_v, _, ok = _normalize_vec_f32_safe(vec, min_norm=0.0)
+                        if ok:
+                            protos[idx] = unit_v
             res = _roundtrip_unit_f16(protos)
             assert res is not None
             return res
@@ -2465,14 +4500,11 @@ class SystemOneCompiler:
         for k in range(K):
             mask = Y_mat[:, k] > 0.5
             if np.any(mask):
-                vec = (
-                    np.average(X_mat[mask], axis=0, weights=sw[mask])
-                    if sw is not None
-                    else np.mean(X_mat[mask], axis=0)
-                )
-                norm = float(np.linalg.norm(vec))
-                if norm > 1e-12:
-                    protos[k] = (vec / norm).astype(np.float32)
+                vec = _safe_weighted_mean(X_mat[mask], sw[mask] if sw is not None else None)
+                if vec is not None:
+                    unit_v, _, ok = _normalize_vec_f32_safe(vec, min_norm=0.0)
+                    if ok:
+                        protos[k] = unit_v
         res = _roundtrip_unit_f16(protos)
         assert res is not None
         return res
@@ -2586,9 +4618,8 @@ class SystemOneCompiler:
         if M >= K:
             return tuple(range(K))
 
-        norms = np.linalg.norm(protos, axis=1, keepdims=True)
-        norms = np.where(norms < 1e-12, 1.0, norms)
-        unit_protos = protos / norms
+        unit_f32, _ = _normalize_rows_f32_safe(protos)
+        unit_protos = unit_f32.astype(np.float64)
 
         # Deterministic farthest-first traversal (k-means++ on cosine similarity)
         sim_matrix = unit_protos @ unit_protos.T
@@ -2753,16 +4784,17 @@ class SystemOneCompiler:
         """Compute sorted calibration prototype similarities and empirical alpha quantile."""
         if prototype_alpha <= 0.0 or prototypes is None or prototypes.size == 0 or len(X_conf) == 0:
             return 0.0, ()
-        protos = np.asarray(prototypes, dtype=np.float32)
-        p_norms = np.linalg.norm(protos, axis=1, keepdims=True)
-        valid_rows = (p_norms.flatten() > 1e-12)
+        protos_all, valid_rows = _normalize_rows_f32_safe(prototypes)
         if not np.any(valid_rows):
             return 0.0, ()
-        protos_valid = (protos[valid_rows] / p_norms[valid_rows]).astype(np.float32)
-        X_mat = np.asarray(X_conf, dtype=np.float32)
-        x_norms = np.linalg.norm(X_mat, axis=1, keepdims=True)
-        x_norms = np.where(x_norms < 1e-12, 1.0, x_norms)
-        X_unit = (X_mat / x_norms).astype(np.float32)
+        protos_valid = protos_all[valid_rows]
+        x64 = np.asarray(X_conf, dtype=np.float64)
+        if x64.ndim != 2 or len(x64) == 0:
+            return 0.0, ()
+        fin_rows = np.all(np.isfinite(x64), axis=1)
+        if not np.any(fin_rows):
+            return 0.0, ()
+        X_unit, _ = _normalize_rows_f32_safe(x64[fin_rows])
         max_sims = np.max(X_unit @ protos_valid.T, axis=1).astype(np.float64)
         finite_sims = max_sims[np.isfinite(max_sims)]
         if len(finite_sims) == 0:
@@ -2772,11 +4804,487 @@ class SystemOneCompiler:
         m = len(sorted_sims)
         rank = int(math.floor((m + 1) * prototype_alpha))
         if rank >= 1:
-            thresh = float(sorted_sims[rank - 1])
+            thresh = float(max(0.0, float(sorted_sims[rank - 1])))
         else:
             min_sim = float(sorted_sims[0])
             thresh = float(max(0.0, min_sim * 0.90)) if min_sim > 0.0 else 0.0
         return thresh, scores_tuple
+
+    @staticmethod
+    def _normalize_soft_probs(
+        raw_probs: Any,
+        f_def: Union[ChoiceField, BooleanField],
+        *,
+        expected_len: Optional[int] = None,
+    ) -> np.ndarray:
+        arr = np.asarray(raw_probs, dtype=np.float64)
+        if isinstance(f_def, BooleanField):
+            if arr.ndim == 1:
+                arr = np.column_stack([1.0 - arr, arr])
+            elif arr.ndim == 2 and arr.shape[1] == 1:
+                p_true = arr[:, 0]
+                arr = np.column_stack([1.0 - p_true, p_true])
+            elif arr.ndim != 2 or arr.shape[1] != 2:
+                raise ValueError(f"soft_probs for BooleanField {f_def.name!r} must have shape (N, 2) or (N,)")
+        elif isinstance(f_def, ChoiceField):
+            K = len(f_def.options)
+            if arr.ndim != 2 or arr.shape[1] != K:
+                raise ValueError(f"soft_probs for ChoiceField {f_def.name!r} must have shape (N, {K})")
+        else:
+            raise ValueError(f"Soft distillation supports ChoiceField and BooleanField, got {type(f_def).__name__}")
+        if arr.shape[0] < 2:
+            raise ValueError("Soft distillation requires at least 2 examples")
+        if expected_len is not None and arr.shape[0] != expected_len:
+            raise ValueError(f"soft_probs length ({arr.shape[0]}) does not match exemplars ({expected_len})")
+        if not np.all(np.isfinite(arr)) or np.any(arr < 0.0):
+            raise ValueError("soft_probs must contain finite non-negative probabilities")
+        row_sums = arr.sum(axis=1, keepdims=True)
+        if np.any(row_sums <= 1e-12):
+            raise ValueError("Each soft_probs row must sum to a positive value")
+        return arr / row_sums
+
+    @staticmethod
+    def _encode_texts_with_projector(
+        texts: Sequence[str],
+        projector: Any,
+        *,
+        recency_weighted: bool = False,
+    ) -> np.ndarray:
+        text_list = [str(t) for t in texts]
+        if not text_list:
+            dim = int(getattr(projector, "dimension", 0) or 0)
+            return np.empty((0, dim), dtype=np.float32)
+        eff_rw = bool(recency_weighted) and not isinstance(projector, (TfidfProjector, PragmaticCompositeProjector))
+        proj_fn = getattr(projector, "project", None)
+        pwn_fn = getattr(projector, "project_with_norm", None)
+        batch_fn = getattr(projector, "project_batch", None)
+        one_rw = _accepts_recency_weighted(proj_fn)
+        pwn_rw = _accepts_recency_weighted(pwn_fn)
+        batch_rw = _accepts_recency_weighted(batch_fn)
+        if (
+            (not _is_native_scalar_projector(projector))
+            and callable(batch_fn)
+            and (batch_rw or not (one_rw or pwn_rw))
+        ):
+            raw_mat = (
+                batch_fn(text_list, recency_weighted=eff_rw)
+                if batch_rw
+                else batch_fn(text_list)
+            )
+            raw_mat_arr = np.asarray(raw_mat)
+            dim_out = int(raw_mat_arr.shape[1]) if raw_mat_arr.ndim == 2 else 0
+            return _normalize_raw_projection_batch(raw_mat_arr, len(text_list), dim_out, zero_unit0=False)
+        rows = []
+        for p in text_list:
+            if callable(pwn_fn) and (pwn_rw or not one_rw):
+                v, _ = pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
+            elif callable(proj_fn):
+                v = proj_fn(p, recency_weighted=eff_rw) if one_rw else proj_fn(p)
+            else:
+                v = projector(p)
+            v_arr = np.asarray(v).ravel()
+            rows.append(_normalize_raw_projection(v_arr, int(v_arr.shape[0]), zero_unit0=False))
+        return np.stack(rows, axis=0)
+
+    @staticmethod
+    def _stratified_folds(y_idx: np.ndarray, k_classes: int) -> Tuple[int, np.ndarray]:
+        N = len(y_idx)
+        n_folds = min(5, max(2, N // max(4, k_classes)))
+        if N < n_folds:
+            n_folds = max(2, N)
+        fold_ids = np.zeros(N, dtype=np.int64)
+        fc = 0
+        for c in range(max(1, k_classes)):
+            idxs = np.where(y_idx == c)[0]
+            for i in idxs:
+                fold_ids[i] = fc % n_folds
+                fc += 1
+        return n_folds, fold_ids
+
+    def _soft_distill_discrete_head(
+        self,
+        field_name: str,
+        f_def: Union[ChoiceField, BooleanField],
+        prompts: Sequence[str],
+        P_T: np.ndarray,
+        *,
+        y_true_idx: Optional[np.ndarray] = None,
+        alpha: float = 0.05,
+        beta_grid: Sequence[float] = (0.15, 0.35, 0.55),
+        reg_grid: Sequence[float] = (0.15, 0.5, 1.5, 5.0),
+        X_precomputed: Optional[np.ndarray] = None,
+        fold_projector_factory: Optional[Any] = None,
+        mondrian: bool = False,
+        fam_thresh: float = 0.0,
+    ) -> CompiledHeadWeights:
+        N, K = P_T.shape
+        y_arg = (
+            np.asarray(y_true_idx, dtype=np.int64)
+            if y_true_idx is not None
+            else np.argmax(P_T, axis=1)
+        )
+        Y_hard_oh = np.eye(K, dtype=np.float64)[y_arg] if y_true_idx is not None else None
+        X_all = (
+            np.asarray(X_precomputed, dtype=np.float32)
+            if X_precomputed is not None
+            else self._encode_texts_with_projector(prompts, self.projector, recency_weighted=self.recency_weighted)
+        )
+
+        n_folds, fold_ids = self._stratified_folds(y_arg, K)
+        fold_features: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        prompt_list = [str(p) for p in prompts]
+        for f in range(n_folds):
+            tri = np.where(fold_ids != f)[0]
+            vai = np.where(fold_ids == f)[0]
+            if len(tri) == 0 or len(vai) == 0:
+                continue
+            if fold_projector_factory is not None:
+                fold_proj = fold_projector_factory(
+                    [prompt_list[i] for i in tri],
+                    [int(y_arg[i]) for i in tri],
+                )
+                Xf_tr = self._encode_texts_with_projector([prompt_list[i] for i in tri], fold_proj).astype(np.float64)
+                Xf_va = self._encode_texts_with_projector([prompt_list[i] for i in vai], fold_proj).astype(np.float64)
+            else:
+                Xf_tr = X_all[tri].astype(np.float64)
+                Xf_va = X_all[vai].astype(np.float64)
+            fold_features.append((tri, vai, Xf_tr, Xf_va))
+
+        betas = tuple(float(b) for b in beta_grid) if Y_hard_oh is not None else (0.0,)
+        regs = tuple(max(1e-4, float(r)) for r in reg_grid)
+        best_nll = float("inf")
+        best_beta = betas[0]
+        best_reg = regs[0]
+        best_oof_logits = np.zeros((N, K), dtype=np.float64)
+
+        for beta_v in betas:
+            for reg_v in regs:
+                oof_logits = np.zeros((N, K), dtype=np.float64)
+                for tri, vai, Xf_tr, Xf_va in fold_features:
+                    U_f, c_f, _, _ = _solve_soft_ridge_student_raw(
+                        Xf_tr,
+                        P_T[tri],
+                        (Y_hard_oh[tri] if Y_hard_oh is not None else None),
+                        beta=beta_v,
+                        reg=reg_v,
+                    )
+                    oof_logits[vai] = Xf_va @ U_f.T + c_f
+                p_cand = _stable_softmax(oof_logits, temperature=1.0)
+                nll = -float(np.mean(np.sum(P_T * np.log(np.clip(p_cand, 1e-12, 1.0)), axis=1)))
+                if nll < best_nll:
+                    best_nll = nll
+                    best_beta = beta_v
+                    best_reg = reg_v
+                    best_oof_logits = oof_logits
+
+        T_soft = _soft_fit_temperature_np(best_oof_logits, P_T)
+        p_oof = _stable_softmax(best_oof_logits / T_soft, temperature=1.0)
+        q_lac, p_floor = _oof_conservative_soft_conformal(
+            p_oof,
+            P_T,
+            y_true_idx=(y_arg if y_true_idx is not None else None),
+            alpha=float(alpha),
+        )
+
+        lac_scores = 1.0 - p_oof[np.arange(N), y_arg]
+        sorted_calib_scores = np.sort(lac_scores)
+        options = f_def.options if isinstance(f_def, ChoiceField) else ("False", "True")
+        per_class_scores = (
+            {
+                options[c]: tuple(float(v) for v in np.sort(lac_scores[y_arg == c]))
+                for c in range(K)
+                if np.any(y_arg == c)
+            }
+            if mondrian
+            else {}
+        )
+        err_mask = np.argmax(p_oof, axis=1) != y_arg
+        if np.any(err_mask):
+            sorted_p = -np.sort(-p_oof[err_mask], axis=1)
+            runner_diff = sorted_p[:, 0] - (sorted_p[:, 1] if K > 1 else 0.0)
+            m_thresh = float(np.clip(np.quantile(runner_diff, 0.95) + 0.05, 0.15, 0.85))
+        else:
+            m_thresh = 0.20
+
+        U_full, c_full, Z_full, sw_full = _solve_soft_ridge_student_raw(
+            X_all.astype(np.float64),
+            P_T,
+            Y_hard_oh,
+            beta=best_beta,
+            reg=best_reg,
+        )
+        if isinstance(f_def, BooleanField):
+            weights = (0.25 * (U_full[1:2] - U_full[0:1])).astype(np.float32)
+            biases = np.array([0.25 * float(c_full[1] - c_full[0])], dtype=np.float32)
+            target_scaled = (0.25 * (Z_full[:, 1] - Z_full[:, 0])).reshape(-1, 1).astype(np.float32)
+            head_options: Tuple[str, ...] = ()
+        else:
+            weights = (0.25 * U_full).astype(np.float32)
+            biases = (0.25 * c_full).astype(np.float32)
+            target_scaled = (0.25 * Z_full).astype(np.float32)
+            head_options = f_def.options
+
+        _, _, P_mat, B_mat = self._solve_ridge(
+            X_all,
+            target_scaled,
+            best_reg,
+            sample_weights=sw_full.astype(np.float32),
+            regularize_bias=False,
+            return_covariance=True,
+        )
+        tau0 = max(0.0, float(p_floor) - (1.0 / max(1, K)))
+        return CompiledHeadWeights(
+            field_name=field_name,
+            field_type=f_def.field_type,
+            weights=weights,
+            biases=biases,
+            temperature=float(T_soft),
+            conformal_quantile=float(q_lac),
+            options=head_options,
+            P=P_mat,
+            B=B_mat,
+            margin_threshold=m_thresh,
+            forgetting_factor=self.forgetting_factor,
+            relative_odds_ratio=self.relative_odds_ratio,
+            confidence_floor_tau0=float(tau0),
+            escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
+            calibration_scores=tuple(float(s) for s in sorted_calib_scores),
+            score_method="lac",
+            mondrian=bool(mondrian),
+            class_calibration_scores=per_class_scores,
+            familiarity_threshold=float(fam_thresh),
+        )
+
+    def compile_soft_distilled(
+        self,
+        prompts: Union[Sequence[str], Mapping[str, Sequence[str]]],
+        *,
+        soft_probs: Union[Sequence[Sequence[float]], Mapping[str, Sequence[Sequence[float]]]],
+        hard_labels: Optional[Union[Sequence[Any], Mapping[str, Sequence[Any]]]] = None,
+        field_name: Optional[str] = None,
+        alpha: Optional[float] = None,
+        beta_grid: Sequence[float] = (0.15, 0.35, 0.55),
+        reg_grid: Sequence[float] = (0.15, 0.5, 1.5, 5.0),
+        semantic_mode: Optional[str] = None,
+        pragmatic: bool = False,
+        max_features: int = 2048,
+        prag_max_dim: int = 384,
+    ) -> CompiledSystemOneModel:
+        """Distill continuous teacher probabilities into a calibrated zero-egress .s1m student."""
+        eff_alpha = 0.05 if alpha is None else float(alpha)
+        if not math.isfinite(eff_alpha) or not (0.0 < eff_alpha < 1.0):
+            raise ValueError("alpha must be finite and in (0, 1)")
+        eff_semantic_mode = self.semantic_mode if semantic_mode is None else semantic_mode
+        if not isinstance(eff_semantic_mode, str) or eff_semantic_mode not in VALID_SEMANTIC_MODES:
+            raise ValueError(
+                f"Unsupported semantic_mode {eff_semantic_mode!r}; expected one of {VALID_SEMANTIC_MODES}"
+            )
+
+        if isinstance(prompts, Mapping):
+            if not isinstance(soft_probs, Mapping):
+                raise ValueError("soft_probs must be a mapping when prompts is a mapping")
+            prompt_map: Dict[str, List[str]] = {k: [str(x) for x in v] for k, v in prompts.items()}
+            soft_map_raw: Dict[str, Any] = dict(soft_probs)
+            hard_map_raw: Dict[str, Any] = dict(hard_labels) if isinstance(hard_labels, Mapping) else {}
+        else:
+            if isinstance(soft_probs, Mapping):
+                raise ValueError("soft_probs must be a sequence/array when prompts is a sequence")
+            if field_name is not None:
+                target_field = field_name
+            elif len(self.schema.fields) == 1:
+                target_field = next(iter(self.schema.fields))
+            else:
+                raise ValueError("field_name is required for multi-field schemas")
+            prompt_map = {target_field: [str(x) for x in prompts]}
+            soft_map_raw = {target_field: soft_probs}
+            hard_map_raw = {target_field: hard_labels} if hard_labels is not None else {}
+
+        if not prompt_map or set(prompt_map) != set(soft_map_raw):
+            raise ValueError("prompts and soft_probs must cover the same schema field(s)")
+
+        parsed_fields: Dict[str, Dict[str, Any]] = {}
+        all_texts: List[str] = []
+        proj_labels: List[str] = []
+        multi_field = len(prompt_map) > 1
+
+        for fname, p_list in prompt_map.items():
+            f_def = self.schema.fields.get(fname)
+            if f_def is None or not isinstance(f_def, (ChoiceField, BooleanField)):
+                raise ValueError(f"Unsupported field for soft distillation: {fname!r}")
+            P_norm = self._normalize_soft_probs(soft_map_raw[fname], f_def, expected_len=len(p_list))
+            y_idx_arr: Optional[np.ndarray] = None
+            raw_hard = hard_map_raw.get(fname)
+            if raw_hard is not None:
+                if len(raw_hard) != len(p_list):
+                    raise ValueError(f"hard_labels length mismatch for field {fname!r}")
+                if isinstance(f_def, ChoiceField):
+                    opt_idx = {opt: i for i, opt in enumerate(f_def.options)}
+                    idx_list = []
+                    for lbl in raw_hard:
+                        if lbl not in opt_idx:
+                            raise ValueError(f"Invalid hard label {lbl!r} for field {fname!r}")
+                        idx_list.append(opt_idx[lbl])
+                    y_idx_arr = np.asarray(idx_list, dtype=np.int64)
+                else:
+                    y_idx_arr = np.asarray([1 if bool(lbl) else 0 for lbl in raw_hard], dtype=np.int64)
+            parsed_fields[fname] = {"f_def": f_def, "prompts": p_list, "P_T": P_norm, "y_idx": y_idx_arr}
+            lbl_source = y_idx_arr if y_idx_arr is not None else np.argmax(P_norm, axis=1)
+            for txt, idx_val in zip(p_list, lbl_source):
+                all_texts.append(txt)
+                proj_labels.append(f"{fname}:{int(idx_val)}" if multi_field else str(int(idx_val)))
+
+        from system1.core.embeddings import HybridProjector
+
+        needs_hybrid_fit = (
+            eff_semantic_mode in ("v1_1", "v1_2_fisher", "v1_2_rbf")
+            and (
+                not self._explicit_projector
+                or (isinstance(self.projector, HybridProjector) and not getattr(self.projector, "_fitted", False))
+            )
+        )
+        fold_factory = None
+        if needs_hybrid_fit:
+            fit_labels = proj_labels if len(set(proj_labels)) >= 2 else None
+            extra_fit_kw: Dict[str, Any] = {}
+            if isinstance(self.projector, HybridProjector):
+                extra_fit_kw["sparse_dim"] = self.projector.sparse_dim
+                extra_fit_kw["dense_dim"] = self.projector.dense_dim
+                extra_fit_kw["alpha"] = self.projector.alpha
+                extra_fit_kw["seed"] = self.projector.seed
+            if eff_semantic_mode == "v1_1":
+                fitted_proj = HybridProjector.fit(
+                    all_texts,
+                    labels=fit_labels,
+                    backend=self.backend,
+                    **extra_fit_kw,
+                )
+            else:
+                fitted_proj = HybridProjector.fit_v1_2(
+                    all_texts,
+                    labels=fit_labels,
+                    schema=self.schema,
+                    backend=self.backend,
+                    attach_rbf=bool(eff_semantic_mode == "v1_2_rbf" and fit_labels is not None),
+                    **extra_fit_kw,
+                )
+            self.projector = fitted_proj
+            self.dimension = int(fitted_proj.dimension)
+            self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
+        elif pragmatic and (not self._explicit_projector or not isinstance(self.projector, PragmaticCompositeProjector)):
+            base_cap = min(int(max_features), MAX_SKILL_DIMENSION - int(prag_max_dim))
+            eff_min_df = 1 if len(all_texts) < 24 else (2 if len(all_texts) < 48 else 3)
+            fit_labels = proj_labels if len(set(proj_labels)) >= 2 else None
+            fitted_prag = PragmaticCompositeProjector.fit(
+                all_texts,
+                labels=fit_labels,
+                max_features=max(16, base_cap),
+                prag_max_dim=min(int(prag_max_dim), MAX_PRAG_FEATURES),
+                min_df=eff_min_df,
+                char_ngrams=(3, 5),
+            )
+            self.projector = fitted_prag
+            self.dimension = int(fitted_prag.dimension)
+            self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
+            if not multi_field:
+                def fold_factory(tr_texts: List[str], tr_lbls: List[int]) -> PragmaticCompositeProjector:
+                    flabels = [str(v) for v in tr_lbls] if len(set(tr_lbls)) >= 2 else None
+                    mdf = 1 if len(tr_texts) < 24 else (2 if len(tr_texts) < 48 else 3)
+                    return PragmaticCompositeProjector.fit(
+                        tr_texts,
+                        labels=flabels,
+                        max_features=max(16, base_cap),
+                        prag_max_dim=min(int(prag_max_dim), MAX_PRAG_FEATURES),
+                        min_df=mdf,
+                        char_ngrams=(3, 5),
+                    )
+        elif not self._explicit_projector:
+            feat_cap = min(int(max_features), MAX_SKILL_DIMENSION)
+            fit_labels = proj_labels if len(set(proj_labels)) >= 2 else None
+            fitted_tfidf = TfidfProjector.fit(
+                all_texts,
+                max_features=max(16, feat_cap),
+                labels=fit_labels,
+                selection="chi2" if fit_labels is not None else "frequency",
+                char_ngrams=(3, 5),
+            )
+            self.projector = fitted_tfidf
+            self.dimension = int(fitted_tfidf.dimension)
+            self.telemetry_projector = TelemetryProjector(embedding_dim=self.dimension)
+            if not multi_field:
+                def fold_factory(tr_texts: List[str], tr_lbls: List[int]) -> TfidfProjector:
+                    flabels = [str(v) for v in tr_lbls] if len(set(tr_lbls)) >= 2 else None
+                    return TfidfProjector.fit(
+                        tr_texts,
+                        max_features=max(16, feat_cap),
+                        labels=flabels,
+                        selection="chi2" if flabels is not None else "frequency",
+                        char_ngrams=(3, 5),
+                    )
+
+        eff_recency = (
+            False
+            if isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector))
+            else self.recency_weighted
+        )
+        compiled_heads: Dict[str, CompiledHeadWeights] = {}
+        sample_counts: Dict[str, Dict[str, int]] = {}
+        for fname, f_def in self.schema.fields.items():
+            info = parsed_fields.get(fname)
+            if info is None:
+                head = DecisionFieldHead(f_def, dimension=self.dimension, projector=self.projector)
+                compiled_heads[fname] = CompiledHeadWeights(
+                    field_name=fname,
+                    field_type=f_def.field_type,
+                    weights=head.weights,
+                    biases=head.biases,
+                    temperature=1.0,
+                    conformal_quantile=0.0,
+                    options=getattr(f_def, "options", ()),
+                    forgetting_factor=self.forgetting_factor,
+                    relative_odds_ratio=self.relative_odds_ratio,
+                    confidence_floor_tau0=self.confidence_floor_tau0,
+                    escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
+                )
+                continue
+            head_w = self._soft_distill_discrete_head(
+                fname,
+                info["f_def"],
+                info["prompts"],
+                info["P_T"],
+                y_true_idx=info["y_idx"],
+                alpha=eff_alpha,
+                beta_grid=beta_grid,
+                reg_grid=reg_grid,
+                fold_projector_factory=fold_factory,
+                mondrian=self.mondrian,
+            )
+            compiled_heads[fname] = head_w
+            sample_counts[fname] = {
+                "fit": len(info["prompts"]),
+                "calibration": len(info["prompts"]),
+                "temperature": len(info["prompts"]),
+                "generated": 0,
+            }
+
+        return CompiledSystemOneModel(
+            schema=self.schema,
+            heads=compiled_heads,
+            dimension=self.dimension,
+            projector=self.projector,
+            backend=self.backend,
+            forgetting_factor=self.forgetting_factor,
+            recency_weighted=eff_recency,
+            metadata={
+                "regularization": self.regularization,
+                "choice_solver": "soft_ridge_oof",
+                "teaching_mode": "soft_distilled",
+                "pragmatic": bool(isinstance(self.projector, PragmaticCompositeProjector)),
+                "semantic_mode": eff_semantic_mode,
+                "alpha": eff_alpha,
+                "sample_counts": sample_counts,
+                "compiled_at": time.time(),
+            },
+        )
 
     def compile(
         self,
@@ -2797,6 +5305,7 @@ class SystemOneCompiler:
         semantic_mode: Optional[str] = None,
         proto_blend: Optional[float] = None,
         fisher_reg: Optional[float] = None,
+        soft_targets: Optional[Mapping[str, Sequence[Sequence[float]]]] = None,
     ) -> CompiledSystemOneModel:
         """Compile a local model, optionally using supplied examples only.
 
@@ -2872,6 +5381,19 @@ class SystemOneCompiler:
             if training_inputs & calibration_inputs:
                 raise ValueError("Training and calibration inputs must be disjoint")
 
+        validated_soft: Dict[str, np.ndarray] = {}
+        if soft_targets is not None:
+            if not isinstance(soft_targets, Mapping):
+                raise ValueError("soft_targets must be a mapping of field_name -> probability sequences")
+            for s_fname, s_probs in soft_targets.items():
+                f_def_s = self.schema.fields.get(s_fname)
+                if f_def_s is None or not isinstance(f_def_s, (ChoiceField, BooleanField)):
+                    raise ValueError(f"soft_targets supports ChoiceField and BooleanField only, got {s_fname!r}")
+                raw_rows = dataset.get(s_fname, [])
+                validated_soft[s_fname] = self._normalize_soft_probs(
+                    s_probs, f_def_s, expected_len=len(raw_rows)
+                )
+
         compiled_heads: Dict[str, CompiledHeadWeights] = {}
         sample_counts: Dict[str, Dict[str, int]] = {}
         partitioned_fields: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -2886,6 +5408,34 @@ class SystemOneCompiler:
                 if not augment:
                     raise ValueError(f"Teaching requires examples for field {field_name!r}")
                 partitioned_fields[field_name] = None
+                continue
+
+            soft_probs_field = validated_soft.get(field_name)
+            if soft_probs_field is not None:
+                calibration_samples = list(calibration_data.get(field_name, [])) if calibration_data is not None else []
+                num_train = len(samples)
+                num_calib = len(calibration_samples)
+                sample_counts[field_name] = {
+                    "fit": num_train,
+                    "calibration": num_calib if num_calib > 0 else num_train,
+                    "temperature": num_calib // 2 if num_calib >= 2 else num_train,
+                    "generated": 0,
+                }
+                for row in samples:
+                    p_txt = row[0]
+                    if isinstance(p_txt, str):
+                        all_train_texts.append(p_txt)
+                        discrete_texts.append(p_txt)
+                        lbl_str = str(row[1])
+                        discrete_labels.append(f"{field_name}:{lbl_str}" if multi_field_schema else lbl_str)
+                partitioned_fields[field_name] = {
+                    "samples": samples + calibration_samples,
+                    "num_train": num_train,
+                    "num_calib": num_calib,
+                    "num_temperature": (num_calib // 2 if num_calib >= 2 else 0),
+                    "generated_count": 0,
+                    "soft_probs": soft_probs_field,
+                }
                 continue
 
             # Teaching from examples keeps repeated inputs in one partition.
@@ -2946,17 +5496,21 @@ class SystemOneCompiler:
                         samples.append((p, lab))
 
                 elif isinstance(f_def, ScoreField):
-                    val_range = max(1e-6, f_def.max_value - f_def.min_value)
                     synth_all = self.generate_synthetic_exemplars(samples_per_choice=samples_per_choice)
                     synth_field = synth_all.get(field_name, [])
 
-                    low_synth = [s for s in synth_field if float(s[1]) <= f_def.min_value + 0.33 * val_range]
-                    mid_synth = [s for s in synth_field if f_def.min_value + 0.33 * val_range < float(s[1]) <= f_def.min_value + 0.67 * val_range]
-                    high_synth = [s for s in synth_field if float(s[1]) > f_def.min_value + 0.67 * val_range]
+                    def _sc_unit(sample_pair: Any) -> float:
+                        return float(
+                            _score_to_unit_ratio(float(sample_pair[1]), f_def.min_value, f_def.max_value)
+                        )
 
-                    low_real = [s for s in samples if float(s[1]) <= f_def.min_value + 0.33 * val_range]
-                    mid_real = [s for s in samples if f_def.min_value + 0.33 * val_range < float(s[1]) <= f_def.min_value + 0.67 * val_range]
-                    high_real = [s for s in samples if float(s[1]) > f_def.min_value + 0.67 * val_range]
+                    low_synth = [s for s in synth_field if _sc_unit(s) <= 0.33]
+                    mid_synth = [s for s in synth_field if 0.33 < _sc_unit(s) <= 0.67]
+                    high_synth = [s for s in synth_field if _sc_unit(s) > 0.67]
+
+                    low_real = [s for s in samples if _sc_unit(s) <= 0.33]
+                    mid_real = [s for s in samples if 0.33 < _sc_unit(s) <= 0.67]
+                    high_real = [s for s in samples if _sc_unit(s) > 0.67]
 
                     target_c = max(len(low_real), len(mid_real), len(high_real), samples_per_choice, 15)
 
@@ -3108,7 +5662,14 @@ class SystemOneCompiler:
             conf_start_idx = (num_train + num_temperature) if isinstance(f_def, ChoiceField) else num_train
             if conf_start_idx >= len(prompts):
                 conf_start_idx = num_train
-            need_fam = eff_familiarity_alpha > 0.0 and hasattr(self.projector, "raw_norm") and conf_start_idx < len(prompts)
+            need_fam = (
+                eff_familiarity_alpha > 0.0
+                and (
+                    callable(getattr(self.projector, "raw_norm", None))
+                    or callable(getattr(self.projector, "project_with_norm", None))
+                )
+                and conf_start_idx < len(prompts)
+            )
 
             # Encode all prompts (and optional continuous telemetry) to embedding matrix X
             X_list = []
@@ -3126,53 +5687,58 @@ class SystemOneCompiler:
                     if need_fam and idx_s >= conf_start_idx:
                         need_norm_set.add(p)
 
-            if unique_prompts and hasattr(self.projector, "project_batch"):
-                use_rw = self.recency_weighted and not isinstance(self.projector, TfidfProjector)
+            eff_rw = bool(self.recency_weighted) and not isinstance(self.projector, (TfidfProjector, PragmaticCompositeProjector))
+            proj_fn = getattr(self.projector, "project", None)
+            pwn_fn = getattr(self.projector, "project_with_norm", None)
+            batch_fn = getattr(self.projector, "project_batch", None)
+            one_rw = _accepts_recency_weighted(proj_fn)
+            pwn_rw = _accepts_recency_weighted(pwn_fn)
+            batch_rw = _accepts_recency_weighted(batch_fn)
+            batch_rn = _accepts_return_norms(batch_fn)
+            if (
+                unique_prompts
+                and (not _is_native_scalar_projector(self.projector))
+                and callable(batch_fn)
+                and (batch_rw or not (one_rw or pwn_rw))
+            ):
                 want_any_norm = bool(need_norm_set)
                 raw_norms_batch: Optional[np.ndarray] = None
-                try:
-                    if want_any_norm:
-                        if use_rw:
-                            raw_mat, raw_norms_batch = self.projector.project_batch(
-                                unique_prompts,
-                                recency_weighted=self.recency_weighted,
-                                return_norms=True,
-                            )
-                        else:
-                            raw_mat, raw_norms_batch = self.projector.project_batch(
-                                unique_prompts,
-                                return_norms=True,
-                            )
-                    elif use_rw:
-                        raw_mat = self.projector.project_batch(
+                if want_any_norm and batch_rn:
+                    if batch_rw:
+                        raw_mat, raw_norms_batch = batch_fn(
                             unique_prompts,
-                            recency_weighted=self.recency_weighted,
+                            recency_weighted=eff_rw,
+                            return_norms=True,
                         )
                     else:
-                        raw_mat = self.projector.project_batch(unique_prompts)
-                except TypeError:
-                    if use_rw:
-                        try:
-                            raw_mat = self.projector.project_batch(
-                                unique_prompts,
-                                recency_weighted=self.recency_weighted,
-                            )
-                        except TypeError:
-                            raw_mat = self.projector.project_batch(unique_prompts)
-                    else:
-                        raw_mat = self.projector.project_batch(unique_prompts)
-                raw_mat_arr = np.asarray(raw_mat, dtype=np.float32)
-                row_norms = np.linalg.norm(raw_mat_arr, axis=1, keepdims=True)
-                normed_mat = np.where(
-                    row_norms > 1e-12,
-                    raw_mat_arr / np.maximum(row_norms, 1e-12),
-                    raw_mat_arr,
-                ).astype(np.float32)
+                        raw_mat, raw_norms_batch = batch_fn(
+                            unique_prompts,
+                            return_norms=True,
+                        )
+                elif batch_rw:
+                    raw_mat = batch_fn(
+                        unique_prompts,
+                        recency_weighted=eff_rw,
+                    )
+                else:
+                    raw_mat = batch_fn(unique_prompts)
+                normed_mat = _normalize_raw_projection_batch(
+                    raw_mat,
+                    len(unique_prompts),
+                    self.dimension,
+                    zero_unit0=False,
+                )
                 for u_idx, p in enumerate(unique_prompts):
                     if raw_norms_batch is not None and p in need_norm_set:
                         rn_val_b: Optional[float] = float(raw_norms_batch[u_idx])
                     elif p in need_norm_set:
-                        rn_val_b = float(self.projector.raw_norm(p))
+                        rn_val_b = None
+                        if callable(pwn_fn):
+                            _, pwn_n_b = pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
+                            if pwn_n_b is not None:
+                                rn_val_b = float(pwn_n_b)
+                        if rn_val_b is None:
+                            rn_val_b = _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw)
                     else:
                         rn_val_b = None
                     proj_cache[p] = (normed_mat[u_idx], rn_val_b)
@@ -3185,27 +5751,42 @@ class SystemOneCompiler:
                 if cached is not None:
                     emb_base, rn_val = cached
                     if want_raw and rn_val is None:
-                        rn_val = float(self.projector.raw_norm(p))
+                        if callable(pwn_fn):
+                            _, pwn_n_c = pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
+                            rn_val = (
+                                float(pwn_n_c)
+                                if pwn_n_c is not None
+                                else _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw)
+                            )
+                        else:
+                            rn_val = _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw)
                         proj_cache[p] = (emb_base, rn_val)
                     emb = emb_base
                 else:
-                    if hasattr(self.projector, "project"):
-                        if self.recency_weighted and not isinstance(self.projector, TfidfProjector):
-                            try:
-                                raw_emb = self.projector.project(p, recency_weighted=self.recency_weighted)
-                            except TypeError:
-                                raw_emb = self.projector.project(p)
+                    if callable(pwn_fn) and t is None and (pwn_rw or not one_rw):
+                        raw_emb, pwn_norm = (
+                            pwn_fn(p, recency_weighted=eff_rw) if pwn_rw else pwn_fn(p)
+                        )
+                        rn_val = (
+                            float(pwn_norm)
+                            if (want_raw and pwn_norm is not None)
+                            else (_call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw) if want_raw else None)
+                        )
+                    elif callable(proj_fn):
+                        raw_emb = proj_fn(p, recency_weighted=eff_rw) if one_rw else proj_fn(p)
+                        if want_raw and callable(pwn_fn) and t is None:
+                            _, pwn_norm = pwn_fn(p)
+                            rn_val = (
+                                float(pwn_norm)
+                                if pwn_norm is not None
+                                else _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw)
+                            )
                         else:
-                            raw_emb = self.projector.project(p)
+                            rn_val = _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw) if want_raw else None
                     else:
                         raw_emb = self.projector(p)
-                    rn_val = float(self.projector.raw_norm(p)) if want_raw else None
-                    norm = float(np.linalg.norm(raw_emb))
-                    emb_base = (
-                        (raw_emb / norm).astype(np.float32)
-                        if norm > 1e-12
-                        else np.asarray(raw_emb, dtype=np.float32)
-                    )
+                        rn_val = _call_raw_norm_if_callable(self.projector, p, recency_weighted=eff_rw) if want_raw else None
+                    emb_base = _normalize_raw_projection(raw_emb, self.dimension, zero_unit0=False)
                     if isinstance(p, str):
                         proj_cache[p] = (emb_base, rn_val)
                     emb = emb_base
@@ -3231,6 +5812,123 @@ class SystemOneCompiler:
             X_conf = X_calib[num_temperature:] if isinstance(f_def, ChoiceField) else X_calib
             if len(X_conf) == 0:
                 X_conf = X_calib
+
+            soft_probs_field = part.get("soft_probs")
+            if soft_probs_field is not None and isinstance(f_def, (ChoiceField, BooleanField)):
+                y_raw_train = raw_labels[:num_train]
+                if isinstance(f_def, ChoiceField):
+                    opt_idx_map = {opt: idx for idx, opt in enumerate(f_def.options)}
+                    y_idx_train = np.asarray([opt_idx_map[lbl] for lbl in y_raw_train], dtype=np.int64)
+                else:
+                    y_idx_train = np.asarray([1 if bool(lbl) else 0 for lbl in y_raw_train], dtype=np.int64)
+
+                if num_calib == 0:
+                    compiled_heads[field_name] = self._soft_distill_discrete_head(
+                        field_name,
+                        f_def,
+                        prompts[:num_train],
+                        soft_probs_field,
+                        y_true_idx=y_idx_train,
+                        alpha=0.05,
+                        X_precomputed=X_train,
+                        mondrian=eff_mondrian,
+                        fam_thresh=fam_thresh,
+                    )
+                else:
+                    K_s = soft_probs_field.shape[1]
+                    Y_hard_s = np.eye(K_s, dtype=np.float64)[y_idx_train]
+                    n_f_s, f_ids_s = self._stratified_folds(y_idx_train, K_s)
+                    best_b_s, best_r_s, best_nll_s = 0.25, 0.5, float("inf")
+                    X_tr64 = X_train.astype(np.float64)
+                    for beta_s in (0.15, 0.35, 0.55):
+                        for reg_s in (0.15, 0.5, 1.5, 5.0):
+                            oof_s = np.zeros((num_train, K_s), dtype=np.float64)
+                            for f_k in range(n_f_s):
+                                tri_s = np.where(f_ids_s != f_k)[0]
+                                vai_s = np.where(f_ids_s == f_k)[0]
+                                if len(tri_s) == 0 or len(vai_s) == 0:
+                                    continue
+                                U_fk, c_fk, _, _ = _solve_soft_ridge_student_raw(
+                                    X_tr64[tri_s], soft_probs_field[tri_s], Y_hard_s[tri_s], beta=beta_s, reg=reg_s
+                                )
+                                oof_s[vai_s] = X_tr64[vai_s] @ U_fk.T + c_fk
+                            p_s = _stable_softmax(oof_s, temperature=1.0)
+                            nll_s = -float(np.mean(np.sum(soft_probs_field * np.log(np.clip(p_s, 1e-12, 1.0)), axis=1)))
+                            if nll_s < best_nll_s:
+                                best_nll_s, best_b_s, best_r_s = nll_s, beta_s, reg_s
+                    U_s, c_s, Z_s, sw_s = _solve_soft_ridge_student_raw(
+                        X_tr64, soft_probs_field, Y_hard_s, beta=best_b_s, reg=best_r_s
+                    )
+                    if isinstance(f_def, BooleanField):
+                        w_s = (0.25 * (U_s[1:2] - U_s[0:1])).astype(np.float32)
+                        b_s = np.array([0.25 * float(c_s[1] - c_s[0])], dtype=np.float32)
+                        t_scaled = (0.25 * (Z_s[:, 1] - Z_s[:, 0])).reshape(-1, 1).astype(np.float32)
+                        h_opts: Tuple[str, ...] = ()
+                        raw_cal = (X_calib.astype(np.float64) @ U_s.T + c_s)
+                        y_cal_idx = np.asarray([1 if bool(l) else 0 for l in raw_labels[num_train:]], dtype=np.int64)
+                    else:
+                        w_s = (0.25 * U_s).astype(np.float32)
+                        b_s = (0.25 * c_s).astype(np.float32)
+                        t_scaled = (0.25 * Z_s).astype(np.float32)
+                        h_opts = f_def.options
+                        opt_idx_map = {opt: idx for idx, opt in enumerate(f_def.options)}
+                        raw_cal = X_calib.astype(np.float64) @ U_s.T + c_s
+                        y_cal_idx = np.asarray([opt_idx_map[l] for l in raw_labels[num_train:]], dtype=np.int64)
+                    _, _, P_s, B_s = self._solve_ridge(
+                        X_train,
+                        t_scaled,
+                        best_r_s,
+                        sample_weights=sw_s.astype(np.float32),
+                        regularize_bias=False,
+                        return_covariance=True,
+                    )
+                    n_temp_s = max(0, min(num_temperature, len(raw_cal) - 1))
+                    if n_temp_s >= 1:
+                        y_t_oh = np.eye(K_s, dtype=np.float64)[y_cal_idx[:n_temp_s]]
+                        T_cal = _soft_fit_temperature_np(raw_cal[:n_temp_s], y_t_oh)
+                        cal_logits_c = raw_cal[n_temp_s:]
+                        cal_y_c = y_cal_idx[n_temp_s:]
+                    else:
+                        T_cal = 1.0
+                        cal_logits_c = raw_cal
+                        cal_y_c = y_cal_idx
+                    p_cal_c = _stable_softmax(cal_logits_c / T_cal, temperature=1.0)
+                    sc_cal = 1.0 - p_cal_c[np.arange(len(cal_y_c)), cal_y_c]
+                    sorted_sc_cal = np.sort(sc_cal)
+                    n_sc_c = len(sorted_sc_cal)
+                    k_c = int(math.ceil((n_sc_c + 1) * 0.95))
+                    conf_q_c = (1.0 if k_c > n_sc_c else float(sorted_sc_cal[k_c - 1])) if n_sc_c else 0.0
+                    c_opts_lbl = f_def.options if isinstance(f_def, ChoiceField) else ("False", "True")
+                    cls_sc_c = (
+                        {
+                            c_opts_lbl[c]: tuple(float(v) for v in np.sort(sc_cal[cal_y_c == c]))
+                            for c in range(K_s)
+                            if np.any(cal_y_c == c)
+                        }
+                        if eff_mondrian
+                        else {}
+                    )
+                    compiled_heads[field_name] = CompiledHeadWeights(
+                        field_name=field_name,
+                        field_type=f_def.field_type,
+                        weights=w_s,
+                        biases=b_s,
+                        temperature=float(T_cal),
+                        conformal_quantile=float(conf_q_c),
+                        options=h_opts,
+                        P=P_s,
+                        B=B_s,
+                        forgetting_factor=self.forgetting_factor,
+                        relative_odds_ratio=self.relative_odds_ratio,
+                        confidence_floor_tau0=self.confidence_floor_tau0,
+                        escalate_on_ambiguity=getattr(f_def, "escalate_on_ambiguity", True),
+                        calibration_scores=tuple(float(v) for v in sorted_sc_cal),
+                        score_method="lac",
+                        mondrian=eff_mondrian,
+                        class_calibration_scores=cls_sc_c,
+                        familiarity_threshold=fam_thresh,
+                    )
+                continue
 
             # Construct target Y matrix
             if isinstance(f_def, ChoiceField):
@@ -3379,7 +6077,7 @@ class SystemOneCompiler:
                 per_class_scores: Dict[str, List[float]] = {opt: [] for opt in f_def.options}
                 for i in range(len(labels_conf)):
                     p_row = probs_calib[i]
-                    s_idx = np.argsort(-p_row)
+                    s_idx = np.argsort(-p_row, kind="mergesort")
                     top_i = int(s_idx[0])
                     runner_i = int(s_idx[1]) if len(s_idx) > 1 else top_i
                     true_c = int(labels_conf[i])
@@ -3503,7 +6201,7 @@ class SystemOneCompiler:
                         error_margins_bool.append(abs(p_true - p_false))
 
                     # APS score
-                    s_idx = np.argsort(-np.array(p_row))
+                    s_idx = np.argsort(-np.array(p_row), kind="mergesort")
                     cum_s = 0.0
                     score_val = 1.0
                     for c_i in s_idx:
@@ -3646,11 +6344,11 @@ class SystemOneCompiler:
                 )
 
             elif isinstance(f_def, ScoreField):
-                val_range = max(1e-6, f_def.max_value - f_def.min_value)
-                raw_floats = np.array([float(lab) for lab in raw_labels], dtype=np.float32).reshape(-1, 1)
+                raw_floats = np.array([float(lab) for lab in raw_labels], dtype=np.float64).reshape(-1, 1)
                 # Map target into logit space matching sigmoid evaluation: prob = sigmoid(z / 0.25) => z = 0.25 * ln(r / (1 - r))
-                r = np.clip((raw_floats - f_def.min_value) / val_range, 0.01, 0.99)
-                Z_all = (0.25 * np.log(r / (1.0 - r))).astype(np.float32)
+                with np.errstate(over="ignore", invalid="ignore"):
+                    r = np.clip(_score_to_unit_ratio(raw_floats, f_def.min_value, f_def.max_value), 0.01, 0.99)
+                    Z_all = (0.25 * np.log(r / (1.0 - r))).astype(np.float32)
                 Z_train = Z_all[:num_train]
                 weights, biases, P_mat, B_mat = self._solve_ridge(
                     X_train, Z_train, self.regularization, regularize_bias=augment, return_covariance=True
@@ -3663,17 +6361,18 @@ class SystemOneCompiler:
                 # Calibrate residual bounds on X_calib
                 logits_calib = (X_calib @ weights.T + biases).flatten()
                 probs_calib = _stable_sigmoid(logits_calib, temperature=0.25)
-                pred_vals = f_def.min_value + val_range * probs_calib
+                pred_vals = _score_from_unit_prob(probs_calib, f_def.min_value, f_def.max_value)
                 true_calib_floats = raw_floats[num_train:].flatten()
                 residuals = [
-                    float(abs(pred_vals[i] - true_calib_floats[i]))
+                    _score_abs_diff_clamped(float(pred_vals[i]), float(true_calib_floats[i]))
                     for i in range(len(pred_vals))
                 ]
                 sorted_residuals = np.sort(np.asarray(residuals, dtype=np.float64))
                 alpha = 0.05
                 n_res = len(sorted_residuals)
                 k = int(math.ceil((n_res + 1) * (1.0 - alpha)))
-                conformal_q = (float(val_range) if k > n_res else float(sorted_residuals[k - 1])) if n_res else 0.0
+                full_range = _score_full_span_clamped(f_def.min_value, f_def.max_value)
+                conformal_q = (full_range if k > n_res else float(sorted_residuals[k - 1])) if n_res else 0.0
 
                 compiled_heads[field_name] = CompiledHeadWeights(
                     field_name=field_name,
@@ -3738,6 +6437,9 @@ class SystemOneCompiler:
         semantic_mode: Optional[str] = None,
         proto_blend: Optional[float] = None,
         fisher_reg: Optional[float] = None,
+        soft_targets: Optional[Mapping[str, Sequence[Sequence[float]]]] = None,
+        format_version: int = 2,
+        embed_vocab: bool = False,
     ) -> CompiledSystemOneModel:
         """Compiles model and writes directly to target .s1m binary file."""
         model = self.compile(
@@ -3757,8 +6459,13 @@ class SystemOneCompiler:
             semantic_mode=semantic_mode,
             proto_blend=proto_blend,
             fisher_reg=fisher_reg,
+            soft_targets=soft_targets,
         )
-        model.save(output_path)
+        model.save(
+            output_path,
+            format_version=format_version,
+            embed_vocab=embed_vocab,
+        )
         return model
 
     @classmethod
@@ -3767,9 +6474,16 @@ class SystemOneCompiler:
         path: Union[str, Path],
         projector: Optional[Any] = None,
         backend: str = "numpy",
+        *,
+        mmap_mode: bool = True,
     ) -> CompiledSystemOneModel:
         """Loads a compiled model from a .s1m file."""
-        return CompiledSystemOneModel.load(path, projector=projector, backend=backend)
+        return CompiledSystemOneModel.load(
+            path,
+            projector=projector,
+            backend=backend,
+            mmap_mode=mmap_mode,
+        )
 
 
 __all__ = [
@@ -3777,6 +6491,9 @@ __all__ = [
     "CompiledSystemOneModel",
     "CompiledHeadWeights",
     "MAGIC_HEADER",
+    "MAGIC_HEADER_V3",
+    "S1M_V3_PAGE_SIZE",
+    "MAX_SKILL_FIELDS_V3",
     "VALID_SEMANTIC_MODES",
     "compute_strict_loo_weights",
 ]

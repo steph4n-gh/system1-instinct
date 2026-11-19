@@ -1,6 +1,7 @@
 """Small, portable TF-IDF features learned from teaching text; NumPy only."""
 from __future__ import annotations
 
+import ast
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 import hashlib
@@ -8,7 +9,7 @@ import json
 import math
 import re
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -963,4 +964,757 @@ class TfidfProjector:
     from_texts = fit
     to_dict = to_config
     from_dict = from_config
+
+
+# ---------------------------------------------------------------------------
+# Pragmatic structural features & composite projector
+# ---------------------------------------------------------------------------
+
+MAX_PRAG_FEATURES = 1024
+_PRAG_PREFIXES = ("NOT_", "HTTP_", "NUM_MAG_", "CURR_", "PCT_", "LAT_", "KV_", "TURN_", "COND_")
+
+_CLAUSE_PUNCT_RE = re.compile(r"[.!?;,:\n()\[\]{}]+|\s--\s|\s—\s")
+_CONTRAST_SPLIT_RE = re.compile(
+    r"\b(but|however|although|though|yet|instead(?!\s+of)|rather|except|unless|while|whereas|nevertheless|nonetheless)\b",
+    re.I,
+)
+_CONTRAST_CONJ_SET: frozenset[str] = frozenset({
+    "but",
+    "however",
+    "although",
+    "though",
+    "yet",
+    "instead",
+    "rather",
+    "except",
+    "unless",
+    "while",
+    "whereas",
+    "nevertheless",
+    "nonetheless",
+})
+_NEGATION_CUES: frozenset[str] = frozenset(_NEGATION_TOKENS) | frozenset({
+    "nothing",
+    "nowhere",
+    "none",
+    "hardly",
+    "barely",
+    "scarcely",
+    "lack",
+    "lacking",
+    "absent",
+    "avoid",
+    "refuse",
+})
+_IGNORE_NEG_FLIP_VERBS: frozenset[str] = frozenset({
+    "ignore",
+    "ignored",
+    "ignoring",
+    "dismiss",
+    "dismissed",
+    "dismissing",
+    "overlook",
+    "overlooked",
+    "underestimate",
+    "forget",
+    "hide",
+    "skip",
+    "suppress",
+    "miss",
+    "missed",
+})
+_NEGATION_CONTENT_STOPWORDS: frozenset[str] = frozenset({
+    "a",
+    "an",
+    "the",
+    "or",
+    "and",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "for",
+    "with",
+    "by",
+    "from",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "any",
+    "this",
+    "that",
+    "these",
+    "those",
+    "it",
+    "its",
+})
+_TOKEN_ALPHA_RE = re.compile(r"[a-z]{2,}")
+_WORD_OR_CONTR_RE = re.compile(r"[a-z0-9']+")
+_CURRENCY_RE = re.compile(r"(?:\$|usd\s*|eur\s*)(\d+(?:,\d{3})*(?:\.\d+)?)\s*([km])?\b", re.I)
+_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_LATENCY_RE = re.compile(
+    r"\b(\d+(?:,\d{3})*(?:\.\d+)?)\s*(ms|msec|s|sec|secs|second|seconds|min|mins|minute|minutes)\b",
+    re.I,
+)
+_NUM_KM_RE = re.compile(r"(?<![A-Za-z0-9_.#-])(\d+(?:,\d{3})*(?:\.\d+)?)\s*([km])?(?![A-Za-z0-9_-])", re.I)
+_HTTP_KNOWN: frozenset[int] = frozenset({
+    200, 201, 202, 204, 301, 302, 304, 307, 308,
+    400, 401, 403, 404, 405, 408, 409, 410, 413, 422, 429,
+    500, 501, 502, 503, 504, 507, 599,
+})
+_HTTP_CTX_RE = re.compile(
+    r"(?:http|status|code|error|err|resp|response|gateway|timeout|returned|got|returning)\s*[:=#]?\s*([2-5]\d\d)\b",
+    re.I,
+)
+_HTTP_BARE_RE = re.compile(r"\b([2-5]\d\d)\b")
+_INLINE_KV_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_.]{1,32})\s*=\s*([A-Za-z0-9_./:-]{1,40})")
+_SPEAKER_TURN_RE = re.compile(r"(?:^|\n)\s*(user|agent|customer|reviewer|assistant|system)\s*:", re.I)
+_COND_PHRASE_RE = re.compile(r"\b(if only|used to)\b", re.I)
+
+
+def _num_mag_bucket(val: float) -> str:
+    v = abs(float(val))
+    if v == 0.0:
+        return "NUM_MAG_ZERO"
+    if v < 1.0:
+        return "NUM_MAG_SUB1"
+    if v < 10.0:
+        return "NUM_MAG_1_9"
+    if v < 100.0:
+        return "NUM_MAG_10_99"
+    if v < 1000.0:
+        return "NUM_MAG_100_999"
+    if v < 100000.0:
+        return "NUM_MAG_1K_99K"
+    return "NUM_MAG_100K_PLUS"
+
+
+def _parse_scaled_float(num_str: str, suffix: Optional[str]) -> Optional[float]:
+    try:
+        v = float(num_str.replace(",", ""))
+    except (ValueError, OverflowError):
+        return None
+    if suffix:
+        s = suffix.lower()
+        if s == "k":
+            v *= 1000.0
+        elif s == "m":
+            v *= 1000000.0
+    if not math.isfinite(v):
+        return None
+    return v
+
+
+def _emit_numeric_and_http_tokens(
+    segment: str,
+    negated: bool,
+    weights: Counter[str],
+    *,
+    enable_num_http: bool,
+    neg_weight: float = 1.85,
+) -> None:
+    if not enable_num_http:
+        return
+
+    def _add(tok: str, w: float) -> None:
+        if negated:
+            weights[f"NOT_{tok}"] += w * neg_weight
+        else:
+            weights[tok] += w
+
+    seen_codes: set[int] = set()
+    for m in _HTTP_CTX_RE.finditer(segment):
+        code = int(m.group(1))
+        seen_codes.add(code)
+        _add(f"HTTP_{code // 100}XX", 2.2)
+        _add(f"HTTP_{code}", 1.3)
+    for m in _HTTP_BARE_RE.finditer(segment):
+        code = int(m.group(1))
+        if code in _HTTP_KNOWN and code not in seen_codes:
+            seen_codes.add(code)
+            _add(f"HTTP_{code // 100}XX", 1.8)
+            _add(f"HTTP_{code}", 1.1)
+
+    for m in _CURRENCY_RE.finditer(segment):
+        v = _parse_scaled_float(m.group(1), m.group(2))
+        if v is None:
+            continue
+        _add(_num_mag_bucket(v), 1.6)
+        if v < 5.0:
+            _add("CURR_MICRO", 1.8)
+        elif v < 500.0:
+            _add("CURR_MODEST", 1.6)
+        elif v < 10000.0:
+            _add("CURR_HIGH", 1.8)
+        else:
+            _add("CURR_ENTERPRISE", 2.2)
+
+    for m in _PCT_RE.finditer(segment):
+        v = _parse_scaled_float(m.group(1), None)
+        if v is None:
+            continue
+        _add("PCT_ZERO" if v == 0.0 else ("PCT_LOW" if v <= 5.0 else ("PCT_MID" if v < 50.0 else "PCT_HIGH")), 1.6)
+
+    for m in _LATENCY_RE.finditer(segment):
+        v = _parse_scaled_float(m.group(1), None)
+        if v is None:
+            continue
+        unit = m.group(2).lower()
+        ms = v if unit.startswith("ms") else (v * 60000.0 if unit.startswith("min") else v * 1000.0)
+        _add("LAT_FAST_MS" if ms < 100.0 else ("LAT_MOD_MS" if ms < 1000.0 else "LAT_SLOW_S"), 1.6)
+
+    for m in _NUM_KM_RE.finditer(segment):
+        v = _parse_scaled_float(m.group(1), m.group(2))
+        if v is None:
+            continue
+        if 200.0 <= v <= 599.0 and v.is_integer() and int(v) in seen_codes:
+            continue
+        _add(_num_mag_bucket(v), 1.15)
+
+
+def _walk_json_obj(
+    obj: Any,
+    path: str,
+    weights: Counter[str],
+    *,
+    enable_num_http: bool,
+    depth: int = 0,
+) -> None:
+    if depth > 4:
+        return
+    if isinstance(obj, dict):
+        for raw_k, val in obj.items():
+            k = re.sub(r"[^a-z0-9_]", "_", str(raw_k).strip().lower()).strip("_")
+            if not k:
+                continue
+            sub_path = f"{path}.{k}" if path else k
+            weights[f"KV_KEY_{k}"] += 0.9
+            if path:
+                weights[f"KV_PATH_{sub_path}"] += 1.0
+            _walk_json_obj(val, sub_path, weights, enable_num_http=enable_num_http, depth=depth + 1)
+    elif isinstance(obj, list):
+        for item in obj[:12]:
+            _walk_json_obj(item, path, weights, enable_num_http=enable_num_http, depth=depth + 1)
+    elif isinstance(obj, bool):
+        bval = "true" if obj else "false"
+        leaf = path.split(".")[-1] if path else "val"
+        weights[f"KV_{leaf}={bval}"] += 2.6
+        if path != leaf:
+            weights[f"KV_{path}={bval}"] += 2.2
+    elif isinstance(obj, (int, float)):
+        try:
+            num_v = float(obj)
+        except (OverflowError, ValueError, TypeError):
+            return
+        if not math.isfinite(num_v):
+            return
+        leaf = path.split(".")[-1] if path else "val"
+        if enable_num_http:
+            if (
+                200.0 <= num_v <= 599.0
+                and num_v.is_integer()
+                and ("status" in leaf or "http" in leaf or "code" in leaf)
+            ):
+                code = int(num_v)
+                weights[f"HTTP_{code // 100}XX"] += 2.4
+                weights[f"KV_{leaf}=HTTP_{code // 100}XX"] += 2.4
+            else:
+                mag = _num_mag_bucket(num_v)
+                weights[mag] += 1.5
+                weights[f"KV_{leaf}={mag}"] += 2.0
+    elif isinstance(obj, str):
+        leaf = path.split(".")[-1] if path else "val"
+        sval = obj.strip().lower()
+        clean_v = re.sub(r"[^a-z0-9_./-]", "_", sval)[:40].strip("_")
+        if clean_v:
+            weights[f"KV_{leaf}={clean_v}"] += 2.4
+            if path != leaf:
+                weights[f"KV_{path}={clean_v}"] += 2.0
+        for w in _TOKEN_ALPHA_RE.findall(sval):
+            weights[f"KV_{leaf}_w_{_stem_word(w)}"] += 1.1
+
+
+def extract_pragmatic_features(
+    text: str,
+    *,
+    enable_negation: bool = True,
+    enable_num_http: bool = True,
+    enable_json_kv: bool = True,
+) -> Dict[str, float]:
+    """Extract pragmatic structural tokens: clause-bounded negation NOT_*, HTTP_*/NUM_MAG_*, JSON KV_*."""
+    if not isinstance(text, str):
+        raise TypeError("Pragmatic input must be text")
+    bounded_text = text[: MAX_TEXT_LENGTH * 2] if len(text) > MAX_TEXT_LENGTH * 2 else text
+    weights: Counter[str] = Counter()
+    residual_text = bounded_text
+
+    if enable_json_kv and ("{" in bounded_text or "=" in bounded_text):
+        spans: List[Tuple[int, int]] = []
+        idx = 0
+        text_len = len(bounded_text)
+        while idx < text_len:
+            if bounded_text[idx] == "{":
+                depth = 0
+                end = -1
+                for j in range(idx, min(text_len, idx + 4096)):
+                    ch = bounded_text[j]
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = j + 1
+                            break
+                if end != -1:
+                    raw = bounded_text[idx:end]
+                    parsed = None
+                    try:
+                        parsed = json.loads(raw)
+                    except Exception:
+                        try:
+                            cand = ast.literal_eval(raw)
+                            if isinstance(cand, (dict, list)):
+                                parsed = cand
+                        except Exception:
+                            parsed = None
+                    if isinstance(parsed, (dict, list)):
+                        _walk_json_obj(parsed, "", weights, enable_num_http=enable_num_http)
+                        spans.append((idx, end))
+                        idx = end
+                        continue
+            idx += 1
+
+        if spans:
+            chunks: List[str] = []
+            last = 0
+            for s, e in spans:
+                if s > last:
+                    chunks.append(bounded_text[last:s])
+                chunks.append(" ")
+                last = e
+            if last < text_len:
+                chunks.append(bounded_text[last:])
+            residual_text = "".join(chunks)
+
+        for m in _INLINE_KV_RE.finditer(residual_text):
+            k = m.group(1).lower()
+            v_raw = m.group(2).lower()
+            weights[f"KV_{k}={v_raw}"] += 2.0
+            if enable_num_http and len(v_raw) == 3 and v_raw.isdigit() and ("status" in k or "http" in k or "code" in k):
+                code = int(v_raw)
+                if 200 <= code <= 599:
+                    weights[f"HTTP_{code // 100}XX"] += 2.2
+                    weights[f"HTTP_{code}"] += 1.3
+
+    for m in _SPEAKER_TURN_RE.finditer(residual_text):
+        weights[f"TURN_{m.group(1).lower()}"] += 1.5
+    for m in _COND_PHRASE_RE.finditer(residual_text):
+        weights[f"COND_{m.group(1).lower().replace(' ', '_')}"] += 1.5
+
+    raw_clauses = _CLAUSE_PUNCT_RE.split(residual_text)
+    for cl in raw_clauses:
+        if not cl.strip():
+            continue
+        parts = _CONTRAST_SPLIT_RE.split(cl)
+        for p in parts:
+            ps = p.strip()
+            if not ps or ps.lower() in _CONTRAST_CONJ_SET:
+                continue
+            words = _WORD_OR_CONTR_RE.findall(ps.lower())
+            neg_active = False
+            neg_seen_in_clause = False
+            neg_tokens_left = 0
+            prev_neg_stem: Optional[str] = None
+            for i, w in enumerate(words):
+                cw = w.replace("'", "")
+                if not cw:
+                    continue
+                nxt = words[i + 1].replace("'", "") if i + 1 < len(words) else ""
+                if (cw in _NEGATION_CUES or (cw == "instead" and nxt == "of")) and enable_negation:
+                    if cw == "not" and nxt == "only":
+                        neg_active = False
+                        neg_tokens_left = 0
+                    elif nxt in _IGNORE_NEG_FLIP_VERBS:
+                        neg_active = False
+                        neg_tokens_left = 0
+                        weights[f"NOT_{_stem_word(nxt)}"] += 1.5
+                    else:
+                        neg_active = True
+                        neg_seen_in_clause = True
+                        neg_tokens_left = 8
+                        prev_neg_stem = None
+                    continue
+                if cw.isdigit():
+                    continue
+                stem = _stem_word(cw)
+                if enable_negation and neg_active and neg_tokens_left > 0:
+                    if cw not in _NEGATION_SKIP_MODIFIERS and cw not in _NEGATION_CONTENT_STOPWORDS and len(cw) >= 2:
+                        neg_tokens_left -= 1
+                        weights[f"NOT_{stem}"] += 2.0
+                        weights[f"NOT_w_{cw}"] += 1.2
+                        if prev_neg_stem is not None:
+                            weights[f"NOT_{prev_neg_stem}_{stem}"] += 1.4
+                        prev_neg_stem = stem
+            _emit_numeric_and_http_tokens(
+                ps,
+                neg_seen_in_clause and enable_negation,
+                weights,
+                enable_num_http=enable_num_http,
+            )
+
+    return dict(weights)
+
+
+class PragmaticCompositeProjector:
+    """Composes a chi2-filtered TF-IDF space with pragmatic structural channels."""
+
+    CONFIG_KEYS: frozenset[str] = frozenset({
+        "type",
+        "base_tfidf",
+        "prag_terms",
+        "prag_idf",
+        "enable_negation",
+        "enable_num_http",
+        "enable_json_kv",
+        "prag_weight",
+    })
+
+    def __init__(
+        self,
+        base_tfidf: TfidfProjector,
+        prag_vocab: Mapping[str, int],
+        prag_idf: Sequence[float] | np.ndarray,
+        *,
+        enable_negation: bool = True,
+        enable_num_http: bool = True,
+        enable_json_kv: bool = True,
+        prag_weight: float = 0.30,
+    ) -> None:
+        self.base_tfidf = base_tfidf
+        ordered_pairs = sorted(dict(prag_vocab).items(), key=lambda kv: int(kv[1]))
+        self._prag_terms: Tuple[str, ...] = tuple(str(k) for k, _ in ordered_pairs)
+        self.prag_vocab: Dict[str, int] = {t: i for i, t in enumerate(self._prag_terms)}
+        self.prag_idf = np.asarray(prag_idf, dtype=np.float64)
+        if self.prag_idf.ndim != 1 or len(self.prag_idf) != len(self._prag_terms):
+            raise ValueError("prag_idf length must match prag_vocab")
+        if len(self.prag_idf) > 0 and not np.all(np.isfinite(self.prag_idf)):
+            raise ValueError("prag_idf must contain finite values")
+        self.enable_negation = bool(enable_negation)
+        self.enable_num_http = bool(enable_num_http)
+        self.enable_json_kv = bool(enable_json_kv)
+        self.prag_weight = float(prag_weight)
+        self.base_dim = int(base_tfidf.dimension)
+        self.prag_dim = len(self.prag_vocab)
+        self.dimension = self.base_dim + self.prag_dim
+        self._digest: Optional[str] = None
+
+    @classmethod
+    def fit(
+        cls,
+        texts: Sequence[str],
+        labels: Optional[Sequence[Any]] = None,
+        *,
+        max_features: int = 2048,
+        prag_max_dim: int = 384,
+        enable_negation: bool = True,
+        enable_num_http: bool = True,
+        enable_json_kv: bool = True,
+        prag_weight: float = 0.30,
+        min_chi2: float = 3.5,
+        min_df: int = 3,
+        char_ngrams: tuple[int, int] | None = (3, 5),
+    ) -> "PragmaticCompositeProjector":
+        text_list = list(texts)
+        if not text_list:
+            raise ValueError("Teaching texts must not be empty")
+        prag_docs: List[Dict[str, float]] = []
+        df: Counter[str] = Counter()
+        for t in text_list:
+            raw = extract_pragmatic_features(
+                t,
+                enable_negation=enable_negation,
+                enable_num_http=enable_num_http,
+                enable_json_kv=enable_json_kv,
+            )
+            p_only = {k: float(v) for k, v in raw.items() if k.startswith(_PRAG_PREFIXES)}
+            prag_docs.append(p_only)
+            for k in p_only:
+                df[k] += 1
+
+        n_docs = len(text_list)
+        label_strs: Optional[List[str]] = None
+        if labels is not None:
+            label_strs = [str(lbl) for lbl in labels]
+            if len(label_strs) != n_docs:
+                raise ValueError("labels length must match texts length")
+            classes = sorted(set(label_strs))
+        else:
+            classes = []
+
+        if label_strs is not None and len(classes) >= 2:
+            cls_to_idx = {c: i for i, c in enumerate(classes)}
+            k_cls = len(classes)
+            cls_counts = np.zeros(k_cls, dtype=np.float64)
+            for lbl in label_strs:
+                cls_counts[cls_to_idx[lbl]] += 1.0
+
+            term_cls: Dict[str, np.ndarray] = {}
+            for pd, lbl in zip(prag_docs, label_strs):
+                ci = cls_to_idx[lbl]
+                for term in pd:
+                    arr = term_cls.get(term)
+                    if arr is None:
+                        arr = np.zeros(k_cls, dtype=np.float64)
+                        term_cls[term] = arr
+                    arr[ci] += 1.0
+
+            scored: List[Tuple[float, str]] = []
+            for term, obs_c in term_cls.items():
+                tot = float(obs_c.sum())
+                if tot < min_df:
+                    continue
+                exp_c = tot * (cls_counts / max(1.0, float(n_docs)))
+                chi2 = float(np.sum(((obs_c - exp_c) ** 2) / np.maximum(1e-6, exp_c)))
+                if chi2 >= min_chi2:
+                    scored.append((chi2 + 0.05 * math.log1p(tot), term))
+            scored.sort(key=lambda x: (-x[0], x[1]))
+            chosen = [t for _, t in scored[: min(prag_max_dim, len(scored))]]
+        else:
+            chosen = [
+                t
+                for t, cnt in sorted(df.items(), key=lambda kv: (-kv[1], kv[0]))
+                if cnt >= min_df
+            ][:prag_max_dim]
+
+        prag_vocab = {t: i for i, t in enumerate(chosen)}
+        prag_idf = np.array([math.log((n_docs + 1.0) / (df[t] + 1.0)) + 1.0 for t in chosen], dtype=np.float64)
+        if label_strs is not None and len(classes) >= 2:
+            base_tfidf = TfidfProjector.fit(
+                text_list,
+                max_features=max_features,
+                labels=label_strs,
+                selection="chi2",
+                char_ngrams=char_ngrams,
+            )
+        else:
+            base_tfidf = TfidfProjector.fit(
+                text_list,
+                max_features=max_features,
+                selection="frequency",
+                char_ngrams=char_ngrams,
+            )
+        return cls(
+            base_tfidf,
+            prag_vocab,
+            prag_idf,
+            enable_negation=enable_negation,
+            enable_num_http=enable_num_http,
+            enable_json_kv=enable_json_kv,
+            prag_weight=prag_weight,
+        )
+
+    def raw_norm(self, text: str) -> float:
+        return self.base_tfidf.raw_norm(text)
+
+    def _prag_vector(self, text: str) -> Tuple[np.ndarray, bool]:
+        raw = extract_pragmatic_features(
+            text,
+            enable_negation=self.enable_negation,
+            enable_num_http=self.enable_num_http,
+            enable_json_kv=self.enable_json_kv,
+        )
+        v_prag = np.zeros(self.prag_dim, dtype=np.float64)
+        pv = self.prag_vocab
+        pidf = self.prag_idf
+        any_hit = False
+        for k, val in raw.items():
+            if not k.startswith(_PRAG_PREFIXES):
+                continue
+            idx = pv.get(k)
+            if idx is not None:
+                v_prag[idx] = math.log1p(val) * pidf[idx] * self.prag_weight
+                any_hit = True
+        return v_prag, any_hit
+
+    def project(self, text: str, recency_weighted: bool | None = None) -> np.ndarray:
+        if recency_weighted:
+            raise ValueError("PragmaticCompositeProjector uses TF-IDF frequencies, not recency weighting")
+        v_base = np.asarray(self.base_tfidf.project(text), dtype=np.float64)
+        if self.prag_dim == 0:
+            return v_base.astype(np.float32)
+        v_prag, any_hit = self._prag_vector(text)
+        if not any_hit:
+            out = np.zeros(self.dimension, dtype=np.float64)
+            out[: self.base_dim] = v_base
+            return out.astype(np.float32)
+        pn = float(np.linalg.norm(v_prag))
+        if pn > 1.15:
+            v_prag *= 1.15 / pn
+        out = np.concatenate([v_base, v_prag])
+        on = float(np.linalg.norm(out))
+        if on > 1e-12:
+            out /= on
+        return out.astype(np.float32)
+
+    encode = project
+
+    def project_with_norm(self, text: str, recency_weighted: bool | None = None) -> tuple[np.ndarray, float]:
+        if recency_weighted:
+            raise ValueError("PragmaticCompositeProjector uses TF-IDF frequencies, not recency weighting")
+        v_base, base_norm = self.base_tfidf.project_with_norm(text)
+        if self.prag_dim == 0:
+            return v_base, base_norm
+        v_prag, any_hit = self._prag_vector(text)
+        if not any_hit:
+            out = np.zeros(self.dimension, dtype=np.float64)
+            out[: self.base_dim] = np.asarray(v_base, dtype=np.float64)
+            return out.astype(np.float32), base_norm
+        pn = float(np.linalg.norm(v_prag))
+        if pn > 1.15:
+            v_prag *= 1.15 / pn
+        out = np.concatenate([np.asarray(v_base, dtype=np.float64), v_prag])
+        on = float(np.linalg.norm(out))
+        if on > 1e-12:
+            out /= on
+        return out.astype(np.float32), float(max(base_norm, pn))
+
+    def project_batch(
+        self,
+        texts: Sequence[str],
+        recency_weighted: bool | None = None,
+        *,
+        return_norms: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        if recency_weighted:
+            raise ValueError("PragmaticCompositeProjector uses TF-IDF frequencies, not recency weighting")
+        n_docs = len(texts)
+        if n_docs == 0:
+            empty_mat = np.empty((0, self.dimension), dtype=np.float32)
+            return (empty_mat, np.empty(0, dtype=np.float32)) if return_norms else empty_mat
+        if return_norms:
+            vecs: List[np.ndarray] = []
+            norms = np.empty(n_docs, dtype=np.float32)
+            for idx, t in enumerate(texts):
+                vec, rn = self.project_with_norm(t)
+                vecs.append(vec)
+                norms[idx] = rn
+            return np.vstack(vecs).astype(np.float32), norms
+        return np.vstack([self.project(t) for t in texts]).astype(np.float32)
+
+    def similarity(self, text_a: str, text_b: str) -> float:
+        return float(np.dot(self.project(text_a), self.project(text_b)))
+
+    def to_config(self, *, include_arrays: bool = True) -> dict[str, Any]:
+        cfg: dict[str, Any] = {
+            "type": "pragmatic_tfidf",
+            "base_tfidf": self.base_tfidf.to_config(include_arrays=include_arrays),
+            "prag_terms": list(self._prag_terms),
+            "enable_negation": self.enable_negation,
+            "enable_num_http": self.enable_num_http,
+            "enable_json_kv": self.enable_json_kv,
+            "prag_weight": self.prag_weight,
+        }
+        if include_arrays:
+            cfg["prag_idf"] = [float(v) for v in self.prag_idf.tolist()]
+        return cfg
+
+    @classmethod
+    def validate_header_config(
+        cls,
+        config: dict[str, Any],
+        *,
+        allow_missing_idf: bool = False,
+    ) -> tuple[list[str], list[str], int]:
+        if (
+            not isinstance(config, dict)
+            or config.get("type") != "pragmatic_tfidf"
+            or "base_tfidf" not in config
+            or "prag_terms" not in config
+            or set(config) - cls.CONFIG_KEYS
+            or (not allow_missing_idf and "prag_idf" not in config)
+        ):
+            raise ValueError("Unsupported pragmatic TF-IDF projector settings")
+        base_terms, _ = TfidfProjector.validate_header_config(
+            config["base_tfidf"],
+            allow_missing_idf=allow_missing_idf,
+        )
+        prag_terms = config["prag_terms"]
+        if (
+            not isinstance(prag_terms, (list, tuple))
+            or len(prag_terms) > MAX_PRAG_FEATURES
+            or any(not isinstance(t, str) or not t or len(t) > MAX_TERM_LENGTH for t in prag_terms)
+            or len(set(prag_terms)) != len(prag_terms)
+        ):
+            raise ValueError("Invalid pragmatic vocabulary in projector config")
+        for b_key in ("enable_negation", "enable_num_http", "enable_json_kv"):
+            if b_key in config and type(config[b_key]) is not bool:
+                raise ValueError(f"Unsupported pragmatic projector {b_key} setting")
+        if "prag_weight" in config:
+            pw = config["prag_weight"]
+            if type(pw) not in (int, float) or not math.isfinite(float(pw)) or not 0.0 <= float(pw) <= 5.0:
+                raise ValueError("Unsupported pragmatic projector prag_weight setting")
+        total_dim = len(base_terms) + len(prag_terms)
+        return base_terms, list(prag_terms), total_dim
+
+    @classmethod
+    def from_config(
+        cls,
+        config: dict[str, Any],
+        *,
+        tfidf_idf_array: Any = None,
+        prag_idf_array: Any = None,
+    ) -> "PragmaticCompositeProjector":
+        allow_missing = tfidf_idf_array is not None or prag_idf_array is not None
+        _, prag_terms, _ = cls.validate_header_config(config, allow_missing_idf=allow_missing)
+        base_proj = TfidfProjector.from_config(config["base_tfidf"], idf_array=tfidf_idf_array)
+        if "prag_idf" in config:
+            raw_pidf = config["prag_idf"]
+            if not isinstance(raw_pidf, (list, tuple)) or len(raw_pidf) != len(prag_terms):
+                raise ValueError("Saved pragmatic IDF weights length mismatch")
+            prag_idf_arr = np.asarray(raw_pidf, dtype=np.float64)
+        elif prag_idf_array is not None:
+            prag_idf_arr = np.asarray(prag_idf_array, dtype=np.float64)
+            if prag_idf_arr.ndim != 1 or len(prag_idf_arr) != len(prag_terms):
+                raise ValueError("Saved pragmatic IDF array shape mismatch")
+        elif len(prag_terms) == 0:
+            prag_idf_arr = np.empty(0, dtype=np.float64)
+        else:
+            raise ValueError("Saved pragmatic IDF weights are required")
+        if prag_idf_arr.size > 0 and not np.all(np.isfinite(prag_idf_arr)):
+            raise ValueError("Saved pragmatic IDF weights contain non-finite values")
+        return cls(
+            base_proj,
+            {t: i for i, t in enumerate(prag_terms)},
+            prag_idf_arr,
+            enable_negation=config.get("enable_negation", True),
+            enable_num_http=config.get("enable_num_http", True),
+            enable_json_kv=config.get("enable_json_kv", True),
+            prag_weight=config.get("prag_weight", 0.30),
+        )
+
+    def projector_digest(self) -> str:
+        if self._digest is None:
+            self._digest = hashlib.sha256(
+                json.dumps(self.to_config(include_arrays=True), sort_keys=True).encode("utf-8")
+            ).hexdigest()
+        return self._digest
+
+    from_texts = fit
+    to_dict = to_config
+    from_dict = from_config
+
+
+__all__ = [
+    "DEFAULT_MAX_FEATURES",
+    "MAX_FEATURES",
+    "MAX_PRAG_FEATURES",
+    "TfidfProjector",
+    "PragmaticCompositeProjector",
+    "extract_pragmatic_features",
+]
 

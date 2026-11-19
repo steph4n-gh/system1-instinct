@@ -266,7 +266,7 @@ class SystemOneMCPProxy:
             elif method == "initialize":
                 result = {
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.2.0"},
+                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.3.0"},
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":
@@ -427,7 +427,7 @@ class SystemOneMCPProxy:
             elif method == "initialize":
                 result = {
                     "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.2.0"},
+                    "serverInfo": {"name": "system1-mcp-guard", "version": "1.3.0"},
                     "capabilities": {"tools": {}},
                 }
             elif method == "tools/list":

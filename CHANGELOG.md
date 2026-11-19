@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.3.0 - 2026-11-18
+
+**System 1: Instinct (`1.3.0`)** - Adds soft-label distillation, compiled decision callables, an opt-in `.s1m` v3 format, a wire-compatible decision gateway, cost-aware calibration, explanations, active example selection, an opt-in guard shield, and a multi-tenant skill fleet. Tightens input validation across skill loading, online learning, receipts, and HTTP servers.
+
+- **Soft Distillation & Few-Shot Routing**:
+  - Add `SystemOneCompiler.compile_soft_distilled(prompts, soft_probs, ...)` and `soft_targets=` on `compile(...)` and `compile_and_save(...)` to fit `ChoiceField` and `BooleanField` heads to teacher probability rows.
+  - Add `PragmaticCompositeProjector` (chi-squared-filtered TF-IDF plus structural text channels) and `SmartsCrossZeroFewRouter` (BM25F, criteria matching, and ridge routing from zero or a few examples per class, with no pretrained weights).
+  - Add `OnlineMondrianConformal`, a per-class online quantile tracker. It targets long-run coverage under drift and does not give a finite-sample guarantee.
+- **Compiled Callables & Opt-In `.s1m` v3**:
+  - Add `SystemOneEngine.compile_callable()` / `compile_engine_callable(engine)` and `TypeSafeClient.compile_callable(questions)` / `compile_typesafe_callable(...)`. Each returns a `FastDecisionCallable` backed by a `PackedMultiQuestionKernel` that scores every `ChoiceField`, `BooleanField`, and `ScoreField` head in one matrix product. The callable returns `values`, `confidences`, and `is_ambiguous` and no receipt. It rebuilds its kernel when the engine's weights, schema, or effective `alpha` change.
+  - Add `format_version=3` and `embed_vocab=True` to `save(...)`, `to_bytes(...)`, `compile_and_save(...)`, and `TypeSafeClient.export_model(...)`. The default stays `format_version=2`. `S1M\x03` allows up to 512 fields (`MAX_SKILL_FIELDS_V3`) and aligns arrays to 16 KiB pages. `load(..., mmap_mode=True)`, the default, memory-maps v3 files; call `close()` on the model or engine to release the mapping. v1 and v2 files load as before.
+  - Add `use_cache=` to `SystemOneModel.forward_single(...)` and `evaluate(...)`, and `set_embedding_cache_maxsize` / `clear_embedding_caches` for the module-level embedding caches.
+- **Universal Decision Gateway (`system1.compat.universal`)**:
+  - Add `UniversalDecisionService`, `UniversalDecisionHTTPServer`, `create_universal_asgi_app`, and `mount_universal_gateway`. They accept Gemini Decision, Laya, and Jev payloads on `POST /v1beta/decisions`, `/v1/decisions`, `/v1/systemone`, and `/v1/laya/decide`, distill teacher probabilities into one `AutoCutoverLifecycle` per schema, and isolate schema drift. The HTTP server refuses non-loopback hosts. Requests with `NaN`, `Infinity`, or duplicate JSON keys are rejected, and body-size caps, header authentication, and `Origin` allowlists apply.
+- **Score Cutover & Cost-Aware Calibration**:
+  - `AutoCutoverLifecycle` accepts a `ScoreField` primary field. A score prediction agrees with the teacher when it lies within `CutoverConfig.score_tolerance` (default `0.15`) times the field's range. Add `post_compile_hook=`, `decide_local(..., accept_predicate=..., cache_key=...)`, and the `is_cutover` property.
+  - Add `UtilityCalibrator`, which picks the Bayes expected-cost action from an `(actions, classes)` cost matrix and gates it with Conformal Risk Control. When the calibration data cannot certify the risk bound, `is_vacuous` is `True` and `predict` returns `safe_action`. `UtilityCascadeRouter` applies the same rule to a local, weak, and strong model ladder.
+  - Add `CumulativeLogitOrdinalHead`, `SoftOrdinalHead`, `BinaryPlattBetaCalibrator`, `cqr_ordinal_intervals`, and `should_use_soft_ordinal`.
+- **Explanations & Active Teaching**:
+  - Add `SystemOneEngine.explain(prompt, field_name=None)` and `explain_all(prompt)` (`FastExplainer`), returning additive token attributions, exemplar witnesses, and counterfactual flips. `sign_compact_witness` and `verify_compact_witness` sign and check a compact witness with Ed25519.
+  - Add `ActiveTeacherSelector`, which ranks unlabeled examples by RLS variance, margin entropy, and k-center coverage.
+- **Opt-In Guard Shield**:
+  - `SystemOneGuardHook` and `SystemOnePromptGuard` accept `shield_mode` (`"off"` by default, `"canonicalize"`, or `"sliding_window"`), and `SystemOneGuardHook` also accepts a `GuardShield` instance. The shield applies NFKC normalization, removes invisible characters, decodes embedded tool payloads, and scores sliding windows against unsafe prototypes before dispatch, with thresholds calibrated from benign text.
+- **Multi-Tenant Skill Fleet**:
+  - Add `MultiTenantSkillFleet`, which serves many tenants from one shared projector and base trunk with compact per-tenant arenas, a bounded token-hash cache (`token_cache_limit=4096`, `set_fleet_token_cache_limit`), and pickle-free delta serialization (`fleet_delta_to_bytes` / `fleet_delta_from_bytes`).
+
+### Behavior changes
+
+- **Optional keyword arguments for model callables come from the signature alone**:
+  - `SystemOneEngine` chooses the optional keyword arguments it passes to `model.encode`, `model.forward_single`, `model.learn_from_tier2`, a head's `online_update`, and a conformal predictor's `predict_set` from that callable's signature. A callable with explicit parameters receives only the ones it names. A callable that accepts `**kwargs` receives every optional keyword argument.
+  - The engine does not inspect what a `**kwargs` callable does with those arguments. A wrapper that forwards them to a stricter callable gets that callable's `TypeError`, and the error propagates to the engine's caller. `learn` leaves the engine's model version and lesson count unchanged when this happens.
+  - In 1.2.0 the engine retried `encode` and `forward_single` with fewer keyword arguments after a `TypeError`. It no longer retries. Give a forwarding wrapper explicit parameters, or filter `**kwargs` before forwarding.
+- **Stricter validation**:
+  - Skill loading, compiled export, batch decisions, and online updates raise `ValueError` for non-finite or mis-shaped weights, biases, covariance matrices, exemplar banks, and calibration arrays, and for values that overflow `float32`.
+  - `compute_receipt_digest` raises `ValueError` for non-finite numbers or for `confidences`, `conformal_sets`, or `probabilities` values that are not mappings. `create_decision_receipt` records non-finite confidences and probabilities as `0.0`. Receipt verification returns `False` for a receipt that contains `NaN` or `Infinity`.
+  - The MCP Streamable HTTP server and the Inbox Zero ASGI app parse `Content-Type` strictly as `application/json` with RFC 9110 parameters and answer `415` to malformed values. The MCP server still accepts a request without `Content-Type`.
+  - `SemanticSystemOneCache` rejects `str`, `bytes`, and non-numeric `embedding` values.
+
 ## 1.2.0 - 2026-11-13
 
 **System 1: Instinct (`1.2.0`)** - Consolidates the internal `1.1` milestone and `1.2` runtime, calibration, cutover, and MCP server upgrades under `Development Status :: 5 - Production/Stable`.
